@@ -206,6 +206,7 @@ def imread_from_optical(
 
     """
     # TODO check method for grayscale images. shape of array?
+    output_dtype = kwargs.pop("dtype", float)
 
     if isinstance(path, Path):
         # Read single image incl. date from metadata of the image
@@ -226,7 +227,7 @@ def imread_from_optical(
             time=time,
             transformations=transformations,
             **kwargs,
-        ).img_as(float)
+        ).img_as(output_dtype)
 
         return image
 
@@ -251,7 +252,7 @@ def imread_from_optical(
             time=time,
             transformations=transformations,
             **kwargs,
-        ).img_as(float)
+        ).img_as(output_dtype)
         return image
 
     else:

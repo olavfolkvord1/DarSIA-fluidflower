@@ -1,0 +1,38 @@
+"""Standalone shell for transferable FluidFlower phase-model development."""
+
+from __future__ import annotations
+
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QMainWindow, QMessageBox
+
+from darsia.fluidflower.ui.model_training import SharedPhaseModelTrainingPage
+from darsia.fluidflower.ui.theme import apply_application_theme
+
+
+class PhaseModelStudioWindow(QMainWindow):
+    """Host the reusable phase-training page outside the production app."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("DarSIA · Phase Model Studio")
+        self.resize(1450, 920)
+        self.setMinimumSize(1000, 680)
+        self.training_page = SharedPhaseModelTrainingPage()
+        self.setCentralWidget(self.training_page)
+        apply_application_theme(self)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.training_page.training_process is not None:
+            QMessageBox.information(
+                self,
+                "Phase-model training is still running",
+                "The studio remains open so the active model version is not "
+                "interrupted accidentally. Use 'Stop after current checkpoint' "
+                "before closing the studio.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+__all__ = ["PhaseModelStudioWindow"]

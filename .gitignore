@@ -177,3 +177,19 @@ cython_debug/
 *.PNG
 images/metadata/*.txt
 *.npy
+
+# Runtime output of the optional FluidFlower application.
+.ruff_cache/
+.venv*/
+.scratch/
+test-results/
+*.npz
+*.pickle
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Shipped application icon, not an experimental image collection.
+!src/darsia/fluidflower/ui/assets/*.png

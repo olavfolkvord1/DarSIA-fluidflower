@@ -91,8 +91,11 @@ class CalibrationMassConfig:
         # This threshold is currently only meaningful for color-path embeddings.
         self.rois = _get_key(sec, "rois", default=[], required=False, type_=list)
         try:
+            calibration_data = sec.get("data")
             self.data = (
-                data_registry.resolve(sec.get("data")) if data_registry else None
+                data_registry.resolve(calibration_data)
+                if data_registry is not None and calibration_data is not None
+                else None
             )
         except KeyError:
             warn("No data found for calibration.mass. Use [calibration.mass].data.")
@@ -139,8 +142,11 @@ class CalibrationConfig:
             self.mass = None
 
         try:
+            calibration_data = sec.get("data")
             self.data = (
-                data_registry.resolve(sec.get("data")) if data_registry else None
+                data_registry.resolve(calibration_data)
+                if data_registry is not None and calibration_data is not None
+                else None
             )
         except KeyError:
             warn("No data found for calibration. Use [calibration].data.")

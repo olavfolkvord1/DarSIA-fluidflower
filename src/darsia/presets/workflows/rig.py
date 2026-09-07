@@ -5,6 +5,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Any
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -1163,7 +1164,7 @@ class Rig:
         else:
             return darsia.ScalarImage(values_reshaped, **metadata)
 
-    def read_image(self, path: Path) -> darsia.Image:
+    def read_image(self, path: Path, dtype: Any = float) -> darsia.Image:
         """Read image from file and apply corrections.
 
         The respective date is extracted from the path using the imaging protocol.
@@ -1188,6 +1189,7 @@ class Rig:
             date=date,
             reference_date=self.reference_date,
             name=path.name,
+            dtype=dtype,
         )
 
         return img

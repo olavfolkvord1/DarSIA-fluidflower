@@ -5,6 +5,12 @@
 # DarSIA
 Darcy scale image analysis toolbox
 
+**FluidFlower development fork:** this branch preserves the complete application
+and phase-model studio. See [development snapshot and startup](FLUIDFLOWER_DEVELOPMENT.md).
+For smaller independently adoptable modules, see
+[darsia-extensions](https://github.com/olavfolkvord1/darsia-extensions).
+The original upstream documentation follows below.
+
 # Documentation
 Visit pmgbergen.github.io/DarSIA
 
