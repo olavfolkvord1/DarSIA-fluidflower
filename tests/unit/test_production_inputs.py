@@ -276,6 +276,122 @@ def test_parity_must_match_exact_source_input_precision(staged, changed):
         source_review=save(proof), exact_cpu_parity_result=parity_desc))
 
 
+def test_qualification_full_descriptors_normalize_mapped_drive_and_unc(staged, monkeypatch):
+    _, frozen, mapping, proof, save = source_review(staged)
+    frozen["path"] = r"\\NAS\Share\frozen\original.py"
+    proof["input_bindings"] = deepcopy(staged.manifest["inputs"])
+    proof["source_bindings"][0]["original_source"] = deepcopy(frozen)
+    # Both proof tables bind the very same full descriptors, with only locator
+    # spelling changed. The original metadata remains literal and untouched.
+    proof["input_bindings"]["frozen_source"]["path"] = "x:/FROZEN/unused/../original.py"
+    proof["source_bindings"][0]["original_source"]["path"] = "//nas/SHARE/frozen/./original.py"
+    current = proof["source_bindings"][0]["current_source"]
+    current["path"] = str(Path(current["path"]).parent / "." / Path(current["path"]).name)
+    monkeypatch.setattr(inputs, "normalize_locator", lambda path: pio.normalize_locator(path, {"X:": r"\\NAS\Share"}))
+    reader = staged.reader(source_provenance=mapping, source_qualification={"source_review": save(proof)})
+    assert reader.source_qualification_state == "exact_CPU_parity_bootstrap"
+    assert reader.source_bindings[0]["original_source"]["path"] == frozen["path"]
+
+
+@pytest.mark.parametrize("kind", ["input_missing", "input_extra", "input_sha", "input_size", "input_bool",
+    "input_path", "input_extra_key", "source_sha", "source_size", "source_path", "source_extra",
+    "source_missing", "commit", "settings"])
+def test_qualification_normalization_preserves_full_binding_strictness(staged, kind):
+    _, _, mapping, proof, save = source_review(staged)
+    bound = proof["input_bindings"]["frozen_source"]
+    source = proof["source_bindings"][0]["current_source"]
+    if kind == "input_missing": proof["input_bindings"].clear()
+    if kind == "input_extra": proof["input_bindings"]["extra"] = deepcopy(bound)
+    if kind == "input_sha": bound["sha256"] = "f" * 64
+    if kind == "input_size": bound["size_bytes"] += 1
+    if kind == "input_bool": bound["size_bytes"] = True
+    if kind == "input_path": bound["path"] += ".other"
+    if kind == "input_extra_key": bound["extra"] = True
+    if kind == "source_sha": source["sha256"] = "f" * 64
+    if kind == "source_size": source["size_bytes"] += 1
+    if kind == "source_path": source["path"] += ".other"
+    if kind == "source_extra": proof["source_bindings"][0]["extra"] = True
+    if kind == "source_missing": proof["source_bindings"] = []
+    if kind == "commit": proof["execution_commit"] = "f" * 40
+    if kind == "settings": proof["reference_settings"]["precision"] = "float32"
+    with pytest.raises(ValueError, match="exact Root IO-only"):
+        staged.reader(source_provenance=mapping, source_qualification={"source_review": save(proof)})
+
+
+def restart_context(staged, monkeypatch):
+    _, _, mapping, proof, save = source_review(staged)
+    old_review = save(proof, "source_review")
+    staged.manifest["environment"] = {"synthetic_packages": "same"}
+    original = pio.NasIO().write_json(staged.worktree / "manifest_ADOPTED.json", staged.manifest)
+    execution = {**staged.manifest["code"], "commit": "1" * 40}
+    monkeypatch.setattr(inputs, "_code_identity", lambda root: deepcopy(execution))
+    monkeypatch.setattr(inputs, "_environment_lock", lambda: deepcopy(staged.manifest["environment"]))
+    retired = []
+    monkeypatch.setattr(inputs, "_require_workers_retired", lambda records: retired.append(deepcopy(records)))
+    fix_review = pio.NasIO().write_json(staged.worktree / "fix_review.json", {**proof, "execution_commit": execution["commit"]})
+    record = dict(format="darsia-production-restart-v1", manifest_sha256=original["sha256"],
+                  initial_commit=staged.manifest["code"]["commit"], fix_commit=execution["commit"],
+                  original_source_review=old_review, fix_source_review=fix_review,
+                  workers_retired=[dict(pid=123, process_create_time="1.25")],
+                  partial_folders_read_or_modified=False, created_utc="2026-10-12T15:15:26Z")
+    return SimpleNamespace(mapping=mapping, original=original, execution=execution, record=record,
+                           retired=retired, fix_review=fix_review, old_review=old_review)
+
+
+def test_restart_uses_one_immutable_manifest_and_explicit_fix_assurance(staged, monkeypatch):
+    context = restart_context(staged, monkeypatch)
+    original_bytes = Path(context.original["path"]).read_bytes()
+    restart = pio.NasIO().write_json(staged.worktree / "restart.json", context.record)
+    reader = staged.reader(source_provenance=context.mapping, manifest_descriptor=context.original,
+                           restart_descriptor=restart)
+    assert reader.code_commit == context.execution["commit"] != staged.manifest["code"]["commit"]
+    assert reader.execution_identity == context.execution
+    assert reader.source_qualification == {"source_review": context.fix_review}
+    assert reader.source_qualification_state == "exact_CPU_parity_bootstrap"
+    assert context.retired == [context.record["workers_retired"]]
+    assert Path(context.original["path"]).read_bytes() == original_bytes
+    assert set(staged.manifest["inputs"]) == {"frozen_source", "source_review"}
+    assert context.fix_review not in staged.manifest["inputs"].values()
+    assert reader.json(context.old_review)["execution_commit"] == "0" * 40
+
+
+@pytest.mark.parametrize("kind", ["manifest_sha", "manifest_value", "initial", "fix", "dirty", "submodules",
+    "environment", "format", "retirement", "partials", "original_review", "missing_fix_review",
+    "unbound_fix_review", "changed_fix_bytes", "review_override"])
+def test_restart_rejects_wrong_identity_environment_and_review(staged, monkeypatch, kind):
+    context = restart_context(staged, monkeypatch)
+    kwargs = dict(source_provenance=context.mapping, manifest_descriptor=context.original)
+    if kind == "manifest_sha": context.record["manifest_sha256"] = "f" * 64
+    if kind == "manifest_value": staged.manifest["settings"]["precision"] = "float32"
+    if kind == "initial": context.record["initial_commit"] = "f" * 40
+    if kind == "fix": context.record["fix_commit"] = "f" * 40
+    if kind == "dirty": context.execution["clean_tree"] = False
+    if kind == "submodules": context.execution["submodules"] = ["changed submodule"]
+    if kind == "environment": monkeypatch.setattr(inputs, "_environment_lock", lambda: {"changed": True})
+    if kind == "format": context.record["format"] = "wrong"
+    if kind == "retirement": monkeypatch.setattr(inputs, "_require_workers_retired", lambda records: (_ for _ in ()).throw(ValueError("worker still alive")))
+    if kind == "partials": context.record["partial_folders_read_or_modified"] = True
+    if kind == "original_review": context.record["original_source_review"] = staged.manifest["inputs"]["frozen_source"]
+    if kind == "missing_fix_review": context.record.pop("fix_source_review")
+    if kind == "unbound_fix_review": context.record["fix_source_review"]["sha256"] = "f" * 64
+    if kind == "changed_fix_bytes": Path(context.fix_review["path"]).write_bytes(b"changed review")
+    if kind == "review_override": kwargs["source_qualification"] = {"source_review": context.old_review}
+    kwargs["restart_descriptor"] = pio.NasIO().write_json(staged.worktree / "restart.json", context.record)
+    with pytest.raises(ValueError): staged.reader(**kwargs)
+
+
+def test_restart_review_is_not_profile_parity_or_dirty_tree_inference(staged, monkeypatch):
+    context = restart_context(staged, monkeypatch)
+    with pytest.raises(ValueError, match="Git identity"):
+        staged.reader(source_provenance=context.mapping, source_qualification={"source_review": context.fix_review})
+    staged.manifest["purpose"] = "profile"
+    context.original = pio.NasIO().write_json(staged.worktree / "profile_manifest.json", staged.manifest)
+    context.record["manifest_sha256"] = context.original["sha256"]
+    restart = pio.NasIO().write_json(staged.worktree / "restart.json", context.record)
+    with pytest.raises(ValueError):
+        staged.reader(source_provenance=context.mapping, manifest_descriptor=context.original, restart_descriptor=restart)
+
+
 def test_verified_reader_delegates_without_opening_original(staged):
     bound = staged.add("a", r"\\NAS\share\a.json", b'{"synthetic":true}')
     reader = staged.reader()

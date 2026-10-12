@@ -347,7 +347,8 @@ class LocalProductionJob:
         self.io.write_json(path, record)
         return record
 
-    def restart(self, *, workers, stop, current_worktree, fix_commit=None) -> dict:
+    def restart(self, *, workers, stop, current_worktree, fix_commit=None,
+                original_source_review=None, fix_source_review=None) -> dict:
         """One coordinator pass; reuse verified finals and ignore all partials."""
         registered = []
         for p in sorted((self.controls_root / "workers").glob("*.json")):
@@ -362,6 +363,29 @@ class LocalProductionJob:
         original = self.manifest["code"]["commit"]
         if current != original and fix_commit != current:
             raise ValueError("Recovery code change must name its actual fix commit")
+        reviews = {}
+        if (original_source_review is None) != (fix_source_review is None):
+            raise ValueError("Restart assurance requires both original and fix source reviews")
+        if original_source_review is not None:
+            if fix_commit != current:
+                raise ValueError("Restart source review must name the actual fix commit")
+            def identity(bound):
+                return (normalize_locator(bound["path"]), bound["sha256"], bound["size_bytes"])
+            original_asset = self.io.verified_asset(original_source_review)
+            assurance = self.manifest.get("assurance_input_roles", [])
+            if identity(original_asset) not in {
+                    identity(self.manifest["inputs"][role]) for role in assurance}:
+                raise ValueError("Original source review must be a manifest assurance input")
+            for key, bound, commit in (("original_source_review", original_asset, original),
+                                       ("fix_source_review", fix_source_review, current)):
+                asset = self.io.verified_asset(bound)
+                review = self.io.read_json(asset)
+                if (review.get("contract") != "darsia-production-io-source-review-v1"
+                        or review.get("complete") is not True
+                        or review.get("io_only_diff_passed") is not True
+                        or review.get("execution_commit") != commit):
+                    raise ValueError("Restart needs the complete source review for its actual commit")
+                reviews[key] = asset
         carried, unfinished = [], []
         for frame_id in self.manifest["frames"]:
             if self._frame_path(frame_id).exists():
@@ -374,5 +398,6 @@ class LocalProductionJob:
                   "initial_commit": original, "fix_commit": fix_commit,
                   "carried_frames": carried, "recompute_frames": unfinished,
                   "partial_folders_read_or_modified": False}
+        record.update(reviews)
         self.io.write_json(self.controls_root / f"restart_{uuid.uuid4().hex}.json", record)
         return record

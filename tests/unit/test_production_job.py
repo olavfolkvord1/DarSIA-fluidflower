@@ -39,7 +39,7 @@ def fixture_repo(tmp_path):
     return root
 
 
-def make_job(tmp_path, fixture_repo, *, purpose="file_handling_acceptance", precision="float64", name="job"):
+def make_job(tmp_path, fixture_repo, *, purpose="file_handling_acceptance", precision="float64", name="job", source_review=None):
     root = tmp_path / name
     root.mkdir()
     io = NasIO()
@@ -49,10 +49,56 @@ def make_job(tmp_path, fixture_repo, *, purpose="file_handling_acceptance", prec
     manifest = create_manifest(root / "manifest.json", worktree=fixture_repo,
         settings={"host": "test", "precision": precision, "backend": "cpu",
                   "threads": 1, "workers": 1, "logical_cpus": 1},
-        calibration=asset, specs={"synthetic_fixture": asset}, inputs={"fixture": asset},
+        calibration=asset, specs={"synthetic_fixture": asset},
+        inputs={"fixture": asset, **({"source_review": source_review} if source_review is not None else {})},
+        scientific_input_roles=["fixture"],
+        assurance_input_roles=["source_review"] if source_review is not None else [],
         purpose=purpose, frames=["fixture/frame_0000", "fixture/frame_0001", "fixture/frame_0002"],
         environment=environment_lock(freeze_text="synthetic-test==1\n"), io=io)
     return LocalProductionJob(manifest, root / "local", root / "nas", io=io)
+
+
+def test_fix_restart_keeps_manifest_and_binds_both_source_reviews(tmp_path, fixture_repo):
+    io = NasIO()
+    initial = code_identity(fixture_repo)["commit"]
+    original_document = {"contract": "darsia-production-io-source-review-v1",
+                         "complete": True, "io_only_diff_passed": True,
+                         "execution_commit": initial}
+    original_path = tmp_path / "original_source_review.json"
+    io.write_json(original_path, original_document)
+    original_asset = io.asset(original_path)
+    job = make_job(tmp_path, fixture_repo, source_review=original_asset)
+    manifest_before = io.asset(job.manifest_asset["path"])
+    (fixture_repo / "native.txt").write_text("synthetic IO metadata correction\n")
+    subprocess.run(["git", "-C", str(fixture_repo), "add", "native.txt"], check=True)
+    subprocess.run(["git", "-C", str(fixture_repo), "-c", "user.name=Local acceptance test",
+                    "-c", "user.email=local-test@example.invalid", "commit", "-q",
+                    "-m", "Synthetic IO fix"], check=True)
+    current = code_identity(fixture_repo)["commit"]
+    fix_path = tmp_path / "fix_source_review.json"
+    io.write_json(fix_path, dict(original_document, execution_commit=current))
+    fix_asset = io.asset(fix_path)
+    options = dict(workers=[], stop={"point": "metadata before arrays"},
+                   current_worktree=fixture_repo, fix_commit=current)
+    with pytest.raises(ValueError, match="both"):
+        job.restart(**options, original_source_review=original_asset)
+    with pytest.raises(ValueError, match="actual commit"):
+        job.restart(**options, original_source_review=original_asset,
+                    fix_source_review=original_asset)
+    unrelated_path = tmp_path / "unbound_original_review.json"
+    io.write_json(unrelated_path, original_document)
+    with pytest.raises(ValueError, match="manifest assurance"):
+        job.restart(**options, original_source_review=io.asset(unrelated_path),
+                    fix_source_review=fix_asset)
+    record = job.restart(**options, original_source_review=original_asset,
+                         fix_source_review=fix_asset)
+    assert record["original_source_review"] == original_asset
+    assert record["fix_source_review"] == fix_asset
+    assert record["initial_commit"] == initial
+    assert record["fix_commit"] == current
+    assert record["recompute_frames"] == job.manifest["frames"]
+    assert record["carried_frames"] == []
+    assert io.asset(job.manifest_asset["path"]) == manifest_before
 
 
 def write_native_products(temporary, frame_index):

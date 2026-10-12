@@ -411,6 +411,34 @@ def test_json_exact_timestamp_keys_nonfinite_duplicates_and_guard_reject(tmp_pat
     assert io.read_json(target) == payload and not clock.pauses
 
 
+def test_nullable_measured_dose_filename_timestamp_preserves_scientific_data(tmp_path):
+    io = pio.NasIO()
+    payload = {"runs": [{"run": "synthetic", "measured_mfc_dose": {
+        "filename_timestamp": None, "source_receipt_note": "no filename timestamp",
+        "dose": 1.25}}, {"measured_mfc_dose": {"filename_timestamp": "exact"}}]}
+    bound = io.write_json(tmp_path / "dose.json", payload)
+    assert io.read_json(bound) == payload
+    assert b'"filename_timestamp": null' in Path(bound["path"]).read_bytes()
+
+
+@pytest.mark.parametrize("payload", [
+    {"filename_timestamp": None},
+    {"runs": [{"filename_timestamp": None}]},
+    {"runs": {"synthetic": {"measured_mfc_dose": {"filename_timestamp": None}}}},
+    {"runs": [{"measured_mfc_dose": {"filename_timestamp": 1.25}}]},
+    {"runs": [{"measured_mfc_dose": {"pid_create_time_epoch": None}}]},
+    {"runs": [{"measured_mfc_dose": {"process_create_time": 1.25}}]},
+    {"timestamp": None}, {"created_utc": None}, {"create_time_epoch": None},
+])
+def test_nullable_filename_exception_does_not_relax_control_epochs(tmp_path, payload):
+    path = tmp_path / "rejected.json"
+    io = pio.NasIO()
+    with pytest.raises(pio.IntegrityError): io.write_json(path, payload)
+    assert not path.exists()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(pio.IntegrityError): io.read_json(path)
+
+
 def test_read_limit_and_postwrite_hash_failure_not_retried(tmp_path, engine, monkeypatch):
     io, clock, _ = engine
     path = tmp_path / "own.bytes"

@@ -21,6 +21,16 @@ def _code_identity(worktree):
     return code_identity(worktree)
 
 
+def _environment_lock():
+    from .production_job import environment_lock
+    return environment_lock()
+
+
+def _require_workers_retired(workers):
+    from .production_job import require_workers_retired
+    return require_workers_retired(workers)
+
+
 class ManifestAssetReader:
     """Use ``ProductionJob.stage_inputs()`` without rewriting native records.
 
@@ -32,19 +42,24 @@ class ManifestAssetReader:
 
     def __init__(self, manifest, staged_inputs, *, cache_root, worktree,
                  source_provenance=None, source_qualification=None,
-                 logical_aliases=None, io=None, opaque_descriptors=()):
+                 logical_aliases=None, io=None, opaque_descriptors=(),
+                 manifest_descriptor=None, restart_descriptor=None):
         self.io = io or NasIO()
         if (manifest.get("format") != "darsia-production-job-v1"
                 or manifest.get("code", {}).get("clean_tree") is not True
                 or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("code", {}).get("commit", ""))):
             raise ValueError("Inputs require the production manifest and code commit")
         execution = _code_identity(worktree)
-        if execution != manifest["code"]:
+        self.restart_record = None
+        self._restart_review = None
+        if restart_descriptor is not None:
+            self._restart_identity(manifest, manifest_descriptor, restart_descriptor, execution)
+        elif execution != manifest["code"]:
             raise ValueError("Input reader runtime differs from the manifest clean Git identity")
         inputs = manifest.get("inputs")
         if not isinstance(inputs, Mapping) or not inputs or set(inputs) != set(staged_inputs):
             raise ValueError("Every flat manifest input must be staged exactly once")
-        self.code_commit = manifest["code"]["commit"]
+        self.code_commit = execution["commit"]
         self.execution_identity = deepcopy(execution)
         self.worktree = Path(worktree).resolve()
         self.cache_root = Path(cache_root).resolve()
@@ -122,13 +137,58 @@ class ManifestAssetReader:
         if self._sources:
             self._qualify_sources(manifest, source_qualification)
 
+    def _restart_identity(self, manifest, manifest_descriptor, restart_descriptor, execution):
+        """Bind an explicit code fix to the same original immutable job."""
+        original = self._full(manifest_descriptor)
+        restart_bound = self._full(restart_descriptor)
+        if self.io.read_json(original, max_bytes=original["size_bytes"]) != manifest:
+            raise IntegrityError("Restart original manifest differs from the supplied manifest")
+        restart = self.io.read_json(restart_bound, max_bytes=restart_bound["size_bytes"])
+        if (not isinstance(restart, Mapping)
+                or restart.get("format") != "darsia-production-restart-v1"
+                or restart.get("manifest_sha256") != original["sha256"]
+                or restart.get("initial_commit") != manifest["code"]["commit"]
+                or not isinstance(restart.get("fix_commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", restart["fix_commit"])
+                or set(execution) != set(manifest["code"])
+                or execution.get("clean_tree") is not True
+                or execution.get("commit") != restart["fix_commit"]
+                or execution.get("submodules") != manifest["code"].get("submodules")
+                or _environment_lock() != manifest.get("environment")):
+            raise ValueError("Restart requires the exact manifest and clean fix runtime/environment")
+        workers = restart.get("workers_retired")
+        if not isinstance(workers, list) or restart.get("partial_folders_read_or_modified") is not False:
+            raise ValueError("Restart needs the actual retired-worker union and untouched partials")
+        _require_workers_retired(workers)
+        if "original_source_review" in restart or "fix_source_review" in restart:
+            old_review = self._full(restart.get("original_source_review"))
+            fix_review = self._full(restart.get("fix_source_review"))
+            assurance = manifest.get("assurance_input_roles", [])
+            if not any(self._same_descriptor(old_review, manifest["inputs"].get(role))
+                       for role in assurance):
+                raise ValueError("Restart must preserve its original manifest source-review assurance")
+            self._restart_review = fix_review
+        self.restart_record = deepcopy(restart)
+        self.restart_descriptor = deepcopy(restart_bound)
+        self.manifest_descriptor = deepcopy(original)
+
     def _qualify_sources(self, manifest, qualification):
         """Source review permits parity bootstrap; actual parity gates profiling."""
+        if qualification is None and self._restart_review is not None:
+            qualification = dict(source_review=self._restart_review)
         if (not isinstance(qualification, Mapping)
                 or not {"source_review"}.issubset(qualification)
                 or set(qualification) - {"source_review", "exact_cpu_parity_result"}):
             raise ValueError("Source qualification needs explicit review/parity descriptors")
-        review = self.json(self._full(qualification["source_review"]))
+        review_bound = self._full(qualification["source_review"])
+        if self._restart_review is not None:
+            if not self._same_descriptor(review_bound, self._restart_review):
+                raise ValueError("Fix source review must match the SHA-bound restart assurance")
+            review = self.io.read_json(review_bound, max_bytes=review_bound["size_bytes"])
+        else:
+            if self.restart_record is not None:
+                raise ValueError("Source substitutions after a code fix need explicit restart assurance")
+            review = self.json(review_bound)
         roles = manifest.get("scientific_input_roles")
         assurance = manifest.get("assurance_input_roles")
         if (not isinstance(roles, list) or not roles or len(set(roles)) != len(roles)
@@ -145,8 +205,8 @@ class ManifestAssetReader:
         settings = dict(backend="cpu", precision=manifest["settings"]["precision"])
         def bindings_match(value):
             return (value.get("execution_commit") == self.code_commit
-                    and value.get("input_bindings") == scientific_inputs
-                    and value.get("source_bindings") == self.source_bindings
+                    and self._same_input_bindings(value.get("input_bindings"), scientific_inputs)
+                    and self._same_source_bindings(value.get("source_bindings"), self.source_bindings)
                     and value.get("reference_settings") == settings)
         if (review.get("contract") != "darsia-production-io-source-review-v1"
                 or review.get("complete") is not True or review.get("io_only_diff_passed") is not True
@@ -187,6 +247,27 @@ class ManifestAssetReader:
                 or type(descriptor["size_bytes"]) is not int or descriptor["size_bytes"] < 0):
             raise ValueError("Manifest/cache descriptors require path, SHA and integer size")
         return dict(descriptor, sha256=descriptor["sha256"].lower())
+
+    @classmethod
+    def _same_descriptor(cls, left, right):
+        try:
+            left, right = cls._full(left), cls._full(right)
+        except ValueError:
+            return False
+        return (normalize_locator(left["path"]) == normalize_locator(right["path"])
+                and (left["sha256"], left["size_bytes"]) == (right["sha256"], right["size_bytes"]))
+
+    @classmethod
+    def _same_input_bindings(cls, left, right):
+        return (isinstance(left, Mapping) and set(left) == set(right)
+                and all(cls._same_descriptor(left[role], right[role]) for role in right))
+
+    @classmethod
+    def _same_source_bindings(cls, left, right):
+        return (isinstance(left, list) and len(left) == len(right)
+                and all(isinstance(a, Mapping) and set(a) == {"current_source", "original_source"}
+                        and all(cls._same_descriptor(a[key], b[key]) for key in b)
+                        for a, b in zip(left, right)))
 
     def logical_descriptor(self, descriptor):
         """Return declared provenance; compact requests cannot invent a size."""

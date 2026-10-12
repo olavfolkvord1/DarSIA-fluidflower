@@ -267,17 +267,24 @@ def exact_timestamp(value: int | str) -> int | str:
     return value
 
 
-def _timestamps(value):
+def _timestamps(value, _path=()):
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise IntegrityError("JSON object keys must be strings")
             if key in _TIMESTAMP_KEYS or key.endswith(("_utc", "_timestamp")):
-                exact_timestamp(item)
-            _timestamps(item)
+                # This frozen dose field describes absent filename metadata,
+                # not a process/control epoch. Keep its scientific null intact.
+                missing_filename = (item is None and key == "filename_timestamp"
+                                    and len(_path) == 3 and _path[0] == "runs"
+                                    and type(_path[1]) is int
+                                    and _path[2] == "measured_mfc_dose")
+                if not missing_filename:
+                    exact_timestamp(item)
+            _timestamps(item, (*_path, key))
     elif isinstance(value, (list, tuple)):
-        for item in value:
-            _timestamps(item)
+        for index, item in enumerate(value):
+            _timestamps(item, (*_path, index))
 
 
 def _json_bytes(document):
