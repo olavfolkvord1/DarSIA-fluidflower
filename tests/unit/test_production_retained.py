@@ -3,8 +3,10 @@ import ast
 from collections.abc import Mapping
 from dataclasses import dataclass
 import importlib.util
+import json
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -239,3 +241,56 @@ def test_separate_total_cast_is_not_sum_of_cast_components(synthetic):
     # This fixture witnesses the rounding distinction, not just equal zeros.
     assert fields["mass_density_g_l"].tobytes() != (
         fields["aqueous_mass_density_g_l"]+fields["gas_mass_density_g_l"]).tobytes()
+
+
+@pytest.mark.parametrize("kind", ["actual_B1", "zero_gain", "negative_gain", "nonfinite_gain",
+    "negative_beta", "gas_parameter", "other_candidate", "sha", "size", "returned_sha", "verifier"])
+def test_selected_n1_uses_verified_freeze_parameters_not_b0_constant(tmp_path, monkeypatch, kind):
+    # Exercise the actual selector, not the evaluator fixture's fake selector.
+    # Only native freeze verification is mocked; real local SHA/size checks and
+    # the original parameter-validation function still run.
+    io_spec = importlib.util.spec_from_file_location("selected_n1_unit_io", SOURCES / "production_io.py")
+    io_module = importlib.util.module_from_spec(io_spec)
+    io_spec.loader.exec_module(io_module)
+    package = ModuleType("darsia")
+    package.__path__ = []
+    fluidflower = ModuleType("darsia.fluidflower")
+    fluidflower.__path__ = []
+    monkeypatch.setitem(sys.modules, "darsia", package)
+    monkeypatch.setitem(sys.modules, "darsia.fluidflower", fluidflower)
+    monkeypatch.setitem(sys.modules, "darsia.fluidflower.production_io", io_module)
+    parameters = dict(candidate="N1", gain=23.882294164545023, beta=.6143584288103799)
+    if kind == "zero_gain": parameters["gain"] = 0.
+    if kind == "negative_gain": parameters["gain"] = -1.
+    if kind == "nonfinite_gain": parameters["gain"] = float("inf")
+    if kind == "negative_beta": parameters["beta"] = -1.
+    if kind == "gas_parameter": parameters["gas_scale"] = 1.
+    if kind == "other_candidate": parameters["candidate"] = "N2"
+    path = tmp_path / "synthetic_freeze.json"
+    path.write_text(json.dumps({"parameters": parameters}), encoding="utf-8")
+    io = io_module.NasIO()
+    bound = io.asset(path)
+    calls = []
+    def verify(frozen_path, **kwargs):
+        calls.append((frozen_path, kwargs))
+        # Same Python JSON numeric values as the original native freeze loader.
+        document = json.loads(Path(frozen_path).read_text(encoding="utf-8"))
+        return document, "f"*64 if kind == "returned_sha" else io.asset(frozen_path)["sha256"]
+    validate = definitions("phase_ffac_common_mass_round2.py", {"_validate_parameters"},
+        dict(np=np, CANDIDATES=("N1", "N2", "N3", "J"),
+             candidate_availability=lambda: {key: {"available": True} for key in ("N1", "N2", "N3", "J")}))["_validate_parameters"]
+    engine = SimpleNamespace(GAIN=24.253536351793787, verify_round3_freeze=verify,
+        r2=SimpleNamespace(verify_round2_freeze=lambda *a, **k: pytest.fail("other calibration evaluated"),
+                           _validate_parameters=validate))
+    choice = dict(verifier="round3", asset=bound)
+    if kind == "sha": bound["sha256"] = "f"*64
+    if kind == "size": bound["size_bytes"] += 1
+    if kind == "verifier": choice["verifier"] = "unregistered"
+    reader = SimpleNamespace(path=io.verify)
+    if kind == "actual_B1":
+        selected, digest = retained._selected_n1({"engine": engine}, choice, reader)
+        assert selected == parameters and selected["gain"] != engine.GAIN
+        assert digest == bound["sha256"] and calls == [(str(path), {"asset_reader": reader})]
+    else:
+        with pytest.raises(ValueError): retained._selected_n1({"engine": engine}, choice, reader)
+        if kind in {"sha", "size", "verifier"}: assert calls == []

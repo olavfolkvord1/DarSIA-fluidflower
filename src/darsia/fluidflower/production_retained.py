@@ -44,7 +44,7 @@ def _selected_n1(modules, selected_calibration, asset_reader):
         raise ValueError("Selected frozen calibration SHA differs from its explicit binding")
     parameters = dict(freeze["parameters"])
     engine.r2._validate_parameters(parameters)
-    if parameters.get("candidate") != "N1" or parameters.get("gain") != engine.GAIN:
+    if parameters.get("candidate") != "N1":
         raise ValueError("This production proposal only implements the explicit frozen native N1 choice")
     return parameters, digest
 
