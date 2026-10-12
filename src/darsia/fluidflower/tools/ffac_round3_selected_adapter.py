@@ -41,7 +41,7 @@ def _target_match(entry, manifest):
     return matches[0]
 
 
-def _admit(entry, plan, reader, scope, frozen_calibration):
+def _admit(entry, plan, reader, scope, frozen_calibration, *, asset_reader=None):
     """Metadata-only guards run before scientific arrays or categorical maps."""
     run = entry["run"]
     if scope == "calibration":
@@ -50,7 +50,8 @@ def _admit(entry, plan, reader, scope, frozen_calibration):
     elif scope == "frozen_evaluation":
         if frozen_calibration is None:
             raise ValueError("A real R3 freeze is required before selected evaluation")
-        engine.verify_round3_freeze(frozen_calibration)
+        engine.verify_round3_freeze(frozen_calibration,
+            **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     else:
         raise ValueError("Selected scientific access needs an explicit R3 scope")
     allowed = set(engine.FIT_RUNS) | set(engine.HELDOUT_RUNS) | set(engine.DESCRIPTIVE_RUNS)
@@ -181,21 +182,28 @@ def selected_bottom_block(receipt, scientific, domain, current_matrix, original_
     return result, proof
 
 
-def _prepare_response(frame, path_folder, parts, swi, scope, freeze):
+def _prepare_response(frame, path_folder, parts, swi, scope, freeze, *, asset_reader=None):
     """Use the unchanged R2 native function with a call-local R3 access verifier."""
-    def verify_current(path):
-        return engine.verify_round3_freeze(path)
+    def verify_current(path, *, asset_reader=None):
+        return engine.verify_round3_freeze(path,
+            **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     namespace = dict(native.__dict__, verify_round2_freeze=verify_current)
     prepare = FunctionType(native.prepare_round2_response.__code__, namespace,
         native.prepare_round2_response.__name__, native.prepare_round2_response.__defaults__)
     prepare.__kwdefaults__ = native.prepare_round2_response.__kwdefaults__
     response = prepare(frame, path_folder, swi_by_facies=swi,
         r1_frozen_calibration_path=parts["r1_freeze"]["path"],
-        frozen_calibration=freeze if scope == "frozen_evaluation" else None)
+        frozen_calibration=freeze if scope == "frozen_evaluation" else None,
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     response.update(round3_selected_native_adapter=dict(contract=CONTRACT,
         native_prepare_source_sha256=source.sha256(native.__file__),
-        original_prepare_bytecode_used=True, global_modules_modified=False,
+        original_prepare_bytecode_used=asset_reader is None, global_modules_modified=False,
         access_verifier="actual round-three freeze before pixels; original R1 source-equivalence verification retained"))
+    if asset_reader is not None:
+        response["round3_selected_native_adapter"].update(
+            production_io_hooks_used=True, execution_commit=asset_reader.code_commit,
+            current_prepare_source_sha256=source.sha256(native.__file__),
+            frozen_source_provenance=asset_reader.source_bindings)
     return response
 
 
@@ -210,10 +218,15 @@ def _no_outflow(frame, receipt_descriptor):
         measured_water_displacement_is_not_CO2_outlet=True)
 
 
-def load_selected(*, entry, plan, reader=None, scope, frozen_calibration=None):
+def load_selected(*, entry, plan, reader=None, scope, frozen_calibration=None, asset_reader=None):
     """Load exact selected float RAW and fixed phase labels without fitting."""
-    reader = reader or source.VerifiedAssetReader()
-    receipt, scientific, manifest = _admit(entry, plan, reader, scope, frozen_calibration)
+    if asset_reader is None:
+        asset_reader = reader if callable(getattr(reader, "resolve_path", None)) else getattr(reader, "asset_reader", None)
+    reader = reader or asset_reader or source.VerifiedAssetReader()
+    if asset_reader is not None and reader is not asset_reader and getattr(reader, "asset_reader", None) is not asset_reader:
+        raise ValueError("Selected input reader and native path resolver must use the same cache")
+    receipt, scientific, manifest = _admit(entry, plan, reader, scope, frozen_calibration,
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     parts = reader.json(plan["saved_parts_plan"])
     input_plan = reader.json(parts["r2_input_plan"])
     dose_inputs.validate_split(input_plan["split"])
@@ -304,10 +317,11 @@ def load_selected(*, entry, plan, reader=None, scope, frozen_calibration=None):
         dose_inputs.dose_at(dose, time), (.49, .90), provenance)
     frame = replace(source.to_native_frame(prepared),
         excluded_masks=dict(bottom_strip=bottom, below_photo_filled=below))
-    original, _ = native.verify_original_round1_freeze(parts["r1_freeze"]["path"])
+    original, _ = native.verify_original_round1_freeze(parts["r1_freeze"]["path"],
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     path_folder = original["path_folder"]
     response = _prepare_response(frame, path_folder, parts, input_plan["physical_limits"]["swi_by_facies"],
-        scope, frozen_calibration)
+        scope, frozen_calibration, **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     from darsia.fluidflower.tools.build_ffac_p1_final2_candidate import transported_floor
     floor = transported_floor(reader.array(parts["pooled_floor_curve"]),
         dict(H_ac28_to_frame_native=geometry["H_ac28_to_frame_native"], rig_domain_revision=revision))

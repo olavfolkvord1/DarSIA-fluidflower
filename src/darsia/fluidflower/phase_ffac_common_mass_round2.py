@@ -50,8 +50,9 @@ def candidate_availability():
         for name in CANDIDATES}
 
 
-def verify_round2_freeze(path):
-    path = Path(path)
+def verify_round2_freeze(path, *, asset_reader=None):
+    logical_path = Path(path)
+    path = logical_path if asset_reader is None else asset_reader.resolve_path(path)
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if value.get("contract") != FREEZE_CONTRACT or value.get("frozen") is not True:
         raise ValueError("Held-out scientific computation requires the round-2 chosen calibration freeze")
@@ -66,7 +67,9 @@ def verify_round2_freeze(path):
         expected = item.get("sha256") if isinstance(item, dict) else item
         file = Path(file)
         if not file.is_absolute():
-            file = path.parent / file
+            file = logical_path.parent / file
+        if asset_reader is not None:
+            file = asset_reader.resolve_path(file, expected)
         if r1.sha256(file) != expected:
             raise ValueError(f"Frozen calibration file changed: {file}")
     if not value.get("calibration_files"):
@@ -74,8 +77,10 @@ def verify_round2_freeze(path):
     return value, r1.sha256(path)
 
 
-def _verify_file(path,expected):
-    path = Path(path)
+def _verify_file(path,expected, *, asset_reader=None, source_file=False):
+    path = (Path(path) if asset_reader is None else
+        asset_reader.source_path(path, expected) if source_file else
+        asset_reader.resolve_path(path, expected))
     stat = path.stat()
     key = (str(path.resolve()),stat.st_size,stat.st_mtime_ns,expected)
     if key not in _VERIFIED_SOURCE_FILES:
@@ -84,7 +89,7 @@ def _verify_file(path,expected):
         _VERIFIED_SOURCE_FILES[key] = True
 
 
-def verify_original_round1_freeze(path, *, expected_sha256=ROUND1_FREEZE_SHA256):
+def verify_original_round1_freeze(path, *, expected_sha256=ROUND1_FREEZE_SHA256, asset_reader=None):
     """Verify immutable R1 bytes at their equivalent current-host locations.
 
     The original record contains its producer's absolute implementation paths.
@@ -92,16 +97,17 @@ def verify_original_round1_freeze(path, *, expected_sha256=ROUND1_FREEZE_SHA256)
     is established by exact source hashes of the currently imported classes,
     without rewriting the record, creating old folders or monkeypatching R1.
     """
-    path = Path(path)
+    path = Path(path) if asset_reader is None else asset_reader.resolve_path(path, expected_sha256)
     stat = path.stat()
-    key = (str(path.resolve()),stat.st_size,stat.st_mtime_ns,expected_sha256)
+    key = (str(path.resolve()),stat.st_size,stat.st_mtime_ns,expected_sha256,
+        None if asset_reader is None else id(asset_reader))
     cached = _VERIFIED_ORIGINAL_FREEZES.get(key)
     if cached is not None:
         record,actual,components = cached
         # Reuse parsed receipt and verified SHA, but still invalidate whenever
         # any bound component's path/size/mtime changes during the session.
-        for file,expected in components:
-            _verify_file(file,expected)
+        for file,expected,source_file in components:
+            _verify_file(file,expected,asset_reader=asset_reader,source_file=source_file)
         return record,actual
     actual = r1.sha256(path)
     if expected_sha256 is not None and actual != expected_sha256:
@@ -113,21 +119,22 @@ def verify_original_round1_freeze(path, *, expected_sha256=ROUND1_FREEZE_SHA256)
     if freeze.get("map_mass_rescaling") is not False or freeze.get("overflow_in_objective") is not False:
         raise ValueError("Original freeze violates the fixed no-rescaling/compare-only contract")
     for file,expected in freeze["calibration_files"].items():
-        _verify_file(file,expected)
-    _verify_file(r1.__file__,freeze["common_engine_sha256"])
+        _verify_file(file,expected,asset_reader=asset_reader)
+    _verify_file(r1.__file__,freeze["common_engine_sha256"],asset_reader=asset_reader,source_file=True)
     objects = (darsia.ColorPath,darsia.ColorPathInterpolation,darsia.ConcentrationAnalysis,
         darsia.PWTransformation,darsia.TitrationFlash,darsia.SimpleFlash,darsia.CO2MassAnalysis,
         darsia.ExtrudedPorousGeometry,r1.NativeConcentrationAnalysis)
     current_by_hash = {}
-    components = list(freeze["calibration_files"].items())+[(r1.__file__,freeze["common_engine_sha256"])]
+    components = [(file,expected,False) for file,expected in freeze["calibration_files"].items()]+[(r1.__file__,freeze["common_engine_sha256"],True)]
     for obj in objects:
         source = str(Path(inspect.getfile(obj)).resolve())
         expected = freeze["native_implementations"].get(obj.__name__)
         if expected is None:
             raise ValueError("Original native implementation inventory is incomplete")
-        _verify_file(source,expected)
-        components.append((source,expected))
-        current_by_hash.setdefault(expected,[]).append(source)
+        _verify_file(source,expected,asset_reader=asset_reader,source_file=True)
+        components.append((source,expected,True))
+        current_by_hash.setdefault(expected,[]).append(source if asset_reader is None
+            else str(asset_reader.source_path(source, expected)))
     equivalence = []
     for original,expected in freeze["native_implementation_files"].items():
         sources = current_by_hash.get(expected)
@@ -139,6 +146,17 @@ def verify_original_round1_freeze(path, *, expected_sha256=ROUND1_FREEZE_SHA256)
         original_freeze_rewritten=False,original_native_bytecode_changed=False,
         common_engine_current_path=str(Path(r1.__file__).resolve()),
         common_engine_sha256=freeze["common_engine_sha256"],native_implementation_files=equivalence))
+    if asset_reader is not None:
+        record["cross_host_source_equivalence"]["common_engine_current_path"] = str(
+            asset_reader.source_path(r1.__file__, freeze["common_engine_sha256"]))
+        record["production_io_source_provenance"] = dict(
+            execution_commit=asset_reader.code_commit,
+            current_common_engine=dict(path=str(Path(r1.__file__).resolve()), sha256=r1.sha256(r1.__file__)),
+            original_calibration_source_sha256=freeze["common_engine_sha256"],
+            frozen_evidence_path=str(asset_reader.source_path(r1.__file__, freeze["common_engine_sha256"])),
+            source_bindings=asset_reader.source_bindings,
+            qualification_state=asset_reader.source_qualification_state,
+            frozen_evidence_is_not_current_executed_source=True)
     _VERIFIED_ORIGINAL_FREEZES[key] = (record,actual,tuple(components))
     return record,actual
 
@@ -179,15 +197,17 @@ def _joint_signal(frame, support):
 
 
 def prepare_round2_response(frame, path_folder, *, swi_by_facies,
-        r1_frozen_calibration_path, frozen_calibration=None):
+        r1_frozen_calibration_path, frozen_calibration=None, asset_reader=None):
     """Interpret one full-resolution frame once, before any candidate fitting."""
     run = r1.normalize_run(frame.run_id)
     freeze = None
     if run not in FIT_RUNS:
         if frozen_calibration is None:
             raise ValueError("Final held-out runs and AC38 stay untouched until the chosen R2 freeze")
-        freeze, freeze_sha = verify_round2_freeze(frozen_calibration)
-    original, original_sha = verify_original_round1_freeze(r1_frozen_calibration_path)
+        freeze, freeze_sha = (verify_round2_freeze(frozen_calibration) if asset_reader is None
+            else verify_round2_freeze(frozen_calibration, asset_reader=asset_reader))
+    original, original_sha = verify_original_round1_freeze(r1_frozen_calibration_path,
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     if Path(original["path_folder"]).resolve() != Path(path_folder).resolve():
         raise ValueError("Round 2 must reuse the unchanged round-1 pooled colour paths")
     native_namespace = dict(r1.__dict__,verify_frozen_calibration=verify_original_round1_freeze)
@@ -195,7 +215,8 @@ def prepare_round2_response(frame, path_folder, *, swi_by_facies,
         r1.prepare_native_response.__name__,r1.prepare_native_response.__defaults__)
     native_prepare.__kwdefaults__ = r1.prepare_native_response.__kwdefaults__
     response = native_prepare(frame, path_folder, flash_kind="titration",
-        frozen_calibration_path=r1_frozen_calibration_path if run in HELDOUT_RUNS else None)
+        frozen_calibration_path=r1_frozen_calibration_path if run in HELDOUT_RUNS else None,
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     analysis = response["analysis"]
     signal = analysis._scalar(response["native_signal"], frame.elapsed_h)
     linear_flash = darsia.SimpleFlash(**response["metadata"]["flash_bounds"])
@@ -213,6 +234,8 @@ def prepare_round2_response(frame, path_folder, *, swi_by_facies,
         round1_freeze_sha256=original_sha, frozen_parameters=None if freeze is None else freeze["parameters"],
         cross_host_source_equivalence=original["cross_host_source_equivalence"],
         round2_freeze_sha256=None if freeze is None else freeze_sha)
+    if asset_reader is not None:
+        response["production_io_source_provenance"] = original["production_io_source_provenance"]
     return response
 
 

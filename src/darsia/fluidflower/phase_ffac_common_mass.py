@@ -188,7 +188,17 @@ class UnclippedNativeConcentrationAnalysis(NativeConcentrationAnalysis):
     DarSIA OpticalImage and RGB ColorPath explicitly support arbitrary finite
     float RGB.  The inherited adapter's [0,1] gate is not part of these tools.
     """
-    def __init__(self, calibration_folder, *, baseline_rgb, labels, domain, depth_m, porosity, dimensions_m, basis="facies", calibration_status="one common corrected RAW calibration"):
+    def __init__(self, calibration_folder, *, baseline_rgb, labels, domain, depth_m, porosity, dimensions_m, basis="facies", calibration_status="one common corrected RAW calibration", asset_reader=None):
+        def local(path):
+            return path if asset_reader is None else asset_reader.resolve_path(path)
+        def model_base(path, suffix):
+            if asset_reader is None:
+                return path
+            verified = local(path.with_suffix(suffix))
+            base = verified.with_suffix("")
+            if base.with_suffix(suffix) != verified:
+                raise ValueError("Model loader must open the exact verified cache file")
+            return base
         self.folder = Path(calibration_folder).resolve()
         self.labels = np.asarray(labels)
         self.domain = np.asarray(domain, bool)
@@ -208,7 +218,7 @@ class UnclippedNativeConcentrationAnalysis(NativeConcentrationAnalysis):
         self.baseline = self._rgb(baseline_rgb)
         self.label_image = darsia.ScalarImage(self.labels, dimensions=list(self.dimensions))
         metadata_path = self.folder / "metadata.json"
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(local(metadata_path).read_text(encoding="utf-8"))
         self.basis = ColorEmbeddingBasis(basis)
         if metadata.get("contract") != CONTRACT or metadata.get("basis") != self.basis.value or not set(map(int, np.unique(self.labels))).issubset(metadata["label_ids"]):
             raise ValueError("Per-frame facies are outside the source-bound common native calibration basis")
@@ -219,16 +229,16 @@ class UnclippedNativeConcentrationAnalysis(NativeConcentrationAnalysis):
         for label in np.unique(self.labels):
             color_base = self.folder / "color_path_interpretation" / f"color_path_interpretation_{int(label)}"
             signal_base = self.folder / "signal_model" / f"signal_model_{int(label)}"
-            color_paths[int(label)] = darsia.ColorPathInterpolation.load(color_base)
-            functions[int(label)] = darsia.PWTransformation.load(signal_base)
+            color_paths[int(label)] = darsia.ColorPathInterpolation.load(model_base(color_base, ".json"))
+            functions[int(label)] = darsia.PWTransformation.load(model_base(signal_base, ".csv"))
             files.extend((color_base.with_suffix(".json"), signal_base.with_suffix(".csv")))
-        self.source_hashes = {str(path): sha256(path) for path in files}
+        self.source_hashes = {str(path): sha256(local(path)) for path in files}
         # A common package is a superset: a transported frame can legitimately
         # contain fewer facies.  Validate the subset, then construct the exact
         # native pipeline rather than changing saved metadata or image labels.
         self.pipeline = HeterogeneousColorToMassAnalysis(baseline=self.baseline, labels=self.label_image,
             color_mode=darsia.ColorMode.RELATIVE, color_path_interpretation=color_paths, signal_functions=functions,
-            flash=darsia.SimpleFlash.load(self.folder / "flash/flash"), co2_mass_analysis=None, geometry=self.geometry,
+            flash=darsia.SimpleFlash.load(model_base(self.folder / "flash/flash", ".json")), co2_mass_analysis=None, geometry=self.geometry,
             restoration=None, ignore_labels=list(self.ignored_labels), basis=self.basis)
         self.calibration_status = calibration_status
         self.legacy_basis_confirmed = False
@@ -356,17 +366,20 @@ def _recipe(recipe: Mapping[str, Any]):
     return {key: float(value) for key, value in values.items()}
 
 
-def prepare_native_response(frame: CommonFrameArrays, path_folder, *, flash_kind="titration", frozen_calibration_path=None):
+def prepare_native_response(frame: CommonFrameArrays, path_folder, *, flash_kind="titration", frozen_calibration_path=None, asset_reader=None):
     """Apply exact native optics and flash once; no mass fit is applied here."""
     run = normalize_run(frame.run_id)
     if run in HELDOUT_RUNS:
         if frozen_calibration_path is None:
             raise ValueError("Freeze the common calibration before computing a held-out response")
-        freeze, _ = verify_frozen_calibration(frozen_calibration_path)
+        freeze, _ = (verify_frozen_calibration(frozen_calibration_path) if asset_reader is None
+            else verify_frozen_calibration(frozen_calibration_path, asset_reader=asset_reader))
         if Path(freeze["path_folder"]).resolve() != Path(path_folder).resolve():
             raise ValueError("Held-out optics differ from the frozen common calibration")
     folder = Path(path_folder)
-    metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    metadata_path = folder / "metadata.json"
+    metadata = json.loads((metadata_path if asset_reader is None
+        else asset_reader.resolve_path(metadata_path)).read_text(encoding="utf-8"))
     if metadata.get("contract") != CONTRACT:
         raise ValueError("Historical JPEG or another optical package cannot enter this common RAW calibration")
     known_facies = ~np.isin(frame.facies, metadata["ignore_labels"])
@@ -375,7 +388,8 @@ def prepare_native_response(frame: CommonFrameArrays, path_folder, *, flash_kind
     safe_current = np.where(observed[..., None], current, safe_baseline).astype(np.float32)
     analysis = UnclippedNativeConcentrationAnalysis(folder, baseline_rgb=safe_baseline, labels=frame.facies,
         domain=frame.known_physical_domain, depth_m=np.where(frame.known_physical_domain, frame.depth_m, 0.), porosity=np.where(frame.known_physical_domain, frame.porosity, 0.), dimensions_m=frame.dimensions_m,
-        basis="facies", calibration_status="one common corrected RAW calibration")
+        basis="facies", calibration_status="one common corrected RAW calibration",
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     analysis.set_pixel_area(frame.pixel_area_m2)
     phase = np.where(frame.known_physical_domain & (frame.phase_labels != 255), frame.phase_labels, 0).astype(np.uint8)
     # Native thermodynamics supplies the measured state and hydrostatic field.
@@ -773,8 +787,9 @@ def freeze_calibration(folder, *, path_folder, fit_result, spec_sha256, input_pl
 _VERIFIED_FREEZES = {}
 
 
-def verify_frozen_calibration(freeze_path, *, expected_sha256=None):
-    path = Path(freeze_path).resolve()
+def verify_frozen_calibration(freeze_path, *, expected_sha256=None, asset_reader=None):
+    path = (Path(freeze_path).resolve() if asset_reader is None
+        else asset_reader.resolve_path(freeze_path, expected_sha256))
     actual = sha256(path)
     if expected_sha256 is not None and actual != expected_sha256:
         raise ValueError("Frozen common calibration SHA-256 mismatch")
@@ -785,14 +800,16 @@ def verify_frozen_calibration(freeze_path, *, expected_sha256=None):
     if freeze.get("map_mass_rescaling") is not False or freeze.get("overflow_in_objective") is not False:
         raise ValueError("The frozen common model violates the no-rescaling/overflow-compare-only contract")
     for name, expected in {**freeze["calibration_files"], **freeze.get("native_implementation_files", {})}.items():
-        source = Path(name)
+        source = Path(name) if asset_reader is None else asset_reader.resolve_path(name, expected)
         stat = source.stat()
         key = (str(source.resolve()), stat.st_size, stat.st_mtime_ns, expected)
         if key not in _VERIFIED_FREEZES:
             if sha256(source) != expected:
                 raise ValueError(f"Frozen calibration file changed: {source}")
             _VERIFIED_FREEZES[key] = True
-    if sha256(__file__) != freeze["common_engine_sha256"]:
+    implementation = (__file__ if asset_reader is None
+        else asset_reader.source_path(__file__, freeze["common_engine_sha256"]))
+    if sha256(implementation) != freeze["common_engine_sha256"]:
         raise ValueError("Common mass implementation changed after freeze")
     return freeze, actual
 

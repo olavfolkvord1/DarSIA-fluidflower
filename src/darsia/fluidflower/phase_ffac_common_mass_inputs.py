@@ -433,13 +433,16 @@ def transport_physical_reference(reference: Mapping[str, np.ndarray], matrix,
 
 class VerifiedAssetReader:
     """Verify actual bytes once per unchanged path/size/mtime, then mmap."""
-    def __init__(self):
+    def __init__(self, *, asset_reader=None):
+        self.asset_reader = asset_reader
         self.verified = {}
         self.raw_baselines = {}
         self.physical_references = {}
         self.json_documents = {}
 
     def path(self, descriptor: Mapping) -> Path:
+        if self.asset_reader is not None:
+            return self.asset_reader.path(descriptor)
         path = Path(descriptor["path"])
         before = path.stat()
         key = (str(path.resolve()).casefold(), before.st_size, before.st_mtime_ns)
@@ -458,9 +461,13 @@ class VerifiedAssetReader:
         return path
 
     def array(self, descriptor: Mapping) -> np.ndarray:
+        if self.asset_reader is not None:
+            return self.asset_reader.array(descriptor)
         return np.load(self.path(descriptor), mmap_mode="r", allow_pickle=False)
 
     def json(self, descriptor: Mapping) -> dict:
+        if self.asset_reader is not None:
+            return self.asset_reader.json(descriptor)
         path = self.path(descriptor)
         key = (str(path.resolve()).casefold(), descriptor["sha256"])
         if key not in self.json_documents:

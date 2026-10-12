@@ -134,7 +134,7 @@ def nearest_main_above(main_positive, y_m, *, max_distance_m=MAX_COLUMN_DISTANCE
     return previous, available, np.where(available, distance, np.nan)
 
 
-def prepare_own_colour_response(response, path_folder, geometry, *, photo_support):
+def prepare_own_colour_response(response, path_folder, geometry, *, photo_support, asset_reader=None):
     """Reuse native optics/flash without putting estimation geometry into M.
 
     The scientific RAW, registered start and measured clear-water divisor are
@@ -157,7 +157,8 @@ def prepare_own_colour_response(response, path_folder, geometry, *, photo_suppor
     analysis = r1.UnclippedNativeConcentrationAnalysis(path_folder, baseline_rgb=baseline,
         labels=frame.facies, domain=geometry.valid & frame.domain,
         depth_m=np.where(geometry.valid, geometry.depth_m, 0),
-        porosity=np.where(geometry.valid, geometry.porosity, 0), dimensions_m=frame.dimensions_m)
+        porosity=np.where(geometry.valid, geometry.porosity, 0), dimensions_m=frame.dimensions_m,
+        **({} if asset_reader is None else dict(asset_reader=asset_reader)))
     interpretation = analysis.pipeline.call_color_interpretation(analysis._rgb(current))
     signal = analysis.pipeline.call_pH_analysis(interpretation)
     aqueous, _ = response["flash"](signal)
@@ -318,25 +319,26 @@ def summarize_round3_response(response, geometry, *, own_colour, photo_support,
     return row
 
 
-def _authorize_prediction(row,parameters,frozen_calibration):
+def _authorize_prediction(row,parameters,frozen_calibration, *, asset_reader=None):
     if row["run"] not in (*HELDOUT_RUNS,*DESCRIPTIVE_RUNS):
         return
     if parameters==dict(candidate="N1",gain=GAIN,beta=B0_BETA):
         return
     if frozen_calibration is None:
         raise ValueError("Freeze B1 before evaluating any final-held-out or descriptive image with it")
-    freeze,_ = verify_round3_freeze(frozen_calibration)
+    freeze,_ = (verify_round3_freeze(frozen_calibration) if asset_reader is None
+        else verify_round3_freeze(frozen_calibration, asset_reader=asset_reader))
     if parameters != freeze["parameters"]:
         raise ValueError("Held-out evaluation differs from the frozen round-three calibration")
 
 
-def evaluate_round3_summary(row, parameters, anchor, *, frozen_calibration=None):
+def evaluate_round3_summary(row, parameters, anchor, *, frozen_calibration=None, asset_reader=None):
     """Evaluate the literal per-pixel estimate interval at one shared beta."""
     parameters = dict(candidate="N1",gain=GAIN,beta=float(parameters)) if np.isscalar(parameters) else dict(parameters)
     r2._validate_parameters(parameters)
     if parameters["candidate"] != "N1" or row.get("contract") != CONTRACT:
         raise ValueError("Round-three evaluation uses the unchanged native N1 response")
-    _authorize_prediction(row,parameters,frozen_calibration)
+    _authorize_prediction(row,parameters,frozen_calibration,asset_reader=asset_reader)
     gain,beta = parameters["gain"],parameters["beta"]
     factor = dilution_factor(row["elapsed_h"],row["affected_pore_volume_m3"],anchor,beta)
     paired = row["paired_estimates"]
@@ -426,9 +428,10 @@ def prepare_round3_beta_summary(row, gain):
         total_a=float(a.sum()),total_c=float(c.sum()))
 
 
-def evaluate_round3_compiled(compiled, beta, anchor, *, frozen_calibration=None):
+def evaluate_round3_compiled(compiled, beta, anchor, *, frozen_calibration=None, asset_reader=None):
     row = compiled["row"]
-    _authorize_prediction(row,dict(candidate="N1",gain=compiled["gain"],beta=float(beta)),frozen_calibration)
+    _authorize_prediction(row,dict(candidate="N1",gain=compiled["gain"],beta=float(beta)),frozen_calibration,
+        asset_reader=asset_reader)
     factor = dilution_factor(row["elapsed_h"],row["affected_pore_volume_m3"],anchor,beta)
     index = int(np.searchsorted(compiled["crossings"],factor,side="right"))
     a,c = compiled["prefix_a"][index],compiled["prefix_c"][index]
@@ -447,8 +450,9 @@ def evaluate_round3_compiled(compiled, beta, anchor, *, frozen_calibration=None)
         dilution_factor=factor,gas_mass_g=row["main_gas_mass_g"],gas_water_mass_g=row["main_gas_water_mass_g"])
 
 
-def verify_round3_freeze(path):
-    path = Path(path)
+def verify_round3_freeze(path, *, asset_reader=None):
+    logical_path = Path(path)
+    path = logical_path if asset_reader is None else asset_reader.resolve_path(path)
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if (value.get("contract") != FREEZE_CONTRACT or value.get("frozen") is not True
             or set(value.get("calibration_runs",())) != set(FIT_RUNS)
@@ -463,8 +467,8 @@ def verify_round3_freeze(path):
         file,expected = (item.get("path",name),item.get("sha256")) if isinstance(item,dict) else (name,item)
         file = Path(file)
         if not file.is_absolute():
-            file = path.parent/file
-        r2._verify_file(file,expected)
+            file = logical_path.parent/file
+        r2._verify_file(file,expected,**({} if asset_reader is None else dict(asset_reader=asset_reader)))
     if not value.get("calibration_files") or not value.get("frozen_utc"):
         raise ValueError("Freeze lacks actual source files or publication time")
     return value,r1.sha256(path)
