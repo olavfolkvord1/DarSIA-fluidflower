@@ -199,10 +199,36 @@ class NativeResult:
                   ("native_signal", "quantifiable", "linear_relative", "joint_signal", "swi")}
         native.update(frame=record(response["frame"], ("provenance",)),
                       prepared=record(response["prepared"]))
+        summary = {key: value for key, value in self.row.items() if key not in
+                   {"source_binding", "geometry_source_binding", "manifest_receipt", "run_manifest"}}
+        def reduction_product(value):
+            # Only the original histogram/pairs reduction clock is operational.
+            # All weights, codes, backend facts and audit flags remain products;
+            # the complete original audit, including time, remains in self.row.
+            if "reduction_audit" not in value:
+                return value
+            return {**value, "reduction_audit": {
+                key: item for key, item in value["reduction_audit"].items()
+                if key != "wall_seconds"}}
+        for key in ("main_aqueous_histogram", "paired_estimates"):
+            if key in summary:
+                summary[key] = reduction_product(summary[key])
+        if "excluded_parts" in summary:
+            parts = {}
+            for name, original in summary["excluded_parts"].items():
+                part = dict(original)
+                if "own_colour_histogram" in part:
+                    part["own_colour_histogram"] = reduction_product(part["own_colour_histogram"])
+                if "by_facies" in part:
+                    part["by_facies"] = {label: {
+                        **values, "own_colour_histogram": reduction_product(values["own_colour_histogram"])}
+                        if "own_colour_histogram" in values else values
+                        for label, values in part["by_facies"].items()}
+                parts[name] = part
+            summary["excluded_parts"] = parts
         return dict(native=native, geometry=record(self.geometry, ("source_binding",)),
                     own_colour=self.own_colour, photo_support=self.loaded["photo_support"],
-                    summary={key: value for key, value in self.row.items() if key not in
-                             {"source_binding", "geometry_source_binding", "manifest_receipt", "run_manifest"}},
+                    summary=summary,
                     static=self.static)
 
 

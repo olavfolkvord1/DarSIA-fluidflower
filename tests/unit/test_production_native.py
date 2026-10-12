@@ -187,6 +187,98 @@ def test_exact_original_code_objects_call_once_and_local_session(fixture):
     assert products["summary"]["native_statistic"].tobytes() == np.float64(3).tobytes()
 
 
+def reduction_result(fixture):
+    context = operator.prepare_native_context(fixture.config, fixture.reader, modules=fixture.modules)
+    result = operator.load_case(context, "ac17_f6")
+    audit = dict(backend="cpu-float64", input_rows=3, downsampled=False,
+                 optical_response_changed=False, reference_backend="cpu-float64",
+                 gpu_status=dict(available=False, reason="cpu_requested_or_empty"), wall_seconds=.125)
+    histogram = dict(native_relative=[.0, .5, 1.], capacity_g=[1., 2., 3.],
+                     quantization_half_width=.0005, reduction_audit=audit)
+    pairs = dict(kind=[1, 2, 3], own_native_relative=[.0, .5, 1.],
+                 aqueous_capacity_g=[1., 2., 3.], reduction_audit=deepcopy(audit))
+    result.row.update(main_aqueous_histogram=histogram, paired_estimates=pairs,
+        baseline_undiluted_main_mass_g=6.,
+        excluded_parts={"synthetic": dict(own_colour_histogram=deepcopy(histogram),
+            by_facies={"1": dict(own_colour_histogram=deepcopy(histogram), fixed_gas_mass_g=2.)})},
+        own_colour_audit={"wall_seconds": 7., "other_flag": False},
+        unrelated={"reduction_audit": {"wall_seconds": 8.}})
+    return result
+
+
+def reduction_audits(row):
+    return [row["main_aqueous_histogram"]["reduction_audit"],
+            row["paired_estimates"]["reduction_audit"],
+            row["excluded_parts"]["synthetic"]["own_colour_histogram"]["reduction_audit"],
+            row["excluded_parts"]["synthetic"]["by_facies"]["1"]["own_colour_histogram"]["reduction_audit"]]
+
+
+def compare_views(first, second):
+    spec = importlib.util.spec_from_file_location("native_product_projection_unit_profile", SOURCES / "production_profile.py")
+    profile = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(profile)
+    return profile.compare_numeric_products(first["summary"], second["summary"])
+
+
+def test_only_original_histogram_pairs_clocks_are_projected_without_mutation(fixture):
+    result = reduction_result(fixture)
+    original = deepcopy(result.row)
+    first = result.scientific_products()
+    assert result.row == original
+    assert all("wall_seconds" not in audit for audit in reduction_audits(first["summary"]))
+    assert all(audit["wall_seconds"] == .125 for audit in reduction_audits(result.row))
+    assert first["summary"]["main_aqueous_histogram"]["capacity_g"] is result.row["main_aqueous_histogram"]["capacity_g"]
+    assert first["summary"]["paired_estimates"]["kind"] is result.row["paired_estimates"]["kind"]
+    assert first["summary"]["own_colour_audit"] is result.row["own_colour_audit"]
+    assert first["native"]["prepared"]["aqueous_relative"] is result.loaded["response"]["prepared"].aqueous_relative
+    assert first["static"] is result.static
+    for audit in reduction_audits(result.row): audit["wall_seconds"] = 3.25
+    second = result.scientific_products()
+    assert compare_views(first, second)["exact_numeric_products"] is True
+    assert all(audit["wall_seconds"] == 3.25 for audit in reduction_audits(result.row))
+
+
+@pytest.mark.parametrize("kind", ["mass", "weight", "bin", "pairs_kind", "pairs_weight", "backend", "flag",
+    "facies_weight", "part_flag", "unrelated_clock", "other_audit_clock"])
+def test_product_projection_keeps_numerics_backend_flags_and_other_clocks(fixture, kind):
+    result = reduction_result(fixture)
+    first = result.scientific_products()
+    # Replace metadata containers to compare the old/new views; neither the
+    # production projection nor the fingerprint utility copies array buffers.
+    result.row = deepcopy(result.row)
+    if kind == "mass": result.row["baseline_undiluted_main_mass_g"] += .01
+    if kind == "weight": result.row["main_aqueous_histogram"]["capacity_g"][0] += .01
+    if kind == "bin": result.row["main_aqueous_histogram"]["native_relative"][0] += .01
+    if kind == "pairs_kind": result.row["paired_estimates"]["kind"][0] = 2
+    if kind == "pairs_weight": result.row["paired_estimates"]["aqueous_capacity_g"][0] += .01
+    if kind == "backend": result.row["main_aqueous_histogram"]["reduction_audit"]["backend"] = "gpu-float64"
+    if kind == "flag": result.row["paired_estimates"]["reduction_audit"]["downsampled"] = True
+    if kind == "facies_weight": result.row["excluded_parts"]["synthetic"]["by_facies"]["1"]["own_colour_histogram"]["capacity_g"][0] += .01
+    if kind == "part_flag": result.row["excluded_parts"]["synthetic"]["own_colour_histogram"]["reduction_audit"]["optical_response_changed"] = True
+    if kind == "unrelated_clock": result.row["unrelated"]["reduction_audit"]["wall_seconds"] += 1
+    if kind == "other_audit_clock": result.row["own_colour_audit"]["wall_seconds"] += 1
+    comparison = compare_views(first, result.scientific_products())
+    assert comparison["exact_numeric_products"] is False
+    assert comparison["different_paths"]
+
+
+def test_projection_changes_only_the_product_view_not_native_functions():
+    import subprocess
+    old = subprocess.run(["git", "show", "HEAD:src/darsia/fluidflower/production_native.py"],
+                         cwd=ROOT, check=True, capture_output=True).stdout.decode("utf-8")
+    before, after = ast.parse(old), ast.parse((SOURCES / "production_native.py").read_text(encoding="utf-8"))
+    first = {n.name: n for n in before.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+    second = {n.name: n for n in after.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+    assert first.keys() == second.keys()
+    for name in first:
+        if name != "NativeResult": assert ast.dump(first[name]) == ast.dump(second[name])
+    assert [ast.dump(n) for n in before.body if not isinstance(n, (ast.ClassDef, ast.FunctionDef))] == [ast.dump(n) for n in after.body if not isinstance(n, (ast.ClassDef, ast.FunctionDef))]
+    def unchanged_members(node):
+        return [ast.dump(member) for member in node.body
+                if not isinstance(member, ast.FunctionDef) or member.name != "scientific_products"]
+    assert unchanged_members(first["NativeResult"]) == unchanged_members(second["NativeResult"])
+
+
 def test_guard_failure_never_calls_native_or_retries(fixture):
     def stop(): raise RuntimeError("authority denied")
     with pytest.raises(RuntimeError, match="authority"):
