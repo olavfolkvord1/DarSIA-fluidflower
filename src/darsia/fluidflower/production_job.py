@@ -22,7 +22,7 @@ from .production_io import NasIO, normalize_locator
 
 MANIFEST_FORMAT = "darsia-production-job-v1"
 RESTART_FORMAT = "darsia-production-restart-v1"
-PURPOSES = frozenset({"file_handling_acceptance", "profile", "equivalence", "production"})
+PURPOSES = frozenset({"file_handling_acceptance", "profile", "equivalence", "production", "calibration", "validation"})
 
 
 def utc_now() -> str:
