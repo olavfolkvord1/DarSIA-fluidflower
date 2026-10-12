@@ -157,3 +157,5 @@ from darsia.corrections.readcorrection import *
 
 # Presets
 from darsia.presets.workflows.simple_run_analysis import *
+
+from darsia.multiphase.flash import TitrationFlash

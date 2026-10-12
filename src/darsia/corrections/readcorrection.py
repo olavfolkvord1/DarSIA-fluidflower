@@ -44,7 +44,10 @@ def read_correction(path: Path) -> AnyCorrection:
     # Read class name from npz file
     class_name = np.load(path, allow_pickle=True)["class_name"].item()
 
-    # Load correction from file
-    correction = eval(class_name)()
+    # Older rigs saved the array resizer as "Resize". Its persisted settings
+    # are shared with ResizeCorrection, which participates in the native rig's
+    # BaseCorrection workflow and preserves the saved interpolation/geometry.
+    correction_class = ResizeCorrection if class_name == "Resize" else eval(class_name)
+    correction = correction_class()
     correction.load(path)
     return correction

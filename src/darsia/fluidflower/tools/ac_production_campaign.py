@@ -1,0 +1,1166 @@
+"""Emit commands for full AC production calibration campaigns.
+
+The AC53 testbed is intentionally narrow. This helper emits repeatable
+PowerShell commands for the production-sized runs we use on the shared
+Moderskipet queue.
+"""
+
+from __future__ import annotations
+
+from darsia.fluidflower.storage_paths import configured_tool_path
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+
+PRODUCTION_RUNS = [
+    "ac17",
+    "ac18",
+    "ac19",
+    "ac20",
+    "ac21",
+    "ac23",
+    "ac24",
+    "ac25",
+    "ac28",
+    "ac29",
+    "ac30",
+    "ac32",
+    "ac33",
+    "ac34",
+    "ac35",
+    "ac39",
+    "ac40",
+    "ac41",
+    "ac43",
+    "ac44",
+    "ac45",
+    "ac46",
+    "ac47",
+    "ac49",
+    "ac52",
+    "ac54",
+    "ac55",
+    "ac56",
+    "ac57",
+    "ac59",
+    "ac60",
+    "ac61",
+]
+
+ROLLOUT_RUNS = [
+    "ac22",
+    "ac26",
+    "ac27",
+    "ac31",
+    "ac42",
+    "ac48",
+    "ac50",
+    "ac51",
+    "ac53",
+    "ac58",
+]
+
+
+HARDCASE_RUNS = [
+    # Start with distinct failure modes and controls so early batches are useful.
+    "ac29",  # worst baseline: under-detects injection end, then late inflation
+    "ac61",  # early over-detection outlier
+    "ac20",  # good baseline control
+    "ac24",
+    "ac25",
+    "ac32",
+    "ac40",
+    "ac44",
+    "ac46",
+    "ac49",
+    "ac52",
+    "ac60",  # best baseline control
+]
+
+
+SCREEN_STEP1_RUNS = [
+    # Final-method screening: hard cases plus controls.
+    "ac20",  # early good-control run
+    "ac24",
+    "ac25",
+    "ac26",
+    "ac29",
+    "ac40",
+    "ac44",
+    "ac51",
+    "ac52",
+    "ac53",  # AC53 testbed / good-control run
+    "ac60",  # template-era good-control run
+]
+
+
+FINAL_GEOMETRY_RUNS = [
+    # Full-budget convergence comparison: controls, slow convergence, and hard cases.
+    "ac20",
+    "ac24",
+    "ac40",
+    "ac44",
+    "ac52",
+    "ac60",
+]
+
+PHASE_SCREEN_RUNS = [
+    "ac20",  # well-calibrated early control
+    "ac60",  # AC60/template-era control
+    "ac24",  # early under-detection followed by late inflation
+    "ac32",  # early under-detection followed by late inflation
+    "ac26",  # persistent hard case with measured-depth history
+    "ac27",  # persistent hard case with measured-depth history
+]
+PHASE_SCREEN_VARIANTS = [
+    "phase_control_titration",
+    "phase_sharedpath_balanced",
+    "phase_residualgas_balanced",
+]
+PHASE_DECIDER_VARIANTS = ["phase_sharedpath_l1"]
+EXPECTED_RUNTIME_DEPTH_SHA256 = (
+    "009365a492c1f2a0a6c61eabb90e18068985f17b833098e59d0100312db8b1be"
+)
+
+FINAL_EXCLUDED_RUNS = {
+    "ac29": "physical/chemical outlier with low-pH yellow initial state",
+    "ac51": "physical/chemical outlier with low-pH yellow initial state",
+}
+FINAL_VARIANT_NAME = "final_production_titration_ac14_seed17"
+FINAL_MAX_ACTIVE_RUNS = 24
+FINAL_MAX_IN_FLIGHT_PER_RUN = 1
+
+FINAL_PRODUCTION_RUNS = [
+    # Put the six fully screened runs first so the first completed batch is informative.
+    *FINAL_GEOMETRY_RUNS,
+    *[
+        run
+        for run in [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
+        if run not in FINAL_GEOMETRY_RUNS and run not in FINAL_EXCLUDED_RUNS
+    ],
+]
+
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    objective_integral: str
+    static_light: str
+    bounds_file: str = "config/bounds_seg6_titration.json"
+    titration: bool = True
+    template_registration: str = "off"
+    template_mode: str = "partial_affine"
+    template_strict: bool = False
+    static_reference: str = "median"
+    signal_parameterization: str = "per-label"
+    color_path_anchor: str = "off"
+    color_path_anchor_weight: float = 0.75
+    phase_separation: str = "shared-signal"
+    optuna_seed: int | None = None
+    save_calibration: bool = False
+    note: str = ""
+
+
+VARIANTS = [
+    Variant(
+        "production_titration_l1",
+        "off",
+        "off",
+        note="current production titration control, no extra static light or template registration",
+    ),
+    Variant(
+        "coupled_baseline_l1",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="previous baseline family: titration flash with coupled bounds and no static light correction",
+    ),
+    Variant(
+        "coupled_static_global_l1",
+        "off",
+        "blue-gain",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="coupled bounds plus global static FluidFlower light gain",
+    ),
+    Variant(
+        "coupled_static_spatial_l1",
+        "off",
+        "blue-spatial",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="coupled bounds plus spatial static FluidFlower light gain",
+    ),
+    Variant(
+        "coupled_static_spatial_drift025",
+        "drift:0.25",
+        "blue-spatial",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="coupled bounds plus spatial static light gain and weak plateau drift penalty",
+    ),
+    Variant(
+        "coupled_static_global_drift025",
+        "drift:0.25",
+        "blue-gain",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="coupled bounds plus global static light gain and weak plateau drift penalty",
+    ),
+    Variant(
+        "titration_relaxed_l1",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_titration_relaxed.json",
+        note="titration-specific but relaxed flash bounds, no static light correction",
+    ),
+    Variant(
+        "titration_relaxed_drift025",
+        "drift:0.25",
+        "off",
+        bounds_file="config/bounds_seg6_titration_relaxed.json",
+        note="relaxed titration bounds plus weak plateau drift penalty",
+    ),
+    Variant(
+        "coupled_static_spatial_drift050",
+        "drift:0.5",
+        "blue-spatial",
+        bounds_file="config/bounds_seg6_coupled.json",
+        note="coupled bounds plus spatial static light gain and medium plateau drift penalty",
+    ),
+    Variant(
+        "coupled_template_ac60_l1",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_coupled.json",
+        template_registration="ac60",
+        note="coupled baseline plus image/template registration into AC60 coordinates",
+    ),
+    Variant(
+        "coupled_template_ac60_translation_l1",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_coupled.json",
+        template_registration="ac60",
+        template_mode="translation",
+        note="coupled baseline plus translation-only registration into AC60 coordinates",
+    ),
+    Variant(
+        "titration_static_spatial_l1",
+        "off",
+        "blue-spatial",
+        note="titration with spatial static FluidFlower light gain",
+    ),
+    Variant(
+        "titration_firstframe_spatial_l1",
+        "off",
+        "blue-spatial",
+        static_reference="first",
+        note="titration with spatial light gain referenced to the first calibration frame",
+    ),
+    Variant(
+        "titration_template_ac14_l1",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        note="titration plus partial-affine registration into AC14/segmentation-template coordinates",
+    ),
+    Variant(
+        "titration_template_ac14_firstframe_spatial_l1",
+        "off",
+        "blue-spatial",
+        template_registration="ac14_template",
+        static_reference="first",
+        note="AC14 template registration plus first-frame spatial light reference",
+    ),
+    Variant(
+        "final_baseline_seed17",
+        "off",
+        "off",
+        optuna_seed=17,
+        note="full-budget production titration baseline, paired Optuna seed 17",
+    ),
+    Variant(
+        "final_template_ac14_seed17",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        note="full-budget AC14 template registration, paired Optuna seed 17",
+    ),
+    Variant(
+        "final_baseline_seed73",
+        "off",
+        "off",
+        optuna_seed=73,
+        note="full-budget production titration baseline, paired Optuna seed 73",
+    ),
+    Variant(
+        "final_template_ac14_seed73",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=73,
+        note="full-budget AC14 template registration, paired Optuna seed 73",
+    ),
+    Variant(
+        "reduced_template_ac14_seed17",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_reduced_shared_shape.json",
+        template_registration="ac14_template",
+        template_strict=True,
+        signal_parameterization="shared-shape",
+        optuna_seed=17,
+        note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 17",
+    ),
+    Variant(
+        "reduced_template_ac14_seed73",
+        "off",
+        "off",
+        bounds_file="config/bounds_seg6_reduced_shared_shape.json",
+        template_registration="ac14_template",
+        template_strict=True,
+        signal_parameterization="shared-shape",
+        optuna_seed=73,
+        note="reduced shared signal shape plus per-facies amplitude, AC14 template, seed 73",
+    ),
+    Variant(
+        FINAL_VARIANT_NAME,
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        save_calibration=True,
+        note=(
+            "final full per-label TitrationFlash model, strict AC14 partial-affine "
+            "registration, point-wise L1, and persistent calibration output"
+        ),
+    ),
+    Variant(
+        "phase_control_titration",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        optuna_seed=17,
+        note=(
+            "corrected-depth control: current per-run color paths, TitrationFlash, "
+            "and equal point-wise L1"
+        ),
+    ),
+    Variant(
+        "phase_sharedpath_balanced",
+        "window-balanced",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        optuna_seed=17,
+        note=(
+            "AC60-regularized relative color-path shape plus equal I1/I2/early/late "
+            "objective weighting"
+        ),
+    ),
+    Variant(
+        "phase_sharedpath_l1",
+        "off",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        optuna_seed=17,
+        note=(
+            "AC60-regularized relative color-path shape with equal point-wise L1; "
+            "isolates color-path transfer from operational-window weighting"
+        ),
+    ),
+    Variant(
+        "phase_residualgas_balanced",
+        "window-balanced",
+        "off",
+        template_registration="ac14_template",
+        template_strict=True,
+        color_path_anchor="ac60",
+        color_path_anchor_weight=0.75,
+        phase_separation="residual-gas",
+        optuna_seed=17,
+        note=(
+            "regularized aqueous titration plus independent off-path optical "
+            "residual for gas saturation"
+        ),
+    ),
+    Variant(
+        "titration_static_spatial_drift025",
+        "drift:0.25",
+        "blue-spatial",
+        note="spatial static light gain plus weak plateau drift penalty",
+    ),
+    Variant(
+        "titration_static_global_l1",
+        "off",
+        "blue-gain",
+        note="titration with global static FluidFlower light gain",
+    ),
+    Variant(
+        "titration_static_global_drift025",
+        "drift:0.25",
+        "blue-gain",
+        note="global static light gain plus weak plateau drift penalty",
+    ),
+    Variant(
+        "titration_static_spatial_drift050",
+        "drift:0.5",
+        "blue-spatial",
+        note="spatial static light gain plus medium plateau drift penalty",
+    ),
+]
+
+VARIANT_SETS = {
+    "hardcase8": [
+        "coupled_baseline_l1",
+        "coupled_static_global_l1",
+        "coupled_static_spatial_l1",
+        "coupled_static_spatial_drift025",
+        "coupled_static_global_drift025",
+        "titration_relaxed_l1",
+        "titration_relaxed_drift025",
+        "coupled_static_spatial_drift050",
+    ],
+    "template_test": [
+        "coupled_baseline_l1",
+        "coupled_template_ac60_l1",
+    ],
+    "geometry_diagnostic": [
+        "coupled_baseline_l1",
+        "coupled_template_ac60_l1",
+        "coupled_template_ac60_translation_l1",
+    ],
+    "holiday4": [
+        "titration_static_spatial_l1",
+        "titration_static_spatial_drift025",
+        "titration_static_global_l1",
+        "titration_static_global_drift025",
+    ],
+    "holiday5": [
+        "titration_static_spatial_l1",
+        "titration_static_spatial_drift025",
+        "titration_static_global_l1",
+        "titration_static_global_drift025",
+        "titration_static_spatial_drift050",
+    ],
+    "spatial": [
+        "titration_static_spatial_l1",
+        "titration_static_spatial_drift025",
+        "titration_static_spatial_drift050",
+    ],
+    "global": [
+        "titration_static_global_l1",
+        "titration_static_global_drift025",
+    ],
+    "screen_step1": [
+        "production_titration_l1",
+        "titration_firstframe_spatial_l1",
+        "titration_template_ac14_l1",
+        "titration_template_ac14_firstframe_spatial_l1",
+    ],
+    "final_geometry": [
+        "final_baseline_seed17",
+        "final_template_ac14_seed17",
+        "final_baseline_seed73",
+        "final_template_ac14_seed73",
+    ],
+    "reduced_model": [
+        "reduced_template_ac14_seed17",
+        "reduced_template_ac14_seed73",
+    ],
+    "final_production": [
+        FINAL_VARIANT_NAME,
+    ],
+    "phase_screen": [
+        *PHASE_SCREEN_VARIANTS,
+    ],
+    "phase_decider": [
+        *PHASE_DECIDER_VARIANTS,
+    ],
+    "all": [variant.name for variant in VARIANTS],
+}
+
+
+def _ps_quote(value: str | Path) -> str:
+    text = str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _variant_by_name(name: str) -> Variant:
+    for variant in VARIANTS:
+        if variant.name == name:
+            return variant
+    known = sorted([*VARIANT_SETS, *(variant.name for variant in VARIANTS)])
+    raise SystemExit(f"Unknown variant {name!r}. Known: {', '.join(known)}")
+
+
+def _select_variants(spec: str) -> list[Variant]:
+    names: list[str] = []
+    for item in [part.strip() for part in spec.split(",") if part.strip()]:
+        if item in VARIANT_SETS:
+            names.extend(VARIANT_SETS[item])
+        else:
+            names.append(item)
+
+    selected: list[Variant] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        selected.append(_variant_by_name(name))
+        seen.add(name)
+    return selected
+
+
+def _select_runs(run_set: str) -> list[str]:
+    if run_set == "production":
+        return PRODUCTION_RUNS
+    if run_set == "rollout":
+        return ROLLOUT_RUNS
+    if run_set == "hardcases":
+        return HARDCASE_RUNS
+    if run_set == "screen_step1":
+        return SCREEN_STEP1_RUNS
+    if run_set == "final_geometry":
+        return FINAL_GEOMETRY_RUNS
+    if run_set == "reduced_model":
+        return FINAL_GEOMETRY_RUNS
+    if run_set == "final_production":
+        return FINAL_PRODUCTION_RUNS
+    if run_set == "phase_screen":
+        return PHASE_SCREEN_RUNS
+    if run_set == "phase_decider":
+        return PHASE_SCREEN_RUNS
+    if run_set == "all":
+        return [*PRODUCTION_RUNS, *ROLLOUT_RUNS]
+    runs = [part.strip().lower() for part in run_set.replace(",", " ").split() if part.strip()]
+    if not runs:
+        raise SystemExit("No runs selected.")
+    return runs
+
+
+def _validate_final_campaign(
+    args: argparse.Namespace,
+    selected: list[Variant],
+    runs: list[str],
+) -> None:
+    selected_names = [variant.name for variant in selected]
+    if any(name in PHASE_DECIDER_VARIANTS for name in selected_names):
+        if selected_names != PHASE_DECIDER_VARIANTS or runs != PHASE_SCREEN_RUNS:
+            raise SystemExit(
+                "The phase decider requires --variant phase_decider "
+                "--run-set phase_decider."
+            )
+        if int(args.max_iters) != 800 or int(args.warmup_iters) != 150:
+            raise SystemExit(
+                "The phase decider requires --max-iters 800 --warmup-iters 150."
+            )
+        if int(args.max_in_flight_per_run) != 1:
+            raise SystemExit(
+                "The phase decider requires --max-in-flight-per-run 1."
+            )
+        if not args.seed_params_file or not Path(args.seed_params_file).exists():
+            raise SystemExit(
+                "The phase decider requires the phase-screen seed-parameter file."
+            )
+        return
+    if any(name in PHASE_SCREEN_VARIANTS for name in selected_names):
+        if selected_names != PHASE_SCREEN_VARIANTS or runs != PHASE_SCREEN_RUNS:
+            raise SystemExit(
+                "The phase screen requires --variant phase_screen "
+                "--run-set phase_screen."
+            )
+        if int(args.max_iters) != 800 or int(args.warmup_iters) != 150:
+            raise SystemExit(
+                "The phase screen requires --max-iters 800 --warmup-iters 150."
+            )
+        if (
+            int(args.max_active_runs) != len(PHASE_SCREEN_RUNS)
+            or int(args.max_in_flight_per_run) != 1
+        ):
+            raise SystemExit(
+                "The phase screen requires --max-active-runs 6 "
+                "--max-in-flight-per-run 1."
+            )
+        if not args.seed_params_file or not Path(args.seed_params_file).exists():
+            raise SystemExit(
+                "The phase screen requires --seed-params-file from "
+                "scripts/prepare_ac_phase_screen.py."
+            )
+        return
+    if not any(variant.save_calibration for variant in selected):
+        return
+    if len(selected) != 1 or selected[0].name != FINAL_VARIANT_NAME:
+        raise SystemExit("The persistent final variant must run by itself.")
+    if runs != FINAL_PRODUCTION_RUNS:
+        raise SystemExit(
+            "The persistent final variant requires --run-set final_production "
+            "(40 runs; AC29 and AC51 excluded)."
+        )
+    if int(args.max_iters) != 1600 or int(args.warmup_iters) != 150:
+        raise SystemExit(
+            "The persistent final variant requires --max-iters 1600 "
+            "--warmup-iters 150."
+        )
+    if (
+        int(args.max_active_runs) != FINAL_MAX_ACTIVE_RUNS
+        or int(args.max_in_flight_per_run) != FINAL_MAX_IN_FLIGHT_PER_RUN
+    ):
+        raise SystemExit(
+            "The persistent final variant requires --max-active-runs "
+            f"{FINAL_MAX_ACTIVE_RUNS} --max-in-flight-per-run "
+            f"{FINAL_MAX_IN_FLIGHT_PER_RUN}."
+        )
+    if not args.seed_params_file:
+        raise SystemExit(
+            "The persistent final variant requires --seed-params-file from "
+            "scripts/ac_final_calibration_prepare.py."
+        )
+    if not Path(args.seed_params_file).exists():
+        raise SystemExit(f"Seed parameter file not found: {args.seed_params_file}")
+
+
+def _env_lines(variant: Variant, spatial_sigma: float) -> list[str]:
+    lines = [
+        "$env:FFAC_REQUIRE_VARYING_DEPTH = 'on'",
+        "$env:FFAC_EXPECTED_DEPTH_SHA256 = "
+        f"'{EXPECTED_RUNTIME_DEPTH_SHA256}'",
+        "$env:FFAC_TITRATION_FLASH = 'on'"
+        if variant.titration
+        else "Remove-Item Env:\\FFAC_TITRATION_FLASH -ErrorAction SilentlyContinue",
+        f"$env:FFAC_STATIC_LIGHT_CORRECTION = '{variant.static_light}'"
+        if variant.static_light != "off"
+        else "Remove-Item Env:\\FFAC_STATIC_LIGHT_CORRECTION -ErrorAction SilentlyContinue",
+        "Remove-Item Env:\\FFAC_COUPLE_AQ_GAS -ErrorAction SilentlyContinue",
+    ]
+    if "spatial" in variant.static_light:
+        lines.append(f"$env:FFAC_STATIC_LIGHT_SPATIAL_SIGMA = '{spatial_sigma:g}'")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_STATIC_LIGHT_SPATIAL_SIGMA -ErrorAction SilentlyContinue")
+    if variant.static_reference != "median":
+        lines.append(f"$env:FFAC_STATIC_LIGHT_REFERENCE = '{variant.static_reference}'")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_STATIC_LIGHT_REFERENCE -ErrorAction SilentlyContinue")
+    if variant.template_registration != "off":
+        lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION = '{variant.template_registration}'")
+        lines.append(f"$env:FFAC_TEMPLATE_REGISTRATION_MODE = '{variant.template_mode}'")
+        if variant.template_strict:
+            lines.append("$env:FFAC_TEMPLATE_REGISTRATION_STRICT = 'on'")
+        else:
+            lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_STRICT -ErrorAction SilentlyContinue")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_MODE -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_TEMPLATE_REGISTRATION_STRICT -ErrorAction SilentlyContinue")
+    if variant.signal_parameterization != "per-label":
+        lines.append(
+            f"$env:FFAC_SIGNAL_PARAMETERIZATION = '{variant.signal_parameterization}'"
+        )
+    else:
+        lines.append("Remove-Item Env:\\FFAC_SIGNAL_PARAMETERIZATION -ErrorAction SilentlyContinue")
+    if variant.color_path_anchor != "off":
+        lines.append(
+            f"$env:FFAC_COLOR_PATH_ANCHOR = '{variant.color_path_anchor}'"
+        )
+        lines.append(
+            "$env:FFAC_COLOR_PATH_ANCHOR_WEIGHT = "
+            f"'{variant.color_path_anchor_weight:g}'"
+        )
+        lines.append("$env:FFAC_COLOR_PATH_ANCHOR_STRICT = 'on'")
+    else:
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR_WEIGHT -ErrorAction SilentlyContinue")
+        lines.append("Remove-Item Env:\\FFAC_COLOR_PATH_ANCHOR_STRICT -ErrorAction SilentlyContinue")
+    if variant.phase_separation != "shared-signal":
+        lines.append(
+            f"$env:FFAC_PHASE_SEPARATION = '{variant.phase_separation}'"
+        )
+    else:
+        lines.append("Remove-Item Env:\\FFAC_PHASE_SEPARATION -ErrorAction SilentlyContinue")
+    return lines
+
+
+def _common_master_args(args: argparse.Namespace, variant: Variant, queue: str, logs_dir: str, control: str) -> list[str]:
+    runs = " ".join(_select_runs(args.run_set))
+    command = [
+        f"& {args.python}",
+        "scripts/distributed_auto_calibration_queue.py master",
+        "--queue",
+        _ps_quote(queue),
+        "--runs",
+        runs,
+        "--config-dir config_seg6/run_ac",
+        "--logs-dir",
+        _ps_quote(logs_dir),
+        "--use-facies true",
+        "--per-label true",
+        "--objective-integral",
+        _ps_quote(variant.objective_integral),
+        "--bounds-file",
+        _ps_quote(variant.bounds_file),
+    ]
+    if not (args.save_calibration or variant.save_calibration):
+        command.append("--no-save-calibration")
+    if args.seed_params_file:
+        command.extend(["--seed-params-file", _ps_quote(args.seed_params_file)])
+    if variant.optuna_seed is not None:
+        command.extend(["--optuna-seed", str(variant.optuna_seed)])
+    command.extend(
+        [
+            "--max-iters",
+            str(args.max_iters),
+            "--warmup-iters",
+            str(args.warmup_iters),
+            "--run-mode parallel",
+            "--max-active-runs",
+            str(args.max_active_runs),
+            "--max-in-flight-per-run",
+            str(args.max_in_flight_per_run),
+            "--control-dir",
+            _ps_quote(control),
+            "--sanity-every",
+            str(args.sanity_every),
+            "--sanity-scale 1.00",
+            "--quality-dtype float32",
+        ]
+    )
+    if args.exact_logs_dir:
+        command.append("--exact-logs-dir")
+    if args.use_history:
+        command.extend(["--use-history", "true"])
+    if args.no_clear_queue or args.resume_existing:
+        command.append("--no-clear-queue")
+    return command
+
+
+def _watchdog_args(
+    args: argparse.Namespace,
+    variant: Variant,
+    queue: str,
+    control: str,
+    workers: int | None = None,
+) -> list[str]:
+    worker_count = args.workers if workers is None else workers
+    command = [
+        f"& {args.python}",
+        "scripts/distributed_auto_calibration_queue.py watchdog",
+        "--queue",
+        _ps_quote(queue),
+        "--config-dir config_seg6/run_ac",
+        "--use-facies true",
+        "--per-label true",
+        "--control-dir",
+        _ps_quote(control),
+        "--workers",
+        str(worker_count),
+        "--worker-stall-seconds 600",
+        "--idle-exit-seconds",
+        str(args.idle_exit_seconds),
+        "--threads-per-worker",
+        str(args.threads_per_worker),
+    ]
+    if args.max_tasks_per_worker > 0:
+        command.extend(["--max-tasks-per-worker", str(args.max_tasks_per_worker)])
+    return command
+
+
+def _worker_counts(args: argparse.Namespace, selected: list[Variant]) -> list[int]:
+    total = int(getattr(args, "total_workers", 0) or 0)
+    if total <= 0:
+        return [int(args.workers)] * len(selected)
+    if total < len(selected):
+        raise SystemExit(
+            f"--total-workers {total} is lower than the number of variants ({len(selected)}). "
+            "Use fewer variants or at least one worker per variant."
+        )
+    base, extra = divmod(total, len(selected))
+    return [base + (1 if idx < extra else 0) for idx in range(len(selected))]
+
+
+def commands(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    selected = _select_variants(args.variant)
+    runs = _select_runs(args.run_set)
+    _validate_final_campaign(args, selected, runs)
+    worker_counts = _worker_counts(args, selected)
+    run_count = len(runs)
+    queue_root = args.queue_root.rstrip("\\/")
+    logs_root = args.logs_root.rstrip("\\/")
+    control_root = args.control_root.rstrip("\\/") if args.control_root else queue_root
+    if args.resume_existing:
+        args.exact_logs_dir = True
+        args.use_history = True
+
+    print("# AC production calibration campaign.")
+    print(f"# Run set: {args.run_set} ({run_count} runs).")
+    if args.run_set == "final_production":
+        print("# Excluded: ac29, ac51 (documented physical/chemical outliers).")
+    print(f"# Variants: {', '.join(variant.name for variant in selected)}")
+    print("# Start one master per variant, then one watchdog per active machine for the same variant.")
+    print("# --workers is per watchdog. With holiday4, the default 3 gives 12 workers per machine.")
+    print("# Sync this repository to every worker machine before starting spatial variants.")
+    print(f"cd {_ps_quote(repo)}")
+    print()
+
+    for variant in selected:
+        queue = f"{queue_root}_{variant.name}"
+        logs_dir = f"{logs_root}\\{variant.name}"
+        if args.resume_existing:
+            variant_log_root = Path(logs_dir)
+            existing = [
+                path for path in variant_log_root.glob("*")
+                if path.is_dir() and (path / "commands.txt").exists()
+            ] if variant_log_root.exists() else []
+            if existing:
+                logs_dir = str(max(existing, key=lambda path: path.stat().st_mtime))
+        control = f"{control_root}_{variant.name}\\control"
+        print(f"# --- {variant.name}: {variant.note} ---")
+        print("# master terminal:")
+        for line in _env_lines(variant, args.spatial_sigma):
+            print(line)
+        print("$env:FFAC_MASTER_LIGHT_CONTEXT = 'on'")
+        print(" ".join(_common_master_args(args, variant, queue, logs_dir, control)))
+        print()
+        print("# watchdog terminal on each machine:")
+        for line in _env_lines(variant, args.spatial_sigma):
+            print(line)
+        print("Remove-Item Env:\\FFAC_MASTER_LIGHT_CONTEXT -ErrorAction SilentlyContinue")
+        print(" ".join(_watchdog_args(args, variant, queue, control)))
+        print()
+
+
+def _variant_env(base_env: dict[str, str], variant: Variant, *, master: bool, spatial_sigma: float) -> dict[str, str]:
+    env = dict(base_env)
+    env["FFAC_REQUIRE_VARYING_DEPTH"] = "on"
+    env["FFAC_EXPECTED_DEPTH_SHA256"] = EXPECTED_RUNTIME_DEPTH_SHA256
+    if variant.titration:
+        env["FFAC_TITRATION_FLASH"] = "on"
+    else:
+        env.pop("FFAC_TITRATION_FLASH", None)
+        env.pop("FFAC_TITRATION_RECIPE", None)
+    if variant.static_light != "off":
+        env["FFAC_STATIC_LIGHT_CORRECTION"] = variant.static_light
+    else:
+        env.pop("FFAC_STATIC_LIGHT_CORRECTION", None)
+    env.pop("FFAC_COUPLE_AQ_GAS", None)
+    if "spatial" in variant.static_light:
+        env["FFAC_STATIC_LIGHT_SPATIAL_SIGMA"] = f"{spatial_sigma:g}"
+    else:
+        env.pop("FFAC_STATIC_LIGHT_SPATIAL_SIGMA", None)
+    if variant.static_reference != "median":
+        env["FFAC_STATIC_LIGHT_REFERENCE"] = variant.static_reference
+    else:
+        env.pop("FFAC_STATIC_LIGHT_REFERENCE", None)
+    if variant.template_registration != "off":
+        env["FFAC_TEMPLATE_REGISTRATION"] = variant.template_registration
+        env["FFAC_TEMPLATE_REGISTRATION_MODE"] = variant.template_mode
+        if variant.template_strict:
+            env["FFAC_TEMPLATE_REGISTRATION_STRICT"] = "on"
+        else:
+            env.pop("FFAC_TEMPLATE_REGISTRATION_STRICT", None)
+    else:
+        env.pop("FFAC_TEMPLATE_REGISTRATION", None)
+        env.pop("FFAC_TEMPLATE_REGISTRATION_MODE", None)
+        env.pop("FFAC_TEMPLATE_REGISTRATION_STRICT", None)
+    if variant.signal_parameterization != "per-label":
+        env["FFAC_SIGNAL_PARAMETERIZATION"] = variant.signal_parameterization
+    else:
+        env.pop("FFAC_SIGNAL_PARAMETERIZATION", None)
+    if variant.color_path_anchor != "off":
+        env["FFAC_COLOR_PATH_ANCHOR"] = variant.color_path_anchor
+        env["FFAC_COLOR_PATH_ANCHOR_WEIGHT"] = (
+            f"{variant.color_path_anchor_weight:g}"
+        )
+        env["FFAC_COLOR_PATH_ANCHOR_STRICT"] = "on"
+    else:
+        env.pop("FFAC_COLOR_PATH_ANCHOR", None)
+        env.pop("FFAC_COLOR_PATH_ANCHOR_WEIGHT", None)
+        env.pop("FFAC_COLOR_PATH_ANCHOR_STRICT", None)
+    if variant.phase_separation != "shared-signal":
+        env["FFAC_PHASE_SEPARATION"] = variant.phase_separation
+    else:
+        env.pop("FFAC_PHASE_SEPARATION", None)
+    if master:
+        env["FFAC_MASTER_LIGHT_CONTEXT"] = "on"
+    else:
+        env.pop("FFAC_MASTER_LIGHT_CONTEXT", None)
+    return env
+
+
+def _powershell_process(command: list[str], repo: Path, env: dict[str, str], log_path: Path, *, dry_run: bool) -> int | None:
+    block = " ".join(command)
+    print(block)
+    if dry_run:
+        return None
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    out = log_path.open("ab")
+    try:
+        proc = subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                block,
+            ],
+            cwd=repo,
+            env=env,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    finally:
+        out.close()
+    return int(proc.pid)
+
+
+def launch(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    selected = _select_variants(args.variant)
+    runs = _select_runs(args.run_set)
+    _validate_final_campaign(args, selected, runs)
+    worker_counts = _worker_counts(args, selected)
+    run_count = len(runs)
+    queue_root = args.queue_root.rstrip("\\/")
+    logs_root = args.logs_root.rstrip("\\/")
+    control_root = args.control_root.rstrip("\\/") if args.control_root else queue_root
+    role = args.role.lower()
+    start_master = role in {"local", "all", "master", "masters"}
+    start_watchdog = role in {"local", "all", "watchdog", "watchdogs"}
+    if not start_master and not start_watchdog:
+        raise SystemExit(f"Unknown launch role {args.role!r}. Use local, master, watchdog, or all.")
+
+    print("# AC production calibration campaign launcher.")
+    print(f"# Role: {args.role}. Run set: {args.run_set} ({run_count} runs).")
+    print(f"# Variants: {', '.join(variant.name for variant in selected)}")
+    print(f"# Worker distribution: {', '.join(str(count) for count in worker_counts)}")
+    print(f"# Max active runs: {args.max_active_runs}; max in-flight per run: {args.max_in_flight_per_run}")
+    print(f"# Repo: {repo}")
+    print()
+
+    launched: list[dict[str, str | int]] = []
+    hostname = socket.gethostname()
+    for variant, worker_count in zip(selected, worker_counts):
+        queue = f"{queue_root}_{variant.name}"
+        logs_dir = f"{logs_root}\\{variant.name}"
+        control = f"{control_root}_{variant.name}\\control"
+        variant_log_dir = Path(logs_dir)
+        if not variant_log_dir.is_absolute():
+            variant_log_dir = repo / variant_log_dir
+        if not args.dry_run:
+            control_dir = Path(control)
+            control_dir.mkdir(parents=True, exist_ok=True)
+            default_file = control_dir / "default.txt"
+            if not default_file.exists():
+                default_file.write_text(str(args.workers), encoding="utf-8")
+            if start_watchdog:
+                (control_dir / f"{hostname}.txt").write_text(str(worker_count), encoding="utf-8")
+
+        print(f"# --- {variant.name}: {variant.note} ---")
+        print(f"# queue: {queue}")
+        if start_master:
+            master_env = _variant_env(os.environ, variant, master=True, spatial_sigma=args.spatial_sigma)
+            master_log = variant_log_dir / "launcher_master_stdout.log"
+            print("# master:")
+            pid = _powershell_process(
+                _common_master_args(args, variant, queue, logs_dir, control),
+                repo,
+                master_env,
+                master_log,
+                dry_run=args.dry_run,
+            )
+            if pid is not None:
+                launched.append(
+                    {
+                        "variant": variant.name,
+                        "role": "master",
+                        "hostname": hostname,
+                        "pid": pid,
+                        "log": str(master_log),
+                    }
+                )
+        if start_watchdog:
+            watchdog_env = _variant_env(os.environ, variant, master=False, spatial_sigma=args.spatial_sigma)
+            watchdog_log = variant_log_dir / f"launcher_watchdog_{hostname}.log"
+            print("# watchdog:")
+            pid = _powershell_process(
+                _watchdog_args(args, variant, queue, control, worker_count),
+                repo,
+                watchdog_env,
+                watchdog_log,
+                dry_run=args.dry_run,
+            )
+            if pid is not None:
+                launched.append(
+                    {
+                        "variant": variant.name,
+                        "role": "watchdog",
+                        "hostname": hostname,
+                        "pid": pid,
+                        "log": str(watchdog_log),
+                    }
+                )
+        print()
+
+    if args.dry_run:
+        print("Dry run only; no processes started.")
+        return
+
+    manifest_root = Path(args.logs_root)
+    manifest_root.mkdir(parents=True, exist_ok=True)
+    manifest = manifest_root / (
+        f"launcher_processes_{args.role}_{hostname}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    manifest.write_text(json.dumps(launched, indent=2), encoding="utf-8")
+    print(f"Started {len(launched)} process(es).")
+    print(f"Process manifest: {manifest}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    cmd = sub.add_parser("commands", help="Emit PowerShell master/watchdog commands.")
+    cmd.add_argument(
+        "--variant",
+        default="holiday4",
+        help=(
+            "Variant name, comma-list, final_production, reduced_model, "
+            "final_geometry, phase_screen, phase_decider, screen_step1, holiday4, holiday5, "
+            "spatial, global, or all."
+        ),
+    )
+    cmd.add_argument(
+        "--run-set",
+        default="all",
+        help=(
+            "production, rollout, final_production, reduced_model, final_geometry, "
+            "phase_screen, phase_decider, screen_step1, all, or an explicit space/comma-separated run list."
+        ),
+    )
+    cmd.add_argument("--repo", default=".")
+    cmd.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
+    cmd.add_argument("--queue-root", default=r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_holiday")
+    cmd.add_argument("--control-root", default=None)
+    cmd.add_argument("--logs-root", default=str(configured_tool_path('ffac', 'calibration_logs') / 'holiday_2026'))
+    cmd.add_argument("--max-iters", type=int, default=800)
+    cmd.add_argument("--warmup-iters", type=int, default=150)
+    cmd.add_argument("--max-active-runs", type=int, default=3)
+    cmd.add_argument("--max-in-flight-per-run", type=int, default=2)
+    cmd.add_argument(
+        "--workers",
+        type=int,
+        default=3,
+        help="Workers per variant watchdog. Use 3 for four concurrent variants on a 12-worker machine.",
+    )
+    cmd.add_argument("--sanity-every", type=int, default=100)
+    cmd.add_argument("--spatial-sigma", type=float, default=6.0)
+    cmd.add_argument("--max-tasks-per-worker", type=int, default=80)
+    cmd.add_argument("--idle-exit-seconds", type=float, default=120.0)
+    cmd.add_argument("--threads-per-worker", type=int, default=1)
+    cmd.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="Restart against the latest existing timestamped log folder per variant.",
+    )
+    cmd.add_argument("--exact-logs-dir", action="store_true")
+    cmd.add_argument("--use-history", action="store_true")
+    cmd.add_argument("--save-calibration", action="store_true")
+    cmd.add_argument(
+        "--seed-params-file",
+        default=None,
+        help="Optional per-run prior-candidate JSON evaluated before normal warmups.",
+    )
+    cmd.add_argument("--no-clear-queue", action="store_true")
+    cmd.set_defaults(func=commands)
+
+    launcher = sub.add_parser("launch", help="Start production/hardcase campaign processes in background.")
+    launcher.add_argument(
+        "--variant",
+        default="hardcase8",
+        help=(
+            "Variant name, comma-list, final_production, reduced_model, "
+            "final_geometry, phase_screen, phase_decider, screen_step1, hardcase8, holiday4, holiday5, "
+            "spatial, global, or all."
+        ),
+    )
+    launcher.add_argument(
+        "--run-set",
+        default="hardcases",
+        help=(
+            "production, rollout, hardcases, final_production, reduced_model, "
+            "final_geometry, phase_screen, phase_decider, screen_step1, all, or an explicit "
+            "space/comma-separated run list."
+        ),
+    )
+    launcher.add_argument(
+        "--role",
+        default="local",
+        help="local starts masters and watchdogs; watchdog starts only watchdogs; master starts only masters.",
+    )
+    launcher.add_argument("--repo", default=".")
+    launcher.add_argument("--python", default=".\\.venv\\Scripts\\python.exe")
+    launcher.add_argument("--queue-root", default=r"\\Moderskipet\Darsia_Queue\Kalibrering_AC_hardcase")
+    launcher.add_argument("--control-root", default=None)
+    launcher.add_argument("--logs-root", default=str(configured_tool_path('ffac', 'calibration_logs') / 'hardcase_2026'))
+    launcher.add_argument("--max-iters", type=int, default=800)
+    launcher.add_argument("--warmup-iters", type=int, default=150)
+    launcher.add_argument("--max-active-runs", type=int, default=3)
+    launcher.add_argument("--max-in-flight-per-run", type=int, default=2)
+    launcher.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Workers per variant watchdog. hardcase8 with 1 worker gives 8 workers per machine.",
+    )
+    launcher.add_argument(
+        "--total-workers",
+        type=int,
+        default=0,
+        help="Distribute this many workers across selected variants for this machine, e.g. 12 over hardcase8 -> 2,2,2,2,1,1,1,1.",
+    )
+    launcher.add_argument("--sanity-every", type=int, default=100)
+    launcher.add_argument("--spatial-sigma", type=float, default=6.0)
+    launcher.add_argument("--max-tasks-per-worker", type=int, default=80)
+    launcher.add_argument("--idle-exit-seconds", type=float, default=120.0)
+    launcher.add_argument("--threads-per-worker", type=int, default=1)
+    launcher.add_argument("--resume-existing", action="store_true")
+    launcher.add_argument("--exact-logs-dir", action="store_true")
+    launcher.add_argument("--use-history", action="store_true")
+    launcher.add_argument("--save-calibration", action="store_true")
+    launcher.add_argument(
+        "--seed-params-file",
+        default=None,
+        help="Optional per-run prior-candidate JSON evaluated before normal warmups.",
+    )
+    launcher.add_argument("--no-clear-queue", action="store_true")
+    launcher.add_argument("--dry-run", action="store_true")
+    launcher.set_defaults(func=launch)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

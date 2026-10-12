@@ -1,0 +1,1503 @@
+"""Layer painting: brush strokes on a raw photograph, a proposed layer map and
+its conversion to a geometry revision for native Setup.
+
+The simple view of the Geometry and facies tab lets a user paint a few strokes
+per layer on the raw baseline photograph of the reference run. A pixel
+classifier (DarSIA's facies features and extremely randomized trees) is trained
+on the painted pixels and labels the rest of the photograph inside the rig
+frame. Class probabilities are smoothed, painted pixels keep their layer and
+regions smaller than a set area join their largest neighbour. Layers are
+grouped into facies that share a role, porosity and permeability. Saving
+converts the proposal to a label map on the raw photograph's grid, stores it as
+a geometry revision and exports it for native Setup.
+
+Strokes are stored in raw-image pixels (row, col) with a brush radius in raw
+pixels, in ``<package>/annotations/layer_painting/<run>.json``. The latest
+proposal is stored next to it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import time
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from darsia.fluidflower.project import FluidFlowerProject, utc_now
+from darsia.fluidflower.series_geometry import (
+    NATIVE_MAX_REGIONS,
+    RigFrame,
+    SeriesRunInputs,
+    _resolved_points,
+    photo_size,
+    saved_injection_points,
+)
+
+LAYER_PAINTING_FORMAT = "darsia-fluidflower-layer-painting-v1"
+LAYER_PROPOSAL_FORMAT = "darsia-fluidflower-layer-proposal-v1"
+PROPOSAL_METHOD = "painted_strokes_extra_trees_v1"
+# Layer ID of eraser strokes, and class of pixels outside the rig frame.
+ERASER = 0
+OUTSIDE = 0
+ANALYSIS_WIDTH = 1200
+DISPLAY_LIMIT_PX = 2400
+LAYER_ROLES: dict[str, str] = {
+    "porous_medium": "Porous medium",
+    "free_water": "Free water",
+    "excluded": "Excluded",
+}
+SMOOTHING_SIGMA: dict[str, float] = {"low": 1.5, "medium": 3.0, "high": 6.0}
+PERMEABILITY_UNITS = ("darcy", "mD", "m2")
+LAYER_COLORS = (
+    "#3d8bd9",
+    "#f2c14e",
+    "#e05d5d",
+    "#9aa0a6",
+    "#4fb38a",
+    "#a77bd6",
+    "#e8893a",
+    "#5cc6d0",
+    "#d36aa8",
+    "#8fa04a",
+    "#c9a27e",
+    "#6f86c9",
+)
+DEFAULT_LAYERS: tuple[tuple[str, str], ...] = (
+    ("Free water", "free_water"),
+    ("Fine sand", "porous_medium"),
+    ("Coarse sand", "porous_medium"),
+    ("Excluded", "excluded"),
+)
+OUTSIDE_FACIES = "Outside the rig frame"
+# Constant depth written into the revision, which requires a depth map. Native
+# Setup takes the depth from its own [depth] section.
+PLACEHOLDER_DEPTH_M = 0.01
+# Pixels whose largest smoothed class probability is below this are uncertain.
+UNCERTAIN_BELOW = 0.6
+
+ProgressCallback = Callable[[str], None]
+
+
+def _progress(callback: ProgressCallback | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+# ---------------------------------------------------------------------------
+# Session: layers, facies and strokes
+
+
+@dataclass
+class PaintedLayer:
+    """A layer the user paints; ``facies`` names the facies it belongs to."""
+
+    layer_id: int
+    name: str
+    color: str
+    facies: str
+
+
+@dataclass
+class FaciesEntry:
+    """Shared role and properties of the layers in one facies."""
+
+    role: str = "porous_medium"
+    porosity: float | None = None
+    permeability: float | None = None
+
+
+@dataclass
+class Stroke:
+    """A brush stroke in raw-image pixels; layer 0 erases."""
+
+    layer_id: int
+    radius_px: float
+    points: list[tuple[float, float]]
+
+    def to_list(self) -> list[Any]:
+        return [
+            int(self.layer_id),
+            round(float(self.radius_px), 2),
+            [[round(float(row), 1), round(float(col), 1)] for row, col in self.points],
+        ]
+
+    @classmethod
+    def from_list(cls, payload: Sequence[Any]) -> Stroke:
+        layer_id, radius, points = payload
+        return cls(
+            int(layer_id),
+            float(radius),
+            [(float(row), float(col)) for row, col in points],
+        )
+
+
+_UNSET: Any = object()
+
+
+@dataclass
+class PaintingSession:
+    """Painted layers of one reference run."""
+
+    run_id: str
+    image_path: str = ""
+    image_size: tuple[int, int] | None = None
+    # File size and modification time of the photograph the strokes belong to.
+    image_stamp: str = ""
+    layers: list[PaintedLayer] = field(default_factory=list)
+    facies: dict[str, FaciesEntry] = field(default_factory=dict)
+    strokes: list[Stroke] = field(default_factory=list)
+    permeability_unit: str = "darcy"
+    smoothing: str = "medium"
+    min_region_cm2: float = 2.0
+    updated_utc: str = ""
+    updated_by: str = ""
+    # Set when the run's baseline photograph differs from the one painted on.
+    photo_changed: bool = field(default=False, compare=False)
+
+    @classmethod
+    def default(
+        cls,
+        run_id: str,
+        image_path: str | Path = "",
+        image_size: tuple[int, int] | None = None,
+    ) -> PaintingSession:
+        session = cls(run_id=str(run_id), image_path=str(image_path or ""))
+        session.image_size = tuple(image_size) if image_size else None
+        for index, (name, role) in enumerate(DEFAULT_LAYERS):
+            session.layers.append(
+                PaintedLayer(index + 1, name, LAYER_COLORS[index], name)
+            )
+            session.facies[name] = FaciesEntry(role=role)
+        return session
+
+    # ------------------------------------------------------------ layers
+
+    def layer(self, layer_id: int) -> PaintedLayer | None:
+        return next((row for row in self.layers if row.layer_id == layer_id), None)
+
+    def _unique_name(self, wanted: str, *, ignore: int | None = None) -> str:
+        used = {row.name.casefold() for row in self.layers if row.layer_id != ignore}
+        if wanted.casefold() not in used:
+            return wanted
+        number = 2
+        while f"{wanted} {number}".casefold() in used:
+            number += 1
+        return f"{wanted} {number}"
+
+    def add_layer(
+        self, name: str | None = None, role: str = "porous_medium"
+    ) -> PaintedLayer:
+        layer_id = max((row.layer_id for row in self.layers), default=0) + 1
+        if layer_id > 255:
+            raise ValueError("At most 255 layers can be painted")
+        used_colors = {row.color for row in self.layers}
+        color = next(
+            (value for value in LAYER_COLORS if value not in used_colors),
+            LAYER_COLORS[(layer_id - 1) % len(LAYER_COLORS)],
+        )
+        text = self._unique_name(str(name or "").strip() or f"Layer {layer_id}")
+        layer = PaintedLayer(layer_id, text, color, text)
+        self.layers.append(layer)
+        if text not in self.facies:
+            self.facies[text] = FaciesEntry(
+                role=role if role in LAYER_ROLES else "porous_medium"
+            )
+        return layer
+
+    def remove_layer(self, layer_id: int) -> None:
+        self.layers = [row for row in self.layers if row.layer_id != layer_id]
+        self.strokes = [row for row in self.strokes if row.layer_id != layer_id]
+        self.prune_facies()
+
+    def rename_layer(self, layer_id: int, name: str) -> None:
+        layer = self.layer(layer_id)
+        text = str(name or "").strip()
+        if layer is None or not text or text == layer.name:
+            return
+        if text.casefold() in {
+            row.name.casefold() for row in self.layers if row.layer_id != layer_id
+        }:
+            raise ValueError(f"Another layer is already called {text!r}")
+        old = layer.name
+        layer.name = text
+        # A facies that only carries this layer's old name follows the rename.
+        alone = [row for row in self.layers if row.facies == layer.facies] == [layer]
+        if layer.facies == old and alone and text not in self.facies:
+            self.facies[text] = self.facies.pop(old, FaciesEntry())
+            layer.facies = text
+
+    def set_layer_facies(self, layer_id: int, facies: str) -> None:
+        layer = self.layer(layer_id)
+        if layer is None:
+            return
+        text = str(facies or "").strip() or layer.name
+        if text == layer.facies:
+            return
+        previous = self.facies.get(layer.facies, FaciesEntry())
+        alone = [row for row in self.layers if row.facies == layer.facies] == [layer]
+        if text not in self.facies:
+            if alone:
+                # Renaming the layer's own facies keeps its properties.
+                self.facies[text] = self.facies.pop(layer.facies, FaciesEntry())
+            else:
+                self.facies[text] = FaciesEntry(role=previous.role)
+        layer.facies = text
+        self.prune_facies()
+
+    def rename_facies(self, old: str, new: str) -> None:
+        """Rename a facies; a name already in use merges the two facies."""
+
+        text = str(new or "").strip()
+        if not text or text == old or old not in self.facies:
+            return
+        entry = self.facies.pop(old)
+        self.facies.setdefault(text, entry)
+        for row in self.layers:
+            if row.facies == old:
+                row.facies = text
+        self.prune_facies()
+
+    def facies_order(self) -> list[str]:
+        """Facies names in the order of the layers."""
+
+        return list(dict.fromkeys(row.facies for row in self.layers))
+
+    def set_facies(
+        self,
+        name: str,
+        *,
+        role: Any = _UNSET,
+        porosity: Any = _UNSET,
+        permeability: Any = _UNSET,
+    ) -> None:
+        entry = self.facies.setdefault(name, FaciesEntry())
+        if role is not _UNSET:
+            if role not in LAYER_ROLES:
+                raise ValueError(f"Unknown role {role!r}")
+            entry.role = role
+        if porosity is not _UNSET:
+            entry.porosity = _number(porosity)
+        if permeability is not _UNSET:
+            entry.permeability = _number(permeability)
+
+    def prune_facies(self) -> None:
+        used = {row.facies for row in self.layers}
+        self.facies = {
+            name: entry for name, entry in self.facies.items() if name in used
+        }
+        for row in self.layers:
+            self.facies.setdefault(row.facies, FaciesEntry())
+
+    def facies_of(self, layer_id: int) -> FaciesEntry:
+        layer = self.layer(layer_id)
+        if layer is None:
+            return FaciesEntry(role="excluded")
+        return self.facies.setdefault(layer.facies, FaciesEntry())
+
+    def layers_in_facies(self, name: str) -> list[PaintedLayer]:
+        return [row for row in self.layers if row.facies == name]
+
+    # ----------------------------------------------------------- strokes
+
+    def add_stroke(self, stroke: Stroke) -> None:
+        if stroke.layer_id != ERASER and self.layer(stroke.layer_id) is None:
+            raise ValueError(f"Unknown layer {stroke.layer_id}")
+        if not stroke.points or stroke.radius_px <= 0.0:
+            raise ValueError("A stroke needs points and a positive radius")
+        self.strokes.append(stroke)
+
+    def stroke_counts(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for row in self.strokes:
+            counts[row.layer_id] = counts.get(row.layer_id, 0) + 1
+        return counts
+
+    def clear_layer_strokes(self, layer_id: int) -> int:
+        before = len(self.strokes)
+        self.strokes = [row for row in self.strokes if row.layer_id != layer_id]
+        return before - len(self.strokes)
+
+    # ------------------------------------------------------- persistence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": 1,
+            "format": LAYER_PAINTING_FORMAT,
+            "run_id": self.run_id,
+            "image": {
+                "path": self.image_path,
+                "size": list(self.image_size) if self.image_size else None,
+                "stamp": self.image_stamp,
+            },
+            "layers": [
+                {
+                    "layer_id": row.layer_id,
+                    "name": row.name,
+                    "color": row.color,
+                    "facies": row.facies,
+                }
+                for row in self.layers
+            ],
+            "facies": {
+                name: {
+                    "role": entry.role,
+                    "porosity": entry.porosity,
+                    "permeability": entry.permeability,
+                }
+                for name, entry in self.facies.items()
+            },
+            "permeability_unit": self.permeability_unit,
+            "proposal_settings": {
+                "smoothing": self.smoothing,
+                "min_region_cm2": self.min_region_cm2,
+            },
+            # One stroke per line keeps the file readable: [layer, radius, points].
+            "strokes": [row.to_list() for row in self.strokes],
+            "updated_utc": self.updated_utc,
+            "updated_by": self.updated_by,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> PaintingSession:
+        if payload.get("format") != LAYER_PAINTING_FORMAT:
+            raise ValueError("Unsupported layer painting file")
+        image = dict(payload.get("image") or {})
+        size = image.get("size")
+        settings = dict(payload.get("proposal_settings") or {})
+        session = cls(
+            run_id=str(payload.get("run_id") or ""),
+            image_path=str(image.get("path") or ""),
+            image_size=(int(size[0]), int(size[1])) if size else None,
+            image_stamp=str(image.get("stamp") or ""),
+            permeability_unit=str(payload.get("permeability_unit") or "darcy"),
+            smoothing=str(settings.get("smoothing") or "medium"),
+            min_region_cm2=float(_number(settings.get("min_region_cm2")) or 0.0),
+            updated_utc=str(payload.get("updated_utc") or ""),
+            updated_by=str(payload.get("updated_by") or ""),
+        )
+        if session.smoothing not in SMOOTHING_SIGMA:
+            session.smoothing = "medium"
+        for row in payload.get("layers") or []:
+            session.layers.append(
+                PaintedLayer(
+                    int(row["layer_id"]),
+                    str(row.get("name") or f"Layer {row['layer_id']}"),
+                    str(row.get("color") or LAYER_COLORS[0]),
+                    str(row.get("facies") or row.get("name") or ""),
+                )
+            )
+        for name, row in dict(payload.get("facies") or {}).items():
+            role = str(row.get("role") or "porous_medium")
+            session.facies[str(name)] = FaciesEntry(
+                role=role if role in LAYER_ROLES else "porous_medium",
+                porosity=_number(row.get("porosity")),
+                permeability=_number(row.get("permeability")),
+            )
+        known = {row.layer_id for row in session.layers} | {ERASER}
+        session.strokes = [
+            stroke
+            for stroke in (
+                Stroke.from_list(row) for row in payload.get("strokes") or []
+            )
+            if stroke.layer_id in known and stroke.points
+        ]
+        session.prune_facies()
+        return session
+
+
+def painting_folder(project: FluidFlowerProject) -> Path:
+    return Path(project.root) / "annotations" / "layer_painting"
+
+
+def _file_stem(run_id: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id)).strip("._")
+    return stem or "run"
+
+
+def session_path(project: FluidFlowerProject, run_id: str) -> Path:
+    return painting_folder(project) / f"{_file_stem(run_id)}.json"
+
+
+def proposal_path(project: FluidFlowerProject, run_id: str) -> Path:
+    return painting_folder(project) / f"{_file_stem(run_id)}.proposal.npz"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def load_painting_session(
+    project: FluidFlowerProject, reference: SeriesRunInputs
+) -> PaintingSession:
+    """The saved session of the reference run, or the default layers."""
+
+    path = session_path(project, reference.run_id)
+    stamp = image_stamp(reference.baseline_image)
+    if path.is_file():
+        session = PaintingSession.from_dict(
+            json.loads(path.read_text(encoding="utf-8-sig"))
+        )
+        session.run_id = reference.run_id
+        if reference.baseline_image is not None:
+            current = Path(reference.baseline_image)
+            session.photo_changed = bool(session.strokes) and (
+                Path(session.image_path).name != current.name
+                or bool(session.image_stamp and stamp and session.image_stamp != stamp)
+            )
+            session.image_path = str(current)
+            session.image_stamp = stamp
+        return session
+    size = None
+    if reference.baseline_image is not None:
+        try:
+            size = photo_size(reference.baseline_image)
+        except (OSError, ValueError):
+            size = None
+    session = PaintingSession.default(
+        reference.run_id, reference.baseline_image or "", size
+    )
+    session.image_stamp = stamp
+    return session
+
+
+def image_stamp(path: Path | str | None) -> str:
+    """Size and modification time of a file ("" when unavailable)."""
+
+    if path is None or not str(path):
+        return ""
+    try:
+        status = Path(path).stat()
+    except OSError:
+        return ""
+    return f"{status.st_size}:{status.st_mtime_ns}"
+
+
+def save_painting_session(
+    project: FluidFlowerProject, session: PaintingSession, *, actor: str = ""
+) -> Path:
+    session.updated_utc = utc_now()
+    session.updated_by = str(actor or session.updated_by or "")
+    payload = session.to_dict()
+    strokes = payload.pop("strokes")
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    # Strokes one per line: readable diffs and a compact file.
+    lines = ",\n".join(
+        "    " + json.dumps(row, separators=(",", ":")) for row in strokes
+    )
+    text = text[: text.rfind("}")].rstrip()
+    text += ',\n  "strokes": [' + ("\n" + lines + "\n  " if strokes else "") + "]\n}\n"
+    path = session_path(project, session.run_id)
+    _atomic_write_text(path, text)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Photograph
+
+
+def enhance_contrast(
+    rgb: np.ndarray,
+    mask: np.ndarray | None = None,
+    *,
+    low: float = 0.5,
+    high: float = 99.5,
+) -> np.ndarray:
+    """Stretch each channel between two percentiles; returns uint8 RGB."""
+
+    image = np.asarray(rgb, dtype=np.float32)
+    if image.max(initial=0.0) > 1.5:
+        image = image / 255.0
+    sample = image[mask] if mask is not None and np.any(mask) else image.reshape(-1, 3)
+    if sample.shape[0] > 400_000:
+        step = int(math.ceil(sample.shape[0] / 400_000))
+        sample = sample[::step]
+    lower = np.percentile(sample, low, axis=0)
+    upper = np.percentile(sample, high, axis=0)
+    span = np.maximum(upper - lower, 1.0e-3)
+    stretched = np.clip((image - lower) / span, 0.0, 1.0)
+    return np.rint(255.0 * stretched).astype(np.uint8)
+
+
+@dataclass
+class PaintingImage:
+    """A raw photograph at display and analysis resolution."""
+
+    path: Path
+    image_size: tuple[int, int]
+    display: np.ndarray
+    analysis: np.ndarray
+    _features: np.ndarray | None = None
+
+    @property
+    def analysis_shape(self) -> tuple[int, int]:
+        return int(self.analysis.shape[0]), int(self.analysis.shape[1])
+
+    def analysis_scale(self) -> tuple[float, float]:
+        """Analysis pixels per raw pixel along rows and columns."""
+
+        height, width = self.analysis_shape
+        return height / self.image_size[1], width / self.image_size[0]
+
+    def features(self) -> np.ndarray:
+        if self._features is None:
+            from darsia.fluidflower.facies_model import extract_facies_features
+
+            self._features = extract_facies_features(self.analysis)
+        return self._features
+
+
+def load_painting_image(
+    path: Path,
+    *,
+    analysis_width: int = ANALYSIS_WIDTH,
+    display_limit: int = DISPLAY_LIMIT_PX,
+) -> PaintingImage:
+    """Read a photograph reduced for display and for the pixel classifier."""
+
+    import cv2
+
+    from darsia.fluidflower.tools.injection_point_detection import load_reduced
+
+    selected = Path(path)
+    width, height = photo_size(selected)
+    factor = max(1, int(math.ceil(max(width, height) / float(display_limit))))
+    display = load_reduced(selected, factor)
+    target_width = min(int(analysis_width), display.shape[1])
+    if target_width < display.shape[1]:
+        target_height = max(8, int(round(height * target_width / width)))
+        analysis = cv2.resize(
+            display, (target_width, target_height), interpolation=cv2.INTER_AREA
+        )
+    else:
+        analysis = display.copy()
+    return PaintingImage(
+        selected,
+        (int(width), int(height)),
+        np.ascontiguousarray(display, dtype=np.float32),
+        np.ascontiguousarray(analysis, dtype=np.float32),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rasterization
+
+
+def _grid_points(
+    points: Sequence[tuple[float, float]], scale: tuple[float, float], shift: int
+) -> np.ndarray:
+    factor = float(1 << shift)
+    return np.asarray(
+        [
+            (
+                int(round(((col + 0.5) * scale[1] - 0.5) * factor)),
+                int(round(((row + 0.5) * scale[0] - 0.5) * factor)),
+            )
+            for row, col in points
+        ],
+        dtype=np.int32,
+    )
+
+
+def rasterize_strokes(
+    strokes: Sequence[Stroke],
+    shape: tuple[int, int],
+    scale: tuple[float, float],
+) -> np.ndarray:
+    """Layer ID of each grid pixel after all strokes (0: not painted).
+
+    ``scale`` gives grid pixels per raw pixel along rows and columns.
+    """
+
+    import cv2
+
+    painted = np.zeros(shape, dtype=np.uint8)
+    shift = 4
+    factor = 0.5 * (scale[0] + scale[1])
+    for stroke in strokes:
+        radius = max(0.5, float(stroke.radius_px) * factor)
+        points = _grid_points(stroke.points, scale, shift)
+        value = int(stroke.layer_id)
+        if len(points) == 1 or np.all(points == points[0]):
+            cv2.circle(
+                painted,
+                (int(points[0][0]), int(points[0][1])),
+                max(1, int(round(radius * (1 << shift)))),
+                value,
+                thickness=-1,
+                lineType=cv2.LINE_8,
+                shift=shift,
+            )
+            continue
+        cv2.polylines(
+            painted,
+            [points.reshape(-1, 1, 2)],
+            isClosed=False,
+            color=value,
+            thickness=max(1, int(round(2.0 * radius))),
+            lineType=cv2.LINE_8,
+            shift=shift,
+        )
+    return painted
+
+
+def frame_polygon(frame: RigFrame, scale: tuple[float, float]) -> np.ndarray | None:
+    """Corners of a complete frame in grid (x, y) coordinates, clockwise."""
+
+    if frame is None or not frame.complete():
+        return None
+    return np.asarray(
+        [
+            (
+                (frame.corners[name][1] + 0.5) * scale[1] - 0.5,
+                (frame.corners[name][0] + 0.5) * scale[0] - 0.5,
+            )
+            for name in ("top_left", "top_right", "bottom_right", "bottom_left")
+        ],
+        dtype=np.float64,
+    )
+
+
+def frame_mask(
+    frame: RigFrame | None, shape: tuple[int, int], scale: tuple[float, float]
+) -> np.ndarray:
+    """Pixels inside the rig frame (all pixels without a complete frame)."""
+
+    import cv2
+
+    polygon = frame_polygon(frame, scale) if frame is not None else None
+    if polygon is None:
+        return np.ones(shape, dtype=bool)
+    mask = np.zeros(shape, dtype=np.uint8)
+    shift = 4
+    points = np.rint(polygon * (1 << shift)).astype(np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(mask, [points], 1, lineType=cv2.LINE_8, shift=shift)
+    return mask.astype(bool)
+
+
+def frame_pixels_per_metre(frame: RigFrame | None) -> float | None:
+    """Raw pixels per metre of a frame with corners and size."""
+
+    if frame is None or not frame.complete() or not frame.has_size():
+        return None
+    corners = {name: np.asarray(frame.corners[name], float) for name in frame.corners}
+    width_px = 0.5 * (
+        np.linalg.norm(corners["top_right"] - corners["top_left"])
+        + np.linalg.norm(corners["bottom_right"] - corners["bottom_left"])
+    )
+    height_px = 0.5 * (
+        np.linalg.norm(corners["bottom_left"] - corners["top_left"])
+        + np.linalg.norm(corners["bottom_right"] - corners["top_right"])
+    )
+    values = [width_px / float(frame.width_m), height_px / float(frame.height_m)]
+    return float(np.sqrt(values[0] * values[1])) if all(values) else None
+
+
+def minimum_region_pixels(
+    min_region_cm2: float,
+    frame: RigFrame | None,
+    scale: tuple[float, float],
+    inside_pixels: int,
+) -> int:
+    """Smallest kept region on a grid; 0 keeps every region.
+
+    Without a frame size the area is taken relative to a 1 m² window, that is
+    ``min_region_cm2`` times 10⁻⁴ of the pixels inside the frame.
+    """
+
+    if min_region_cm2 <= 0.0:
+        return 0
+    per_metre = frame_pixels_per_metre(frame)
+    if per_metre is not None:
+        grid_per_metre = per_metre * math.sqrt(scale[0] * scale[1])
+        return max(1, int(round(min_region_cm2 * 1.0e-4 * grid_per_metre**2)))
+    return max(1, int(round(min_region_cm2 * 1.0e-4 * inside_pixels)))
+
+
+def merge_small_regions(
+    classes: np.ndarray,
+    min_pixels: int,
+    *,
+    protected: np.ndarray | None = None,
+    fixed: Sequence[int] = (OUTSIDE,),
+    passes: int = 3,
+) -> tuple[np.ndarray, int]:
+    """Give connected regions below ``min_pixels`` the class of their largest
+    neighbour; returns the classes (modified in place) and the merge count.
+
+    Regions of a ``fixed`` class are kept and never receive merged pixels.
+    Regions that contain a ``protected`` pixel of their own class are kept.
+    """
+
+    from scipy import ndimage as ndi
+
+    if min_pixels <= 1:
+        return classes, 0
+    structure = ndi.generate_binary_structure(2, 1)
+    fixed_values = np.asarray(sorted({int(value) for value in fixed}), dtype=np.int64)
+    merged = 0
+    height, width = classes.shape
+    for _ in range(max(1, passes)):
+        changed = 0
+        counts = np.bincount(classes.ravel(), minlength=256)
+        for value in np.flatnonzero(counts):
+            if int(value) in fixed_values:
+                continue
+            components = np.zeros(classes.shape, dtype=np.int32)
+            count = ndi.label(classes == value, structure=structure, output=components)
+            if not count:
+                continue
+            sizes = np.bincount(components.ravel(), minlength=count + 1)
+            small = np.flatnonzero(sizes < min_pixels)
+            small = small[small != 0]
+            if protected is not None and small.size:
+                keep = np.unique(components[(protected == value) & (components > 0)])
+                small = np.setdiff1d(small, keep)
+            if not small.size:
+                continue
+            slices = ndi.find_objects(components)
+            for component in small[np.argsort(sizes[small], kind="stable")]:
+                bounds = slices[int(component) - 1]
+                if bounds is None:
+                    continue
+                rows = slice(
+                    max(0, bounds[0].start - 1), min(height, bounds[0].stop + 1)
+                )
+                cols = slice(
+                    max(0, bounds[1].start - 1), min(width, bounds[1].stop + 1)
+                )
+                region = components[rows, cols] == component
+                window = classes[rows, cols]
+                region &= window == value
+                if not np.any(region):
+                    continue
+                ring = ndi.binary_dilation(region, structure) & ~region
+                neighbours = window[ring].astype(np.int64)
+                neighbours = neighbours[
+                    (neighbours != value) & ~np.isin(neighbours, fixed_values)
+                ]
+                if not neighbours.size:
+                    continue
+                window[region] = int(np.bincount(neighbours).argmax())
+                changed += 1
+        merged += changed
+        if not changed:
+            break
+    return classes, merged
+
+
+# ---------------------------------------------------------------------------
+# Proposal
+
+
+def _frame_key(frame: RigFrame | None) -> Any:
+    if frame is None or not frame.complete():
+        return None
+    return {
+        "corners": {
+            name: [round(float(value), 1) for value in frame.corners[name]]
+            for name in sorted(frame.corners)
+        },
+        "width_m": round(float(frame.width_m), 6) if frame.width_m else None,
+        "height_m": round(float(frame.height_m), 6) if frame.height_m else None,
+    }
+
+
+def proposal_digest(session: PaintingSession, frame: RigFrame | None) -> str:
+    """Digest of everything a proposal depends on."""
+
+    payload = {
+        "method": PROPOSAL_METHOD,
+        "image": [
+            Path(session.image_path).name,
+            list(session.image_size) if session.image_size else None,
+            session.image_stamp,
+        ],
+        "strokes": [row.to_list() for row in session.strokes],
+        "smoothing": session.smoothing,
+        "min_region_cm2": round(float(session.min_region_cm2), 4),
+        "frame": _frame_key(frame),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass
+class LayerProposal:
+    """Layer of each analysis pixel; 0 outside the rig frame."""
+
+    classes: np.ndarray
+    confidence: np.ndarray
+    image_size: tuple[int, int]
+    digest: str
+    created_utc: str = ""
+    elapsed_s: float = 0.0
+    stroke_count: int = 0
+    merged_regions: int = 0
+    min_region_pixels: int = 0
+    frame: dict[str, Any] | None = None
+    layers: list[dict[str, Any]] = field(default_factory=list)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "schema": 1,
+            "format": LAYER_PROPOSAL_FORMAT,
+            "method": PROPOSAL_METHOD,
+            "image_size": list(self.image_size),
+            "digest": self.digest,
+            "created_utc": self.created_utc,
+            "elapsed_s": self.elapsed_s,
+            "stroke_count": self.stroke_count,
+            "merged_regions": self.merged_regions,
+            "min_region_pixels": self.min_region_pixels,
+            "frame": self.frame,
+            "layers": self.layers,
+        }
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                classes=self.classes.astype(np.uint8),
+                confidence=self.confidence.astype(np.uint8),
+                meta=np.asarray(json.dumps(meta)),
+            )
+        os.replace(temporary, path)
+
+    @classmethod
+    def load(cls, path: Path) -> LayerProposal:
+        with np.load(path, allow_pickle=False) as archive:
+            meta = json.loads(str(archive["meta"]))
+            if meta.get("format") != LAYER_PROPOSAL_FORMAT:
+                raise ValueError("Unsupported layer proposal file")
+            return cls(
+                classes=np.asarray(archive["classes"], dtype=np.uint8),
+                confidence=np.asarray(archive["confidence"], dtype=np.uint8),
+                image_size=(int(meta["image_size"][0]), int(meta["image_size"][1])),
+                digest=str(meta.get("digest") or ""),
+                created_utc=str(meta.get("created_utc") or ""),
+                elapsed_s=float(meta.get("elapsed_s") or 0.0),
+                stroke_count=int(meta.get("stroke_count") or 0),
+                merged_regions=int(meta.get("merged_regions") or 0),
+                min_region_pixels=int(meta.get("min_region_pixels") or 0),
+                frame=meta.get("frame"),
+                layers=list(meta.get("layers") or []),
+            )
+
+    def uncertain(self) -> np.ndarray:
+        return (self.classes != OUTSIDE) & (
+            self.confidence < int(round(255 * UNCERTAIN_BELOW))
+        )
+
+
+def _region_counts(classes: np.ndarray) -> dict[int, tuple[int, int]]:
+    """Pixels and connected regions (4-connected) of each class."""
+
+    from scipy import ndimage as ndi
+
+    structure = ndi.generate_binary_structure(2, 1)
+    result: dict[int, tuple[int, int]] = {}
+    counts = np.bincount(classes.ravel(), minlength=256)
+    for value in np.flatnonzero(counts):
+        _labels, regions = ndi.label(classes == value, structure=structure)
+        result[int(value)] = (int(counts[value]), int(regions))
+    return result
+
+
+def propose_layers(
+    image: PaintingImage,
+    session: PaintingSession,
+    *,
+    frame: RigFrame | None = None,
+    n_estimators: int = 100,
+    max_samples_per_layer: int = 6000,
+    random_seed: int = 20_261_010,
+    progress: ProgressCallback | None = None,
+) -> LayerProposal:
+    """Label every pixel inside the rig frame with one of the painted layers."""
+
+    import cv2
+    from sklearn.ensemble import ExtraTreesClassifier
+
+    started = time.monotonic()
+    if session.image_size and tuple(session.image_size) != tuple(image.image_size):
+        raise ValueError(
+            "The strokes were painted on a photograph of another size "
+            f"({session.image_size[0]} x {session.image_size[1]} px)."
+        )
+    shape = image.analysis_shape
+    scale = image.analysis_scale()
+    painted = rasterize_strokes(session.strokes, shape, scale)
+    inside = frame_mask(frame, shape, scale)
+    painted[~inside] = 0
+    counts = np.bincount(painted.ravel(), minlength=256)
+    layer_ids = [int(value) for value in np.flatnonzero(counts) if value != 0]
+    if len(layer_ids) < 2:
+        raise ValueError(
+            "Paint at least two layers (inside the rig frame) before proposing "
+            "boundaries."
+        )
+
+    _progress(progress, "Computing image features…")
+    features = image.features()
+    rng = np.random.default_rng(int(random_seed))
+    flat = painted.ravel()
+    sample_index: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    for layer_id in layer_ids:
+        index = np.flatnonzero(flat == layer_id)
+        if index.size > max_samples_per_layer:
+            index = rng.choice(index, int(max_samples_per_layer), replace=False)
+        sample_index.append(index)
+        targets.append(np.full(index.size, layer_id, dtype=np.uint8))
+    _progress(progress, "Training on the painted pixels…")
+    model = ExtraTreesClassifier(
+        n_estimators=max(8, int(n_estimators)),
+        min_samples_leaf=2,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=int(random_seed),
+    )
+    model.fit(features[np.concatenate(sample_index)], np.concatenate(targets))
+    classes_order = [int(value) for value in model.classes_]
+
+    _progress(progress, "Labelling the photograph…")
+    inside_index = np.flatnonzero(inside.ravel())
+    probabilities = np.zeros((shape[0] * shape[1], len(classes_order)), np.float32)
+    chunk = 200_000
+    for start in range(0, inside_index.size, chunk):
+        part = inside_index[start : start + chunk]
+        probabilities[part] = model.predict_proba(features[part])
+    probabilities = probabilities.reshape(shape[0], shape[1], len(classes_order))
+
+    sigma = SMOOTHING_SIGMA.get(session.smoothing, SMOOTHING_SIGMA["medium"])
+    weight = cv2.GaussianBlur(inside.astype(np.float32), (0, 0), sigma)
+    np.maximum(weight, 1.0e-6, out=weight)
+    for index in range(len(classes_order)):
+        layer = np.ascontiguousarray(probabilities[..., index])
+        probabilities[..., index] = cv2.GaussianBlur(layer, (0, 0), sigma) / weight
+    best = np.argmax(probabilities, axis=2)
+    confidence = np.take_along_axis(probabilities, best[..., None], axis=2)[..., 0]
+    classes = np.asarray(classes_order, dtype=np.uint8)[best]
+    classes[~inside] = OUTSIDE
+    classes[painted > 0] = painted[painted > 0]
+
+    _progress(progress, "Merging small islands…")
+    min_pixels = minimum_region_pixels(
+        session.min_region_cm2, frame, scale, int(np.count_nonzero(inside))
+    )
+    classes, merged = merge_small_regions(classes, min_pixels, protected=painted)
+    confidence = np.clip(np.rint(255.0 * confidence), 0, 255).astype(np.uint8)
+    confidence[~inside] = 255
+
+    summary = _region_counts(classes)
+    layers = []
+    for layer in session.layers:
+        pixels, regions = summary.get(layer.layer_id, (0, 0))
+        layers.append(
+            {
+                "layer_id": layer.layer_id,
+                "name": layer.name,
+                "pixels": pixels,
+                "regions": regions,
+                "painted": layer.layer_id in layer_ids,
+            }
+        )
+    return LayerProposal(
+        classes=classes,
+        confidence=confidence,
+        image_size=tuple(image.image_size),
+        digest=proposal_digest(session, frame),
+        created_utc=utc_now(),
+        elapsed_s=round(time.monotonic() - started, 2),
+        stroke_count=len(session.strokes),
+        merged_regions=int(merged),
+        min_region_pixels=int(min_pixels),
+        frame=_frame_key(frame),
+        layers=layers,
+    )
+
+
+def load_proposal(project: FluidFlowerProject, run_id: str) -> LayerProposal | None:
+    path = proposal_path(project, run_id)
+    if not path.is_file():
+        return None
+    try:
+        return LayerProposal.load(path)
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Revision and export
+
+
+def upsample_classes(
+    classes: np.ndarray,
+    size: tuple[int, int],
+    values: Sequence[int],
+    *,
+    sigma: float = 0.6,
+    strip_rows: int = 512,
+) -> np.ndarray:
+    """Classes on a finer grid with smooth boundaries.
+
+    Each class indicator is slightly blurred and bilinearly interpolated; every
+    pixel takes the class with the largest value. ``size`` is (width, height).
+    """
+
+    import cv2
+
+    width, height = int(size[0]), int(size[1])
+    grid_height, grid_width = classes.shape
+    indicators = [
+        cv2.GaussianBlur((classes == value).astype(np.float32), (0, 0), sigma)
+        for value in values
+    ]
+    map_x = (np.arange(width, dtype=np.float32) + 0.5) * (grid_width / width) - 0.5
+    output = np.zeros((height, width), dtype=np.uint8)
+    for start in range(0, height, strip_rows):
+        stop = min(height, start + strip_rows)
+        rows = (np.arange(start, stop, dtype=np.float32) + 0.5) * (
+            grid_height / height
+        ) - 0.5
+        map_xs = np.ascontiguousarray(np.broadcast_to(map_x, (stop - start, width)))
+        map_ys = np.ascontiguousarray(
+            np.broadcast_to(rows[:, None], (stop - start, width))
+        )
+        best = np.full((stop - start, width), -1.0, dtype=np.float32)
+        strip = np.zeros((stop - start, width), dtype=np.uint8)
+        for value, indicator in zip(values, indicators):
+            sampled = cv2.remap(
+                indicator,
+                map_xs,
+                map_ys,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            better = sampled > best
+            best[better] = sampled[better]
+            strip[better] = int(value)
+        output[start:stop] = strip
+    return output
+
+
+def facies_ids(session: PaintingSession, present: Sequence[int]) -> dict[str, int]:
+    """Facies numbers 1, 2, ... in the order of the painted layers."""
+
+    order: dict[str, int] = {}
+    for layer in session.layers:
+        if layer.layer_id in present and layer.facies not in order:
+            order[layer.facies] = len(order) + 1
+    return order
+
+
+def check_ready_for_revision(
+    session: PaintingSession,
+    proposal: LayerProposal | None,
+    frame: RigFrame | None,
+    reference: SeriesRunInputs | None,
+) -> list[str]:
+    """Reasons why the proposal cannot be saved yet (empty when it can)."""
+
+    problems: list[str] = []
+    if reference is None or reference.baseline_image is None:
+        problems.append("The reference run has no baseline photograph.")
+    if proposal is None:
+        problems.append("Propose the boundaries first (step 3).")
+        return problems
+    if proposal.digest != proposal_digest(session, frame):
+        problems.append(
+            "The strokes, settings or rig frame changed after the last proposal; "
+            "propose the boundaries again."
+        )
+    size = _rig_size(frame, reference)
+    if size is None:
+        problems.append(
+            "Enter the rig's inner width and height (step 1); the revision needs "
+            "the rig size."
+        )
+    present = {int(row["layer_id"]) for row in proposal.layers if row.get("pixels")}
+    missing: list[str] = []
+    for name in facies_ids(session, sorted(present)):
+        entry = session.facies.get(name, FaciesEntry())
+        if entry.role != "porous_medium":
+            continue
+        porosity_ok = entry.porosity is not None and 0.0 < entry.porosity <= 1.0
+        permeability_ok = entry.permeability is not None and entry.permeability > 0
+        if not (porosity_ok and permeability_ok):
+            missing.append(name)
+    if missing:
+        problems.append(
+            "Enter porosity (0-1) and a positive permeability for "
+            + ", ".join(missing)
+            + " (step 4)."
+        )
+    regions = proposal_region_count(proposal)
+    if regions > NATIVE_MAX_REGIONS:
+        problems.append(
+            f"The proposal has {regions} regions; native Setup supports at most "
+            f"{NATIVE_MAX_REGIONS}. Raise 'Merge regions under' or paint over "
+            "small islands, and propose again."
+        )
+    return problems
+
+
+def proposal_region_count(proposal: LayerProposal) -> int:
+    """Connected regions of a proposal, the area outside the frame included."""
+
+    count = sum(int(row.get("regions") or 0) for row in proposal.layers)
+    if np.any(proposal.classes == OUTSIDE):
+        count += 1
+    return count
+
+
+def _rig_size(
+    frame: RigFrame | None, reference: SeriesRunInputs | None
+) -> tuple[float, float] | None:
+    if frame is not None and frame.has_size():
+        return float(frame.width_m), float(frame.height_m)
+    if reference is not None and reference.width_m and reference.height_m:
+        return float(reference.width_m), float(reference.height_m)
+    return None
+
+
+def painted_label_map(
+    session: PaintingSession,
+    proposal: LayerProposal,
+    *,
+    frame: RigFrame | None,
+    progress: ProgressCallback | None = None,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Label map on the raw photograph's grid and one region row per label."""
+
+    from scipy import ndimage as ndi
+
+    width, height = proposal.image_size
+    present = [
+        int(value)
+        for value in np.flatnonzero(
+            np.bincount(proposal.classes.ravel(), minlength=256)
+        )
+        if value != OUTSIDE
+    ]
+    _progress(progress, "Scaling the layers to the photograph's full resolution…")
+    classes = upsample_classes(proposal.classes, (width, height), present)
+    scale = (1.0, 1.0)
+    inside = frame_mask(frame, (height, width), scale)
+    classes[~inside] = OUTSIDE
+    grid_ratio = (width / proposal.classes.shape[1]) * (
+        height / proposal.classes.shape[0]
+    )
+    # Islands were merged on the analysis grid, where painted regions are
+    # protected; here only slivers of the upsampling (two grid cells) go.
+    min_pixels = int(math.ceil(2.0 * grid_ratio))
+    _progress(progress, "Cleaning up small regions…")
+    classes, _merged = merge_small_regions(classes, min_pixels)
+    del inside
+
+    _progress(progress, "Numbering the regions…")
+    structure = ndi.generate_binary_structure(2, 1)
+    labels = np.zeros((height, width), dtype=np.uint16)
+    order = facies_ids(session, present)
+    regions: list[dict[str, Any]] = []
+    next_label = 1
+    for layer in session.layers:
+        if layer.layer_id not in present:
+            continue
+        components = np.zeros((height, width), dtype=np.int32)
+        count = ndi.label(
+            classes == layer.layer_id, structure=structure, output=components
+        )
+        if not count:
+            continue
+        if next_label + count > np.iinfo(np.uint16).max:
+            raise ValueError("Too many regions; merge small islands first.")
+        sizes = np.bincount(components.ravel(), minlength=count + 1)
+        entry = session.facies.get(layer.facies, FaciesEntry())
+        porous = entry.role == "porous_medium"
+        table = np.zeros(count + 1, dtype=np.uint16)
+        for rank, component in enumerate(
+            sorted(range(1, count + 1), key=lambda value: -int(sizes[value])), start=1
+        ):
+            table[component] = next_label
+            regions.append(
+                {
+                    "label_id": next_label,
+                    "facies_id": order[layer.facies],
+                    "name": layer.facies,
+                    "layer": layer.name,
+                    "layer_id": layer.layer_id,
+                    "region_index": rank,
+                    "pixels": int(sizes[component]),
+                    "analysis_role": entry.role,
+                    "porosity": entry.porosity if porous else None,
+                    "permeability": entry.permeability if porous else None,
+                    "enabled": entry.role != "excluded",
+                }
+            )
+            next_label += 1
+        labels += table[components]
+        del components
+    outside = classes == OUTSIDE
+    if np.any(outside):
+        components = np.zeros((height, width), dtype=np.int32)
+        count = ndi.label(outside, structure=structure, output=components)
+        if next_label + count > np.iinfo(np.uint16).max:
+            raise ValueError("Too many regions; merge small islands first.")
+        sizes = np.bincount(components.ravel(), minlength=count + 1)
+        facies_id = len(order) + 1
+        table = np.zeros(count + 1, dtype=np.uint16)
+        for rank, component in enumerate(range(1, count + 1), start=1):
+            table[component] = next_label
+            regions.append(
+                {
+                    "label_id": next_label,
+                    "facies_id": facies_id,
+                    "name": OUTSIDE_FACIES,
+                    "layer": OUTSIDE_FACIES,
+                    "layer_id": OUTSIDE,
+                    "region_index": rank,
+                    "pixels": int(sizes[component]),
+                    "analysis_role": "frame",
+                    "porosity": None,
+                    "permeability": None,
+                    "enabled": False,
+                }
+            )
+            next_label += 1
+        labels += table[components]
+        del components
+    return labels, regions
+
+
+def revision_injectors(
+    project: FluidFlowerProject,
+    frame: RigFrame | None,
+    size: tuple[float, float],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The series' injection points as revision injectors.
+
+    Points without rig coordinates or outside the rig are left out; their IDs
+    are returned as the second value.
+    """
+
+    injectors: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    width_m, height_m = size
+    for point in _resolved_points(saved_injection_points(project), frame):
+        identifier = str(point.get("location_id") or "").strip()
+        x_m, y_m = _number(point.get("x_m")), _number(point.get("y_m"))
+        if (
+            not identifier
+            or x_m is None
+            or y_m is None
+            or not (0.0 <= x_m <= width_m and 0.0 <= y_m <= height_m)
+        ):
+            skipped.append(identifier or "unnamed point")
+            continue
+        injectors.append(
+            {
+                "injector_id": identifier,
+                "protocol_location_id": identifier,
+                "name": str(point.get("name") or "").strip() or identifier,
+                "x_m": x_m,
+                "y_m": y_m,
+                "uncertainty_m": None,
+                "coordinate_source": (
+                    "geometry workspace: " + str(point.get("source") or "typed")
+                ),
+            }
+        )
+    return injectors, skipped
+
+
+def save_painted_revision(
+    project: FluidFlowerProject,
+    session: PaintingSession,
+    proposal: LayerProposal,
+    reference: SeriesRunInputs,
+    *,
+    frame: RigFrame | None,
+    actor: str = "",
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Store the proposal as a validated geometry revision."""
+
+    from darsia.fluidflower.geometry_facies import (
+        GeometryRevisionStore,
+        _save_darsia_field,
+        default_geometry_config,
+        validate_geometry_config,
+    )
+
+    problems = check_ready_for_revision(session, proposal, frame, reference)
+    if problems:
+        raise ValueError(" ".join(problems))
+    assert reference.baseline_image is not None
+    width_px, height_px = photo_size(reference.baseline_image)
+    if (width_px, height_px) != tuple(proposal.image_size):
+        raise ValueError(
+            f"The baseline photograph of {reference.run_id} has {width_px} x "
+            f"{height_px} px; the layers were painted on a "
+            f"{proposal.image_size[0]} x {proposal.image_size[1]} px photograph."
+        )
+    size = _rig_size(frame, reference)
+    assert size is not None
+    width_m, height_m = size
+
+    labels, regions = painted_label_map(
+        session, proposal, frame=frame, progress=progress
+    )
+    if len(regions) > NATIVE_MAX_REGIONS:
+        raise ValueError(
+            f"The layers form {len(regions)} regions; native Setup supports at most "
+            f"{NATIVE_MAX_REGIONS}. Raise 'Merge regions under' or paint over small "
+            "islands, and propose again."
+        )
+    injectors, skipped = revision_injectors(project, frame, (width_m, height_m))
+    _progress(progress, "Writing the label map…")
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    destination = (
+        Path(project.root)
+        / "overrides"
+        / "geometry_facies"
+        / "painted"
+        / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    )
+    destination.mkdir(parents=True, exist_ok=False)
+    labels_path = destination / "labels.npz"
+    depth_path = destination / "depth.npz"
+    _save_darsia_field(labels_path, labels, width_m=width_m, height_m=height_m)
+    shape = labels.shape
+    del labels
+    _save_darsia_field(
+        depth_path,
+        np.full(shape, PLACEHOLDER_DEPTH_M, dtype=np.float32),
+        width_m=width_m,
+        height_m=height_m,
+    )
+    session_file = session_path(project, session.run_id)
+    (destination / "regions.json").write_text(
+        json.dumps(regions, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    config = default_geometry_config(project)
+    config.update(
+        {
+            "baseline_path": str(reference.baseline_image),
+            "depth_path": str(depth_path),
+            "labels_path": str(labels_path),
+            "display_image_path": str(reference.baseline_image),
+            "draft_source_image_path": str(reference.baseline_image),
+            "width_m": float(width_m),
+            "height_m": float(height_m),
+            "grouping_mode": "shared_facies",
+            "permeability_unit": session.permeability_unit,
+            "regions": regions,
+            "injectors": injectors,
+            "depth_note": (
+                "Constant placeholder; native Setup takes the depth from its own "
+                "[depth] section."
+            ),
+            "facies_generation": {
+                "method": PROPOSAL_METHOD,
+                "status": "painted layers reviewed in the layer view",
+                "reference_run": reference.run_id,
+                "source_image_path": str(reference.baseline_image),
+                "session_path": str(session_file),
+                "proposal_digest": proposal.digest,
+                "proposal_created_utc": proposal.created_utc,
+                "stroke_count": len(session.strokes),
+                "layers": [
+                    {
+                        "layer_id": layer.layer_id,
+                        "name": layer.name,
+                        "facies": layer.facies,
+                    }
+                    for layer in session.layers
+                ],
+                "smoothing": session.smoothing,
+                "min_region_cm2": session.min_region_cm2,
+                "rig_frame": _frame_key(frame),
+                "injection_points_left_out": skipped,
+            },
+        }
+    )
+    _progress(progress, "Validating…")
+    validation = validate_geometry_config(config)
+    errors = [
+        str(row.get("message") or row.get("code") or "")
+        for row in validation.get("issues") or []
+        if row.get("severity") == "error"
+    ]
+    if errors:
+        raise ValueError("The revision is not valid: " + "; ".join(errors))
+    _progress(progress, "Saving the revision…")
+    used = {int(row["layer_id"]) for row in regions}
+    names = ", ".join(layer.name for layer in session.layers if layer.layer_id in used)
+    return GeometryRevisionStore(project).save_revision(
+        config,
+        actor=actor,
+        reason=f"Painted layers of run {reference.run_id}: {names}",
+        validation=validation,
+    )
+
+
+__all__ = [
+    "DEFAULT_LAYERS",
+    "ERASER",
+    "LAYER_COLORS",
+    "LAYER_ROLES",
+    "OUTSIDE",
+    "OUTSIDE_FACIES",
+    "PERMEABILITY_UNITS",
+    "SMOOTHING_SIGMA",
+    "FaciesEntry",
+    "LayerProposal",
+    "PaintedLayer",
+    "PaintingImage",
+    "PaintingSession",
+    "Stroke",
+    "check_ready_for_revision",
+    "enhance_contrast",
+    "facies_ids",
+    "frame_mask",
+    "frame_pixels_per_metre",
+    "load_painting_image",
+    "load_painting_session",
+    "load_proposal",
+    "merge_small_regions",
+    "minimum_region_pixels",
+    "painted_label_map",
+    "painting_folder",
+    "proposal_digest",
+    "proposal_path",
+    "propose_layers",
+    "rasterize_strokes",
+    "save_painted_revision",
+    "save_painting_session",
+    "session_path",
+    "upsample_classes",
+]

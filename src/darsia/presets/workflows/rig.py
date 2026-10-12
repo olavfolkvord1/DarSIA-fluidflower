@@ -5,6 +5,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Any
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -624,7 +625,16 @@ class Rig:
         # Fetch samples for illumination correction based on labels and baseline.
         if config is not None:
             sample_groups = []
-            if not config.labels:
+            if config.samples:
+                # Explicit windows from the configuration form a single group, e.g.
+                # hand-picked sand windows; labels/width/num_samples/seed are ignored.
+                sample_groups.append(
+                    [
+                        (slice(row_start, row_stop), slice(col_start, col_stop))
+                        for row_start, row_stop, col_start, col_stop in config.samples
+                    ]
+                )
+            elif not config.labels:
                 # If no labels specified, use random samples from the whole image.
                 samples = illumination_correction.select_random_samples(
                     mask=darsia.ones_like(self.shape_corrected_baseline, dtype=bool),
@@ -642,18 +652,39 @@ class Rig:
                     )
                     sample_groups.append(samples)
 
+            # Reference sample for the closed-form method: an index, or the sample
+            # whose centre has the smallest row + column ("top_left").
+            reference_sample = getattr(config, "reference_sample", 0)
+            if isinstance(reference_sample, str):
+                first_group = sample_groups[0] if sample_groups else []
+                if not first_group:
+                    raise ValueError(
+                        "reference_sample='top_left' needs at least one sample window."
+                    )
+                centres = [
+                    (s[0].start + s[0].stop) // 2 + (s[1].start + s[1].stop) // 2
+                    for s in first_group
+                ]
+                reference_sample = int(np.argmin(centres))
+
             # Determine illumination correction based on inputs
             illumination_correction.setup(
                 # Use shape-corrected baseline as explicit setup input.
                 base=self.shape_corrected_baseline,
                 sample_groups=sample_groups,
-                mask=self.boolean_porosity,
+                mask=(
+                    self.boolean_porosity
+                    if getattr(config, "use_porosity_mask", True)
+                    else None
+                ),
                 outliers=config.outliers,
                 filter=lambda x: skimage.filters.gaussian(x, sigma=config.sigma),
                 colorspace=config.colorspace,
                 interpolation=config.interpolation,
                 show_plot=show_plot,
                 log=log,
+                method=getattr(config, "method", "group_average"),
+                reference_sample=reference_sample,
             )
 
         return illumination_correction
@@ -1208,7 +1239,7 @@ class Rig:
         else:
             return darsia.ScalarImage(values_reshaped, **metadata)
 
-    def read_image(self, path: Path) -> darsia.Image:
+    def read_image(self, path: Path, dtype: Any = float) -> darsia.Image:
         """Read image from file and apply corrections.
 
         The respective date is extracted from the path using the imaging protocol.
@@ -1217,6 +1248,8 @@ class Rig:
         ----------
         path : Path
             Path to the image file.
+        dtype : numpy dtype, optional
+            Floating-point type used when reading optical input.
 
         Returns
         -------
@@ -1236,6 +1269,7 @@ class Rig:
             date=date,
             reference_date=self.reference_date,
             name=path.name,
+            dtype=dtype,
         )
 
         return img
