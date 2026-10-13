@@ -131,6 +131,26 @@ def test_metadata_publication_recovers_without_replaying_science(tmp_path, monke
     assert shared.aggregate()["complete"] is True
 
 
+def test_repeated_recovery_of_completed_run_performs_no_writes(tmp_path, monkeypatch):
+    shared = JobQueue(tmp_path)
+    shared.enqueue(task())
+    claim = shared.claim("machine", "cpu", OWNER)
+    shared.complete(claim, result(claim))
+    before = {p.relative_to(tmp_path): (p.read_bytes(), p.stat().st_mtime_ns)
+              for p in tmp_path.rglob("*") if p.is_file()}
+
+    def unexpected_write(*args, **kwargs):
+        raise AssertionError("Recovery tried to write an already matching publication")
+
+    monkeypatch.setattr("darsia.fluidflower.job_queue.write_immutable", unexpected_write)
+    for _ in range(10):
+        shared.recover_publications()
+    after = {p.relative_to(tmp_path): (p.read_bytes(), p.stat().st_mtime_ns)
+             for p in tmp_path.rglob("*") if p.is_file()}
+    assert after == before
+    assert not list(tmp_path.rglob("*.partial"))
+
+
 def test_output_files_do_not_imply_completion(tmp_path):
     shared = JobQueue(tmp_path)
     shared.enqueue(task())

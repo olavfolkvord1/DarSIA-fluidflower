@@ -584,6 +584,32 @@ def _publish_frame(output,manifest,manifest_asset,spec,evaluated,config,backend,
 
 def run_n1(task: dict, output: Path, backend: str, precision: str,
            on_progress: Callable | None = None) -> dict:
+    """Run one N1 selection under measured, restored CPU thread limits.
+
+    Thread admission is independent of the scientific formula. Import the
+    numerical libraries before limiting their pools, then cover setup, every
+    frame and publication in the same limit context.
+    """
+    threads = task.get("threads", 1)
+    if type(threads) is not int or threads < 1:
+        raise ValueError("task.threads must be a positive integer")
+    import cv2
+    import scipy.linalg
+    from threadpoolctl import threadpool_info, threadpool_limits
+
+    previous_cv2_threads = cv2.getNumThreads()
+    try:
+        cv2.setNumThreads(threads)
+        with threadpool_limits(limits=threads):
+            runtime = {"requested_threads": threads, "cv2_threads": cv2.getNumThreads(),
+                       "threadpools": threadpool_info()}
+            return _run_n1(task, output, backend, precision, on_progress, thread_runtime=runtime)
+    finally:
+        cv2.setNumThreads(previous_cv2_threads)
+
+
+def _run_n1(task: dict, output: Path, backend: str, precision: str,
+            on_progress: Callable | None = None, *, thread_runtime: dict) -> dict:
     """Compute one configured whole run once and publish Main-format frames.
 
     ``task.configuration`` is a full descriptor of the explicit run data;
@@ -613,7 +639,8 @@ def run_n1(task: dict, output: Path, backend: str, precision: str,
     records=[]
     try:
         pipeline=N1Pipeline(config,precision=precision,pixel_math=math,unc_only=unc_only)
-        settings=dict(host=socket.gethostname(),backend=backend,precision=precision,threads=int(task.get("threads",1)))
+        settings=dict(host=socket.gethostname(),backend=backend,precision=precision,
+                      threads=task.get("threads",1),thread_runtime=thread_runtime)
         commit=task.get("commit")
         if not isinstance(commit,str) or len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
             raise ValueError("The caller must provide the actual full Git commit")

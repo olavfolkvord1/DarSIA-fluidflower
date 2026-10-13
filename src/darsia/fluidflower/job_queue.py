@@ -364,19 +364,28 @@ class JobQueue:
         run = name(value["run"])
         target = (self.root / "results" / run / "completed.json"
                   if publication["success"] else self.root / "failed" / (run + ".json"))
-        try:
-            write_immutable(target, value)
-        except FileExistsError:
+        if target.exists():
             if read_json(target) != value:
                 raise ValueError("A different terminal result already exists")
+        else:
+            try:
+                write_immutable(target, value)
+            except FileExistsError:
+                if read_json(target) != value:
+                    raise ValueError("A different terminal result already exists")
         if publication["success"]:
             done = dict(run=value["run"], attempt_id=publication["attempt_id"],
                         completed=descriptor(target))
-            try:
-                write_immutable(self.root / "done" / (run + ".json"), done)
-            except FileExistsError:
-                if read_json(self.root / "done" / (run + ".json")) != done:
+            done_path = self.root / "done" / (run + ".json")
+            if done_path.exists():
+                if read_json(done_path) != done:
                     raise ValueError("Done identity changed")
+            else:
+                try:
+                    write_immutable(done_path, done)
+                except FileExistsError:
+                    if read_json(done_path) != done:
+                        raise ValueError("Done identity changed")
 
     def recover_publications(self) -> None:
         for directory in (self.root / "publishing").iterdir():

@@ -137,6 +137,10 @@ def test_real_tiny_native_path_and_main_storage(tiny_config,tmp_path):
     assert result["complete"] and result["worker_references_closed"]
     assert result["ordered_case_ids"] == ["sample_1","sample_3"]
     assert result["frames"] == 2 and result["wall_seconds"] > 0 and result["images_per_hour"] > 0
+    manifest=json.loads(Path(result["manifest"]["path"]).read_bytes())
+    runtime=manifest["settings"]["thread_runtime"]
+    assert runtime["requested_threads"] == 1 and runtime["cv2_threads"] == 1
+    assert all(pool["num_threads"] == 1 for pool in runtime["threadpools"])
     assert len(events) == 4
     for publication in result["records"]:
         root=Path(publication["nas_directory"])
@@ -299,3 +303,34 @@ def test_qualified_cuda_provider_is_unchanged():
     path=Path(pipeline.__file__).with_name("mass_cuda.py")
     assert len(path.read_bytes()) == 26135
     assert hashlib.sha256(path.read_bytes()).hexdigest() == "ebc695edf36bc308b7f994d589c0de74660c1f692c8d09b25d764ba351a9e5ea"
+
+
+def test_thread_limits_apply_inside_run_and_restore(monkeypatch,tmp_path):
+    """Measure real OpenCV/BLAS limits inside the body, then restore them."""
+    import cv2
+    import scipy.linalg
+    from threadpoolctl import threadpool_info
+    previous_cv2=cv2.getNumThreads()
+    before={pool["filepath"]:pool["num_threads"] for pool in threadpool_info()}
+    seen={}
+    def body(task,output,backend,precision,on_progress,*,thread_runtime):
+        """Observe actual runtime configuration at the scientific boundary."""
+        seen.update(thread_runtime)
+        assert cv2.getNumThreads() == 1
+        assert all(pool["num_threads"] == 1 for pool in threadpool_info())
+        return {"complete":True}
+    monkeypatch.setattr(pipeline,"_run_n1",body)
+    assert pipeline.run_n1({"threads":1},tmp_path/"not-created","cpu","float32")["complete"]
+    assert seen["requested_threads"] == 1 and seen["cv2_threads"] == 1
+    assert cv2.getNumThreads() == previous_cv2
+    assert {pool["filepath"]:pool["num_threads"] for pool in threadpool_info()} == before
+    assert not (tmp_path/"not-created").exists()
+
+
+@pytest.mark.parametrize("threads",[0,-1,True,1.0,"1",None])
+def test_invalid_thread_request_rejected_before_outputs(threads,tmp_path):
+    """Bad resource metadata cannot be silently coerced or create an output."""
+    output=tmp_path/"not-created"
+    with pytest.raises(ValueError,match="positive integer"):
+        pipeline.run_n1({"threads":threads},output,"cpu","float32")
+    assert not output.exists()
