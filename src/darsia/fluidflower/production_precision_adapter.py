@@ -463,78 +463,20 @@ class PrecisionAdapter:
         return result
 
     def evaluate_main(self, response, anchor, *, selected_calibration, domain_masks, kept_fields=()):
-        import numpy as np
-        context, math, retained = self.context, self.math, self.retained
-        if response.get("precision") != self.precision:
-            raise ValueError("Response did not use this explicit working precision")
-        if set(kept_fields)-retained.FIELDS or set(domain_masks) != {"full_rig", "box1", "box2"}:
-            raise ValueError("Supported retained fields and all three frozen domain masks are required")
-        parameters, digest = retained._selected_n1(context.modules, selected_calibration, context.asset_reader)
+        """Retain historical admission and delegate canonical native N1 math."""
+        from .n1_arithmetic import evaluate_main
+        parameters, digest = self.retained._selected_n1(self.context.modules, selected_calibration, self.context.asset_reader)
         if response.get("frozen_parameters") != parameters:
             raise ValueError("Response differs from the one frozen production calibration")
-        engine, frame = context.modules["engine"], response["frame"]
-        for name, mask in domain_masks.items():
-            if not isinstance(mask, np.ndarray) or mask.dtype != bool or mask.shape != frame.domain.shape:
-                raise ValueError("Frozen domain mask differs from the native full-resolution grid")
-            if name == "full_rig" and not np.array_equal(mask, frame.domain):
-                raise ValueError("Full-rig domain must be the exact original frozen phase domain")
-        analysis, physics = response["analysis"], response["physics"]
-        partition = retained._main_partition(response)  # original finite/positive physics guards
-        factor = engine.r2.dilution_factor(frame.elapsed_h, partition["affected_pore_volume_m3"],
-                                          anchor, parameters.get("beta", 0.))
-        maps = math.selected_n1_fields(response["prepared"].aqueous_relative,
-            gain=parameters["gain"], factor=factor, swi=response["swi"],
-            aqueous_known=partition["aq_known"], gas_known=partition["gas_known"],
-            solubility=physics.solubility_co2, gas_density=physics.density_gaseous_co2)
-        eligible = frame.mass_eligible_mask & frame.known_physical_domain
-        def integrate(value, mask):
-            # Original Geometry.integrate itself remains unchanged; its weights
-            # are genuinely float64 before multiply and repeated axis-zero sums.
-            analysis.geometry._prepare_cached_voxel_volume(list(value.shape[:analysis.geometry.space_dim]))
-            if np.asarray(analysis.geometry.cached_voxel_volume).dtype != np.float64:
-                raise TypeError("Geometry weights must be float64 before reduction")
-            return float(analysis.geometry.integrate(np.where(mask, value, 0.)))*1000
-        def masses(mask):
-            return dict(total_mass_g=integrate(maps["mass_total"], mask),
-                        aqueous_mass_g=integrate(maps["mass_aqueous"], mask),
-                        gas_mass_g=integrate(maps["mass_gas"], mask))
-        domains = {name: masses(eligible & mask) for name, mask in domain_masks.items()}
-        excluded, covered = {}, np.zeros(frame.domain.shape, bool)
-        for name, mask in sorted((frame.excluded_masks or {}).items()):
-            covered |= mask
-            excluded[name] = masses(mask)
-        excluded["other_not_mass_eligible"] = masses(frame.domain & ~frame.mass_eligible_mask & ~covered)
-        fields = {}
-        if "c_aq_g_l" in kept_fields or "unquantified_phase_mask" in kept_fields or "s_g" in kept_fields:
-            unknown = frame.domain & np.isin(frame.phase_labels, (1, 2)) & ~(
-                partition["aq_known"] | partition["gas_known"])
-            if "c_aq_g_l" in kept_fields:
-                concentration = maps["concentration"]
-                concentration[unknown] = np.nan
-                fields["c_aq_g_l"] = concentration
-            if "unquantified_phase_mask" in kept_fields:
-                fields["unquantified_phase_mask"] = unknown
-            if "s_g" in kept_fields:
-                gas = maps["gas"]
-                gas[unknown & (frame.phase_labels == 2)] = np.nan
-                fields["s_g"] = gas
-        if "c_aq_relative" in kept_fields: fields["c_aq_relative"] = maps["aqueous"]
-        if "phase_labels" in kept_fields: fields["phase_labels"] = frame.phase_labels.copy()
-        if "main_mass_eligible_mask" in kept_fields: fields["main_mass_eligible_mask"] = eligible
-        for name, value in (("mass_density_g_l", "mass_total"),
-                            ("aqueous_mass_density_g_l", "mass_aqueous"),
-                            ("gas_mass_density_g_l", "mass_gas")):
-            if name in kept_fields: fields[name] = maps[value]
-        return dict(contract="darsia-production-retained-main-precision-draft-v1", parameters=parameters,
-            calibration_sha256=digest, scalar_reference="native_final_calibration_fields", run=frame.run_id,
-            frame_index=frame.frame_index, elapsed_h=frame.elapsed_h, dilution_factor=factor,
-            **domains["full_rig"], domains=domains, excluded_mass=excluded,
-            affected_pore_volume_m3=partition["affected_pore_volume_m3"], fields=fields,
-            precision=self.precision, pixel_backend=response["pixel_backend"],
-            pixel_backend_facts=self._facts(),
-            input_storage_dtype=response["input_storage_dtype"], working_pixel_dtype=self.precision,
-            parameter_dtype="float64", reduction_dtype="float64",
-            scientific_eligibility=False, production_permission_granted=False)
+        if response.get("precision") != self.precision:
+            raise ValueError("Response did not use this explicit working precision")
+        result = evaluate_main(response, anchor, parameters=parameters, pixel_math=self.math,
+            calibration_sha256=digest, domain_masks=domain_masks, kept_fields=kept_fields)
+        result["contract"] = "darsia-production-retained-main-precision-draft-v1"
+        result["pixel_backend"] = response["pixel_backend"]
+        result["pixel_backend_facts"] = self._facts()
+        result["input_storage_dtype"] = response["input_storage_dtype"]
+        return result
 
     def run_case(self, case_id, *, selected_calibration, anchor, domain_masks, kept_fields):
         loaded = self.load_response(case_id, selected_calibration=selected_calibration)
@@ -548,29 +490,6 @@ class PrecisionAdapter:
         return result
 
     def main_products(self, result):
-        """Original retained export/mask/units, with truthful chosen mass dtype."""
-        import numpy as np
-        if result.get("precision") != self.precision:
-            raise ValueError("Products differ from the declared working precision")
-        fields = result["fields"]
-        required = {"c_aq_g_l", "s_g", "phase_labels", "main_mass_eligible_mask",
-                    "mass_density_g_l", "aqueous_mass_density_g_l", "gas_mass_density_g_l"}
-        if not required.issubset(fields):
-            raise ValueError("Every retained native §3 product and the main mask must be present")
-        mask = fields["main_mass_eligible_mask"]
-        if not isinstance(mask, np.ndarray) or mask.dtype != bool:
-            raise ValueError("Main product mask must retain the original boolean grid")
-        products = dict(concentration_aqueous=fields["c_aq_g_l"], saturation_free_gas=fields["s_g"],
-                        phase_labels=fields["phase_labels"])
-        for name, native in (("mass_total", "mass_density_g_l"),
-                             ("mass_aqueous", "aqueous_mass_density_g_l"),
-                             ("mass_free_gas", "gas_mass_density_g_l")):
-            value = fields[native]
-            if value.dtype != self.math.dtype or value.shape != mask.shape:
-                raise ValueError("Retained mass map must keep chosen precision and exact grid")
-            products[name] = np.where(mask, value, 0.)
-        return dict(products=products, units={"concentration_aqueous": "g/L", "saturation_free_gas": "1",
-            "mass_total": "g/L", "mass_aqueous": "g/L", "mass_free_gas": "g/L", "phase_labels": "category"},
-            required_transport_weight_units="L pore volume per pixel", native_mass_scalar_units="g",
-            main_mask_applied=True, raw_native_fields_retained=True, precision=self.precision,
-            pixel_backend=result["pixel_backend"], scientific_eligibility=False, production_permission_granted=False)
+        """Compatibility ABI for the canonical retained product export."""
+        from .n1_arithmetic import main_products
+        return main_products(result, self.math)

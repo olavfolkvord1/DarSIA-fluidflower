@@ -217,145 +217,29 @@ def choose_alignment(ac28_measurement, group_measurements, *, elapsed_seconds, e
 
 
 def fill_to_edges(facies, rig_domain, *, sand_labels):
-    """Fill facies0 from ORIGINAL sand: nearest same row, column, then global.
-
-    Equal row distances choose left; equal column distances choose above. The
-    global Euclidean nearest-pixel tie follows SciPy's deterministic EDT. Known
-    facies, including D/E/G, and all pixels outside the rig remain unchanged.
-    """
-    labels = np.asarray(facies)
-    if labels.ndim != 2 or not np.issubdtype(labels.dtype, np.integer) or np.any(labels < 0):
-        raise ValueError("Facies must be nonnegative native categorical values")
-    rig = _mask(rig_domain, labels.shape, "Rig domain")
-    allowed = tuple(map(int, sand_labels))
-    if not allowed or any(label <= 0 or label == 255 for label in allowed):
-        raise ValueError("Measured positive sand IDs are required")
-    sand = rig & np.isin(labels, allowed)
-    pending = rig & (labels == 0)
-    result, method = labels.copy(), np.zeros(labels.shape, np.uint8)
-    if pending.any() and not sand.any():
-        raise ValueError("No measured sand pixel exists for the prescribed fill")
-    for row in np.flatnonzero(pending.any(axis=1)):
-        donors, targets = np.flatnonzero(sand[row]), np.flatnonzero(pending[row])
-        if not len(donors): continue
-        right = np.searchsorted(donors, targets)
-        a, b = donors[np.clip(right-1, 0, len(donors)-1)], donors[np.clip(right, 0, len(donors)-1)]
-        selected = np.where(np.abs(targets-a) <= np.abs(b-targets), a, b)
-        result[row, targets], method[row, targets], pending[row, targets] = labels[row, selected], 1, False
-    for column in np.flatnonzero(pending.any(axis=0)):
-        donors, targets = np.flatnonzero(sand[:, column]), np.flatnonzero(pending[:, column])
-        if not len(donors): continue
-        below = np.searchsorted(donors, targets)
-        a, b = donors[np.clip(below-1, 0, len(donors)-1)], donors[np.clip(below, 0, len(donors)-1)]
-        selected = np.where(np.abs(targets-a) <= np.abs(b-targets), a, b)
-        result[targets, column], method[targets, column], pending[targets, column] = labels[selected, column], 2, False
-    if pending.any():
-        yy, xx = distance_transform_edt(~sand, return_distances=False, return_indices=True)
-        result[pending], method[pending] = labels[yy[pending], xx[pending]], 3
-    return result, method
+    """Compatibility wrapper for the canonical measured facies extension."""
+    from .n1_geometry import fill_to_edges as canonical
+    return canonical(facies, rig_domain, sand_labels=sand_labels)
 
 
 def measured_geometry(x_m, y_m, facies, depth_points, *, porosity_by_facies, swi_by_facies,
                       chunk_pixels=250000):
-    """Measured phi/Swi and linear depth inside the hull, nearest outside."""
-    x, y = np.asarray(x_m, np.float64), np.asarray(y_m, np.float64)
-    labels, points = np.asarray(facies), np.asarray(depth_points, np.float64)
-    if (x.ndim != 2 or x.shape != y.shape or labels.shape != x.shape
-            or not np.isfinite(x).all() or not np.isfinite(y).all()
-            or points.ndim != 2 or points.shape[1] != 3 or len(points) < 3
-            or not np.isfinite(points).all() or np.any(points[:, 2] <= 0)
-            or type(chunk_pixels) is not int or chunk_pixels < 1):
-        raise ValueError("Registered metre coordinates and positive measured depth triples are required")
-    linear, nearest = LinearNDInterpolator(points[:, :2], points[:, 2]), cKDTree(points[:, :2])
-    depth, outside = np.empty(x.size, np.float64), np.zeros(x.size, bool)
-    for start in range(0, x.size, chunk_pixels):
-        stop = min(x.size, start+chunk_pixels)
-        query = np.column_stack((x.ravel()[start:stop], y.ravel()[start:stop]))
-        values = np.asarray(linear(query), np.float64)
-        bad = ~np.isfinite(values)
-        if bad.any(): values[bad] = points[nearest.query(query[bad])[1], 2]
-        depth[start:stop], outside[start:stop] = values, bad
-    phi, swi = np.full(x.shape, np.nan, np.float64), np.full(x.shape, np.nan, np.float64)
-    for table, output, name in ((porosity_by_facies, phi, "porosity"), (swi_by_facies, swi, "Swi")):
-        for label, value in table.items():
-            if int(label) == 0: continue
-            value = float(value)
-            if not np.isfinite(value) or not 0 <= value <= 1 or name == "porosity" and value == 0:
-                raise ValueError("Measured " + name + " is outside its physical range")
-            output[labels == int(label)] = value
-    depth = depth.reshape(x.shape)
-    known = np.isfinite(phi) & (phi > 0) & np.isfinite(depth) & (depth > 0)
-    return dict(depth_m=depth, porosity=phi, swi=swi, known=known,
-                depth_nearest_outside_hull=outside.reshape(x.shape))
+    """Compatibility wrapper for the canonical measured geometry."""
+    from .n1_geometry import measured_geometry as canonical
+    return canonical(x_m, y_m, facies, depth_points, porosity_by_facies=porosity_by_facies,
+        swi_by_facies=swi_by_facies, chunk_pixels=chunk_pixels)
 
 
 def correct_prepared(prepared, *, x_m, y_m, floor_curve_canvas_y, depth_points,
                      porosity_by_facies, swi_by_facies, optical_support,
                      transported_facies=None, source_binding=None):
-    """Round4 physical frame input, before ANY native optics or fit summary."""
-    shape = prepared.domain.shape
-    rig = _mask(prepared.domain, shape, "Original rig domain")
-    optical = _mask(optical_support, shape, "Original light/colour/clearwater support")
-    floor = np.asarray(floor_curve_canvas_y, np.float64)
-    if floor.shape != (shape[1],) or not np.isfinite(floor).all():
-        raise ValueError("The original transported sand-floor line is required")
-    below = rig & (np.arange(shape[0])[:, None] > floor[None, :])
-    if np.any(below & np.isin(prepared.phase_labels, (1, 2))):
-        raise ValueError("Positive locked phase labels exist below the bound floor; cannot discard them")
-    domain = rig & ~below
-    labels = prepared.facies if transported_facies is None else transported_facies
-    corrected, fill = fill_to_edges(labels, domain, sand_labels=porosity_by_facies)
-    physical = measured_geometry(x_m, y_m, corrected, depth_points,
-        porosity_by_facies=porosity_by_facies, swi_by_facies=swi_by_facies)
-    known = domain & physical["known"]
-    supported = known & optical
-    eligible = supported.copy()
-    # Former bottom additions above the floor are admitted only with the SAME
-    # existing optical support. Remaining old excluded classes keep their names.
-    bottom = prepared.bottom_strip_mask & domain & ~eligible
-    below_photo = prepared.below_photo_filled_mask & domain & ~eligible & ~bottom
-    old_main = prepared.mass_eligible_mask & prepared.supported_mask
-    # Report the actual quantifiable main partition; the original D/E/G masks
-    # and numerical eligibility fields below retain their treatment.
-    quantifiable = (~np.isin(corrected, UNQUANTIFIED_FACIES)
-                    | (prepared.phase_labels == 2) & np.isfinite(physical["swi"]))
-    current_main = eligible & quantifiable
-    previous_finite_swi = np.isin(prepared.facies,
-        [int(label) for label,value in swi_by_facies.items() if np.isfinite(value)])
-    previous_main = old_main & (~prepared.unquantified_facies_mask
-        | (prepared.phase_labels == 2) & ~prepared.unknown_physical_mask & previous_finite_swi)
-    added = current_main & ~previous_main
-    filled = fill != 0
-    blocked = domain & filled & ~optical
-    area = np.broadcast_to(np.asarray(prepared.pixel_area_m2, np.float64), shape)
-    if not np.isfinite(area[rig]).all() or np.any(area[rig] <= 0):
-        raise ValueError("Original measured per-frame pixel area is required")
-    co2 = np.isin(prepared.phase_labels, (1, 2))
-    def areas(mask):
-        return dict(area_cm2=float(np.sum(area[mask]))*1.e4,
-                    co2_area_cm2=float(np.sum(area[mask & co2]))*1.e4)
-    report = dict(contract="ffac-round4-corrected-sandmap-v1", source_binding=dict(source_binding or {}),
-        run=prepared.run, frame_index=prepared.frame_index, elapsed_h=prepared.elapsed_h,
-        added_to_M=areas(added), filled_without_optical_support=areas(blocked),
-        below_sand_floor=areas(below), removed_from_M=areas(previous_main & ~current_main),
-        filled_pixels_by_method={name:int(np.count_nonzero(fill == code))
-                                for name,code in (("same_row",1),("same_column",2),("global_nearest",3))},
-        depth_nearest_outside_hull_pixels=int(np.count_nonzero(domain & physical["depth_nearest_outside_hull"])),
-        phase_labels_changed=False, RAW_changed=False, D_E_G_treatment_changed=False)
-    provenance = dict(prepared.provenance, original_physical_provenance=dict(prepared.provenance),
-        round4_sandmap=report, undefined_facies_not_borrowed=False,
-        facies_zero_fill_rule="same row, same column, global nearest sand",
-        physical_unknown_pixels=int(np.count_nonzero(domain & ~known)),
-        supported_pixels=int(np.count_nonzero(supported)), mass_eligible_pixels=int(np.count_nonzero(eligible)),
-        quantifiable_main_pixels=int(np.count_nonzero(current_main)),
-        bottom_mass_allowed_above_sand_floor_with_existing_optical_support=True,
-        optical_unresolved_pixels=int(np.count_nonzero(domain & ~optical)))
-    value = replace(prepared, facies=corrected, domain=domain, supported_mask=supported,
-        mass_eligible_mask=eligible, depth_m=physical["depth_m"], porosity=physical["porosity"],
-        unknown_physical_mask=domain & ~known, bottom_strip_mask=bottom,
-        below_photo_filled_mask=below_photo,
-        unquantified_facies_mask=domain & np.isin(corrected, UNQUANTIFIED_FACIES), provenance=provenance)
-    return value, report, physical["swi"]
+    """Historical report ABI around canonical physical frame correction."""
+    from .n1_geometry import correct_prepared as canonical
+    return canonical(prepared, x_m=x_m, y_m=y_m, floor_curve_canvas_y=floor_curve_canvas_y,
+        depth_points=depth_points, porosity_by_facies=porosity_by_facies, swi_by_facies=swi_by_facies,
+        optical_support=optical_support, transported_facies=transported_facies,
+        source_binding=source_binding, unquantified_facies=UNQUANTIFIED_FACIES,
+        report_contract="ffac-round4-corrected-sandmap-v1")
 
 
 def make_to_native_frame(original_to_native_frame, geometry_provider, *, on_corrected=None):

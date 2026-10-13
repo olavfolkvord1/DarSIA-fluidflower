@@ -118,25 +118,9 @@ def load_response(context, case_id, *, selected_calibration):
 
 
 def _main_partition(response):
-    """Original measured main support/volume, without discarded bound products."""
-    import numpy as np
-    frame, physics = response["frame"], response["physics"]
-    shape = frame.domain.shape
-    positive = frame.domain & np.isin(frame.phase_labels, (1, 2))
-    known = frame.known_physical_domain
-    area = np.broadcast_to(np.asarray(frame.pixel_area_m2, np.float64), shape)
-    depth = np.broadcast_to(np.asarray(frame.depth_m, np.float64), shape)
-    phi = np.broadcast_to(np.asarray(frame.porosity, np.float64), shape)
-    volume = np.where(known, area*depth*phi, 0.)
-    aq_known = known & response["quantifiable"] & (frame.phase_labels == 1)
-    gas_known = known & np.isfinite(response["swi"]) & (frame.phase_labels == 2)
-    sol = np.asarray(physics.solubility_co2, np.float64)
-    density = np.asarray(physics.density_gaseous_co2, np.float64)
-    if (not np.isfinite(sol[positive]).all() or not np.isfinite(density[positive]).all()
-            or np.any(sol[positive] < 0) or np.any(density[positive] < 0)):
-        raise ValueError("Native thermodynamic capacity must be finite across the locked phase domain")
-    return dict(volume=volume, aq_known=aq_known, gas_known=gas_known,
-                affected_pore_volume_m3=float(np.sum(volume[positive])))
+    """Compatibility wrapper for the canonical native N1 volume partition."""
+    from .n1_arithmetic import main_partition
+    return main_partition(response)
 
 
 def evaluate_main(response, anchor, *, modules, selected_calibration, domain_masks,
