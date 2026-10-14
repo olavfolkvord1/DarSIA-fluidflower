@@ -1,12 +1,12 @@
 # Removed source and Studio actions
 
-The applied source tree is `ca639622c570adbd4f5aea3f6c9b9c9de701622e`. All 611 original Python paths below are absent from that tree. The actual 445-test unit suite passed. The final clean commit and fresh final G1â€“G6 qualification remain pending.
+All 611 original Python paths below are absent from the current cleanup source in HEAD. The earlier candidate passed 445 unit tests; the corrected reader-route candidate passed the full 454-test suite, including nine saved-reader behavioral cases. The external final gate report binds the actual clean commit and each fresh G1-G6 receipt. Scientific and Studio qualification is claimed only when those actual gate receipts are complete.
 
 Last modification is the literal Git change commit. Last presence is the last branch snapshot containing the original path, `65c0e85015700f764b2c4f5fed6bb558490ef7f0`; this does **not** establish runtime use. Last observed use is limited to qualified retained import captures or result-bound producer source descriptors. An import does not prove numerical function execution. A result binding has no inferred execution date. No row claims the globally last actual execution.
 
 | Class | Scope | Tracked files | Python files | Physical / code lines |
 |---|---|---:|---:|---:|
-| 1 | Retained source plus three accounting documents, including generic replacements and tests | 892 | 759 | 258192 / 222618 |
+| 1 | Retained source plus three accounting documents, including generic replacements and tests | 899 | 766 | 259754 / 223994 |
 | 2 | Original Python sources absent from v11, at literal last-present base65 Git bytes | 50 | 50 | 20251 / 18276 |
 | 3 | Original Python sources absent from v11, at literal last-present base65 Git bytes | 561 | 561 | 219687 / 199318 |
 
@@ -658,6 +658,6 @@ The later bounded removals/restorations retain their exact proof descriptors:
 - \\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\step6_readonly_preparation\obsolete_runtime_test_loader_retirement_v1\proof.json â€” SHA256 `fed91f953072968cbf5092ce4c83f613c286349b6f58d8e413637f953fd4a4d5`, 11562 bytes.
 - \\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\step6_readonly_preparation\obsolete_production_inputs_suite_retirement_v1\proof.json â€” SHA256 `90c696a9364440ea8ba0974b4543119c2361df5a2310a33863a7b5853af420db`, 1096 bytes.
 
-Whole operation-only suites and obsolete facade assertions are removed with Git history; no tests are skipped. Canonical numerical assertions and all three mandatory test files remain. SDK forwards retain original class identities, argument defaults, dtype and serialization behavior. The byte-locked CUDA provider remains unchanged and is documented externally; this is not a GPU execution claim.
+Whole operation-only suites and obsolete facade assertions are removed with Git history; no tests are skipped. Canonical numerical assertions and all three mandatory test files remain. SDK forwards retain original class identities, argument defaults, dtype and serialization behavior. The byte-locked CUDA provider remains unchanged; runtime documentation is attached to its original functions. Small actual GPU unit contracts are recorded separately and confer no new scientific qualification.
 
 Rootâ€™s actual NAS retirement commit is `c7f576463e42af6987d18b87f200582059de781d`: 52 historical controls retired after exact preservation, 10 active controls and 72 producer archives retained. No scientific DATA, result, or partial-product deletion occurred.

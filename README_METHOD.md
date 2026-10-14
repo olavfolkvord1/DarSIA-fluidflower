@@ -39,7 +39,7 @@ The tools package includes protected callable SDK adapters and saved-review/trai
 
 ## Byte-locked CUDA provider and external method documentation
 
-`src/darsia/fluidflower/mass/mass_cuda.py` remains byte-identical to the locked provider: SHA256 `ebc695edf36bc308b7f994d589c0de74660c1f692c8d09b25d764ba351a9e5ea`, 26,135 bytes. Its historical in-file wording and runtime fact fields remain unchanged. Public methods are documented here rather than changing provider docstrings or runtime metadata. The exact documentation exception is:
+`src/darsia/fluidflower/mass/mass_cuda.py` remains byte-identical to the locked provider: SHA256 `ebc695edf36bc308b7f994d589c0de74660c1f692c8d09b25d764ba351a9e5ea`, 26,135 bytes. Its historical in-file wording and runtime fact fields remain unchanged. The package initializer supplies runtime __doc__ help strings for exactly the 23 methods whose original in-file docstring is absent; the function objects, numeric codeobjects and provider bytes stay unchanged. No CuPy is imported or device allocated by this CPU-side documentation attachment. The table describes the same physical-purpose contracts:
 
 `\\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\step6_readonly_preparation\qualified_cuda_public_API_documentation_exception_v1.json` — SHA256 `a95dcb6307bc3ea8a8accdcc00b7e35081c43cb426b08a2c9a53b0e985a4166c`, 4,006 bytes.
 
@@ -71,7 +71,7 @@ The provider has a host ABI with explicit uploads, scoped device kernels, synchr
 | `CudaHostPixelMath.facts` | `self` | Add host-ABI, CPU facies scatter/reduction and per-stage transfer facts to device facts. |
 | `CudaHostPixelMath.close` | `self` | Close the owned device backend. |
 
-The existing documented `scope` and device `warp_continuous` methods retain their in-file documentation. The table covers exactly the 23 public methods listed by the byte-lock exception.
+The existing documented `scope` and device `warp_continuous` methods retain their in-file documentation. The table covers exactly the 23 originally undocumented public methods whose runtime help strings are attached by the initializer. Their original raw AST None entries are retained explicitly, not falsely counted as in-file literals.
 
 ## Saved Studio views
 
@@ -88,3 +88,10 @@ The tracked environment lock is `requirements-worker.lock`. Run from a clean che
 The NAS `code/pipeline` tree contains only configuration, models, masks and locks. Validation scripts and the exact historical producer sources are under `code/validation`. Original result files and partial attempts remain at their recorded paths. Historical code is never imported to display a saved result.
 
 `INVENTORY.md` records every archived source version and constant origin, including the actual 72 result-bound archives and 52 retired NAS control byte versions. Final package counts use tracked Python blobs from the actual baseline and final commits; the source-removal table and three-commit package counts are included in INVENTORY. `REMOVED.md` distinguishes deleted implementations from retained annotation and review functionality. The gate report supplies executable commit and actual per-image evidence; source compilation or a live controller alone is not a gate result.
+
+
+## Public API unit evidence
+
+The integrated candidate passed 538 unit tests, including 84 new cases (82 public-API contracts and two runtime-documentation contracts). All 398 public method-core APIs were observed in passed cases by a source-bound Python call profile. The CUDA cases used actual available CuPy for 14 small float32/float64 GPU tests; missing-device skips would not count as passed API calls. This is unit evidence, not a new scientific equivalence qualification or throughput benchmark. The final clean-commit gate report separately records numerical and Studio qualification.
+
+The provider file retains its exact original bytes and 23 raw AST docstring slots remain None. The mass package initializer attaches physical-purpose and parameter runtime __doc__ text to those same function objects without altering co_code/co_consts, signatures or the two existing in-file docs. All 25 CUDA public methods therefore have runtime help strings; a fresh CPU import loads no CuPy or device allocation. This is runtime documentation, not a claim that literal strings were inserted into the byte-locked file.
