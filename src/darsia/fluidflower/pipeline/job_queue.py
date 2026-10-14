@@ -46,12 +46,69 @@ def read_json(path: Path) -> dict:
     )
 
 
+def _windows_rename(source: Path, destination: Path) -> None:
+    """Rename by one exclusive DELETE handle, without replacing a destination.
+
+    Excluding FILE_SHARE_DELETE prevents concurrent source handles from moving
+    the same file through several destinations. Ordinary readers may finish;
+    the caller retains the existing bounded sharing-error retry policy.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class RenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    # DELETE only; share reads/writes, but never a second delete/rename handle.
+    handle = kernel.CreateFileW(
+        os.path.abspath(source), 0x00010000, 0x00000003, None,
+        3, 0x02000000, None,  # OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        target = os.path.abspath(destination).encode("utf-16-le")
+        buffer = ctypes.create_string_buffer(ctypes.sizeof(RenameInfo) + len(target))
+        info = RenameInfo.from_buffer(buffer)
+        info.ReplaceIfExists = False
+        info.RootDirectory = None
+        info.FileNameLength = len(target)
+        ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.FileName.offset,
+                       target, len(target))
+        if not kernel.SetFileInformationByHandle(handle, 3, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if not kernel.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
 def rename(source: Path, destination: Path) -> None:
     """Atomic move; briefly let concurrent Windows metadata readers close."""
     deadline = time.monotonic() + 1.0
     while True:
         try:
-            os.rename(source, destination)
+            if os.name == "nt":
+                _windows_rename(source, destination)
+            else:
+                os.rename(source, destination)
             return
         except PermissionError as exc:
             if (os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32}
