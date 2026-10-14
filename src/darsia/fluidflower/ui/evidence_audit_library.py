@@ -52,12 +52,6 @@ class EvidenceAuditLibrary(QWidget):
         self.model_details = QLabel()
         self.model_details.setWordWrap(True)
         layout.addWidget(self.model_details)
-        self.check_button = QPushButton("Check disagreements")
-        self.check_button.setToolTip(
-            "Compare saved regions and validations with the selected model's prepared phase maps. "
-            "Open the largest disagreements for review when the check finishes.")
-        self.check_button.clicked.connect(self.check_disagreements)
-        layout.addWidget(self.check_button)
         self.queues = QComboBox()
         self.queues.setMinimumContentsLength(35)
         self.queues.setToolTip("Each queue records its own evaluated model, original labels and image timeline.")
@@ -159,11 +153,6 @@ class EvidenceAuditLibrary(QWidget):
         ready = bool(model and not model.get("validation_collection_error")
                      and self.owner.reviewer.text().strip()
                      and self.owner.review_save_root.text().strip() and self.process is None)
-        self.check_button.setEnabled(ready)
-        self.check_button.setText("Checking disagreements..." if self.operation == "check" else "Check disagreements")
-        if hasattr(self.owner, "check_disagreements_button"):
-            self.owner.check_disagreements_button.setEnabled(ready)
-            self.owner.check_disagreements_button.setText(self.check_button.text())
         self.model_details.setText(
             "Check model: " + self.owner._validation_model_label(model) if model else
             "Select a model in Review and label evidence to check its saved regions and validations.")
@@ -193,85 +182,9 @@ class EvidenceAuditLibrary(QWidget):
                         "Both annotations are preserved; resolve them in the original saved reviews")
         return summary
 
-    def check_disagreements(self):
-        if self.process is not None:
-            return
-        model = self.owner._selected_validation_model()
-        if not model or not self.owner.reviewer.text().strip():
-            return
-        try:
-            script = self.owner._companion_path("build_phase_disagreement_review.py")
-            model_root = Path(str(model["root"])).resolve()
-            collection = self.owner._normal_review_collection(model_root)
-            output = queue_directory(model_root) / f"audit-{uuid.uuid4().hex}.json"
-            arguments = ["-m", "darsia.fluidflower.tools.build_phase_disagreement_review", "--model", str(model_root), "--output", str(output)]
-            if collection is not None:
-                arguments += ["--review-root", str(collection["combined_root"])]
-            self.pending_check = dict(output=output, model_root=model_root, model_id=str(model["model_id"]),
-                reviewer=self.owner.reviewer.text().strip(), save_root=Path(self.owner.review_save_root.text()),
-                use_gpu=self.owner.review_gpu.isChecked())
-            process = QProcess(self)
-            process.setProgram(phase_python_executable())
-            process.setArguments(arguments)
-            process.setWorkingDirectory(str(local_cache_root()))
-            process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-            process.readyReadStandardOutput.connect(self.check_progress)
-            process.finished.connect(self.check_finished)
-            process.errorOccurred.connect(self.check_failed)
-            self.process, self.operation, self.worker_output = process, "check", ""
-            self.import_button.setEnabled(False)
-            self.update_check_state()
-            self.status.setText(f"Checking saved regions and validations for {model['model_id']}...")
-            self.owner.tabs.setCurrentWidget(self.owner.evidence_tab)
-            self.owner.evidence_scroll.ensureWidgetVisible(self)
-            process.start()
-        except Exception as exc:
-            self.pending_check = None
-            self.status.setText(f"Could not check disagreements: {exc}")
 
-    def check_progress(self):
-        if self.process is None or self.operation != "check":
-            return
-        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        self.worker_output = (self.worker_output + text)[-16000:]
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines:
-            self.status.setText(lines[-1])
 
-    def check_failed(self, error):
-        if self.process is None or self.operation != "check":
-            return
-        self.worker_output += "\n" + self.process.errorString()
-        if error == QProcess.ProcessError.FailedToStart:
-            self.check_finished(-1, QProcess.ExitStatus.CrashExit)
 
-    def check_finished(self, code, exit_status):
-        if self.process is None or self.operation != "check":
-            return
-        self.check_progress()
-        process, pending = self.process, self.pending_check
-        self.process, self.pending_check, self.operation = None, None, None
-        process.deleteLater()
-        self.import_button.setEnabled(True)
-        self.update_check_state()
-        if code != 0 or exit_status != QProcess.ExitStatus.NormalExit:
-            self.status.setText("Disagreement check failed: " + self.worker_output[-1500:])
-            return
-        try:
-            queue = load_queue(pending["output"], verify_sources=True)
-            if (queue["model_id"] != pending["model_id"]
-                    or Path(queue["model_root"]).resolve() != pending["model_root"]):
-                raise ValueError("The completed queue belongs to another model")
-            self.refresh(str(pending["output"]))
-            coverage = self.coverage_summary(queue)
-            if not queue["entries"]:
-                self.status.setText(f"No scored regions met the initial disagreement threshold for {pending['model_id']}. " + coverage)
-                return
-            self.start_review(queue_path=pending["output"], launch_context=pending)
-            if coverage:
-                self.status.setText(self.status.text() + " · " + coverage)
-        except Exception as exc:
-            self.status.setText(f"Could not open completed disagreement check: {exc}")
 
     def launch(self, command):
         started, pid = QProcess.startDetached(command[0], command[1:])

@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMainWindow,
@@ -40,7 +40,7 @@ class StudioMassWindow(QMainWindow):
         from darsia.fluidflower.tools.phase_studio_mass_cache import DEFAULT_MASS_POLICY
         self.request.setdefault("mass_policy", dict(DEFAULT_MASS_POLICY))
         self.cache_root = Path(cache_root)
-        self.process = None; self.result = None; self.job = None; self.result_path = None
+        self.result = None; self.result_path = None
         self.lookup = None
         candidate = request["candidate"]
         self.setWindowTitle(f"Concentration and mass · {candidate['dataset'].upper()} · {candidate['run'].upper()}")
@@ -67,15 +67,11 @@ class StudioMassWindow(QMainWindow):
             "those cells is retained as a reported mass interval.")
         notice.setWordWrap(True); layout.addWidget(notice)
         actions = QHBoxLayout(); layout.addLayout(actions)
-        self.calculate = QPushButton("Prepare inputs / fit individual comparison")
-        self.calculate.clicked.connect(self.start); actions.addWidget(self.calculate)
         self.prepared = QPushButton("Load prepared results")
         self.prepared.clicked.connect(self.load_prepared); actions.addWidget(self.prepared)
         self.open_files = QPushButton("Open result files"); self.open_files.setEnabled(False)
         self.open_files.clicked.connect(self.open_result); actions.addWidget(self.open_files)
-        self.stop = QPushButton("Stop calculation"); self.stop.setEnabled(False)
-        self.stop.clicked.connect(self.cancel); actions.addWidget(self.stop); actions.addStretch()
-        self.status = QLabel("Ready. Calculation runs in a separate process; phase validation remains available.")
+        self.status = QLabel("Ready to load an existing saved result.")
         self.status.setWordWrap(True); layout.addWidget(self.status)
         self.details = QTextEdit(); self.details.setReadOnly(True); self.details.setMaximumHeight(115)
         layout.addWidget(self.details)
@@ -98,7 +94,6 @@ class StudioMassWindow(QMainWindow):
         self.slider.valueChanged.connect(self.show_frame); playback.addWidget(self.slider, 1)
         self.playback_timer = QTimer(self); self.playback_timer.setInterval(1500)
         self.playback_timer.timeout.connect(self.advance_frame)
-        self.timer = QTimer(self); self.timer.setInterval(1000); self.timer.timeout.connect(self.poll)
         for widget in (self.optical, self.restoration, self.chemistry):
             widget.currentIndexChanged.connect(self.method_changed)
         QTimer.singleShot(0, self.load_prepared)
@@ -144,7 +139,6 @@ class StudioMassWindow(QMainWindow):
         self.load_prepared()
 
     def load_prepared(self):
-        if self.process is not None and self.process.state() != QProcess.NotRunning: return
         if self.lookup is not None and self.lookup.isRunning(): return
         self.prepared.setEnabled(False)
         self.status.setText("Checking prepared results for this exact phase model and method…")
@@ -157,74 +151,19 @@ class StudioMassWindow(QMainWindow):
         if method != self.method():
             QTimer.singleShot(100, self.load_prepared)
             return
-        if self.process is not None and self.process.state() != QProcess.NotRunning: return
         if error:
-            self.status.setText("Prepared result could not be verified. Recalculate or inspect the saved files.")
+            self.status.setText("Prepared result could not be verified; inspect the saved files.")
             self.details.setPlainText(error)
         elif path is not None:
             self.load_result(path)
             self.status.setText("Prepared results loaded · no mass recalculation · Play or select an image below.")
         else:
-            self.status.setText("No prepared result for this exact selection and method. Calculation remains available.")
+            self.status.setText("No saved result for this exact selection and method. Historical calculation is unavailable.")
 
-    def start(self):
-        if self.process is not None and self.process.state() != QProcess.NotRunning:
-            return
-        # The job folder is unique. Numerical results inside it carry exact
-        # input hashes; an older run can never masquerade as the selected map.
-        self.job = self.cache_root/"phase_mass"/uuid.uuid4().hex
-        self.job.mkdir(parents=True, exist_ok=False)
-        payload = {**self.request, "method": self.method(), "analysis_width": 1024,
-                   "results_root": str(self.cache_root/"phase_mass"/"results")}
-        path = self.job/"request.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.play.setChecked(False); self.play.setEnabled(False)
-        self.result = None; self.open_files.setEnabled(False); self.image.clear(); self.mass_curve.clear(); self.details.clear()
-        self.calculate.setEnabled(False); self.stop.setEnabled(True)
-        for widget in (self.optical, self.restoration, self.chemistry): widget.setEnabled(False)
-        repo = process_directory()
-        python = Path(sys.executable)
-        self.process = QProcess(self)
-        self.process.setWorkingDirectory(str(repo))
-        env = QProcessEnvironment.systemEnvironment()
-        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"): env.insert(name, "2")
-        self.process.setProcessEnvironment(env)
-        self.process.setStandardOutputFile(str(self.job/"stdout.log"))
-        self.process.setStandardErrorFile(str(self.job/"stderr.log"))
-        self.process.finished.connect(self.finished)
-        self.process.errorOccurred.connect(self.process_error)
-        self.process.start(str(python if python.exists() else Path(sys.executable)),
-                           ["-B", "-m", "darsia.fluidflower.tools.phase_studio_mass", "--request", str(path)])
-        self.status.setText("Starting registered phase-to-mass calculation…"); self.timer.start()
 
-    def process_error(self, error):
-        self.status.setText(self.process.errorString())
-        if error == QProcess.FailedToStart:
-            self.timer.stop(); self.calculate.setEnabled(True); self.stop.setEnabled(False)
-            for widget in (self.optical, self.restoration, self.chemistry): widget.setEnabled(True)
 
-    def poll(self):
-        if self.job is None: return
-        path = self.job/"status.json"
-        try: status = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError): return
-        self.status.setText(status["stage"])
-        if status["stage"] == "failed": self.details.setPlainText(status.get("error", ""))
-        if status["stage"] == "complete" and self.result is None:
-            self.load_result(Path(status["result"]))
 
-    def finished(self, code, _status):
-        self.poll(); self.timer.stop(); self.calculate.setEnabled(True); self.stop.setEnabled(False)
-        for widget in (self.optical, self.restoration, self.chemistry): widget.setEnabled(True)
-        if code and self.result is None:
-            self.status.setText("Calculation did not finish. Completed inputs are retained; see the error below.")
-            if not self.details.toPlainText():
-                try: self.details.setPlainText((self.job/"stderr.log").read_text(encoding="utf-8")[-6000:])
-                except OSError: pass
 
-    def cancel(self):
-        if self.process is not None and self.process.state() != QProcess.NotRunning:
-            self.process.kill()
 
     def load_result(self, path):
         result = json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -278,7 +217,7 @@ class StudioMassWindow(QMainWindow):
     def closeEvent(self, event):
         # Closing the viewer does not interrupt numerical work or Studio saves.
         self.play.setChecked(False)
-        if getattr(self, '_standalone', False) and self.process is None:
+        if getattr(self, '_standalone', False):
             if self.lookup is not None: self.lookup.wait()
             event.accept(); return
         self.hide(); event.ignore()
@@ -294,7 +233,7 @@ def open_for_review(window):
                    reference=(window.injection_references[window.active_injection_reference]
                               if window.active_injection_reference is not None else None))
     dialog = StudioMassWindow(request, window.cache_root, window)
-    from darsia.fluidflower.phase_ffac_common_mass_review import attach_saved_common_review
+    from darsia.fluidflower.mass_saved_review import attach_saved_common_review
     attach_saved_common_review(dialog, candidate, int(window.frame_index))
     if not hasattr(window, "_mass_windows"): window._mass_windows = []
     window._mass_windows.append(dialog)

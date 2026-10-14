@@ -817,7 +817,7 @@ def build_phase_training_command(
     if settings.get("gas_selection_policy"):
         command.extend(("--gas-selection-policy", str(settings["gas_selection_policy"])))
     if settings.get("v5_chemistry_fit_scope"):
-        from .phase_training.v5_chemistry_fit_scope import EXCLUDED_RUNS
+        from .phase_training.chemistry_fit_scope import EXCLUDED_RUNS
         scope = settings["v5_chemistry_fit_scope"]
         if scope.get("excluded_runs") != list(EXCLUDED_RUNS):
             raise ValueError("V5 chemistry fit exclusion differs from frozen run policy")

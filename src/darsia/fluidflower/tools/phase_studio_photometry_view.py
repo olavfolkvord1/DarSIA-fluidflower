@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QSlider, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from darsia.fluidflower.tools import phase_studio_series_mass as backend
+from darsia.fluidflower import saved_mass_rendering as backend
 from darsia.fluidflower.tools.phase_studio_mass_comparison import matching_frame_index
 from darsia.fluidflower.tools.phase_studio_photometry_canvas import SynchronizedImagePair
 from darsia.fluidflower.tools.phase_studio_photometry_geometry import (
@@ -156,7 +156,7 @@ def _reference_identity(anchor, other, category):
 
 
 def _reference_rgb(result, category):
-    from darsia.fluidflower.tools.phase_studio_native_mass import sha
+    from darsia.fluidflower.saved_mass_rendering import sha
     from darsia.fluidflower.review_storage import resolve_review_path
 
     if category not in {"baseline", "clearwater"}:
@@ -314,7 +314,7 @@ def _geometry_only_rgb(anchor, anchor_index, category, shape, cache=None):
     """
     import darsia
     from darsia.fluidflower.review_storage import resolve_review_path
-    from darsia.fluidflower.tools.phase_studio_native_mass import read, sha
+    from darsia.fluidflower.saved_mass_rendering import read, sha
 
     selected = anchor["selected_inputs"]
     candidate = selected["candidate"]

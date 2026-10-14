@@ -499,24 +499,13 @@ class MainWindow(QMainWindow):
 
     def get_value(self, dictionary, key_path):
         """Get a value from nested dict using dot notation (e.g., 'a.b.c')"""
-        keys = key_path.split(".")
-        value = dictionary
-        for key in keys:
-            if isinstance(value, dict) and key in value:
-                value = value[key]
-            else:
-                return None
-        return value
+        from darsia.gui.ui.settings import SettingsFactory
+        return SettingsFactory.get_value(self, dictionary, key_path)
 
     def set_value(self, dictionary, key_path, value):
         """Set a value in nested dict using dot notation, creating keys as needed"""
-        keys = key_path.split(".")
-        current = dictionary
-        for key in keys[:-1]:
-            if key not in current:
-                current[key] = {}
-            current = current[key]
-        current[keys[-1]] = value
+        from darsia.gui.ui.settings import SettingsFactory
+        return SettingsFactory.set_value(self, dictionary, key_path, value)
 
     def create_setting_edit(self, setting_dict):
         """Create a new setting edit based on the setting type."""

@@ -18,8 +18,7 @@ from weakref import WeakValueDictionary
 import numpy as np
 
 from .phase_ffac_rig_camera_metadata import EXTENDED_SCIENTIFIC_CONTRACT
-from .phase_ffac_rig_camera_runtime import bound_path, native_frame_assets
-from .phase_pixel_area import load_rig_classes, rig_phase_shape
+from .phase_saved_review_metadata import bound_path, native_frame_assets, load_rig_classes, rig_phase_shape
 
 CONTRACT = "ffac-rig-extended-raw-display-v1"
 BACKGROUND = (19, 22, 27)
@@ -205,7 +204,7 @@ def _native_frame_assets_cached(review_root, run, frame_index=None, *, reference
     geometry and scientific receipts are verified once per version in this
     session. The strict scientific reader itself remains unchanged.
     """
-    from . import phase_ffac_rig_camera_runtime as runtime
+    from . import phase_saved_review_metadata as runtime
     from .review_storage import resolve_review_path
     root = resolve_review_path(review_root)
     path = root / "native_frames" / str(run).casefold() / "manifest.json"
@@ -246,8 +245,8 @@ def _native_frame_assets_cached(review_root, run, frame_index=None, *, reference
         with _REFERENCE_LOCK:
             checked = check_key in _FRAME_STATES
         if not checked:
-            runtime._geometry(binding, record, base=state["input_path"].parent, reference=reference)
-            runtime._scientific_receipt(record)
+            runtime._saved_geometry(binding, record, base=state["input_path"].parent, reference=reference)
+            runtime._saved_scientific_receipt(record)
             with _REFERENCE_LOCK:
                 if generation == _CACHE_GENERATION:
                     _remember(_FRAME_STATES, check_key, True)
@@ -355,11 +354,15 @@ def mark_missing_raw(rgb, domain, support):
 
 
 def _prepared_reference(record, manifest):
-    from .tools.ffac_track1_change_flatfield import FlatfieldReference, prepare_flatfield_reference
+    from .native.display_modes import DisplayFlatfieldReference, prepare_display_flatfield_reference
+    from .native.config import require_parameters
+    parameters = {"display_modes": require_parameters("display_modes"),
+                  "change_display": require_parameters("change_display")}
     key = _raw_identity(record, manifest)
     def create():
         signal, support = compose_display_raw(record, manifest)
-        prepared = prepare_flatfield_reference(signal, source_valid_mask=support)
+        prepared = prepare_display_flatfield_reference(signal, source_valid_mask=support,
+            tile_rows=parameters["change_display"]["tile_rows"], parameters=parameters)
         # The old display renderer repairs tiny nonfinite pixels. A rig RAW
         # view must disclose those pixels as lacking source support instead.
         luminance = prepared.luminance.copy()
@@ -367,7 +370,7 @@ def _prepared_reference(record, manifest):
         luminance.setflags(write=False)
         support &= prepared.valid
         support.setflags(write=False)
-        return FlatfieldReference(luminance, support, prepared.invalid_cleanup)
+        return DisplayFlatfieldReference(luminance, support, prepared.invalid_cleanup)
     return _cached("reference", key, create)
 
 
@@ -425,8 +428,11 @@ def _render_rig_raw_display_rgb(state, record, binding, run, frame_index, *, mod
         rgb[~current_support] = BACKGROUND
         backend_audit = backend_description() if backend != "cpu" else {"backend": "cpu"}
     else:
-        from .tools.ffac_track1_change_flatfield import (
-            register_flatfield_reference, render_change_flatfield, _box5_fully_valid, MIN_REFERENCE_LUMINANCE)
+        from .native.display_modes import (
+            register_display_flatfield_reference, render_change_flatfield, display_box_fully_valid)
+        from .native.config import require_parameters
+        parameters = {"display_modes": require_parameters("display_modes"),
+                      "change_display": require_parameters("change_display")}
         prepared = _prepared_reference(manifest["reference"], manifest)
         reference_sha256 = manifest["reference"]["source_sha256"]
         homography = np.eye(3) if reference else np.asarray(binding["H_v5_B_to_frame_native"], np.float64)
@@ -434,15 +440,16 @@ def _render_rig_raw_display_rgb(state, record, binding, run, frame_index, *, mod
         source_origin = tuple(manifest["reference"]["rig_domain_revision"]["native_origin_xy"])
         registered_key = _token(dict(reference=reference_key, homography=homography.tolist(),
             shape=list(domain.shape), source_origin=source_origin, target_origin=origin))
-        registered = _cached("registered", registered_key, lambda: register_flatfield_reference(
+        registered = _cached("registered", registered_key, lambda: register_display_flatfield_reference(
             prepared, homography, target_shape_hw=domain.shape,
-            source_origin_xy=source_origin, target_origin_xy=origin))
+            source_origin_xy=source_origin, target_origin_xy=origin, parameters=parameters))
         from .phase_rig_display_acceleration import render_lift1, backend_description
         lift1 = render_lift1(signal, domain, backend=backend)
-        rgb, rendering = render_change_flatfield(signal, registered, domain, lift1_rgb=lift1)
+        rgb, rendering = render_change_flatfield(signal, registered, domain, lift1_rgb=lift1,
+            tile_rows=parameters["change_display"]["tile_rows"], parameters=parameters)
         backend_audit = backend_description() if backend != "cpu" else {"backend": "cpu"}
-        mode_support = (_box5_fully_valid(current_support) & _box5_fully_valid(registered.valid)
-                        & (registered.luminance_box5 >= MIN_REFERENCE_LUMINANCE))
+        mode_support = (display_box_fully_valid(current_support, parameters=parameters) & display_box_fully_valid(registered.valid, parameters=parameters)
+                        & (registered.luminance_box5 >= parameters["change_display"]["minimum_reference_luminance"]))
     missing = mark_missing_raw(rgb, domain, mode_support)
     support = domain & mode_support
     extended_domain = domain.copy()

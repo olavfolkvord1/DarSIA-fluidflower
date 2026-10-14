@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .phase_pixel_area import load_rig_classes, rig_phase_shape
+from .phase_saved_review_metadata import load_rig_classes, rig_phase_shape
 from .phase_rig_display_canvas import pad_rig_display_mask
 
 

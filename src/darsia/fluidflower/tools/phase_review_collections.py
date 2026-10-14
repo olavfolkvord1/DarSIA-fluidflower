@@ -114,8 +114,8 @@ def _bound_jobs(manifest_path, binding):
 
 def build_collection(model_root, evaluation_roots, output_root=None, *, base_root=None):
     """Publish only collection metadata, using completed full-model results."""
-    from darsia.fluidflower.tools.phase_training_promotions import _selection, _validate_science
-    from darsia.fluidflower.tools import phase_transfer_review as transfer
+    from darsia.fluidflower.phase_saved_promotions import _selection, _validate_science
+    from darsia.fluidflower import phase_saved_transfer_review as transfer
     model = Path(model_root).resolve()
     identity = _identity(model)
     # The bundle holds a base validation only when phase maps were prepared right after
@@ -250,7 +250,7 @@ def _saved_collection_identity(model_root, manifest):
         elif source["kind"] == "extra":
             # Collections without base maps still retain the source profile's
             # full file digest in their immutable transfer plans.
-            from darsia.fluidflower.tools import phase_transfer_review as transfer
+            from darsia.fluidflower import phase_saved_transfer_review as transfer
             plan = _read(_check(source["plan"]))
             original = resolve_review_path(plan.get("source_model") or model_root)
             current = resolve_review_path(model_root)
@@ -269,8 +269,8 @@ def _saved_collection_identity(model_root, manifest):
 
 def validated_collection(manifest_path, model_root, *, full=True, saved_comparison=False):
     """Check composite identity without substituting one run's physical runtime."""
-    from darsia.fluidflower.tools import phase_transfer_review as transfer
-    from darsia.fluidflower.tools.phase_training_promotions import _validate_science
+    from darsia.fluidflower import phase_saved_transfer_review as transfer
+    from darsia.fluidflower.phase_saved_promotions import _validate_science
     manifest_path = resolve_review_path(manifest_path)
     manifest = _read(manifest_path)
     binding = _read(manifest_path.parent / "validation_binding.json")

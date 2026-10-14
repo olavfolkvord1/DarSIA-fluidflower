@@ -16,6 +16,12 @@ from typing import Any, Mapping
 
 import cv2
 import numpy as np
+from .phase.metrics import (
+    _shape as _canonical_shape,
+    validate_pixel_area as _canonical_validate_pixel_area,
+    sum_pixel_area as _canonical_sum_pixel_area,
+    filter_components_by_area as _canonical_filter_components_by_area,
+)
 
 CONTRACT = "ffac-native-pixel-area-v1"
 RIG_MARKER = "ffac_rig_geometry"
@@ -24,25 +30,12 @@ FIXED_AC28_MM2 = .027053
 
 
 def _shape(shape):
-    result = tuple(int(v) for v in shape)
-    if len(result) != 2 or min(result) <= 0 or tuple(shape) != result:
-        raise ValueError("Pixel area requires a positive integer grid shape")
-    return result
+    return _canonical_shape(shape)
 
 
 def validate_pixel_area(value, shape_hw):
     """Return a positive finite scalar or matching floating area grid."""
-    shape = _shape(shape_hw)
-    array = np.asarray(value)
-    if array.ndim == 0:
-        number = float(array)
-        if not np.isfinite(number) or number <= 0:
-            raise ValueError("Pixel area must be positive and finite")
-        return number
-    if (array.shape != shape or not np.issubdtype(array.dtype, np.floating)
-            or not np.isfinite(array).all() or np.any(array <= 0)):
-        raise ValueError("Pixel area grid must be positive finite floating values on the exact grid")
-    return array
+    return _canonical_validate_pixel_area(value, shape_hw)
 
 
 def inverse_homography_area_map(H_ac28_to_frame_native, shape_hw, *,
@@ -78,16 +71,7 @@ def inverse_homography_area_map(H_ac28_to_frame_native, shape_hw, *,
 
 
 def sum_pixel_area(mask, pixel_area, *, unit="mm2"):
-    mask = np.asarray(mask)
-    if mask.dtype != bool or mask.ndim != 2:
-        raise ValueError("Area support must be a two-dimensional bool mask")
-    area = validate_pixel_area(pixel_area, mask.shape)
-    total = (float(np.count_nonzero(mask)) * area if np.isscalar(area)
-             else float(np.sum(area, where=mask, dtype=np.float64)))
-    factors = {"mm2": 1., "cm2": .01, "m2": 1e-6}
-    if unit not in factors:
-        raise ValueError("Area output unit must be mm2, cm2 or m2")
-    return total * factors[unit]
+    return _canonical_sum_pixel_area(mask, pixel_area, unit=unit)
 
 
 @dataclass(frozen=True)
@@ -123,16 +107,8 @@ class PixelArea:
 
 
 def _asset(asset, base_dir):
-    if not isinstance(asset, Mapping) or not asset.get("path") or not asset.get("sha256"):
-        raise ValueError("Pixel-area asset requires an exact path and SHA256")
-    path = Path(asset["path"])
-    if not path.is_absolute():
-        path = Path(base_dir) / path
-    data = path.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    if digest != asset["sha256"]:
-        raise ValueError("Pixel-area asset SHA256 mismatch")
-    return path, data, digest
+    from darsia.fluidflower.phase_saved_review_metadata import _rig_class_asset as _canonical_rig_class_asset
+    return _canonical_rig_class_asset(asset, base_dir)
 
 
 def _array_asset(asset, base_dir, key):
@@ -346,25 +322,7 @@ def load_frame_pixel_area(native_manifest_path, frame_index, shape_hw, *,
 
 def filter_components_by_area(mask, pixel_area_mm2, minimum_area_mm2=2.5, *, connectivity=4):
     """Filter components by the sum of physical pixel areas, never pixel count."""
-    mask = np.asarray(mask)
-    if mask.dtype != bool or mask.ndim != 2 or connectivity != 4:
-        raise ValueError("Gas minimum requires a bool grid and four-connectivity")
-    area = validate_pixel_area(pixel_area_mm2, mask.shape)
-    minimum = float(minimum_area_mm2)
-    if not np.isfinite(minimum) or minimum < 0:
-        raise ValueError("Gas minimum area must be finite and nonnegative")
-    if minimum == 0:
-        return mask.copy(), dict(withdrawn_components=0, withdrawn_pixels=0, minimum_area_mm2=minimum)
-    count, components = cv2.connectedComponents(mask.astype(np.uint8), connectivity=connectivity)
-    weights = (np.bincount(components.ravel(), minlength=count) * area if np.isscalar(area)
-               else np.bincount(components.ravel(), weights=area.ravel(), minlength=count))
-    small = weights < minimum
-    small[0] = False
-    result = mask & ~small[components]
-    return result, dict(withdrawn_components=int(small.sum()),
-                        withdrawn_pixels=int(np.count_nonzero(mask & ~result)),
-                        minimum_area_mm2=minimum, connectivity=connectivity,
-                        component_areas_mm2=weights[1:].tolist())
+    return _canonical_filter_components_by_area(mask, pixel_area_mm2, minimum_area_mm2=minimum_area_mm2, connectivity=connectivity)
 
 
 def area_filtered_gas(mask, area_mm2_array, minimum_area_mm2=2.5, connectivity=4):
@@ -423,25 +381,3 @@ def carry_mass_area_bindings(run_input):
         bindings.append(dict(frame_index=index, **{name: source[name]}))
     result["geometry"]["pixel_area_frames"] = bindings
     return result
-
-
-def apply_g3_area_configuration(frozen_labels, g3_pixel, regional_probability,
-                                pixel_area_mm2, settings=None):
-    """Approved G3 thresholds with an area-weighted final component cutoff."""
-    from dataclasses import replace, asdict
-    from .phase_g3_production import APPROVED_SETTINGS, apply_g3_configuration, configuration_identity
-    settings = settings or APPROVED_SETTINGS
-    labels, audit = apply_g3_configuration(frozen_labels, g3_pixel, regional_probability,
-                                           1., replace(settings, minimum_area_mm2=0.))
-    gas, filtered = filter_components_by_area(labels == 2, pixel_area_mm2, settings.minimum_area_mm2,
-                                               connectivity=settings.connectivity)
-    labels[(labels == 2) & ~gas] = 1
-    audit.update(settings=asdict(settings), configuration_sha256=configuration_identity(settings),
-                 gas_pixels=int(np.count_nonzero(gas)),
-                 gas_area_mm2=sum_pixel_area(gas, pixel_area_mm2),
-                 withdrawn_gas_components=filtered["withdrawn_components"],
-                 withdrawn_gas_pixels=filtered["withdrawn_pixels"],
-                 variable_pixel_area=not np.isscalar(pixel_area_mm2),
-                 pixel_area_mm2=None if not np.isscalar(pixel_area_mm2) else float(pixel_area_mm2),
-                 minimum_policy="4-connected sum of native physical pixel areas strictly smaller than minimum is aqueous")
-    return labels, audit

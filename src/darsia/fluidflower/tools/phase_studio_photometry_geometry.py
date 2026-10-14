@@ -198,7 +198,7 @@ def load_registered_shape_rig(anchor, native, dataset, run, anchor_index):
         optical = anchor.get("method", {}).get("optical_provenance") or {}
         selected_artifacts = ((optical.get("optical_binding") or {}).get("recorded_rig") or {}).get(
             "selected_optical_artifacts") or []
-        from darsia.fluidflower.tools.phase_studio_native_mass import sha
+        from darsia.fluidflower.saved_mass_rendering import sha
 
         for item in selected_artifacts:
             if sha(resolve_review_path(Path(item["path"]))) != item["sha256"]:

@@ -359,12 +359,3 @@ def test_baseline_io_dtype_geometry_hash_and_legacy_constructor(parameters, orig
     with a.open("ab") as stream: stream.write(b"changed")
     with pytest.raises(ValueError, match="SHA"):
         photo.load_baseline(a, parameters=parameters)
-    from darsia.fluidflower.native.config import configure_parameters, reset_parameters
-    from darsia.fluidflower.tools import ffac_v5_observed_sand as facade
-    token = configure_parameters({"photometry": parameters})
-    try:
-        assert facade.ReferenceGrid().shape_hw == tuple(parameters["expanded_shape_hw"])
-        assert facade.ReferenceGrid(shape).shape_hw == shape
-        assert facade.ReferenceGrid(shape, (-1, 2), (6, 8)).origin_cell_xy == (-1, 2)
-    finally:
-        reset_parameters(token)

@@ -195,8 +195,8 @@ def compute_feature_support(
     h_baseline_to_current: np.ndarray,
     previous_valid: np.ndarray | None = None,
     h_baseline_to_previous: np.ndarray | None = None,
-    baseline_origin_xy: tuple[int, int] = (0, 0),
-    previous_origin_xy: tuple[int, int] = (0, 0),
+    baseline_origin_xy: tuple[int, int],
+    previous_origin_xy: tuple[int, int],
     parameters: Mapping,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Intersect current support with bilinearly transported reference and previous

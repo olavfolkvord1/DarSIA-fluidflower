@@ -162,11 +162,8 @@ def _quick_hash(path: Path, sample_bytes: int) -> str:
 
 
 def _full_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    from .project import _sha256_file_uncached
+    return _sha256_file_uncached(path)
 
 
 def _parse_exif_datetime(value: Any) -> str:

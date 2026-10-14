@@ -96,7 +96,7 @@ def test_feature_footprint_uses_previous_and_origin(parameters):
         previous_valid=previous,
         h_baseline_to_previous=np.eye(3),
         parameters=parameters,
-    )
+    baseline_origin_xy=(0, 0), previous_origin_xy=(0, 0))
     assert not raw[4, 4]
     assert not safe[3:6, 3:6].any()
     _, shifted = support.compute_feature_support(
@@ -105,7 +105,7 @@ def test_feature_footprint_uses_previous_and_origin(parameters):
         h_baseline_to_current=np.eye(3),
         baseline_origin_xy=(1, 0),
         parameters=parameters,
-    )
+    previous_origin_xy=(0, 0))
     assert not shifted[:, 0].any() and shifted[:, 1:].all()
 
 

@@ -296,6 +296,7 @@ class SeriesInputs:
     """
 
     def __init__(self, config, output):
+        """Load bound model, baseline and acquisition-history inputs for the ordered series."""
         from ..mass.n1_pipeline import DataReader
         from ..phase import features
         from . import phase_inputs as loaders

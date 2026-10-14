@@ -48,11 +48,8 @@ def _digest(value: Any) -> str:
 
 
 def _finite(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
+    from darsia.fluidflower.mass_inputs import _number as _canonical_finite_number
+    return _canonical_finite_number(value)
 
 
 def _same_time(a: Any, b: Any) -> bool:
@@ -443,7 +440,7 @@ def _normalize_geometry(payload: dict[str, Any], native: Mapping[str, Any]) -> s
 def _align(payload: Mapping[str, Any], original: Mapping[str, Any] | None,
            current: Mapping[str, Any] | None, *, geometry: bool) -> dict[str, Any]:
     if "ffac_selected_policy_a_sources" in (current or {}):
-        from darsia.fluidflower.phase_ffac_selected_annotation_binding import align_selected_annotation
+        from darsia.fluidflower.phase_annotation_binding import align_selected_annotation
         checked=deepcopy(dict(payload))
         if geometry and original:
             error=_normalize_geometry(checked,original)
@@ -676,7 +673,7 @@ def load_review_history(*, campaign_root: Path, current_native_paths: Mapping[st
                         for native_path in options or [None]:
                             native = reader.read(native_path, required=bool(native_path))
                             if "ffac_selected_policy_a_sources" in (current.get(run) or {}):
-                                from darsia.fluidflower.phase_ffac_selected_annotation_binding import resolve_camera_lineage
+                                from darsia.fluidflower.phase_annotation_binding import resolve_camera_lineage
                                 try:
                                     native=resolve_camera_lineage(native,reader.read)
                                 except (KeyError,ValueError,TypeError,OSError) as exc:
@@ -743,7 +740,7 @@ def _apply_retraction_status(result: dict[str, Any], current: Mapping[str, Any],
     remains visible as pending while inspecting an older model. Ledger errors
     disable new withdrawals and are surfaced; originals are never rewritten.
     """
-    from darsia.fluidflower.tools import phase_review_retractions as retractions
+    import darsia.fluidflower.phase_review_retractions as retractions
 
     result["retraction_context"] = {}
     result["withdrawn_by_run"] = {}
@@ -842,7 +839,7 @@ def _include_replacement_history(result: dict[str, Any], run: str,
 
 def apply_saved_retraction(payload: Mapping[str, Any], event: Mapping[str, Any]) -> dict[str, Any]:
     """Mark every copy immediately from an acknowledged append, without NAS IO."""
-    from darsia.fluidflower.tools import phase_review_retractions as retractions
+    import darsia.fluidflower.phase_review_retractions as retractions
 
     result = deepcopy(dict(payload))
     target = event["target"]

@@ -56,21 +56,13 @@ PHASE_REVIEW_CLASSES = (
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _json_digest(value: Any) -> str:
@@ -81,23 +73,13 @@ def _json_digest(value: Any) -> str:
 
 
 def _file_reference(path: Path) -> dict[str, Any]:
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(resolved)
-    stat = resolved.stat()
-    return {
-        "path": str(resolved),
-        "size_bytes": int(stat.st_size),
-        "modified_ns": int(stat.st_mtime_ns),
-        "sha256": sha256_file(resolved),
-    }
+    from darsia.fluidflower.phase_interpretation import _file_reference as _canonical_file_reference
+    return _canonical_file_reference(path)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected one JSON object in {path}")
-    return payload
+    from .phase_saved_review_metadata import read_model_json
+    return read_model_json(path)
 
 
 def phase_uncertainty_map(predictions: Mapping[str, Any]) -> np.ndarray:
@@ -922,20 +904,8 @@ class SerializedPhaseHead:
         )
 
     def probability(self, features: np.ndarray) -> np.ndarray:
-        values = np.asarray(features, dtype=np.float64)
-        if values.shape[-1] != self.coefficients.size:
-            raise ValueError(
-                f"Feature width {values.shape[-1]} differs from {self.coefficients.size}"
-            )
-        logits = (
-            (values - self.mean) / self.scale
-        ) @ self.coefficients + self.intercept
-        output = np.empty_like(logits, dtype=np.float64)
-        positive = logits >= 0
-        output[positive] = 1.0 / (1.0 + np.exp(-logits[positive]))
-        exp_values = np.exp(logits[~positive])
-        output[~positive] = exp_values / (1.0 + exp_values)
-        return output.astype(np.float32)
+        from .phase.heads import SerializedPhaseHead as CanonicalHead
+        return CanonicalHead.probability(self, features)
 
 
 @dataclass(frozen=True)
@@ -963,18 +933,8 @@ class HierarchicalPhaseModel:
         return self.co2_presence.feature_contract
 
     def predict_features(self, features: np.ndarray) -> dict[str, np.ndarray]:
-        co2 = self.co2_presence.probability(features)
-        conditional_gas = self.gas_within_co2.probability(features)
-        free_gas = co2 * conditional_gas
-        aqueous = co2 * (np.float32(1.0) - conditional_gas)
-        water = np.float32(1.0) - co2
-        return {
-            "co2_presence_probability": co2,
-            "gas_probability_conditional_on_co2": conditional_gas,
-            "untouched_water_probability": water,
-            "aqueous_co2_probability": aqueous,
-            "free_co2_gas_probability": free_gas,
-        }
+        from .phase.heads import HierarchicalPhaseModel as CanonicalModel
+        return CanonicalModel.predict_features(self, features)
 
     def predict_image(
         self,

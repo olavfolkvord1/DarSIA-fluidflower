@@ -367,14 +367,8 @@ class WassersteinPage(ModulePage):
         self.wasserstein_cell_size.setEnabled(enabled)
 
     def _analysis_domain_rows(self) -> list[dict[str, Any]]:
-        revision = AnalysisDomainStore(self.project).current()
-        if revision.get("format") != ANALYSIS_DOMAIN_REVISION_FORMAT:
-            return []
-        return [
-            deepcopy_settings(row)
-            for row in (revision.get("configuration") or {}).get("domains") or []
-            if bool(row.get("enabled", True))
-        ]
+        from ..post_analysis.page import PostAnalysisPage
+        return PostAnalysisPage._post_domain_rows(self)
 
     def _reload_domain_choices(self, *, selected_ids: set[str] | None = None) -> None:
         while self.wasserstein_domain_choices.count():

@@ -40,8 +40,8 @@ def _read(path):
 
 
 def _signature(path):
-    stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino
+    from .phase_saved_review_metadata import metadata_file_stamp
+    return metadata_file_stamp(path)
 
 
 @lru_cache(maxsize=128)
@@ -71,7 +71,7 @@ def _bound(asset):
 
 
 def _registration_path(model_id, registry_dir=None):
-    from .tools.register_track1_studio_candidate import registration_path
+    from .phase_saved_registration import registration_path
     path = (Path(registry_dir) / f"{model_id}.json" if registry_dir is not None
             else registration_path(model_id))
     return resolve_review_path(path).resolve()
@@ -135,7 +135,7 @@ def _t4c_root(candidate_or_child):
 
 def _candidate_graph(root, registry_dir=None):
     """Verify only source-bound metadata; never load labels or prediction assets."""
-    from .phase_ffac_t4c_review import t4c_saved_review
+    from .phase_saved_floor_review import t4c_saved_review
     checked = t4c_saved_review(root)
     identity = checked["model_identity"]
     placement = checked["placement"]
@@ -351,13 +351,13 @@ def predictions_withheld(candidate_or_child, run):
         return False
     try:
         if (root / "p1_final3_plan.json").is_file():
-            from .phase_ffac_p1_final3_review import p1_final3_saved_review
+            from .phase_saved_contact_review import p1_final3_saved_review
             p1_final3_saved_review(root)
         elif (root / "p1_final2_plan.json").is_file():
-            from .phase_ffac_p1_final2_review import p1_final2_saved_review
+            from .phase_saved_categorical_review import p1_final2_saved_review
             p1_final2_saved_review(root)
         elif _p1_final(root):
-            from .phase_ffac_p1_final_review import p1_final_saved_review
+            from .phase_saved_boundary_review import p1_final_saved_review
             p1_final_saved_review(root)
         else:
             _validated_release(root)
@@ -384,21 +384,21 @@ def effective_publication_warning(candidate_or_child, producer_warning):
     if root is None:
         return producer_warning
     if (root / "p1_final3_plan.json").is_file():
-        from .phase_ffac_p1_final3_review import p1_final3_saved_review
+        from .phase_saved_contact_review import p1_final3_saved_review
         try:
             p1_final3_saved_review(root)
             return producer_warning
         except (OSError, ValueError, KeyError, TypeError):
             return f"{producer_warning} {NOTICE}".strip()
     if (root / "p1_final2_plan.json").is_file():
-        from .phase_ffac_p1_final2_review import p1_final2_saved_review
+        from .phase_saved_categorical_review import p1_final2_saved_review
         try:
             p1_final2_saved_review(root)
             return producer_warning
         except (OSError, ValueError, KeyError, TypeError):
             return f"{producer_warning} {NOTICE}".strip()
     if _p1_final(root):
-        from .phase_ffac_p1_final_review import p1_final_saved_review
+        from .phase_saved_boundary_review import p1_final_saved_review
         try:
             p1_final_saved_review(root)
             return producer_warning

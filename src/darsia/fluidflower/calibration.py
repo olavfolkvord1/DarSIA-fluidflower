@@ -256,21 +256,13 @@ PARAMETER_DEFINITIONS: tuple[dict[str, Any], ...] = (
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -289,21 +281,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _json_digest(payload: Any) -> str:
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    from darsia.fluidflower.analysis_domains import _json_digest as _canonical_ascii_digest
+    return _canonical_ascii_digest(payload)
 
 
 def _number(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
+    from darsia.fluidflower.mass_inputs import _number as _canonical_finite_number
+    return _canonical_finite_number(value)
 
 
 def default_calibration_parameter_space(
@@ -779,7 +763,12 @@ def validate_calibration_plan(
     if native_contract and not native_fixed:
         _issue(issues, "error", "invalid_native_fixed_contract", "Unknown native fixed-phase calibration contract.")
     if native_round2:
-        from .phase_ffac_common_mass_round2_production import CALIBRATION, HELDOUT, EXCLUDED, DESCRIPTIVE
+        from .phase_saved_review_metadata import configured_parameters
+        cohort_parameters = configured_parameters("calibration_cohorts")
+        CALIBRATION = frozenset(cohort_parameters["CALIBRATION"])
+        HELDOUT = frozenset(cohort_parameters["HELDOUT"])
+        EXCLUDED = frozenset(cohort_parameters["EXCLUDED"])
+        DESCRIPTIVE = frozenset(cohort_parameters["DESCRIPTIVE"])
         if (set(native_contract.get("calibration_runs") or []) != CALIBRATION
                 or set(native_contract.get("heldout_runs") or []) != HELDOUT
                 or set(native_contract.get("excluded_runs") or []) != EXCLUDED
@@ -1391,12 +1380,8 @@ class CalibrationPlanStore:
         return _read_jsonl(self.revisions_path)
 
     def current(self) -> dict[str, Any]:
-        if self.current_path.is_file():
-            payload = json.loads(self.current_path.read_text(encoding="utf-8-sig"))
-            if isinstance(payload, dict):
-                return payload
-        rows = self.revisions()
-        return deepcopy(rows[-1]) if rows else {}
+        from .analysis_domains import AnalysisDomainStore
+        return AnalysisDomainStore.current(self)
 
     def save_plan(
         self,

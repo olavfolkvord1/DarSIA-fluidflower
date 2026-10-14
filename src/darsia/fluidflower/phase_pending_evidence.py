@@ -333,7 +333,7 @@ def _consumed_regions(root, documents, series):
 
 def _registered_promotions(family, series):
     """Verify saved enrollment metadata; full native-image checks stay in capture."""
-    from .tools import phase_training_promotions as promotions
+    from . import phase_saved_promotions as promotions
     result = []
     for path in sorted(promotions.promotion_root().glob("*.json")):
         stored = _read(path)

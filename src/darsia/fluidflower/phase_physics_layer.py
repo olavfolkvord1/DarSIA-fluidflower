@@ -57,11 +57,8 @@ class VerifiedPhysicsFrame:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    from .project import _sha256_file_uncached
+    return _sha256_file_uncached(path)
 
 
 def _read_json(path: Path, label: str) -> dict:

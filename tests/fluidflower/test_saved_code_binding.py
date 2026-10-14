@@ -1,90 +1,66 @@
-"""Saved-map code admission locates source identities without numerical imports."""
-from __future__ import annotations
-
-import ast
+"""Passive saved-source declarations keep exact names/hashes without execution."""
 import hashlib
-from pathlib import Path
-import subprocess
 import sys
-from types import ModuleType, SimpleNamespace
+from pathlib import Path
 
 import pytest
 
-from darsia.fluidflower import phase_ffac_t4c_review as review
+from darsia.fluidflower.phase_saved_review_metadata import declared_code_binding
 
 
-def test_binding_hashes_original_tuple_without_executing_targets(tmp_path, monkeypatch):
-    package = tmp_path / "saved_binding_fixture"
-    package.mkdir()
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    runner = package / "runner.py"
-    numeric = package / "numeric.py"
-    numeric.write_text("raise AssertionError('numerical target must not execute')\n", encoding="utf-8")
-    runner.write_text(
+def _descriptor(path, **extra):
+    data = Path(path).read_bytes()
+    return dict(path=str(path), sha256=hashlib.sha256(data).hexdigest(),
+                size_bytes=len(data), **extra)
+
+
+def _parameters(tmp_path, declaration):
+    runner = tmp_path / "runner.py"
+    runner.write_text(declaration, encoding="utf-8")
+    numerical = tmp_path / "numeric.py"
+    numerical.write_text("raise AssertionError('source must not execute')\n", encoding="utf-8")
+    names = ["saved_binding_fixture.runner", "saved_binding_fixture.numeric"]
+    return dict(code_declaration=_descriptor(runner, function_name="code_binding",
+                                             module_name=names[0]),
+                declared_code_names=names,
+                code_sources={names[0]: _descriptor(runner),
+                              names[1]: _descriptor(numerical)})
+
+
+def test_literal_bindings_are_read_without_import_or_execution(tmp_path):
+    parameters = _parameters(tmp_path,
         "raise AssertionError('runner must not execute')\n"
         "def code_binding():\n"
-        "    names = (__name__, 'saved_binding_fixture.numeric')\n"
-        "    return {name: sha256_file(importlib.import_module(name).__file__) for name in names}\n",
-        encoding="utf-8",
-    )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    binding = review._declared_code_binding(SimpleNamespace(
-        __file__=str(runner), __name__="saved_binding_fixture.runner",
-    ))
-    assert binding == {
-        "saved_binding_fixture.runner": hashlib.sha256(runner.read_bytes()).hexdigest(),
-        "saved_binding_fixture.numeric": hashlib.sha256(numeric.read_bytes()).hexdigest(),
-    }
+        "    names = (__name__, 'saved_binding_fixture.numeric')\n")
+    expected = {name: entry["sha256"] for name, entry in parameters["code_sources"].items()}
+    assert declared_code_binding(parameters=parameters) == expected
     assert "saved_binding_fixture.runner" not in sys.modules
     assert "saved_binding_fixture.numeric" not in sys.modules
 
 
-def test_loaded_module_keeps_literal_file_identity(tmp_path, monkeypatch):
-    source = tmp_path / "loaded.py"
-    source.write_text("bound source\n", encoding="utf-8")
-    loaded = ModuleType("saved_binding_loaded")
-    loaded.__file__ = str(source)
-    monkeypatch.setitem(sys.modules, loaded.__name__, loaded)
-    assert review._module_source_path(loaded.__name__) == source
-
-
 def test_nonliteral_names_are_rejected_without_execution(tmp_path):
-    source = tmp_path / "unsafe_runner.py"
-    source.write_text(
-        "raise AssertionError('no source execution')\n"
+    parameters = _parameters(tmp_path,
+        "raise AssertionError('runner must not execute')\n"
         "def code_binding():\n"
-        "    names = tuple(discover_numerical_modules())\n",
-        encoding="utf-8",
-    )
+        "    names = tuple(discover_numerical_modules())\n")
     with pytest.raises(ValueError, match="literal name tuple"):
-        review._declared_code_binding(SimpleNamespace(
-            __file__=str(source), __name__="unsafe_runner",
-        ))
+        declared_code_binding(parameters=parameters)
 
 
-def test_saved_admission_guards_unchanged_except_source_lookup():
-    repo = Path(__file__).resolve().parents[2]
-    relative = "src/darsia/fluidflower/phase_ffac_t4c_review.py"
-    original = subprocess.check_output(
-        ["git", "show", "1be6b7b510233c3d35d21ed4119f8552953408a3:" + relative],
-        cwd=repo, text=True, encoding="utf-8",
-    )
-    old = next(node for node in ast.parse(original).body
-               if isinstance(node, ast.FunctionDef) and node.name == "_admitted")
-    new = next(node for node in ast.parse((repo / relative).read_text()).body
-               if isinstance(node, ast.FunctionDef) and node.name == "_admitted")
+def test_declared_names_must_match_the_full_order_and_set(tmp_path):
+    parameters = _parameters(tmp_path,
+        "def code_binding():\n"
+        "    names = (__name__, 'saved_binding_fixture.numeric')\n")
+    parameters["declared_code_names"].reverse()
+    with pytest.raises(ValueError, match="declared source names changed"):
+        declared_code_binding(parameters=parameters)
 
-    class RestoreLookup(ast.NodeTransformer):
-        def visit_Call(self, node):
-            node = self.generic_visit(node)
-            if isinstance(node.func, ast.Name) and node.func.id == "_declared_code_binding":
-                assert len(node.args) == 1 and isinstance(node.args[0], ast.Name)
-                assert node.args[0].id == "runner" and not node.keywords
-                return ast.Call(func=ast.Attribute(value=ast.Name(id="runner", ctx=ast.Load()),
-                                                  attr="code_binding", ctx=ast.Load()),
-                                args=[], keywords=[])
-            return node
 
-    assert ast.dump(RestoreLookup().visit(new), include_attributes=False) == ast.dump(
-        old, include_attributes=False,
-    )
+def test_passive_source_bytes_are_still_bound(tmp_path):
+    parameters = _parameters(tmp_path,
+        "def code_binding():\n"
+        "    names = (__name__, 'saved_binding_fixture.numeric')\n")
+    Path(parameters["code_sources"]["saved_binding_fixture.numeric"]["path"]).write_text(
+        "changed bytes\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        declared_code_binding(parameters=parameters)

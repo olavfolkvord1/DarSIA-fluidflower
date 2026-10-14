@@ -63,7 +63,7 @@ def match_rows(a: np.ndarray, b: np.ndarray, points,
     return np.asarray(rows, dtype=np.float64).reshape(-1, 5)
 
 
-def match_metrics(rows: np.ndarray, scale: float = 1.0) -> dict:
+def match_metrics(rows: np.ndarray, scale: float) -> dict:
     'Summarize displacement and correlation for accepted source matches.'
     if len(rows) == 0:
         return {"n": 0, "p50_px": None, "p95_px": None, "max_px": None}

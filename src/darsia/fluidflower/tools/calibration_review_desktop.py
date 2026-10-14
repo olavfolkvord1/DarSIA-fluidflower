@@ -109,11 +109,7 @@ from darsia.fluidflower.tools import calibration_pairwise_review as review
 from darsia.fluidflower.tools.phase_view_overlay import (
     UNRESOLVED_RGB, display_phase_overlay, overlay_asset_layer,
 )
-from darsia.fluidflower.phase_v5_display_asset import (
-    BASE_DISPLAY_MODES, DISPLAY_MODES, DISPLAY_MODE_LABELS,
-    change_display_available, display_modes_available,
-    resolve_display_mode, resolve_photo_sand_domain, load_original_display_rgb,
-)
+from darsia.fluidflower.phase_photographic_assets import BASE_DISPLAY_MODES, DISPLAY_MODES, DISPLAY_MODE_LABELS, change_display_available, display_modes_available, resolve_display_mode, resolve_photo_sand_domain, load_original_display_rgb
 from darsia.fluidflower.tools.phase_review_area_sort import (
     peak_phase_area_percent,
     sorted_phase_area_runs,
@@ -457,8 +453,8 @@ def timestamp_utc(value: Any) -> datetime:
 
 
 def reviewer_identifier(name: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", "-", str(name).strip().casefold()).strip("-")
-    return value or "anonymous"
+    from .calibration_pairwise_review import _reviewer_identifier
+    return _reviewer_identifier(name)
 
 
 def reviewer_output_dir(save_root: Path, reviewer_name: str, workspace: ReviewWorkspace) -> Path:
@@ -1029,18 +1025,18 @@ class ReviewImageAssets:
     def _selected_photo_asset(self,index,mode,*,reference=False):
         if "ffac_selected_policy_a_sources" not in (self.current_pair or {}):
             return None
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import resolve_photograph
+        from darsia.fluidflower.phase_selected_policy_review import resolve_photograph
         root,run=self.current_review_root,self.current_run
         return ReviewImageAssets._bound_photo_asset(self,DeferredImage(
             f"selected-file-photo:{root}:{run}:{index}:{reference}:{mode}",
             lambda: resolve_photograph(root,run,index,mode=mode,reference=reference)),index,mode,reference=reference)
 
     def _annotation_display_frame(self,annotation):
-        from darsia.fluidflower.phase_ffac_selected_annotation_binding import presentation_frame
+        from darsia.fluidflower.phase_annotation_binding import presentation_frame
         return presentation_frame(annotation,getattr(self,"_selected_annotation_binding",None))
 
     def _annotation_display_payload(self,annotation):
-        from darsia.fluidflower.phase_ffac_selected_annotation_binding import presentation_annotation
+        from darsia.fluidflower.phase_annotation_binding import presentation_annotation
         return presentation_annotation(annotation,getattr(self,"_selected_annotation_binding",None))
 
     def _add_brightness_control(self, layout) -> None:
@@ -1108,7 +1104,7 @@ class ReviewImageAssets:
         if "ffac_selected_policy_a_sources" in (self.current_pair or {}):
             revision=rows[index]["rig_domain_revision"]
             def selected_filled():
-                from darsia.fluidflower.phase_pixel_area import load_rig_classes
+                from darsia.fluidflower.phase_saved_review_metadata import load_rig_classes
                 fields,_=load_rig_classes(revision,base_dir=self.current_review_root)
                 return fields["filled_observed"] | fields["filled_unobserved"]
             return selected_filled
@@ -1130,7 +1126,7 @@ class ReviewImageAssets:
         if raw_detail:
             if asset := ReviewImageAssets._rig_raw_display_asset(self, index, "raw_detail"):
                 return asset
-            from darsia.fluidflower.phase_v5_display_asset import resolve_raw_detail
+            from darsia.fluidflower.phase_photographic_assets import resolve_raw_detail
             return ReviewImageAssets._bound_photo_asset(self, DeferredImage(
                 f"v5-raw-detail:frame:{root}:{run}:{index}",
                 lambda: resolve_raw_detail(root, run, index),
@@ -1162,7 +1158,7 @@ class ReviewImageAssets:
         if raw_detail:
             if asset := ReviewImageAssets._rig_raw_display_asset(self, None, "raw_detail", reference=True):
                 return asset
-            from darsia.fluidflower.phase_v5_display_asset import resolve_raw_detail
+            from darsia.fluidflower.phase_photographic_assets import resolve_raw_detail
             return DeferredImage(
                 f"v5-raw-detail:reference:{root}:{run}",
                 lambda: resolve_raw_detail(root, run, None, reference=True),
@@ -1320,7 +1316,7 @@ class ReviewImageAssets:
         dependencies = ()
         if revision is not None and (revision.get("classes") or {}).get("path"):
             def masks():
-                from darsia.fluidflower.phase_pixel_area import load_rig_classes
+                from darsia.fluidflower.phase_saved_review_metadata import load_rig_classes
                 fields, _ = load_rig_classes(revision, base_dir=root)
                 return fields["rig_domain"], fields["filled_observed"] | fields["filled_unobserved"]
             dependencies = (str(revision["classes"]["path"]),)
@@ -2963,24 +2959,18 @@ class QuizPreparationTask(QRunnable):
 
     def run(self) -> None:
         try:
-            from darsia.fluidflower.phase_validation import ensure_review_proposals
-            from darsia.fluidflower.phase_execution_resources import available_resources
-            from darsia.fluidflower.tools.phase_studio_execution import make_predictor
+            from darsia.fluidflower.phase_saved_review_proposals import ensure_review_proposals
+            from darsia.fluidflower.phase_saved_review_metadata import configured_parameters
 
             def progress(message):
                 if self.cancelled.is_set():
                     raise RuntimeError("Quiz preparation cancelled because its window was closed")
                 self.signals.progress.emit(self.key, str(message))
 
-            def predictor_factory(model, baseline):
-                return make_predictor(model, baseline, {"runs": []}, backend="auto",
-                                      threads=max(1, min(4, available_resources()[0])))
-
-            progress("Preparing model-selected regions")
+            progress("Reading saved model-selected regions")
             path = ensure_review_proposals(
                 self.campaign, self.key[0], progress=progress,
-                predictor_factory=predictor_factory,
-                inference_provenance={"purpose": "on-demand-quiz", "backend": "checked-auto"},
+                parameters=configured_parameters("quiz"),
             )
             payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
             self.signals.finished.emit(self.key, payload, "")
@@ -3009,7 +2999,7 @@ class PresentationTask(QRunnable):
 
     def run(self):
         try:
-            from darsia.fluidflower.tools.phase_transfer_materialization import ensure_candidate_presentation
+            from darsia.fluidflower.phase_saved_presentation import ensure_candidate_presentation
             def progress(message):
                 if self.cancelled.is_set():
                     raise RuntimeError("Presentation preparation cancelled")
@@ -5382,7 +5372,7 @@ class ReviewHistoryRetractionTask(QRunnable):
 
     def run(self) -> None:
         try:
-            from darsia.fluidflower.tools.phase_review_retractions import retract_history_entry
+            from darsia.fluidflower.phase_review_retractions import retract_history_entry
             event = retract_history_entry(self.entry, **self.inputs)
         except Exception as exc:  # noqa: BLE001 - background write boundary
             self.signals.loaded.emit({}, f"{type(exc).__name__}: {exc}")
@@ -5400,7 +5390,7 @@ class ReviewHistoryReclassificationTask(QRunnable):
 
     def run(self) -> None:
         try:
-            from darsia.fluidflower.tools.phase_review_retractions import reclassify_history_entry
+            from darsia.fluidflower.phase_review_retractions import reclassify_history_entry
             event = reclassify_history_entry(self.entry, **self.inputs)
         except Exception as exc:  # noqa: BLE001 - background write boundary
             self.signals.loaded.emit({}, f"{type(exc).__name__}: {exc}")
@@ -5541,7 +5531,7 @@ class ComparisonRunLoadTask(QRunnable):
                          else BASE_DISPLAY_MODES)
             annotation_binding=None
             if "ffac_selected_policy_a_sources" in pair:
-                from darsia.fluidflower.phase_ffac_selected_annotation_binding import load_annotation_binding
+                from darsia.fluidflower.phase_annotation_binding import load_annotation_binding
                 annotation_binding=load_annotation_binding(review_root,self.run_name)
             decision = self.store.decisions().get(self.run_name) or {}
             try:
@@ -5986,7 +5976,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         if view == "raw_detail":
             if asset := ReviewImageAssets._rig_raw_display_asset(self, index, view, reference=reference):
                 return asset
-            from darsia.fluidflower.phase_v5_display_asset import resolve_raw_detail
+            from darsia.fluidflower.phase_photographic_assets import resolve_raw_detail
             return ReviewImageAssets._bound_photo_asset(self, DeferredImage(
                 f"v5-raw-detail:{'reference' if reference else 'frame'}:{root}:{run}:{index}",
                 lambda: resolve_raw_detail(root, run, index, reference=reference),
@@ -6224,8 +6214,6 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             )
             self.end_blind_session.clicked.connect(self._end_blind_gas_session)
             header.addWidget(self.end_blind_session)
-        from darsia.fluidflower.ui.live_disagreement_review import attach_live_disagreement_action
-        header.addWidget(attach_live_disagreement_action(self, sys.modules[__name__]))
         root.addWidget(self.header_widget)
 
         notice = QLabel(
@@ -7590,8 +7578,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
 
     @staticmethod
     def _run_number(run: str) -> tuple[int, str]:
-        digits = "".join(character for character in run if character.isdigit())
-        return (int(digits) if digits else 10 ** 9, run)
+        from .phase_review_area_sort import _run_number
+        return _run_number(run)
 
     def _refresh_runs(self, _checked: bool = False) -> None:
         """Explicitly refresh disk state; autosave only updates cached labels."""
@@ -10357,7 +10345,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
 
     def _append_issue_annotation(self, annotation: dict[str, Any]) -> None:
         if getattr(self,"_selected_annotation_binding",None) is not None:
-            from darsia.fluidflower.phase_ffac_selected_annotation_binding import stamp_camera_identity
+            from darsia.fluidflower.phase_annotation_binding import stamp_camera_identity
             row=self.current_pair["frame_sources"][self.frame_index]
             annotation=stamp_camera_identity(annotation,row,self.current_run)
         side = str(annotation.get("candidate") or "A").upper()
@@ -11289,7 +11277,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         ]
         annotation_binding=getattr(self,"_selected_annotation_binding",None)
         if annotation_binding is not None:
-            from darsia.fluidflower.phase_ffac_selected_annotation_binding import stamp_camera_identity
+            from darsia.fluidflower.phase_annotation_binding import stamp_camera_identity
             originals=(getattr(self,"current_decision",{}) or {}).get("frame_choices") or []
             kept=[]
             for item in originals:

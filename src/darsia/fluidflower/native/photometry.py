@@ -458,6 +458,7 @@ class ReferenceGrid:
             raise ValueError('Original grid shape must be positive')
 
     def normalized_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return float64 x/y coordinates normalized about the parent grid centre."""
         parameters = self.parameters
         yy, xx = np.mgrid[:self.shape_hw[0], :self.shape_hw[1]]
         x = (xx + self.origin_cell_xy[0] - self.original_shape_hw[1] / 2) / (self.original_shape_hw[1] / 2)
@@ -465,6 +466,7 @@ class ReferenceGrid:
         return (x.astype(np.float64), y.astype(np.float64))
 
     def basis(self, *, include_constant: bool=False) -> np.ndarray:
+        """Build the ordered float64 polynomial basis on the normalized reference grid."""
         parameters = self.parameters
         x, y = self.normalized_coordinates()
         first = 0 if include_constant else 1

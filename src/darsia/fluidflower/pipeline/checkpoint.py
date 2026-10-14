@@ -387,11 +387,8 @@ def verify_frame_prefix(
 
 def _descriptor(path):
     """Metadata descriptors are small; payload validation streams separately."""
-    path = Path(path)
-    raw = path.read_bytes()
-    return dict(
-        path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw)
-    )
+    from .job_queue import descriptor
+    return descriptor(path)
 
 
 def retirement_document(task, attempt, identities, supervisor):

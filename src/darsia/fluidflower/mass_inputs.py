@@ -508,7 +508,7 @@ def validate_mass_parameter_artifact(
     candidate = deepcopy(dict(payload))
     issues: list[dict[str, Any]] = []
     if candidate.get("native_contract") == "native-round2-fixed-phase-v1":
-        from darsia.fluidflower.phase_ffac_common_mass_round2_production import FrozenEvidence
+        from darsia.fluidflower.mass_saved_metadata import FrozenEvidence
         artifact_model=str(candidate.get("selected_model") or "")
         if candidate.get("format")!=MASS_PARAMETER_ARTIFACT_FORMAT or artifact_model!=selected_model:
             _issue(issues,"error","native_round2_parameter_model","The saved round-2 response must match the selected mass model.")
@@ -548,7 +548,7 @@ def validate_mass_parameter_artifact(
             requires_native_fixed_executor=True,legacy_probability_executor_allowed=False,
             full_production_allowed=production_allowed)
     if candidate.get("native_contract") == "native-darsia-fixed-phase-mass-v1":
-        from darsia.fluidflower.phase_ffac_common_mass import verify_frozen_calibration, EXCLUDED_RUNS
+        from darsia.fluidflower.mass_saved_metadata import verify_frozen_calibration, EXCLUDED_RUNS
         artifact_model = str(candidate.get("selected_model") or "")
         if candidate.get("format") != MASS_PARAMETER_ARTIFACT_FORMAT or artifact_model != selected_model or selected_model != "titration":
             _issue(issues, "error", "native_parameter_model", "The common native main result requires a titration mass-parameter artifact.")

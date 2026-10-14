@@ -33,14 +33,14 @@ def _independent_alignments(arguments, *, feature_parameters):
     named = dict(arguments)
     native_previous = (
         named.get("previous") is not None
-        and tuple(named.get("previous_origin_xy", (0, 0))) == (0, 0)
+        and tuple(named["previous_origin_xy"]) == (0, 0)
         and np.asarray(named["previous"]).shape == np.asarray(named["current"]).shape
     )
     if native_previous:
         named = dict(named, previous_source_valid_mask=None)
     inherited_named = dict(named)
     native_baseline = (
-        tuple(named.get("baseline_origin_xy", (0, 0))) == (0, 0)
+        tuple(named["baseline_origin_xy"]) == (0, 0)
         and np.asarray(named["baseline"]).shape == np.asarray(named["current"]).shape
     )
     if native_baseline:
@@ -211,7 +211,10 @@ def infer_native_centre(
                 parameters=fp,
             )
         registered = features.register_flatfield_reference(
-            flat_reference, current_h, target_shape_hw=shape, parameters=fp
+            flat_reference, current_h, target_shape_hw=shape,
+            source_origin_xy=tuple(runtime["flatfield_source_origin_xy"]),
+            target_origin_xy=tuple(runtime["flatfield_target_origin_xy"]),
+            parameters=fp
         )
         current_features = predictor.prepare_rgb(current)
         previous_features = (

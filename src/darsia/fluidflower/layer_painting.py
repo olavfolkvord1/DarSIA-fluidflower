@@ -93,11 +93,8 @@ def _progress(callback: ProgressCallback | None, message: str) -> None:
 
 
 def _number(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+    from .mass_inputs import _number as shared_number
+    return shared_number(value)
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +573,7 @@ def load_painting_image(
 
     import cv2
 
-    from darsia.fluidflower.tools.injection_point_detection import load_reduced
+    from darsia.fluidflower.photograph_io import load_reduced
 
     selected = Path(path)
     width, height = photo_size(selected)

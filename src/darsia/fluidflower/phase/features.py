@@ -124,7 +124,7 @@ def _rgb(value: Any, name: str, *, parameters: Mapping) -> np.ndarray:
         raise ValueError(f'{name} must be finite HWC float32 unit RGB')
     return rgb
 
-def warp_reference_to_current(reference: np.ndarray, h_reference_to_current: Any, *, required_valid_mask: np.ndarray | None=None, target_shape_hw: tuple[int, int] | None=None, source_origin_xy: tuple[int, int]=(0, 0), source_valid_mask: np.ndarray | None=None, parameters: Mapping) -> tuple[np.ndarray, np.ndarray]:
+def warp_reference_to_current(reference: np.ndarray, h_reference_to_current: Any, *, required_valid_mask: np.ndarray | None=None, target_shape_hw: tuple[int, int] | None=None, source_origin_xy: tuple[int, int], source_valid_mask: np.ndarray | None=None, parameters: Mapping) -> tuple[np.ndarray, np.ndarray]:
     """Return a reference on the current native grid and its exact support.
 
     ``source_origin_xy`` locates the reference array's (0, 0) in native review
@@ -162,7 +162,7 @@ def warp_reference_to_current(reference: np.ndarray, h_reference_to_current: Any
             raise ValueError('optical reference warp lacks source pixels in required region')
     return (np.asarray(aligned, np.float32), valid)
 
-def align_temporal_inputs(*, baseline: np.ndarray, current: np.ndarray, previous: np.ndarray | None, h_baseline_to_current: Any, h_baseline_to_previous: Any | None=None, required_valid_mask: np.ndarray | None=None, baseline_origin_xy: tuple[int, int]=(0, 0), previous_origin_xy: tuple[int, int]=(0, 0), baseline_source_valid_mask: np.ndarray | None=None, previous_source_valid_mask: np.ndarray | None=None, return_support_mask: bool=False, parameters: Mapping) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any]]:
+def align_temporal_inputs(*, baseline: np.ndarray, current: np.ndarray, previous: np.ndarray | None, h_baseline_to_current: Any, h_baseline_to_previous: Any | None=None, required_valid_mask: np.ndarray | None=None, baseline_origin_xy: tuple[int, int], previous_origin_xy: tuple[int, int], baseline_source_valid_mask: np.ndarray | None=None, previous_source_valid_mask: np.ndarray | None=None, return_support_mask: bool=False, parameters: Mapping) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any]]:
     """Align baseline and previous into current native coordinates.
 
     The two transforms must be certified by source-bound per-frame receipts.
@@ -206,6 +206,7 @@ class FeatureBuilder:
     """Original float32 optical features, with separate masked convolution."""
 
     def __init__(self, contract, baseline, *, parameters, input_encoding, block_rows, texture_sigma, valid=None, feature_shape_hw=None):
+        """Bind corrected-camera baseline features; texture lengths are in feature-grid pixels."""
         self.parameters = parameters
         self.feature_contract = contract
         p = parameters['optical']
@@ -396,7 +397,7 @@ def _origin_xy(value: Sequence[int], *, parameters: Mapping) -> tuple[int, int]:
         raise ValueError('Flatfield origins must be integer native coordinates')
     return result
 
-def register_flatfield_reference(prepared: FlatfieldReference, h_baseline_to_current: np.ndarray, *, target_shape_hw: tuple[int, int], source_origin_xy: tuple[int, int]=(0, 0), target_origin_xy: tuple[int, int]=(0, 0), parameters: Mapping) -> RegisteredFlatfieldReference:
+def register_flatfield_reference(prepared: FlatfieldReference, h_baseline_to_current: np.ndarray, *, target_shape_hw: tuple[int, int], source_origin_xy: tuple[int, int], target_origin_xy: tuple[int, int], parameters: Mapping) -> RegisteredFlatfieldReference:
     """Transport calibrated baseline colour with the change view's exact H."""
     if not isinstance(prepared, FlatfieldReference):
         raise TypeError('Expected an unregistered FlatfieldReference')

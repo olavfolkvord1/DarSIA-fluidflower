@@ -8,9 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from darsia.fluidflower.tools import phase_reference_maps as maps
+from darsia.fluidflower import phase_saved_review_metadata as maps
 from darsia.fluidflower.tools.phase_injection_references import injection_end_references
-from darsia.fluidflower.tools.phase_reference_batch import resolve_layers
 from darsia.fluidflower.review_storage import resolve_review_path
 from darsia.fluidflower.tools._paths import canonical_metadata_paths
 
@@ -100,103 +99,3 @@ def defer_validation_references(validation):
                "unavailable_references": []}
     maps._write(existing_path, receipt)
     return receipt
-
-
-def prepare_validation_references(validation, progress=None, *, allow_inference=True):
-    """Resolve baseline and every injection end against final published paths.
-
-    The resolver validates the frozen candidate and reuses verified cached maps.
-    Missing source acquisitions are recorded separately from phase-map failures.
-    """
-    from darsia.fluidflower.phase_training.radiometry import analysis_review_root
-
-    validation = Path(validation).resolve()
-    binding_path = validation / "validation_binding.json"
-    campaign_path = validation / "postflight_manifest.json"
-    binding, campaign = maps._read(binding_path), maps._read(campaign_path)
-    output_mode = binding.get("output_mode", "review")
-    if output_mode not in ("review", "production") or campaign.get("output_mode", "review") != output_mode:
-        raise ValueError("Reference preparation requires matching phase output modes")
-    selected = binding["selected_candidates"]
-    jobs = campaign["jobs"]
-    if (not jobs or len(jobs) != len(selected)
-            or {j["run"]: j["candidate_id"] for j in jobs} != selected):
-        raise ValueError("Reference preparation requires the complete selected validation campaign")
-    receipt = {"format": FORMAT, "status": "preparing", "output_mode": output_mode, "binding": maps._asset(binding_path),
-               "campaign": maps._asset(campaign_path), "references": [],
-               "unavailable_references": []}
-    maps._write(validation / RECEIPT, receipt)
-    try:
-        for job in jobs:
-            from darsia.fluidflower.phase_review_basis import is_regional, REGIONAL_VERSION
-            regional = is_regional(job) or (campaign.get('physics_profile') or {}).get('format') == REGIONAL_VERSION
-            required_layers = ({"all", "aqueous", "gas"} if output_mode == "production"
-                               else {"all", "aqueous", "gas", "raw"} if regional
-                               else maps.LAYERS)
-            run, dataset = job["run"], job["dataset"]
-            if dataset not in {"ffac", "ffum", "ffbm"}:
-                raise ValueError(f"Unsupported reference experiment series: {dataset}")
-            root = analysis_review_root(Path(job.get("analysis_source_review_root") or job["review_output_dir"]), run)
-            pair = {"run": run, "dataset": dataset}
-            references = injection_end_references(pair, root)
-            # A reference the selector could not resolve is not automatically a
-            # dead end. Without acquisition_inventory.json the selector sees only
-            # the sparse reviewed timeline, so it reports no elapsed time for any
-            # row -- which is the very state the completeness test below rejects,
-            # so the runs that needed the inventory were the ones never given it.
-            # Building it is what decides the question: attempt it whenever a row
-            # is unusable and the selector read no complete inventory. A source
-            # acquisition that genuinely does not exist still lands in
-            # unavailable_references, and a failure here is recorded rather than
-            # failing the evaluation: missing acquisitions stay separate from
-            # phase-map failures.
-            unusable = [row for row in references
-                        if not row.get("available") or row.get("needs_inventory")
-                        or row.get("needs_materialization")]
-            complete_selection = bool(references) and all(
-                row.get("elapsed_h") is not None for row in references)
-            no_inventory = any("inventory" in row
-                               and not (row.get("inventory") or {}).get("complete")
-                               for row in unusable)
-            if unusable and (complete_selection or no_inventory):
-                from darsia.fluidflower.tools.prepare_phase_injection_references import prepare
-                try:
-                    prepare(root, run, dataset)
-                except Exception as error:  # noqa: BLE001 - reported, never fatal
-                    receipt.setdefault("reference_preparation_errors", []).append(
-                        {"dataset": dataset, "run": run,
-                         "reason": f"{type(error).__name__}: {error}"})
-                    maps._write(validation / RECEIPT, receipt)
-                else:
-                    references = injection_end_references(pair, root)
-            available = [row for row in references if row.get("available")
-                         and not row.get("needs_inventory")
-                         and not row.get("needs_materialization")]
-            for row in references:
-                if row not in available:
-                    receipt["unavailable_references"].append({
-                        "dataset": dataset, "run": run, "reference_id": row["id"],
-                        "reason": str(row.get("reason") or "Exact reference image is unavailable")})
-            for reference in [None, *available]:
-                label = "Before injection" if reference is None else reference["label"]
-                if progress:
-                    progress(f"{run.upper()}: preparing reference phase map — {label}")
-                started = time.perf_counter()
-                layers = resolve_layers(reference, root, run, job, required_layers, progress=progress,
-                                        allow_inference=allow_inference)
-                receipt["references"].append({"dataset": dataset, "run": run,
-                    "reference_id": "baseline" if reference is None else reference["id"],
-                    "layers": layers, "preparation_seconds": time.perf_counter() - started})
-                maps._write(validation / RECEIPT, receipt)
-        for name, path in (("binding", binding_path), ("campaign", campaign_path)):
-            if maps._asset(path) != receipt[name]:
-                raise ValueError("Validation binding changed during reference preparation")
-        receipt["reference_coverage"] = (
-            "partial" if receipt["unavailable_references"] else "complete")
-        receipt["status"] = "ready"
-        maps._write(validation / RECEIPT, receipt)
-        return receipt
-    except Exception as error:
-        receipt.update(status="failed", error=f"{type(error).__name__}: {error}")
-        maps._write(validation / RECEIPT, receipt)
-        raise

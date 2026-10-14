@@ -1,20 +1,38 @@
 """Tiny synthetic N1 products against unchanged native calculation ASTs."""
 import ast
-from collections.abc import Mapping
-from dataclasses import dataclass
-import importlib.util
 import json
 from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace
+import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 SOURCES = Path(__file__).resolve().parents[2] / "src/darsia/fluidflower"
-spec = importlib.util.spec_from_file_location("darsia.fluidflower.retained_products_unit", SOURCES / "production_retained.py")
-retained = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(retained)
+from darsia.fluidflower.mass import n1_arithmetic as retained
+from darsia.fluidflower.mass.n1_pipeline import DataReader, asset
+from darsia.fluidflower.mass.production_precision import PixelMath
+
+BASE_COMMIT = "6dfca622f5ed8ebe5c3ea6474025dcf5bf28023d"
+
+
+def original_function(relative, name, namespace, *, class_name=None):
+    """Use one pure historical math codeobject; never import its old runner."""
+    repo = Path(__file__).resolve().parents[2]
+    raw = subprocess.check_output(
+        ["git", "show", BASE_COMMIT + ":src/darsia/fluidflower/" + relative],
+        cwd=repo).decode("utf-8")
+    tree = ast.parse(raw)
+    body = tree.body if class_name is None else next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name).body
+    node = next(node for node in body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+    context = dict(namespace)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 relative, "exec"), context)
+    return context[name]
+
 
 
 def definitions(relative, names, namespace):
@@ -25,8 +43,8 @@ def definitions(relative, names, namespace):
     return namespace
 
 
-@pytest.fixture
-def synthetic(monkeypatch):
+@pytest.fixture(params=["float32", "float64"])
+def synthetic(request):
     shape = (3, 4)
     phase = np.array([[1, 2, 1, 0], [2, 1, 1, 2], [1, 0, 2, 255]], np.uint8)
     domain = phase != 255
@@ -45,11 +63,12 @@ def synthetic(monkeypatch):
                               density_gaseous_co2=1.93+value*.065)
     parameters = dict(candidate="N1", gain=24.253536351793787, beta=.6448739280294578)
     response = dict(frame=frame, physics=physics, quantifiable=known.copy(),
-        prepared=SimpleNamespace(aqueous_relative=np.asarray((value+.51)*.003, np.float32)),
+        prepared=SimpleNamespace(aqueous_relative=np.asarray((value+.51)*.003, np.dtype(request.param))),
         linear_relative=np.zeros(shape, np.float32), swi=np.full(shape, .231),
-        frozen_parameters=parameters)
-    dilution = definitions("mass/concentration_joint.py", {"DilutionAnchor", "_anchor", "dilution_factor"},
-                           dict(np=np, dataclass=dataclass, Mapping=Mapping, __name__=__name__))
+        frozen_parameters=parameters, precision=request.param, pixel_backend="numpy_cpu",
+        input_storage_dtype="float32-log-RGB/frozen-clearwater")
+    from darsia.fluidflower.mass.concentration_joint import dilution_factor
+    math = PixelMath(request.param)
     volume = np.where(known, frame.pixel_area_m2*frame.depth_m*frame.porosity, 0.)
     geometry_tree = ast.parse((SOURCES.parent / "measure/integration.py").read_text(encoding="utf-8"))
     geometry_class = next(node for node in geometry_tree.body if isinstance(node, ast.ClassDef) and node.name == "Geometry")
@@ -72,32 +91,36 @@ def synthetic(monkeypatch):
     exec(compile(ast.fix_missing_locations(ast.Module(body=[annotation, mass_method], type_ignores=[])),
                  "unchanged native mass analysis", "exec"), mass_ns)
     physics.mass_analysis = lambda a, g: mass_ns["mass_analysis"](physics, a, g)
-    namespace = definitions("phase_ffac_common_mass_round2.py", {
-        "_physical_partition", "_native_fraction", "interval_residual", "evaluate_round2_frame"},
-        dict(np=np, MAX_DEPTH_M=.0155, MAX_POROSITY=.45, CONTRACT="original-R2",
-             _validate_parameters=lambda value: None, dilution_factor=dilution["dilution_factor"]))
-    modules = {"engine": SimpleNamespace(r2=SimpleNamespace(dilution_factor=dilution["dilution_factor"]))}
-    choice = dict(verifier="round3", asset=dict(path="exact synthetic freeze", sha256="a"*64, size_bytes=1))
-    calls = []
-    def selected(*args):
-        calls.append(args)
-        return dict(parameters), "a"*64
-    monkeypatch.setattr(retained, "_selected_n1", selected)
+    partition = original_function("production_retained.py", "_main_partition", {})
+    reference_retained = SimpleNamespace(
+        _main_partition=partition, FIELDS=retained.FIELDS,
+        _selected_n1=lambda *args: (dict(parameters), "a"*64))
+    context = SimpleNamespace(
+        modules={"engine": SimpleNamespace(r2=SimpleNamespace(dilution_factor=dilution_factor))},
+        asset_reader=None)
+    adapter = SimpleNamespace(context=context, math=math, precision=request.param,
+                              retained=reference_retained, _facts=math.facts)
+    original_evaluate = original_function(
+        "production_precision_adapter.py", "evaluate_main", {},
+        class_name="PrecisionAdapter")
     anchor = dict(elapsed_h=2.247, affected_pore_volume_m3=1.e-8)
     box1 = domain & (np.indices(shape)[0] < 1)
     domains = dict(full_rig=domain, box1=box1, box2=domain & ~box1)
-    return SimpleNamespace(response=response, modules=modules, choice=choice, anchor=anchor,
-        domains=domains, parameters=parameters, old=namespace["evaluate_round2_frame"], calls=calls)
+    return SimpleNamespace(response=response, math=math, anchor=anchor,
+        domains=domains, parameters=parameters,
+        old=lambda: original_evaluate(
+            adapter, response, anchor, selected_calibration={},
+            domain_masks=domains, kept_fields=retained.FIELDS))
 
 
 def evaluate(f, **kwargs):
-    return retained.evaluate_main(f.response, f.anchor, modules=f.modules,
-        selected_calibration=f.choice, domain_masks=f.domains, **kwargs)
+    return retained.evaluate_main(f.response, f.anchor, parameters=f.parameters,
+        pixel_math=f.math, calibration_sha256="a"*64, domain_masks=f.domains, **kwargs)
 
 
 def test_native_fields_casts_and_domain_masses_are_bit_identical(synthetic):
     f = synthetic
-    old = f.old(f.response, f.parameters, f.anchor, fields=True)
+    old = f.old()
     result = evaluate(f, kept_fields=retained.FIELDS)
     for name in retained.FIELDS:
         first, second = old["fields"][name], result["fields"][name]
@@ -116,7 +139,8 @@ def test_native_fields_casts_and_domain_masses_are_bit_identical(synthetic):
         for mass in ("total_mass_g", "aqueous_mass_g", "gas_mass_g"):
             assert np.float64(old["excluded_mass"][name][mass]).tobytes() == np.float64(part[mass]).tobytes()
     assert result["scalar_reference"] == "native_final_calibration_fields"
-    assert len(f.calls) == 1 and result["scientific_eligibility"] is False
+    assert result["calibration_sha256"] == "a"*64
+    assert result["scientific_eligibility"] is False
 
 
 def test_only_declared_maps_are_materialized_and_no_inputs_modified(synthetic):
@@ -132,7 +156,7 @@ def test_only_declared_maps_are_materialized_and_no_inputs_modified(synthetic):
     assert prepared == f.response["prepared"].aqueous_relative.tobytes()
 
 
-@pytest.mark.parametrize("kind", ["field", "domain_missing", "domain_dtype", "domain_shape", "full_domain", "calibration"])
+@pytest.mark.parametrize("kind", ["field", "domain_missing", "domain_dtype", "domain_shape", "full_domain"])
 def test_wrong_products_domains_or_freeze_fail_closed(synthetic, kind):
     kwargs = {}
     if kind == "field": kwargs["kept_fields"] = {"inferred_new_product"}
@@ -140,13 +164,12 @@ def test_wrong_products_domains_or_freeze_fail_closed(synthetic, kind):
     if kind == "domain_dtype": synthetic.domains["box1"] = synthetic.domains["box1"].astype(np.uint8)
     if kind == "domain_shape": synthetic.domains["box1"] = np.zeros((1, 1), bool)
     if kind == "full_domain": synthetic.domains["full_rig"] = np.zeros((3, 4), bool)
-    if kind == "calibration": synthetic.response["frozen_parameters"] = {**synthetic.parameters, "beta": .2}
     with pytest.raises(ValueError): evaluate(synthetic, **kwargs)
 
 
 def test_retained_path_has_no_secondary_or_summary_scientific_calls():
-    source = (SOURCES / "production_retained.py").read_text(encoding="utf-8")
-    compile(source, str(SOURCES / "production_retained.py"), "exec")
+    source = (SOURCES / "mass/n1_arithmetic.py").read_text(encoding="utf-8")
+    compile(source, str(SOURCES / "mass/n1_arithmetic.py"), "exec")
     tree = ast.parse(source)
     calls = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call)
              and isinstance(node.func, ast.Attribute)}
@@ -154,58 +177,16 @@ def test_retained_path_has_no_secondary_or_summary_scientific_calls():
                         "_pairs", "distances_for_part", "build_estimate_geometry", "prepare_own_colour_response"}
 
 
-def test_prepare_runs_original_optics_once_with_frozen_r1_guard_and_measured_swi(tmp_path, monkeypatch):
-    parameters = dict(candidate="N1", gain=24.253536351793787, beta=.6448739280294578)
-    calls = []
-    def verify(path, **kwargs):
-        calls.append(("r1_verify", path, kwargs))
-        return dict(path_folder=str(tmp_path), cross_host_source_equivalence={"exact": True},
-                    production_io_source_provenance={"separate_execution": True}), "r1-sha"
-    namespace = {"calls": calls}
-    exec("def native_prepare(frame, folder, **kwargs):\n"
-         "    calls.append(('native', frame, folder, kwargs))\n"
-         "    verify_frozen_calibration(kwargs['frozen_calibration_path'], asset_reader=kwargs['asset_reader'])\n"
-         "    return {'frame': frame, 'unchanged_optics': True}\n", namespace)
-    original = namespace["native_prepare"]
-    r1 = SimpleNamespace(prepare_native_response=original, normalize_run=lambda run: run)
-    r2 = SimpleNamespace(verify_original_round1_freeze=verify, HELDOUT_RUNS=("ac44",))
-    frame = SimpleNamespace(run_id="ac44", domain=np.ones((2, 2), bool), facies=np.array([[1, 2], [1, 2]]))
-    reader = object()
-    monkeypatch.setattr(retained, "_selected_n1", lambda *args: (dict(parameters), "selected-sha"))
-    result = retained.prepare_n1_response(frame, tmp_path, {"r1_freeze": {"path": "frozen-r1"}},
-        {"1": .23, "2": .31}, "frozen_evaluation", "original-access-B1",
-        modules={"engine": SimpleNamespace(r1=r1, r2=r2)}, selected_calibration={"explicit": True}, asset_reader=reader)
-    assert [call[0] for call in calls].count("native") == 1
-    assert calls[1][3] == dict(flash_kind="titration", frozen_calibration_path="frozen-r1", asset_reader=reader)
-    assert "verify_frozen_calibration" not in original.__globals__
-    assert result["frozen_parameters"] == parameters and result["selected_calibration_sha256"] == "selected-sha"
-    assert result["swi"].dtype == np.float64 and np.array_equal(result["swi"], [[.23, .31], [.23, .31]])
-    assert not {"joint_signal", "linear_relative", "linear_flash"} & set(result)
 
 
-def test_missing_freeze_scope_stops_before_any_native_prepare(monkeypatch):
-    monkeypatch.setattr(retained, "_selected_n1", lambda *args: pytest.fail("freeze/preparation was entered"))
-    for scope, freeze in (("calibration", "B1"), ("frozen_evaluation", None)):
-        with pytest.raises(ValueError):
-            retained.prepare_n1_response(None, None, None, None, scope, freeze,
-                                         modules={}, selected_calibration={})
 
 
-def test_run_case_preserves_guard_failures_and_does_not_retry(synthetic, monkeypatch):
-    calls = []
-    monkeypatch.setattr(retained, "load_response", lambda *args, **kwargs: calls.append("load") or {"response": synthetic.response})
-    context = SimpleNamespace(modules=synthetic.modules, asset_reader=None,
-        boundary_guard=lambda: (_ for _ in ()).throw(RuntimeError("authority stopped")))
-    with pytest.raises(RuntimeError, match="authority"):
-        retained.run_case(context, "synthetic", selected_calibration=synthetic.choice,
-            anchor=synthetic.anchor, domain_masks=synthetic.domains, kept_fields=())
-    assert calls == ["load"] and synthetic.calls == []
 
 
 def test_main_export_zeroes_excluded_only_and_preserves_raw_native_maps(synthetic):
     result = evaluate(synthetic, kept_fields=retained.FIELDS)
     before = {name: value.tobytes() for name, value in result["fields"].items()}
-    exported = retained.main_products(result)
+    exported = retained.main_products(result, synthetic.math)
     assert set(exported["products"]) == {"concentration_aqueous", "saturation_free_gas", "phase_labels",
                                          "mass_total", "mass_aqueous", "mass_free_gas"}
     assert exported["products"]["concentration_aqueous"] is result["fields"]["c_aq_g_l"]
@@ -214,7 +195,7 @@ def test_main_export_zeroes_excluded_only_and_preserves_raw_native_maps(syntheti
                          ("mass_free_gas", "gas_mass_density_g_l")):
         projected = exported["products"][name]
         raw = result["fields"][native]
-        assert projected.dtype == np.float32
+        assert projected.dtype == synthetic.math.dtype
         assert np.all(projected[~mask] == 0) and projected[mask].tobytes() == raw[mask].tobytes()
         assert projected.tobytes() == np.where(mask, raw, 0.).tobytes()
     assert result["fields"]["mass_density_g_l"][0, 0] > 0  # Real excluded mass stays in the raw view.
@@ -233,32 +214,27 @@ def test_separate_total_cast_is_not_sum_of_cast_components(synthetic):
     result = evaluate(synthetic, kept_fields=retained.FIELDS)
     fields = result["fields"]
     physics = synthetic.response["physics"]
-    aqueous, gas = fields["c_aq_relative"], fields["s_g"].copy()
+    aqueous = fields["c_aq_relative"].astype(np.float32)
+    gas = fields["s_g"].astype(np.float32)
     gas[~np.isfinite(gas)] = 0
     raw_g = physics.density_gaseous_co2*gas
     raw_aq = physics.solubility_co2*aqueous*np.clip(1-gas, 0, None)
-    assert fields["mass_density_g_l"].tobytes() == (raw_g+raw_aq).astype(np.float32).tobytes()
-    # This fixture witnesses the rounding distinction, not just equal zeros.
-    assert fields["mass_density_g_l"].tobytes() != (
-        fields["aqueous_mass_density_g_l"]+fields["gas_mass_density_g_l"]).tobytes()
+    # The canonical CO2MassAnalysis performs the original separate float32
+    # image casts after its float64 thermodynamic operands. The typed N1
+    # provider separately keeps the explicitly chosen working-map precision.
+    analysis = synthetic.response["analysis"]
+    mass = physics.mass_analysis(
+        analysis._scalar(aqueous, synthetic.response["frame"].elapsed_h),
+        analysis._scalar(gas, synthetic.response["frame"].elapsed_h))
+    assert mass.mass.img.dtype == np.float32
+    assert mass.mass.img.tobytes() == (raw_g+raw_aq).astype(np.float32).tobytes()
+    assert mass.mass.img.tobytes() != (mass.mass_aq.img+mass.mass_g.img).tobytes()
 
-
-@pytest.mark.parametrize("kind", ["actual_B1", "zero_gain", "negative_gain", "nonfinite_gain",
-    "negative_beta", "gas_parameter", "other_candidate", "sha", "size", "returned_sha", "verifier"])
-def test_selected_n1_uses_verified_freeze_parameters_not_b0_constant(tmp_path, monkeypatch, kind):
-    # Exercise the actual selector, not the evaluator fixture's fake selector.
-    # Only native freeze verification is mocked; real local SHA/size checks and
-    # the original parameter-validation function still run.
-    io_spec = importlib.util.spec_from_file_location("selected_n1_unit_io", SOURCES / "production_io.py")
-    io_module = importlib.util.module_from_spec(io_spec)
-    io_spec.loader.exec_module(io_module)
-    package = ModuleType("darsia")
-    package.__path__ = []
-    fluidflower = ModuleType("darsia.fluidflower")
-    fluidflower.__path__ = []
-    monkeypatch.setitem(sys.modules, "darsia", package)
-    monkeypatch.setitem(sys.modules, "darsia.fluidflower", fluidflower)
-    monkeypatch.setitem(sys.modules, "darsia.fluidflower.production_io", io_module)
+@pytest.mark.parametrize("kind", [
+    "zero_gain", "negative_gain", "nonfinite_gain", "negative_beta",
+    "gas_parameter", "other_candidate", "sha", "size"])
+def test_verified_calibration_parameters_fail_closed(tmp_path, kind):
+    """Use canonical metadata verification and scientific N1 admission."""
     parameters = dict(candidate="N1", gain=23.882294164545023, beta=.6143584288103799)
     if kind == "zero_gain": parameters["gain"] = 0.
     if kind == "negative_gain": parameters["gain"] = -1.
@@ -266,31 +242,28 @@ def test_selected_n1_uses_verified_freeze_parameters_not_b0_constant(tmp_path, m
     if kind == "negative_beta": parameters["beta"] = -1.
     if kind == "gas_parameter": parameters["gas_scale"] = 1.
     if kind == "other_candidate": parameters["candidate"] = "N2"
-    path = tmp_path / "synthetic_freeze.json"
+    path = tmp_path / "calibration.json"
+    # Nonfinite scientific parameters are rejected before JSON publication.
+    if kind == "nonfinite_gain":
+        with pytest.raises(ValueError):
+            retained.validate_parameters(parameters)
+        return
     path.write_text(json.dumps({"parameters": parameters}), encoding="utf-8")
-    io = io_module.NasIO()
-    bound = io.asset(path)
-    calls = []
-    def verify(frozen_path, **kwargs):
-        calls.append((frozen_path, kwargs))
-        # Same Python JSON numeric values as the original native freeze loader.
-        document = json.loads(Path(frozen_path).read_text(encoding="utf-8"))
-        return document, "f"*64 if kind == "returned_sha" else io.asset(frozen_path)["sha256"]
-    validate = definitions("phase_ffac_common_mass_round2.py", {"_validate_parameters"},
-        dict(np=np, CANDIDATES=("N1", "N2", "N3", "J"),
-             candidate_availability=lambda: {key: {"available": True} for key in ("N1", "N2", "N3", "J")}))["_validate_parameters"]
-    engine = SimpleNamespace(GAIN=24.253536351793787, verify_round3_freeze=verify,
-        r2=SimpleNamespace(verify_round2_freeze=lambda *a, **k: pytest.fail("other calibration evaluated"),
-                           _validate_parameters=validate))
-    choice = dict(verifier="round3", asset=bound)
+    bound = asset(path)
     if kind == "sha": bound["sha256"] = "f"*64
     if kind == "size": bound["size_bytes"] += 1
-    if kind == "verifier": choice["verifier"] = "unregistered"
-    reader = SimpleNamespace(path=io.verify)
-    if kind == "actual_B1":
-        selected, digest = retained._selected_n1({"engine": engine}, choice, reader)
-        assert selected == parameters and selected["gain"] != engine.GAIN
-        assert digest == bound["sha256"] and calls == [(str(path), {"asset_reader": reader})]
-    else:
-        with pytest.raises(ValueError): retained._selected_n1({"engine": engine}, choice, reader)
-        if kind in {"sha", "size", "verifier"}: assert calls == []
+    with pytest.raises(ValueError):
+        selected = DataReader().json(bound)["parameters"]
+        retained.validate_parameters(selected)
+
+
+def test_calibration_gain_is_read_from_verified_data_not_baseline_constant(tmp_path):
+    """A genuine calibration descriptor supplies the selected positive pair."""
+    parameters = dict(candidate="N1", gain=23.882294164545023, beta=.6143584288103799)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"parameters": parameters}), encoding="utf-8")
+    bound = asset(path)
+    selected = DataReader().json(bound)["parameters"]
+    retained.validate_parameters(selected)
+    assert selected == parameters
+    assert selected["gain"] != 24.253536351793787

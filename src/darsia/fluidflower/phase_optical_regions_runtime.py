@@ -153,7 +153,7 @@ def _incremental_overlay(root, profile):
                          else Path(plan["old_candidate"]) / "review_source" / run / "original_job.json")
         original_job = _read_bound(original_path,
             (plan.get("original_source_job_sha256_by_run") or {}).get(run), f"{run} original source job")
-        from .tools.train_phase_model_further import native_source
+        from .phase_saved_runtime_views import native_source
         _, old_native_path, old_native = native_source(original_job)
         key = f"ffac/{run}"
         original_entry = profile["runs"][key]

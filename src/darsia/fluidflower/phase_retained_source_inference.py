@@ -17,8 +17,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .phase_g3_production import CO2_SHA256, G3_SHA256, REFIT_SHA256
-from .phase_pixel_area import sum_pixel_area, validate_pixel_area
+from .phase_saved_review_metadata import configured_parameters
+from .phase.metrics import sum_pixel_area, validate_pixel_area
 from .project import sha256_file
 
 CONTRACT = "ffac-retained-source-inference-cache-v1"
@@ -70,12 +70,8 @@ def _outer_domain_ring(domain):
     feature-support holes are not an outer edge and keep their existing policy.
     This geometry uses only the bound old mask, never a predicted category.
     """
-    exterior = np.pad((~domain).astype(np.uint8), 1, constant_values=1)
-    cv2.floodFill(exterior, None, (0, 0), 2, flags=4)
-    exterior = exterior == 2
-    touches = (exterior[:-2, 1:-1] | exterior[2:, 1:-1]
-               | exterior[1:-1, :-2] | exterior[1:-1, 2:])
-    return domain & touches
+    from .phase.domain import outer_domain_ring
+    return outer_domain_ring(domain)
 
 
 def _old_domain_interpolation_footprint(domain, working_shape_hw):
@@ -122,47 +118,10 @@ def _old_domain_interpolation_footprint(domain, working_shape_hw):
 
 
 def probability_encoding_contract(receipt, native_shape_hw):
-    """Describe the bound production encoding; do not invent float32 parity.
-
-    Only receipt metadata is inspected here. Probability arrays are not used
-    for categorical reuse. The packed eligibility masks are verified separately.
-    """
-    shape = list(native_shape_hw)
-    metadata, binding, files = (receipt.get(key) or {} for key in ("metadata", "binding", "files"))
-    layout = metadata.get("storage_layout")
-    expected = ("native-float16" if binding.get("labelled") is True else
-                "compact-g3-u8-regional-own-grid-float16")
-    if (receipt.get("contract") != PROBABILITY_CONTRACT or receipt.get("complete") is not True
-            or binding.get("provisional") is not False or layout != expected
-            or metadata.get("native_shape_hw") != shape
-            or binding.get("g3_model_sha256") != G3_SHA256
-            or binding.get("regional_refit_sha256") != REFIT_SHA256
-            or metadata.get("co2_head_sha256") != CO2_SHA256):
-        raise ValueError("Retained inference lacks its frozen probability encoding identity")
-    working_shape = metadata.get("regional_working_shape_hw")
-    if (not isinstance(working_shape, list) or len(working_shape) != 2
-            or any(type(n) is not int or n < 1 for n in working_shape)):
-        raise ValueError("Frozen probability working grid is invalid")
-    for name in ("g3_pixel.npy", "regional_frozen.npy", "regional_refit.npy"):
-        item = files.get(name) or {}
-        expected_dtype = "uint8" if name == "g3_pixel.npy" and layout != "native-float16" else "float16"
-        expected_shape = (shape if name == "g3_pixel.npy" or layout == "native-float16" else working_shape)
-        if item.get("dtype") != expected_dtype or item.get("shape") != expected_shape:
-            raise ValueError("Frozen probability storage dtype/grid changed")
-    if (metadata.get("bitorder") != "little" or metadata.get("masks_order") != list(MASK_NAMES)
-            or metadata.get("resize_rule") !=
-            "cv2.resize(values.astype(float32), native_shape[::-1], interpolation=cv2.INTER_LINEAR); threshold AFTER resize"
-            or metadata.get("g3_compact_rule") !=
-            "round-to-nearest-even(254*p); 255 invalid; decode code/254"):
-        raise ValueError("Frozen probability decoding contract changed")
-    return dict(contract=ENCODING_CONTRACT, layout=layout,
-        g3=("native float32 -> float16 -> decoded float32" if layout == "native-float16"
-            else "native uint8 round-even(254*p); invalid255; decoded code/254"),
-        regional=("native bilinear resize before float16 encoding; decoded float32" if layout == "native-float16"
-                  else "working-grid float16 -> decoded float32 -> native bilinear resize"),
-        native_shape_hw=shape, regional_working_shape_hw=working_shape,
-        float32_fresh_inference_equivalence_claimed=False,
-        probability_artifacts_used_as_training_input=False)
+    """Delegate original storage admission to its one canonical implementation."""
+    from .pipeline.phase_inputs import probability_encoding_contract as admit
+    return admit(receipt, native_shape_hw,
+                 parameters=configured_parameters("retained"))
 
 
 @dataclass(frozen=True)
@@ -177,9 +136,8 @@ class RetainedSourceInferenceCache:
     recomputed_old_domain_ring: np.ndarray
 
     def __post_init__(self):
-        for value in (self.labels, self.cached_parent_modelled, self.tie_reference_eligible,
-                      self.prior_fill_eligible, self.allowed_domain, self.recomputed_old_domain_ring):
-            value.flags.writeable = False
+        from .phase.domain import RetainedSourceInferenceCache as CanonicalCache
+        CanonicalCache.__post_init__(self)
 
 
 def prepare_retained_source_cache(binding, *, run, frame_index,
@@ -571,3 +529,10 @@ __all__ = ["CONTRACT", "PRIOR_FILL_CONTRACT", "OLD_DOMAIN_RING_CONTRACT", "OLD_D
            "probability_encoding_contract", "prepare_retained_source_cache",
            "load_retained_pre_minimum_gas_selection", "merge_retained_source_inference",
            "preserve_prior_categorical_fill"]
+
+
+def __getattr__(name):
+    keys = {"CO2_SHA256": "co2", "G3_SHA256": "g3", "REFIT_SHA256": "regional_refit"}
+    if name not in keys:
+        raise AttributeError(name)
+    return configured_parameters("retained")["expected_models"][keys[name]]

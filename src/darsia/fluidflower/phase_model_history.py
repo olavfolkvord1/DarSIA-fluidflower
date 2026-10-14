@@ -104,7 +104,7 @@ def project_result_model_roots() -> list[Path]:
     training request but no completed model files yet.
     """
     from .series_paths import configured_series
-    from .tools.register_track1_studio_candidate import registered_roots
+    from .phase_saved_registration import registered_roots
 
     roots: list[Path] = []
     for _series, _label, project_root in configured_series():
@@ -145,7 +145,7 @@ def registered_old_domain_seam_review(model_root, warning):
     """Recognize this sealed review kind only through its intact warning."""
     if not warning.startswith("Studio review candidate:"):
         return False
-    from .tools.register_track1_studio_candidate import registration_path
+    from .phase_saved_registration import registration_path
     try:
         registration = _read_mapping(registration_path(Path(model_root).name))
         return registration.get("registration_kind") == "approved_g3_old_domain_seam_revision"
@@ -155,10 +155,11 @@ def registered_old_domain_seam_review(model_root, warning):
 
 def registered_combined_l1_review(model_root, warning):
     """Recognize only this intact, sealed review kind; never promote its QA."""
-    from .tools.run_ffac_t2_l1zone_candidate import WARNING
+    from .phase_saved_review_metadata import saved_revision_bindings
+    WARNING = saved_revision_bindings('combined_floor')._export('WARNING')
     if warning != WARNING:
         return False
-    from .phase_ffac_t2_l1zone_review import combined_saved_review
+    from .phase_saved_revision_review import combined_saved_review
     try:
         combined_saved_review(model_root)
         return True
@@ -168,10 +169,11 @@ def registered_combined_l1_review(model_root, warning):
 
 def registered_t3_review(model_root, warning):
     """Recognize only the source-bound T3 review revision, never approve mass."""
-    from .tools.run_ffac_t3_floor_candidate import WARNING
+    from .phase_saved_review_metadata import saved_revision_bindings
+    WARNING = saved_revision_bindings('trained_floor')._export('WARNING')
     if warning != WARNING:
         return False
-    from .phase_ffac_t3_review import t3_saved_review
+    from .phase_saved_revision_review import t3_saved_review
     try:
         t3_saved_review(model_root)
         return True
@@ -181,10 +183,11 @@ def registered_t3_review(model_root, warning):
 
 def registered_t4_review(model_root, warning):
     """Recognize the sealed two-epoch gas revision without approving mass."""
-    from .tools.run_ffac_t4_floor_candidate import WARNING
+    from .phase_saved_review_metadata import saved_revision_bindings
+    WARNING = saved_revision_bindings('epoch_floor')._export('WARNING')
     if warning != WARNING:
         return False
-    from .phase_ffac_t4_review import t4_saved_review
+    from .phase_saved_revision_review import t4_saved_review
     try:
         t4_saved_review(model_root)
         return True
@@ -194,10 +197,11 @@ def registered_t4_review(model_root, warning):
 
 def registered_t4b_review(model_root, warning):
     """Admit the sealed joint lamp-shift review without approving mass."""
-    from .tools.run_ffac_t4b_floor_candidate import WARNING
+    from .phase_saved_review_metadata import saved_revision_bindings
+    WARNING = saved_revision_bindings('joint_floor')._export('WARNING')
     if warning != WARNING:
         return False
-    from .phase_ffac_t4b_review import t4b_saved_review
+    from .phase_saved_revision_review import t4b_saved_review
     try:
         t4b_saved_review(model_root)
         return True
@@ -209,19 +213,18 @@ def registered_t4c_review(model_root, warning):
     """Use exact calibrated saved-map admission, including the placement."""
     if not (resolve_review_path(model_root) / "t4c_floor_plan.json").is_file():
         return False
-    from .phase_ffac_t4c_review import t4c_saved_review
-    from .tools import run_ffac_t4c_floor_candidate as runner
+    from .phase_saved_floor_review import t4c_saved_review
+    from .phase_saved_review_metadata import configured_parameters
     try:
         checked = t4c_saved_review(model_root)
-        expected = (runner.warning_for_placement(checked["placement"])
-                    if hasattr(runner, "warning_for_placement") else runner.WARNING)
+        expected = configured_parameters("floor")["warning"]
         return warning == expected
     except (OSError, KeyError, ValueError, TypeError):
         return False
 
 
 def registered_p1_final3_review(model_root, warning):
-    from .phase_ffac_p1_final3_review import p1_final3_saved_review, WARNING, PLAN
+    from .phase_saved_contact_review import p1_final3_saved_review, WARNING, PLAN
     if warning != WARNING or not (resolve_review_path(model_root) / PLAN).is_file():
         return False
     try:
@@ -232,7 +235,7 @@ def registered_p1_final3_review(model_root, warning):
 
 
 def registered_p1_final2_review(model_root, warning):
-    from .phase_ffac_p1_final2_review import p1_final2_saved_review, WARNING, PLAN
+    from .phase_saved_categorical_review import p1_final2_saved_review, WARNING, PLAN
     if warning != WARNING or not (resolve_review_path(model_root) / PLAN).is_file():
         return False
     try:
@@ -243,7 +246,7 @@ def registered_p1_final2_review(model_root, warning):
 
 
 def registered_p1_final_review(model_root, warning):
-    from .phase_ffac_p1_final_review import p1_final_saved_review, WARNING
+    from .phase_saved_boundary_review import p1_final_saved_review, WARNING
     if warning != WARNING or not (resolve_review_path(model_root) / "p1_final_plan.json").is_file():
         return False
     try:
@@ -255,10 +258,11 @@ def registered_p1_final_review(model_root, warning):
 
 def registered_l1_neighbourhood_review(model_root, warning):
     """Admit this sealed post-processing revision only through its exact policy."""
-    from .tools.run_ffac_l1_neighbourhood_candidate import WARNING
+    from .phase_saved_review_metadata import saved_revision_bindings
+    WARNING = saved_revision_bindings('neighbourhood_floor')._export('WARNING')
     if warning != WARNING:
         return False
-    from .phase_ffac_l1_neighbourhood_review import l1_neighbourhood_saved_review
+    from .phase_saved_revision_review import l1_neighbourhood_saved_review
     try:
         l1_neighbourhood_saved_review(model_root)
         return True
@@ -268,8 +272,10 @@ def registered_l1_neighbourhood_review(model_root, warning):
 
 def l1_neighbourhood_history_state_label(model_root):
     """Read the variant only from the admitted immutable plan, never its name."""
-    from .phase_ffac_l1_neighbourhood_review import l1_neighbourhood_saved_review
-    from .tools.run_ffac_l1_neighbourhood_candidate import PLAN, plan_rule_settings
+    from .phase_saved_revision_review import l1_neighbourhood_saved_review
+    from .phase_saved_review_metadata import saved_revision_bindings
+    PLAN = saved_revision_bindings('neighbourhood_floor')._export('PLAN')
+    plan_rule_settings = saved_revision_bindings('neighbourhood_floor').plan_rule_settings
 
     l1_neighbourhood_saved_review(model_root)
     plan = _read_mapping(resolve_review_path(model_root) / PLAN)
@@ -497,7 +503,7 @@ def _full_head_retraining(
 
 def _validation_only_publication_warning(root: Path) -> str:
     """Keep a failed publication visible as failed in every Studio model view."""
-    from .tools.register_track1_studio_candidate import registration_warning
+    from .phase_saved_registration import registration_warning
 
     registered_warning = registration_warning(root)
     if registered_warning:
@@ -860,19 +866,19 @@ def inspect_phase_model_history_entry(root: Path) -> dict[str, Any]:
         state = "human_validation_required"
         state_label = "G3-T3 gas · Floor contact · Studio review only"
     elif p1_final3_review:
-        from .phase_ffac_p1_final3_review import STATE_LABEL
+        from .phase_saved_contact_review import STATE_LABEL
         state = "human_validation_required"
         state_label = STATE_LABEL
     elif p1_final2_review:
-        from .phase_ffac_p1_final2_review import STATE_LABEL
+        from .phase_saved_categorical_review import STATE_LABEL
         state = "human_validation_required"
         state_label = STATE_LABEL
     elif p1_final_review:
-        from .phase_ffac_p1_final_review import STATE_LABEL
+        from .phase_saved_boundary_review import STATE_LABEL
         state = "human_validation_required"
         state_label = STATE_LABEL
     elif t4c_review:
-        from .phase_ffac_t4c_review import t4c_saved_review
+        from .phase_saved_floor_review import t4c_saved_review
         state = "human_validation_required"
         state_label = t4c_saved_review(model_root)["state_label"]
     elif t4b_review:
@@ -1083,7 +1089,7 @@ def discover_phase_model_history(
                    if root.is_dir() else [])
     directories = [Path(record["root"]) for record in library_records if record["available"]] + directories
     directories.extend(Path(p) for p in registered_phase_model_defaults().values())
-    from .tools.register_track1_studio_candidate import registered_roots
+    from .phase_saved_registration import registered_roots
     directories.extend(registered_roots())
     review_root = str(os.environ.get("DARSIA_FLUIDFLOWER_PHASE_MODEL_REVIEW_ROOT") or "").strip()
     if review_root:

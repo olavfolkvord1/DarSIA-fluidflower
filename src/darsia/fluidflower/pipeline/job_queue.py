@@ -24,10 +24,14 @@ class LeaseLost(RuntimeError):
 
 
 def utc() -> str:
+    """Return an aware UTC timestamp for queue lifecycle evidence.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 
 def read_json(path: Path) -> dict:
+    """Read UTF-8 JSON metadata, rejecting duplicate keys and nonfinite numbers.
+    """
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -136,12 +140,16 @@ def write_immutable(path: Path, document: dict, *, create_parents=True) -> None:
 
 
 def descriptor(path: Path) -> dict:
+    """Bind the exact bytes of a file to its path, SHA-256, and byte count.
+    """
     path = Path(path)
     data = path.read_bytes()
     return dict(path=str(path), sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
 
 
 def require_unc(value: str) -> None:
+    """Require a shared UNC input path and reject local drives and device paths.
+    """
     if (not isinstance(value, str)
             or not PureWindowsPath(value).drive.startswith("\\\\")
             or value.replace("/", "\\").startswith(("\\\\?\\", "\\\\.\\"))):
@@ -149,6 +157,8 @@ def require_unc(value: str) -> None:
 
 
 def name(value: str) -> str:
+    """Validate and normalize a filesystem-safe run or machine identifier.
+    """
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
         raise ValueError(f"Unsafe run or machine name: {value!r}")
     key = value.casefold()
@@ -161,6 +171,11 @@ def name(value: str) -> str:
 
 
 def validate_task(task: dict) -> None:
+    """Validate whole-run metadata without reading scientific inputs.
+
+    The task declares full code, calibration, and configuration identities, a
+    UNC configuration path, and supported backend and working precision.
+    """
     name(task["run"])
     for key, length in (("commit", 40), ("calibration_sha256", 64)):
         if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
@@ -189,6 +204,7 @@ class JobQueue:
     """Filesystem protocol; workers and controllers share this implementation."""
 
     def __init__(self, root: Path, *, stale_seconds=600, clock=time.time, on_error=None):
+        """Open the shared queue; stale_seconds measures time since actual attempt progress."""
         self.root = Path(root)
         self.stale_seconds = stale_seconds
         self.clock = clock
@@ -198,6 +214,7 @@ class JobQueue:
             (self.root / directory).mkdir(parents=True, exist_ok=True)
 
     def enqueue(self, task: dict) -> Path:
+        """Reserve one whole-run output identity and publish its immutable pending task."""
         validate_task(task)
         run = name(task["run"])
         result_root = self.root / "results" / run
@@ -224,6 +241,7 @@ class JobQueue:
                 raise ValueError("Task is outside job.json expected_runs")
 
     def claim(self, machine: str, backend: str, owner: dict) -> Claim | None:
+        """Atomically claim one backend-compatible run and bind a fresh attempt lease to its owner."""
         machine = name(machine)
         for pending in sorted((self.root / "queue").glob("*.json")):
             try:
@@ -303,6 +321,7 @@ class JobQueue:
             self.on_error(dict(kind="invalid_task", **value))
 
     def assert_owner(self, claim: Claim) -> None:
+        """Require the exact current claim generation before writing or publishing."""
         try:
             owner = read_json(claim.lease / "owner.json")
             task = read_json(claim.claimed)
@@ -312,6 +331,7 @@ class JobQueue:
             raise LeaseLost("Claim identity changed")
 
     def progress(self, claim: Claim, event: dict) -> None:
+        """Record an actual I/O or frame-advance event with a nanosecond timestamp under ownership."""
         with self._progress_lock:
             self.assert_owner(claim)
             sequence = len(list(claim.output.glob("progress_*.json")))
@@ -322,6 +342,7 @@ class JobQueue:
             self.assert_owner(claim)
 
     def reclaim_stale(self) -> list[dict]:
+        """Archive expired claim generations and enqueue fresh attempts without allowing stale writers."""
         reclaimed = []
         for lease in sorted((self.root / "leases").iterdir()):
             try:
@@ -445,11 +466,13 @@ class JobQueue:
                         raise ValueError("Done identity changed")
 
     def recover_publications(self) -> None:
+        """Finish pending publications while leaving matching completed/done documents untouched."""
         for directory in (self.root / "publishing").iterdir():
             if (directory / "publication.json").exists():
                 self._finish_publication(directory)
 
     def complete(self, claim: Claim, result: dict) -> dict:
+        """Publish a genuine whole-run result only after scientific references are closed."""
         if result.get("complete") is not True or result.get("run") != claim.task["run"]:
             raise ValueError("A genuine complete per-run scientific result is required")
         if result.get("worker_references_closed") is not True:
@@ -457,12 +480,14 @@ class JobQueue:
         return self._publish(claim, result, True)
 
     def fail(self, claim: Claim, traceback_text: str, owner: dict) -> dict:
+        """Publish the current attempt failure with its verbatim traceback and actual owner."""
         value = dict(complete=False, run=claim.task["run"], attempt_id=claim.token,
                      task=claim.task, actual_worker=owner, traceback=traceback_text,
                      failed_utc=utc())
         return self._publish(claim, value, False)
 
     def aggregate(self) -> dict:
+        """Verify immutable completion bindings and report the expected whole-run results and failures."""
         results, failures = {}, {}
         for path in sorted((self.root / "done").glob("*.json")):
             done = read_json(path)

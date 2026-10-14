@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QComboBox, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem, QTabWidget,
     QScrollArea, QSlider, QTextEdit, QAbstractItemView, QDialog)
 
-from darsia.fluidflower.tools import phase_studio_series_mass as backend
+from darsia.fluidflower import phase_saved_review_metadata as backend
 from darsia.fluidflower.tools.phase_studio_mass_comparison import (
     result_variant_label, matching_frame_index, ac_compatibility_note)
 from darsia.fluidflower.tools.phase_studio_saved_results import (
@@ -177,14 +177,6 @@ class SeriesMassWorkspace(QWidget):
             prepare_bar.addWidget(widget)
         self.phase_binding = QLabel('Load the selected phase model to use its exact review images.')
         self.phase_binding.setWordWrap(True); setup_layout.addWidget(self.phase_binding)
-        from darsia.fluidflower.tools.phase_studio_native_controls import NativeConcentrationControls
-        self.native_toggle = QPushButton('Native concentration calculation settings')
-        self.native_toggle.setCheckable(True); self.native_toggle.setChecked(False)
-        setup_layout.addWidget(self.native_toggle)
-        self.native_controls = NativeConcentrationControls(self)
-        self.native_toggle.toggled.connect(self.native_controls.setVisible)
-        self.native_controls.calculate_requested.connect(self.start_native_calculation)
-        setup_layout.addWidget(self.native_controls); self.native_controls.setVisible(False)
         self.settings_toggle=QPushButton('Legacy comparison method and imported results')
         self.settings_toggle.setCheckable(True);setup_layout.addWidget(self.settings_toggle)
         self.settings_body=QWidget();setup_layout.addWidget(self.settings_body)
@@ -221,29 +213,10 @@ class SeriesMassWorkspace(QWidget):
             'assumptions before enabling constraints. Conflicts with the phase map are reported, not hidden.')
         info.setWordWrap(True); layout.addWidget(info)
         actions = QHBoxLayout(); layout.addLayout(actions)
-        self.calculate = QPushButton('Fit existing comparison method'); self.calculate.clicked.connect(self.start_calculation)
         self.open_selected = QPushButton('View selected prepared result'); self.open_selected.clicked.connect(self.view_selected)
         self.stop_button = QPushButton('Stop'); self.stop_button.clicked.connect(self.stop); self.stop_button.setEnabled(False)
-        for w in (self.calculate,self.open_selected,self.stop_button): actions.addWidget(w)
+        for w in (self.open_selected,self.stop_button): actions.addWidget(w)
         layout=self.layout()
-        from darsia.fluidflower.tools.phase_studio_calibration_controls import CalibrationControls
-        self.modern_toggle = QPushButton('New calibrated comparison · shared / individual / optical corrections')
-        self.modern_toggle.setCheckable(True); self.modern_toggle.setChecked(False)
-        layout.addWidget(self.modern_toggle)
-        self.modern_controls = CalibrationControls(self)
-        self.modern_controls.setVisible(False)
-        self.modern_toggle.toggled.connect(self.modern_controls.setVisible)
-        self.modern_controls.calculate_requested.connect(self.start_modern_calibration)
-        self.modern_controls.attach_overflow_requested.connect(self.attach_modern_overflow)
-        layout.addWidget(self.modern_controls)
-        self.full_depth_button = QPushButton('Compare persistent visible gas through full depth · FF_UM')
-        self.full_depth_button.setToolTip(
-            'Start an experimental global/local comparison from the selected frozen FF_UM '
-            'gas-history or local-dilution result. Only repeatedly visible gas cells can '
-            'reach 100% depth saturation; phase maps and saved source results stay fixed.')
-        self.full_depth_button.setEnabled(False)
-        self.full_depth_button.clicked.connect(self.start_full_depth_comparison)
-        layout.addWidget(self.full_depth_button)
         self.status = QLabel('')
         self.status.setWordWrap(True); self.status.setMaximumHeight(34); layout.addWidget(self.status)
         browser = QHBoxLayout(); layout.addLayout(browser)
@@ -422,7 +395,6 @@ class SeriesMassWorkspace(QWidget):
 
     def _series_changed(self, *_):
         dataset = str(self.series.currentData() or '').casefold()
-        self.full_depth_button.setVisible(dataset == 'ffum')
         if dataset and dataset not in self._archive_by_series:
             try:
                 root = series_path(dataset, 'results') / 'concentration_mass'
@@ -524,8 +496,6 @@ class SeriesMassWorkspace(QWidget):
         bound = str((self.phase_catalog or {}).get('dataset') or '').casefold()
         matches = bool(bound and dataset == bound)
         self.phase_experiment.setEnabled(matches)
-        self.native_controls.calculate.setEnabled(matches)
-        self.modern_controls.setEnabled(matches)
         if bound and not matches:
             self.phase_binding.setText(
                 f"Browsing saved {dataset.upper()} concentration results. The loaded phase model is "
@@ -700,16 +670,11 @@ class SeriesMassWorkspace(QWidget):
     def model_results_ready(self, catalog, error):
         if error:
             self.phase_catalog = None; self.phase_experiment.clear()
-            self.native_controls.set_catalog(None)
             self.phase_binding.setText('Phase-model inputs unavailable: '+error)
             self.status.setText(error); return
         previous_path = str(self.result_path.resolve()) if self.result_path else None
         self.phase_catalog = catalog
-        self.native_controls.set_catalog(catalog)
-        self.modern_controls.set_catalog(catalog)
         ready = sum(bool(job.get('concentration',{}).get('ready')) for job in catalog['jobs'])
-        self.native_toggle.setText(f'Native concentration calculation settings · {ready}/{len(catalog["jobs"])} experiments registered')
-        self.native_toggle.setChecked(not any(entry['dataset'] == catalog['dataset'] for entry in self.entries))
         self.series.setCurrentIndex(self.series.findData(catalog['dataset']))
         self.phase_experiment.clear()
         for job in catalog['jobs']:self.phase_experiment.addItem(job['run'].upper(), job)
@@ -733,17 +698,6 @@ class SeriesMassWorkspace(QWidget):
                 'Select registered native inputs above to calculate; saved results can be compared below.')
         self._sync_series_controls()
 
-    def start_native_calculation(self):
-        if self.process is not None and self.process.state()!=QProcess.NotRunning:return
-        try:
-            if not self.phase_catalog:raise ValueError('Load a phase model first.')
-            job = Path(self.phase_catalog['results_root'])/'jobs'/('native-'+uuid.uuid4().hex)
-            request = self.native_controls.request(job/'results')
-            job.mkdir(parents=True)
-            self.job = job
-            path = job/'request.json'; backend.write(path,request)
-            self.launch(['--request',str(path)],'native')
-        except (OSError,ValueError,KeyError) as error:self.status.setText(str(error))
 
     def attach_modern_overflow(self, run):
         try:
@@ -759,70 +713,9 @@ class SeriesMassWorkspace(QWidget):
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
 
-    def start_modern_calibration(self):
-        if self.process is not None and self.process.state() != QProcess.NotRunning:
-            return
-        try:
-            from darsia.fluidflower.tools.phase_studio_calibration_launch import calibration_request
-            catalog = self.phase_catalog
-            if not catalog or catalog['dataset'] != self.series.currentData():
-                raise ValueError('Load the matching phase model before starting a new calibration.')
-            options = self.modern_controls.request_options()
-            job = Path(catalog['results_root']) / 'jobs' / ('studio-calibration-' + uuid.uuid4().hex)
-            overflow = ({run: path for (dataset, run), path in self.overflow.items()
-                         if dataset == catalog['dataset']}
-                        if options['method'] == 'registered' else {})
-            request = calibration_request(
-                catalog, options['cohort'], job / 'results', method=options['method'],
-                overflow_mode=options['overflow_mode'], overflow=overflow,
-                overflow_weight=options['overflow_weight'], workers=options['workers'],
-                analysis_width=options['analysis_width'],
-                photometry_variants=options['photometry_variants'],
-                physical_profile=options.get('physical_profile', 'registered'),
-                image_selection_receipt_path=options.get('image_selection_receipt_path'))
-            job.mkdir(parents=True)
-            self.job = job
-            path = job / 'request.json'
-            backend.write(path, request)
-            self.launch(['--request', str(path)],
-                        'photometry' if options['method'] == 'photometry' else 'joint')
-        except (OSError, ValueError, KeyError) as error:
-            self.status.setText(str(error))
 
-    def _frozen_gas_study_source(self):
-        if self.result_path is None or self.result is None:
-            return None
-        if self.result['selected_inputs']['candidate'].get('dataset') != 'ffum':
-            return None
-        if variant_status('ffum', self.result.get('method', {}).get('settings') or {},
-                          self._photometry_policy('ffum')) == 'excluded':
-            return None
-        from darsia.fluidflower.tools.phase_studio_calibration_launch import frozen_gas_study_request
-        root = series_path('ffum', 'results') / 'concentration_mass'
-        return frozen_gas_study_request(self.result_path, root)
 
-    def _update_full_depth_button(self):
-        idle = self.process is None or self.process.state() == QProcess.NotRunning
-        self.full_depth_button.setEnabled(bool(idle and self._frozen_gas_study_source()))
 
-    def start_full_depth_comparison(self):
-        if self.process is not None and self.process.state() != QProcess.NotRunning:
-            return
-        try:
-            source = self._frozen_gas_study_source()
-            if source is None:
-                raise ValueError('Select a saved FF_UM gas-history or local-dilution result first.')
-            from darsia.fluidflower.tools.phase_studio_local_dilution_compare import create_request
-            root = series_path('ffum', 'results') / 'concentration_mass'
-            job = root / 'jobs' / ('studio-visible-gas-depth-' + uuid.uuid4().hex)
-            request = create_request(source, job,
-                workers=self.modern_controls.workers.value(),
-                include_persistent_full_depth=True,
-                variant_ids=('global_persistent_full_depth', 'local_persistent_full_depth'))
-            self.job = job
-            self.launch(['--request', str(request)], 'local_full_depth')
-        except (OSError, ValueError, KeyError) as error:
-            self.status.setText(str(error))
 
     def refresh(self, *, keep_view=False):
         self.visible=[e for e in self.entries if e['dataset']==self.series.currentData()]
@@ -940,7 +833,6 @@ class SeriesMassWorkspace(QWidget):
         self.previous_image.setEnabled(False); self.next_image.setEnabled(False)
         self.fullscreen_button.setEnabled(False)
         self.compare_photometry.setEnabled(False)
-        self.full_depth_button.setEnabled(False)
         self.image_position.setText('No image selected')
         self.frame_summary.setText('No saved concentration result for this series.')
         self.model_assumption.clear()
@@ -1019,34 +911,6 @@ class SeriesMassWorkspace(QWidget):
             e=self.selected_entry();self.overflow.pop((e['dataset'],e['run']),None);self.refresh()
         except ValueError as error:self.status.setText(str(error))
 
-    def start_calculation(self):
-        if self.process is not None and self.process.state()!=QProcess.NotRunning:return
-        selected=[e for i,e in enumerate(self.visible) if self.table.item(i,0).checkState()==Qt.Checked]
-        try:
-            for entry in selected:
-                if self._is_excluded_method(entry):
-                    raise ValueError('An excluded FF_UM light-correction method cannot be used for a new fit.')
-                if entry.get('receipt_path'):
-                    verify_saved_series_entry(entry)
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            self.status.setText(str(error)); return
-        scope=self.scope.currentData()
-        if self.calibration_file and scope!='series':
-            self.status.setText('Clear the frozen series calibration before fitting an individual comparison.');return
-        if len(selected)<(2 if scope=='series' and not self.calibration_file else 1) or (scope=='individual' and len(selected)!=1):
-            self.status.setText('Select at least two experiments for a shared fit, or exactly one for an individual comparison.');return
-        if len({e['run'] for e in selected})!=len(selected):
-            self.status.setText('Select only one result per experiment.');return
-        if self.phase_catalog and self.phase_catalog['dataset']!=self.series.currentData():
-            self.status.setText('Load the phase model for this series before saving a new calculation.');return
-        target = Path(self.phase_catalog['results_root'])/'jobs' if self.phase_catalog else self.cache_root
-        self.job=target/uuid.uuid4().hex;self.job.mkdir(parents=True)
-        payload=dict(results=[e['path'] for e in selected],scope=scope,overflow_mode=self.overflow_mode.currentData(),
-            overflow={e['run']:self.overflow[(e['dataset'],e['run'])] for e in selected if (e['dataset'],e['run']) in self.overflow},
-            output=str(self.job/'results'))
-        if self.calibration_file:payload['calibration_file']=str(self.calibration_file)
-        path=self.job/'request.json';backend.write(path,payload)
-        self.launch(['--request',str(path)],'calculate')
 
     def load_calibration(self):
         path,_=QFileDialog.getOpenFileName(self,'Frozen shared-series calibration','','JSON (*.json)')
@@ -1077,26 +941,16 @@ class SeriesMassWorkspace(QWidget):
         self.process.setStandardErrorFile(str(self.job/'stderr.log'))
         self.process.finished.connect(self.finished)
         self.process.errorOccurred.connect(self.process_error)
-        self.calculate.setEnabled(False);self.stop_button.setEnabled(True)
-        self.native_controls.calculate.setEnabled(False)
-        self.modern_controls.calculate.setEnabled(False)
-        self.full_depth_button.setEnabled(False)
-        module = {
-            'native': 'darsia.fluidflower.tools.phase_studio_native_mass',
-            'calculate': 'darsia.fluidflower.tools.phase_studio_series_mass',
-            'joint': 'darsia.fluidflower.tools.phase_studio_joint_calibration_compare',
-            'photometry': 'darsia.fluidflower.tools.phase_studio_photometry_compare',
-            'local_full_depth': 'darsia.fluidflower.tools.phase_studio_local_dilution_compare',
-        }.get(operation, 'darsia.fluidflower.tools.phase_studio_series_mass')
+        self.stop_button.setEnabled(True)
+        if operation != 'export':
+            raise ValueError("This workspace only exports completed saved results")
+        module = 'darsia.fluidflower.tools.phase_studio_series_export'
         self.process.start(str(python),['-B','-m',module,*arguments])
         self.status.setText('Working in background; phase validation remains available.');self.timer.start()
 
     def process_error(self,error):
         if error==QProcess.FailedToStart:
-            self.timer.stop();self.calculate.setEnabled(True);self.stop_button.setEnabled(False)
-            self.native_controls.calculate.setEnabled(bool(self.phase_catalog))
-            self.modern_controls.calculate.setEnabled(bool(self.phase_catalog))
-            self._update_full_depth_button()
+            self.timer.stop();self.stop_button.setEnabled(False)
             self.status.setText(self.process.errorString())
 
     def poll(self):
@@ -1107,10 +961,7 @@ class SeriesMassWorkspace(QWidget):
         if state.get('error'):self.details.setPlainText(state['error'])
 
     def finished(self,code,_status):
-        self.poll();self.timer.stop();self.calculate.setEnabled(True);self.stop_button.setEnabled(False)
-        self.native_controls.calculate.setEnabled(bool(self.phase_catalog))
-        self.modern_controls.calculate.setEnabled(bool(self.phase_catalog))
-        self._update_full_depth_button()
+        self.poll();self.timer.stop();self.stop_button.setEnabled(False)
         if code:
             self.status.setText('Operation stopped or failed. Existing results are unchanged.')
             try:
@@ -1205,7 +1056,6 @@ class SeriesMassWorkspace(QWidget):
         from darsia.fluidflower.tools.phase_studio_photometry_view import variant_choices
         self.compare_photometry.setEnabled(
             bool(variant_choices(self.visible, value, path)))
-        self._update_full_depth_button()
         scenario = explain_ffum_scenario(value) if candidate['dataset'].casefold() == 'ffum' else None
         self.model_assumption.setText(
             f"What this model assumes: {scenario['short_label']}. {scenario['detail']}" if scenario else '')

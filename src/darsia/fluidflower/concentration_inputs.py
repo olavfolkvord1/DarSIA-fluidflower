@@ -60,7 +60,7 @@ def discover_model_inputs(model_root: Path, *, include_saved_results: bool = Tru
     preserves strict discovery for calculation and other programmatic callers.
     """
     from .phase_evidence_audit import verified_review_binding
-    from .tools.studio_mass_campaign_worker import mass_candidate
+    from .phase_saved_runtime_views import mass_candidate
 
     root = _path(model_root)
     binding = verified_review_binding(root)
@@ -366,9 +366,9 @@ def _require_bottom_mass_policy(run: Mapping) -> None:
     """
     location = run.get("model_root") or run.get("native_manifest")
     if location:
-        from .phase_ffac_p1_final3_review import require_mass_exclusion as require_final3_mass_exclusion
+        from .phase_saved_contact_review import require_mass_exclusion as require_final3_mass_exclusion
         require_final3_mass_exclusion(location)
-        from .phase_ffac_p1_final2_review import require_mass_exclusion
+        from .phase_saved_categorical_review import require_mass_exclusion
         require_mass_exclusion(location)
         from .phase_rig_bottom_review_policy import require_bottom_mass_exclusion
         exclusion = require_bottom_mass_exclusion(location)
@@ -484,9 +484,9 @@ class V5NativeScientificInputReader:
     """
 
     def __init__(self, run: Mapping):
-        from .phase_training.v5_linear_input import RunV5LinearInput
-        from .tools.ffac_v5_frame_context import V5FrameGeometryCohort
-        from .tools.ffac_v5_track1_photo_context import Track1FramePhotoCohort
+        from .phase_training.log_linear_input import RunV5LinearInput
+        from .phase_training.frame_context import V5FrameGeometryCohort
+        from .phase_training.photo_context import Track1FramePhotoCohort
 
         _require_bottom_mass_policy(run)
         _unchanged(run)

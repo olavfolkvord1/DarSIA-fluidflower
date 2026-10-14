@@ -152,38 +152,17 @@ def _raw_detail(signal, support, *, backend, tile_rows):
     return output
 
 
-def render_lift1(signal, sand, *, backend="auto", tile_rows=128):
-    """Render only lift1, byte-equivalent to the existing three-mode renderer."""
-    from .tools import ffac_track1_display_modes as display
-    height, width = sand.shape
-    linear = np.empty((height, width, 3), np.float32)
-    valid = np.empty((height, width), bool)
-    for start in range(0, height, tile_rows):
-        end = min(start+tile_rows, height)
-        tile = np.moveaxis(signal[:, start:end], 0, -1)
-        finite = np.isfinite(tile).all(-1)
-        with np.errstate(over="ignore", invalid="ignore"):
-            transformed = np.exp(np.where(finite[..., None], tile, 0).astype(np.float64)) @ display.M_NATURAL
-            transformed = transformed.astype(np.float32)
-        finite &= np.isfinite(transformed).all(-1)
-        transformed[~finite] = np.nan
-        linear[start:end] = np.maximum(transformed, 0)
-        valid[start:end] = finite
-    unfilled, _ = display._fill_small_invalid(linear, valid)
-    display._neutralise_highlights(linear, sand, valid, None)
-    output = np.empty((height, width, 3), np.uint8)
-    gain = display.GAINS["lift1"]
-    for start in range(0, height, tile_rows):
-        end = min(start+tile_rows, height)
-        rgb = np.where(valid[start:end, :, None], linear[start:end], 0).astype(np.float64)
-        luminance = rgb @ display.LUMINANCE_WEIGHTS
-        gained = gain*luminance
-        toned = gained*(1+gained/(.95*gain)**2)/(1+gained)
-        ratio = np.divide(toned, luminance, out=np.zeros_like(toned), where=luminance>0)
-        rgb *= ratio[..., None]
-        rgb /= np.maximum(np.max(rgb, axis=-1, keepdims=True), 1)
-        output[start:end] = np.rint(255*display._srgb_encode(rgb)).astype(np.uint8)
-    output[unfilled] = 40
-    output = median_chroma(output, backend=backend)
-    output[unfilled] = 40
-    return output
+
+def render_lift1(signal, sand, *, backend="auto", tile_rows=None):
+    """Forward the configured lift mode through the single display implementation."""
+    from .native.config import require_parameters
+    from .native.display_modes import render_display_modes
+    display = require_parameters("display_modes")
+    change = require_parameters("change_display")
+    rows = change["tile_rows"] if tile_rows is None else tile_rows
+    mode = change["lift_mode"]
+    modes, _ = render_display_modes(
+        signal, sand, tile_rows=rows, parameters=display,
+        selected_modes=(mode,),
+        chroma_filter=lambda image: median_chroma(image, backend=backend))
+    return np.rint(modes[mode] * 255).astype(np.uint8)

@@ -204,12 +204,17 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     _retry_storage_io(write, str(path))
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    """Read one UTF-8-sig JSON object with the execution reader's original error."""
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return payload
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     def read() -> dict[str, Any]:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        if not isinstance(payload, dict):
-            raise ValueError(f"Expected a JSON object in {path}")
-        return payload
+        return _read_json_object(path)
 
     return _retry_storage_io(read, str(path), retry_not_found=False)
 

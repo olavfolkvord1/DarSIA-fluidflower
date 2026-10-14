@@ -1301,32 +1301,32 @@ def _manifest_relative_path(selection_dir: Path, value: Any) -> Path:
 
 def _t4b_saved_review_candidate(selection_dir: Path, job: Mapping[str, Any], root: Path) -> Candidate:
     """Adapt admitted joint-head saved maps without the legacy G3 warning gate."""
-    from darsia.fluidflower.phase_ffac_t4b_review import t4b_saved_review
+    from darsia.fluidflower.phase_saved_revision_review import t4b_saved_review
     return _admitted_saved_review_candidate(selection_dir, job, root, t4b_saved_review(root),
         revision="T4b", kind="ffac_g3_t4b_floor_review")
 
 
 def _t4c_saved_review_candidate(selection_dir: Path, job: Mapping[str, Any], root: Path) -> Candidate:
     """Adapt exactly admitted calibrated placements to their native timeline."""
-    from darsia.fluidflower.phase_ffac_t4c_review import t4c_saved_review
+    from darsia.fluidflower.phase_saved_floor_review import t4c_saved_review
     return _admitted_saved_review_candidate(selection_dir, job, root, t4c_saved_review(root),
         revision="T4c", kind="ffac_g3_t4c_floor_review")
 
 
 def _p1_final3_saved_review_candidate(selection_dir, job, root):
-    from darsia.fluidflower.phase_ffac_p1_final3_review import p1_final3_saved_review, KIND
+    from darsia.fluidflower.phase_saved_contact_review import p1_final3_saved_review, KIND
     return _admitted_saved_review_candidate(selection_dir, job, root, p1_final3_saved_review(root),
         revision="P1-final3", kind=KIND)
 
 
 def _p1_final2_saved_review_candidate(selection_dir, job, root):
-    from darsia.fluidflower.phase_ffac_p1_final2_review import p1_final2_saved_review, KIND
+    from darsia.fluidflower.phase_saved_categorical_review import p1_final2_saved_review, KIND
     return _admitted_saved_review_candidate(selection_dir, job, root, p1_final2_saved_review(root),
         revision="P1-final2", kind=KIND)
 
 
 def _p1_final_saved_review_candidate(selection_dir, job, root):
-    from darsia.fluidflower.phase_ffac_p1_final_review import p1_final_saved_review, KIND
+    from darsia.fluidflower.phase_saved_boundary_review import p1_final_saved_review, KIND
     return _admitted_saved_review_candidate(selection_dir, job, root, p1_final_saved_review(root),
         revision="P1-final", kind=KIND)
 
@@ -1409,8 +1409,8 @@ def _admitted_saved_review_candidate(selection_dir, job, root, checked, *, revis
 
 def _selected_policy_a_review_candidate(selection_dir,job,root,admission=None):
     """Use saved selected maps, with no legacy mass/movie assets or inference."""
-    from darsia.fluidflower.tools.register_ffac_selected_policy_a_studio_candidate import selected_saved_review
-    from darsia.fluidflower.phase_ffac_selected_policy_a_review import load_native_source,load_profile,runtime_identity
+    from darsia.fluidflower.phase_saved_selected_registration import selected_saved_review
+    from darsia.fluidflower.phase_selected_policy_review import load_native_source,load_profile,runtime_identity
     admission=admission or selected_saved_review(root)
     profile=load_profile(root)
     run=str(job["run"]).casefold()
@@ -1442,35 +1442,35 @@ def _candidate_from_job(selection_dir: Path, job: Mapping[str, Any], *, selected
     if (job.get("quality_flags") or {}).get("approved_g3_downstream") is True:
         root = _manifest_relative_path(selection_dir, job["candidate_folder"]).resolve()
         if (root / "p1_final3_plan.json").is_file():
-            from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+            from darsia.fluidflower.phase_saved_registration import registration_path
             registration = _read_json(resolve_review_path(registration_path(root.name)))
             if registration.get("registration_kind") != "ffac_g3_t4c_p1_final3_review":
                 raise ValueError("P1-final3 saved review has no exact reason-b removal registration")
             return _p1_final3_saved_review_candidate(selection_dir, job, root)
         if (root / "p1_final2_plan.json").is_file():
-            from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+            from darsia.fluidflower.phase_saved_registration import registration_path
             registration = _read_json(resolve_review_path(registration_path(root.name)))
             if registration.get("registration_kind") != "ffac_g3_t4c_p1_final2_review":
                 raise ValueError("P1-final2 saved review has no exact A–D postprocessing registration")
             return _p1_final2_saved_review_candidate(selection_dir, job, root)
         if (root / "p1_final_plan.json").is_file():
-            from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+            from darsia.fluidflower.phase_saved_registration import registration_path
             registration = _read_json(resolve_review_path(registration_path(root.name)))
             if registration.get("registration_kind") != "ffac_g3_t4c_p1_final_review":
                 raise ValueError("P1-final saved review has no exact post-processing registration")
             return _p1_final_saved_review_candidate(selection_dir, job, root)
         if (root / "t4c_floor_plan.json").is_file():
-            from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+            from darsia.fluidflower.phase_saved_registration import registration_path
             registration = _read_json(resolve_review_path(registration_path(root.name)))
             if registration.get("registration_kind") != "ffac_g3_t4c_floor_review":
                 raise ValueError("T4c saved review has no exact calibrated-placement registration")
             return _t4c_saved_review_candidate(selection_dir, job, root)
         if (root / "t4b_floor_plan.json").is_file():
-            from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+            from darsia.fluidflower.phase_saved_registration import registration_path
             registration = _read_json(resolve_review_path(registration_path(root.name)))
             if registration.get("registration_kind") == "ffac_g3_t4b_floor_review":
                 return _t4b_saved_review_candidate(selection_dir, job, root)
-        from darsia.fluidflower.tools.register_ffac_g3_studio_candidate import saved_review_candidate
+        from darsia.fluidflower.phase_saved_candidate_admission import saved_review_candidate
         return saved_review_candidate(selection_dir, job)
     run = str(job["run"]).casefold()
     variant = str(job["variant"])
@@ -1507,7 +1507,7 @@ def _candidate_from_job(selection_dir: Path, job: Mapping[str, Any], *, selected
     if job.get("presentation_status") == "deferred":
         if not phase_model_only:
             raise ValueError("Deferred presentation requires a native phase model candidate")
-        from darsia.fluidflower.tools.phase_transfer_materialization import validate_deferred_presentation
+        from darsia.fluidflower.phase_saved_candidate_admission import validate_deferred_presentation
         validate_deferred_presentation(summary, run=run, candidate_id=candidate_id,
             params_sha256=digest,
             review_output_dir=_manifest_relative_path(selection_dir, job["review_output_dir"]),
@@ -1707,7 +1707,7 @@ def discover_review_inventory(
 
     selected_admission=None
     if physics_profile.get("format") == "ffac-selected-policy-a-review-physics-v1":
-        from darsia.fluidflower.tools.register_ffac_selected_policy_a_studio_candidate import selected_saved_review
+        from darsia.fluidflower.phase_saved_selected_registration import selected_saved_review
         selected_admission=selected_saved_review(_manifest_relative_path(selection_dir,manifest["model_root"]))
 
     grouped: dict[str, dict[str, Candidate]] = {}
@@ -1856,13 +1856,13 @@ def _native_frame_folder(output_dir: Path, run: str) -> Path:
 def _native_frame_path(output_dir: Path, run: str, frame_index: int) -> Path:
     manifest = _native_frame_folder(output_dir, run) / "manifest.json"
     if manifest.is_file() and "ffac_selected_policy_a_sources" in _read_json(manifest):
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import resolve_photograph
+        from darsia.fluidflower.phase_selected_policy_review import resolve_photograph
         return resolve_photograph(resolve_review_path(output_dir),run,frame_index,verify=False)
     if manifest.is_file() and "ffac_rig_camera_sources" in json.loads(manifest.read_text(encoding="utf-8-sig")):
-        from darsia.fluidflower.phase_ffac_rig_camera_runtime import resolve_photograph
+        from darsia.fluidflower.phase_saved_review_metadata import resolve_photograph
         return resolve_photograph(resolve_review_path(output_dir),run,frame_index,verify=False)
     if manifest.is_file() and "v5_native_source_alias" in json.loads(manifest.read_text(encoding="utf-8-sig")):
-        from darsia.fluidflower.phase_v5_source_alias import resolve_native_photo_path
+        from darsia.fluidflower.phase_source_alias import resolve_native_photo_path
         return resolve_native_photo_path(resolve_review_path(output_dir), run, frame_index)
     path = _native_frame_folder(output_dir, run) / f"frame_{frame_index:03d}.jpg"
     return path.with_suffix(".png") if path.with_suffix(".png").is_file() else path
@@ -1879,7 +1879,7 @@ def _native_photograph_availability(
     Selected image reads still verify their own asset content in the image worker.
     """
     if "ffac_selected_policy_a_sources" in manifest:
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import load_native_source
+        from darsia.fluidflower.phase_selected_policy_review import load_native_source
         state=load_native_source(output_dir,run,manifest,verify_geometry=False)
         if len(state["native"]["frame_sources"]) != frame_count:
             raise ValueError("Selected photographic timeline differs from candidate count")
@@ -1892,7 +1892,7 @@ def _native_photograph_availability(
             for index in range(frame_count)
         )
 
-    from darsia.fluidflower.phase_ffac_rig_camera_runtime import bound_path
+    from darsia.fluidflower.phase_saved_review_metadata import bound_path
     from darsia.fluidflower.phase_rig_raw_display import _native_frame_assets_cached
 
     # This is the same presentation-only session cache used for RAW/Change.
@@ -2149,7 +2149,7 @@ def _native_phase_map_path(
     if _candidate_prediction_withheld(output_dir, candidate):
         return _withheld_prediction_asset(output_dir, candidate)
     if (getattr(candidate,"quality_flags",None) or {}).get("selected_camera_review"):
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import resolve_phase_map
+        from darsia.fluidflower.phase_selected_policy_review import resolve_phase_map
         return resolve_phase_map(_candidate_review_root(output_dir,candidate),candidate.run,frame_index)
     folder = _native_phase_map_folder(
         output_dir,
@@ -2193,7 +2193,7 @@ def _preferred_phase_overlay_path(
         return _withheld_prediction_asset(output_dir, candidate), "bottom_blind_withheld"
 
     if (getattr(candidate,"quality_flags",None) or {}).get("selected_camera_review"):
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import resolve_phase_map
+        from darsia.fluidflower.phase_selected_policy_review import resolve_phase_map
         return resolve_phase_map(_candidate_review_root(output_dir,candidate),candidate.run,frame_index,phase=phase), "selected_saved_phase_fill"
     if phase in {"below_sand_floor", "removed_floor_connectivity", "floor_contact_fill_v2", "removed_gas_envelope", "removed_contact_fill_b"}:
         final3 = bool((candidate.quality_flags or {}).get("p1_final3_revision"))
@@ -2826,13 +2826,13 @@ def _native_reference_path(output_dir: Path, run: str) -> Path:
     output_dir = resolve_review_path(output_dir)
     manifest = output_dir / "native_frames" / run.casefold() / "manifest.json"
     if manifest.is_file() and "ffac_selected_policy_a_sources" in _read_json(manifest):
-        from darsia.fluidflower.phase_ffac_selected_policy_a_review import resolve_photograph
+        from darsia.fluidflower.phase_selected_policy_review import resolve_photograph
         return resolve_photograph(output_dir,run,reference=True,verify=False)
     if manifest.is_file() and "ffac_rig_camera_sources" in json.loads(manifest.read_text(encoding="utf-8-sig")):
-        from darsia.fluidflower.phase_ffac_rig_camera_runtime import resolve_photograph
+        from darsia.fluidflower.phase_saved_review_metadata import resolve_photograph
         return resolve_photograph(output_dir,run,reference=True,verify=False)
     if manifest.is_file() and "v5_native_source_alias" in json.loads(manifest.read_text(encoding="utf-8-sig")):
-        from darsia.fluidflower.phase_v5_source_alias import resolve_native_photo_path
+        from darsia.fluidflower.phase_source_alias import resolve_native_photo_path
         return resolve_native_photo_path(output_dir, run, reference=True)
     path = output_dir / "native_references" / run.casefold() / "pre_injection.jpg"
     return path.with_suffix(".png") if path.with_suffix(".png").is_file() else path
@@ -3375,564 +3375,6 @@ def _existing_registration_records(
     return result
 
 
-def prepare_clean_frames(
-    selection_dir: Path,
-    output_dir: Path,
-    inventory: ReviewInventory,
-    *,
-    runs: Sequence[str] | None = None,
-    force: bool = False,
-    backend: str = "auto",
-) -> dict[str, Any]:
-    """Cache matched plain and line-only contour images for visual review."""
-
-    import cv2
-    import numpy as np
-
-    from darsia.fluidflower.tools import ac_spatial_winner_selection as selection
-    from darsia.fluidflower.tools.calibration_review_movie import (
-        render_contour_frame,
-        render_contour_overlay,
-    )
-    from darsia.fluidflower.tools.spatial_mass_evaluator import create_spatial_mass_evaluator
-
-    requested = {str(run).casefold() for run in (runs or ())}
-    pairs = [pair for pair in inventory.pairs if not requested or pair.run in requested]
-    unknown = requested - {pair.run for pair in pairs}
-    if unknown:
-        raise ValueError(f"Unknown or unpaired runs: {sorted(unknown)}")
-
-    completed: list[str] = []
-    skipped: list[str] = []
-    for pair in pairs:
-        source_expected = [_reference_frame_path(output_dir, pair.run)]
-        source_expected.extend(
-            _clean_frame_path(output_dir, candidate, label, index)
-            for label, candidate in (
-                ("A", pair.candidate_a),
-                ("B", pair.candidate_b),
-            )
-            for index in range(candidate.frame_count)
-        )
-        source_expected.extend(
-            _line_contour_frame_path(output_dir, candidate, label, index)
-            for label, candidate in (
-                ("A", pair.candidate_a),
-                ("B", pair.candidate_b),
-            )
-            for index in range(candidate.frame_count)
-        )
-        aligned_expected = [
-            _aligned_reference_frame_path(output_dir, candidate, label, index)
-            for label, candidate in (
-                ("A", pair.candidate_a),
-                ("B", pair.candidate_b),
-            )
-            for index in range(candidate.frame_count)
-        ]
-        native_expected = [
-            _native_reference_path(output_dir, pair.run),
-            _native_manifest_path(output_dir, pair.run),
-        ]
-        native_expected.extend(
-            _native_frame_path(output_dir, pair.run, index)
-            for index in range(pair.candidate_a.frame_count)
-        )
-        native_expected.extend(
-            _native_overlay_path(output_dir, candidate, label, index)
-            for label, candidate in (
-                ("A", pair.candidate_a),
-                ("B", pair.candidate_b),
-            )
-            for index in range(candidate.frame_count)
-        )
-        native_expected.extend(
-            _phase_quiz_path(output_dir, candidate, label)
-            for label, candidate in (
-                ("A", pair.candidate_a),
-                ("B", pair.candidate_b),
-            )
-        )
-        sources_ready = bool(source_expected) and all(
-            path.is_file() for path in source_expected
-        )
-        aligned_ready = bool(aligned_expected) and all(
-            path.is_file() for path in aligned_expected
-        )
-        native_ready = bool(native_expected) and all(
-            path.is_file() for path in native_expected
-        )
-        native_manifest_path = _native_manifest_path(output_dir, pair.run)
-        existing_native_manifest = (
-            _read_json(native_manifest_path)
-            if native_manifest_path.is_file()
-            else {}
-        )
-        native_metadata_ready = len(
-            existing_native_manifest.get("frame_sources") or []
-        ) == pair.candidate_a.frame_count
-        if (
-            not force
-            and sources_ready
-            and aligned_ready
-            and native_ready
-            and native_metadata_ready
-        ):
-            skipped.append(pair.run)
-            continue
-        if not force and sources_ready and not aligned_ready:
-            _prepare_aligned_reference_frames(output_dir, pair, force=False)
-
-        representative = pair.candidate_a
-        spec = selection.FAMILY_SPECS[representative.family]
-        variant = replace(spec.variant, name=representative.variant)
-        environment = selection.screen._spatial_environment_values(pair.run, spec)
-        context = None
-        loaded = None
-        representative_records = _calibration_records(
-            str(pair.candidate_a.per_frame_csv)
-        )
-        evaluation_times = [
-            float(record["elapsed_h"]) for record in representative_records
-        ]
-        environment["FFAC_EXTRA_CALIBRATION_TIMES_H"] = ",".join(
-            f"{value:.12g}" for value in evaluation_times
-        )
-        try:
-            with selection.pilot.campaign_environment(variant, environment):
-                context = selection.screen.selection._build_evaluation_context(
-                    pair.run,
-                    variant,
-                    times=None,
-                )
-                loaded = context._loaded
-                if force or not _reference_frame_path(output_dir, pair.run).is_file():
-                    _write_reference_frame(output_dir, pair.run, context)
-                if not loaded:
-                    raise RuntimeError(f"No calibration images loaded for {pair.run}")
-                first_image_array = np.asarray(loaded[0][0].img)
-                facies_array = np.asarray(context.fluidflower.facies.img)
-                if facies_array.shape != first_image_array.shape[:2]:
-                    raise RuntimeError(
-                        f"Facies/image shape mismatch for {pair.run}: "
-                        f"{facies_array.shape} versus {first_image_array.shape[:2]}"
-                    )
-                # Facies zero is the free-water/background class in both FF_AC
-                # and FF_UM. Quiz probes belong only inside the porous medium.
-                phase_quiz_domain = np.isfinite(facies_array) & (facies_array != 0)
-                if not np.any(phase_quiz_domain):
-                    raise RuntimeError(
-                        f"No porous-medium pixels available for {pair.run} phase quiz"
-                    )
-                native_width, native_height = _native_review_dimensions(
-                    first_image_array.shape
-                )
-                reference_metadata = _write_native_reference_frame(
-                    output_dir,
-                    pair.run,
-                    context,
-                    width=native_width,
-                    height=native_height,
-                    force=force,
-                )
-                registration = _existing_registration_records(
-                    output_dir,
-                    pair,
-                    source_shape=first_image_array.shape,
-                )
-                baseline_array = np.asarray(
-                    context.calibration.color_analysis.base.img
-                )
-                if len(representative_records) != len(loaded):
-                    raise RuntimeError(
-                        f"Frame mismatch for {pair.run}: "
-                        f"{len(representative_records)} records versus "
-                        f"{len(loaded)} images"
-                    )
-                native_registration_records: list[dict[str, Any]] = []
-                for index, ((image, injected, elapsed_h), record) in enumerate(
-                    zip(loaded, representative_records, strict=True)
-                ):
-                    image_array = np.asarray(image.img)
-                    if image_array.shape != first_image_array.shape:
-                        raise RuntimeError(
-                            f"Native image shape changed within {pair.run}: "
-                            f"{first_image_array.shape} to {image_array.shape}"
-                        )
-                    target = _native_frame_path(output_dir, pair.run, index)
-                    elapsed_value = float(record.get("elapsed_h") or elapsed_h)
-                    injected_value = float(
-                        record.get("injected_mass_kg") or injected
-                    )
-                    if force or not target.is_file():
-                        zeros = np.zeros(image_array.shape[:2], dtype=np.float32)
-                        frame = render_contour_frame(
-                            image=image_array,
-                            concentration_aq=zeros,
-                            saturation_g=zeros,
-                            run=pair.run,
-                            variant="Blind review",
-                            frame_index=index,
-                            frame_count=len(loaded),
-                            elapsed_h=elapsed_value,
-                            injected_mass_kg=injected_value,
-                            detected_total_mass_kg=0.0,
-                            detected_gas_mass_kg=0.0,
-                            detected_aqueous_mass_kg=0.0,
-                            width=native_width,
-                            height=native_height,
-                            gas_fill_alpha=0.0,
-                            show_aqueous=False,
-                            show_gas=False,
-                            preserve_native_resolution=True,
-                            header_title=(
-                                f"{pair.run.upper()}  |  calibration frame "
-                                f"{index + 1}/{len(loaded)}  |  "
-                                f"t={elapsed_value:.3f} h  |  "
-                                "corrected input at native resolution"
-                            ),
-                            header_mass=(
-                                f"Injected {1000.0 * injected_value:.4f} g  |  "
-                                "candidate-specific detected masses are shown "
-                                "above the image"
-                            ),
-                            status_text="",
-                        )
-                        _write_review_jpeg(
-                            target,
-                            frame,
-                            quality=NATIVE_REVIEW_JPEG_QUALITY,
-                        )
-                    registration_row = registration.get(index)
-                    if registration_row is None:
-                        dx, dy, response, region = _estimate_review_translation(
-                            baseline_array,
-                            image_array,
-                            header_height=0,
-                        )
-                        registration_row = {
-                            "dx_px": dx,
-                            "dy_px": dy,
-                            "response": response,
-                            "region": region,
-                            "source": "native_analysis_images",
-                        }
-                    native_registration_records.append(
-                        {
-                            "frame_index": index,
-                            **registration_row,
-                            "dx_canvas_fraction": (
-                                float(registration_row["dx_px"]) / native_width
-                            ),
-                            "dy_canvas_fraction": (
-                                float(registration_row["dy_px"]) / native_height
-                            ),
-                        }
-                    )
-
-                native_manifest = {
-                    "schema": 1,
-                    "run": pair.run,
-                    "kind": "native_resolution_corrected_review_frames",
-                    "frame_count": len(loaded),
-                    "canvas_wh": [native_width, native_height],
-                    "analysis_image_shape_hw": [
-                        int(value) for value in first_image_array.shape[:2]
-                    ],
-                    "content_box_xywh": list(
-                        _native_content_box(
-                            first_image_array.shape,
-                            native_width,
-                            native_height,
-                        )
-                    ),
-                    "full_analysis_resolution": True,
-                    "additional_spatial_resampling": False,
-                    "jpeg_quality": NATIVE_REVIEW_JPEG_QUALITY,
-                    "base_image_shared_between_candidates": True,
-                    "contours_stored_as_transparent_overlays": True,
-                    "reference": reference_metadata,
-                    "frame_sources": _native_frame_source_records(context, loaded),
-                    "reference_registration": native_registration_records,
-                    "created_utc": _utc_now(),
-                }
-                _atomic_write(
-                    _native_manifest_path(output_dir, pair.run),
-                    json.dumps(native_manifest, indent=2),
-                )
-                for label, candidate in (
-                    ("A", pair.candidate_a),
-                    ("B", pair.candidate_b),
-                ):
-                    records = _calibration_records(str(candidate.per_frame_csv))
-                    if len(records) != len(loaded):
-                        raise RuntimeError(
-                            f"Frame mismatch for {pair.run}/{label}: "
-                            f"{len(records)} records versus {len(loaded)} images"
-                        )
-                    clean_folder = _clean_frame_folder(output_dir, candidate, label)
-                    contour_folder = _line_contour_frame_folder(
-                        output_dir, candidate, label
-                    )
-                    clean_folder.mkdir(parents=True, exist_ok=True)
-                    contour_folder.mkdir(parents=True, exist_ok=True)
-                    contour_targets = [
-                        _line_contour_frame_path(output_dir, candidate, label, index)
-                        for index in range(candidate.frame_count)
-                    ]
-                    native_overlay_targets = [
-                        _native_overlay_path(
-                            output_dir,
-                            candidate,
-                            label,
-                            index,
-                        )
-                        for index in range(candidate.frame_count)
-                    ]
-                    quiz_target = _phase_quiz_path(output_dir, candidate, label)
-                    needs_quiz = force or not quiz_target.is_file()
-                    needs_contours = force or any(
-                        not target.is_file() for target in contour_targets
-                    ) or any(
-                        not target.is_file() for target in native_overlay_targets
-                    ) or needs_quiz
-                    evaluator = None
-                    quiz_proposals: list[dict[str, Any]] = []
-                    try:
-                        if needs_contours:
-                            candidate_path = (
-                                selection_dir
-                                / "postflight_input"
-                                / candidate.variant
-                                / pair.run
-                                / f"final_full_scale_{pair.run}.json"
-                            )
-                            payload = _read_json(candidate_path)
-                            params = payload.get("params")
-                            if not isinstance(params, dict) or not params:
-                                raise RuntimeError(
-                                    f"Candidate has no parameters: {candidate_path}"
-                                )
-                            selection.screen.calibration.apply_params(
-                                context.calibration,
-                                params,
-                                labels=context.signal_labels,
-                                np_module=np,
-                            )
-                            evaluator = create_spatial_mass_evaluator(
-                                context.calibration,
-                                backend=backend,
-                                output_dtype="float32",
-                                cuda_color_interpretation=(
-                                    "on" if backend in {"auto", "cuda"} else "off"
-                                ),
-                            )
-                        for index, ((image, injected, elapsed_h), record) in enumerate(
-                            zip(loaded, records, strict=True)
-                        ):
-                            image_array = np.asarray(image.img)
-                            clean_target = _clean_frame_path(
-                                output_dir, candidate, label, index
-                            )
-                            contour_target = contour_targets[index]
-                            native_overlay_target = native_overlay_targets[index]
-                            common = {
-                                "image": image_array,
-                                "run": pair.run,
-                                "variant": f"Candidate {label}",
-                                "frame_index": index,
-                                "frame_count": len(loaded),
-                                "elapsed_h": float(record.get("elapsed_h") or elapsed_h),
-                                "injected_mass_kg": float(
-                                    record.get("injected_mass_kg") or injected
-                                ),
-                                "detected_total_mass_kg": float(
-                                    record["detected_total_mass_kg"]
-                                ),
-                                "detected_gas_mass_kg": float(
-                                    record["detected_gas_mass_kg"]
-                                ),
-                                "detected_aqueous_mass_kg": float(
-                                    record["detected_aqueous_mass_kg"]
-                                ),
-                                "gas_fill_alpha": 0.0,
-                            }
-                            if force or not clean_target.is_file():
-                                zeros = np.zeros(image_array.shape[:2], dtype=np.float32)
-                                clean_frame = render_contour_frame(
-                                    concentration_aq=zeros,
-                                    saturation_g=zeros,
-                                    show_aqueous=False,
-                                    show_gas=False,
-                                    **common,
-                                )
-                                _write_review_jpeg(clean_target, clean_frame, quality=94)
-                            needs_spatial = (
-                                force
-                                or not contour_target.is_file()
-                                or not native_overlay_target.is_file()
-                                or needs_quiz
-                            )
-                            if needs_spatial:
-                                if evaluator is None:
-                                    raise RuntimeError("Contour evaluator was not initialized")
-                                spatial = evaluator.evaluate(image)
-                            else:
-                                spatial = None
-                            if needs_quiz:
-                                if spatial is None:
-                                    raise RuntimeError("Spatial result was not evaluated")
-                                quiz_proposals.extend(
-                                    _phase_quiz_proposals_from_fields(
-                                        run=pair.run,
-                                        label=label,
-                                        candidate_id=candidate.candidate_id,
-                                        params_sha256=candidate.params_sha256,
-                                        frame_index=index,
-                                        elapsed_h=common["elapsed_h"],
-                                        concentration_aq=np.asarray(
-                                            spatial.concentration_aq.img
-                                        ),
-                                        saturation_g=np.asarray(
-                                            spatial.saturation_g.img
-                                        ),
-                                        mass_aq=np.asarray(spatial.mass_aq.img),
-                                        mass_g=np.asarray(spatial.mass_g.img),
-                                        canvas_wh=(native_width, native_height),
-                                        content_box_xywh=_native_content_box(
-                                            image_array.shape,
-                                            native_width,
-                                            native_height,
-                                        ),
-                                        analysis_domain_mask=phase_quiz_domain,
-                                    )
-                                )
-                            if force or not contour_target.is_file():
-                                if spatial is None:
-                                    raise RuntimeError("Spatial result was not evaluated")
-                                contour_frame = render_contour_frame(
-                                    concentration_aq=np.asarray(
-                                        spatial.concentration_aq.img
-                                    ),
-                                    saturation_g=np.asarray(spatial.saturation_g.img),
-                                    show_aqueous=True,
-                                    show_gas=True,
-                                    **common,
-                                )
-                                _write_review_jpeg(
-                                    contour_target, contour_frame, quality=94
-                                )
-                            if force or not native_overlay_target.is_file():
-                                if spatial is None:
-                                    raise RuntimeError("Spatial result was not evaluated")
-                                overlay = render_contour_overlay(
-                                    image_shape=image_array.shape,
-                                    concentration_aq=np.asarray(
-                                        spatial.concentration_aq.img
-                                    ),
-                                    saturation_g=np.asarray(spatial.saturation_g.img),
-                                    width=native_width,
-                                    height=native_height,
-                                    show_aqueous=True,
-                                    show_gas=True,
-                                    preserve_native_resolution=True,
-                                )
-                                _write_review_png(native_overlay_target, overlay)
-                        if needs_quiz:
-                            initial_quiz = _select_phase_quiz_proposals(
-                                quiz_proposals,
-                                max_total=PHASE_QUIZ_INITIAL_PROPOSALS_PER_CANDIDATE,
-                            )
-                            quiz_pool = _select_phase_quiz_proposals(
-                                quiz_proposals,
-                                max_total=PHASE_QUIZ_MAX_PROPOSALS_PER_CANDIDATE,
-                            )
-                            initial_ids = {
-                                str(proposal.get("proposal_id") or "")
-                                for proposal in initial_quiz
-                            }
-                            selected_quiz = initial_quiz + [
-                                proposal
-                                for proposal in quiz_pool
-                                if str(proposal.get("proposal_id") or "")
-                                not in initial_ids
-                            ]
-                            _atomic_write(
-                                quiz_target,
-                                json.dumps(
-                                    {
-                                        "schema": PHASE_QUIZ_PROPOSAL_SCHEMA,
-                                        "run": pair.run,
-                                        "candidate": label,
-                                        "candidate_id": candidate.candidate_id,
-                                        "params_sha256": candidate.params_sha256,
-                                        "interpretation_scope": (
-                                            "visible_2d_slice_only"
-                                        ),
-                                        "analysis_domain": "porous_medium_only",
-                                        "proposal_count": len(initial_quiz),
-                                        "initial_proposal_count": len(initial_quiz),
-                                        "available_proposal_count": len(selected_quiz),
-                                        "proposals": selected_quiz,
-                                        "created_utc": _utc_now(),
-                                    },
-                                    indent=2,
-                                ),
-                            )
-                    finally:
-                        if evaluator is not None:
-                            evaluator.close()
-                    manifest = {
-                        "schema": 2,
-                        "run": pair.run,
-                        "label": label,
-                        "candidate_id": candidate.candidate_id,
-                        "params_sha256": candidate.params_sha256,
-                        "frame_count": len(records),
-                        "source_manifest": str(inventory.manifest_path),
-                        "same_base_image_for_plain_and_contours": True,
-                        "native_base_image_shared_between_candidates": True,
-                        "native_contours_are_transparent_overlays": True,
-                        "phase_quiz_proposals": len(
-                            _load_phase_quiz_proposals(
-                                output_dir,
-                                candidate,
-                                label,
-                            )
-                        ),
-                        "native_canvas_wh": [native_width, native_height],
-                        "gas_fill_alpha": 0.0,
-                        "created_utc": _utc_now(),
-                    }
-                    _atomic_write(
-                        clean_folder / "manifest.json",
-                        json.dumps(manifest, indent=2),
-                    )
-                    _atomic_write(
-                        contour_folder / "manifest.json",
-                        json.dumps(manifest, indent=2),
-                    )
-                    _atomic_write(
-                        _native_overlay_folder(output_dir, candidate, label)
-                        / "manifest.json",
-                        json.dumps(manifest, indent=2),
-                    )
-            _prepare_aligned_reference_frames(output_dir, pair, force=force)
-            completed.append(pair.run)
-        finally:
-            if context is not None:
-                if loaded is not None:
-                    loaded.clear()
-                selection.screen._close_context(context)
-                context = None
-    return {
-        "schema": 1,
-        "selection_dir": str(selection_dir),
-        "output_dir": str(output_dir),
-        "completed": completed,
-        "skipped": skipped,
-        "backend": backend,
-    }
 
 
 def _selected_pairs(
@@ -4094,7 +3536,7 @@ def _portable_candidate_payload(
     for source, target in zip(overlay_sources, overlay_paths, strict=True):
         if not source.is_file():
             raise FileNotFoundError(
-                f"Missing native contour overlay: {source}. Run prepare-clean first."
+                f"Missing native contour overlay: {source}. Saved native review assets are unavailable."
             )
         if force or not target.is_file():
             _atomic_copy(source, target)
@@ -4216,7 +3658,7 @@ def _portable_native_payload(
     if not source_manifest_path.is_file():
         raise FileNotFoundError(
             f"Missing native-resolution manifest: {source_manifest_path}. "
-            "Run prepare-clean first."
+            "Saved native review assets are unavailable."
         )
     source_manifest = _read_json(source_manifest_path)
     if not source_manifest.get("full_analysis_resolution"):
@@ -4307,7 +3749,7 @@ def _portable_reference_payload(
     source = _reference_frame_path(review_output_dir, run)
     if not source.is_file():
         raise FileNotFoundError(
-            f"Missing pre-injection reference cache: {source}. Run prepare-clean first."
+            f"Missing pre-injection reference cache: {source}. Saved native review assets are unavailable."
         )
     relative = Path("assets") / run / "pre_injection_reference.jpg"
     target = portable_dir / relative
@@ -5459,7 +4901,7 @@ class ReviewStore:
             strict=has_frame_choices,
         )
         if (pair.candidate_a.quality_flags or {}).get("selected_camera_review"):
-            from darsia.fluidflower.phase_ffac_selected_annotation_binding import stamp_camera_identity
+            from darsia.fluidflower.phase_annotation_binding import stamp_camera_identity
             for index,frame_choice in enumerate(clean_frame_choices):
                 source=candidate_a_records[frame_choice["frame_index"]]
                 clean_frame_choices[index]=stamp_camera_identity(frame_choice,source,run)
@@ -5754,7 +5196,7 @@ class ReviewStore:
                 if key in annotation
             }
             if (getattr(candidate,"quality_flags",None) or {}).get("selected_camera_review") and annotation.get("source_binding_contract"):
-                from darsia.fluidflower.phase_ffac_selected_annotation_binding import CONTRACT as camera_contract,stamp_camera_identity
+                from darsia.fluidflower.phase_annotation_binding import CONTRACT as camera_contract,stamp_camera_identity
                 expected=stamp_camera_identity({},records[frame_index],run)
                 if annotation.get("source_binding_contract")!=camera_contract or any(
                         annotation.get(key)!=expected[key] for key in ("source_sha256","source_label_identity")):
@@ -6203,7 +5645,7 @@ class ReviewApp:
         selection_dir: Path | None = None,
         blind_seed: str = DEFAULT_BLIND_SEED,
         watch: bool = False,
-        prepare_new: bool = True,
+        prepare_new: bool = False,
         prepare_backend: str = "auto",
         watch_interval: float = 10.0,
     ) -> None:
@@ -6216,7 +5658,7 @@ class ReviewApp:
         )
         self.blind_seed = blind_seed
         self.watch = bool(watch and self.selection_dir is not None)
-        self.prepare_new = bool(prepare_new)
+        self.prepare_new = False
         self.prepare_backend = prepare_backend
         self.watch_interval = max(2.0, float(watch_interval))
         self.inventory_lock = threading.RLock()
@@ -6316,24 +5758,6 @@ class ReviewApp:
         new_runs = [
             pair.run for pair in discovered.pairs if pair.run not in current_runs
         ]
-        if new_runs and self.prepare_new:
-            self.live_status = {
-                "enabled": True,
-                "state": "preparing",
-                "updated_utc": _utc_now(),
-                "message": (
-                    "Preparing native-resolution review assets for "
-                    + ", ".join(run.upper() for run in new_runs)
-                ),
-            }
-            prepare_clean_frames(
-                self.selection_dir,
-                self.store.output_dir,
-                discovered,
-                runs=new_runs,
-                force=False,
-                backend=self.prepare_backend,
-            )
         self._publish_inventory(discovered)
         self.live_status = {
             "enabled": True,
@@ -6469,7 +5893,7 @@ class ReviewApp:
         reference_version = (
             reference_path.stat().st_mtime_ns if reference_path.is_file() else 0
         )
-        from darsia.fluidflower.phase_v5_display_asset import original_display_available, raw_detail_available
+        from darsia.fluidflower.phase_photographic_assets import original_display_available, raw_detail_available
         v5_raw_detail_available = (
             raw_detail_available(native_manifest)
             and raw_detail_available(native_manifest, reference=True)
@@ -8018,7 +7442,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=("inventory", "prepare-clean", "prepare-portable", "serve"),
+        choices=("inventory", "prepare-portable", "serve"),
         nargs="?",
         default="serve",
     )
@@ -8046,12 +7470,6 @@ def build_parser() -> argparse.ArgumentParser:
             "For serve mode, discover completed postflight pairs while the "
             "calibration/postflight campaign is still running."
         ),
-    )
-    parser.add_argument(
-        "--prepare-new",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prepare native-resolution review assets before publishing a new run.",
     )
     parser.add_argument("--watch-interval", type=float, default=10.0)
     return parser
@@ -8083,17 +7501,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.action == "inventory":
         print(json.dumps(summary, indent=2))
         return
-    if args.action == "prepare-clean":
-        result = prepare_clean_frames(
-            selection_dir,
-            output_dir,
-            inventory,
-            runs=args.runs,
-            force=args.force,
-            backend=args.backend,
-        )
-        print(json.dumps(result, indent=2))
-        return
     if args.action == "prepare-portable":
         portable_dir = (
             args.portable_dir or output_dir / "portable_review"
@@ -8116,7 +7523,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         selection_dir=selection_dir,
         blind_seed=args.blind_seed,
         watch=args.watch,
-        prepare_new=args.prepare_new,
         prepare_backend=args.backend,
         watch_interval=args.watch_interval,
     )

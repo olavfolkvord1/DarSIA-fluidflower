@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -18,6 +19,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exit-after-ms", type=int, default=0)
     parser.add_argument("--select-model", type=Path, default=None,
                         help="Select an existing model without narrowing the model library")
+    parser.add_argument("--configuration", type=Path, default=None,
+                        help="Explicit content-bound parameter DATA for saved-model readers")
+    parser.add_argument("--configuration-sha256", default=None,
+                        help="SHA256 of --configuration; required together with its path")
     return parser
 
 
@@ -60,8 +65,48 @@ def select_initial_model(page, root: Path, completed=None):
     return timer
 
 
+
+
+@contextmanager
+def _configuration_context(args):
+    """Adopt actual application DATA before Studio imports and async discovery.
+
+    The ContextVar covers synchronous readers. The identical bound environment
+    document covers newly created Qt/Python threads, which do not inherit that
+    context. Prior values are restored when this application invocation ends.
+    """
+    if (args.configuration is None) != (args.configuration_sha256 is None):
+        raise ValueError("--configuration and --configuration-sha256 are required together")
+    if args.configuration is None:
+        yield None
+        return
+    from .native.config import load_parameters, configure_parameters, reset_parameters
+    path = args.configuration.expanduser().resolve()
+    document = load_parameters(path, args.configuration_sha256)
+    token = configure_parameters(document)
+    previous = {name: os.environ.get(name) for name in
+                ("DARSIA_NATIVE_CONFIGURATION", "DARSIA_NATIVE_CONFIGURATION_SHA256")}
+    try:
+        os.environ["DARSIA_NATIVE_CONFIGURATION"] = str(path)
+        os.environ["DARSIA_NATIVE_CONFIGURATION_SHA256"] = args.configuration_sha256
+        yield dict(path=str(path), sha256=args.configuration_sha256,
+                   size_bytes=path.stat().st_size)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        reset_parameters(token)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    with _configuration_context(args) as configuration:
+        return _run_application(args, configuration=configuration)
+
+
+def _run_application(args, *, configuration):
     try:
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QFont
@@ -94,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     def record_runtime():
         (startup / f"runtime-{os.getpid()}.json").write_text(json.dumps({
             "pid": os.getpid(), "executable": sys.executable,
+            "configuration": configuration,
             "training_page_source": model_training.__file__,
             "training_page_sha256": hashlib.sha256(Path(model_training.__file__).read_bytes()).hexdigest(),
             "settings_file": page._model_filter_settings.fileName(),

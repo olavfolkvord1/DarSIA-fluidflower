@@ -7,6 +7,8 @@ from .job_queue import JobQueue, require_unc, write_immutable
 
 
 def main(argv=None):
+    """Summarize a whole-run queue and optionally publish a new UNC JSON record.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--output", type=Path,

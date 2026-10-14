@@ -45,13 +45,8 @@ CORRECTED_FRAME_INDEX_FORMAT = "darsia-fluidflower-corrected-frame-index-v1"
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _safe_identifier(value: str, fallback: str = "item") -> str:

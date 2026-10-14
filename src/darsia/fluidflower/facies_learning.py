@@ -103,13 +103,8 @@ FACIES_COLORS = np.asarray(
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -130,11 +125,8 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 @contextmanager
@@ -200,16 +192,8 @@ def _rgb_float(array: np.ndarray) -> np.ndarray:
 
 
 def _file_reference(path: Path) -> dict[str, Any]:
-    selected = Path(path).expanduser().resolve()
-    if not selected.is_file():
-        raise FileNotFoundError(selected)
-    stat = selected.stat()
-    return {
-        "path": str(selected),
-        "size_bytes": int(stat.st_size),
-        "modified_ns": int(stat.st_mtime_ns),
-        "sha256": sha256_file(selected),
-    }
+    from darsia.fluidflower.phase_interpretation import _file_reference as _canonical_file_reference
+    return _canonical_file_reference(path)
 
 
 def _artifact_reference(path: Path, relative_path: Path) -> dict[str, Any]:

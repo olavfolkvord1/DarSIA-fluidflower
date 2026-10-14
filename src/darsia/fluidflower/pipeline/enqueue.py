@@ -7,6 +7,8 @@ from .job_queue import JobQueue, read_json, require_unc
 
 
 def main(argv=None):
+    """Enqueue explicit whole-run task metadata with the job's code and calibration pins.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--tasks", type=Path, required=True,

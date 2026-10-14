@@ -100,13 +100,8 @@ def darsia_runtime_fingerprints() -> dict[str, str]:
 
 
 def _as_rgb_float(image: Any) -> np.ndarray:
-    array = np.asarray(getattr(image, "img", image))
-    if array.ndim != 3 or array.shape[-1] < 3:
-        raise ValueError(f"Expected an RGB image, got {array.shape}.")
-    array = np.asarray(array[..., :3], dtype=np.float32)
-    if array.size and float(np.nanmax(array)) > 1.5:
-        array = array / np.float32(255.0)
-    return np.clip(array, 0.0, 1.0)
+    from darsia.fluidflower.phase_features import _as_rgb_float as _canonical_as_rgb_float
+    return _canonical_as_rgb_float(image)
 
 
 def _acidification(rgb: np.ndarray, epsilon: float = 1e-4) -> np.ndarray:

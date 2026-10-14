@@ -11,15 +11,20 @@ import json
 from pathlib import Path
 import tomllib
 import uuid
+from darsia.fluidflower.phase_saved_runtime_views import selection, stamp
+from darsia.fluidflower.phase_saved_review_metadata import configured_parameters
 
 
-DEFAULT_MASS_POLICY = {
-    "gas_saturation_min": .5,
-    "gas_saturation_max": 1.,
-    "residual_liquid_concentration_fraction": 1.,
-    "residual_liquid_fraction_min": 0.,
-    "residual_liquid_fraction_max": 1.,
-}
+def _mass_policy():
+    return dict(configured_parameters("mass_review_cache")["mass_policy"])
+
+
+def __getattr__(name):
+    if name != "DEFAULT_MASS_POLICY":
+        raise AttributeError(name)
+    return _mass_policy()
+
+
 
 
 def read(path):
@@ -31,19 +36,8 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def stamp(path):
-    stat = Path(path).stat()
-    return [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
 
-def selection(request, method):
-    candidate = request["candidate"]
-    return dict(candidate={key: candidate.get(key) for key in
-                ("dataset", "run", "candidate_id", "params_sha256", "optical_model_sha256")},
-                local_baseline_search=bool(request.get("local_baseline_search")),
-                method=dict(method),
-                mass_policy=dict(request.get("mass_policy", DEFAULT_MASS_POLICY)),
-                analysis_width=int(request.get("analysis_width", 1024)))
 
 
 def index_path(request, method):
@@ -75,7 +69,7 @@ def register_result(path, request):
     expected = selection(request, method)
     actual = selection({"candidate": result["selected_inputs"]["candidate"],
                         "local_baseline_search": result["selected_inputs"].get("local_baseline_search"),
-                        "mass_policy": result.get("mass_policy", DEFAULT_MASS_POLICY),
+                        "mass_policy": result.get("mass_policy", _mass_policy()),
                         "analysis_width": request.get("analysis_width", 1024)}, method)
     if expected != actual or any(result["method"]["settings"].get(k) != v for k, v in method.items()):
         raise ValueError("Result differs from the requested model or concentration method")

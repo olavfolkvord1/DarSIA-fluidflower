@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .phase_pixel_area import rig_phase_shape
+from .phase_saved_review_metadata import rig_phase_shape
 
 BACKGROUND = "#202326"
 

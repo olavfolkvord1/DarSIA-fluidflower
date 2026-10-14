@@ -57,21 +57,13 @@ WASSERSTEIN_METRICS = (
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -90,21 +82,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _json_digest(payload: Any) -> str:
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    from darsia.fluidflower.analysis_domains import _json_digest as _canonical_ascii_digest
+    return _canonical_ascii_digest(payload)
 
 
 def _number(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
+    from darsia.fluidflower.mass_inputs import _number as _canonical_finite_number
+    return _canonical_finite_number(value)
 
 
 def _issue(
@@ -125,15 +109,13 @@ def _issue(
 
 
 def _resolved_path(raw: str, *, relative_to: Path | None = None) -> Path:
-    path = Path(str(raw)).expanduser()
-    if not path.is_absolute() and relative_to is not None:
-        path = relative_to / path
-    return path.resolve()
+    from darsia.fluidflower.mass_inputs import _resolved_path as _canonical_resolved_path
+    return _canonical_resolved_path(raw, relative_to=relative_to)
 
 
 def _mass_run_ids(mass_plan: Mapping[str, Any]) -> list[str]:
-    bindings = (mass_plan.get("configuration") or {}).get("run_bindings") or []
-    return sorted(str(row.get("run_id") or "") for row in bindings if row.get("run_id"))
+    from .post_analysis import _mass_run_ids as shared_mass_run_ids
+    return shared_mass_run_ids(mass_plan)
 
 
 def _all_run_pairs(run_ids: list[str]) -> list[dict[str, str]]:
@@ -146,10 +128,8 @@ def _all_run_pairs(run_ids: list[str]) -> list[dict[str, str]]:
 
 
 def _current_domain_state(project: FluidFlowerProject) -> tuple[dict, dict]:
-    revision = AnalysisDomainStore(project).current()
-    if revision.get("format") == ANALYSIS_DOMAIN_REVISION_FORMAT:
-        return revision, deepcopy(dict(revision.get("configuration") or {}))
-    return {}, {}
+    from .post_analysis import _current_domain_state as shared_domain_state
+    return shared_domain_state(project)
 
 
 def _mass_result_reference(
@@ -1050,12 +1030,8 @@ class WassersteinPlanStore:
         return _read_jsonl(self.revisions_path)
 
     def current(self) -> dict[str, Any]:
-        if self.current_path.is_file():
-            payload = json.loads(self.current_path.read_text(encoding="utf-8-sig"))
-            if isinstance(payload, dict):
-                return payload
-        rows = self.revisions()
-        return deepcopy(rows[-1]) if rows else {}
+        from .analysis_domains import AnalysisDomainStore
+        return AnalysisDomainStore.current(self)
 
     def save_plan(
         self,

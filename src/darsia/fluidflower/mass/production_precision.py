@@ -21,20 +21,24 @@ class PixelMath:
 
     @property
     def dtype(self):
+        """Return the declared NumPy dtype for working image pixels."""
         import numpy as np
         return np.float32 if self.precision == "float32" else np.float64
 
     def pixels(self, value):
+        """Convert image values to the declared working pixel dtype."""
         import numpy as np
         return np.asarray(value, dtype=self.dtype)
 
     def require_pixels(self, value):
+        """Require an existing NumPy pixel array with the declared working dtype."""
         import numpy as np
         if not isinstance(value, np.ndarray) or value.dtype != self.dtype:
             raise TypeError("Pixel input must already have the declared working dtype")
         return value
 
     def facts(self):
+        """Report CPU pixel, coefficient and reduction dtypes without granting execution permission."""
         return dict(precision=self.precision, backend="numpy_cpu",
                     parameter_dtype="float64", reduction_dtype="float64",
                     input_storage_dtype="frozen_asset_encoding",

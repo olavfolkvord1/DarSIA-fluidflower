@@ -111,7 +111,7 @@ def _registered_saved_phase_pipeline(model_root: Path, profile, identity) -> str
             or not (profile.get("approved_g3_gas")
                     or profile.get("format") in {"ffac-rig-camera-physics-v1", "ffac-selected-policy-a-review-physics-v1"})):
         return None
-    from darsia.fluidflower.tools.register_track1_studio_candidate import (
+    from darsia.fluidflower.phase_saved_registration import (
         registration_path, registration_warning,
     )
 
@@ -136,7 +136,7 @@ def _registered_saved_phase_pipeline(model_root: Path, profile, identity) -> str
     registration = json.loads(registration_path(identity[0]).read_text(encoding="utf-8-sig"))
     kind = registration.get("registration_kind")
     if kind == "ffac_selected_camera_policy_a_p1_final3_review":
-        from darsia.fluidflower.tools.register_ffac_selected_policy_a_studio_candidate import selected_saved_review
+        from darsia.fluidflower.phase_saved_selected_registration import selected_saved_review
         checked = selected_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("Selected Policy A saved maps identify another model revision")
@@ -147,55 +147,55 @@ def _registered_saved_phase_pipeline(model_root: Path, profile, identity) -> str
                    and warning.startswith("Studio review candidate:"))
     combined_review = None
     if kind == "ffac_g3_t4c_p1_final3_review":
-        from darsia.fluidflower.phase_ffac_p1_final3_review import p1_final3_saved_review
+        from darsia.fluidflower.phase_saved_contact_review import p1_final3_saved_review
         checked = p1_final3_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("P1-final3 saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t4c_p1_final2_review":
-        from darsia.fluidflower.phase_ffac_p1_final2_review import p1_final2_saved_review
+        from darsia.fluidflower.phase_saved_categorical_review import p1_final2_saved_review
         checked = p1_final2_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("P1-final2 saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t4c_p1_final_review":
-        from darsia.fluidflower.phase_ffac_p1_final_review import p1_final_saved_review
+        from darsia.fluidflower.phase_saved_boundary_review import p1_final_saved_review
         checked = p1_final_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("P1-final saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t4c_floor_review":
-        from darsia.fluidflower.phase_ffac_t4c_review import t4c_saved_review
+        from darsia.fluidflower.phase_saved_floor_review import t4c_saved_review
         checked = t4c_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("T4c saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t4b_floor_review":
-        from darsia.fluidflower.phase_ffac_t4b_review import t4b_saved_review
+        from darsia.fluidflower.phase_saved_revision_review import t4b_saved_review
         checked = t4b_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("T4b saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t4_floor_review":
-        from darsia.fluidflower.phase_ffac_t4_review import t4_saved_review
+        from darsia.fluidflower.phase_saved_revision_review import t4_saved_review
         checked = t4_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("T4 saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_l1_neighbourhood_floor_review":
-        from darsia.fluidflower.phase_ffac_l1_neighbourhood_review import l1_neighbourhood_saved_review
+        from darsia.fluidflower.phase_saved_revision_review import l1_neighbourhood_saved_review
         checked = l1_neighbourhood_saved_review(model_root)
         if checked["model_identity"] != list(identity):
             raise ValueError("L1-neighbourhood saved maps identify another model revision")
         return checked["pipeline_sha256"]
     if kind == "ffac_g3_t3_floor_review":
-        from darsia.fluidflower.phase_ffac_t3_review import t3_saved_review
+        from darsia.fluidflower.phase_saved_revision_review import t3_saved_review
         review = t3_saved_review(model_root)
         if review["model_identity"] != list(identity):
             raise ValueError("T3 saved maps identify another model revision")
         return review["pipeline_sha256"]
     if kind == "ffac_g3_t2_l1zone_review":
-        from darsia.fluidflower.phase_ffac_t2_l1zone_review import combined_saved_review
+        from darsia.fluidflower.phase_saved_revision_review import combined_saved_review
         combined_review = combined_saved_review(model_root)
     if names is None or not (warning.startswith("Studio review candidate: approved G3") or seam_review or combined_review):
         raise ValueError("Saved phase maps have no intact approved G3 registration")
@@ -316,7 +316,7 @@ def _recover_ready_validation_packages(model_root: Path) -> Path | None:
     """
     from darsia.fluidflower.phase_runtime import load_physics_profile, physics_runtime_identity
     from darsia.fluidflower.tools.phase_reference_readiness import RECEIPT, require_reference_readiness
-    from darsia.fluidflower.tools.prepare_optical_region_studio import assemble, complete_run, read
+    from darsia.fluidflower.phase_saved_package_recovery import assemble_saved_packages as assemble, read
 
     model_root = Path(model_root)
     packages_root = model_root / "validation/run_packages"
@@ -366,9 +366,7 @@ def _recover_ready_validation_packages(model_root: Path) -> Path | None:
         print(f"Reusing completed phase maps: {package.name.upper()}", flush=True)
         job = read(package / "postflight_manifest.json")["jobs"][0]
         if _candidate_from_job(package, job) is None:
-            result = complete_run(model_root, package.name, 1, allow_inference=False)
-            if result["needs_inference"]:
-                raise ValueError(f"{package.name}: completed reference assets require repair")
+            raise ValueError(f"{package.name}: completed maps have no admitted saved presentation metadata; publish that metadata before opening")
     assemble(model_root, packages, partial=len(packages) < len(expected))
     prepared = read(model_root / "studio_preparation.json")
     print(f"Ready for validation: {len(packages)}/{len(expected)} existing experiments; no maps recomputed",
@@ -387,13 +385,7 @@ def _prepare_regional_review(model_root: Path, output_root: Path) -> None:
     if prepared is None:
         prepared = _recover_ready_validation_packages(model_root)
     if prepared is None:
-        print("Preparing missing phase maps with the shared optimized pipeline", flush=True)
-        subprocess.run([
-            phase_python_executable(), "-m", "darsia.fluidflower.tools.prepare_optical_region_studio",
-            "--root", str(model_root), "--resume", "--fresh-optical",
-        ], check=True)
-        status = json.loads((model_root / "studio_preparation.json").read_text(encoding="utf-8-sig"))
-        prepared = Path(status["validation"])
+        raise ValueError("This model has no completed saved phase-map package to review")
     require_reference_readiness(prepared, allow_pending=True)
     binding = json.loads((prepared / "validation_binding.json").read_text(encoding="utf-8-sig"))
     if (identity != _model_identity(model_root)
@@ -699,11 +691,6 @@ class SharedPhaseModelTrainingPage(QWidget):
         self._update_action_states()
         if project_root is not None:
             self.set_project_root(project_root)
-        self._series_batch_timer = QTimer(self)
-        self._series_batch_timer.setInterval(2000)
-        self._series_batch_timer.timeout.connect(self._poll_series_batch_status)
-        self._series_batch_timer.start()
-        self._poll_series_batch_status()
         self._start_review_session_discovery()
         # A saved, model-bound collection can be opened without first scanning
         # every historical human review on the network storage.
@@ -889,9 +876,6 @@ class SharedPhaseModelTrainingPage(QWidget):
         if visible:
             self.evidence_scroll.ensureWidgetVisible(self.evidence_audit_tab)
 
-    def _check_disagreements_from_review(self) -> None:
-        self.disagreement_toggle.setChecked(True)
-        self.evidence_audit_tab.check_disagreements()
 
     def _open_mass_workspace_tab(self, index: int) -> None:
         if self.tabs.widget(index) is not self.mass_workspace_tab:
@@ -1003,20 +987,13 @@ class SharedPhaseModelTrainingPage(QWidget):
             "No model selected. Model choice is separate from saved review sessions."
         )
         model_layout.addWidget(self.validation_model_summary, 0, 0, 1, 3)
-        self.train_further_button = QPushButton("Train further")
+        self.train_further_button = QLabel("Saved corrections")
         self.train_further_button.setToolTip(
             "Retrain both CO2 and gas heads as a new version using earlier evidence "
             "and saved corrections for this model's lineage. Keep the selected "
             "series and physical settings, then generate native review maps."
         )
-        self.train_further_button.clicked.connect(self._train_further)
         self.train_further_button.setText("Train new version from saved corrections")
-        self.check_disagreements_button = QPushButton("Check disagreements")
-        self.check_disagreements_button.setToolTip(
-            "Automatically compare saved regions and validations with this model's prepared phase maps, "
-            "then open the largest disagreements for review.")
-        self.check_disagreements_button.clicked.connect(
-            self._check_disagreements_from_review)
         self.training_update_card = QFrame()
         self.training_update_card.setObjectName("trainingUpdateCard")
         self.training_update_card.setStyleSheet(
@@ -1034,10 +1011,9 @@ class SharedPhaseModelTrainingPage(QWidget):
             "Counts are compared with the selected model's recorded training inputs."
         )
         update_layout.addWidget(self.training_update_details, 2, 0, 1, 2)
-        self.update_model_button = QPushButton("Train new model with new data")
+        self.update_model_button = QLabel("Saved model evidence")
         self.update_model_button.setMinimumHeight(38)
         self.update_model_button.setEnabled(False)
-        self.update_model_button.clicked.connect(self._train_further)
         update_layout.addWidget(self.update_model_button, 3, 0)
         self.refresh_new_evidence_button = QPushButton("Refresh saved labels")
         self.refresh_new_evidence_button.clicked.connect(
@@ -1045,7 +1021,6 @@ class SharedPhaseModelTrainingPage(QWidget):
         )
         update_layout.addWidget(self.refresh_new_evidence_button, 3, 1)
         model_layout.addWidget(self.training_update_card, 1, 0, 1, 3)
-        model_layout.addWidget(self.check_disagreements_button, 2, 0, 1, 3)
         self.compare_phase_models_button = QPushButton("Compare two phase models side by side")
         self.compare_phase_models_button.setToolTip(
             "Inspect two saved models on matching source photographs, with synchronized "
@@ -1108,17 +1083,15 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.test_transfer_button = QPushButton("Open selected ready experiment")
         self.test_transfer_button.setToolTip("Run the frozen model and open predictions directly. This does not retrain the model or add test labels to training.")
         self.test_transfer_button.clicked.connect(self._open_selected_experiment)
-        self.blind_transfer_button = QPushButton("Blind labeling (optional)")
-        self.blind_transfer_button.clicked.connect(self._start_blind_transfer)
+        self.blind_transfer_button = QLabel("Blind labeling (optional)")
         
         self.transfer_comparison_button = QPushButton("Open transfer comparison")
         self.transfer_comparison_button.setToolTip("After blind labeling, open the same evaluation with predictions visible. Labels remain outside automatic training.")
         self.transfer_comparison_button.clicked.connect(self._open_transfer_comparison)
         
-        self.include_transfer_training_button = QPushButton("Include in next training")
+        self.include_transfer_training_button = QLabel("Saved training inclusion")
         self.include_transfer_training_button.setToolTip(
             "Include this completed full-model experiment's saved and future corrections in the next Train further run. No training starts now.")
-        self.include_transfer_training_button.clicked.connect(self._include_transfer_in_training)
         
         self.transfer_status = _secondary(
             "Choose a prepared experiment and test the frozen model with predictions visible. "
@@ -1192,14 +1165,13 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.advanced_experiments.hide()
         transfer_layout.addWidget(advanced_toggle, 11, 0, 1, 3)
         transfer_layout.addWidget(self.advanced_experiments, 12, 0, 1, 3)
-        self.series_batch_button = QPushButton(
+        self.series_batch_button = QLabel(
             "Generate phase maps for all experiments in this series"
         )
         self.series_batch_button.setToolTip(
             "Apply the selected frozen model to all experiments; no model fitting "
             "and no automatic QC pass. Existing completed maps are reused when resumed."
         )
-        self.series_batch_button.clicked.connect(self._start_series_batch_from_selection)
         self.series_batch_workers = QSpinBox()
         self.series_batch_workers.setRange(0, 14)
         try:
@@ -1208,9 +1180,6 @@ class SharedPhaseModelTrainingPage(QWidget):
         except (TypeError, ValueError):
             saved_batch_workers = 4
         self.series_batch_workers.setValue(max(0, min(14, saved_batch_workers)))
-        self.series_batch_workers.valueChanged.connect(
-            lambda workers: (self._model_filter_settings.setValue("seriesBatch/cpuWorkers", workers),
-                             self._change_running_cpu_workers(workers), self._update_action_states()))
         self.series_batch_workers.setToolTip(
             "Up to 14 shared CPU compute slots. With the GPU worker selected they run the ordered history/physics "
             "steps, plus only those optical frames the GPU backend cannot compute (two slots per experiment prepared "
@@ -1221,19 +1190,9 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.series_batch_gpu.setChecked(
             str(self._model_filter_settings.value("seriesBatch/gpuWorker", "true")).lower()
             in {"true", "1", "yes"})
-        self.series_batch_gpu.toggled.connect(
-            lambda enabled: (self._model_filter_settings.setValue("seriesBatch/gpuWorker", enabled),
-                             self._change_running_cpu_workers(self.series_batch_workers.value()),
-                             self._update_action_states()))
         self.series_batch_gpu.setToolTip("One shared GPU worker. While selected it computes every optical frame it supports, so that "
             "CPU slots stay free for the ordered history/physics steps. Switch off during preparation to finish its "
             "current image and then use CPU workers.")
-        batch_actions = QHBoxLayout()
-        batch_actions.addWidget(QLabel("CPU workers (0–14)"))
-        batch_actions.addWidget(self.series_batch_workers)
-        batch_actions.addWidget(self.series_batch_gpu)
-        batch_actions.addWidget(self.series_batch_button, 1)
-        transfer_layout.addLayout(batch_actions, 7, 0, 1, 3)
         self.series_batch_status = _secondary(
             "Choose one series and a model to prepare its phase maps for manual QC."
         )
@@ -2483,13 +2442,13 @@ class SharedPhaseModelTrainingPage(QWidget):
             entry["p1_final3_registered_complete"] = True
             entry["catalog_admission_pending"] = False
             entry["state"] = "human_validation_required"
-            from darsia.fluidflower.phase_ffac_p1_final3_review import STATE_LABEL
+            from darsia.fluidflower.phase_saved_contact_review import STATE_LABEL
             entry["state_label"] = STATE_LABEL
         if entry.get("validation_binding") and entry.get("p1_final2_catalog_registered") is True:
             entry["p1_final2_registered_complete"] = True
             entry["catalog_admission_pending"] = False
             entry["state"] = "human_validation_required"
-            from darsia.fluidflower.phase_ffac_p1_final2_review import STATE_LABEL
+            from darsia.fluidflower.phase_saved_categorical_review import STATE_LABEL
             entry["state_label"] = STATE_LABEL
         if entry.get("validation_binding") and entry.get("p1_final_catalog_registered") is True:
             # _validation_binding validated the exact saved pipeline before
@@ -2497,7 +2456,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             entry["p1_final_registered_complete"] = True
             entry["catalog_admission_pending"] = False
             entry["state"] = "human_validation_required"
-            from darsia.fluidflower.phase_ffac_p1_final_review import STATE_LABEL
+            from darsia.fluidflower.phase_saved_boundary_review import STATE_LABEL
             entry["state_label"] = STATE_LABEL
         entry.pop("validation_collection_error", None)
         if verified.get("validation_collection_error"):
@@ -2702,14 +2661,14 @@ class SharedPhaseModelTrainingPage(QWidget):
 
     @staticmethod
     def _binding_file_stamp(path):
-        stat = path.stat()
-        return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino
+        from darsia.fluidflower.phase_saved_review_metadata import metadata_file_stamp
+        return metadata_file_stamp(path)
 
     @staticmethod
     def _p1_final3_binding_guard(entry, binding):
         """Include the new runtime and the complete already-checked P1 ancestry."""
-        from darsia.fluidflower import phase_ffac_p1_final3_review as final
-        from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+        from darsia.fluidflower import phase_saved_contact_review as final
+        from darsia.fluidflower.phase_saved_registration import registration_path
         from darsia.fluidflower.phase_model_library import source_identity
         root = final._resolved_path(str(entry["root"]))
         admitted = final.p1_final3_saved_review(root)
@@ -2736,8 +2695,8 @@ class SharedPhaseModelTrainingPage(QWidget):
     @staticmethod
     def _p1_final2_binding_guard(entry, binding):
         """Include the new runtime and the complete already-checked P1 ancestry."""
-        from darsia.fluidflower import phase_ffac_p1_final2_review as final
-        from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+        from darsia.fluidflower import phase_saved_categorical_review as final
+        from darsia.fluidflower.phase_saved_registration import registration_path
         from darsia.fluidflower.phase_model_library import source_identity
         root = final._resolved_path(str(entry["root"]))
         admitted = final.p1_final2_saved_review(root)
@@ -2769,24 +2728,25 @@ class SharedPhaseModelTrainingPage(QWidget):
         large plan is parsed to enumerate a model dropdown, and changed bytes
         must pass the existing SHA checks before a new guard can be recorded.
         """
-        from darsia.fluidflower import phase_ffac_p1_final_review as final
-        from darsia.fluidflower import phase_ffac_t4c_review as parent_review
-        from darsia.fluidflower.tools import run_ffac_t4c_floor_candidate as runner
+        from darsia.fluidflower import phase_saved_boundary_review as final
+        from darsia.fluidflower import phase_saved_floor_review as parent_review
+        from darsia.fluidflower.phase_saved_review_metadata import configured_parameters
+        parent_plan_name = configured_parameters("floor")["plan"]
         root = Path(str(entry["root"]))
         admitted = final.p1_final_saved_review(root)
         plan, assets, heads = final._saved_dependencies(str(root), final._signature(root / final.PLAN))
         paths = {final._resolved_path(str(Path(value))) for value in
                  [root / name for name in final.FILES]}
-        from darsia.fluidflower.tools.register_track1_studio_candidate import registration_path
+        from darsia.fluidflower.phase_saved_registration import registration_path
         paths.add(final._resolved_path(str(registration_path(root.name))))
         paths.update(final._bound(value, base=root) for value in (*assets, *heads))
         parent = final._resolved_path(plan["binding"]["parent"])
         registration = final._bound(plan["binding"]["inputs"]["parent_registration"], base=root)
         parent_metadata = json.loads(registration.read_text(encoding="utf-8-sig"))
         paths.update(parent / name for name in parent_metadata["metadata_sha256"])
-        dependencies = parent_review._plan_dependencies(str(parent), parent_review._signature(parent / runner.PLAN),
+        dependencies = parent_review._plan_dependencies(str(parent), parent_review._signature(parent / parent_plan_name),
                                                         parent_metadata["source_plan_sha256"])
-        from darsia.fluidflower.phase_ffac_rig_camera_runtime import bound_path
+        from darsia.fluidflower.phase_saved_review_metadata import bound_path
         for path, sha in dependencies:
             # Strict parent admission has already SHA-verified these assets.
             # Record their current stamps without a second large-file hash.
@@ -3474,10 +3434,8 @@ class SharedPhaseModelTrainingPage(QWidget):
 
     @staticmethod
     def _batch_series_supported(series: str) -> bool:
-        # The preparation worker owns this capability list. A model being visible
-        # in the catalog does not mean its series can run the batch workflow.
-        from darsia.fluidflower.tools.phase_series_batch import SERIES
-        return series in SERIES
+        """Historical phase-map batch launch is retired; saved review remains available."""
+        return False
 
     def _runs_with_a_stale_prepared_source(self, runs) -> list[str]:
         """Of these experiments, the ones the batch must rebuild instead of verify and skip."""
@@ -3486,19 +3444,6 @@ class SharedPhaseModelTrainingPage(QWidget):
                        if str(row.get("run") or "").casefold() in wanted
                        and self._stale_prepared_source(row)})
 
-    def _start_series_batch_from_selection(self, _checked: bool = False) -> None:
-        """One action for both lists: the checked experiments, or the whole series."""
-        runs = self._checked_pending_experiments()
-        if not runs:
-            self._start_series_batch()
-            return
-        # Verifying a stale result against its own source succeeds, so the batch would skip it
-        # and the experiment would stay stuck. Name those explicitly to have them rebuilt.
-        stale = self._runs_with_a_stale_prepared_source(runs)
-        if stale:
-            self._start_series_batch(requested_runs=runs, reprepare_runs=stale)
-        else:
-            self._start_series_batch(requested_runs=runs)
 
     def _review_launch_block_reason(self, model=None):
         """Explain the actual launch gate without changing scientific eligibility."""
@@ -3949,7 +3894,7 @@ class SharedPhaseModelTrainingPage(QWidget):
 
         def read():
             try:
-                from ..tools.phase_transfer_review import saved_validation_sources
+                from ..phase_saved_transfer_review import saved_validation_sources
                 rows = saved_validation_sources(root, binding, sessions)
                 result = (generation, root, rows, None)
             except Exception as error:
@@ -3989,238 +3934,18 @@ class SharedPhaseModelTrainingPage(QWidget):
             "Saved phase maps are ready to review. Training-history statistics load separately.")
 
     def _series_batch_blocks_selection(self) -> bool:
-        """Is the running batch the one that would touch what is selected here?
-
-        A batch prepares one series for one model. Another series' review session reads
-        different targets and writes its own review store, so a batch elsewhere does not
-        hold it back. ``_series_batch_job`` stays pinned to the batch the poll last saw
-        running, so it is compared against the current selection rather than trusted on
-        its own. When either side is unknown the answer is yes, as before.
-        """
-        if not self._series_batch_active:
-            return False
-        running, selected = self._series_batch_job, self._selected_series_batch()
-        if running is None or selected is None:
-            return True
-        return running == selected
+        """Historical phase-map batch launch is retired; saved review remains available."""
+        return False
 
     def _selected_series_batch(self) -> tuple[str, str] | None:
-        model = self._selected_validation_model()
-        series = _model_series(model) if model else set()
-        selected = self._active_model_series or (next(iter(series)) if len(series) == 1 else "")
-        if not model or len(series) != 1 or selected not in series or not self._batch_series_supported(selected):
-            return None
-        return str(model["root"]), selected
+        """Historical phase-map batch launch is retired; saved review remains available."""
+        return None
 
-    @staticmethod
-    def _series_batch_status_location(model_root: str, series: str, output_parent: Path) -> Path:
-        """Use the worker's own identity function for its durable status path."""
-        from darsia.fluidflower.tools import phase_series_batch as module
-        return module.batch_status_path(model_root, series, output_parent)
 
-    @staticmethod
-    def _series_batch_pid_running(pid: object) -> bool:
-        try:
-            number = int(pid)
-            if number <= 0:
-                return False
-            os.kill(number, 0)
-            return True
-        except (TypeError, ValueError, OSError, OverflowError):
-            return False
 
-    def _start_series_batch(self, _checked=False, *, only_run=None, requested_runs=None,
-                            excluded_runs=(), reprepare_runs=()) -> None:
-        identity = self._selected_series_batch()
-        if (identity is None or self._series_batch_active or self.training_process is not None
-                or self.validation_process is not None):
-            return
-        reviewer = self.reviewer.text().strip() or "Phase-map preparation"
-        save_root = self.review_save_root.text().strip()
-        if not save_root:
-            self.series_batch_status.setText("Enter a local review location first.")
-            return
-        model_root, series = identity
-        cpu_workers = self.series_batch_workers.value()
-        gpu_workers = int(self.series_batch_gpu.isChecked())
-        if cpu_workers + gpu_workers == 0:
-            self.series_batch_status.setText("Select at least one CPU or GPU worker.")
-            return
-        try:
-            script = self._companion_path("phase_series_batch.py")
-            output_parent = default_execution_cache_root() / "phase-series-batch"
-            status_path = self._series_batch_status_location(model_root, series, output_parent)
-            status_path.parent.mkdir(parents=True, exist_ok=True)
-            self._series_batch_prior_invocation = ""
-            if status_path.is_file():
-                try:
-                    prior = json.loads(status_path.read_text(encoding="utf-8-sig"))
-                    self._series_batch_prior_invocation = str(prior.get("invocation_started_utc") or "")
-                except (OSError, ValueError, AttributeError):
-                    pass
-            self._series_batch_launch_error = None
-            command = [phase_python_executable(), *tool_arguments(script),
-                "--model", model_root, "--series", series,
-                "--output-parent", str(output_parent),
-                "--reviewer", reviewer, "--save-root", save_root,
-                "--cache-root", str(default_execution_cache_root() / "phase-series-batch-cache"),
-                "--backend", "auto", "--cpu-workers", str(cpu_workers),
-                "--gpu-workers", str(gpu_workers)]
-            if requested_runs:
-                command += ["--runs", *requested_runs]
-            if reprepare_runs:
-                command += ["--reprepare-runs", *reprepare_runs]
-            if excluded_runs:
-                command += ["--exclude-runs", *excluded_runs]
-            if only_run:
-                command += ["--only-run", only_run]
-                # The serial run must not dispatch additional worker processes.
-                index=command.index("--cpu-workers"); del command[index:index+4]
-            command += [argument for root in self._transfer_review_roots
-                        for argument in ("--review-root", root)]
-            command += [argument for manifest in self._extra_transfer_manifests
-                        for argument in ("--source-manifest", manifest)]
-            log_path = status_path.with_suffix(".log")
-            with log_path.open("a", encoding="utf-8") as log:
-                options = (dict(creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                           if os.name == "nt" else dict(start_new_session=True))
-                process = subprocess.Popen(command, cwd=str(local_cache_root()), stdin=subprocess.DEVNULL,
-                    stdout=log, stderr=subprocess.STDOUT, close_fds=True, **options)
-            self.series_batch_pid = process.pid
-            self._series_batch_job = identity
-            self._series_batch_status_path = status_path
-            self._series_batch_active = True
-            self._series_batch_reported_for = identity
-            self.series_batch_status.setText(
-                f"Started phase-map preparation for {series.upper()} with {Path(model_root).name} "
-                f"({cpu_workers} CPU + {gpu_workers} GPU workers). "
-                "Manual QC remains open."
-            )
-            self.series_batch_button.setText("Preparing phase maps...")
-            self._update_action_states()
-            self._poll_series_batch_status()
-        except Exception as exc:  # noqa: BLE001 - visible detached worker boundary
-            self._series_batch_active = False
-            self.series_batch_status.setText(f"Could not start phase-map preparation: {exc}")
-            self._update_action_states()
 
-    def _poll_series_batch_status(self) -> None:
-        identity = self._series_batch_job or self._selected_series_batch()
-        if identity is None:
-            if not self._series_batch_active:
-                self.series_batch_status.setText("Choose one series and a model to prepare its phase maps for manual QC.")
-            return
-        model_root, series = identity
-        try:
-            path = (self._series_batch_status_path if self._series_batch_job == identity
-                    and self._series_batch_status_path else
-                    self._series_batch_status_location(model_root, series,
-                        default_execution_cache_root() / "phase-series-batch"))
-        except (OSError, ValueError, RuntimeError, ImportError) as exc:
-            if self._series_batch_job is not None:
-                self.series_batch_status.setText(f"Cannot read batch progress: {exc}")
-            return
-        status = None
-        try:
-            if path.is_file():
-                status = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            # Atomic replacement can race one poll; the next poll retries.
-            return
-        if not isinstance(status, dict):
-            if self.series_batch_pid and self._series_batch_pid_running(self.series_batch_pid):
-                self._series_batch_active = True
-                self._update_action_states()
-            elif self._series_batch_job is not None:
-                self._series_batch_active = False
-                self.series_batch_pid = None
-                self.series_batch_status.setText(
-                    f"Batch stopped before writing progress. Check {path.with_suffix('.log')} and press again to resume."
-                )
-                self.series_batch_button.setText("Resume phase-map preparation for this series")
-                self._update_action_states()
-            return
-        if (status.get("model_root"), status.get("series")) != identity:
-            self.series_batch_status.setText("Batch status belongs to another model or series.")
-            return
-        if self._series_batch_launch_error == identity:
-            return
-        if (self._series_batch_job == identity and self.series_batch_pid
-                and str(status.get("invocation_started_utc") or "") == self._series_batch_prior_invocation):
-            pid_running = self._series_batch_pid_running(self.series_batch_pid)
-            if pid_running:
-                self._series_batch_active = True
-                self.series_batch_status.setText(
-                    f"Starting phase-map batch for {series.upper()} · {Path(model_root).name}..."
-                )
-                self._update_action_states()
-                return
-            # A terminal status written by the batch must be rendered below,
-            # even when the detached launcher PID has already exited.  The old
-            # branch treated every non-running PID as a launch failure and
-            # left Studio showing stale progress such as 1/12.
-            if status.get("state") == "running" and not pid_running:
-                self._series_batch_active = False
-                self._series_batch_launch_error = identity
-                self.series_batch_status.setText(
-                    f"Batch did not update its status. Check {path.with_suffix('.log')} and press again to resume."
-                )
-                self.series_batch_button.setText("Resume phase-map preparation for this series")
-                self._update_action_states()
-                return
-        running = status.get("state") == "running" and self._series_batch_pid_running(status.get("pid"))
-        was_active = self._series_batch_active
-        self._series_batch_active = running
-        if running:
-            self._series_batch_job = identity
-            self._series_batch_status_path = path
-            self._series_batch_reported_for = identity
-        if (not running and status.get("state") != "running"
-                and self._series_batch_job != identity
-                and self._series_batch_reported_for != identity):
-            # A batch that finished in an earlier window is history, not progress. Rendering it
-            # made a run from days ago look like one still being worked on. A status that still
-            # says "running" is different: that batch was interrupted and can be resumed.
-            self._clear_series_batch_report()
-            self._update_action_states()
-            return
-        self._show_series_batch_status(status, running=running)
-        self._update_action_states()
-        if was_active and not running:
-            self.series_batch_pid = None
-            self._series_batch_job = None
-            self._series_batch_status_path = None
-            current = self._selected_series_batch()
-            self._forget_discovered_experiments()
-            if current == identity and self.validation_process is None and self.training_process is None:
-                self._find_transfer_targets()
 
-    def _change_running_cpu_workers(self, workers) -> None:
-        control = getattr(self, "_live_batch_control", None)
-        if not self._series_batch_active or not control:
-            return
-        if workers == 0 and not self.series_batch_gpu.isChecked():
-            self.series_batch_workers.setValue(1)
-            return
-        path = Path(control["path"]).with_name("worker_control.json")
-        from darsia.fluidflower.phase_validation import _atomic_json
-        try:
-            _atomic_json(path, dict(pid=control["pid"],
-                invocation_started_utc=control["invocation_started_utc"], cpu_workers=int(workers),
-                gpu_workers=int(self.series_batch_gpu.isChecked())))
-        except OSError as error:
-            self.series_batch_status.setText(f"Could not update CPU workers: {error}")
 
-    def _clear_series_batch_report(self) -> None:
-        """No batch has run here for this model, so there is no progress to report."""
-        self._batch_run_states = {}
-        self.series_batch_progress.hide()
-        self.series_batch_progress.setValue(0)
-        self.series_batch_progress.setFormat("0/0 experiments")
-        self.series_batch_status.setText(
-            "No phase-map batch has run in this window. "
-            "The two lists above show where this series stands."
-        )
 
     def _apply_batch_states_to_tables(self) -> None:
         """Write the running batch's per-experiment state into the two experiment lists."""
@@ -4242,118 +3967,6 @@ class SharedPhaseModelTrainingPage(QWidget):
                 detail.setToolTip(description)
             table.blockSignals(False)
 
-    def _show_series_batch_status(self, status: Mapping[str, object], *, running: bool) -> None:
-        self.series_batch_progress.show()
-        old_control = getattr(self, "_live_batch_control", None)
-        self._live_batch_control = (dict(path=status["status_path"], pid=status["pid"],
-            invocation_started_utc=status["invocation_started_utc"], gpu_workers=status.get("gpu_workers", 0))
-            if running and status.get("frame_workers") and status.get("status_path") else None)
-        if self._live_batch_control and (not old_control or
-                old_control['invocation_started_utc'] != self._live_batch_control['invocation_started_utc']):
-            self.series_batch_workers.blockSignals(True)
-            self.series_batch_gpu.blockSignals(True)
-            self.series_batch_workers.setValue(int(status.get('cpu_workers', status.get('parallel_workers', 1)-status.get('gpu_workers', 0))))
-            self.series_batch_gpu.setChecked(bool(status.get('gpu_workers')))
-            self.series_batch_workers.blockSignals(False)
-            self.series_batch_gpu.blockSignals(False)
-        rows = status.get("rows") or {}
-        if not isinstance(rows, dict):
-            rows = {}
-        states: dict[str, str] = {}
-        for run, raw in rows.items():
-            item = raw if isinstance(raw, Mapping) else {}
-            state = str(item.get("state") or "pending")
-            description = {
-                "pending": "Pending", "running": "Preparing / generating",
-                "complete": "Phase maps ready", "failed": "Failed · retry available",
-            }.get(state, state)
-            preparation = str(item.get("preparation_status") or "")
-            if state == "pending" and preparation == "ready":
-                description = "Images prepared · phase maps pending"
-            elif state == "pending" and preparation == "needs_preparation":
-                description = "Images need preparation"
-            elif state == "running" and preparation == "ready":
-                description = "Generating phase maps"
-            if state == "running" and item.get("progress_message"):
-                description += f" · {item['progress_message']}"
-            frame_timing = item.get("frame_timing")
-            if isinstance(frame_timing, Mapping) and frame_timing.get("text"):
-                # Measured by the ordered loop itself: photograph loaded -> phase map written.
-                if state == "running":
-                    description += f" · {frame_timing['text']}"
-                elif state == "complete" and not item.get("skipped_this_run"):
-                    description += (f" · {frame_timing.get('frames_done')} images, median "
-                                    f"{float(frame_timing.get('median_total_s') or 0):.0f} s/image, "
-                                    f"{float(frame_timing.get('elapsed_s') or 0) / 60:.1f} min")
-            if item.get("image_preparation_s") is not None and state in {"running", "complete"}:
-                description += f" · raw-image preparation {float(item['image_preparation_s']) / 60:.1f} min"
-            if state == "failed" and item.get("error"):
-                description += f": {item['error']}"
-            if state == "complete" and item.get("skipped_this_run"):
-                description += " · existing result reused"
-            states[str(run).casefold()] = description
-        # Only while the batch runs. Afterwards the lists go back to showing review progress, so
-        # a finished experiment never looks like one that is still being worked on.
-        had_states = bool(getattr(self, "_batch_run_states", None))
-        self._batch_run_states = states if running else {}
-        if had_states and not self._batch_run_states:
-            self._experiment_discovery_timer.start(500)
-        self._apply_batch_states_to_tables()
-        ready_signature=(status.get("model_root"), sum(isinstance(v,Mapping) and v.get("state")=="complete" for v in rows.values()))
-        if ready_signature != getattr(self,"_batch_ready_signature",None):
-            self._batch_ready_signature=ready_signature
-            self._forget_discovered_experiments()
-            if (self._selected_validation_model() or {}).get("root")==status.get("model_root"):
-                self._experiment_discovery_timer.start(500)
-        counts = status.get("counts") or {}
-        if not isinstance(counts, Mapping):
-            counts = {}
-        total = len(rows)
-        completed = int(counts.get("completed") or 0)
-        failed = int(counts.get("failed") or 0)
-        pending = int(counts.get("pending") or 0)
-        processed = max(0, total - pending)
-        self.series_batch_progress.setRange(0, max(1, total))
-        self.series_batch_progress.setValue(min(processed, max(1, total)))
-        self.series_batch_progress.setFormat(f"{processed}/{total} experiments processed")
-        label = f"{status.get('series', '').upper()} · {status.get('model_id', '')}: "
-        detail = (f"{completed} phase maps ready, {failed} failed, {pending} pending. "
-                  "Manual review is still needed for series QC.")
-        image_ready = sum(isinstance(item, Mapping) and item.get("preparation_status") == "ready"
-                          for item in rows.values())
-        needs_preparation = sum(isinstance(item, Mapping)
-                                and item.get("preparation_status") == "needs_preparation"
-                                for item in rows.values())
-        if image_ready or needs_preparation:
-            detail = (f"{completed} phase maps ready, {image_ready} image sources prepared, "
-                      f"{needs_preparation} need image preparation. {failed} failed, {pending} pending. "
-                      "Manual review is still needed for series QC.")
-        if running:
-            self.series_batch_button.setText("Preparing phase maps...")
-            active_runs = status.get("current_runs")
-            frame_workers = status.get("frame_workers")
-            if isinstance(frame_workers, Mapping):
-                detail = (f"{frame_workers.get('active_workers', 0)}/{status['parallel_workers']} compute slots active "
-                          f"({frame_workers.get('active_cpu', 0)} CPU frames, "
-                          f"{frame_workers.get('active_gpu', 0)} GPU frames, "
-                          f"{frame_workers.get('chronological_cpu', 0)} ordered phase steps). "
-                          f"{frame_workers.get('queued_frames', 0)} frames queued. "
-                          + str(frame_workers.get('memory_wait') or "") + " " + detail)
-                if frame_workers.get('active_workers', 0) > status['parallel_workers']:
-                    detail = "Finishing active calculations before applying the lower limit. " + detail
-            elif isinstance(active_runs, list) and status.get("parallel_workers"):
-                detail = (f"{len(active_runs)}/{status['parallel_workers']} workers active. " + detail)
-            self.series_batch_status.setText(
-                label + detail + " Use Find experiments to open completed runs while the batch continues."
-            )
-        else:
-            self.series_batch_button.setText("Retry failed / resume phase maps"
-                                             if failed or pending else
-                                             "Generate phase maps for all experiments in this series")
-            prefix = ("Preparation interrupted. " if status.get("state") == "running" else
-                      f"Preparation finished with {failed} failed experiment{'s' if failed != 1 else ''}. " if failed else
-                      "Preparation finished. ")
-            self.series_batch_status.setText(label + prefix + detail)
 
     @staticmethod
     def _transfer_run_identity(row: Mapping[str, object]) -> tuple[str, str]:
@@ -4556,22 +4169,6 @@ class SharedPhaseModelTrainingPage(QWidget):
             self._transfer_review_roots.append(str(root))
             self._model_filter_settings.setValue("review/transferRoots",json.dumps(self._transfer_review_roots))
 
-    def _include_transfer_in_training(self) -> None:
-        result, model = self._completed_transfer, self._selected_validation_model()
-        if not result or not model or result.get("review_mode") != "visible" or result.get("physics_mode") not in {"prepared-target", "registered-target"}:
-            return
-        command = result.get("reopen_command") or result.get("command") or []
-        try:
-            reviewer = command[command.index("--reviewer") + 1]
-            save_root = command[command.index("--local-review-root") + 1]
-        except (ValueError, IndexError):
-            self.transfer_status.setText("The completed test lacks its bound reviewer and review location.")
-            return
-        if self.reviewer.text().strip().casefold() != str(reviewer).casefold():
-            self.transfer_status.setText(f"This test belongs to reviewer {reviewer}. Select that reviewer before including its corrections.")
-            return
-        self._launch_transfer_worker("promote",["--evaluation-root",str(result["evaluation_root"]),
-            "--reviewer",reviewer,"--save-root",save_root])
 
     def _open_transfer_comparison(self) -> None:
         result = self._completed_transfer
@@ -4603,46 +4200,19 @@ class SharedPhaseModelTrainingPage(QWidget):
             "Predictions are visible. Training inclusion is shown with the selected experiment."
             if started else "The prepared transfer comparison could not be opened.")
 
-    def _start_blind_transfer(self) -> None:
-        self._start_transfer("blind")
 
-    def _start_transfer(self, review_mode: str = "visible") -> None:
-        if review_mode not in {"visible", "blind"}:
-            raise ValueError("Choose visible testing or optional blind labeling")
-        target = self.transfer_target.currentData()
-        model = self._selected_validation_model()
-        if not isinstance(target, dict) or model is None or self._transfer_sources_for != str(model.get("root") or ""):
-            return
-        if target.get("preparation_status", "ready") != "ready":
-            self.transfer_status.setText(
-                f"{str(target.get('run') or '').upper()}: Needs image preparation "
-                "before phase maps can be tested."
-            )
-            return
-        if self.transfer_physics_mode.currentData() not in {"optical-only", "registered-target", "prepared-target"}:
-            self.transfer_status.setText("This Studio version does not support the selected physics mode.")
-            return
-        self._select_completed_target_result(target)
-        if review_mode == "visible" and self._completed_transfer and self._completed_transfer.get("review_mode") == "visible":
-            self._open_transfer_comparison()
-            return
-        arguments = ["--source-manifest", str(target["source_manifest"]), "--run", str(target["run"]),
-            "--output-parent", str(default_execution_cache_root() / "phase-transfer-review"),
-            "--physics-mode", str(self.transfer_physics_mode.currentData()), "--reviewer", self.reviewer.text().strip(),
-            "--review-mode", review_mode,
-            "--save-root", self.review_save_root.text().strip(),
-            "--cache-root", str(default_execution_cache_root() / "phase-transfer-review-cache")]
-        self._launch_transfer_worker("prepare", arguments)
 
     def _launch_transfer_worker(self, operation: str, arguments: list[str]) -> None:
+        if operation != "list":
+            raise ValueError("Only stored transfer metadata may be listed here")
         model = self._selected_validation_model()
         if (model is None or self.validation_process is not None
                 or self.training_process is not None
                 or (self._series_batch_active and operation != "list")):
             return
         try:
-            script = self._companion_path("phase_training_promotions.py" if operation == "promote" else "phase_transfer_review.py")
-            command = [phase_python_executable(), *tool_arguments(script), "register" if operation == "promote" else operation,
+            script = self._companion_path("phase_transfer_review.py")
+            command = [phase_python_executable(), *tool_arguments(script), "list",
                 "--model", str(model["root"]), *arguments]
             process = QProcess(self)
             process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -4657,8 +4227,6 @@ class SharedPhaseModelTrainingPage(QWidget):
             self._transfer_job = dict(operation=operation, model_root=str(model["root"]), model_id=model["model_id"],
                 review_mode=review_mode, target=dict(self.transfer_target.currentData() or {}),
                 own_validation_only="--own-validation-only" in arguments)
-            if operation == "promote":
-                self._transfer_job["evaluation_root"] = arguments[arguments.index("--evaluation-root")+1]
             self._transfer_result = None
             self._transfer_event_buffer = ""
             physics_mode = arguments[arguments.index("--physics-mode") + 1] if "--physics-mode" in arguments else ""
@@ -4666,10 +4234,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             review_label = "Predictions will open directly." if review_mode == "visible" else "Optional blind labeling: predictions will remain hidden."
             if operation == "list":
                 self.transfer_count.setText("Reading experiments...")
-            self.transfer_status.setText(("Reading this model's prepared experiments..." if self._transfer_job["own_validation_only"]
-                else "Finding prepared same-series experiments...") if operation == "list" else
-                "Recording this experiment for the next Train further run. No training starts now." if operation == "promote" else
-                f"Running {evaluation_label} with frozen parameters. {review_label} No retraining.")
+            self.transfer_status.setText("Reading this model\'s prepared experiments..." if self._transfer_job["own_validation_only"] else "Finding prepared same-series experiments...")
             self._update_action_states()
             process.start()
         except Exception as exc:  # noqa: BLE001 - visible worker boundary
@@ -4880,7 +4445,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             else None
         )
         if not isinstance(binding, Mapping):
-            self._materialize_and_launch_review(mode)
+            self.review_status.setText("No prepared phase maps are bound to this model. Open an existing saved candidate for review.")
             return
         self._start_review_process(mode, binding)
 
@@ -4919,104 +4484,6 @@ class SharedPhaseModelTrainingPage(QWidget):
                 "to the selected series review folder."
         )
 
-    def _materialize_and_launch_review(self, mode: str) -> None:
-        model = self._selected_validation_model()
-        if model is None:
-            QMessageBox.warning(self, "Select a model", "Select a model to validate first.")
-            return
-        model_root = Path(str(model.get("root") or "")).expanduser().resolve()
-        source_root = model_root / "review_source"
-        if not (source_root / "postflight_manifest.json").is_file():
-            # Legacy packages may have only the exact selected model's prior
-            # validation campaign. Never substitute the currently visible form.
-            source_root = model_root / "validation"
-        if not (source_root / "postflight_manifest.json").is_file():
-            QMessageBox.warning(
-                self,
-                "Prepared evidence is unavailable",
-                "This model has no bound review_source or validation campaign. "
-                "Its registered image source must be restored before generating maps.",
-            )
-            return
-        model_id = str(model.get("model_id") or model_root.name).strip()
-        source_manifest = source_root / "postflight_manifest.json"
-        source_key = sha256_file(source_manifest)[:12]
-        from darsia.fluidflower.phase_runtime import load_physics_profile, physics_runtime_identity
-        try:
-            physics_key = physics_runtime_identity(load_physics_profile(model_root))
-        except (OSError, TypeError, ValueError) as exc:
-            QMessageBox.critical(self, "Invalid physical context", str(exc))
-            return
-        pipeline_suffix = f"-physics-{physics_key[:12]}" if physics_key else ""
-        output_root = (
-            default_execution_cache_root()
-            / "phase-validation"
-            / f"{model_id}-{source_key}{pipeline_suffix}"
-        )
-        session_id = (
-            f"review-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
-            f"{uuid.uuid4().hex[:8]}"
-        )
-        command = [
-            phase_python_executable(),
-            "-m",
-            "darsia.fluidflower.phase_validation",
-            "--model-root",
-            str(model_root),
-            "--source-campaign-root",
-            str(source_root.resolve()),
-            "--output-root",
-            str(output_root),
-        ]
-        regional_recovery = (
-            source_root == model_root / "review_source"
-            and (model_root / "phase_optical_regions.json").is_file()
-        )
-        if regional_recovery:
-            # The regional preparer owns persistent optical reuse, checked GPU
-            # execution, bounded CPU workers and incremental publication.
-            # The generic phase_validation CLI is only the legacy CPU path.
-            command = [phase_python_executable(), "-m", __name__,
-                       "--prepare-review-root", str(model_root),
-                       "--receipt-root", str(output_root)]
-        process = QProcess(self)
-        if regional_recovery:
-            try:
-                companion = self._companion_path("prepare_optical_region_studio.py")
-            except FileNotFoundError as exc:
-                QMessageBox.critical(self, "Could not prepare validation", str(exc))
-                return
-            process.setWorkingDirectory(str(local_cache_root()))
-        process.setProgram(command[0])
-        process.setArguments(command[1:])
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
-        process.readyReadStandardOutput.connect(self._validation_materialization_output)
-        process.readyReadStandardError.connect(self._validation_materialization_error)
-        process.finished.connect(self._validation_materialization_finished)
-        self.validation_process = process
-        self.validation_error_output.clear()
-        self.pending_validation_mode = mode
-        self.pending_validation_session_id = session_id
-        self.pending_validation_output = output_root
-        self.pending_validation_model_root = model_root
-        from darsia.fluidflower.phase_validation import _model_identity
-        self.pending_validation_model_identity = _model_identity(model_root)
-        self.pending_validation_physics_runtime = physics_key
-        self.review_status.setText(
-            f"Checking completed {model_id} experiments before preparing missing phase maps..."
-            if regional_recovery else
-            f"Generating {model_id} phase maps from corrected full-resolution frames..."
-        )
-        self._update_action_states()
-        process.start()
-        if not process.waitForStarted(5000):
-            self.validation_process = None
-            self._update_action_states()
-            QMessageBox.critical(
-                self,
-                "Could not prepare validation",
-                process.errorString() or "The phase-map process did not start.",
-            )
 
     def _validation_materialization_output(self) -> None:
         process = self.validation_process
@@ -5265,35 +4732,6 @@ class SharedPhaseModelTrainingPage(QWidget):
         self._launch_training_job(request, command, Path(request["request_path"]).parent,
             f"Training {request['model_id']} from {len(bundles)} frozen evidence package(s)...")
 
-    def _train_further(self) -> None:
-        if (self.training_process is not None or self.validation_process is not None
-                or self._series_batch_active):
-            return
-        model = self._selected_validation_model()
-        if model is None:
-            return
-        coverage = _model_series(model)
-        selected = self._active_model_series or (next(iter(coverage)) if len(coverage) == 1 else "")
-        try:
-            if not selected or coverage != {selected}:
-                raise ValueError("Select the fitted model for one experimental series before updating it")
-            if not self.reviewer.text().strip():
-                raise ValueError("Enter your reviewer name before training a new model")
-            if model.get("state") == "transfer_evaluation":
-                raise ValueError("Select a fitted source model before training a new version")
-            script = tool_path("train_studio_series_update.py")
-            command = [phase_python_executable(), *tool_arguments(script), "--parent", str(model["root"]),
-                "--library", str(series_path(selected, "models")), "--cache", self.cache_parent.text().strip(),
-                "--series", selected, "--actor", self.reviewer.text().strip(),
-                "--backend", str(self.backend.currentData() or "auto")]
-            request = dict(continuation=True, parent_model=str(model["root"]), series=selected,
-                           original_library=self.model_library.text().strip())
-            self._launch_training_job(request, command, local_cache_root(),
-                f"Preparing cumulative {self._model_series_labels.get(selected, selected.upper())} evidence. "
-                "Training a new version with the common series method; native maps follow automatically.")
-            self.tabs.setCurrentWidget(self.training_tab)
-        except Exception as exc:  # noqa: BLE001 - visible job boundary
-            QMessageBox.critical(self, "Could not train further", str(exc))
 
     def _launch_training_job(self, request, command, working_directory, status) -> None:
         process = QProcess(self)
@@ -5392,7 +4830,7 @@ class SharedPhaseModelTrainingPage(QWidget):
                 self.status.setText("New model ready. Phase maps for the selected reviewed experiments are already prepared.");return
             self.series_batch_workers.setValue(plan["cpu_workers"])
             self.series_batch_gpu.setChecked(plan["gpu_worker"])
-            self._start_series_batch(requested_runs=runs,excluded_runs=prepared)
+            self.status.setText("Model fitted. Missing phase maps are not generated by the saved-review workspace.")
         except Exception as error:
             self.status.setText(f"Model fitted; post-training preparation could not start: {error}")
 

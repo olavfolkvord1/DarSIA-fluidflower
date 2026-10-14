@@ -1,32 +1,28 @@
-"""Import metadata must not request numerical calibration parameters."""
-
+"""Canonical method functions import without numerical calibration DATA."""
 import subprocess
 import sys
 from pathlib import Path
 
 
 def test_photometry_function_import_without_numerical_configuration():
-    """A legacy saved-model reader can import functions without evaluating them."""
+    """Function imports stay inert; actual method calls require explicit parameters."""
     source = Path(__file__).resolve().parents[2] / "src"
     code = f"""
-import os, sys
+import os, sys, inspect
 sys.path.insert(0, {str(source)!r})
 os.environ.pop('DARSIA_NATIVE_CONFIGURATION', None)
 os.environ.pop('DARSIA_NATIVE_CONFIGURATION_SHA256', None)
-from darsia.fluidflower.tools.ffac_v5_photometry import render_ac28_response
-from darsia.fluidflower.tools import ffac_v5_photometry as facade
-assert callable(render_ac28_response)
+from darsia.fluidflower.native.photometry import render_response
+from darsia.fluidflower.native import photometry
+from darsia.fluidflower.native.config import require_parameters
+assert callable(render_response)
+assert inspect.signature(render_response).parameters['parameters'].default is inspect.Parameter.empty
+assert not hasattr(photometry, 'GRID')
 try:
-    facade.__path__
-except AttributeError:
-    pass
-else:
-    raise AssertionError('Unknown module attribute must be rejected')
-try:
-    facade.GRID
+    require_parameters('photometry')
 except ValueError as error:
     assert str(error) == 'An explicit native parameter document is required'
 else:
-    raise AssertionError('Numerical constants still require explicit DATA')
+    raise AssertionError('Numerical calls still require explicit DATA')
 """
     subprocess.run([sys.executable, "-I", "-B", "-c", code], check=True)

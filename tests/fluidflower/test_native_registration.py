@@ -91,7 +91,7 @@ def test_bandpass_and_patch_matches_detect_known_translation(parameters):
 
 
 def test_match_metrics_empty_and_exact_scaled_displacement():
-    assert reg.match_metrics(np.empty((0, 5))) == {
+    assert reg.match_metrics(np.empty((0, 5)), scale=1.0) == {
         "n": 0, "p50_px": None, "p95_px": None, "max_px": None}
     result = reg.match_metrics(np.array([[0, 0, 3, 4, .5], [2, 2, 5, 6, 1.]]), scale=2.)
     assert result == dict(n=2, p50_px=10., p95_px=10., max_px=10.,
@@ -283,28 +283,3 @@ def test_prewarp_sensor_grid_log_retains_float32_and_original_signal_bounds(
     assert np.array_equal(result[1:], original[1:], equal_nan=True)
     with pytest.raises(ValueError, match="Unknown geometry profile"):
         reg.registered_sensor_grid_log(arw, np.eye(3), "unbound", geometry, parameters=parameters)
-
-
-def test_legacy_adapters_forward_only_explicit_configuration(parameters, monkeypatch):
-    from darsia.fluidflower.native.config import configure_parameters, reset_parameters
-    from darsia.fluidflower.tools import ffac_raw_geometry as legacy
-    from darsia.fluidflower.tools import ffac_raw_native_ea as edge
-    parameters["legacy"] = dict(profile_path_prefix="RUN", profile_number_split=8,
-                                lower_profile="low", upper_profile="high")
-    calls = []
-    def render(*args, **kwargs):
-        calls.append(kwargs)
-        return "forwarded"
-    monkeypatch.setattr(reg, "registered_edge_aware_sensor_linear", render)
-    token = configure_parameters({"registration": parameters})
-    try:
-        assert legacy._metrics is reg.match_metrics
-        assert legacy._RAW_WH == (8, 8)
-        assert edge.registered_edge_aware_raw_linear("RUN9/source.arw", "source.jpg", "review.jpg",
-            expected_source_hashes={"bound": "digest"}, content_box=(0, 0, 4, 4)) == "forwarded"
-        assert calls[0]["parameters"] is parameters
-        assert calls[0]["source_id"] == "RUN9" and calls[0]["profile_id"] == "high"
-    finally:
-        reset_parameters(token)
-    with pytest.raises(ValueError, match="explicit native parameter"):
-        legacy._bandpass(np.zeros((4, 4), np.float32))

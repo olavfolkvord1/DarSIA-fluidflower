@@ -34,9 +34,6 @@ _PREFETCH_SELECTION = None
 # This previously frozen renderer differs only in path/metadata/cache handling.
 # Accept its saved pixels only while the actual numerical implementation still
 # has the same AST fingerprint. Future pixel changes cannot reuse this allowance.
-_COMPATIBLE_RAW_RENDERER = "58cb29a9bfc3087adb5b159e1904b25f110cb6ecdfdde24092f464b26250d421"
-_COMPATIBLE_RAW_PIXELS = "8f52325ee0423f78a41a1d5424827a858b55d998a67ae01d16cec82c93fb6d83"
-_COMPATIBLE_GRID_PIXELS = "7f69c489482c5d0e1637b214ee9d4d2c90ce23b06fa6cbae4c843c11de0194d0"
 
 
 def _key(path):
@@ -60,7 +57,7 @@ def candidate_root(review_root):
 
 
 def pointer_path(root, *, registry_dir=None):
-    from .tools.register_track1_studio_candidate import registration_path
+    from .phase_saved_registration import registration_path
     from .phase_rig_raw_display import _path_configuration, _remember
     key = (_key(root), str(registry_dir), _path_configuration())
     with _LOCK:
@@ -89,16 +86,23 @@ def _code_sha(path, stamp):
     return sha256(Path(path).read_bytes()).hexdigest()
 
 
+
 def _renderer_code():
-    from . import phase_rig_raw_display, phase_rig_display_acceleration
-    from .tools import ffac_track1_change_flatfield, ffac_track1_display_modes
-    modules = (phase_rig_raw_display, phase_rig_display_acceleration,
-               ffac_track1_change_flatfield, ffac_track1_display_modes)
+    """Admit current code separately from immutable saved producer identities."""
+    from .phase_saved_review_metadata import configured_parameters, bound_path
+    parameters = configured_parameters("display_renderer")
+    base = Path(__file__).parent
+    for asset in parameters["current_execution_sources"].values():
+        path = bound_path(asset, base=base)
+        if path != (base / asset["path"]).resolve() or path.stat().st_size != asset["size_bytes"]:
+            raise ValueError("Current display execution source binding differs")
     result = {}
-    for module in modules:
-        path = Path(module.__file__)
+    for name, asset in parameters["producer_code_sources"].items():
+        path = bound_path(asset)
         stat = path.stat()
-        result[module.__name__] = _code_sha(str(path), (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        if stat.st_size != asset["size_bytes"]:
+            raise ValueError("Saved display producer source size differs")
+        result[name] = _code_sha(str(path), (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
     return result
 
 
@@ -135,20 +139,21 @@ def _compatible_binding(expected, actual):
         return True
     if not isinstance(actual, dict):
         return False
-    from . import phase_rig_raw_display, phase_pixel_area
+    from .phase_saved_review_metadata import configured_parameters, bound_path
     from .phase_rig_raw_display import _stamp
-    name = phase_rig_raw_display.__name__
+    parameters = configured_parameters("display_renderer")
+    name = parameters["raw_renderer_name"]
     codes = actual.get("renderer_code")
-    if not isinstance(codes, dict) or codes.get(name) != _COMPATIBLE_RAW_RENDERER:
+    if not isinstance(codes, dict) or codes.get(name) != parameters["compatible_raw_renderer"]:
         return False
     adjusted = dict(codes, **{name: expected["renderer_code"][name]})
     if adjusted != expected["renderer_code"]:
         return False
-    path = Path(phase_rig_raw_display.__file__)
-    if _pixel_fingerprint(str(path), _stamp(path)) != _COMPATIBLE_RAW_PIXELS:
+    path = bound_path(parameters["pixel_fingerprint_source"])
+    if _pixel_fingerprint(str(path), _stamp(path)) != parameters["compatible_raw_pixels"]:
         return False
-    grid_path = Path(phase_pixel_area.__file__)
-    if _grid_fingerprint(str(grid_path), _stamp(grid_path)) != _COMPATIBLE_GRID_PIXELS:
+    grid_path = bound_path(parameters["grid_fingerprint_source"])
+    if _grid_fingerprint(str(grid_path), _stamp(grid_path)) != parameters["compatible_grid_pixels"]:
         return False
     return dict(actual, renderer_code=adjusted) == expected
 

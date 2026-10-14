@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .phase_ffac_floor_contact import CONTRACT
+from .phase_saved_review_metadata import configured_parameters
 
 
 def resolve_floor_contact_display_mask(review_root, run, frame_index):
@@ -28,7 +28,7 @@ def resolve_floor_contact_display_mask(review_root, run, frame_index):
         return None  # Earlier candidates have no floor interpretation flag.
     revision = row.get("rig_domain_revision") or {}
     shape = tuple(map(int, revision.get("phase_shape_hw", ())))
-    if (descriptor.get("contract") != CONTRACT or descriptor.get("frame_index") != frame_index
+    if (descriptor.get("contract") != configured_parameters("display_views")["floor_contact_contract"] or descriptor.get("frame_index") != frame_index
             or descriptor.get("source_sha256") != row.get("source_sha256")
             or len(str(descriptor.get("source_sha256", ""))) != 64
             or tuple(descriptor.get("shape_hw", ())) != shape or len(shape) != 2):
@@ -83,3 +83,9 @@ def hatch_floor_contact_overlay(image, mask=None, *, enabled=True, phase_visible
     array = np.frombuffer(converted.constBits(), np.uint8).reshape(converted.height(), converted.bytesPerLine())[:, :converted.width()*4].reshape(converted.height(), converted.width(), 4)
     rgba = hatch_floor_contact_rgba(array, mask, enabled=enabled, phase_visible=phase_visible)
     return QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], QImage.Format.Format_RGBA8888).copy()
+
+
+def __getattr__(name):
+    if name != "CONTRACT":
+        raise AttributeError(name)
+    return configured_parameters("display_views")["floor_contact_contract"]

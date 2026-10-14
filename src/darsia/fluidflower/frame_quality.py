@@ -167,32 +167,18 @@ def default_frame_quality_config() -> dict[str, Any]:
 
 
 def _canonical_digest(payload: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    from darsia.fluidflower.analysis_domains import _json_digest as _canonical_ascii_digest
+    return _canonical_ascii_digest(payload)
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_json(path: Path) -> dict[str, Any]:

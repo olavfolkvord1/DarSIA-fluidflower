@@ -85,6 +85,8 @@ def _data(rule_parameters):
         block_rows=3,
         input_encoding="v5-unit-float32",
         gas_feature_count=4,
+        flatfield_source_origin_xy=[0, 0],
+        flatfield_target_origin_xy=[0, 0],
         square_metres_to_square_millimetres=1e6,
         provenance={},
     )

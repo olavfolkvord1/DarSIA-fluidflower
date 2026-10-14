@@ -74,11 +74,13 @@ class ServiceLock:
     """One parent/log writer for this local machine, backend and UNC job."""
 
     def __init__(self, identity: str):
+        """Bind a machine/backend identity to the sole shared-log ownership guard."""
         self.identity = hashlib.sha256(identity.encode()).hexdigest()
         self.handle = None
         self.file = None
 
     def __enter__(self):
+        """Acquire the process ownership guard or reject a second active log writer."""
         if os.name == "nt":
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel.CreateMutexW.argtypes = [
@@ -113,6 +115,7 @@ class ServiceLock:
         return self
 
     def __exit__(self, *args):
+        """Release this process ownership guard without removing preserved log files."""
         if self.handle is not None:
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel.ReleaseMutex(ctypes.c_void_p(self.handle))
@@ -268,17 +271,21 @@ class QueueStream:
     encoding = "utf-8"
 
     def __init__(self, messages, stream):
+        """Bind a child console stream to the parent process message queue."""
         self.messages, self.stream = messages, stream
 
     def write(self, text):
+        """Forward console text to the parent log writer and return the number of characters."""
         if text:
             self.messages.put(dict(kind="console", stream=self.stream, text=text))
         return len(text)
 
     def flush(self):
+        """Perform no write because this stream retains no buffered child text."""
         pass
 
     def isatty(self):
+        """Report a queued console stream rather than an interactive terminal."""
         return False
 
 
@@ -328,6 +335,11 @@ def emit(log, event):
 
 
 def main(argv=None):
+    """Start the common CPU or CUDA queue worker with one verified code environment.
+
+    Worker slots claim complete runs, report actual progress, and publish only
+    while holding their attempt lease. Startup failures retain their traceback.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", required=True, type=Path)
     parser.add_argument("--backend", required=True, choices=("cpu", "cuda"))

@@ -30,10 +30,8 @@ DEFAULT_COMBINED_ROOT = configured_tool_path('ffac', 'calibration_logs') / f'{CA
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    return payload
+    from darsia.fluidflower.execution import _read_json_object
+    return _read_json_object(path)
 
 
 def _write_json_if_changed(path: Path, payload: Mapping[str, Any]) -> bool:

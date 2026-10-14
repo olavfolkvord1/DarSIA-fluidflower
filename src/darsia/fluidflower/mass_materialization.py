@@ -78,19 +78,8 @@ INTEGRATED_COLUMNS = (
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+    from .mass_artifacts import _atomic_json as _write_metadata
+    return _write_metadata(path, payload)
 
 
 def _safe_identifier(value: str) -> str:

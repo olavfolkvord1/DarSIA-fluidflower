@@ -21,9 +21,7 @@ def load_review_rgb(path: Path, content_box: Sequence[int], *,
 
     path = Path(path)
     if path.name.endswith(".log_linear_rgb.npy"):
-        from darsia.fluidflower.phase_training.v5_linear_input import (
-            V5_UNIT_DENOMINATOR, decode_log_linear,
-        )
+        from darsia.fluidflower.phase_training.log_linear_input import V5_UNIT_DENOMINATOR, decode_log_linear
 
         _x, _y, width, height = (int(value) for value in content_box)
         return decode_log_linear(path, expected_sha256=expected_sha256,

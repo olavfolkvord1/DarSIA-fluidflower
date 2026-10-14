@@ -269,11 +269,8 @@ def json_pretty(value: Any) -> str:
 
 
 def _gui_float(value: Any) -> float | None:
-    try:
-        parsed = float(str(value).strip().replace(",", "."))
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) else None
+    from darsia.fluidflower.analysis_domains import _number
+    return _number(value)
 
 
 def _gui_int(value: Any) -> int | None:

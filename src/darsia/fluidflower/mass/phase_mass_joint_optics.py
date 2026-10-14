@@ -26,6 +26,11 @@ RGB_ENCODINGS = ("srgb", "camera_linear")
 
 
 def srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
+    """Decode normalized sRGB channel values into float32 linear-light RGB.
+
+    The standard piecewise transfer preserves zero and unit endpoints; it
+    does not apply camera correction, phase inference, or concentration fitting.
+    """
     x = np.asarray(rgb, dtype=np.float32)
     return np.where(x <= .04045, x / 12.92, ((x + .055) / 1.055) ** 2.4)
 
@@ -104,8 +109,8 @@ def _regularized_span(raw: np.ndarray, valid: np.ndarray, facies: np.ndarray,
 
 
 def build_joint_reference(baseline: np.ndarray, clearwater: np.ndarray,
-                          facies: np.ndarray, *, sigma: float = 2.0,
-                          linear_floor: float = 1e-4, min_span: float = .15,
+                          facies: np.ndarray, *, sigma: float,
+                          linear_floor: float, min_span: float,
                           domain_mask: np.ndarray | None = None,
                           rgb_encoding: str = "srgb") -> JointReference:
     """Freeze two robust reference normalizers without seeing injection frames.

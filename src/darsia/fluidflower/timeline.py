@@ -83,11 +83,8 @@ def _utc_now() -> str:
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -268,11 +265,8 @@ def _load_table(path: Path) -> list[dict[str, Any]]:
 
 
 def _source_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    from .project import _sha256_file_uncached
+    return _sha256_file_uncached(path)
 
 
 class TimelineStore:

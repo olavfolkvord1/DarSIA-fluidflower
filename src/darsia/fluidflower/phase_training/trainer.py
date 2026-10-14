@@ -579,7 +579,7 @@ def _stage_run(source: RunSource, cache_root: Path, *, native_revision: bool = F
         local_linear_baseline = local_baseline.with_suffix(".log_linear_rgb.npy")
         local_linear_frames = tuple(path.with_suffix(".log_linear_rgb.npy")
                                     for path in local_frames)
-        from .v5_linear_input import EXACT_VALID_MASK_POLICY
+        from darsia.fluidflower.phase_training.log_linear_input import EXACT_VALID_MASK_POLICY
         invalid_policy = manifest.get("v5_float_support_policy")
         if invalid_policy not in (None, EXACT_VALID_MASK_POLICY):
             raise ValueError("Unknown V5 scientific valid-mask policy")
@@ -797,12 +797,12 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         if task.radiometry_profile is not None:
             raise ValueError("V5 camera-linear optical input cannot use legacy radiometry")
         if track1_photo:
-            from darsia.fluidflower.tools.ffac_v5_track1_photo_context import (
+            from darsia.fluidflower.phase_training.photo_context import (
                 Track1FramePhotoCohort,
             )
             frame_geometry = Track1FramePhotoCohort(task.staged.asset_manifest_path)
         else:
-            from darsia.fluidflower.tools.ffac_v5_frame_context import (
+            from darsia.fluidflower.phase_training.frame_context import (
                 V5FrameGeometryCohort,
             )
             frame_geometry = V5FrameGeometryCohort(task.staged.asset_manifest_path)
@@ -873,7 +873,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
     baseline_source_valid = None
     baseline_origin = (0, 0)
     if v5 and extended_temporal:
-        from .v5_linear_input import decode_extended_log_linear
+        from darsia.fluidflower.phase_training.log_linear_input import decode_extended_log_linear
         reference = manifest["reference"]
         if task.staged.baseline_extended_path is None:
             raise ValueError("V5 source-backed temporal baseline ring was not staged")
@@ -936,7 +936,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                      f"frame_{previous_index:03d}"))
             )
             if v5 and extended_temporal:
-                from .v5_linear_input import decode_extended_log_linear
+                from darsia.fluidflower.phase_training.log_linear_input import decode_extended_log_linear
                 if len(task.staged.frame_extended_paths) != len(task.staged.frame_paths):
                     raise ValueError("V5 source-backed temporal frame rings were not staged")
                 previous_record = manifest["frame_sources"][previous_index]
@@ -981,8 +981,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         certified_sand = None
         uncertain_photo_boundary = None
         if frame_geometry is not None:
-            from darsia.fluidflower.tools.ffac_v5_temporal_alignment import align_temporal_inputs
-            from darsia.fluidflower.tools.ffac_v5_frame_context import compute_feature_support
+            from darsia.fluidflower.phase_training.temporal_alignment import align_temporal_inputs
+            from darsia.fluidflower.phase_training.frame_context import compute_feature_support
             if track1_photo:
                 certified_sand, uncertain_photo_boundary, geometry_binding = (
                     frame_geometry.photo(frame_index))
@@ -1056,7 +1056,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         support_rows: list[dict[str, Any]] = []
         for local_index, region in by_frame[frame_index]:
             if v5:
-                from .v5_review_sampling import sampling_receipt
+                from .review_sampling import sampling_receipt
                 review_sampling = sampling_receipt(region.phase_class, region.payload)
                 if review_sampling["role"] in (
                         "candidate_issue_evaluation_only", "evaluation_only"):
@@ -1243,11 +1243,11 @@ def _feature_cache_key(
         "ffac-v5-native-source-materialization-v1")
     v5_geometry = None
     if v5:
-        from darsia.fluidflower.tools import ffac_v5_frame_context, ffac_v5_temporal_alignment
+        from darsia.fluidflower.phase_training import frame_context as ffac_v5_frame_context, temporal_alignment as ffac_v5_temporal_alignment
         track1_photo = bool(native.get("v5_track1_photo_geometry"))
         if track1_photo:
-            from darsia.fluidflower.tools import ffac_v5_track1_photo_context
-            from . import v5_linear_input
+            from darsia.fluidflower.phase_training import photo_context as ffac_v5_track1_photo_context
+            from . import log_linear_input as v5_linear_input
             cohort = ffac_v5_track1_photo_context.Track1FramePhotoCohort(
                 staged.asset_manifest_path)
         else:
@@ -1288,7 +1288,7 @@ def _feature_cache_key(
     ]
     for item, region in zip(region_contract, regions):
         if v5:
-            from .v5_review_sampling import sampling_receipt
+            from .review_sampling import sampling_receipt
             item["sampling"] = sampling_receipt(region.phase_class, region.payload)
         elif "training_sampling" in region.payload:
             from . import gas_negative_sampling
@@ -2387,7 +2387,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
     if any(track1_flags) and not all(track1_flags):
         raise ValueError("Cannot mix Track1 photo-only and physical V5 sources")
     if v5_source_flags and all(v5_source_flags):
-        from .v5_chemistry_fit_scope import EXCLUDED_RUNS, verify_scope
+        from darsia.fluidflower.phase_training.chemistry_fit_scope import EXCLUDED_RUNS, verify_scope
         request_path = Path(args.output_root) / "training_request.json"
         if not request_path.is_file():
             raise ValueError("V5 fit requires its frozen training request")
@@ -2397,7 +2397,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("V5 fit omitted its six-run chemistry exclusion")
         verify_scope(chemistry_scope, regions)
         if track1_flags and all(track1_flags):
-            from .v5_review_fit_partition import verify_fit_partition
+            from .review_fit_partition import verify_fit_partition
             partition_binding = (request.get("settings") or {}).get(
                 "v5_review_fit_partition")
             if not partition_binding or origin_sources is None:
@@ -2477,7 +2477,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         inventory["v5_chemistry_fit_scope"] = chemistry_scope
         if partition_binding is not None:
             inventory["v5_review_fit_partition"] = partition_binding
-        from .v5_review_sampling import inventory as v5_sampling_inventory
+        from .review_sampling import inventory as v5_sampling_inventory
         inventory.update(v5_sampling_inventory(ordered_regions))
     else:
         from .gas_negative_sampling import sampling_inventory

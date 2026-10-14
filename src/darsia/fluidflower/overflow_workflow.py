@@ -27,11 +27,8 @@ EXACT_IMAGE_STATUSES = frozenset({"Verified", "Corrected"})
 
 
 def _review_float(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
+    from darsia.fluidflower.mass_inputs import _number as _canonical_finite_number
+    return _canonical_finite_number(value)
 
 
 @lru_cache(maxsize=256)

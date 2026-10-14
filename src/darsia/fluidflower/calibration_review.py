@@ -21,21 +21,13 @@ CALIBRATION_REVIEW_STATUSES = ("pending", "approved", "needs_recalibration")
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    from .project import _atomic_json as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    from .project import _append_jsonl as _write_metadata
+    return _write_metadata(path, payload, copy_payload=True)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -56,13 +48,8 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _json_digest(payload: Any) -> str:
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    from darsia.fluidflower.analysis_domains import _json_digest as _canonical_ascii_digest
+    return _canonical_ascii_digest(payload)
 
 
 def _issue(
@@ -294,12 +281,8 @@ class CalibrationResultReviewStore:
         return _read_jsonl(self.revisions_path)
 
     def current(self) -> dict[str, Any]:
-        if self.current_path.is_file():
-            payload = json.loads(self.current_path.read_text(encoding="utf-8-sig"))
-            if isinstance(payload, dict):
-                return payload
-        rows = self.revisions()
-        return deepcopy(rows[-1]) if rows else {}
+        from .analysis_domains import AnalysisDomainStore
+        return AnalysisDomainStore.current(self)
 
     def save_review(
         self,

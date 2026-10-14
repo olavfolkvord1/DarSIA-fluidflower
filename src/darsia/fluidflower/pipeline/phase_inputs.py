@@ -299,6 +299,7 @@ class FixedBaselineDecodeCache:
     """One worker's two-entry byte-bounded cache; hits never share writable RGB."""
 
     def __init__(self, *, max_bytes: int, parameters: Mapping):
+        """Bind a byte-budgeted cache for verified fixed-reference decoding and validation."""
         self.parameters = parameters
         if type(max_bytes) is not int or not 0 <= max_bytes <= self.parameters['maximum_bytes']:
             raise ValueError('Fixed-reference decode cache requires a 0..1 GiB byte budget')
@@ -370,9 +371,11 @@ class FixedBaselineDecodeCache:
         return None
 
     def clear(self):
+        """Discard retained decoded arrays and validation entries and reset retained byte accounting."""
         self._entries.clear()
         self._validated.clear()
         self._bytes = 0
 
     def receipt(self) -> dict:
+        """Report cache byte/count statistics and bindings without replacing source verification."""
         return dict(contract=self.parameters['contract'], fixed_roles=sorted(frozenset(self.parameters['fixed_roles'])), cached_entries=len(self._entries), cached_bytes=self._bytes, max_bytes=self.max_bytes, hits=self._hits, misses=self._misses, delegated_calls=self._delegated, oversized_results=self._too_large, validation_hits=self._validation_hits, validation_misses=self._validation_misses, validation_keys=len(self._validated), validation_rgb_retained_bytes=0, array_bindings=dict(self._bindings), cached_values_readonly=True, hits_return_fresh_mutable_copy=True, source_file_verification_replaced=False, numerical_decoder_changed=False, accepted_running_snapshot_changed=False)

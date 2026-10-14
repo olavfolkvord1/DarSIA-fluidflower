@@ -884,10 +884,8 @@ def _prediction_preview(
 
 
 def _json_digest(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    from darsia.fluidflower.facies_learning import _json_digest as _canonical_mapping_digest
+    return _canonical_mapping_digest(payload)
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:

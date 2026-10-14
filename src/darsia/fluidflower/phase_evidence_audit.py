@@ -225,7 +225,7 @@ def build_queue(evaluation_path, output, *, threshold=.75, evidence_pairs=None, 
     originals = {s.run: read(s.asset_manifest_path) for s in sources}
     region_originals = {}
     if regional:
-        from darsia.fluidflower.tools.train_phase_model_further import native_source
+        from darsia.fluidflower.phase_saved_runtime_views import native_source
         manifests, original_natives = {}, {}
         for region in regions:
             document = origins[region.region_id]["document_index"]

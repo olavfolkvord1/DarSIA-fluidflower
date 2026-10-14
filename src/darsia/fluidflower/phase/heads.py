@@ -95,6 +95,7 @@ class CpuFeaturePredictor(FeatureBuilder):
     """Original packed CPU predictor composed with the unchanged feature builder."""
 
     def __init__(self, model, baseline, *, parameters, feature_parameters, block_rows=None, texture_sigma=None, input_encoding=None, feature_block_rows=None, valid=None, feature_shape_hw=None):
+        """Validate frozen optical contracts and bind the two CPU heads to baseline features."""
         self.model = model
         d = feature_parameters['contract']['defaults']
         supported = tuple((OpticalFeatureContract(**dict(d, generic_version=version, include_dynamic=dynamic), parameters=feature_parameters) for version in feature_parameters['contract']['packed_versions'] for dynamic in (False, True)))
@@ -127,6 +128,8 @@ class CpuFeaturePredictor(FeatureBuilder):
 def gas_probability(model: Mapping[str, Any], current: np.ndarray, flatfield: np.ndarray, *, parameters: Mapping) -> np.ndarray:
     'Score frozen gas evidence with float64 standardization and float32 output.'
     variant = model['variant']
+    if variant not in (*parameters['variants']['current'], parameters['variants']['flatfield_only'], parameters['variants']['combined']):
+        raise ValueError(f'Unknown gas feature variant {variant!r}')
     features = current if variant in parameters['variants']['current'] else flatfield if variant == parameters['variants']['flatfield_only'] else np.concatenate((current, flatfield), axis=-1)
     fit = model['fit']
     values = np.asarray(features, np.float64)

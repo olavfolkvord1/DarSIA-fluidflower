@@ -3,18 +3,15 @@
 Discovery reads the selected model's bound campaign and delivery receipts only.
 It never prepares phase maps or starts phase inference, and never scans a result
 archive. The small catalog also makes shared-calibration variants discoverable.
-Calculation delegates to phase_studio_mass, whose existing optical corrections
-and mass fitting remain experimental; this bridge adds no scientific methods.
+This module reads saved catalogs and registers already completed results.
 """
 from __future__ import annotations
 
-import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-import traceback
 
 
 CATALOG_FORMAT = "studio-mass-variant-delivery-v1"
@@ -45,7 +42,7 @@ def _path(root, value):
 
 def _prepared_jobs(root, *, saved_comparison=False):
     from darsia.fluidflower.phase_evidence_audit import verified_review_binding
-    from darsia.fluidflower.tools.studio_mass_campaign_worker import mass_candidate
+    from darsia.fluidflower.phase_saved_runtime_views import mass_candidate
 
     root = Path(root).resolve()
     binding = verified_review_binding(root, saved_comparison=saved_comparison)
@@ -106,7 +103,7 @@ def _matching_result(path, candidate):
 
 
 def _ordinary_results(job):
-    from darsia.fluidflower.tools.phase_studio_mass_cache import selection, stamp
+    from darsia.fluidflower.phase_saved_runtime_views import selection, stamp
 
     candidate = job["candidate"]
     folder = Path(candidate["phase_map_output_dir"]) / "mass_results"
@@ -223,50 +220,3 @@ def _index_saved_calibration(result_path, results_root):
         index_saved_result(result_path, results_root)
     except (OSError, ValueError, KeyError, TypeError) as error:
         warnings.warn("Completed concentration result is preserved, but its mass-library reference could not be indexed: " + str(error), RuntimeWarning)
-
-
-def run(request_path):
-    """Run the existing experimental adapter; complete only after registration."""
-    from darsia.fluidflower.tools import phase_studio_mass as adapter
-    from darsia.fluidflower.tools.phase_studio_mass_cache import register_result
-    from darsia.fluidflower.tools.studio_mass_campaign_worker import retry_json_write
-
-    request_path = Path(request_path).resolve()
-    request = _read(request_path)
-    status_path = request_path.with_name("status.json")
-    original_write = adapter.write
-    completed = {}
-
-    def write(path, value):
-        if Path(path).resolve() == status_path and value.get("stage") == "complete":
-            completed.update(value)
-            value = dict(value, stage="Registering completed concentration results")
-        return retry_json_write(original_write, path, value)
-
-    try:
-        if request.get("model_root"):
-            _, _, jobs = _prepared_jobs(request["model_root"])
-            matches = [job for job in jobs if job["candidate"] == request["candidate"]
-                       and job["review_root"] == request["review_root"]]
-            if len(matches) != 1:
-                raise ValueError("Selected phase inputs changed; reload the selected model")
-        adapter.write = write
-        result = adapter.run(request_path)
-        result_path = Path(completed["result"])
-        register_result(result_path, request)
-        register_variant(result_path, request["results_root"])
-        retry_json_write(original_write, status_path, dict(stage="complete", result=str(result_path),
-            updated_utc=datetime.now(timezone.utc).isoformat()))
-        return result
-    except Exception:
-        retry_json_write(original_write, status_path, dict(stage="failed", error=traceback.format_exc(),
-            updated_utc=datetime.now(timezone.utc).isoformat()))
-        raise
-    finally:
-        adapter.write = original_write
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", type=Path, required=True)
-    run(parser.parse_args().request)

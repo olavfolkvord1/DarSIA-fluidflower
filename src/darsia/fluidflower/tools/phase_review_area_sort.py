@@ -108,6 +108,12 @@ def _weighted_peak(report, candidate):
         return None
 
 
+def _run_number(run: str) -> tuple[int, str]:
+    """Preserve stable acquisition ordering by numeric digits then identifier."""
+    digits = "".join(character for character in run if character.isdigit())
+    return (int(digits) if digits else 10 ** 9, run)
+
+
 def sorted_phase_area_runs(
     entries: list[tuple[str, str, str, int]],
     areas: dict[str, dict[str, dict[str, float] | None]],
@@ -119,8 +125,7 @@ def sorted_phase_area_runs(
     """Sort known reports first, unknown reports last, then stable run number."""
 
     def run_number(run: str) -> tuple[int, str]:
-        digits = "".join(character for character in run if character.isdigit())
-        return (int(digits) if digits else 10**9, run)
+        return _run_number(run)
 
     def key(entry: tuple[str, str, str, int]) -> tuple[bool, float, tuple[int, str]]:
         report = areas.get(entry[0], {}).get(side)

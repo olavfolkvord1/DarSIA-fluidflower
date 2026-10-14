@@ -29,13 +29,7 @@ from darsia.fluidflower.model_display import (
 from darsia.fluidflower.tools.phase_review_area_sort import (
     peak_phase_area_percent, sorted_phase_area_runs,
 )
-from darsia.fluidflower.phase_v5_display_asset import (
-    V5_SOURCE_FORMAT, raw_detail_available, resolve_raw_detail,
-    BASE_DISPLAY_MODES, DISPLAY_MODES,
-    change_display_available, display_modes_available,
-    resolve_display_mode, resolve_photo_sand_domain,
-    original_display_available, load_original_display_rgb,
-)
+from darsia.fluidflower.phase_photographic_assets import V5_SOURCE_FORMAT, raw_detail_available, resolve_raw_detail, BASE_DISPLAY_MODES, DISPLAY_MODES, change_display_available, display_modes_available, resolve_display_mode, resolve_photo_sand_domain, original_display_available, load_original_display_rgb
 from darsia.fluidflower.phase_rig_raw_display import (
     rig_raw_display_available, load_rig_raw_display_image,
 )
@@ -95,7 +89,7 @@ def model_catalog(root):
     current_physics = physics_runtime_identity(profile) if profile is not None else None
     receipt_path = Path(root) / "publication_receipt.json"
     receipt = read_json(receipt_path) if receipt_path.is_file() else {}
-    from darsia.fluidflower.tools.register_track1_studio_candidate import registration_warning
+    from darsia.fluidflower.phase_saved_registration import registration_warning
     from darsia.fluidflower.phase_model_history import registered_old_domain_seam_review, registered_combined_l1_review, registered_t3_review, registered_l1_neighbourhood_review, registered_p1_final_review
     track1_warning = registration_warning(root)
     if registered_p1_final_review(root, track1_warning):

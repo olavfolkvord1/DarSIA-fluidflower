@@ -375,7 +375,7 @@ def resolve_reference_asset(reference: Mapping, review_root: Path, run: str) -> 
     if row.get("selection_policy") == RIG_SAVED_POLICY:
         if not row.get("available"):
             raise FileNotFoundError(row.get("reason"))
-        from darsia.fluidflower.phase_v5_display_asset import resolve_display_mode
+        from darsia.fluidflower.phase_photographic_assets import resolve_display_mode
         return resolve_display_mode(root, run, row["frame_index"], "natural")
     if row.get("frame_index") is not None:
         folder = root/"native_frames"/str(row["run"])
@@ -385,17 +385,8 @@ def resolve_reference_asset(reference: Mapping, review_root: Path, run: str) -> 
             if path.is_file():
                 return path
         raise FileNotFoundError(f"Reviewed injection reference frame is missing: {folder/stem}")
-    if row.get("needs_materialization") and row.get("available"):
-        repo = process_directory()
-        interpreter = Path(sys.executable)
-        command = [str(interpreter if interpreter.is_file() else Path(sys.executable)),
-            "-m", "darsia.fluidflower.tools.prepare_phase_injection_references", "--review-root", str(root),
-            "--run", str(row["run"]), "--dataset", str(row["dataset"])]
-        result = subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=1800,
-            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-        if result.returncode:
-            raise RuntimeError("Could not prepare injection reference: " + (result.stderr or result.stdout)[-3000:])
-        row = current()
+    if row.get("needs_materialization"):
+        raise FileNotFoundError("This injection reference has no saved inspection photograph; historical preparation is unavailable")
     if not row.get("path") or not row.get("sha256"):
         raise FileNotFoundError(row.get("reason") or "No verified injection reference asset is available")
     path = resolve_review_path(row["path"])

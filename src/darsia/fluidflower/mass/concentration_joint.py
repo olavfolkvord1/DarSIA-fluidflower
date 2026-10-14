@@ -137,6 +137,12 @@ def evaluate_signal_fields(signal, av, gv, solubility, density, parameters, *, e
 
 def evaluate_joint_fields(rgb, reference: JointReference, av, gv, solubility, density,
                           parameters, *, elapsed_h, anchor):
+    """Convert registered RGB response into aqueous and gas mass on fixed pore volumes.
+
+    Volumes are in m3, solubility and gas density in g/L, and elapsed time in
+    hours. The optical reference fixes the signal scale; explicit concentration
+    parameters and an observed injection-end anchor control the mass law.
+    """
     if not reference.usable:
         raise ValueError("Joint optical reference has no reliable positive span")
     signal = joint_optical_signals(rgb, reference)["joint_chromatic_od"]
@@ -147,7 +153,7 @@ def evaluate_joint_fields(rgb, reference: JointReference, av, gv, solubility, de
 
 
 def summarize_frame(signal, av, gv, solubility, density, *, run, elapsed_h, injected_g,
-                    bins=8192, max_signal=8., **metadata):
+                    bins, max_signal, **metadata):
     """Compact capacity-weighted input; exact zero is separate from positive bins.
 
     The final positive bin contains the tail above ``max_signal``; its capacity
@@ -193,6 +199,11 @@ def _validate_summary(summary):
 
 
 def endpoint_from_summaries(summaries, indices):
+    """Choose the capacity-weighted positive optical endpoint from training rows.
+
+    The dimensionless endpoint excludes the exact-zero signal bin and uses
+    only the supplied observation indices, preserving stable quantile order.
+    """
     selected = [summaries[int(i)] for i in indices]
     if not selected:
         raise ValueError("Endpoint requires training observations")
@@ -210,6 +221,11 @@ def endpoint_from_summaries(summaries, indices):
 
 
 def anchor_from_summaries(summaries):
+    """Locate the first observed end of injection on a strictly ordered timeline.
+
+    Dose is measured in grams, time in hours, and affected pore volume in m3.
+    A declared final dose must be consistent and reached by an observation.
+    """
     if not summaries or any(b["elapsed_h"] <= a["elapsed_h"] for a, b in zip(summaries, summaries[1:])):
         raise ValueError("Injection timeline must be strictly ordered")
     declared = {float(row["expected_final_injected_mass_g"]) for row in summaries
@@ -230,6 +246,12 @@ def anchor_from_summaries(summaries):
 
 
 def evaluate_joint_summary(summary, parameters, anchor):
+    """Evaluate phase masses and histogram quantization bounds in grams.
+
+    Explicit optical parameters map capacity-weighted signal bins to aqueous
+    concentration; the anchor supplies observed injection-end time and volume.
+    Gas occupancy also accounts for the residual aqueous liquid in gas pores.
+    """
     values, weights = _validate_summary(summary)
     p = _parameters(parameters)
     factor = dilution_factor(summary["elapsed_h"], summary["affected_pore_volume_m3"], anchor, p.beta)
@@ -256,11 +278,21 @@ def evaluate_joint_summary(summary, parameters, anchor):
 
 
 def predict_joint_summaries(summaries_by_run, parameters_by_run, anchors_by_run):
+    """Evaluate ordered frame summaries using each run's parameters and anchor.
+
+    Each returned row reports aqueous, gas, and total mass in grams together
+    with the numerical bounds from the unchanged histogram representation.
+    """
     return {run: [evaluate_joint_summary(row, parameters_by_run[run], anchors_by_run[run])
                   for row in rows] for run, rows in summaries_by_run.items()}
 
 
 def joint_mass_metrics(predictions, indices=None):
+    """Measure mass error against positive injection observations.
+
+    RMSE uses grams; normalized errors use the observed dose with the existing
+    final-dose floor. Optional indices select observations independently per run.
+    """
     by_run, all_errors, all_normalized = {}, [], []
     for run, rows in predictions.items():
         chosen = list(range(len(rows))) if indices is None else list(indices.get(run, ()))
@@ -407,7 +439,7 @@ def _fit_broader_objective(objective, legacy_starts, bounds, settings):
 
 def fit_joint_summaries(summaries_by_run, *, scope="individual", gas_bounds=DEFAULT_GAS_BOUNDS,
                         training_indices_by_run=None, optimization_settings=None,
-                        overflow_mode="off", overflow_references=(), overflow_weight=.25):
+                        overflow_mode="off", overflow_references=(), overflow_weight):
     """Fit common response parameters with equal experiment objective weights.
 
     Each run retains its reference images and observed injection-end anchor.

@@ -89,20 +89,20 @@ def resolve_project_package_root(selection: Path) -> Path:
     )
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_json(path: Path, payload: Mapping[str, Any], *, copy_payload: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(dict(payload) if copy_payload else payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     os.replace(temporary, path)
 
 
-def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+def _append_jsonl(path: Path, payload: Mapping[str, Any], *, copy_payload: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        stream.write(json.dumps(dict(payload) if copy_payload else payload, ensure_ascii=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
 
