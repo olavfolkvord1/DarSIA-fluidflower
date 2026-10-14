@@ -8,6 +8,9 @@ eligible for training. A separate native-boundary audit must do that.
 
 from __future__ import annotations
 
+from darsia.fluidflower.native import sidecar as _sidecar
+from darsia.fluidflower.native.config import require_parameters
+
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -359,24 +362,7 @@ def _write_new(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-@dataclass(frozen=True)
-class CorrectedFrame:
-    """One rendered v5 frame in the original native content coordinates.
-
-    ``rgb`` is display RGB (not log-linear RAW) in H×W×3, float32, range 0–1.
-    The phase trainer and map inference use ``log_linear_rgb`` instead.
-    ``certificate`` holds the source-specific RAW→native alignment and v5 fit.
-    """
-
-    rgb: np.ndarray
-    log_linear_rgb: np.ndarray
-    certificate: dict[str, Any]
-    extended_log_linear_rgb: np.ndarray | None = None
-    required_valid_mask: np.ndarray | None = None
-    filled_invalid_mask: np.ndarray | None = None
-    display_modes: dict[str, np.ndarray] | None = None
-    photo_sand_mask: np.ndarray | None = None
-    display_invalid_mask: np.ndarray | None = None
+from darsia.fluidflower.native.sidecar import CorrectedFrame
 
 
 class FrameProcessor(Protocol):
@@ -548,10 +534,10 @@ def _validate_output(
     if rgb.shape != (*expected_shape, 3) or rgb.dtype != np.float32:
         raise ValueError("V5 output must be float32 RGB on the exact native content grid")
     if not np.all(np.isfinite(rgb)) or rgb.min() < 0 or rgb.max() > 1:
-        raise ValueError("V5 display output is nonfinite or outside RGB 0–1")
+        raise ValueError("V5 display output is nonfinite or outside RGB 0â€“1")
     log_linear = np.asarray(frame.log_linear_rgb)
     if log_linear.shape != (3, *expected_shape) or log_linear.dtype != np.float32:
-        raise ValueError("V5 linear sidecar must be native 3×H×W float32")
+        raise ValueError("V5 linear sidecar must be native 3Ã—HÃ—W float32")
     if np.isinf(log_linear).any():
         raise ValueError("V5 linear sidecar contains infinite RAW values")
     valid = np.all(np.isfinite(log_linear), axis=0)
@@ -570,7 +556,7 @@ def _validate_output(
         raise ValueError("More than 0.1% of the V5 native linear signal is nonfinite")
     certificate = frame.certificate
     if not isinstance(certificate, dict) or not certificate.get("transform_sha256"):
-        raise ValueError("V5 frame lacks its RAW→native transform certificate")
+        raise ValueError("V5 frame lacks its RAWâ†’native transform certificate")
     if source.get("camera_members"):
         expected_members = [{"camera_jpeg_sha256": r["camera_jpeg_sha256"],
                              "camera_arw_sha256": r["camera_arw_sha256"]}
@@ -629,152 +615,30 @@ def _validate_output(
     return rgb, log_linear
 
 
-def _fixed_float_input_qa(log_linear: np.ndarray, *,
-                          required_valid_mask: np.ndarray | None = None) -> dict[str, Any]:
-    """Fail before writing any clipped scientific feature source."""
-    valid = np.all(np.isfinite(log_linear), axis=0)
-    invalid_fraction = float(1 - np.mean(valid))
-    if (not np.any(valid) or (required_valid_mask is None and invalid_fraction > .001)):
-        raise ValueError("V5 corrected float source has excessive invalid pixels")
-    if required_valid_mask is not None:
-        if (required_valid_mask.dtype != np.dtype("bool")
-                or required_valid_mask.shape != valid.shape
-                or not required_valid_mask.any()
-                or np.any(required_valid_mask & ~valid)):
-            raise ValueError("V4-R3 required photo/sensor support contains invalid float pixels")
-    finite_log = log_linear[:, valid]
-    maxima_log = np.max(finite_log, axis=1)
-    if np.any(maxima_log > np.log(65535.0)):
-        raise ValueError("V5 corrected camera-linear signal exceeds 16-bit unit denominator")
-    return dict(contract="ffac-v5-float32-sidecar-nonclipping-v1",
-                unit_denominator=65535,
-                valid_pixel_fraction=float(np.mean(valid)),
-                invalid_pixel_fraction=invalid_fraction,
-                max_corrected_linear_by_channel=[float(x) for x in np.exp(maxima_log)],
-                max_corrected_linear=float(np.exp(np.max(maxima_log))),
-                fixed_input_nonclipping_pass=True,
-                invalid_policy=(EXACT_VALID_MASK_POLICY if required_valid_mask is not None
-                                else "legacy_fraction_v1"),
-                required_valid_pixels=(int(np.count_nonzero(required_valid_mask))
-                                       if required_valid_mask is not None else None))
+def _fixed_float_input_qa(log_linear, *, required_valid_mask=None):
+    return _sidecar.fixed_float_input_qa(log_linear,required_valid_mask=required_valid_mask,
+        parameters=require_parameters('sidecar'))
 
 
-def _write_v4_ring(path: Path, frame: CorrectedFrame, native_log: np.ndarray,
-                   *, pad_px: int) -> dict[str, Any]:
-    """Seal only RAW-observed border strips; retain their invalidity mask."""
-    from darsia.fluidflower.tools.ffac_v5_extended_reference import (
-        CONTRACT as RING_CONTRACT, write_extended_ring,
-    )
-
-    padded = frame.extended_log_linear_rgb
-    if padded is None:
-        raise ValueError("V4 processor did not return a source-backed RAW border")
-    padded = np.asarray(padded)
-    valid = np.isfinite(padded).all(axis=0)
-    if not np.any(valid) or np.isinf(padded).any():
-        raise ValueError("V4 extended RAW source has no valid sensor signal")
-    if np.max(padded[:, valid]) > np.log(65535.0):
-        raise ValueError("V4 extended RAW source exceeds fixed input denominator")
-    digest, difference = write_extended_ring(
-        path, padded, native_log, pad_px=pad_px)
-    return dict(contract=RING_CONTRACT,
-        v5_extended_ring_path=str(path), v5_extended_ring_sha256=digest,
-        v5_extended_pad_px=pad_px,
-        v5_extended_origin_xy=[-pad_px, -pad_px],
-        extended_native_center_max_abs_delta_log=difference,
-        extended_valid_pixels=int(np.count_nonzero(valid)),
-        extended_invalid_pixels=int(np.count_nonzero(~valid)),
-        extended_valid_fraction=float(np.mean(valid)),
-        extended_max_corrected_linear=float(np.exp(np.max(padded[:, valid]))),
-        invalid_sensor_pixels_preserved=True)
+def _write_v4_ring(path, frame, native_log, *, pad_px):
+    return _sidecar.write_frame_ring(path,frame,native_log,pad_px=pad_px,parameters=require_parameters('extended_ring'))
 
 
-def _raw_detail_display(log_linear: np.ndarray) -> np.ndarray:
-    """Fixed campaign-wide detail view; never used for phase features."""
-    low, high = np.log(2.0), np.log(65535.0)
-    normalized = np.clip((np.nan_to_num(log_linear, nan=low) - low)
-                         / (high - low), 0, 1)
-    rgb = np.moveaxis(np.power(normalized, .75), 0, -1).astype(np.float32)
-    rgb[~np.isfinite(log_linear).all(axis=0)] = 1.0
-    return rgb
+def _raw_detail_display(log_linear):
+    return _sidecar.raw_detail_display(log_linear,parameters=require_parameters('sidecar'))
 
 
-def _write_log_linear(path: Path, values: np.ndarray) -> str:
-    """Retain the exact full-resolution scientific signal separately from JPEG."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.pending")
-    try:
-        with temporary.open("xb") as stream:
-            np.save(stream, np.ascontiguousarray(values), allow_pickle=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = file_sha256(temporary)
-        if path.exists():
-            if file_sha256(path) != digest:
-                raise ValueError(f"Unreceipted V5 linear output differs from recomputation: {path}")
-        else:
-            os.replace(temporary, path)
-        return digest
-    finally:
-        temporary.unlink(missing_ok=True)
+def _write_log_linear(path, values):
+    return _sidecar.write_log_linear(path,values)
 
 
-def _copy_verified(source: Path, destination: Path, expected_sha256: str) -> str:
-    """Copy a frozen timeline output with atomic receipt-safe resume."""
-    if file_sha256(source) != expected_sha256:
-        raise ValueError(f"Frozen timeline output changed before baseline copy: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if file_sha256(destination) != expected_sha256:
-            raise ValueError(f"Unreceipted baseline copy differs from source: {destination}")
-        return expected_sha256
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.pending")
-    try:
-        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing, length=1 << 20)
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
-        if file_sha256(temporary) != expected_sha256:
-            raise ValueError("Baseline temporary copy differs from frozen timeline")
-        if destination.exists():
-            if file_sha256(destination) != expected_sha256:
-                raise ValueError(f"Concurrent baseline output differs: {destination}")
-        else:
-            os.replace(temporary, destination)
-        return expected_sha256
-    finally:
-        temporary.unlink(missing_ok=True)
+def _copy_verified(source,destination,expected_sha256):
+    return _sidecar.copy_verified(source,destination,expected_sha256)
 
 
-def _frame_output(
-    rgb: np.ndarray, *, run: str, index: int, count: int,
-    elapsed_h: float, canvas_wh: tuple[int, int], destination: Path,
-) -> str:
-    canvas = _plain_frame(rgb, run=run, index=index, count=count,
-                          elapsed_h=elapsed_h, width=canvas_wh[0],
-                          height=canvas_wh[1], native=True)
-    if canvas.shape[:2] != tuple(reversed(canvas_wh)):
-        raise ValueError("Renderer changed the native review canvas geometry")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    # The JPEG is a Studio display asset. The V5 phase trainer reads the
-    # SHA-bound float32 log-linear sidecar; no clipped display values may enter
-    # the optical/regional fit.
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.pending")
-    try:
-        with temporary.open("xb") as stream:
-            Image.fromarray(np.asarray(canvas, np.uint8), "RGB").save(
-                stream, format="JPEG", quality=100, subsampling=0)
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = file_sha256(temporary)
-        if destination.exists():
-            if file_sha256(destination) != digest:
-                raise ValueError(f"Unreceipted V5 JPEG differs from recomputation: {destination}")
-        else:
-            os.replace(temporary, destination)
-        return digest
-    finally:
-        temporary.unlink(missing_ok=True)
+def _frame_output(rgb, *, run,index,count,elapsed_h,canvas_wh,destination):
+    return _sidecar.write_display_jpeg(rgb,run=run,index=index,count=count,elapsed_h=elapsed_h,
+        canvas_wh=canvas_wh,destination=destination,renderer=_plain_frame,parameters=require_parameters('sidecar'))
 
 
 _AUXILIARY_OUTPUT_KEYS = ("v5_display_modes", "v5_photo_sand_mask_path",
@@ -783,54 +647,17 @@ _AUXILIARY_OUTPUT_KEYS = ("v5_display_modes", "v5_photo_sand_mask_path",
     "v5_display_invalid_mask_sha256")
 
 
-def _write_display_invalid_mask(path: Path, mask: np.ndarray) -> str:
-    """Retain the pre-cleanup full-frame invalid support in a compact archive."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.pending")
-    try:
-        with temporary.open("xb") as stream:
-            np.savez_compressed(stream, invalid_mask=np.ascontiguousarray(mask))
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = file_sha256(temporary)
-        if path.exists():
-            if file_sha256(path) != digest:
-                raise ValueError(f"Unreceipted display-invalid mask differs: {path}")
-        else:
-            os.replace(temporary, path)
-        return digest
-    finally:
-        temporary.unlink(missing_ok=True)
+def _write_display_invalid_mask(path, mask):
+    return _sidecar.write_display_invalid_mask(path,mask,parameters=require_parameters('sidecar'))
 
 
-def _auxiliary_output_fields(record: dict[str, Any]) -> dict[str, Any]:
-    return {key: record[key] for key in _AUXILIARY_OUTPUT_KEYS if key in record}
+def _auxiliary_output_fields(record):
+    return _sidecar.auxiliary_output_fields(record,parameters=require_parameters('sidecar'))
 
 
-def _write_auxiliary_outputs(frame: CorrectedFrame, target: Path, native_sha256: str,
-        *, run: str, index: int, count: int, elapsed_h: float,
-        canvas_wh: tuple[int, int]) -> dict[str, Any]:
-    """Write opt-in view/repair assets atomically beside the unchanged float grid."""
-    output = {}
-    for field, values in (("photo_sand", frame.photo_sand_mask),
-                          ("filled_invalid", frame.filled_invalid_mask)):
-        if values is not None:
-            path = target.with_name(f"{target.stem}.{field}_mask.npy")
-            output[f"v5_{field}_mask_path"] = str(path)
-            output[f"v5_{field}_mask_sha256"] = _write_log_linear(path, values)
-    if frame.display_modes is not None:
-        invalid_path = target.with_name(f"{target.stem}.display_invalid_mask.npz")
-        output["v5_display_invalid_mask_path"] = str(invalid_path)
-        output["v5_display_invalid_mask_sha256"] = _write_display_invalid_mask(
-            invalid_path, frame.display_invalid_mask)
-        modes = {"natural": dict(jpeg_path=str(target), jpeg_sha256=native_sha256)}
-        for mode in ("lift1", "lift2"):
-            path = target.with_name(f"{target.stem}.{mode}.jpg")
-            digest = _frame_output(frame.display_modes[mode], run=run, index=index,
-                count=count, elapsed_h=elapsed_h, canvas_wh=canvas_wh, destination=path)
-            modes[mode] = dict(jpeg_path=str(path), jpeg_sha256=digest)
-        output["v5_display_modes"] = modes
-    return output
+def _write_auxiliary_outputs(frame,target,native_sha256,*,run,index,count,elapsed_h,canvas_wh):
+    return _sidecar.write_auxiliary_outputs(frame,target,native_sha256,run=run,index=index,count=count,
+        elapsed_h=elapsed_h,canvas_wh=canvas_wh,renderer=_plain_frame,parameters=require_parameters('sidecar'))
 
 
 def _verify_auxiliary_outputs(record: dict[str, Any], identity: dict[str, Any],

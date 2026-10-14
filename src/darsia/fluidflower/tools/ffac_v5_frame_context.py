@@ -11,6 +11,9 @@ manual-validation context and cannot establish scientific mass eligibility.
 
 from __future__ import annotations
 
+from darsia.fluidflower.native import support as _support
+from darsia.fluidflower.native.config import require_parameters
+
 from functools import lru_cache
 from hashlib import sha256
 import json
@@ -40,152 +43,28 @@ PHOTO_SAFE_CORE_HOLE_MAX_AREA_PX = 60_000
 PHOTO_SAFE_CORE_VERTICAL_GAP_MAX_PX = 64
 
 
-def photo_safe_core_policy_metadata(enclosed_hole_policy: str = "keep"
-                                    ) -> dict[str, Any]:
-    """Describe the fixed native-pixel support policy without inferring colour.
-
-    Missing policy in an older manifest means ``keep``.  A filled revision
-    must explicitly select ``fill_enclosed_v1``; neither the area cap nor the
-    connectivity can be changed by a manifest.
-    """
-    if (not isinstance(enclosed_hole_policy, str)
-            or enclosed_hole_policy not in ("keep", "fill_enclosed_v1")):
-        raise ValueError("Unknown V5 source-photo enclosed-hole policy")
-    metadata = dict(
-        photo_sand_support_contract=(PHOTO_SAFE_CORE_CONTRACT
-            if enclosed_hole_policy == "keep" else PHOTO_SAFE_CORE_FILLED_CONTRACT),
-        enclosed_hole_policy=enclosed_hole_policy,
-        enclosed_hole_max_area_px=PHOTO_SAFE_CORE_HOLE_MAX_AREA_PX,
-        enclosed_hole_connectivity=8,
-        fixed_native_mask_erosion_px=PHOTO_SAFE_CORE_GUARD_PX,
-    )
-    if enclosed_hole_policy == "fill_enclosed_v1":
-        metadata.update(vertical_gap_max_length_px=PHOTO_SAFE_CORE_VERTICAL_GAP_MAX_PX,
-                        vertical_gap_rule="same_column_supported_above_and_below_v1")
-    return metadata
+def photo_safe_core_policy_metadata(enclosed_hole_policy: str = "keep") -> dict[str, Any]:
+    """Retained entry point; policy values come from explicit configuration."""
+    return _support.photo_safe_core_policy_metadata(enclosed_hole_policy, parameters=require_parameters('support'))
 
 
-def apply_photo_safe_core_enclosed_holes(
-    safe: np.ndarray, *, enclosed_hole_policy: str = "keep",
-    return_rule_masks: bool = False,
-) -> (tuple[np.ndarray, dict[str, Any]]
-      | tuple[np.ndarray, dict[str, Any], dict[str, np.ndarray]]):
-    """Apply both fixed support rules to an already eroded sand core.
-
-    Rule 1 uses 8-connected complement components of at most 60,000 px that
-    do not touch a native border. Rule 2 then fills vertical invalid runs of
-    at most 64 px, supported directly above and below in the same column.
-    The rules never remove existing support, including the lower sand strip.
-    """
-    core = np.asarray(safe)
-    if core.ndim != 2 or core.dtype != np.bool_ or min(core.shape) <= 0:
-        raise ValueError("V5 source-photo safe core must be nonempty HW bool")
-    metadata = photo_safe_core_policy_metadata(enclosed_hole_policy)
-    added_pixels = added_components = 0
-    enclosed = np.zeros(core.shape, dtype=bool) if return_rule_masks else None
-    vertical = np.zeros(core.shape, dtype=bool) if return_rule_masks else None
-    vertical_pixels = vertical_runs = 0
-    if enclosed_hole_policy == "fill_enclosed_v1":
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(
-            (~core).astype(np.uint8), connectivity=8, ltype=cv2.CV_32S)
-        selected = np.zeros(count, dtype=bool)
-        component = stats[1:]
-        if len(component):
-            left = component[:, cv2.CC_STAT_LEFT]
-            top = component[:, cv2.CC_STAT_TOP]
-            right = left + component[:, cv2.CC_STAT_WIDTH]
-            bottom = top + component[:, cv2.CC_STAT_HEIGHT]
-            area = component[:, cv2.CC_STAT_AREA]
-            selected[1:] = ((left > 0) & (top > 0)
-                & (right < core.shape[1]) & (bottom < core.shape[0])
-                & (area <= PHOTO_SAFE_CORE_HOLE_MAX_AREA_PX))
-            added_components = int(np.count_nonzero(selected))
-            added_pixels = int(np.sum(stats[selected, cv2.CC_STAT_AREA], dtype=np.int64))
-        rule1 = selected[labels]
-        if return_rule_masks:
-            enclosed = rule1
-        core = core | rule1
-        # A vertical morphological close with a 65-pixel kernel fills exactly
-        # gaps <=64 px. Explicit zero padding keeps this property even when
-        # the bounding support lies on the first/last native image row; it
-        # never treats pixels beyond the image as valid support.
-        pad = PHOTO_SAFE_CORE_VERTICAL_GAP_MAX_PX
-        padded = np.pad(core.astype(np.uint8), ((pad, pad), (0, 0)))
-        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE,
-            np.ones((pad + 1, 1), np.uint8),
-            borderType=cv2.BORDER_CONSTANT, borderValue=0)[pad:-pad].astype(bool)
-        rule2 = closed & ~core
-        vertical_pixels = int(np.count_nonzero(rule2))
-        vertical_runs = int(np.count_nonzero(rule2[0])) + int(
-            np.count_nonzero(rule2[1:] & ~rule2[:-1]))
-        if return_rule_masks:
-            vertical = rule2
-        core = core | rule2
-    metadata.update(enclosed_hole_added_pixel_count=added_pixels,
-                    enclosed_hole_added_component_count=added_components)
-    if enclosed_hole_policy == "fill_enclosed_v1":
-        metadata.update(vertical_gap_added_pixel_count=vertical_pixels,
-                        vertical_gap_added_run_count=vertical_runs,
-                        photo_sand_support_added_pixel_count=added_pixels + vertical_pixels)
-    if return_rule_masks:
-        return core, metadata, {"enclosed_rule1": enclosed,
-                                "vertical_gap_rule2": vertical}
-    return core, metadata
+def apply_photo_safe_core_enclosed_holes(safe, *, enclosed_hole_policy="keep", return_rule_masks=False):
+    """Delegate the unchanged support operation to the native core."""
+    return _support.apply_photo_safe_core_enclosed_holes(safe, enclosed_hole_policy=enclosed_hole_policy,
+        return_rule_masks=return_rule_masks, parameters=require_parameters('support'))
 
 
-def project_source_photo_safe_core(
-    sand_grid: np.ndarray, h_ac28_to_frame_native: np.ndarray, *,
-    shape_hw: tuple[int, int] = SHAPE,
-    guard_px: int = PHOTO_SAFE_CORE_GUARD_PX,
-    enclosed_hole_policy: str = "keep",
-    return_metadata: bool = False,
-) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
-    """Transport a source-photo B sand core, without classifying frame colour.
-
-    The 382×710 grid has 8 px cells and AC28 cell origin (-16, 0).
-    Current-frame annotations and RAW pixels never move.  Eight native pixels
-    are removed at every projected support edge.  The default keeps that
-    original support unchanged.  Explicit ``fill_enclosed_v1`` then fills
-    enclosed complement components of at most 60,000 native pixels, followed
-    by vertically bounded invalid gaps of at most 64 pixels.
-    """
-    grid = np.asarray(sand_grid)
-    if grid.shape != (382, 710) or grid.dtype != np.bool_:
-        raise ValueError("V5 source-photo B sand core must be bool 382x710")
-    if not isinstance(guard_px, int) or guard_px != PHOTO_SAFE_CORE_GUARD_PX:
-        raise ValueError("V5 source-photo boundary guard changed")
-    if len(shape_hw) != 2 or min(shape_hw) <= 0:
-        raise ValueError("V5 source-photo destination shape is invalid")
-    photo_safe_core_policy_metadata(enclosed_hole_policy)
-    h = _normal_h(h_ac28_to_frame_native)
-    # A cell centre (column 0,row 0) is (-124,4) in the AC28 native grid.
-    cell_to_ac28 = np.array([[8.0, 0.0, -124.0],
-                             [0.0, 8.0, 4.0],
-                             [0.0, 0.0, 1.0]], dtype=np.float64)
-    projected = cv2.warpPerspective(
-        grid.astype(np.uint8), h @ cell_to_ac28,
-        (int(shape_hw[1]), int(shape_hw[0])), flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    kernel = np.ones((2 * guard_px + 1, 2 * guard_px + 1), np.uint8)
-    safe = cv2.erode(projected, kernel, iterations=1,
-                     borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
-    safe, metadata = apply_photo_safe_core_enclosed_holes(
-        safe, enclosed_hole_policy=enclosed_hole_policy)
-    return (safe, metadata) if return_metadata else safe
+def project_source_photo_safe_core(sand_grid, h_ac28_to_frame_native, *, shape_hw=SHAPE,
+                                    guard_px=PHOTO_SAFE_CORE_GUARD_PX,
+                                    enclosed_hole_policy="keep", return_metadata=False):
+    """Retain historical call coordinates while delegating numerical work."""
+    return _support.project_source_photo_safe_core(sand_grid, h_ac28_to_frame_native,
+        shape_hw=shape_hw, guard_px=guard_px, enclosed_hole_policy=enclosed_hole_policy,
+        return_metadata=return_metadata, parameters=require_parameters('support'))
 
 
-@lru_cache(maxsize=16)
 def _source_photo_grid(path: str, digest: str) -> np.ndarray:
-    source = Path(path)
-    _check(source, digest, "source-photo B sand core")
-    with np.load(source, allow_pickle=False) as archive:
-        if "sand" not in archive.files:
-            raise ValueError("Source-photo B mask lacks its sand grid")
-        sand = np.asarray(archive["sand"])
-    if sand.shape != (382, 710) or sand.dtype != np.bool_:
-        raise ValueError("Source-photo B mask has another grid or dtype")
-    sand.setflags(write=False)
-    return sand
+    return _support.source_photo_grid(path, digest, parameters=require_parameters('support'))
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -219,59 +98,17 @@ def _check_static_once(path: Path, digest: str, label: str,
 
 
 def _normal_h(value: Any) -> np.ndarray:
-    h = np.asarray(value, np.float64)
-    if (h.shape != (3, 3) or not np.isfinite(h).all()
-            or abs(float(np.linalg.det(h))) < 1e-9
-            or abs(float(h[2, 2])) < 1e-9):
-        raise ValueError("V5 per-frame homography is invalid")
-    return h / h[2, 2]
+    return _support._normal_h(value, parameters=require_parameters('support'))
 
 
-def compute_feature_support(
-    *, current_valid: np.ndarray, baseline_valid: np.ndarray,
-    h_baseline_to_current: np.ndarray,
-    previous_valid: np.ndarray | None = None,
-    h_baseline_to_previous: np.ndarray | None = None,
-    baseline_origin_xy: tuple[int, int] = (0, 0),
-    previous_origin_xy: tuple[int, int] = (0, 0),
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply the common source-footprint and fixed texture-support policy."""
-    current = np.asarray(current_valid)
-    baseline = np.asarray(baseline_valid)
-    if (current.ndim != 2 or current.dtype != np.bool_
-            or baseline.ndim != 2 or baseline.dtype != np.bool_):
-        raise ValueError("V5 feature source masks must be HW bool")
-    if previous_valid is not None:
-        previous = np.asarray(previous_valid)
-        if (previous.ndim != 2 or previous.dtype != np.bool_
-                or h_baseline_to_previous is None):
-            raise ValueError("V5 previous source needs its exact bool mask and H")
-    else:
-        previous = None
-    if len(baseline_origin_xy) != 2 or len(previous_origin_xy) != 2:
-        raise ValueError("V5 feature source origin is not native XY")
-
-    def project(valid: np.ndarray, origin: tuple[int, int],
-                h_native_to_current: np.ndarray) -> np.ndarray:
-        source_to_native = np.array([[1., 0., origin[0]],
-                                     [0., 1., origin[1]],
-                                     [0., 0., 1.]], np.float64)
-        h = _normal_h(_normal_h(h_native_to_current) @ source_to_native)
-        coverage = cv2.warpPerspective(
-            valid.astype(np.float32), h, (current.shape[1], current.shape[0]),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0.0)
-        return coverage >= np.float32(1 - 1e-6)
-
-    b_to_current = _normal_h(h_baseline_to_current)
-    raw = current & project(baseline, baseline_origin_xy, b_to_current)
-    if previous is not None:
-        previous_to_current = _normal_h(b_to_current @ np.linalg.inv(
-            _normal_h(h_baseline_to_previous)))
-        raw &= project(previous, previous_origin_xy, previous_to_current)
-    safe = cv2.erode(raw.astype(np.uint8), np.ones((17, 17), np.uint8),
-                     iterations=1).astype(bool)
-    return safe, raw
+def compute_feature_support(*, current_valid, baseline_valid, h_baseline_to_current,
+                            previous_valid=None, h_baseline_to_previous=None,
+                            baseline_origin_xy=(0, 0), previous_origin_xy=(0, 0)):
+    """Delegate source footprint intersections without changing their coordinate origins."""
+    return _support.compute_feature_support(current_valid=current_valid,baseline_valid=baseline_valid,
+        h_baseline_to_current=h_baseline_to_current,previous_valid=previous_valid,
+        h_baseline_to_previous=h_baseline_to_previous,baseline_origin_xy=baseline_origin_xy,
+        previous_origin_xy=previous_origin_xy,parameters=require_parameters('support'))
 
 
 def verify_frame_geometry(receipt_path: Path, source_manifest_path: Path, *,
@@ -383,7 +220,7 @@ def verify_frame_geometry(receipt_path: Path, source_manifest_path: Path, *,
     crossrun = _read(Path(receipt["crossrun_geometry_receipt_path"]))
     # The photometric B image is a distinct acquisition from timeline frame 0
     # for eleven runs.  Both source coordinate systems must be explicit: an
-    # identity B→frame0 H may only be certified from the exact B source, not
+    # identity BÃ¢â€ â€™frame0 H may only be certified from the exact B source, not
     # inferred from run or frame number.
     h_timeline_to_frame = _normal_h(receipt.get("H_timeline0_to_frame_native"))
     h_b_to_timeline = _normal_h(receipt.get("H_v5_B_to_timeline0_native"))
@@ -640,12 +477,12 @@ class V5FrameGeometryCohort:
                                     expected_shape_hw=self.shape_hw), binding
 
     def H_v5_B_to_frame(self, index: int) -> np.ndarray:
-        """Exact corrected V5 B review → current native frame transform."""
+        """Exact corrected V5 B review Ã¢â€ â€™ current native frame transform."""
         return _normal_h(self.frame(index)["H_v5_B_to_frame_native"])
 
     def H_previous_to_frame(self, previous_index: int,
                             index: int) -> np.ndarray:
-        """Previous native frame → current native frame via common B anchor."""
+        """Previous native frame Ã¢â€ â€™ current native frame via common B anchor."""
         current = self.H_v5_B_to_frame(index)
         previous = self.H_v5_B_to_frame(previous_index)
         return _normal_h(current @ np.linalg.inv(previous))
