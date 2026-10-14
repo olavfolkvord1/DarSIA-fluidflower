@@ -9,10 +9,10 @@ from ..native.config import require_parameters
 Baseline = _core.Baseline
 
 def __getattr__(name):
+    if name not in {"GRID", "NATIVE", "GB_SAT", "LIGHT_WEIGHTS"}:
+        raise AttributeError(name)
     p = require_parameters("photometry")
     values = {"GRID": lambda: tuple(p["grid_shape_hw"]), "NATIVE": lambda: tuple(p["native_shape_hw"]), "GB_SAT": lambda: p["green_blue_saturation"], "LIGHT_WEIGHTS": lambda: __import__("numpy").array(p["light_weights"], dtype="float64")}
-    if name not in values:
-        raise AttributeError(name)
     return values[name]()
 
 def _log_rgb(a, shape=None):
