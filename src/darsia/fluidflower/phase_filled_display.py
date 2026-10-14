@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .phase_pixel_area import load_rig_classes
+from .phase_pixel_area import load_rig_classes, rig_phase_shape
+from .phase_rig_display_canvas import pad_rig_display_mask
 
 
 def resolve_filled_display_mask(review_root, run, frame_index, *, canvas=True):
@@ -23,10 +24,17 @@ def resolve_filled_display_mask(review_root, run, frame_index, *, canvas=True):
     if revision is None:
         return None
     if tuple(revision["canvas_wh"]) != tuple(native["canvas_wh"]):
-        raise ValueError("Filled display flags belong to another review canvas")
+        # A saved full-rig view may use the declared phase grid, whose extra
+        # bottom rows extend the unchanged photographic canvas. Require both
+        # explicit grid bindings; no arbitrary resize, crop or shift is allowed.
+        phase_shape = rig_phase_shape(revision)
+        if (tuple(native["canvas_wh"])[::-1] != phase_shape
+                or tuple(native.get("phase_shape_hw", ())) != phase_shape):
+            raise ValueError("Filled display flags belong to another review canvas")
     shape = None if canvas else tuple(native["analysis_image_shape_hw"])
     fields, _ = load_rig_classes(revision, base_dir=path.parent, shape_hw=shape)
-    return fields["filled_observed"] | fields["filled_unobserved"]
+    filled = fields["filled_observed"] | fields["filled_unobserved"]
+    return pad_rig_display_mask(filled, revision, manifest=native) if canvas else filled
 
 
 def hatch_filled_rgba(rgba, filled_mask, *, enabled=True, period=12, phase_visible=True):
