@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 SOURCES = Path(__file__).resolve().parents[2] / "src/darsia/fluidflower"
-spec = importlib.util.spec_from_file_location("retained_products_unit", SOURCES / "production_retained.py")
+spec = importlib.util.spec_from_file_location("darsia.fluidflower.retained_products_unit", SOURCES / "production_retained.py")
 retained = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(retained)
 
@@ -48,7 +48,7 @@ def synthetic(monkeypatch):
         prepared=SimpleNamespace(aqueous_relative=np.asarray((value+.51)*.003, np.float32)),
         linear_relative=np.zeros(shape, np.float32), swi=np.full(shape, .231),
         frozen_parameters=parameters)
-    dilution = definitions("concentration_joint.py", {"DilutionAnchor", "_anchor", "dilution_factor"},
+    dilution = definitions("mass/concentration_joint.py", {"DilutionAnchor", "_anchor", "dilution_factor"},
                            dict(np=np, dataclass=dataclass, Mapping=Mapping, __name__=__name__))
     volume = np.where(known, frame.pixel_area_m2*frame.depth_m*frame.porosity, 0.)
     geometry_tree = ast.parse((SOURCES.parent / "measure/integration.py").read_text(encoding="utf-8"))
