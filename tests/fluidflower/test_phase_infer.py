@@ -929,3 +929,151 @@ def test_full_infer_labels_rejects_wrong_predecessor_before_pixels(
         infer.infer_labels(frame, None, bundle, p)
     with pytest.raises(ValueError, match="another predecessor"):
         infer.infer_labels(frame, {"source": {"source_sha256": "c" * 64}}, bundle, p)
+
+
+@pytest.mark.parametrize("anchor", [False, True])
+def test_series_photo_geometry_reaches_actual_native_and_rig_inference(
+    monkeypatch, rule_parameters, domain_parameters, anchor
+):
+    """The admitted geometric mask must reach inference in both source routes.
+
+    Only source asset reads are substituted. Masking, temporal composition,
+    measured-area recipe, static-component transport and all phase maths execute.
+    """
+    from darsia.fluidflower.native import support
+    from darsia.fluidflower.phase import inputs
+    from darsia.fluidflower.pipeline import phase_inputs as loaders
+    from darsia.fluidflower.pipeline.series import SeriesInputs
+
+    seed, bundle, p = _full_inputs(rule_parameters, domain_parameters)
+    shape = seed["full_valid"].shape
+    full = seed["full_log"].copy()
+    valid = seed["full_valid"].copy()
+    photo = valid.copy()
+    photo[0, 0] = False
+    input_data = json.loads(
+        (Path(__file__).parent / "fixtures" / "phase_input_parameters.json").read_bytes()
+    )
+    p["inputs"] = input_data["inputs"]
+    p["retained"] = input_data["retained"]
+    policy = dict(contract=p["inputs"]["contract"], pad_px=0, origin_xy=[0, 0])
+    support_parameters = dict(
+        keep_policy="keep", fill_policy="fill", keep_contract="keep",
+        fill_contract="fill", hole_max_area_px=0, connectivity=8,
+        guard_px=0, vertical_gap_max_px=1, vertical_gap_rule="bounded",
+        grid_shape_hw=list(shape), grid_archive_key="sand",
+        cell_to_reference_native=np.eye(3).tolist(), homography_epsilon=1e-9,
+        coverage_tolerance=1e-6, texture_footprint_hw=[3, 3],
+    )
+    projected = support.project_source_photo_safe_core(
+        photo, np.eye(3), shape_hw=shape, guard_px=0,
+        enclosed_hole_policy="fill", parameters=support_parameters,
+    )
+    expected_photo = photo if anchor else projected
+    proof = dict(sha256="d" * 64, phase_labels_used=False)
+    source = copy.deepcopy(seed["source"])
+    source.update(studio_anchor=anchor, previous_source_sha256="b" * 64)
+    source["source_binding"] = dict(source_sha256=source["source_sha256"])
+    previous_native = inputs.TemporalNativeInput(
+        full, valid, (0, 0), {"fixture_predecessor": True}
+    )
+    previous = dict(
+        source=dict(source_sha256="b" * 64), full_log=full,
+        full_valid=valid, current_h=np.eye(3), temporal_input=previous_native,
+    )
+    rp = p["retained"]
+    probability = dict(
+        contract=rp["contracts"]["PROBABILITY_CONTRACT"], complete=True,
+        binding=dict(labelled=True, provisional=False,
+            g3_model_sha256=rp["expected_models"]["g3"],
+            regional_refit_sha256=rp["expected_models"]["regional_refit"]),
+        metadata=dict(storage_layout=rp["encoding"]["labelled_layout"],
+            native_shape_hw=list(shape), regional_working_shape_hw=[5, 6],
+            co2_head_sha256=rp["expected_models"]["co2"],
+            bitorder="little", masks_order=rp["mask_names"],
+            resize_rule=rp["encoding"]["resize_rule"],
+            g3_compact_rule=rp["encoding"]["compact_rule"],
+            spacing_m=seed["probability_spacing_m"]),
+        files={name:dict(dtype="float16",shape=list(shape))
+            for name in rp["encoding"]["probability_files"]},
+    )
+    encoding = loaders.probability_encoding_contract(
+        probability, shape, parameters=rp
+    ) if anchor else None
+    original_area = np.linspace(.5, 1.5, valid.size, dtype=np.float32).reshape(shape)
+    measured = (original_area.astype(np.float64) * .5).astype(np.float32)
+    read_roles = []
+
+    class AssetReader:
+        def json(self, descriptor):
+            read_roles.append(descriptor["role"])
+            return probability if descriptor["role"] == "probability" else {}
+        def path(self, descriptor):
+            read_roles.append(descriptor["role"])
+            return Path("synthetic_photo.npz")
+        def array(self, descriptor):
+            read_roles.append(descriptor["role"])
+            return original_area if descriptor["role"] == "historical_area" else measured
+        def archive(self, descriptor, keys):
+            read_roles.append(descriptor["role"])
+            return dict(open_components=np.ones(shape, np.uint8),
+                barrier_mask=np.zeros(shape, bool), reference_domain=valid)
+
+    def admitted_original_native(row, *, scientific_native_log, parameters, aliases):
+        masked = full.copy()
+        masked[:, ~photo] = np.nan
+        return inputs.original_native_input(masked, photo,
+            provenance={"fixture_original": True},
+            scientific_native_log=scientific_native_log, parameters=parameters)
+
+    monkeypatch.setattr(loaders, "original_photo_sand",
+        lambda receipt, **kwargs: (photo, proof))
+    monkeypatch.setattr(loaders, "original_native_input", admitted_original_native)
+    monkeypatch.setattr(loaders, "original_temporal_input",
+        lambda native, row, **kwargs: inputs.original_temporal_input(
+            native, policy=policy, parameters=kwargs["parameters"]))
+    monkeypatch.setattr(support, "source_photo_grid", lambda *args, **kwargs: photo)
+    owner = SeriesInputs.__new__(SeriesInputs)
+    owner.reader, owner.aliases, owner.previous = AssetReader(), {}, previous
+    owner.parameters = p
+    owner.native_parameters = dict(support=support_parameters, extended_ring={})
+    owner.temporal_policy = policy
+    owner.config = dict(run="synthetic", history_policy="ordered unique acquisitions")
+    owner.phase = dict(area_parameters=dict(maximum_relative_rounding_error=1e-7),
+        barrier_parameters=dict(contract="synthetic static geometry"))
+    roles = dict(
+        native_row={"role":"native"} if anchor else None,
+        probability_receipt={"role":"probability"},
+        photo_sand_reference=dict(role="photo_reference",sha256="d"*64),
+        photo_proof=proof, area=dict(role="measured_parent" if anchor else "selected",
+            historical={"role":"historical_area"}, measured={"role":"measured_area"},
+            factor=.5, revision={"synthetic":True}),
+        static=dict(components={"role":"static_geometry"},source_ids=[1],
+            unchanged_source=anchor),
+        encoding_contract=encoding, probability_spacing_m=seed["probability_spacing_m"],
+        inherited_spacing_m=seed["inherited_spacing_m"],
+        current_h=np.eye(3).tolist(),reference_to_current_h=np.eye(3).tolist(),
+        light_epoch_id="rig_light",placement_metadata={},
+    )
+    native = dict(log=full, valid=valid, full_log=full, full_valid=valid,
+        context=SimpleNamespace(rig_domain=valid,hardware_excluded=np.zeros(shape,bool),
+            pixel_area_mm2=original_area,parameters={"fixture_geometry":True}),
+        observed=valid,top=valid,record={"synthetic_source":True},
+        record_asset={"role":"actual_native"},audit={"parent_cache":None})
+    assembled = owner.frame(dict(source=source,phase_roles=roles), native)
+    assert np.array_equal(assembled["photo_sand"], expected_photo)
+    assert assembled["photo_sand"].dtype == bool
+    assert np.array_equal(assembled["native_input"].valid, expected_photo)
+    assert np.array_equal(assembled["native_input"].log[:,expected_photo],full[:,expected_photo])
+    assert np.isnan(assembled["native_input"].log[:,~expected_photo]).all()
+    assert assembled["full_valid"] is valid and assembled["context"].rig_domain is valid
+    assert np.array_equal(full, seed["full_log"])
+    assert not {"labels","classes","expected_phase"}.intersection(read_roles)
+    actual = infer.infer_labels(assembled, previous, bundle, p)
+    assert np.array_equal(actual["labels"], np.zeros(shape,np.uint8))
+    assert actual["native_inference"]["inference_performed"] is True
+    assert actual["qa"]["edge_inference"]["inference_performed"] is True
+    assert actual["qa"]["phase_area"]["co2_cm2"] == 0.0
+    assert actual["qa"]["phase_area"]["gas_cm2"] == 0.0
+    assert actual["qa"]["source_history"]["previous_source_sha256"] == "b"*64
+    assert actual["pixel_area_mm2"] is assembled["pixel_area_mm2"]

@@ -794,6 +794,7 @@ class SeriesInputs:
             source=source,
             native_input=masked,
             temporal_input=temporal,
+            photo_sand=photo,
             full_log=native["full_log"],
             full_valid=native["full_valid"],
             current_h=np.asarray(roles["current_h"], np.float64),
