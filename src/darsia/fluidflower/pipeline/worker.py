@@ -1,4 +1,5 @@
 """Persistent Git-pinned whole-run workers reading a shared UNC job directly."""
+
 from __future__ import annotations
 
 import argparse
@@ -17,7 +18,15 @@ import threading
 import traceback
 from pathlib import Path, PureWindowsPath
 
-from .job_queue import JobQueue, LeaseLost, name, read_json, require_unc, utc, write_immutable
+from .job_queue import (
+    JobQueue,
+    LeaseLost,
+    name,
+    read_json,
+    require_unc,
+    utc,
+    write_immutable,
+)
 
 
 def verify_startup(job_root: Path) -> tuple[dict, str]:
@@ -35,8 +44,11 @@ def verify_startup(job_root: Path) -> tuple[dict, str]:
         raise RuntimeError("Startup requires a clean Git worktree at job.json commit")
     lock = job["environment_lock"]
     relative = Path(lock["path"])
-    if (relative.is_absolute() or PureWindowsPath(lock["path"]).drive
-            or ".." in relative.parts):
+    if (
+        relative.is_absolute()
+        or PureWindowsPath(lock["path"]).drive
+        or ".." in relative.parts
+    ):
         raise ValueError("environment_lock.path must be repository-relative")
     actual = (repository / relative).resolve(strict=True)
     if not actual.is_relative_to(repository):
@@ -49,8 +61,11 @@ def verify_startup(job_root: Path) -> tuple[dict, str]:
 
     if not re.fullmatch(r"[0-9a-f]{64}", job.get("calibration_sha256", "")):
         raise ValueError("Explicit job calibration SHA required")
-    if (not isinstance(job.get("expected_runs"), list) or not job["expected_runs"]
-            or len({name(run) for run in job["expected_runs"]}) != len(job["expected_runs"])):
+    if (
+        not isinstance(job.get("expected_runs"), list)
+        or not job["expected_runs"]
+        or len({name(run) for run in job["expected_runs"]}) != len(job["expected_runs"])
+    ):
         raise ValueError("Explicit distinct expected_runs required")
     return job, head
 
@@ -66,10 +81,16 @@ class ServiceLock:
     def __enter__(self):
         if os.name == "nt":
             kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel.CreateMutexW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_bool,
+                ctypes.c_wchar_p,
+            ]
             kernel.CreateMutexW.restype = ctypes.c_void_p
             ctypes.set_last_error(0)
-            self.handle = kernel.CreateMutexW(None, True, "Global\\DarSIAWorker-" + self.identity)
+            self.handle = kernel.CreateMutexW(
+                None, True, "Global\\DarSIAWorker-" + self.identity
+            )
             if not self.handle:
                 raise ctypes.WinError(ctypes.get_last_error())
             if ctypes.get_last_error() == 183:
@@ -79,12 +100,16 @@ class ServiceLock:
         else:
             import fcntl
 
-            self.file = open(Path(tempfile.gettempdir()) / ("darsia-worker-" + self.identity), "a")
+            self.file = open(
+                Path(tempfile.gettempdir()) / ("darsia-worker-" + self.identity), "a"
+            )
             try:
                 fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 self.file.close()
-                raise RuntimeError("A worker service already owns this machine log") from exc
+                raise RuntimeError(
+                    "A worker service already owns this machine log"
+                ) from exc
         return self
 
     def __exit__(self, *args):
@@ -100,12 +125,25 @@ def _identity(machine: str) -> dict:
     import psutil
 
     process = psutil.Process(os.getpid())
-    return dict(machine=machine, pid=process.pid, process_create_time=str(process.create_time()))
+    return dict(
+        machine=machine, pid=process.pid, process_create_time=str(process.create_time())
+    )
 
 
-def _run_tasks(root: str, job: dict, commit: str, machine: str, backend: str,
-          messages, stop, once: bool, exit_when_idle: bool,
-          watchdog: bool = False, worker_slot=None, worker_generation=None):
+def _run_tasks(
+    root: str,
+    job: dict,
+    commit: str,
+    machine: str,
+    backend: str,
+    messages,
+    stop,
+    once: bool,
+    exit_when_idle: bool,
+    watchdog: bool = False,
+    worker_slot=None,
+    worker_generation=None,
+):
     def queue_error(event):
         messages.put(event)
 
@@ -126,11 +164,20 @@ def _run_tasks(root: str, job: dict, commit: str, machine: str, backend: str,
                 return
             stop.wait(1)
             continue
-        messages.put(dict(kind="claimed", run=claim.task["run"], attempt_id=claim.token,
-                          actual_worker=owner))
+        messages.put(
+            dict(
+                kind="claimed",
+                run=claim.task["run"],
+                attempt_id=claim.token,
+                actual_worker=owner,
+            )
+        )
         try:
             task = claim.task
-            if task["commit"] != commit or task["calibration_sha256"] != job["calibration_sha256"]:
+            if (
+                task["commit"] != commit
+                or task["calibration_sha256"] != job["calibration_sha256"]
+            ):
                 raise ValueError("Claimed commit/calibration differs from job.json")
             precision = task.get("precision", job["precision"])
             if precision != job["precision"]:
@@ -138,9 +185,18 @@ def _run_tasks(root: str, job: dict, commit: str, machine: str, backend: str,
 
             def progress(event):
                 if not isinstance(event, dict):
-                    raise TypeError("Scientific progress must be an actual event dictionary")
+                    raise TypeError(
+                        "Scientific progress must be an actual event dictionary"
+                    )
                 shared.progress(claim, event)
-                messages.put(dict(kind="progress", run=task["run"], attempt_id=claim.token, event=event))
+                messages.put(
+                    dict(
+                        kind="progress",
+                        run=task["run"],
+                        attempt_id=claim.token,
+                        event=event,
+                    )
+                )
 
             from .checkpoint import resume_source_for_claim
 
@@ -153,32 +209,53 @@ def _run_tasks(root: str, job: dict, commit: str, machine: str, backend: str,
             pipeline = task.get("pipeline", "n1")
             if pipeline == "n1":
                 from darsia.fluidflower.n1_pipeline import run_n1
+
                 execute = run_n1
             elif pipeline == "native-phase-n1":
                 from .runner import run_series
+
                 execute = run_series
             else:
                 raise ValueError("Unknown explicit task pipeline: " + str(pipeline))
             result = execute(science_task, claim.output, backend, precision, progress)
             if result.get("precision") != precision or result.get("backend") != backend:
                 raise ValueError("Actual scientific backend/precision differs")
-            result = dict(result, actual_worker=owner, commit=commit,
-                          calibration_sha256=task["calibration_sha256"],
-                          attempt_id=claim.token, task=task)
+            result = dict(
+                result,
+                actual_worker=owner,
+                commit=commit,
+                calibration_sha256=task["calibration_sha256"],
+                attempt_id=claim.token,
+                task=task,
+            )
             shared.complete(claim, result)
-            messages.put(dict(kind="completed", run=task["run"], attempt_id=claim.token))
+            messages.put(
+                dict(kind="completed", run=task["run"], attempt_id=claim.token)
+            )
         except LeaseLost:
             text = traceback.format_exc()
-            messages.put(dict(kind="lease_lost", run=claim.task["run"],
-                              attempt_id=claim.token, traceback=text))
+            messages.put(
+                dict(
+                    kind="lease_lost",
+                    run=claim.task["run"],
+                    attempt_id=claim.token,
+                    traceback=text,
+                )
+            )
         except Exception:
             text = traceback.format_exc()
             try:
                 shared.fail(claim, text, owner)
             except LeaseLost:
                 pass  # Its own attempt failure stays; only the current lease publishes.
-            messages.put(dict(kind="failed", run=claim.task["run"],
-                              attempt_id=claim.token, traceback=text))
+            messages.put(
+                dict(
+                    kind="failed",
+                    run=claim.task["run"],
+                    attempt_id=claim.token,
+                    traceback=text,
+                )
+            )
             if once:
                 raise SystemExit(1)
         if once:
@@ -212,11 +289,15 @@ def _work(*args):
     values = list(args)
     values[5] = forwarded
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = QueueStream(forwarded, "stdout"), QueueStream(forwarded, "stderr")
+    sys.stdout, sys.stderr = QueueStream(forwarded, "stdout"), QueueStream(
+        forwarded, "stderr"
+    )
     finished = threading.Event()
     heartbeat = None
     if len(args) > 9 and args[9]:
-        heartbeat = threading.Thread(target=_heartbeat, args=(forwarded, finished, args[3]), daemon=True)
+        heartbeat = threading.Thread(
+            target=_heartbeat, args=(forwarded, finished, args[3]), daemon=True
+        )
         heartbeat.start()
     try:
         return _run_tasks(*values)
@@ -225,6 +306,7 @@ def _work(*args):
         if heartbeat is not None:
             heartbeat.join()
         sys.stdout, sys.stderr = old_stdout, old_stderr
+
 
 def emit(log, event):
     """The exact parent console bytes also go into its single log."""
@@ -236,7 +318,10 @@ def emit(log, event):
     else:
         import json
 
-        text, stream = utc() + " " + json.dumps(event, ensure_ascii=False) + "\n", sys.stdout
+        text, stream = (
+            utc() + " " + json.dumps(event, ensure_ascii=False) + "\n",
+            sys.stdout,
+        )
     print(text, file=stream, end="", flush=True)
     log.write(text)
     log.flush()
@@ -250,10 +335,17 @@ def main(argv=None):
     parser.add_argument("--machine", default=socket.gethostname())
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
-    parser.add_argument("--watchdog", action="store_true",
-                        help="Parent restarts a silent owned worker only after exact retirement.")
-    parser.add_argument("--watchdog-seconds", type=float, default=600.0,
-                        help="Operational liveness limit; actual-progress queue lease remains 600s.")
+    parser.add_argument(
+        "--watchdog",
+        action="store_true",
+        help="Parent restarts a silent owned worker only after exact retirement.",
+    )
+    parser.add_argument(
+        "--watchdog-seconds",
+        type=float,
+        default=600.0,
+        help="Operational liveness limit; actual-progress queue lease remains 600s.",
+    )
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be positive")
@@ -268,10 +360,11 @@ def main(argv=None):
             try:
                 job, commit = verify_startup(args.job)
             except Exception:
-                emit(log, dict(kind="startup_failure", traceback=traceback.format_exc()))
+                emit(
+                    log, dict(kind="startup_failure", traceback=traceback.format_exc())
+                )
                 return 1
             return _parent(args, identity, job, commit, log)
-
 
 
 class _SlotMessages:
@@ -281,8 +374,11 @@ class _SlotMessages:
         self.messages, self.slot, self.generation = messages, slot, generation
 
     def put(self, event):
-        self.messages.put(dict(event, worker_slot=self.slot, worker_generation=self.generation)
-                          if self.slot is not None else event)
+        self.messages.put(
+            dict(event, worker_slot=self.slot, worker_generation=self.generation)
+            if self.slot is not None
+            else event
+        )
 
 
 def _heartbeat(messages, finished, machine):
@@ -293,8 +389,11 @@ def _heartbeat(messages, finished, machine):
 
 
 def _process_identity(process):
-    return dict(pid=process.pid, process_create_time=str(process.create_time()),
-                command_line=process.cmdline())
+    return dict(
+        pid=process.pid,
+        process_create_time=str(process.create_time()),
+        command_line=process.cmdline(),
+    )
 
 
 def _same_process(identity):
@@ -305,7 +404,11 @@ def _same_process(identity):
         return None
     try:
         process = psutil.Process(identity["pid"])
-        return process if process.create_time() == float(identity["process_create_time"]) else None
+        return (
+            process
+            if process.create_time() == float(identity["process_create_time"])
+            else None
+        )
     except psutil.NoSuchProcess:
         return None
 
@@ -314,8 +417,10 @@ def retire_owned_processes(root_identity, observed=()):
     """Retire only the exact known child tree, then prove every incarnation absent."""
     import psutil
 
-    identities = {(i["pid"], i["process_create_time"]): dict(i)
-                  for i in (*(() if root_identity is None else (root_identity,)), *observed)}
+    identities = {
+        (i["pid"], i["process_create_time"]): dict(i)
+        for i in (*(() if root_identity is None else (root_identity,)), *observed)
+    }
     root = _same_process(root_identity)
     if root is not None:
         for process in root.children(recursive=True):
@@ -346,7 +451,9 @@ def retire_owned_processes(root_identity, observed=()):
                 continue
     psutil.wait_procs(pending, timeout=10.0)
     if any(_same_process(bound) is not None for bound in identities.values()):
-        raise RuntimeError("Owned child retirement is incomplete; no replacement may start")
+        raise RuntimeError(
+            "Owned child retirement is incomplete; no replacement may start"
+        )
     return list(identities.values())
 
 
@@ -354,9 +461,23 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
     import uuid
 
     generation = uuid.uuid4().hex
-    process = context.Process(target=_work, args=(
-        str(args.job), job, commit, identity, args.backend, messages, stop,
-        args.once, args.exit_when_idle, args.watchdog, number, generation))
+    process = context.Process(
+        target=_work,
+        args=(
+            str(args.job),
+            job,
+            commit,
+            identity,
+            args.backend,
+            messages,
+            stop,
+            args.once,
+            args.exit_when_idle,
+            args.watchdog,
+            number,
+            generation,
+        ),
+    )
     process.start()
     import psutil
 
@@ -364,15 +485,26 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
         bound = _process_identity(psutil.Process(process.pid))
     except psutil.NoSuchProcess:
         bound = None  # A completed launch has no invented create_time.
-    return dict(number=number, generation=generation, process=process, root=bound, observed=[],
-                last_heartbeat=time.monotonic(), claim=None, retired=False,
-                waiting_reclaim=False, finished=False)
+    return dict(
+        number=number,
+        generation=generation,
+        process=process,
+        root=bound,
+        observed=[],
+        last_heartbeat=time.monotonic(),
+        claim=None,
+        retired=False,
+        waiting_reclaim=False,
+        finished=False,
+    )
 
 
 def _record_retirement(slot, args, identity):
     """The live parent publishes a separate genuine owned-child closure."""
     if slot["root"] is None and slot["process"].is_alive():
-        raise RuntimeError("Live launch has no bound epoch; preserve it and do not replace")
+        raise RuntimeError(
+            "Live launch has no bound epoch; preserve it and do not replace"
+        )
     identities = retire_owned_processes(slot["root"], slot["observed"])
     slot["observed"] = identities
     slot["process"].join(timeout=1.0)
@@ -380,16 +512,27 @@ def _record_retirement(slot, args, identity):
     if claim is not None:
         from .checkpoint import retirement_document
 
-        output = args.job / "results" / name(claim["run"]) / ".attempts" / claim["attempt_id"]
-        document = retirement_document(claim["task"], output, identities, _identity(identity))
+        output = (
+            args.job
+            / "results"
+            / name(claim["run"])
+            / ".attempts"
+            / claim["attempt_id"]
+        )
+        document = retirement_document(
+            claim["task"], output, identities, _identity(identity)
+        )
         document["retired_utc"] = utc()
         document["actual_launch_wrapper"] = slot["root"]
         document["owned_launch_handle_retired"] = not slot["process"].is_alive()
         path = output / "retirement.json"
         if path.exists():
             old = read_json(path)
-            if (old.get("attempt_id") != claim["attempt_id"] or old.get("all_absent") is not True
-                    or old.get("identities") != document["identities"]):
+            if (
+                old.get("attempt_id") != claim["attempt_id"]
+                or old.get("all_absent") is not True
+                or old.get("identities") != document["identities"]
+            ):
                 raise ValueError("A different retirement already exists; preserve it")
         else:
             write_immutable(path, document)
@@ -404,9 +547,14 @@ def _parent(args, identity, job, commit, log):
     shared = JobQueue(args.job)
     context = mp.get_context("spawn")
     messages, stop = context.Queue(), context.Event()
-    slots = [_start_slot(context, args, job, commit, identity, messages, stop, i)
-             for i in range(args.workers)]
-    emit(log, dict(kind="started", message=f"Worker service started at Git commit {commit}."))
+    slots = [
+        _start_slot(context, args, job, commit, identity, messages, stop, i)
+        for i in range(args.workers)
+    ]
+    emit(
+        log,
+        dict(kind="started", message=f"Worker service started at Git commit {commit}."),
+    )
     fatal = False
     try:
         while True:
@@ -416,10 +564,19 @@ def _parent(args, identity, job, commit, log):
                 event = None
             if event is not None:
                 number = event.get("worker_slot")
-                slot = slots[number] if isinstance(number, int) and 0 <= number < len(slots) else None
-                if slot is not None and event.get("worker_generation") != slot["generation"]:
+                slot = (
+                    slots[number]
+                    if isinstance(number, int) and 0 <= number < len(slots)
+                    else None
+                )
+                if (
+                    slot is not None
+                    and event.get("worker_generation") != slot["generation"]
+                ):
                     if event.get("kind") != "watchdog_heartbeat":
-                        emit(log, event)  # Preserve old output, never attribute it to the replacement.
+                        emit(
+                            log, event
+                        )  # Preserve old output, never attribute it to the replacement.
                     continue
                 owner = event.get("actual_worker")
                 if slot is not None and owner is not None:
@@ -429,13 +586,20 @@ def _parent(args, identity, job, commit, log):
                     if process is not None:
                         root = _same_process(slot["root"])
                         try:
-                            owned = (root is not None and (process.pid == root.pid or any(
-                                parent.pid == root.pid and parent.create_time() == root.create_time()
-                                for parent in process.parents())))
+                            owned = root is not None and (
+                                process.pid == root.pid
+                                or any(
+                                    parent.pid == root.pid
+                                    and parent.create_time() == root.create_time()
+                                    for parent in process.parents()
+                                )
+                            )
                         except psutil.NoSuchProcess:
                             owned = _same_process(owner) is None
                         if not owned:
-                            raise ValueError("Live worker is outside its owned launch tree")
+                            raise ValueError(
+                                "Live worker is outside its owned launch tree"
+                            )
                     if owner not in slot["observed"]:
                         slot["observed"].append(dict(owner))
                 if slot is not None and event.get("kind") == "watchdog_heartbeat":
@@ -444,12 +608,25 @@ def _parent(args, identity, job, commit, log):
                     raise ValueError("Watchdog message has no owned worker slot")
                 else:
                     if slot is not None and event.get("kind") == "claimed":
-                        path = args.job / "claimed" / identity / (name(event["run"]) + ".json")
+                        path = (
+                            args.job
+                            / "claimed"
+                            / identity
+                            / (name(event["run"]) + ".json")
+                        )
                         task = read_json(path)
                         if task["attempt_id"] != event["attempt_id"]:
-                            raise ValueError("Claim message and actual task generation differ")
-                        slot["claim"] = dict(run=event["run"], attempt_id=event["attempt_id"], task=task)
-                    if slot is not None and event.get("kind") in {"completed", "failed", "lease_lost"}:
+                            raise ValueError(
+                                "Claim message and actual task generation differ"
+                            )
+                        slot["claim"] = dict(
+                            run=event["run"], attempt_id=event["attempt_id"], task=task
+                        )
+                    if slot is not None and event.get("kind") in {
+                        "completed",
+                        "failed",
+                        "lease_lost",
+                    }:
                         # Terminal/revoked attempts do not need a numerical restart.
                         slot["claim"] = None
                     emit(log, event)
@@ -458,19 +635,35 @@ def _parent(args, identity, job, commit, log):
                 if slot["finished"]:
                     continue
                 process = slot["process"]
-                stalled = (args.watchdog and process.is_alive()
-                           and time.monotonic() - slot["last_heartbeat"] >= args.watchdog_seconds)
+                stalled = (
+                    args.watchdog
+                    and process.is_alive()
+                    and time.monotonic() - slot["last_heartbeat"]
+                    >= args.watchdog_seconds
+                )
                 if process.is_alive() and not stalled:
                     active = True
                     continue
                 if not slot["retired"]:
                     identifiers = _record_retirement(slot, args, identity)
-                    emit(log, dict(kind="watchdog_retired" if args.watchdog else "child_retired",
-                                   slot=number, identities=identifiers, stalled=stalled,
-                                   exitcode=process.exitcode))
+                    emit(
+                        log,
+                        dict(
+                            kind=(
+                                "watchdog_retired" if args.watchdog else "child_retired"
+                            ),
+                            slot=number,
+                            identities=identifiers,
+                            stalled=stalled,
+                            exitcode=process.exitcode,
+                        ),
+                    )
                     clean_exit = process.exitcode == 0 and not stalled
-                    if (not args.watchdog or clean_exit
-                            or (args.once and slot["claim"] is None)):
+                    if (
+                        not args.watchdog
+                        or clean_exit
+                        or (args.once and slot["claim"] is None)
+                    ):
                         slot["finished"] = True
                         fatal |= process.exitcode not in (0, None)
                         continue
@@ -481,7 +674,11 @@ def _parent(args, identity, job, commit, log):
                     for record in shared.reclaim_stale():
                         emit(log, dict(kind="reclaimed", **record))
                     claim = slot["claim"]
-                    lease = args.job / "leases" / (name(claim["run"]) + "." + claim["attempt_id"])
+                    lease = (
+                        args.job
+                        / "leases"
+                        / (name(claim["run"]) + "." + claim["attempt_id"])
+                    )
                     if lease.exists():
                         active = True
                         continue
@@ -494,10 +691,17 @@ def _parent(args, identity, job, commit, log):
                 same_job, same_commit = verify_startup(args.job)
                 if same_job != job or same_commit != commit:
                     raise RuntimeError("Watchdog restart startup identity differs")
-                slots[number] = _start_slot(context, args, job, commit, identity,
-                                            messages, stop, number)
-                emit(log, dict(kind="watchdog_restarted", slot=number,
-                               actual_launch_wrapper=slots[number]["root"]))
+                slots[number] = _start_slot(
+                    context, args, job, commit, identity, messages, stop, number
+                )
+                emit(
+                    log,
+                    dict(
+                        kind="watchdog_restarted",
+                        slot=number,
+                        actual_launch_wrapper=slots[number]["root"],
+                    ),
+                )
                 active = True
             if not active and all(slot["finished"] for slot in slots):
                 break

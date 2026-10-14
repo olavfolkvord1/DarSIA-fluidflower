@@ -4,6 +4,7 @@ Importing this module does not load models or numerical libraries. One worker
 owns one run and the original queue publishes its terminal completion. All
 inputs/parameters are DATA, and each stage calls the single library method.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,12 +25,16 @@ def prepare_job(series_path, job_root, *, expected_sha256):
     This is metadata preparation only. Reusing the exact already prepared job
     is allowed; conflicting terminal/pending/scientific task records fail.
     """
-    value, configs, bound = series.read_series(series_path, expected_sha256=expected_sha256)
-    job, tasks = series.series_tasks(value, configs, job_root=job_root, series_asset=bound)
+    value, configs, bound = series.read_series(
+        series_path, expected_sha256=expected_sha256
+    )
+    job, tasks = series.series_tasks(
+        value, configs, job_root=job_root, series_asset=bound
+    )
     root = Path(job_root)
     require_unc(str(root))
     root.mkdir(parents=True, exist_ok=True)
-    target = root/"job.json"
+    target = root / "job.json"
     if target.exists():
         if read_json(target) != job:
             raise ValueError("Existing job DATA differs from immutable series")
@@ -38,19 +43,32 @@ def prepare_job(series_path, job_root, *, expected_sha256):
     shared = JobQueue(root)
     prepared = []
     for task in tasks:
-        location = root/"results"/task["run"]/"task.json"
+        location = root / "results" / task["run"] / "task.json"
         if location.exists():
             prior = read_json(location)
-            projected = {key: item for key, item in prior.items() if key not in {"attempt_id", "output_directory"}}
+            projected = {
+                key: item
+                for key, item in prior.items()
+                if key not in {"attempt_id", "output_directory"}
+            }
             if projected != task:
                 raise ValueError("Existing queued/terminal run task differs")
             # Never republish or re-enqueue an existing run, claimed or failed.
-            prepared.append(dict(run=task["run"], task=descriptor(location), already_enqueued=True))
+            prepared.append(
+                dict(run=task["run"], task=descriptor(location), already_enqueued=True)
+            )
         else:
             path = shared.enqueue(task)
-            prepared.append(dict(run=task["run"], task=descriptor(path), already_enqueued=False))
-    return dict(complete=True, series=bound, job=descriptor(target), tasks=prepared,
-                numerical_calls_started=False)
+            prepared.append(
+                dict(run=task["run"], task=descriptor(path), already_enqueued=False)
+            )
+    return dict(
+        complete=True,
+        series=bound,
+        job=descriptor(target),
+        tasks=prepared,
+        numerical_calls_started=False,
+    )
 
 
 def _phase_outputs(stage, spec, frame, inferred):
@@ -59,35 +77,64 @@ def _phase_outputs(stage, spec, frame, inferred):
     from PIL import Image
     from ..mass.n1_pipeline import _write_json, _write_npz, asset
     from ..native.sidecar import write_log_linear
+
     labels = inferred["labels"]
     if labels.dtype != np.uint8 or labels.shape != frame["pixel_area_mm2"].shape:
         raise ValueError("Fresh phase labels/grid differ")
-    label_path = stage/"phase_labels.png"
+    label_path = stage / "phase_labels.png"
     with label_path.open("xb") as stream:
         Image.fromarray(labels).save(stream, format="PNG")
-    classes = _write_npz(stage/"phase_classes.npz", inferred["classes"])
-    area = dict(_write_npz(stage/"phase_area.npz", {"pixel_area_mm2": inferred["pixel_area_mm2"]}), array_key="pixel_area_mm2")
-    qa = _write_json(stage/"phase_qa.json", inferred["qa"])
+    classes = _write_npz(stage / "phase_classes.npz", inferred["classes"])
+    area = dict(
+        _write_npz(
+            stage / "phase_area.npz", {"pixel_area_mm2": inferred["pixel_area_mm2"]}
+        ),
+        array_key="pixel_area_mm2",
+    )
+    qa = _write_json(stage / "phase_qa.json", inferred["qa"])
     # Preserve input representations before history advancement. These are
     # source data, never classifiers' labels/classes/probabilities.
     temporal = frame["temporal_input"]
-    temporal_log, temporal_valid = stage/"temporal_log.npy", stage/"temporal_valid.npy"
+    temporal_log, temporal_valid = (
+        stage / "temporal_log.npy",
+        stage / "temporal_valid.npy",
+    )
     write_log_linear(temporal_log, temporal.log)
     write_log_linear(temporal_valid, temporal.valid)
-    history = dict(complete=True, source=spec["source"], current_h=frame["current_h"].tolist(),
-        full=frame["scientific"]["full"], temporal_log=asset(temporal_log), temporal_valid=asset(temporal_valid),
-        temporal_origin_xy=list(temporal.origin_xy), temporal_provenance=temporal.provenance)
-    history_asset = _write_json(stage/"history_input.json", history)
+    history = dict(
+        complete=True,
+        source=spec["source"],
+        current_h=frame["current_h"].tolist(),
+        full=frame["scientific"]["full"],
+        temporal_log=asset(temporal_log),
+        temporal_valid=asset(temporal_valid),
+        temporal_origin_xy=list(temporal.origin_xy),
+        temporal_provenance=temporal.provenance,
+    )
+    history_asset = _write_json(stage / "history_input.json", history)
     masks = dict(inferred["seam_masks"], **inferred["post_masks"])
-    mask_asset = _write_npz(stage/"phase_operator_masks.npz", masks)
-    return dict(complete=True, source_sha256=spec["source"]["source_sha256"], labels=asset(label_path),
-                classes=classes, area=area, qa=qa, operator_masks=mask_asset, history_input=history_asset)
+    mask_asset = _write_npz(stage / "phase_operator_masks.npz", masks)
+    return dict(
+        complete=True,
+        source_sha256=spec["source"]["source_sha256"],
+        labels=asset(label_path),
+        classes=classes,
+        area=area,
+        qa=qa,
+        operator_masks=mask_asset,
+        history_input=history_asset,
+    )
 
 
 def _inventory(stage):
     """Describe every actual native/phase file, including generated windows."""
     from ..mass.n1_pipeline import asset
-    return {path.name: asset(path) for path in sorted(Path(stage).iterdir()) if path.is_file()}
+
+    return {
+        path.name: asset(path)
+        for path in sorted(Path(stage).iterdir())
+        if path.is_file()
+    }
 
 
 def validate_frame_artifacts(spec, result, final_directory, config):
@@ -98,26 +145,39 @@ def validate_frame_artifacts(spec, result, final_directory, config):
     checks the extra full descriptors byte-bound through that result.json.
     """
     from ..mass.n1_pipeline import DataReader
+
     product = result["prediction"]["pipeline"]
-    if (product.get("complete") is not True or product.get("format") != "darsia-series-frame-v1"
-            or product["source"] != spec["source"] or product["case_id"] != spec["case_id"]
-            or product["configuration_sha256"] != config["_configuration_sha256"]):
+    if (
+        product.get("complete") is not True
+        or product.get("format") != "darsia-series-frame-v1"
+        or product["source"] != spec["source"]
+        or product["case_id"] != spec["case_id"]
+        or product["configuration_sha256"] != config["_configuration_sha256"]
+    ):
         raise ValueError("Committed series-stage source/configuration differs")
-    if product["native"]["source_sha256"] != spec["source"]["source_sha256"] or product["phase"]["source_sha256"] != spec["source"]["source_sha256"]:
+    if (
+        product["native"]["source_sha256"] != spec["source"]["source_sha256"]
+        or product["phase"]["source_sha256"] != spec["source"]["source_sha256"]
+    ):
         raise ValueError("Committed native/phase source identity differs")
     reader = DataReader(unc_only=False)
-    owned = Path(final_directory).resolve().parents[1]/"preparation"/spec["case_id"]
+    owned = Path(final_directory).resolve().parents[1] / "preparation" / spec["case_id"]
     inventory = product["files"]
     if not inventory:
         raise ValueError("Committed series-stage inventory is empty")
     for relative, bound in inventory.items():
-        if Path(relative).name != relative or Path(bound["path"]).resolve() != (owned/relative).resolve():
+        if (
+            Path(relative).name != relative
+            or Path(bound["path"]).resolve() != (owned / relative).resolve()
+        ):
             raise ValueError("Committed stage file escapes its actual producer attempt")
         reader.path(bound)
     for key in ("labels", "classes", "area", "qa", "operator_masks", "history_input"):
         bound = product["phase"][key]
         if bound["sha256"] != inventory[Path(bound["path"]).name]["sha256"]:
-            raise ValueError("Phase descriptor differs from committed transitive inventory")
+            raise ValueError(
+                "Phase descriptor differs from committed transitive inventory"
+            )
         reader.path(bound)
     native = product["native"]
     reader.json(native["audit"])
@@ -141,32 +201,51 @@ def _restore_predecessor(inputs, result, spec):
     import numpy as np
     from ..phase.inputs import TemporalNativeInput
     from . import phase_inputs as loaders
+
     product = result["prediction"]["pipeline"]
     history = inputs.reader.json(product["phase"]["history_input"])
     series.restore_history(history, spec)
-    full, valid = loaders.compose_extended_scientific(history["full"],
-        parameters=inputs.parameters["scientific"], aliases=inputs.aliases)
-    temporal = TemporalNativeInput(inputs.reader.array(history["temporal_log"]),
-        inputs.reader.array(history["temporal_valid"]), tuple(history["temporal_origin_xy"]),
-        history["temporal_provenance"])
+    full, valid = loaders.compose_extended_scientific(
+        history["full"],
+        parameters=inputs.parameters["scientific"],
+        aliases=inputs.aliases,
+    )
+    temporal = TemporalNativeInput(
+        inputs.reader.array(history["temporal_log"]),
+        inputs.reader.array(history["temporal_valid"]),
+        tuple(history["temporal_origin_xy"]),
+        history["temporal_provenance"],
+    )
     for array in (full, valid, temporal.log, temporal.valid):
         array.setflags(write=False)
-    inputs.previous = dict(source=history["source"], full_log=full, full_valid=valid,
-                           current_h=np.asarray(history["current_h"], np.float64), temporal_input=temporal)
+    inputs.previous = dict(
+        source=history["source"],
+        full_log=full,
+        full_valid=valid,
+        current_h=np.asarray(history["current_h"], np.float64),
+        temporal_input=temporal,
+    )
 
 
 def scalar_table(records, fields, destination):
     """Export ordered scalar result JSON only; never load a scientific NPZ."""
     from ..mass.n1_pipeline import DataReader, asset
+
     reader = DataReader()
     destination = Path(destination)
     with destination.open("x", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for record in records:
-            bound = dict(record["files"]["result.json"], path=str(Path(record["nas_directory"])/"result.json"))
+            bound = dict(
+                record["files"]["result.json"],
+                path=str(Path(record["nas_directory"]) / "result.json"),
+            )
             result = reader.json(bound)
-            if result.get("complete") is not True or result["case_id"] != record["frame_id"]:
+            if (
+                result.get("complete") is not True
+                or result["case_id"] != record["frame_id"]
+            ):
                 raise ValueError("Table row is not its genuine committed frame")
             selected = {}
             for field in fields:
@@ -188,6 +267,7 @@ def run_series(task, output, backend, precision, on_progress=None):
     import cv2
     import scipy.linalg
     from threadpoolctl import threadpool_info, threadpool_limits
+
     threads = task.get("threads", 1)
     if type(threads) is not int or threads < 1:
         raise ValueError("Positive internal thread count required")
@@ -195,7 +275,11 @@ def run_series(task, output, backend, precision, on_progress=None):
     try:
         cv2.setNumThreads(threads)
         with threadpool_limits(limits=threads):
-            runtime = dict(requested_threads=threads, cv2_threads=cv2.getNumThreads(), threadpools=threadpool_info())
+            runtime = dict(
+                requested_threads=threads,
+                cv2_threads=cv2.getNumThreads(),
+                threadpools=threadpool_info(),
+            )
             return _run_series(task, output, backend, precision, on_progress, runtime)
     finally:
         cv2.setNumThreads(old_threads)
@@ -206,6 +290,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     from ..mass.production_precision import PixelMath
     from ..phase.infer import infer_labels
     from .checkpoint import verify_frame_prefix, run_identity, frame_producer
+
     config = series.load_run(task)
     config["_configuration_sha256"] = task["configuration"]["sha256"]
     if backend not in {"cpu", "cuda"} or precision != task["precision"]:
@@ -216,26 +301,61 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     if any(output.iterdir()):
         raise FileExistsError("Each attempt must be fresh")
     clock = time.perf_counter()
-    prefix = verify_frame_prefix(task, config, output, backend, precision, task.get("resume_from"),
-        frame_validator=validate_frame_artifacts, calibration_sha256=task["calibration_sha256"])
-    resume_asset = _write_json(output/"resume.json", dict(complete=True,
-        source=prefix["source"], prefix_case_ids=prefix["prefix_case_ids"],
-        frame_producers=prefix["frame_producers"], predecessor_input=prefix["predecessor_input"]))
-    settings = dict(host=socket.gethostname(), backend=backend, precision=precision,
-                    threads=task["threads"], thread_runtime=runtime, phase_precision="explicit-historical-stage-dtypes")
-    manifest = dict(format="darsia-series-run-manifest-v1", job_id=task["job_id"], run=task["run"],
-        configuration=task["configuration"], task_identity=run_identity(task, backend, precision, task["calibration_sha256"]),
+    prefix = verify_frame_prefix(
+        task,
+        config,
+        output,
+        backend,
+        precision,
+        task.get("resume_from"),
+        frame_validator=validate_frame_artifacts,
+        calibration_sha256=task["calibration_sha256"],
+    )
+    resume_asset = _write_json(
+        output / "resume.json",
+        dict(
+            complete=True,
+            source=prefix["source"],
+            prefix_case_ids=prefix["prefix_case_ids"],
+            frame_producers=prefix["frame_producers"],
+            predecessor_input=prefix["predecessor_input"],
+        ),
+    )
+    settings = dict(
+        host=socket.gethostname(),
+        backend=backend,
+        precision=precision,
+        threads=task["threads"],
+        thread_runtime=runtime,
+        phase_precision="explicit-historical-stage-dtypes",
+    )
+    manifest = dict(
+        format="darsia-series-run-manifest-v1",
+        job_id=task["job_id"],
+        run=task["run"],
+        configuration=task["configuration"],
+        task_identity=run_identity(
+            task, backend, precision, task["calibration_sha256"]
+        ),
         code=dict(commit=task["commit"], identity_algorithm="sha256-git-commit-ascii"),
-        code_sha256=hashlib.sha256(task["commit"].encode("ascii")).hexdigest(), settings=settings,
-        frames={spec["case_id"]: spec for spec in config["frames"]}, resume_checkpoint=resume_asset)
-    manifest_asset = _write_json(output/"manifest.json", manifest)
+        code_sha256=hashlib.sha256(task["commit"].encode("ascii")).hexdigest(),
+        settings=settings,
+        frames={spec["case_id"]: spec for spec in config["frames"]},
+        resume_checkpoint=resume_asset,
+    )
+    manifest_asset = _write_json(output / "manifest.json", manifest)
     records = list(prefix["records"])
     producers = list(prefix["frame_producers"])
     if backend == "cpu":
         math_provider = PixelMath(precision)
     else:
         from ..mass.mass_cuda import CudaHostPixelMath
-        math_provider = CudaHostPixelMath(precision, device_id=int(task["device_id"]), pool_limit_bytes=int(task["pool_limit_bytes"]))
+
+        math_provider = CudaHostPixelMath(
+            precision,
+            device_id=int(task["device_id"]),
+            pool_limit_bytes=int(task["pool_limit_bytes"]),
+        )
     inputs = None
     try:
         inputs = series.SeriesInputs(config, output)
@@ -243,30 +363,69 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             index = prefix["predecessor_index"]
             old = records[-1]
             reader = DataReader()
-            result = reader.json(dict(old["files"]["result.json"], path=str(Path(old["nas_directory"])/"result.json")))
+            result = reader.json(
+                dict(
+                    old["files"]["result.json"],
+                    path=str(Path(old["nas_directory"]) / "result.json"),
+                )
+            )
             _restore_predecessor(inputs, result, config["frames"][index])
-        mass_config = dict(config["mass"]["template"], run=config["run"], frames=config["frames"],
-                           data_aliases=config.get("data_aliases", ()))
-        mass = N1Pipeline(mass_config, precision=precision, pixel_math=math_provider, unc_only=True)
+        mass_config = dict(
+            config["mass"]["template"],
+            run=config["run"],
+            frames=config["frames"],
+            data_aliases=config.get("data_aliases", ()),
+        )
+        mass = N1Pipeline(
+            mass_config, precision=precision, pixel_math=math_provider, unc_only=True
+        )
         for position in range(len(records), len(config["frames"])):
             spec = config["frames"][position]
             if on_progress:
-                on_progress(dict(state="frame_started", run=task["run"], case_id=spec["case_id"], frame_index=spec["frame_index"]))
+                on_progress(
+                    dict(
+                        state="frame_started",
+                        run=task["run"],
+                        case_id=spec["case_id"],
+                        frame_index=spec["frame_index"],
+                    )
+                )
             start = time.perf_counter()
-            native = inputs.native(spec, output/"preparation"/spec["case_id"])
+            native = inputs.native(spec, output / "preparation" / spec["case_id"])
             frame = inputs.frame(spec, native)
-            inferred = infer_labels(frame, inputs.previous, inputs.model_bundle, inputs.parameters)
-            stage = output/"preparation"/spec["case_id"]
+            inferred = infer_labels(
+                frame, inputs.previous, inputs.model_bundle, inputs.parameters
+            )
+            stage = output / "preparation" / spec["case_id"]
             phase = _phase_outputs(stage, spec, frame, inferred)
-            mass_spec = series.bind_mass_frame(spec, native["record"], phase, baseline=inputs.mass_baseline)
+            mass_spec = series.bind_mass_frame(
+                spec, native["record"], phase, baseline=inputs.mass_baseline
+            )
             evaluated = mass.evaluate(mass_spec)
-            stage_binding = dict(format="darsia-series-frame-v1", complete=True, case_id=spec["case_id"],
-                configuration_sha256=task["configuration"]["sha256"], source=spec["source"],
-                native=native["record"], phase=phase, files=_inventory(stage), numerical_phase_calls=1)
+            stage_binding = dict(
+                format="darsia-series-frame-v1",
+                complete=True,
+                case_id=spec["case_id"],
+                configuration_sha256=task["configuration"]["sha256"],
+                source=spec["source"],
+                native=native["record"],
+                phase=phase,
+                files=_inventory(stage),
+                numerical_phase_calls=1,
+            )
             evaluated["prediction"]["pipeline"] = stage_binding
-            elapsed = time.perf_counter()-start
-            record = _publish_frame(output, manifest, manifest_asset, mass_spec, evaluated,
-                                    mass_config, backend, position, elapsed)
+            elapsed = time.perf_counter() - start
+            record = _publish_frame(
+                output,
+                manifest,
+                manifest_asset,
+                mass_spec,
+                evaluated,
+                mass_config,
+                backend,
+                position,
+                elapsed,
+            )
             records.append(record)
             producers.append(frame_producer(output, record, manifest_asset))
             # Full commit precedes advancement and actual progress. LeaseLost
@@ -274,20 +433,44 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             inputs.advance(frame)
             del frame, inferred, evaluated, native
             if on_progress:
-                on_progress(dict(state="frame_completed", complete=True, run=task["run"], case_id=spec["case_id"],
-                    frame_index=spec["frame_index"], compute_seconds=elapsed, publication=record))
-        table = scalar_table(records, config["table_fields"], output/"mass_table.csv")
-        wall = time.perf_counter()-clock
-        result = dict(complete=True, run=task["run"], whole_run=True, pipeline=series.PIPELINE,
-            backend=backend, precision=precision, working_pixel_dtype=precision,
-            ordered_case_ids=[spec["case_id"] for spec in config["frames"]], case_count=len(records), frames=len(records),
-            records=records, table=table, configuration=task["configuration"], manifest=manifest_asset,
-            calibration=config["mass"]["calibration"], physical_correction=mass_config["physical_correction"],
-            anchor=mass_config["anchor"], wall_seconds=wall,
-            newly_computed_frames=len(records)-len(prefix["records"]),
-            images_per_hour=(len(records)-len(prefix["records"]))*3600/wall,
-            reused_case_ids=list(prefix["prefix_case_ids"]), frame_producers=producers,
-            elapsed_seconds=wall)
+                on_progress(
+                    dict(
+                        state="frame_completed",
+                        complete=True,
+                        run=task["run"],
+                        case_id=spec["case_id"],
+                        frame_index=spec["frame_index"],
+                        compute_seconds=elapsed,
+                        publication=record,
+                    )
+                )
+        table = scalar_table(records, config["table_fields"], output / "mass_table.csv")
+        wall = time.perf_counter() - clock
+        result = dict(
+            complete=True,
+            run=task["run"],
+            whole_run=True,
+            pipeline=series.PIPELINE,
+            backend=backend,
+            precision=precision,
+            working_pixel_dtype=precision,
+            ordered_case_ids=[spec["case_id"] for spec in config["frames"]],
+            case_count=len(records),
+            frames=len(records),
+            records=records,
+            table=table,
+            configuration=task["configuration"],
+            manifest=manifest_asset,
+            calibration=config["mass"]["calibration"],
+            physical_correction=mass_config["physical_correction"],
+            anchor=mass_config["anchor"],
+            wall_seconds=wall,
+            newly_computed_frames=len(records) - len(prefix["records"]),
+            images_per_hour=(len(records) - len(prefix["records"])) * 3600 / wall,
+            reused_case_ids=list(prefix["prefix_case_ids"]),
+            frame_producers=producers,
+            elapsed_seconds=wall,
+        )
         del mass
     finally:
         if inputs is not None:

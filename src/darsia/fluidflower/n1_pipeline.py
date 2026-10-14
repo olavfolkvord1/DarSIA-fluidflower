@@ -4,6 +4,7 @@ Only the historical dictionary field names are adapted here. Canonical workers
 import the mass package directly and receive these names in explicit run DATA.
 No mathematical function is duplicated.
 """
+
 from .mass import n1_pipeline as _core
 
 # Preserve the historical public attributes, including its scientific file path.
@@ -31,21 +32,27 @@ class N1Pipeline(_core.N1Pipeline):
 
     def __init__(self, config, *, precision, pixel_math, unc_only=False):
         super().__init__(
-            config, precision=precision, pixel_math=pixel_math,
-            unc_only=unc_only, geometry_fields=_LEGACY_GEOMETRY_FIELDS
+            config,
+            precision=precision,
+            pixel_math=pixel_math,
+            unc_only=unc_only,
+            geometry_fields=_LEGACY_GEOMETRY_FIELDS,
         )
 
 
 def _run_n1(task, output, backend, precision, on_progress=None, *, thread_runtime):
     """Supply historical field names to the single canonical numerical body."""
     return _core._run_n1(
-        task, output, backend, precision, on_progress,
-        thread_runtime=thread_runtime, geometry_fields=_LEGACY_GEOMETRY_FIELDS
+        task,
+        output,
+        backend,
+        precision,
+        on_progress,
+        thread_runtime=thread_runtime,
+        geometry_fields=_LEGACY_GEOMETRY_FIELDS,
     )
 
 
 def run_n1(task, output, backend, precision, on_progress=None):
     """Retain the public thread-limit hook without copying its implementation."""
-    return _core.run_n1(
-        task, output, backend, precision, on_progress, _runner=_run_n1
-    )
+    return _core.run_n1(task, output, backend, precision, on_progress, _runner=_run_n1)
