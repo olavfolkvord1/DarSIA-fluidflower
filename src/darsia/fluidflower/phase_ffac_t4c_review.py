@@ -1,5 +1,8 @@
 """Exact, read-only Studio admission of calibrated T4c saved placements."""
 from functools import lru_cache
+import ast
+import importlib.util
+import sys
 import json
 import math
 from pathlib import Path
@@ -7,6 +10,53 @@ from pathlib import Path
 from .project import sha256_file
 from .review_storage import resolve_review_path
 
+
+def _module_source_path(name):
+    """Locate the same source file as an import, without executing the target.
+
+    Already loaded modules retain their literal file identity. For other
+    modules the import finder supplies the origin; importing their parent
+    package does not evaluate the target numerical module.
+    """
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        origin = getattr(loaded, "__file__", None)
+    else:
+        specification = importlib.util.find_spec(name)
+        origin = None if specification is None else specification.origin
+    if not isinstance(origin, str) or origin in {"built-in", "frozen"}:
+        raise ModuleNotFoundError("Saved review requires a source-file module: " + name)
+    return Path(origin)
+
+
+def _declared_code_binding(runner):
+    """Hash the original runner's declared module names without running them.
+
+    The unchanged runner source supplies its literal name tuple. Its own file
+    remains part of that tuple and of the resulting full binding, so saved
+    admission keeps the original source hashes and complete dictionary check.
+    No parameter defaults or numerical module initialization are needed.
+    """
+    tree = ast.parse(Path(runner.__file__).read_text(encoding="utf-8-sig"))
+    functions = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "code_binding"]
+    if len(functions) != 1:
+        raise ValueError("Saved review runner has no unique declared code binding")
+    declarations = [node.value for node in functions[0].body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "names"
+                            for target in node.targets)]
+    if len(declarations) != 1 or not isinstance(declarations[0], ast.Tuple):
+        raise ValueError("Saved review runner code binding must declare a literal name tuple")
+    names = []
+    for node in declarations[0].elts:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            names.append(node.value)
+        elif isinstance(node, ast.Name) and node.id == "__name__":
+            names.append(runner.__name__)
+        else:
+            raise ValueError("Saved review runner contains a nonliteral module name")
+    return {name: sha256_file(_module_source_path(name)) for name in names}
 
 def _read(path):
     value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -130,7 +180,7 @@ def _admitted(root_text, registration_text, stamps):
         and raw.get("counts_sha256") == shift["counts"]["sha256"]
         and raw["variants"][placement]["delta_star"] == shift["delta_star_unrounded"],
         "T4c calibrated shift differs from the frozen calibrator output")
-    _require(inputs.get("code") == runner.code_binding(), "T4c current numerical pipeline differs from its frozen code binding")
+    _require(inputs.get("code") == _declared_code_binding(runner), "T4c current numerical pipeline differs from its frozen code binding")
     runner.validate_source_inventory(plan["source_inventory"])
     _require(inputs.get("source_inventory_sha256") == canonical_sha256(plan["source_inventory"]),
              "T4c source inventory changed")
