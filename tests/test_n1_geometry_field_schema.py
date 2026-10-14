@@ -2,7 +2,7 @@
 import json
 import numpy as np
 import pytest
-from test_n1_pipeline import tiny_config
+from tests.test_n1_pipeline import tiny_config
 from darsia.fluidflower import n1_pipeline as legacy
 from darsia.fluidflower.mass import n1_pipeline as core
 from darsia.fluidflower.mass import n1_geometry as geometry

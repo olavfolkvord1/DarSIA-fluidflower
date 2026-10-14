@@ -15,7 +15,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from test_n1_pipeline import BASE_COMMIT, tiny_config as original_tiny_config
+from tests.test_n1_pipeline import BASE_COMMIT, tiny_config as original_tiny_config
 from darsia.fluidflower.mass import n1_pipeline as n1
 from darsia.fluidflower.pipeline import checkpoint, worker
 from darsia.fluidflower.pipeline.job_queue import JobQueue, read_json, write_immutable
