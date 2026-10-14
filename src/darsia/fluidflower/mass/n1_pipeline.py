@@ -156,10 +156,27 @@ class DataReader:
         return result
 
 
-def load_n1_run(descriptor, *, unc_only=False):
+def _geometry_fields(config, supplied=None):
+    """Require explicit source and provenance field names without alias searches."""
+    required = ("source_to_native", "original_domain_to_native",
+                "carried_homography_provenance")
+    existing = config.get("geometry_fields")
+    if supplied is not None:
+        if existing is not None and existing != supplied:
+            raise ValueError("Explicit geometry field mappings differ")
+        existing = supplied
+    if not isinstance(existing, dict) or set(existing) != set(required):
+        raise ValueError("The complete explicit geometry_fields mapping is required")
+    if any(not isinstance(existing[name], str) or not existing[name] for name in required):
+        raise ValueError("Geometry field names must be nonempty strings")
+    return dict(existing)
+
+
+def load_n1_run(descriptor, *, unc_only=False, geometry_fields=None):
     """Read the explicit whole-run configuration and check its metadata scope."""
     reader = DataReader(unc_only=unc_only)
     config = reader.json(descriptor)
+    config = dict(config, geometry_fields=_geometry_fields(config, geometry_fields))
     if config.get("format") != CONFIG_FORMAT:
         raise ValueError("Explicit N1 run configuration required")
     for key in CONFIG_REQUIRED:
@@ -237,11 +254,12 @@ def _dose(config, spec):
 
 class N1Pipeline:
     """One run's explicit saved native data and unchanged typed arithmetic."""
-    def __init__(self, config, *, precision, pixel_math, unc_only=False):
+    def __init__(self, config, *, precision, pixel_math, unc_only=False, geometry_fields=None):
         """Load only this run's shared data and saved scientific models."""
         import numpy as np
         import darsia
         from .n1_arithmetic import validate_parameters
+        config = dict(config, geometry_fields=_geometry_fields(config, geometry_fields))
         self.config, self.math = config, pixel_math
         if precision not in {"float32", "float64"} or pixel_math.precision != precision:
             raise ValueError("Provider and working precision differ")
@@ -315,7 +333,7 @@ class N1Pipeline:
         def matrix(raw):
             """Compose the original source-to-canvas homography."""
             origin = raw["native_origin_xy"]
-            h = np.asarray(raw["binding"]["geometry"]["H_ac28_to_frame_native"], np.float64)
+            h = np.asarray(raw["binding"]["geometry"][config["geometry_fields"]["source_to_native"]], np.float64)
             if h.shape != (3,3) or not np.isfinite(h).all() or abs(np.linalg.det(h)) < 1e-12:
                 raise ValueError("A registered native homography is required")
             return np.asarray([[1.,0.,-float(origin[0])],[0.,1.,-float(origin[1])],[0.,0.,1.]]) @ h
@@ -348,7 +366,8 @@ class N1Pipeline:
         top_descriptor = dict(spec["photo_top"])
         top_descriptor.setdefault("array_key", "keep")
         top = reader.array(top_descriptor)
-        carried, carried_proof = geometry._carried_domain(spec["original_domain"], current_matrix, shape, reader)
+        carried, carried_proof = geometry._carried_domain(spec["original_domain"], current_matrix, shape, reader,
+            fields=config["geometry_fields"])
         bottom = geometry._bottom_side(domain, top, spec["inner_polygon_native"], spec["current"]["native_origin_xy"]) & ~carried
         below = classes["filled_unobserved"] & ~bottom
         unknown = domain & ~physical["physical_supported_mask"]
@@ -357,9 +376,10 @@ class N1Pipeline:
             & np.isfinite(clear_rgb).all(-1) & (current > 0).all(-1) & (baseline > 0).all(-1) & (clear_rgb > 0).all(-1))
         raw_geometry = spec["current"]["binding"]["geometry"]
         revision = {"phase_shape_hw":list(shape), "native_origin_xy":spec["current"]["native_origin_xy"]}
-        x, y = geometry.frame_coordinates(self.reference_matrix, raw_geometry, revision)
+        x, y = geometry.frame_coordinates(self.reference_matrix, raw_geometry, revision,
+            fields=config["geometry_fields"])
         floor = geometry.transport_curve(self.floor,
-            H_source_to_target=np.asarray(raw_geometry["H_ac28_to_frame_native"], np.float64),
+            H_source_to_target=np.asarray(raw_geometry[config["geometry_fields"]["source_to_native"]], np.float64),
             source_origin_xy=shared["floor_origin_xy"], target_origin_xy=revision["native_origin_xy"], target_width=shape[1])
         good = np.flatnonzero(np.isfinite(floor))
         if not len(good):
@@ -583,7 +603,7 @@ def _publish_frame(output,manifest,manifest_asset,spec,evaluated,config,backend,
 
 
 def run_n1(task: dict, output: Path, backend: str, precision: str,
-           on_progress: Callable | None = None) -> dict:
+           on_progress: Callable | None = None, *, _runner=None) -> dict:
     """Run one N1 selection under measured, restored CPU thread limits.
 
     Thread admission is independent of the scientific formula. Import the
@@ -603,13 +623,15 @@ def run_n1(task: dict, output: Path, backend: str, precision: str,
         with threadpool_limits(limits=threads):
             runtime = {"requested_threads": threads, "cv2_threads": cv2.getNumThreads(),
                        "threadpools": threadpool_info()}
-            return _run_n1(task, output, backend, precision, on_progress, thread_runtime=runtime)
+            runner = _run_n1 if _runner is None else _runner
+            return runner(task, output, backend, precision, on_progress, thread_runtime=runtime)
     finally:
         cv2.setNumThreads(previous_cv2_threads)
 
 
 def _run_n1(task: dict, output: Path, backend: str, precision: str,
-            on_progress: Callable | None = None, *, thread_runtime: dict) -> dict:
+            on_progress: Callable | None = None, *, thread_runtime: dict,
+            geometry_fields=None) -> dict:
     """Compute one configured whole run once and publish Main-format frames.
 
     ``task.configuration`` is a full descriptor of the explicit run data;
@@ -621,7 +643,7 @@ def _run_n1(task: dict, output: Path, backend: str, precision: str,
     unc_only = _is_unc(output) or _is_unc(task["configuration"]["path"])
     if unc_only and (not _is_unc(output) or not _is_unc(task["configuration"]["path"])):
         raise ValueError("Production configuration and output must both be UNC")
-    config=load_n1_run(task["configuration"],unc_only=unc_only)
+    config=load_n1_run(task["configuration"],unc_only=unc_only,geometry_fields=geometry_fields)
     if config["run"] != task["run"] or backend not in {"cpu","cuda"}:
         raise ValueError("Task run and explicit numerical backend are required")
     if on_progress is not None and not callable(on_progress):
@@ -631,12 +653,25 @@ def _run_n1(task: dict, output: Path, backend: str, precision: str,
     if any(output.iterdir()):
         raise FileExistsError("The caller-owned attempt directory must be empty: "+str(output))
     clock=time.perf_counter()
+    from ..pipeline.checkpoint import verify_frame_prefix, run_identity, frame_producer
+    resume = verify_frame_prefix(task, config, output, backend, precision, task.get("resume_from"))
+    resumed = len(resume["records"])
+    records = list(resume["records"])
+    frame_producers = list(resume["frame_producers"])
+    resume_asset = None
+    if task.get("resume_from") is not None:
+        resume_asset = _write_json(output/"resume.json", dict(
+            source=task["resume_from"], prefix_case_ids=resume["prefix_case_ids"],
+            frame_producers=resume["frame_producers"], predecessor_input=resume["predecessor_input"]))
+        if on_progress:
+            on_progress(dict(run=task["run"],state="resume_verified",
+                complete=True,verified_prefix_case_ids=resume["prefix_case_ids"],
+                elapsed_seconds=time.perf_counter()-clock))
     if backend == "cpu":
         math=PixelMath(precision)
     else:
         from .mass_cuda import CudaHostPixelMath
         math=CudaHostPixelMath(precision,device_id=int(task.get("device_id",0)),pool_limit_bytes=int(task["pool_limit_bytes"]))
-    records=[]
     try:
         pipeline=N1Pipeline(config,precision=precision,pixel_math=math,unc_only=unc_only)
         settings=dict(host=socket.gethostname(),backend=backend,precision=precision,
@@ -647,9 +682,14 @@ def _run_n1(task: dict, output: Path, backend: str, precision: str,
         code_sha=hashlib.sha256(commit.encode("ascii")).hexdigest()
         manifest=dict(format="darsia-n1-run-manifest-v1",job_id=task.get("job_id",output.name),run=task["run"],
             configuration=task["configuration"],code={"commit":commit,"identity_algorithm":"sha256-git-commit-ascii"},code_sha256=code_sha,settings=settings,
-            frames={frame["case_id"]:frame for frame in config["frames"]})
+            frames={frame["case_id"]:frame for frame in config["frames"]},
+            task_identity=run_identity(task,backend,precision,config["calibration"]["sha256"]))
+        if resume_asset is not None:
+            manifest["resume_checkpoint"] = resume_asset
         manifest_asset=_write_json(output/"manifest.json",manifest)
         for position,spec in enumerate(config["frames"]):
+            if position < resumed:
+                continue
             if on_progress:
                 on_progress(dict(run=task["run"],case_id=spec["case_id"],frame_index=spec["frame_index"],
                     state="frame_started",elapsed_seconds=time.perf_counter()-clock))
@@ -658,6 +698,7 @@ def _run_n1(task: dict, output: Path, backend: str, precision: str,
             compute_seconds=time.perf_counter()-started
             publication=_publish_frame(output,manifest,manifest_asset,spec,evaluated,config,backend,position,compute_seconds)
             records.append(publication)
+            frame_producers.append(frame_producer(output,publication,manifest_asset))
             del evaluated
             if on_progress:
                 on_progress(dict(run=task["run"],case_id=spec["case_id"],frame_index=spec["frame_index"],
@@ -667,7 +708,10 @@ def _run_n1(task: dict, output: Path, backend: str, precision: str,
         outcome=dict(complete=True,run=task["run"],whole_run=True,backend=backend,precision=precision,
             working_pixel_dtype=precision,pixel_backend=math.facts()["backend"],
             ordered_case_ids=[frame["case_id"] for frame in config["frames"]],case_count=len(records),records=records,
-            frames=len(records),wall_seconds=wall,images_per_hour=len(records)*3600/wall,
+            frames=len(records),wall_seconds=wall,images_per_hour=(len(records)-resumed)*3600/wall,
+            frames_computed_this_attempt=len(records)-resumed,resumed_frame_count=resumed,
+            rate_scope="new_frames_this_attempt",frame_producers=frame_producers,
+            resume_checkpoint=resume_asset,
             static_copy=None,static_geometry="per-frame native_geometry.npz",
             configuration=task["configuration"],manifest=manifest_asset,calibration=config["calibration"],
             physical_correction=config["physical_correction"],anchor=config["anchor"],elapsed_seconds=wall)

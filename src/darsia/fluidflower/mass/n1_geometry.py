@@ -209,12 +209,12 @@ def project_points(matrix, x, y):
             (matrix[1, 0]*x+matrix[1, 1]*y+matrix[1, 2])/denominator)
 
 
-def frame_coordinates(reference_matrix, geometry, revision):
+def frame_coordinates(reference_matrix, geometry, revision, *, fields):
     """Retain the original float32 metre coordinates on the native canvas."""
     shape = tuple(map(int, revision["phase_shape_hw"]))
     ox, oy = map(float, revision["native_origin_xy"])
     matrix = np.asarray(reference_matrix, np.float64) @ np.linalg.inv(
-        np.asarray(geometry["H_ac28_to_frame_native"], np.float64))
+        np.asarray(geometry[fields["source_to_native"]], np.float64))
     x = np.arange(shape[1], dtype=np.float64)[None, :] + ox
     y = np.arange(shape[0], dtype=np.float64)[:, None] + oy
     xm, ym = project_points(matrix, x, y)
@@ -251,7 +251,7 @@ def transport_curve(curve, *, H_source_to_target, source_origin_xy, target_origi
     return result
 
 
-def _carried_domain(row, current_matrix, shape, reader):
+def _carried_domain(row, current_matrix, shape, reader, *, fields):
     """Carry only historical domain membership with nearest-neighbour geometry."""
     descriptor = row["parent_labels_map"]
     # Only membership is retained. Aqueous/gas categories never enter the new map.
@@ -259,14 +259,14 @@ def _carried_domain(row, current_matrix, shape, reader):
         membership = np.asarray(image) != 255
     if tuple(membership.shape) != tuple(row["native_shape_hw"]):
         raise ValueError("Original domain and source registration use different grids")
-    original_h = np.asarray(row["H_ac28_to_frame_native"], np.float64)
+    original_h = np.asarray(row[fields["original_domain_to_native"]], np.float64)
     if original_h.shape != (3, 3) or not np.isfinite(original_h).all() or abs(np.linalg.det(original_h)) < 1e-12:
         raise ValueError("Original domain source homography is invalid")
     warp = np.asarray(current_matrix) @ np.linalg.inv(original_h)
     carried = cv2.warpPerspective(membership.astype(np.uint8), warp, shape[::-1],
         flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
     return carried, dict(original_labels=descriptor, original_frame_index=int(row["frame_index"]),
-        original_H_ac28_to_native=original_h.tolist(), original_domain_to_current=warp.tolist(),
+        **{fields["carried_homography_provenance"]: original_h.tolist()}, original_domain_to_current=warp.tolist(),
         prediction_categories_used=False)
 
 
