@@ -1066,12 +1066,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
     # section titles and the row selected first.
     _STEP_SIDEBAR = {
         "protocols": (
-            {"setup": {"protocols", "crop"}},
-            {"setup": "Protocols"},
-            ("setup", "protocols"),
+            {"preprocessing": {"protocols", "depth_measurements", "crop"}},
+            {"preprocessing": "Preprocessing"},
+            ("preprocessing", "protocols"),
         ),
         "native": (
-            {"setup": {"all", "depth", "segmentation", "facies", "rig"}},
+            {"setup": {"all", "segmentation", "facies", "rig"}},
             {"setup": "Native Setup"},
             ("setup", "all"),
         ),
@@ -1083,6 +1083,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
     }
     # The original workflow: its mass calibration and analysis.
     _ORIGINAL_SIDEBAR = {
+        "preprocessing": None,
         "calibration": {"mass", OPTUNA_MASS_ROW, "default_mass", "reset", "delete"},
         "analysis": None,
         "helper": None,
