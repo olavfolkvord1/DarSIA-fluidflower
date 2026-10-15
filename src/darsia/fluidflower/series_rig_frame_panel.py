@@ -744,7 +744,7 @@ class RigFramePanel(QWidget):
     def show_photo(self, path: Path) -> bool:
         """Display a raw photograph in the canvas (reduced for display)."""
 
-        from darsia.fluidflower.tools.injection_point_detection import load_reduced
+        from darsia.fluidflower.photograph_io import load_reduced
 
         host_show = getattr(self.page, "show_frame_photo", None)
         try:

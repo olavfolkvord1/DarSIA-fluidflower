@@ -1856,7 +1856,7 @@ class LayerPainterView(QWidget):
             if self.canvas.preview is not self._reference_token:
                 self._show_reference(reset_view=False)
             return True
-        from darsia.fluidflower.tools.injection_point_detection import load_reduced
+        from darsia.fluidflower.photograph_io import load_reduced
 
         try:
             width, height = photo_size(Path(path))
