@@ -108,13 +108,22 @@ def test_sidebar_has_one_ordered_navigation_and_preserves_settings(native_window
     assert not window.setup_series_label.isVisible()
 
 
-def test_setup_merges_three_groups_without_changing_original_actions(native_window):
+def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     window = native_window
     section = window.sidebar._sections["setup"]
-    assert [label for label, _rows in section.groups] == [
-        "Preparation",
-        "Setup steps",
-        "Geometry & facies (interactive)",
+    assert [label for label, _rows in section.groups] == [""]
+    assert [row.label for row in section._rows.values()] == [
+        "Protocols",
+        "Mark rig corners",
+        "Crop correction",
+        "Depth measurements",
+        "Depth map",
+        "Paint layers and facies",
+        "Apply painted geometry to Setup",
+        "Segmentation (automatic)",
+        "Facies (automatic)",
+        "Compute rig geometry",
+        "Full setup",
     ]
     expected = {
         "preprocessing": window.preprocessing_tab.sidebar_items(),
@@ -127,14 +136,48 @@ def test_setup_merges_three_groups_without_changing_original_actions(native_wind
                 assert row is not None
                 assert row.action == action
                 assert row.checkbox_id == row_id
-                # The merged Full setup row may be spelled out for clarity.
-                assert row.label == ("Full setup" if row_id == "all" else text)
+                assert row.help_text
     for row_id in ("rig_frame", "layers", "export"):
         row = section.get_row(f"geometry_facies:{row_id}")
         assert row is not None
         assert (row.action, row.checkbox_id) == ("geometry_facies", row_id)
     assert "preprocessing" not in window.sidebar._sections
     assert "geometry_facies" not in window.sidebar._sections
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_current_painted_export_greys_automatic_alternative_only_for_its_series(
+    native_window, monkeypatch
+):
+    from darsia.fluidflower import setup_display, series_geometry
+
+    window = native_window
+    roots = window.phase_model_workspace.series_roots
+    monkeypatch.setattr(series_geometry, "geometry_package_root", lambda root: root)
+    exported = set()
+    monkeypatch.setattr(
+        setup_display,
+        "completed_current_native_setup_export",
+        lambda root: {"revision_id": "current"} if root in exported else None,
+    )
+    window._select_series("series-a")
+    window._select_row(("setup", "segmentation"))
+    assert window.toolbar_builder.play_action.isEnabled()
+    exported.add(roots["series-a"])
+    window._update_painted_geometry_status()
+    assert not window.toolbar_builder.play_action.isEnabled()
+    window.sidebar.select("setup", "facies")
+    assert window.sidebar.get_selected() == ("setup", "segmentation")
+    for key in ("segmentation", "facies"):
+        row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
+        assert not row.isEnabled()
+        assert "a painted geometry is applied" in row.label
+        assert row.graphicsEffect().opacity() < 1
+    window._select_series("series-b")
+    for key in ("segmentation", "facies"):
+        row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
+        assert row.isEnabled()
+        assert "a painted geometry is applied" not in row.label
 
 
 @pytest.mark.parametrize(

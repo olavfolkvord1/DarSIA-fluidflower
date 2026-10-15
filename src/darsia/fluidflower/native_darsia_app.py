@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -1025,7 +1026,7 @@ def _update_group_headers(section) -> None:
 
 
 class _NativeSidebar(Sidebar):
-    """Display three Setup groups while preserving DarSIA's action keys."""
+    """Display the Setup workflow while preserving DarSIA's action keys."""
 
     def __init__(self, categories_data: dict, setup_rows: dict) -> None:
         self._setup_rows = setup_rows
@@ -1037,6 +1038,9 @@ class _NativeSidebar(Sidebar):
             row = self._sections["setup"].get_row(display_id)
             row.action = action
             row.checkbox_id = item_id
+        for header in self._sections["setup"].findChildren(GroupHeaderLabel):
+            if not header.text():
+                header.hide()
 
     def display_selection(self, action: str, item_id: str) -> tuple[str, str]:
         return self._display_rows.get((action, item_id), (action, item_id))
@@ -1048,7 +1052,8 @@ class _NativeSidebar(Sidebar):
 
     def _on_selection_changed(self, action: str, checkbox_id: str) -> None:
         # Let Sidebar maintain one visual selection, then emit the original keys.
-        if self._sections[action].get_row(checkbox_id) is None:
+        row = self._sections[action].get_row(checkbox_id)
+        if row is None or not row.isEnabled():
             return
         with QSignalBlocker(self):
             super()._on_selection_changed(action, checkbox_id)
@@ -1091,6 +1096,75 @@ class NativeFluidFlowerMainWindow(MainWindow):
         ("comparison", "Comparison", "fa5s.exchange-alt", None),
         ("helper", "Helper", "fa5s.life-ring", None),
         ("utils", "Utils", "fa5s.toolbox", None),
+    )
+
+    SETUP_WORKFLOW = (
+        (
+            "Protocols",
+            "preprocessing",
+            "protocols",
+            "Read the run protocol and produce the injection and timing records.",
+        ),
+        (
+            "Mark rig corners",
+            "geometry_facies",
+            "rig_frame",
+            "Mark the inner rig corners and injection points on a photograph for the crop geometry.",
+        ),
+        (
+            "Crop correction",
+            "preprocessing",
+            "crop",
+            "Use the marked corners to compute straightened and cropped photographs.",
+        ),
+        (
+            "Depth measurements",
+            "preprocessing",
+            "depth_measurements",
+            "Read a constant or CSV of measured depths for the depth map.",
+        ),
+        (
+            "Depth map",
+            "setup",
+            "depth",
+            "Use the depth measurements to compute the spatial depth map.",
+        ),
+        (
+            "Paint layers and facies",
+            "geometry_facies",
+            "layers",
+            "Paint the sand layers and facies, then save the geometry revision.",
+        ),
+        (
+            "Apply painted geometry to Setup",
+            "geometry_facies",
+            "export",
+            "Export the saved revision as native Setup inputs; add the emitted sections using the existing export dialog.",
+        ),
+        (
+            "Segmentation (automatic)",
+            "setup",
+            "segmentation",
+            "Automatically segment the configured image as an alternative to painted geometry.",
+        ),
+        (
+            "Facies (automatic)",
+            "setup",
+            "facies",
+            "Build the facies data from automatic segmentation as an alternative to painted geometry.",
+        ),
+        (
+            "Compute rig geometry",
+            "setup",
+            "rig",
+            "Combine the configured labels, facies and corrections into the rig geometry.",
+        ),
+        (
+            "Full setup",
+            "setup",
+            "all",
+            "Run all original DarSIA Setup steps using the selected run configuration.",
+        ),
     )
 
     def __init__(self, *, initial_series: str | None = None) -> None:
@@ -1146,6 +1220,13 @@ class NativeFluidFlowerMainWindow(MainWindow):
             series=series, initial_series=initial_series
         )
         self.geometry_workspace.series_label.hide()
+        show_export = self.geometry_workspace._show_export_dialog
+
+        def export_finished(export):
+            show_export(export)
+            self._update_painted_geometry_status()
+
+        self.geometry_workspace._show_export_dialog = export_finished
         self.content_stack.addWidget(self.geometry_workspace)
         self.phase_model_workspace = PhaseModelWorkspace(
             series=series, initial_series=initial_series
@@ -1160,43 +1241,14 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         sidebar_data = {}
         setup_rows = {}
-        geometry_rows = [
-            ("Rig frame", "rig_frame", "fa5s.circle", "Rig frame"),
-            ("Layers and facies", "layers", "fa5s.circle", "Layers and facies"),
-            (
-                "Export to native Setup",
-                "export",
-                "fa5s.circle",
-                "Export to native Setup",
-            ),
-        ]
         for action, label, icon, rows in self.SIDEBAR_CATEGORIES:
             if action == "setup":
-                groups = []
-                for group, source, items in (
-                    (
-                        "Preparation",
-                        "preprocessing",
-                        self.preprocessing_tab.sidebar_items(),
-                    ),
-                    ("Setup steps", "setup", self.setup_tab.sidebar_items()),
-                    (
-                        "Geometry & facies (interactive)",
-                        "geometry_facies",
-                        [("", geometry_rows)],
-                    ),
-                ):
-                    display_items = []
-                    for _original_group, original_items in items:
-                        for text, item_id, row_icon, help_text in original_items:
-                            if source == "setup" and item_id == "all":
-                                text = "Full setup"
-                            display_id = f"{source}:{item_id}"
-                            setup_rows[display_id] = (source, item_id)
-                            display_items.append(
-                                (text, display_id, row_icon, help_text)
-                            )
-                    groups.append((group, display_items))
+                display_items = []
+                for text, source, item_id, help_text in self.SETUP_WORKFLOW:
+                    display_id = f"{source}:{item_id}"
+                    setup_rows[display_id] = (source, item_id)
+                    display_items.append((text, display_id, "fa5s.circle", help_text))
+                groups = [("", display_items)]
             else:
                 groups = (
                     self.action_dispatch[action].sidebar_items()
@@ -1325,6 +1377,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.home_page.table.selectRow(row)
                 break
         self.geometry_workspace.set_series(self.phase_model_workspace.series_id)
+        self._update_painted_geometry_status()
         self._populate_runs()
         if self._darsia_visible():
             self._ensure_run_loaded()
@@ -1640,13 +1693,66 @@ class NativeFluidFlowerMainWindow(MainWindow):
     def show_color_path(self) -> None:
         self._select_row(("calibration", "color"))
 
+    def _update_painted_geometry_status(self) -> None:
+        """Mark the automatic alternative after current-revision step 7 export."""
+        from darsia.fluidflower.series_geometry import geometry_package_root
+        from darsia.fluidflower.setup_display import (
+            completed_current_native_setup_export,
+        )
+
+        root = self.phase_model_workspace.series_roots.get(
+            self.phase_model_workspace.series_id
+        )
+        completed = (
+            completed_current_native_setup_export(geometry_package_root(root))
+            if root is not None
+            else None
+        )
+        for item in ("segmentation", "facies"):
+            row = self.sidebar._sections["setup"].get_row(f"setup:{item}")
+            title = next(
+                text
+                for text, source, key, _help in self.SETUP_WORKFLOW
+                if source == "setup" and key == item
+            )
+            row.label = title + (
+                " — a painted geometry is applied" if completed else ""
+            )
+            row._text_label.setText(row.label)
+            row._text_label.setWordWrap(True)
+            row.setToolTip(
+                "Current saved geometry exported for Setup; importing its sections follows the existing export dialog."
+                if completed
+                else row.help_text
+            )
+            row.setEnabled(not completed)
+            effect = row.graphicsEffect()
+            if effect is None:
+                effect = QGraphicsOpacityEffect(row)
+                row.setGraphicsEffect(effect)
+            effect.setOpacity(0.45 if completed else 1.0)
+        self._update_run_action()
+
+    def _sidebar_selection_enabled(self) -> bool:
+        if not hasattr(self, "sidebar"):
+            return False
+        selected = self.sidebar.get_selected()
+        if selected is None:
+            return False
+        action, item = self.sidebar.display_selection(*selected)
+        row = self.sidebar._sections[action].get_row(item)
+        return row is not None and row.isEnabled()
+
     def _darsia_visible(self) -> bool:
         return getattr(self, "_current_category", None) in self.action_dispatch
 
     def _guard_custom_play(self) -> None:
         """A background workflow may finish after navigation to a custom page."""
         action = self.toolbar_builder.play_action
-        if self.selected_action not in self.action_dispatch and action.isEnabled():
+        if action.isEnabled() and (
+            self.selected_action not in self.action_dispatch
+            or not self._sidebar_selection_enabled()
+        ):
             action.setEnabled(False)
 
     def _update_run_action(self) -> None:
@@ -1655,6 +1761,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             and self.selected_action in self.action_dispatch
             and self.selected_checkbox_id is not None
             and not self.process_runner.active
+            and self._sidebar_selection_enabled()
         )
 
     def _select_row(self, selection: tuple[str, str]) -> None:
@@ -1682,6 +1789,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
     def _on_sidebar_expanded(self, action: str, is_expanded: bool) -> None:
         if action == "setup" and hasattr(self, "content_stack"):
+            self._update_painted_geometry_status()
             if is_expanded and not self._selecting_sidebar:
                 self._sync_home_series_before_navigation()
                 self.sidebar.select("preprocessing", "protocols")
