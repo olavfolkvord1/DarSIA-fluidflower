@@ -152,7 +152,7 @@ def test_method_badge_is_visible_in_workflow_categories_and_analysis_repeats_it(
         section = window.sidebar._sections[category]
         logical = window.sidebar._logical_selection(category, next(iter(section._rows)))
         window._select_row(logical)
-        assert window.method_badge.isVisible() is (category != "start"), category
+        assert window.method_badge.isVisible() is (category not in {"start", "calibration"}), category
         assert "Method: phase model" in window.method_badge.text()
         assert window.method_panel.isVisible() is (category == "calibration")
         assert window.analysis_method_badge.isVisible() is (category == "analysis")

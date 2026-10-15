@@ -1435,6 +1435,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.recent_requested.connect(self._open_series_from_start)
         self._sync_series_display()
         self._select_row(("start", "series"))
+        from darsia.fluidflower.calibration_header import NativeCalibrationHeader
+
+        self.calibration_header = NativeCalibrationHeader(self)
 
     def refresh_sidebar_progress(self):
         """Native metadata status; preserve unrelated shallow completion dots."""
@@ -1563,6 +1566,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.depth_workflow.keep_selection_disabled_if_running()
         if getattr(self, "rig_context", None) is not None:
             self.rig_context.refresh()
+        if getattr(self, "calibration_header", None) is not None:
+            self.calibration_header.refresh()
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""

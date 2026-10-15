@@ -280,7 +280,7 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert not window.toolbar_builder.play_action.isEnabled()
     assert not window.toolbar_builder.wizard_action.isEnabled()
     assert window.run_combo.isVisible() is (category != "start")
-    assert window.setup_series_label.isVisible() is (category != "start")
+    assert window.setup_series_label.isVisible() is (category not in {"start", "phase_model"})
     if category == "phase_model":
         choices = window.phase_model_workspace.calibration_sidebar
         assert choices.get_selected() == ("calibration", "phase_model_training")
@@ -346,7 +346,7 @@ def test_series_run_selector_is_visible_for_every_category_except_start(
     )
     assert window.series_header.isVisible()
     assert window.run_combo.isVisible()
-    assert window.setup_series_label.isVisible()
+    assert window.setup_series_label.isVisible() is (category != "calibration")
     window._select_row(("start", "series"))
     assert not window.series_header.isVisible()
 
