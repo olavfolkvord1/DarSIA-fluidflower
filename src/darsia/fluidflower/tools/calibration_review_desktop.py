@@ -11864,6 +11864,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open an existing session for audit without permitting any edits.",
     )
+    parser.add_argument("--review-current-model-root", type=Path,
+                        help="Saved phase-model folder currently shown in Studio correction review")
+    parser.add_argument("--review-model-choice", action="append", default=[],
+                        help="Explicit Studio model choice as a JSON root/label object")
     parser.add_argument("--evidence-audit", type=Path, help="Immutable evidence-disagreement queue")
     parser.add_argument("--no-gpu", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -12457,6 +12461,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("Evidence audit requires the single-model correction viewer")
         from darsia.fluidflower.ui.evidence_audit import attach_evidence_audit
         attach_evidence_audit(window, args.evidence_audit, sys.modules[__name__])
+    from darsia.fluidflower.ui.review_version_controls import attach_review_version_controls
+    attach_review_version_controls(window, args, sys.modules[__name__], use_opengl=use_opengl)
     window.show()
 
     if args.smoke_test or args.screenshot is not None:

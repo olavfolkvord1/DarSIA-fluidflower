@@ -4405,7 +4405,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             )
         model_id = str(model.get("model_id") or "").strip()
         resolved_session_id = session_id or self._review_session_id_for(model_id)
-        return build_phase_review_command(
+        command = build_phase_review_command(
             mode=mode,
             ffac_root=Path(str(binding["ffac_root"])),
             ffum_root=Path(str(binding["ffum_root"])),
@@ -4418,6 +4418,19 @@ class SharedPhaseModelTrainingPage(QWidget):
             target_model_id=model_id,
             review_session_id=resolved_session_id,
         )
+        if (
+            getattr(self, "_native_step_adapter", None)
+            and mode == "open_correction"
+            and model and model.get("root")
+        ):
+            from .review_version_controls import model_choice_arguments
+
+            choices = [
+                dict(entry, display_name=self._validation_model_label(entry))
+                for entry in _models_for_series(self.model_history, self._active_model_series)
+            ]
+            command.extend(model_choice_arguments(choices, model["root"]))
+        return command
 
     def _launch_review(self, mode: str) -> None:
         if self._series_batch_blocks_selection():

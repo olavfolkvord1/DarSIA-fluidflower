@@ -187,6 +187,7 @@ class NativePhaseSteps(QWidget):
     ):
         super().__init__(parent)
         self.studio, self.series_root, self.series_id = studio, None, ""
+        studio._native_step_adapter = self
         self.actor_provider = actor_provider
         self.training_routes = dict(training_routes or {})
         self.normalisation = normalisation
