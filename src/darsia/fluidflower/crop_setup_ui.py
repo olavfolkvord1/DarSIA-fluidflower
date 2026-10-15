@@ -232,7 +232,8 @@ class NativeCropWorkflow(QObject):
             return False
         try:
             context = self._selected_context(export)
-            self._require_saved_open_settings()
+            if not self._require_saved_open_settings():
+                return False  # The shared guard already explained the refusal.
         except Exception as error:
             self.window.print_log(f"Could not apply rig corners: {error}")
             QMessageBox.warning(self.window, "Rig corners were not applied", str(error))
@@ -266,11 +267,14 @@ class NativeCropWorkflow(QObject):
         thread.start()
         return True
 
-    def _require_saved_open_settings(self) -> None:
-        """Read normal form edits back to memory; never discard or save them."""
+    def _require_saved_open_settings(self) -> bool:
+        """Reuse the native Save-first guard, retaining the standalone fallback."""
+        guard = getattr(self.window, "reference_open_guard", None)
+        if guard is not None:
+            return guard.allowed()
         opened = getattr(self.window, "config_file", None)
         if not opened:
-            return
+            return True
         # The native factory's existing sync also settles deferred field fills.
         # It does not save. Keep all edits in config_dict if Save-first stops us.
         self.window.settings_factory._sync_settings_inputs_to_config_dict()
@@ -281,6 +285,7 @@ class NativeCropWorkflow(QObject):
                 "apply rig corners. Your edits remain in the editor; no crop "
                 "registration or configuration write has started."
             )
+        return True
 
     @Slot(str)
     def _capture_complete(self, receipt: str) -> None:

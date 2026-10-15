@@ -75,6 +75,15 @@ def native_window(qtbot, monkeypatch, tmp_path, request):
         QSettings.setDefaultFormat(old_format)
 
 
+def _allow_reference_for_empty_routing_fixture(window, monkeypatch):
+    # These historical A9 fixtures test navigation only and have no runs.
+    # Actual A15 reference/refusal tests keep the real loader and guard.
+    for root in window.phase_model_workspace.series_roots.values():
+        manifest = tomllib.loads((root / "series.toml").read_bytes().decode("utf-8"))
+        assert manifest["runs"]["ids"] == []
+    monkeypatch.setattr(window, "_load_reference_configuration", lambda: True)
+
+
 def _custom_page(window, category):
     if category == "start":
         return window.home_page
@@ -510,6 +519,7 @@ def test_single_click_opens_setup_without_training_or_wizard(
     native_window, qtbot, monkeypatch
 ):
     window = native_window
+    _allow_reference_for_empty_routing_fixture(window, monkeypatch)
     home = window.home_page
     target = next(
         row
@@ -564,6 +574,7 @@ def test_add_existing_folder_registers_and_opens_series(native_window, monkeypat
     from darsia.fluidflower import native_darsia_app as native, series_paths
 
     window = native_window
+    _allow_reference_for_empty_routing_fixture(window, monkeypatch)
     root = window.phase_model_workspace.series_roots["series-b"]
     registered = []
     monkeypatch.setattr(
@@ -598,6 +609,7 @@ def test_single_and_double_click_signals_share_one_setup_open(
     native_window, monkeypatch
 ):
     window = native_window
+    _allow_reference_for_empty_routing_fixture(window, monkeypatch)
     home = window.home_page
     target_row = next(
         row
@@ -629,8 +641,11 @@ def test_single_and_double_click_signals_share_one_setup_open(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_hidden_open_signal_and_compatibility_entries_use_setup(native_window):
+def test_hidden_open_signal_and_compatibility_entries_use_setup(
+    native_window, monkeypatch
+):
     window = native_window
+    _allow_reference_for_empty_routing_fixture(window, monkeypatch)
     table = window.home_page.table
     target_row = next(
         row

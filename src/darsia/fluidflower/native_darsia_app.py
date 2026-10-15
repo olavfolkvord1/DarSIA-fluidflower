@@ -1417,6 +1417,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.run_combo.activated.connect(self._run_chosen)
         self.run_combo.currentIndexChanged.connect(self._update_setup_action)
         self.run_combo.currentIndexChanged.connect(self._refresh_scope_display)
+        from darsia.fluidflower.reference_open_guard import ReferenceOpenGuard
+
+        self.reference_open_guard = ReferenceOpenGuard(self)
         self.home_page.table.itemSelectionChanged.connect(self._home_series_selected)
         self.phase_model_workspace.series_selector.currentIndexChanged.connect(
             self._sync_series_display
@@ -2084,36 +2087,88 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._open_series_from_start()
 
     def _open_series_from_start(self, path: str | None = None) -> None:
-        """Open series metadata and the first Setup row, without a wizard/model.
-
-        The table's existing single- and double-click signals share this route.
-        A repeated signal for the already-open destination is a no-op; returning
-        to Start and opening the same series again remains a normal open.
-        """
+        """Open one series' reference config and Setup, without a workflow."""
         path = path or self.home_page._selected_project_path()
         if path in self.home_page.series_registry.legacy_by_path:
             self._open_legacy_project(path)
             return
         series_id = self._series_for_path(path)
-        if not series_id:
+        if not series_id or not self._reference_switch_allowed():
             return
         target = ("preprocessing", "protocols")
-        if (
-            self.phase_model_workspace.series_id == series_id
-            and self.sidebar.get_selected() == target
-            and self.content_stack.currentWidget() is self.settings_scroll_area
-        ):
-            return
         self._select_series(series_id)
-        # Retain the existing active-job guard's rejection of a series change.
         if self.phase_model_workspace.series_id != series_id:
             return
-        self._select_row(target)
+        if not self._load_reference_configuration():
+            # An old/foreign configuration must never look like successful
+            # Protocols for the requested series, or remain runnable there.
+            self._select_row(("start", "series"))
+            return
+        if (
+            self.sidebar.get_selected() != target
+            or self.content_stack.currentWidget() is not self.settings_scroll_area
+        ):
+            self._select_row(target)
+
+    def _reference_switch_allowed(self) -> bool:
+        return self.reference_open_guard.allowed()
+
+    def _load_reference_configuration(self) -> bool:
+        """Use the existing safe loader; never skip to another usable run."""
+        from darsia.fluidflower.series_reference_selection import reference_choice
+
+        depth = getattr(self, "depth_workflow", None)
+        if self.process_runner.active or (depth is not None and depth.sequence.running):
+            self.print_log(
+                "Reference configuration stays unchanged while the current workflow is running."
+            )
+            return False
+        workspace = self.phase_model_workspace
+        root = workspace.series_roots.get(workspace.series_id)
+        if root is None:
+            return False
+        choice = reference_choice(root, run_configurations(root))
+        self.reference_configuration_choice = choice
+        if not choice.config_path:
+            self.print_log(choice.summary + " " + " ".join(choice.issues))
+            return False
+        index = self.run_combo.findText(choice.run_id)
+        if index < 0:
+            self.print_log(
+                "Reference run is not present in the current run selector: "
+                + choice.run_id
+            )
+            return False
+        with QSignalBlocker(self.run_combo):
+            self.run_combo.setCurrentIndex(index)
+        if self._config_series == workspace.series_id and _same_file(
+            self.config_file, choice.config_path
+        ):
+            self._update_run_path()
+            self._refresh_scope_display()
+            return True
+        if not self._load_run_config(choice.config_path):
+            self._update_run_path()
+            self._refresh_scope_display()
+            self.print_log(
+                "Reference configuration could not be loaded: " + choice.config_path
+            )
+            return False
+        self.print_log(choice.summary)
+        return True
 
     def _home_series_selected(self) -> None:
         """Keep the per-run categories on the series selected on Start."""
         selected = self.home_page.selected_series()
         if selected and selected != self.phase_model_workspace.series_id:
+            if not self.reference_open_guard.allowed(notify=False):
+                current = self.phase_model_workspace.series_id
+                with QSignalBlocker(self.home_page.table):
+                    for row in range(self.home_page.table.rowCount()):
+                        if self.home_page.table.item(row, 1).text() == current:
+                            self.home_page.table.selectRow(row)
+                            break
+                return
             self._select_series(selected)
         self._update_setup_action()
 
