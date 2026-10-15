@@ -29,6 +29,7 @@ from .comparison import ComparisonTab
 from .config_controller import ConfigController
 from .helper import HelperTab
 from .menu import MenuBuilder
+from .preprocessing import PreprocessingTab
 from .process_runner import ProcessRunner
 from .settings import SettingsFactory
 from .setup import SetupTab
@@ -39,6 +40,7 @@ from .theme import set_theme as save_theme
 from .theme import theme_signal
 from .toolbar import ToolbarBuilder
 from .utils_tab import UtilsTab
+from .wizards import has_wizard, load_wizard_dialog_class
 
 _BATCH_DURATION_WINDOW = 5
 
@@ -161,6 +163,7 @@ class MainWindow(QMainWindow):
 
         # Setting up the middle upper layout with sidebar
         # Initialize tab managers
+        self.preprocessing_tab = PreprocessingTab(self)
         self.setup_tab = SetupTab(self)
         self.calibration_tab = CalibrationTab(self)
         self.analysis_tab = AnalysisTab(self)
@@ -170,6 +173,7 @@ class MainWindow(QMainWindow):
 
         # Build action dispatch dict (needed by toolbar Play/Stop)
         self.action_dispatch = {
+            "preprocessing": self.preprocessing_tab,
             "setup": self.setup_tab,
             "calibration": self.calibration_tab,
             "analysis": self.analysis_tab,
@@ -180,6 +184,11 @@ class MainWindow(QMainWindow):
 
         # Build sidebar from tab-manager declarative data
         sidebar_data = {
+            "preprocessing": (
+                "Preprocessing",
+                "fa5s.tasks",
+                self.preprocessing_tab.sidebar_items(),
+            ),
             "setup": ("Setup", "fa5s.cogs", self.setup_tab.sidebar_items()),
             "calibration": (
                 "Calibration",
@@ -201,6 +210,7 @@ class MainWindow(QMainWindow):
         }
         self.sidebar = Sidebar(sidebar_data)
         self.sidebar.selection_changed.connect(self._on_sidebar_selection)
+        self.sidebar.expanded_changed.connect(self._on_sidebar_expanded)
         upper_mid_layout.addWidget(self.sidebar)
 
         # Initialize selection state (will be set when sidebar row is clicked)
@@ -478,11 +488,51 @@ class MainWindow(QMainWindow):
         self.selected_checkbox_id = checkbox_id
         self.settings_factory.display_settings(action, [checkbox_id])
         self.streaming_panel.refresh_results()
+        self._sync_wizard_action_state()
+
+    def _on_sidebar_expanded(self, action: str, is_expanded: bool):
+        """Handle a category header being clicked open/closed.
+
+        Opening a category's header is enough on its own to make it "active"
+        (e.g. unlocking the wizard button for it) — the user doesn't have to
+        additionally pick a specific item first. No specific item is implied
+        though, so this deliberately doesn't touch settings display the way
+        _on_sidebar_selection does; any stale checkbox_id from a previously
+        selected, different category is cleared so Play can't misfire against
+        it under the newly active category.
+        """
+        if is_expanded:
+            self.selected_action = action
+            self.selected_checkbox_id = None
+        elif self.selected_action == action:
+            # Either the user closed the active category, or the accordion is
+            # collapsing it because another one is about to take over (that
+            # category's own is_expanded=True call follows right after, and
+            # will set selected_action itself) -- clear in the meantime.
+            self.selected_action = None
+        self._sync_wizard_action_state()
 
     def _on_open_full_config(self):
         """Handle opening full config: deselect sidebar and show all settings."""
         self.sidebar.deselect_all()
         self.settings_factory.display_full_settings()
+        self.clear_selection()
+
+    def clear_selection(self):
+        """Reset sidebar-selection state (e.g. after New/Open Config, or opening
+        the full config view) — sidebar.deselect_all() only clears the sidebar's
+        own visual state, so callers that use it must also call this to keep
+        selected_action/selected_checkbox_id (and anything driven by them, like
+        the wizard button) from going stale.
+        """
+        self.selected_action = None
+        self.selected_checkbox_id = None
+        self._sync_wizard_action_state()
+
+    def _sync_wizard_action_state(self):
+        """Enable the toolbar/Run-menu 'current category' wizard action only
+        when the currently selected sidebar category has a registered wizard."""
+        self.toolbar_builder.wizard_action.setEnabled(has_wizard(self.selected_action))
 
     # (action, checkbox_id) -> the exact action-label string
     # results_folder.has_workflow_output expects, for the few cases that
@@ -503,8 +553,8 @@ class MainWindow(QMainWindow):
 
         Best-effort and skipped without a loaded config. Coverage matches
         what results_folder.suggested_workflow_results_folder understands
-        per category/step; a step outside that coverage (e.g. Setup's Crop
-        correction, which has no known output folder at all) simply keeps
+        per category/step; a step outside that coverage (e.g. Preprocessing's
+        Crop correction, which has no known output folder at all) simply keeps
         its default, uninformative dot rather than showing a wrong one.
         Helper's items are inspection tools, not one-time pipeline steps, so
         they're intentionally left out of scope.
@@ -513,6 +563,7 @@ class MainWindow(QMainWindow):
             return
         config_path = Path(self.config_file)
         tab_managers = {
+            "preprocessing": self.preprocessing_tab,
             "setup": self.setup_tab,
             "calibration": self.calibration_tab,
             "analysis": self.analysis_tab,
@@ -566,6 +617,35 @@ class MainWindow(QMainWindow):
     def show_about_dialog(self):
         """Show the About dialog."""
         AboutDialog(self).exec()
+
+    def open_wizard_for(self, category: str) -> None:
+        """Open the guided wizard registered for `category` (see wizards.py),
+        for the currently-loaded config.
+
+        The wizard edits the same config the Settings tabs do and saves to the
+        same file, so it needs one to exist: without a config loaded, route
+        through the normal 'new config' flow first.
+        """
+        if not has_wizard(category):
+            self.print_log(f"No wizard available yet for '{category}'.")
+            return
+        dialog_class = load_wizard_dialog_class(category)
+
+        if not self.config_file:
+            self.print_log("Wizard: create or open a config file first.")
+            self.config_controller.new_config()
+            if not self.config_file:
+                return
+        dialog_class(self).exec()
+
+    def open_current_wizard(self) -> None:
+        """Open the wizard for whichever sidebar category is currently
+        selected (toolbar wizard-wand button / Run menu's 'Run Category
+        Wizard')."""
+        if self.selected_action is None:
+            self.print_log("Select a category in the sidebar first.")
+            return
+        self.open_wizard_for(self.selected_action)
 
     def print_log(self, text):
         """Emit log_message signal to append text to log window (thread-safe via Qt signal)."""

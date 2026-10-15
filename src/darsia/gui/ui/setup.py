@@ -1,9 +1,11 @@
-"""Setup workflow tab for DarSIA GUI."""
+"""Setup workflow tab for DarSIA GUI: depth map, segmentation, facies, rig.
+
+Preprocessing (protocols, depth measurements, crop correction) is a separate
+tab/category — see :mod:`darsia.gui.ui.preprocessing`.
+"""
 
 import sys
 from pathlib import Path
-
-from PySide6.QtWidgets import QMessageBox
 
 
 class SetupTab:
@@ -48,9 +50,7 @@ class SetupTab:
             "depth": selected_id == "depth",
             "segmentation": selected_id == "segmentation",
             "facies": selected_id == "facies",
-            "protocols": selected_id == "protocols",
             "rig": selected_id == "rig",
-            "crop": selected_id == "crop",
             "show": show_plots,
             "force": False,
         }
@@ -59,53 +59,6 @@ class SetupTab:
             """Starting setup with options: """
             f"""{[k for k, v in options.items() if v and k != "force"]}"""
         )
-
-        # Check for protocol file conflicts and ask user if overwrite is needed
-        config_paths = [Path(config_file)]
-        if options["protocols"]:
-            try:
-                from darsia.presets.workflows.setup.setup_protocols import (
-                    preview_protocol_setup_conflicts,
-                )
-
-                conflicts = preview_protocol_setup_conflicts(config_paths)
-                if conflicts:
-                    # Truncate to 8 items max; show remainder count if needed
-                    CONFLICT_PREVIEW_LIMIT = 8
-                    preview_paths = conflicts[:CONFLICT_PREVIEW_LIMIT]
-                    preview_text = "\n".join(str(p) for p in preview_paths)
-                    if len(conflicts) > CONFLICT_PREVIEW_LIMIT:
-                        preview_text += (
-                            f"\n... and {len(conflicts) - CONFLICT_PREVIEW_LIMIT} more."
-                        )
-
-                    message = (
-                        "Protocol files already exist:\n\n"
-                        f"{preview_text}\n\n"
-                        "Overwrite existing protocol files?"
-                    )
-
-                    result = QMessageBox.question(
-                        self.main_window,
-                        "Protocol files exist",
-                        message,
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-
-                    if result != QMessageBox.Yes:
-                        self.main_window.print_log(
-                            """Protocol setup cancelled: user chose not to """
-                            """overwrite existing files."""
-                        )
-                        return
-
-                    options["force"] = True
-            except Exception as e:
-                self.main_window.print_log(
-                    f"Error checking protocol conflicts: {str(e)}"
-                )
-                return
 
         # Build command-line arguments for subprocess
         argv = [
@@ -123,12 +76,8 @@ class SetupTab:
             argv.append("--segmentation")
         if options["facies"]:
             argv.append("--facies")
-        if options["protocols"]:
-            argv.append("--protocol")
         if options["rig"]:
             argv.append("--rig")
-        if options["crop"]:
-            argv.append("--crop")
         if options["force"]:
             argv.append("--force")
         if options["show"]:
@@ -145,7 +94,7 @@ class SetupTab:
             cwd=Path.cwd(),
             workflow="setup",
             actions=[selected_id],
-            config_path=config_paths[0],
+            config_path=Path(config_file),
         )
 
     def sidebar_items(self):
@@ -153,23 +102,6 @@ class SetupTab:
         from .help_text import get_help_text
 
         return [
-            (
-                "Preparation",
-                [
-                    (
-                        "Protocols",
-                        "protocols",
-                        "fa5s.circle",
-                        get_help_text("setup", "protocols", "Protocols"),
-                    ),
-                    (
-                        "Crop correction",
-                        "crop",
-                        "fa5s.circle",
-                        get_help_text("setup", "crop", "Crop correction"),
-                    ),
-                ],
-            ),
             (
                 "Full setup",
                 [

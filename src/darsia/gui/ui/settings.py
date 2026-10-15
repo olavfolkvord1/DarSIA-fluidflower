@@ -1,7 +1,6 @@
 """Settings and input widget factory for DarSIA GUI."""
 
 import ast
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -140,6 +139,7 @@ class SettingsFactory:
         "multi_file",
         "multi_folder",
         "path_map",
+        "number_map",
         "int_rows",
         "dataclass_group_map",
         "key_list",
@@ -171,6 +171,11 @@ class SettingsFactory:
         if "path_map" in field_or_result:
             return {
                 "path_map": True,
+                "rows": field_or_result["rows"],
+            }
+        elif "number_map" in field_or_result:
+            return {
+                "number_map": True,
                 "rows": field_or_result["rows"],
             }
         elif "int_rows" in field_or_result:
@@ -318,7 +323,13 @@ class SettingsFactory:
                 settings_by_section[section] = section_fields
 
         # Append the activity-specific options group if the action is an activity
-        ACTIVITY_OPTIONS_GROUPS = {"setup", "calibration", "analysis", "helper"}
+        ACTIVITY_OPTIONS_GROUPS = {
+            "setup",
+            "preprocessing",
+            "calibration",
+            "analysis",
+            "helper",
+        }
         if action in ACTIVITY_OPTIONS_GROUPS:
             options_fields = get_section_fields("options", only_group=action)
             if options_fields is not None:
@@ -488,6 +499,15 @@ class SettingsFactory:
                 row_label = "" if auto_grouped else label_text
                 target_form.addRow(row_label, field_or_result)
                 self.main_window.settings_inputs[setting["key"]] = field_or_result
+                # Track this scalar row for depends_on wiring (see below)
+                unqualified_key = setting["key"].rsplit(".", 1)[-1]
+                row_index = target_form.rowCount() - 1
+                field_row_map[unqualified_key] = (
+                    row_index,
+                    field_or_result,
+                    setting,
+                    target_form,
+                )
             # Handle ungrouped scalar fields
             elif isinstance(field_or_result, dict):
                 # This is a result dict from multi_file/path_map in fallback mode
@@ -497,9 +517,20 @@ class SettingsFactory:
             else:
                 target_form.addRow(label_text, field_or_result)
                 self.main_window.settings_inputs[setting["key"]] = field_or_result
+                # Track this scalar row for depends_on wiring (see below)
+                unqualified_key = setting["key"].rsplit(".", 1)[-1]
+                row_index = target_form.rowCount() - 1
+                field_row_map[unqualified_key] = (
+                    row_index,
+                    field_or_result,
+                    setting,
+                    target_form,
+                )
 
-        # Wire up depends_on visibility for top-level group fields (e.g., restoration
-        # method -> volume_averaging_options / tvd_options)
+        # Wire up depends_on visibility for top-level fields: either a whole nested
+        # group/multi-row widget (e.g., restoration method -> volume_averaging_options
+        # / tvd_options), or a single plain-scalar form row (e.g., protocols
+        # start_reference -> start_reference_fixed).
         for unqualified_key, (
             row_index,
             field_or_result,
@@ -531,53 +562,69 @@ class SettingsFactory:
 
             driver_field_or_result = self.main_window.settings_inputs[driver_full_key]
 
-            # Extract the QComboBox and type_map, handling both scalar and multi-row drivers
+            # Extract the driver control and type_map, handling both scalar and
+            # multi-row drivers
             if isinstance(driver_field_or_result, dict) and driver_field_or_result.get(
                 "key_list"
             ):
                 # Multi-row key-list selector
                 rows = driver_field_or_result.get("rows", [])
-                driver_combo = rows[0] if rows else None
+                driver_control = rows[0] if rows else None
                 type_map = driver_field_or_result.get("source_type_map", {})
             else:
-                # Scalar field: unwrap to get QComboBox
-                driver_combo = unwrap_composite_widget(driver_field_or_result)
+                # Scalar field: unwrap to get the real control
+                driver_control = unwrap_composite_widget(driver_field_or_result)
                 type_map = {}
 
-            if not isinstance(driver_combo, QComboBox):
+            if not isinstance(driver_control, (QComboBox, QCheckBox)):
                 continue
 
-            # Get the group widget to control visibility directly
-            group_widget = field_or_result.get("widget")
-            if group_widget is None:
+            # Whole-widget target (nested group/multi-row) vs. a single scalar row
+            is_group_target = (
+                isinstance(field_or_result, dict) and "widget" in field_or_result
+            )
+            group_widget = field_or_result.get("widget") if is_group_target else None
+            if is_group_target and group_widget is None:
                 continue
 
-            # Create visibility handler supporting both value-based and type-based checks
-            def make_visibility_handler(widget, required_val, required_type, type_map):
-                def handler(current_text):
+            # Create visibility handler supporting both value-based and type-based
+            # checks, and both whole-widget and single-row targets
+            def make_visibility_handler(
+                required_val, required_type, type_map, group_widget, row_idx, form
+            ):
+                def handler(current_value):
                     if required_type is not None:
                         # Type-based check: look up the type of the selected embedding
-                        selected_type = type_map.get(current_text)
+                        selected_type = type_map.get(current_value)
                         is_visible = selected_type == required_type
                     else:
                         # Value-based check (original behavior)
                         is_visible = (
-                            current_text in required_val
+                            current_value in required_val
                             if isinstance(required_val, (list, set, tuple))
-                            else current_text == required_val
+                            else current_value == required_val
                         )
-                    widget.setVisible(is_visible)
+                    if group_widget is not None:
+                        group_widget.setVisible(is_visible)
+                    else:
+                        form.setRowVisible(row_idx, is_visible)
 
                 return handler
 
-            # type_map already extracted from driver_field_or_result above
             handler = make_visibility_handler(
-                group_widget, driver_value, driver_type, type_map
+                driver_value,
+                driver_type,
+                type_map,
+                group_widget,
+                row_index,
+                target_form,
             )
-            driver_combo.currentTextChanged.connect(handler)
-
-            # Set initial visibility
-            handler(driver_combo.currentText())
+            if isinstance(driver_control, QComboBox):
+                driver_control.currentTextChanged.connect(handler)
+                handler(driver_control.currentText())
+            elif isinstance(driver_control, QCheckBox):
+                driver_control.toggled.connect(handler)
+                handler(driver_control.isChecked())
 
     def wrap_setting_with_help(self, setting_container, setting_dict):
         """Wrap a setting container with a dedicated help button column."""
@@ -657,6 +704,13 @@ class SettingsFactory:
                 value_is_directory=value_is_directory,
                 key_source=key_source,
                 form_context=form_context,
+            )
+        elif setting_type == "number_map":
+            return self.file_dialog.create_path_map_input(
+                setting_dict,
+                key_source=setting_dict.get("key_source"),
+                form_context=form_context,
+                value_is_number=True,
             )
         elif setting_type == "int_rows":
             return self.create_int_rows_input(setting_dict, form_context=form_context)
@@ -1386,11 +1440,19 @@ class SettingsFactory:
         if placeholder:
             setting_edit.setPlaceholderText(placeholder)
 
+        required = bool(setting_dict.get("required"))
+
         # Wire normalization on blur
         def normalize_time():
             text = setting_edit.text().strip()
             if not text:
-                return  # Allow blank for optional fields
+                if required:
+                    setting_edit.setStyleSheet("border: 1px solid #d32f2f;")
+                    setting_edit.setToolTip(f"{display_name} is required.")
+                else:
+                    setting_edit.setStyleSheet("")
+                    setting_edit.setToolTip("")
+                return
             try:
                 normalized = _normalize_time_string(text)
                 setting_edit.setText(normalized)
@@ -1846,26 +1908,9 @@ class SettingsFactory:
 
         # "From catalogue" submenu
         try:
-            # Load the bundled catalogue
-            catalogue_path = (
-                Path(__file__).parent.parent
-                / "config"
-                / "catalogue"
-                / config_meta["catalogue_file"]
-            )
-            if not catalogue_path.exists():
-                # Fallback: try relative to darsia installation
-                import darsia
+            from darsia.presets.workflows.config.catalogue import catalogue_path as _cat
 
-                darsia_root = Path(darsia.__file__).parent
-                catalogue_path = (
-                    darsia_root
-                    / "presets"
-                    / "workflows"
-                    / "config"
-                    / "catalogue"
-                    / config_meta["catalogue_file"]
-                )
+            catalogue_path = _cat(config_meta["catalogue_file"])
 
             # Dynamically import the catalogue class
             module_path, class_name = config_meta["catalogue_class"].rsplit(":", 1)
@@ -2247,6 +2292,7 @@ class SettingsFactory:
             # (handled below)
             if isinstance(value, dict) and (
                 "path_map" in value
+                or "number_map" in value
                 or "int_rows" in value
                 or "key_list" in value
                 or "dataclass_group_map" in value
@@ -2316,6 +2362,25 @@ class SettingsFactory:
                     if k.text().strip() and v.text().strip()
                 }
                 self.set_value(self.main_window.config_dict, key, result)
+
+        # Third pass (b): save number_map dicts (key -> float mappings)
+        for key, value in self.main_window.settings_inputs.items():
+            if not (isinstance(value, dict) and "number_map" in value):
+                continue
+            result = {}
+            for key_edit, value_edit in value["rows"]:
+                key_text = key_edit.text().strip()
+                value_text = value_edit.text().strip()
+                if not key_text or not value_text:
+                    continue
+                try:
+                    result[key_text] = float(value_text)
+                except ValueError:
+                    self.main_window.print_log(
+                        f"Skipping invalid value '{value_text}' for {key} "
+                        f"[{key_text}]: not a number."
+                    )
+            self.set_value(self.main_window.config_dict, key, result)
 
         # Fourth pass: parse int_rows editors. Non-pair → list[list[int]];
         # pair → dict[int, list[int]] (or flattened [section].<id>.labels sub-tables).
@@ -2517,7 +2582,11 @@ class SettingsFactory:
                                     except (ValueError, SyntaxError):
                                         pass
                                 elif field_type == "time":
-                                    # Time fields: normalize and store as canonical string
+                                    # Time fields: normalize and store as canonical string.
+                                    # Required fields are always written, even when the
+                                    # entered value equals the schema default (e.g. a
+                                    # start time of "00:00:00") — omitting it here would
+                                    # silently drop a value the user explicitly set.
                                     try:
                                         from darsia.presets.workflows.config.utils import (
                                             _normalize_time_string,
@@ -2526,9 +2595,9 @@ class SettingsFactory:
                                         extracted_value = _normalize_time_string(
                                             text_value
                                         )
-                                        should_include = (
-                                            extracted_value != field_default
-                                        )
+                                        should_include = field_schema.get(
+                                            "required"
+                                        ) or (extracted_value != field_default)
                                     except (ValueError, AssertionError):
                                         pass
                                 else:
