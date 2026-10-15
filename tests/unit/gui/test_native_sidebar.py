@@ -114,11 +114,9 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
         "Protocols",
         "Rig corners and injection points",
         "Depth",
-        "Paint layers and facies",
+        "Layers and facies",
         "Apply geometry to Setup",
-        "Segmentation (automatic)",
-        "Facies (automatic)",
-        "Compute rig geometry",
+        "Build run model",
         "Full setup",
     ]
     expected = {
@@ -133,6 +131,8 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
                     "crop",
                 ):
                     continue  # The single Depth pane owns both existing steps.
+                if action == "setup" and row_id in ("segmentation", "facies"):
+                    continue  # Existing workflows remain, with one visible Layers entry.
                 row = section.get_row(f"{action}:{row_id}")
                 assert row is not None
                 assert row.action == action
@@ -165,15 +165,13 @@ def test_reference_export_does_not_claim_other_runs_geometry_is_applied(
     exported.add(roots["series-a"])
     window._update_painted_geometry_status()
     for key in ("segmentation", "facies"):
-        row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
-        assert row.isEnabled()
-        assert "reference export available" in row.label
-        assert "not been applied to other runs" in row.toolTip()
+        assert window.sidebar._sections["setup"].get_row(f"setup:{key}") is None
+    export_row = window.sidebar._sections["setup"].get_row("geometry_facies:export")
+    assert export_row.label == "Apply geometry to Setup"
+    assert "separate reference exports" in export_row.help_text
     window._select_series("series-b")
-    for key in ("segmentation", "facies"):
-        row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
-        assert row.isEnabled()
-        assert "reference export available" not in row.label
+    assert export_row.label == "Apply geometry to Setup"
+    assert "applied" not in export_row.label.casefold()
 
 
 @pytest.mark.parametrize(
@@ -181,8 +179,6 @@ def test_reference_export_does_not_claim_other_runs_geometry_is_applied(
     [
         ("preprocessing", "protocols"),
         ("setup", "all"),
-        ("setup", "segmentation"),
-        ("setup", "facies"),
         ("setup", "rig"),
     ],
 )
@@ -234,6 +230,8 @@ def test_invalid_sidebar_selection_keeps_the_current_real_row(native_window):
     for action, row in (
         ("preprocessing", "does-not-exist"),
         ("setup", "does-not-exist"),
+        ("setup", "segmentation"),
+        ("setup", "facies"),
         ("unknown-category", "protocols"),
     ):
         window.sidebar.select(action, row)

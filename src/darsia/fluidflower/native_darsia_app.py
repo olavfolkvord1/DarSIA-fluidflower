@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
 from darsia.fluidflower.rig_display import NativeRigContext
 from darsia.fluidflower.crop_setup_ui import NativeCropWorkflow
+from darsia.fluidflower.coloured_map_ui import NativeColouredMapWorkflow
 from darsia.fluidflower.crop_wizard_ui import prepare_crop_wizard
 from darsia.fluidflower.project import ProjectRegistry
 from darsia.fluidflower.series_geometry import series_rig_class
@@ -1135,10 +1136,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Choose constant depth or measured points, then compute the depth map using the original two steps.",
         ),
         (
-            "Paint layers and facies",
+            "Layers and facies",
             "geometry_facies",
             "layers",
-            "Paint the sand layers and facies, then save the geometry revision.",
+            "Import an existing coloured map or mark layers on the raw reference photograph; Propose boundaries remains separate, then save the geometry revision.",
         ),
         (
             "Apply geometry to Setup",
@@ -1147,19 +1148,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Open the saved native export and explicitly apply registered rig corners to the run crop settings; labels and facies remain separate reference exports.",
         ),
         (
-            "Segmentation (automatic)",
-            "setup",
-            "segmentation",
-            "Automatically segment the configured image as an alternative to painted geometry.",
-        ),
-        (
-            "Facies (automatic)",
-            "setup",
-            "facies",
-            "Build the facies data from automatic segmentation as an alternative to painted geometry.",
-        ),
-        (
-            "Compute rig geometry",
+            "Build run model",
             "setup",
             "rig",
             "Combine the configured labels, facies and corrections into the rig geometry.",
@@ -1270,6 +1259,17 @@ class NativeFluidFlowerMainWindow(MainWindow):
         )
         self.geometry_workspace.series_label.hide()
         self.crop_workflow = NativeCropWorkflow(self)
+        self.coloured_map_workflow = NativeColouredMapWorkflow(self)
+        self.coloured_map_workflow.install_workspace(self.geometry_workspace)
+        show_geometry_page = self.geometry_workspace._show_page
+
+        def show_geometry_page_with_import():
+            result = show_geometry_page()
+            self.coloured_map_workflow.install(self.geometry_workspace.simple_view)
+            return result
+
+        self.geometry_workspace._show_page = show_geometry_page_with_import
+        self.coloured_map_workflow.install(self.geometry_workspace.simple_view)
         show_export = self.geometry_workspace._show_export_dialog
 
         def export_finished(export):
