@@ -169,6 +169,7 @@ class NativeHomePage(HomePage):
         super().__init__(self.series_registry, draft_store=_NoLegacyDrafts())
         self.new_button.hide()
         self.open_button.setText("Open series")
+        self.open_button.hide()
         self.open_selected_button.setText("Open phase model training")
         self.open_selected_button.hide()
         self.update_run_sources_button.setText("Open experiment setup")
@@ -180,6 +181,8 @@ class NativeHomePage(HomePage):
             ["Series", "ID", "Runs", "Rig class", "Last opened", "Folder"]
         )
         self.table.setColumnHidden(4, True)
+        # Open only on a user click, never on programmatic selection/refresh.
+        self.table.cellClicked.connect(self._open_row)
         self.table.horizontalHeader().setSectionResizeMode(
             5, QHeaderView.ResizeMode.Stretch
         )
@@ -1497,6 +1500,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             )
             return
         self._refresh_series(preferred_series=series_id, show_errors=True)
+
+        self._select_series(series_id)
+        self.show_phase_model_workflow()
 
     def open_image_selection_plan(self) -> None:
         """Open the metadata-only image plan from the Phase model category."""

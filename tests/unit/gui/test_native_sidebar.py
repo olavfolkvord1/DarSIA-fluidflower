@@ -418,7 +418,7 @@ def test_workflow_completion_cannot_enable_play_on_custom_pages(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_start_only_shows_series_list_and_four_actions_after_refresh(
+def test_start_only_shows_series_list_and_three_actions_after_refresh(
     native_window,
 ):
     window = native_window
@@ -426,6 +426,7 @@ def test_start_only_shows_series_list_and_four_actions_after_refresh(
 
     def check_controls():
         assert home.new_button.isHidden()
+        assert home.open_button.isHidden()
         assert home.open_selected_button.isHidden()
         assert home.update_run_sources_button.isHidden()
         assert home.add_runs_button.isHidden()
@@ -438,14 +439,12 @@ def test_start_only_shows_series_list_and_four_actions_after_refresh(
             if button.isVisibleTo(home)
         }
         assert visible == {
-            home.open_button,
             home.new_series_button,
             home.add_existing_button,
             home.refresh_series_button,
         }
         assert home.open_button.text() == "Open series"
         for button in (
-            home.open_button,
             home.new_series_button,
             home.add_existing_button,
             home.refresh_series_button,
@@ -469,7 +468,7 @@ def test_start_only_shows_series_list_and_four_actions_after_refresh(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_open_series_uses_the_selected_series(native_window, qtbot):
+def test_single_click_opens_series_without_a_separate_open_button(native_window, qtbot):
     window = native_window
     home = window.home_page
     target = next(
@@ -477,11 +476,13 @@ def test_open_series_uses_the_selected_series(native_window, qtbot):
         for row in range(home.table.rowCount())
         if home.table.item(row, 1).text() == "series-b"
     )
-    home.table.selectRow(target)
     window.phase_model_workspace.select_calibration("mass")
-    assert home.open_button.isVisible()
-    assert home.open_button.isEnabled()
-    qtbot.mouseClick(home.open_button, Qt.MouseButton.LeftButton)
+    assert home.open_button.isHidden()
+    qtbot.mouseClick(
+        home.table.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=home.table.visualItemRect(home.table.item(target, 0)).center(),
+    )
 
     assert window.content_stack.currentWidget() is window.phase_model_workspace
     assert window.sidebar.get_selected() == ("phase_model", "training")
@@ -491,6 +492,36 @@ def test_open_series_uses_the_selected_series(native_window, qtbot):
         "phase_model_training",
     )
     assert not window.toolbar_builder.play_action.isEnabled()
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_programmatic_series_selection_and_refresh_do_not_open_workspace(native_window):
+    window = native_window
+    window.home_page.table.selectRow(1)
+    window._refresh_series()
+    assert window.content_stack.currentWidget() is window.home_page
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_add_existing_folder_registers_and_opens_series(native_window, monkeypatch):
+    from darsia.fluidflower import native_darsia_app as native, series_paths
+
+    window = native_window
+    root = window.phase_model_workspace.series_roots["series-b"]
+    registered = []
+    monkeypatch.setattr(
+        native.QFileDialog, "getExistingDirectory", lambda *args: str(root)
+    )
+
+    def register(folder):
+        registered.append(folder)
+        return "series-b", "series-b", root
+
+    monkeypatch.setattr(series_paths, "register_series", register)
+    window._add_existing_series()
+    assert registered == [root]
+    assert window.phase_model_workspace.series_id == "series-b"
+    assert window.content_stack.currentWidget() is window.phase_model_workspace
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
