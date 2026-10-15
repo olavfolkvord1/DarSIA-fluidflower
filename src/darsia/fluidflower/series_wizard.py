@@ -649,6 +649,8 @@ class NewSeriesFolderWizard(QWizard):
         experiment_folder: Path | None = None,
     ) -> None:
         super().__init__(parent)
+        # Aero needs a native Windows handle and can leave the controls unpainted.
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setWindowTitle("New series")
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
         self.resize(980, 640)
