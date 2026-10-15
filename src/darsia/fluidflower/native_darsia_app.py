@@ -39,6 +39,13 @@ from darsia.fluidflower.project import ProjectRegistry
 from darsia.fluidflower.series_geometry import series_rig_class
 from darsia.fluidflower.series_geometry_workspace import SeriesGeometryWorkspace
 from darsia.fluidflower.series_paths import configured_series
+from darsia.fluidflower.series_method import (
+    MethodSelection,
+    SeriesMethodPanel,
+    missing_method_references,
+    read_series_method,
+    save_series_method,
+)
 from darsia.fluidflower.templates import RIG_CLASSES, rig_class_rank
 from darsia.fluidflower.ui.home import HomePage
 from darsia.gui.ui.main_window import MainWindow
@@ -1026,18 +1033,22 @@ def _update_group_headers(section) -> None:
 
 
 class _NativeSidebar(Sidebar):
-    """Display the Setup workflow while preserving DarSIA's action keys."""
+    """Display merged categories while preserving the original action keys."""
 
-    def __init__(self, categories_data: dict, setup_rows: dict) -> None:
+    def __init__(self, categories_data: dict, setup_rows: dict, aliases=None) -> None:
         self._setup_rows = setup_rows
+        self._logical_rows = {"setup": setup_rows, **(aliases or {})}
         self._display_rows = {
-            value: ("setup", key) for key, value in setup_rows.items()
+            logical: (category, key)
+            for category, rows in self._logical_rows.items()
+            for key, logical in rows.items()
         }
         super().__init__(categories_data)
-        for display_id, (action, item_id) in setup_rows.items():
-            row = self._sections["setup"].get_row(display_id)
-            row.action = action
-            row.checkbox_id = item_id
+        for category, rows in self._logical_rows.items():
+            for display_id, (action, item_id) in rows.items():
+                row = self._sections[category].get_row(display_id)
+                row.action = action
+                row.checkbox_id = item_id
         for header in self._sections["setup"].findChildren(GroupHeaderLabel):
             if not header.text():
                 header.hide()
@@ -1046,9 +1057,7 @@ class _NativeSidebar(Sidebar):
         return self._display_rows.get((action, item_id), (action, item_id))
 
     def _logical_selection(self, action: str, item_id: str) -> tuple[str, str]:
-        if action == "setup":
-            return self._setup_rows.get(item_id, (action, item_id))
-        return action, item_id
+        return self._logical_rows.get(action, {}).get(item_id, (action, item_id))
 
     def _on_selection_changed(self, action: str, checkbox_id: str) -> None:
         # Let Sidebar maintain one visual selection, then emit the original keys.
@@ -1080,19 +1089,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         ("start", "Start", "fa5s.home", (("Series", "series"),)),
         ("setup", "Setup", "fa5s.cogs", None),
         ("calibration", "Calibration", "fa5s.balance-scale", None),
-        (
-            "phase_model",
-            "Phase model",
-            "fa5s.adjust",
-            (("Training", "training"), ("Image selection plan…", "selection_plan")),
-        ),
         ("analysis", "Analysis", "fa5s.chart-line", None),
-        (
-            "mass_analysis",
-            "Mass analysis",
-            "fa5s.chart-area",
-            (("Frozen model", "frozen"),),
-        ),
         ("comparison", "Comparison", "fa5s.exchange-alt", None),
         ("helper", "Helper", "fa5s.life-ring", None),
         ("utils", "Utils", "fa5s.toolbox", None),
@@ -1177,6 +1174,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._current_category = "start"
         self._last_sidebar_selection = ("start", "series")
         self._selecting_sidebar = False
+        self._method_root = None
+        self._method_manifest_bytes = None
+        self._saved_method = MethodSelection()
+        self._method_panel_seed = MethodSelection()
         series = tuple(configured_series())
         initial_series = initial_series or (series[0][0] if series else "")
         if initial_series and initial_series not in {
@@ -1189,6 +1190,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         # Retain MainWindow's splitter, menus, toolbar, log and streaming handles.
         right_layout = self.settings_scroll_area.parentWidget().layout()
         right_layout.removeWidget(self.settings_scroll_area)
+        self.method_badge = QLabel("Method: not chosen")
+        self.method_badge.setTextFormat(Qt.TextFormat.PlainText)
+        self.method_badge.setWordWrap(True)
+        right_layout.addWidget(self.method_badge)
         self.series_header = QWidget()
         top = QHBoxLayout(self.series_header)
         top.setContentsMargins(0, 0, 0, 0)
@@ -1213,9 +1218,23 @@ class NativeFluidFlowerMainWindow(MainWindow):
         top.addWidget(self.run_path)
         top.addStretch(1)
         right_layout.addWidget(self.series_header)
+        self.method_panel = SeriesMethodPanel()
+        self.method_panel.hide()
+        self.method_panel.use_requested.connect(self._save_method_choice)
+        right_layout.addWidget(self.method_panel)
+        self.analysis_method_badge = QLabel("Method: not chosen")
+        self.analysis_method_badge.setTextFormat(Qt.TextFormat.PlainText)
+        self.analysis_method_badge.setWordWrap(True)
+        self.analysis_method_badge.hide()
+        right_layout.addWidget(self.analysis_method_badge)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.settings_scroll_area)
         self.content_stack.addWidget(self.home_page)
+        from darsia.fluidflower.mass_calibration_display import MassCalibrationDisplay
+
+        self.mass_calibration_display = MassCalibrationDisplay()
+        self._displayed_mass_method = None
+        self.content_stack.addWidget(self.mass_calibration_display)
         self.geometry_workspace = SeriesGeometryWorkspace(
             series=series, initial_series=initial_series
         )
@@ -1231,6 +1250,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.phase_model_workspace = PhaseModelWorkspace(
             series=series, initial_series=initial_series
         )
+        self.phase_model_workspace.calibration_sidebar.hide()
         self.content_stack.addWidget(self.phase_model_workspace)
         self.mass_analysis_page: QWidget | None = None
         self.mass_analysis_placeholder = QLabel(
@@ -1241,6 +1261,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         sidebar_data = {}
         setup_rows = {}
+        aliases = {"calibration": {}, "analysis": {}}
         for action, label, icon, rows in self.SIDEBAR_CATEGORIES:
             if action == "setup":
                 display_items = []
@@ -1249,6 +1270,57 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     setup_rows[display_id] = (source, item_id)
                     display_items.append((text, display_id, "fa5s.circle", help_text))
                 groups = [("", display_items)]
+            elif action == "calibration":
+                groups = self.calibration_tab.sidebar_items()
+                groups[0] = ("Colour path — original method", groups[0][1])
+                phase_rows = []
+                for text, item_id, help_text in (
+                    (
+                        "Training",
+                        "training",
+                        "Choose, review and train a saved phase-model version.",
+                    ),
+                    (
+                        "Mass calibration",
+                        "mass_from_phase",
+                        "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs.",
+                    ),
+                    (
+                        "Image selection plan…",
+                        "selection_plan",
+                        "Plan the per-series image selection without calculating images.",
+                    ),
+                ):
+                    display_id = f"phase_model:{item_id}"
+                    aliases[action][display_id] = ("phase_model", item_id)
+                    phase_rows.append((text, display_id, "fa5s.circle", help_text))
+                groups.append(("Phase model — classification first", phase_rows))
+            elif action == "analysis":
+                original_rows = [
+                    row
+                    for _group, rows in self.analysis_tab.sidebar_items()
+                    for row in rows
+                ]
+                phase_rows = []
+                for text, item_id, help_text in (
+                    (
+                        "Frozen model mass analysis",
+                        "frozen",
+                        "Inspect and export the selected model's completed concentration and mass results.",
+                    ),
+                    (
+                        "Phase review window",
+                        "review",
+                        "Open the existing prepared model-correction review window; a loaded model with bound phase maps is required.",
+                    ),
+                ):
+                    display_id = f"mass_analysis:{item_id}"
+                    aliases[action][display_id] = ("mass_analysis", item_id)
+                    phase_rows.append((text, display_id, "fa5s.circle", help_text))
+                groups = [
+                    ("Original method", original_rows),
+                    ("Phase model", phase_rows),
+                ]
             else:
                 groups = (
                     self.action_dispatch[action].sidebar_items()
@@ -1265,7 +1337,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 )
             sidebar_data[action] = (label, icon, groups)
         old_sidebar = self.sidebar
-        self.sidebar = _NativeSidebar(sidebar_data, setup_rows)
+        self.sidebar = _NativeSidebar(sidebar_data, setup_rows, aliases)
         self.sidebar.setMinimumWidth(180)
         self.sidebar.setMaximumWidth(600)
         old_sidebar.parentWidget().layout().replaceWidget(old_sidebar, self.sidebar)
@@ -1275,6 +1347,31 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.sidebar.expanded_changed.connect(self._on_sidebar_expanded)
         # The helper captures its calibration section, so install it after replacement.
         add_automatic_mass_calibration(self)
+        section = self.sidebar._sections["calibration"]
+        mass_row = section.get_row("mass")
+        mass_row.label = "Mass calibration"
+        mass_row._text_label.setText(mass_row.label)
+        mass_row.help_text = "Show saved colour-path parameters and reported mass-balance error; calibration runs belong to Jobs."
+        # Retain the original implementations and logical IDs, but offer one
+        # read-only mass row while calibration execution moves to Jobs.
+        for key in (OPTUNA_MASS_ROW, "default_mass"):
+            row = section.get_row(key)
+            row.hide()
+            row.setEnabled(False)
+        original_calibration = self.calibration_tab.run_calibration
+
+        def run_calibration(*args, **kwargs):
+            if self.selected_checkbox_id in {"mass", OPTUNA_MASS_ROW, "default_mass"}:
+                self.print_log(
+                    "Mass calibration is read-only here. Manual and automatic calibration runs will be available on Jobs."
+                )
+                return None
+            return original_calibration(*args, **kwargs)
+
+        run_calibration.__wrapped__ = original_calibration
+        self.calibration_tab.run_calibration = run_calibration
+        self._capture_method_groups()
+        self._install_method_analysis_guard()
         self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
 
         self.run_combo.activated.connect(self._run_chosen)
@@ -1294,6 +1391,233 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.recent_requested.connect(self._show_training_for_path)
         self._sync_series_display()
         self._select_row(("start", "series"))
+
+    def _capture_method_groups(self) -> None:
+        """Retain the existing row widgets, including the original Optuna row."""
+        self._method_group_widgets = {}
+        self._method_row_labels = {}
+        self._method_group_order = {}
+        for category in ("calibration", "analysis"):
+            section = self.sidebar._sections[category]
+            grouped = {"colour_path": [], "phase_model": []}
+            method = "colour_path"
+            rows = {}
+            for index in range(section.items_layout.count()):
+                widget = section.items_layout.itemAt(index).widget()
+                if isinstance(widget, GroupHeaderLabel) and widget.text().startswith(
+                    "Phase model"
+                ):
+                    method = "phase_model"
+                grouped[method].append(widget)
+                if isinstance(widget, SidebarRow):
+                    _category, key = self.sidebar.display_selection(
+                        widget.action, widget.checkbox_id
+                    )
+                    rows[key] = widget
+                    self._method_row_labels[id(widget)] = widget.label
+            # The unchanged Optuna helper iterates logical row IDs. Restore the
+            # custom aliases after it has inserted its row, without rebuilding UI.
+            section._rows = rows
+            self._method_group_widgets[category] = grouped
+
+    def _method_series_root(self) -> Path | None:
+        workspace = self.phase_model_workspace
+        root = workspace.series_roots.get(workspace.series_id)
+        return Path(root) if root is not None else None
+
+    def _show_mass_calibration_values(self, method: str) -> None:
+        """Read only the explicitly referenced saved calibration, never fit."""
+        from darsia.fluidflower.mass_calibration_display import (
+            read_mass_calibration_display,
+        )
+
+        selection = self.method_panel.selection()
+        reference = (
+            selection.mass_calibration
+            if method == "phase_model"
+            else selection.colour_calibration
+        )
+        data = read_mass_calibration_display(
+            method, reference, series_root=self._method_series_root()
+        )
+        self.mass_calibration_display.set_display(data)
+        self._displayed_mass_method = method
+        self.content_stack.setCurrentWidget(self.mass_calibration_display)
+
+    def _refresh_method_state(self, *, force: bool = False) -> None:
+        if not hasattr(self, "method_panel") or not hasattr(
+            self, "phase_model_workspace"
+        ):
+            return
+        root = self._method_series_root()
+        try:
+            raw = (root / "series.toml").read_bytes() if root is not None else None
+        except OSError:
+            raw = None
+        changed = root != self._method_root or raw != self._method_manifest_bytes
+        pristine = self.method_panel.selection() == self._method_panel_seed
+        if changed or force:
+            self._method_root = root
+            self._method_manifest_bytes = raw
+            self._saved_method = (
+                read_series_method(root) if root is not None else MethodSelection()
+            )
+        if changed or force or pristine:
+            self.method_panel.set_selection(
+                self._saved_method,
+                available=root is not None,
+            )
+            self._method_panel_seed = self.method_panel.selection()
+        choice = self._saved_method
+        if choice.active == "phase_model":
+            text = f"Method: phase model · model {choice.model_version or 'not referenced'} · mass calibration {choice.mass_calibration or 'not referenced'}"
+        elif choice.active == "colour_path":
+            text = f"Method: colour path · calibration {choice.colour_calibration or 'not referenced'}"
+        else:
+            text = "Method: not chosen"
+        missing = missing_method_references(choice)
+        if missing:
+            text += " · missing " + " and ".join(missing)
+        if choice.error:
+            text += " · " + choice.error
+        for badge in (self.method_badge, self.analysis_method_badge):
+            badge.setText(text)
+            badge.setStyleSheet(
+                "color: #b77900;"
+                if not choice.active or missing or choice.error
+                else ""
+            )
+        self._order_method_groups()
+        if self.content_stack.currentWidget() is self.mass_calibration_display:
+            self._show_mass_calibration_values(self._displayed_mass_method)
+
+    def _order_method_groups(self) -> None:
+        if not hasattr(self, "_method_group_widgets"):
+            return
+        chosen = self._saved_method.active
+        order = (
+            ("phase_model", "colour_path")
+            if chosen == "phase_model"
+            else ("colour_path", "phase_model")
+        )
+        for category, groups in self._method_group_widgets.items():
+            section = self.sidebar._sections[category]
+            keys = {id(row): key for key, row in section._rows.items()}
+            rows = {}
+            for method in order:
+                for widget in groups[method]:
+                    section.items_layout.removeWidget(widget)
+                    section.items_layout.addWidget(widget)
+                    if isinstance(widget, SidebarRow):
+                        base = self._method_row_labels[id(widget)]
+                        suffix = (
+                            " (not the chosen method for this series)"
+                            if category == "analysis" and method != chosen
+                            else ""
+                        )
+                        widget.label = base + suffix
+                        widget._text_label.setText(widget.label)
+                        if category == "analysis":
+                            widget._text_label.setWordWrap(True)
+                            widget.setMinimumHeight(44 if suffix else 28)
+                        rows[keys[id(widget)]] = widget
+            section._rows = rows
+            self._method_group_order[category] = order
+
+    def _set_method_category_visibility(self, action: str, item_id: str) -> None:
+        category, _item = self.sidebar.display_selection(action, item_id)
+        self.method_panel.setVisible(category == "calibration")
+        self.analysis_method_badge.setVisible(category == "analysis")
+        self.method_badge.show()
+
+    def _save_method_choice(self, selection: MethodSelection) -> None:
+        root = self._method_series_root()
+        if root is None or root != self._method_root:
+            self.print_log("Choose a series before recording its method.")
+            return
+        try:
+            save_series_method(
+                root, selection, expected_bytes=self._method_manifest_bytes
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            self.print_log(f"Could not record the series method: {error}")
+            QMessageBox.warning(self, "Could not record series method", str(error))
+            return
+        self._refresh_method_state(force=True)
+        self.print_log(
+            f"Series method recorded: {selection.active}. No calibration or run configuration changed."
+        )
+
+    def _confirm_method_action(self, method: str, description: str) -> bool:
+        self._refresh_method_state()
+        active = self._saved_method.active
+        if (
+            active == method
+            and not missing_method_references(self._saved_method)
+            and not self._saved_method.error
+        ):
+            return True
+        prefix = (
+            "No complete method is chosen for this series."
+            if not active or missing_method_references(self._saved_method)
+            else "This is not the chosen method for this series."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Confirm analysis method",
+            prefix
+            + "\n"
+            + description
+            + " anyway?\nChoose the series method under Calibration. This confirmation will not change it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _install_method_analysis_guard(self) -> None:
+        original = self.analysis_tab.run_analysis
+
+        def run_analysis(*args, **kwargs):
+            if not self._confirm_method_action(
+                "colour_path", "Run original DarSIA analysis"
+            ):
+                return None
+            return original(*args, **kwargs)
+
+        run_analysis.__wrapped__ = original
+        self.analysis_tab.run_analysis = run_analysis
+
+    def _guard_phase_exports(self, page) -> None:
+        saved = getattr(page, "saved_results", page)
+        if getattr(saved, "_native_method_guard", False):
+            return
+        original = saved.export
+
+        def export(*args, **kwargs):
+            if not self._confirm_method_action(
+                "phase_model", "Export phase-model analysis results"
+            ):
+                return None
+            return original(*args, **kwargs)
+
+        export.__wrapped__ = original
+        saved.export = export
+        saved._native_method_guard = True
+
+    def _open_existing_phase_review(self) -> None:
+        studio = getattr(self.phase_model_workspace.studio_page, "studio", None)
+        if (
+            studio is not None
+            and getattr(studio, "_active_model_series", None)
+            == self.phase_model_workspace.series_id
+        ):
+            selected = studio._selected_validation_model() or {}
+            if isinstance(selected.get("validation_binding"), dict):
+                studio._launch_review("open_correction")
+                return
+        self.print_log(
+            "Open a phase model with prepared review images under Calibration before opening its phase review window."
+        )
 
     def _series_for_path(self, path: str) -> str:
         return self.home_page.series_registry.series_by_path.get(
@@ -1389,6 +1713,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 or self.mass_analysis_page.project_root != Path(root)
             ):
                 self.mass_analysis_page.set_series(series_id, root)
+        self._refresh_method_state()
 
     def ensure_mass_analysis(self) -> QWidget:
         """Create production mass analysis as its own top-level workspace."""
@@ -1408,6 +1733,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self._mass_analysis_series_selected
             )
             self.content_stack.addWidget(self.mass_analysis_page)
+            self._guard_phase_exports(self.mass_analysis_page)
         return self.mass_analysis_page
 
     def _mass_analysis_series_selected(self, series_id: str) -> None:
@@ -1685,7 +2011,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
     def show_original_workflow(self) -> None:
         """Compatibility entry point for the original Calibration category."""
-        self._select_row(("calibration", OPTUNA_MASS_ROW))
+        self._select_row(("calibration", "mass"))
 
     def show_geometry_facies(self) -> None:
         self._select_row(("geometry_facies", "rig_frame"))
@@ -1744,13 +2070,18 @@ class NativeFluidFlowerMainWindow(MainWindow):
         return row is not None and row.isEnabled()
 
     def _darsia_visible(self) -> bool:
-        return getattr(self, "_current_category", None) in self.action_dispatch
+        return (
+            getattr(self, "_current_category", None) in self.action_dispatch
+            and hasattr(self, "content_stack")
+            and self.content_stack.currentWidget() is self.settings_scroll_area
+        )
 
     def _guard_custom_play(self) -> None:
         """A background workflow may finish after navigation to a custom page."""
         action = self.toolbar_builder.play_action
         if action.isEnabled() and (
             self.selected_action not in self.action_dispatch
+            or not self._darsia_visible()
             or not self._sidebar_selection_enabled()
         ):
             action.setEnabled(False)
@@ -1788,6 +2119,14 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self._select_series(selected)
 
     def _on_sidebar_expanded(self, action: str, is_expanded: bool) -> None:
+        if action in {"calibration", "analysis"} and hasattr(self, "content_stack"):
+            if is_expanded and not self._selecting_sidebar:
+                self._sync_home_series_before_navigation()
+                self._refresh_method_state()
+                first = next(iter(self.sidebar._sections[action]._rows))
+                logical = self.sidebar._logical_selection(action, first)
+                self.sidebar.select(*logical)
+                return
         if action == "setup" and hasattr(self, "content_stack"):
             self._update_painted_geometry_status()
             if is_expanded and not self._selecting_sidebar:
@@ -1810,6 +2149,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             return
         if is_expanded:
             self._sync_home_series_before_navigation()
+            self._set_method_category_visibility(action, "")
             if not self._selecting_sidebar:
                 section = self.sidebar._sections[action]
                 if action not in self.action_dispatch:
@@ -1825,6 +2165,20 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._current_category = action
         self._last_sidebar_selection = (action, item_id)
         self.series_header.setVisible(action != "start")
+        self._set_method_category_visibility(action, item_id)
+        self._refresh_method_state()
+        if (action, item_id) in {
+            ("calibration", "mass"),
+            ("phase_model", "mass_from_phase"),
+        }:
+            self.selected_action = action
+            self.selected_checkbox_id = item_id
+            self._show_mass_calibration_values(
+                "colour_path" if action == "calibration" else "phase_model"
+            )
+            self._sync_wizard_action_state()
+            self._update_run_action()
+            return
         if action in self.action_dispatch:
             self.content_stack.setCurrentWidget(self.settings_scroll_area)
             self._ensure_run_loaded()
@@ -1864,14 +2218,20 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     self._update_run_action()
                     return
                 # Select Training even without a series, without a lazy Studio load.
+                mode = "mass" if item_id == "mass_from_phase" else "training"
                 with QSignalBlocker(workspace.calibration_sidebar):
-                    workspace.select_calibration("training")
-                workspace._requested_mode = "training"
+                    workspace.select_calibration(mode)
+                workspace._requested_mode = mode
                 self.content_stack.setCurrentWidget(workspace)
                 if workspace.series_id:
                     workspace.ensure_studio()
                 workspace._show_selected_studio_mode()
             elif action == "mass_analysis":
+                if item_id == "review":
+                    self._open_existing_phase_review()
+                    self._sync_wizard_action_state()
+                    self._update_run_action()
+                    return
                 page = (
                     self.ensure_mass_analysis()
                     if self.phase_model_workspace.series_id
@@ -1883,6 +2243,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
     def _on_open_full_config(self) -> None:
         self.series_header.hide()
+        self.method_panel.hide()
+        self.analysis_method_badge.hide()
         self.content_stack.setCurrentWidget(self.settings_scroll_area)
         super()._on_open_full_config()
         self._update_run_action()
@@ -2039,6 +2401,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.run_combo.setCurrentIndex(index)
             self.run_combo.blockSignals(False)
         self._update_run_path()
+        self._refresh_method_state()
 
     def run_selected_workflow(self) -> None:
         """Play applies only to the original DarSIA categories."""
@@ -2049,12 +2412,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._select_row(("phase_model", "training"))
 
     def show_mass_calibration(self) -> None:
-        self._select_row(("phase_model", "training"))
-        workspace = self.phase_model_workspace
-        with QSignalBlocker(workspace.calibration_sidebar):
-            workspace.select_calibration("mass")
-        workspace._requested_mode = "mass"
-        workspace._show_selected_studio_mode()
+        self._select_row(("phase_model", "mass_from_phase"))
 
     def show_mass_analysis(self) -> None:
         self._select_row(("mass_analysis", "frozen"))

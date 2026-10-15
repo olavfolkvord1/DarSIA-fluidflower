@@ -92,9 +92,7 @@ def test_sidebar_has_one_ordered_navigation_and_preserves_settings(native_window
         "Start",
         "Setup",
         "Calibration",
-        "Phase model",
         "Analysis",
-        "Mass analysis",
         "Comparison",
         "Helper",
         "Utils",
@@ -285,7 +283,9 @@ def test_custom_rows_return_to_real_preprocessing_settings(
         choices = window.phase_model_workspace.calibration_sidebar
         assert choices.get_selected() == ("calibration", "phase_model_training")
         window.show_mass_calibration()
-        assert choices.get_selected() == ("calibration", "mass_from_phase")
+        assert window.content_stack.currentWidget() is window.mass_calibration_display
+        assert window.sidebar.get_selected() == ("phase_model", "mass_from_phase")
+        assert not window.toolbar_builder.play_action.isEnabled()
 
     window._select_row(("preprocessing", "protocols"))
     assert window.content_stack.currentWidget() is window.settings_scroll_area
@@ -295,7 +295,7 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert window.settings_layout.count() > 0
 
 
-@pytest.mark.parametrize("category", ["start", "phase_model", "mass_analysis"])
+@pytest.mark.parametrize("category", ["start", "calibration", "analysis"])
 def test_category_header_routes_page_and_resets_wizard_state(
     native_window, qtbot, category
 ):
@@ -306,10 +306,14 @@ def test_category_header_routes_page_and_resets_wizard_state(
     qtbot.mouseClick(
         window.sidebar._sections[category].header_button, Qt.MouseButton.LeftButton
     )
-    assert window.content_stack.currentWidget() is _custom_page(window, category)
+    assert window.content_stack.currentWidget() is (
+        window.home_page if category == "start" else window.settings_scroll_area
+    )
     assert window.selected_action == category
-    assert not window.toolbar_builder.play_action.isEnabled()
-    assert not window.toolbar_builder.wizard_action.isEnabled()
+    assert window.toolbar_builder.play_action.isEnabled() is (category != "start")
+    from darsia.gui.ui.wizards import has_wizard
+
+    assert window.toolbar_builder.wizard_action.isEnabled() is has_wizard(category)
 
     qtbot.mouseClick(
         window.sidebar._sections["setup"].header_button,
@@ -325,9 +329,7 @@ def test_category_header_routes_page_and_resets_wizard_state(
     [
         "setup",
         "calibration",
-        "phase_model",
         "analysis",
-        "mass_analysis",
         "comparison",
         "helper",
         "utils",
@@ -595,8 +597,8 @@ def test_image_selection_plan_is_reached_from_phase_model_for_selected_series(
     monkeypatch.setattr(series_paths, "series_root", lambda key: root)
     monkeypatch.setattr(selection_dialog, "ImageSelectionPlanDialog", SelectionDialog)
     window._select_row(("phase_model", "training"))
-    section = window.sidebar._sections["phase_model"]
-    plan = section.get_row("selection_plan")
+    section = window.sidebar._sections["calibration"]
+    plan = section.get_row("phase_model:selection_plan")
     assert plan is not None
     assert plan.label == "Image selection plan…"
     qtbot.mouseClick(plan, Qt.MouseButton.LeftButton)
@@ -1210,6 +1212,7 @@ def test_new_series_opens_real_preprocessing_on_first_manifest_run(
     assert opened["step"] == 0
     assert state.window.run_combo.currentText() == "zrun"
     manifest = tomllib.loads((state.root / "series.toml").read_text("utf-8"))
+    assert manifest["method"] == {"active": ""}
     assert manifest["rig_class"] == rig_class
     assert manifest["runs"]["ids"] == ["zrun", "arun"]
     for run in ("zrun", "arun"):
