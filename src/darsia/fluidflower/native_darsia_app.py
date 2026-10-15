@@ -1024,24 +1024,56 @@ def _update_group_headers(section) -> None:
         header.setVisible(shown)
 
 
+class _NativeSidebar(Sidebar):
+    """Display three Setup groups while preserving DarSIA's action keys."""
+
+    def __init__(self, categories_data: dict, setup_rows: dict) -> None:
+        self._setup_rows = setup_rows
+        self._display_rows = {
+            value: ("setup", key) for key, value in setup_rows.items()
+        }
+        super().__init__(categories_data)
+        for display_id, (action, item_id) in setup_rows.items():
+            row = self._sections["setup"].get_row(display_id)
+            row.action = action
+            row.checkbox_id = item_id
+
+    def display_selection(self, action: str, item_id: str) -> tuple[str, str]:
+        return self._display_rows.get((action, item_id), (action, item_id))
+
+    def _logical_selection(self, action: str, item_id: str) -> tuple[str, str]:
+        if action == "setup":
+            return self._setup_rows.get(item_id, (action, item_id))
+        return action, item_id
+
+    def _on_selection_changed(self, action: str, checkbox_id: str) -> None:
+        # Let Sidebar maintain one visual selection, then emit the original keys.
+        if self._sections[action].get_row(checkbox_id) is None:
+            return
+        with QSignalBlocker(self):
+            super()._on_selection_changed(action, checkbox_id)
+        if self._selected_row is not None:
+            self.selection_changed.emit(*self._logical_selection(action, checkbox_id))
+
+    def select(self, action: str, checkbox_id: str) -> None:
+        super().select(*self.display_selection(action, checkbox_id))
+
+    def get_selected(self) -> tuple[str, str] | None:
+        selected = super().get_selected()
+        return self._logical_selection(*selected) if selected is not None else None
+
+    def set_item_state(self, action: str, checkbox_id: str, state: str) -> None:
+        action, checkbox_id = self.display_selection(action, checkbox_id)
+        super().set_item_state(action, checkbox_id, state)
+
+
 class NativeFluidFlowerMainWindow(MainWindow):
     """FluidFlower pages alongside DarSIA's original sidebar categories."""
 
     # One ordered list owns the navigation; original rows come from their managers.
     SIDEBAR_CATEGORIES = (
         ("start", "Start", "fa5s.home", (("Series", "series"),)),
-        ("preprocessing", "Preprocessing", "fa5s.tasks", None),
         ("setup", "Setup", "fa5s.cogs", None),
-        (
-            "geometry_facies",
-            "Geometry & facies",
-            "fa5s.draw-polygon",
-            (
-                ("Rig frame", "rig_frame"),
-                ("Layers and facies", "layers"),
-                ("Export to native Setup", "export"),
-            ),
-        ),
         ("calibration", "Calibration", "fa5s.balance-scale", None),
         ("phase_model", "Phase model", "fa5s.adjust", (("Training", "training"),)),
         ("analysis", "Analysis", "fa5s.chart-line", None),
@@ -1127,24 +1159,61 @@ class NativeFluidFlowerMainWindow(MainWindow):
         right_layout.addWidget(self.content_stack, 1)
 
         sidebar_data = {}
+        setup_rows = {}
+        geometry_rows = [
+            ("Rig frame", "rig_frame", "fa5s.circle", "Rig frame"),
+            ("Layers and facies", "layers", "fa5s.circle", "Layers and facies"),
+            (
+                "Export to native Setup",
+                "export",
+                "fa5s.circle",
+                "Export to native Setup",
+            ),
+        ]
         for action, label, icon, rows in self.SIDEBAR_CATEGORIES:
-            groups = (
-                self.action_dispatch[action].sidebar_items()
-                if rows is None
-                else [
+            if action == "setup":
+                groups = []
+                for group, source, items in (
                     (
-                        label,
-                        [(text, row_id, "fa5s.circle", text) for text, row_id in rows],
-                    )
-                ]
-            )
+                        "Preparation",
+                        "preprocessing",
+                        self.preprocessing_tab.sidebar_items(),
+                    ),
+                    ("Setup steps", "setup", self.setup_tab.sidebar_items()),
+                    (
+                        "Geometry & facies (interactive)",
+                        "geometry_facies",
+                        [("", geometry_rows)],
+                    ),
+                ):
+                    display_items = []
+                    for _original_group, original_items in items:
+                        for text, item_id, row_icon, help_text in original_items:
+                            if source == "setup" and item_id == "all":
+                                text = "Full setup"
+                            display_id = f"{source}:{item_id}"
+                            setup_rows[display_id] = (source, item_id)
+                            display_items.append(
+                                (text, display_id, row_icon, help_text)
+                            )
+                    groups.append((group, display_items))
+            else:
+                groups = (
+                    self.action_dispatch[action].sidebar_items()
+                    if rows is None
+                    else [
+                        (
+                            label,
+                            [
+                                (text, row_id, "fa5s.circle", text)
+                                for text, row_id in rows
+                            ],
+                        )
+                    ]
+                )
             sidebar_data[action] = (label, icon, groups)
         old_sidebar = self.sidebar
-        self.sidebar = Sidebar(sidebar_data)
-        # QPushButton treats a single ampersand as a keyboard mnemonic.
-        geometry_section = self.sidebar._sections["geometry_facies"]
-        geometry_section.category_label = "Geometry && facies"
-        geometry_section.refresh_style()
+        self.sidebar = _NativeSidebar(sidebar_data, setup_rows)
         self.sidebar.setMinimumWidth(180)
         self.sidebar.setMaximumWidth(600)
         old_sidebar.parentWidget().layout().replaceWidget(old_sidebar, self.sidebar)
@@ -1506,8 +1575,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
     def _select_row(self, selection: tuple[str, str]) -> None:
         action, item_id = selection
-        section = self.sidebar._sections.get(action)
-        if section is None or section.get_row(item_id) is None:
+        display_action, display_id = self.sidebar.display_selection(action, item_id)
+        section = self.sidebar._sections.get(display_action)
+        if section is None or section.get_row(display_id) is None:
             return
         self._selecting_sidebar = True
         try:
@@ -1527,7 +1597,23 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self._select_series(selected)
 
     def _on_sidebar_expanded(self, action: str, is_expanded: bool) -> None:
-        super()._on_sidebar_expanded(action, is_expanded)
+        if action == "setup" and hasattr(self, "content_stack"):
+            if is_expanded and not self._selecting_sidebar:
+                self._sync_home_series_before_navigation()
+                self.sidebar.select("preprocessing", "protocols")
+                return
+            if not is_expanded and self.selected_action in {
+                "preprocessing",
+                "setup",
+                "geometry_facies",
+            }:
+                self.selected_action = None
+                self.selected_checkbox_id = None
+                self._sync_wizard_action_state()
+            else:
+                super()._on_sidebar_expanded(action, is_expanded)
+        else:
+            super()._on_sidebar_expanded(action, is_expanded)
         if not hasattr(self, "content_stack"):
             return
         if is_expanded:
@@ -1538,7 +1624,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     self.sidebar.select(action, next(iter(section._rows)))
                 else:
                     self._current_category = action
-                    self.series_header.hide()
+                    self.series_header.show()
                     self.content_stack.setCurrentWidget(self.settings_scroll_area)
         self._update_run_action()
 
@@ -1546,7 +1632,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._sync_home_series_before_navigation()
         self._current_category = action
         self._last_sidebar_selection = (action, item_id)
-        self.series_header.setVisible(action not in self.action_dispatch)
+        self.series_header.setVisible(action != "start")
         if action in self.action_dispatch:
             self.content_stack.setCurrentWidget(self.settings_scroll_area)
             self._ensure_run_loaded()

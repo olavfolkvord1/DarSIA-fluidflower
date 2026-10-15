@@ -90,9 +90,7 @@ def test_sidebar_has_one_ordered_navigation_and_preserves_settings(native_window
     categories = window.sidebar.categories_data
     assert [entry[0].replace("&&", "&") for entry in categories.values()] == [
         "Start",
-        "Preprocessing",
         "Setup",
-        "Geometry & facies",
         "Calibration",
         "Phase model",
         "Analysis",
@@ -105,8 +103,108 @@ def test_sidebar_has_one_ordered_navigation_and_preserves_settings(native_window
     assert not hasattr(window, "workspace_tabs")
     assert not hasattr(window, "workspace_pages")
     assert window.settings_scroll_area.widget() is window.settings_container
-    assert window.run_combo.isVisible()
-    assert window.setup_series_label.isVisible()
+    assert not window.series_header.isVisible()
+    assert not window.run_combo.isVisible()
+    assert not window.setup_series_label.isVisible()
+
+
+def test_setup_merges_three_groups_without_changing_original_actions(native_window):
+    window = native_window
+    section = window.sidebar._sections["setup"]
+    assert [label for label, _rows in section.groups] == [
+        "Preparation",
+        "Setup steps",
+        "Geometry & facies (interactive)",
+    ]
+    expected = {
+        "preprocessing": window.preprocessing_tab.sidebar_items(),
+        "setup": window.setup_tab.sidebar_items(),
+    }
+    for action, groups in expected.items():
+        for _label, rows in groups:
+            for text, row_id, _icon, _help in rows:
+                row = section.get_row(f"{action}:{row_id}")
+                assert row is not None
+                assert row.action == action
+                assert row.checkbox_id == row_id
+                # The merged Full setup row may be spelled out for clarity.
+                assert row.label == ("Full setup" if row_id == "all" else text)
+    for row_id in ("rig_frame", "layers", "export"):
+        row = section.get_row(f"geometry_facies:{row_id}")
+        assert row is not None
+        assert (row.action, row.checkbox_id) == ("geometry_facies", row_id)
+    assert "preprocessing" not in window.sidebar._sections
+    assert "geometry_facies" not in window.sidebar._sections
+
+
+@pytest.mark.parametrize(
+    ("action", "row_id"),
+    [
+        ("preprocessing", "protocols"),
+        ("preprocessing", "depth_measurements"),
+        ("preprocessing", "crop"),
+        ("setup", "all"),
+        ("setup", "depth"),
+        ("setup", "segmentation"),
+        ("setup", "facies"),
+        ("setup", "rig"),
+    ],
+)
+def test_merged_setup_click_uses_original_settings_play_and_wizard_keys(
+    native_window, monkeypatch, qtbot, action, row_id
+):
+    from darsia.gui.ui.wizards import has_wizard
+
+    window = native_window
+    displayed = []
+    original_display = window.settings_factory.display_settings
+
+    def record_display(selected_action, selected):
+        displayed.append((selected_action, list(selected)))
+        return original_display(selected_action, selected)
+
+    monkeypatch.setattr(window.settings_factory, "display_settings", record_display)
+    ran = []
+    monkeypatch.setattr(
+        window.action_dispatch[action],
+        "on_run_clicked",
+        lambda: ran.append((window.selected_action, window.selected_checkbox_id)),
+    )
+    section = window.sidebar._sections["setup"]
+    section.set_expanded(True)
+    row = section.get_row(f"{action}:{row_id}")
+    qtbot.mouseClick(row, Qt.MouseButton.LeftButton)
+
+    assert window.sidebar.get_selected() == (action, row_id)
+    assert window.selected_action == action
+    assert window.selected_checkbox_id == row_id
+    assert displayed[-1] == (action, [row_id])
+    assert window.content_stack.currentWidget() is window.settings_scroll_area
+    assert window.series_header.isVisible()
+    assert window.toolbar_builder.play_action.isEnabled()
+    assert window.toolbar_builder.wizard_action.isEnabled() is has_wizard(action)
+    window.toolbar_builder.play_action.trigger()
+    assert ran == [(action, row_id)]
+
+    window.sidebar.set_item_state(action, row_id, "done")
+    assert row._completion_state == "done"
+
+
+def test_invalid_sidebar_selection_keeps_the_current_real_row(native_window):
+    window = native_window
+    window._select_row(("preprocessing", "protocols"))
+    selected = window.sidebar.get_selected()
+    page = window.content_stack.currentWidget()
+    for action, row in (
+        ("preprocessing", "does-not-exist"),
+        ("setup", "does-not-exist"),
+        ("unknown-category", "protocols"),
+    ):
+        window.sidebar.select(action, row)
+        assert window.sidebar.get_selected() == selected
+        assert window.selected_action == "preprocessing"
+        assert window.selected_checkbox_id == "protocols"
+        assert window.content_stack.currentWidget() is page
 
 
 @pytest.mark.parametrize(
@@ -138,8 +236,8 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert window.content_stack.currentWidget() is _custom_page(window, category)
     assert not window.toolbar_builder.play_action.isEnabled()
     assert not window.toolbar_builder.wizard_action.isEnabled()
-    assert window.run_combo.isVisible()
-    assert window.setup_series_label.isVisible()
+    assert window.run_combo.isVisible() is (category != "start")
+    assert window.setup_series_label.isVisible() is (category != "start")
     if category == "phase_model":
         choices = window.phase_model_workspace.calibration_sidebar
         assert choices.get_selected() == ("calibration", "phase_model_training")
@@ -154,9 +252,7 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert window.settings_layout.count() > 0
 
 
-@pytest.mark.parametrize(
-    "category", ["start", "geometry_facies", "phase_model", "mass_analysis"]
-)
+@pytest.mark.parametrize("category", ["start", "phase_model", "mass_analysis"])
 def test_category_header_routes_page_and_resets_wizard_state(
     native_window, qtbot, category
 ):
@@ -173,12 +269,39 @@ def test_category_header_routes_page_and_resets_wizard_state(
     assert not window.toolbar_builder.wizard_action.isEnabled()
 
     qtbot.mouseClick(
-        window.sidebar._sections["preprocessing"].header_button,
+        window.sidebar._sections["setup"].header_button,
         Qt.MouseButton.LeftButton,
     )
     assert window.content_stack.currentWidget() is window.settings_scroll_area
     assert window.selected_action == "preprocessing"
     assert window.toolbar_builder.wizard_action.isEnabled()
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "setup",
+        "calibration",
+        "phase_model",
+        "analysis",
+        "mass_analysis",
+        "comparison",
+        "helper",
+        "utils",
+    ],
+)
+def test_series_run_selector_is_visible_for_every_category_except_start(
+    native_window, qtbot, category
+):
+    window = native_window
+    qtbot.mouseClick(
+        window.sidebar._sections[category].header_button, Qt.MouseButton.LeftButton
+    )
+    assert window.series_header.isVisible()
+    assert window.run_combo.isVisible()
+    assert window.setup_series_label.isVisible()
+    window._select_row(("start", "series"))
+    assert not window.series_header.isVisible()
 
 
 def test_original_menus_and_dock_controls_survive_page_navigation(native_window):
@@ -240,7 +363,7 @@ def test_start_series_selection_is_applied_before_showing_destination(
         assert window.content_stack.currentWidget() is window.geometry_workspace
     else:
         qtbot.mouseClick(
-            window.sidebar._sections["preprocessing"].header_button,
+            window.sidebar._sections["setup"].header_button,
             Qt.MouseButton.LeftButton,
         )
         assert window.content_stack.currentWidget() is window.settings_scroll_area
@@ -256,7 +379,7 @@ def test_collapsing_active_jakub_category_disables_play(native_window, qtbot):
     window._select_row(("preprocessing", "protocols"))
     assert window.toolbar_builder.play_action.isEnabled()
     qtbot.mouseClick(
-        window.sidebar._sections["preprocessing"].header_button,
+        window.sidebar._sections["setup"].header_button,
         Qt.MouseButton.LeftButton,
     )
     assert window.selected_action is None
