@@ -13,7 +13,7 @@ import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QSettings, QSignalBlocker, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStackedWidget,
-    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -622,7 +621,9 @@ def run_configurations(root: str | Path) -> list[tuple[str, Path | None, str]]:
     for run in [str(value) for value in runs.get("ids") or []]:
         merged = merged_folder / f"{run}.toml"
         if merged.is_file():
-            choices.append((run, merged, "Merged configuration (common and run settings)"))
+            choices.append(
+                (run, merged, "Merged configuration (common and run settings)")
+            )
             continue
         name = str(files.get(run) or f"{run_folder}/{run}.toml")
         path = Path(name) if Path(name).is_absolute() else root / name
@@ -742,7 +743,9 @@ def guard_config_file(window) -> None:
             if current is not None and current != recorded[1]:
                 choice = _ask_config_reload(window, str(path))
                 if choice == "cancel":
-                    window.print_log("Run cancelled: the configuration changed on disk.")
+                    window.print_log(
+                        "Run cancelled: the configuration changed on disk."
+                    )
                     return None
                 if choice == "reload":
                     selection = window.sidebar.get_selected()
@@ -1020,76 +1023,36 @@ def _update_group_headers(section) -> None:
 
 
 class NativeFluidFlowerMainWindow(MainWindow):
-    """One native DarSIA workspace: series, setup, two methods and analysis.
+    """FluidFlower pages alongside DarSIA's original sidebar categories."""
 
-    Tabs in working order: Start (choose a series), Setup (everything that
-    describes the experiments of the series and is shared by both methods),
-    Original DarSIA workflow (its mass calibration and analysis), Phase-model
-    workflow (training and mass calibration) and Analysis.
-    """
-
-    _START_TAB = 0
-    _SETUP_TAB = 1
-    _ORIGINAL_TAB = 2
-    _PHASE_MODEL_TAB = 3
-    _ANALYSIS_TAB = 4
-    _MASS_ANALYSIS_TAB = _ANALYSIS_TAB
-
-    # Steps of the Setup tab: key, label and tooltip.
-    SETUP_STEPS = (
+    # One ordered list owns the navigation; original rows come from their managers.
+    SIDEBAR_CATEGORIES = (
+        ("start", "Start", "fa5s.home", (("Series", "series"),)),
+        ("preprocessing", "Preprocessing", "fa5s.tasks", None),
+        ("setup", "Setup", "fa5s.cogs", None),
         (
-            "protocols",
-            "Protocols",
-            "Imaging protocols from the photographs and templates for the "
-            "injection and pressure-temperature protocols of a new series; crop "
-            "correction (DarSIA Setup)",
+            "geometry_facies",
+            "Geometry & facies",
+            "fa5s.draw-polygon",
+            (
+                ("Rig frame", "rig_frame"),
+                ("Layers and facies", "layers"),
+                ("Export to native Setup", "export"),
+            ),
         ),
+        ("calibration", "Calibration", "fa5s.balance-scale", None),
+        ("phase_model", "Phase model", "fa5s.adjust", (("Training", "training"),)),
+        ("analysis", "Analysis", "fa5s.chart-line", None),
         (
-            "geometry",
-            "Geometry and facies",
-            "Rig frame, injection points, sand layers and facies of a reference "
-            "run, exported for native Setup",
+            "mass_analysis",
+            "Mass analysis",
+            "fa5s.chart-area",
+            (("Frozen model", "frozen"),),
         ),
-        (
-            "native",
-            "Native Setup",
-            "Depth, labels, facies and rig of a run (DarSIA Setup)",
-        ),
-        (
-            "color",
-            "Color path",
-            "Color-path calibration of a run (DarSIA Calibration > Color Path). "
-            "Both mass calibrations build on it.",
-        ),
+        ("comparison", "Comparison", "fa5s.exchange-alt", None),
+        ("helper", "Helper", "fa5s.life-ring", None),
+        ("utils", "Utils", "fa5s.toolbox", None),
     )
-    # DarSIA sidebar rows shown in each Setup step (None: all rows), the
-    # section titles and the row selected first.
-    _STEP_SIDEBAR = {
-        "protocols": (
-            {"preprocessing": {"protocols", "depth_measurements", "crop"}},
-            {"preprocessing": "Preprocessing"},
-            ("preprocessing", "protocols"),
-        ),
-        "native": (
-            {"setup": {"all", "segmentation", "facies", "rig"}},
-            {"setup": "Native Setup"},
-            ("setup", "all"),
-        ),
-        "color": (
-            {"calibration": {"color"}},
-            {"calibration": "Color path"},
-            ("calibration", "color"),
-        ),
-    }
-    # The original workflow: its mass calibration and analysis.
-    _ORIGINAL_SIDEBAR = {
-        "preprocessing": None,
-        "calibration": {"mass", OPTUNA_MASS_ROW, "default_mass", "reset", "delete"},
-        "analysis": None,
-        "helper": None,
-        "comparison": None,
-        "utils": None,
-    }
 
     def __init__(self, *, initial_series: str | None = None) -> None:
         super().__init__()
@@ -1098,54 +1061,24 @@ class NativeFluidFlowerMainWindow(MainWindow):
         guard_config_file(self)
         settle_settings_before_sync(self)
         self._config_series: str | None = None
-        self._setup_step = "geometry"
-        self._step_selection = {
-            key: default for key, (_rows, _labels, default) in self._STEP_SIDEBAR.items()
-        }
-        self._last_original_selection = ("calibration", OPTUNA_MASS_ROW)
+        self._current_category = "start"
+        self._last_sidebar_selection = ("start", "series")
+        self._selecting_sidebar = False
         series = tuple(configured_series())
         initial_series = initial_series or (series[0][0] if series else "")
         if initial_series and initial_series not in {
             key for key, _label, _root in series
         }:
             raise ValueError(f"Unknown experimental series: {initial_series}")
-        original_content = self.takeCentralWidget()
-        if original_content is None:
-            raise RuntimeError("DarSIA MainWindow has no central widget")
-        self.original_content = original_content
-        self.workspace_tabs = QTabBar(self)
-        self.workspace_tabs.setObjectName("nativeWorkspaceTabs")
-        self.workspace_tabs.setExpanding(False)
-        self.workspace_tabs.addTab("Start")
-        self.workspace_tabs.addTab("Setup")
-        self.workspace_tabs.setTabToolTip(
-            self._SETUP_TAB,
-            "Protocols, geometry and facies, native Setup and color path of the "
-            "selected series",
-        )
-        self.workspace_tabs.addTab("Original DarSIA workflow")
-        self.workspace_tabs.setTabToolTip(
-            self._ORIGINAL_TAB, "Mass calibration and analysis of the original method"
-        )
-        self.workspace_tabs.addTab("Phase-model workflow")
-        self.workspace_tabs.setTabToolTip(
-            self._PHASE_MODEL_TAB, "Phase-model training and mass calibration"
-        )
-        self.workspace_tabs.addTab("Analysis")
-        self.workspace_tabs.setTabToolTip(
-            self._ANALYSIS_TAB, "Mass analysis with a frozen model and calibration"
-        )
-        self.workspace_pages = QStackedWidget(self)
         self.home_page = NativeHomePage(series=series, initial_series=initial_series)
         self._legacy_windows: dict[str, QWidget] = {}
-        self.workspace_pages.addWidget(self.home_page)
 
-        # One page shows DarSIA's own sidebar and settings, for the Setup tab
-        # (with its steps) and for the original workflow.
-        self.native_page = QWidget()
-        native_layout = QVBoxLayout(self.native_page)
-        native_layout.setContentsMargins(8, 8, 8, 8)
-        top = QHBoxLayout()
+        # Retain MainWindow's splitter, menus, toolbar, log and streaming handles.
+        right_layout = self.settings_scroll_area.parentWidget().layout()
+        right_layout.removeWidget(self.settings_scroll_area)
+        self.series_header = QWidget()
+        top = QHBoxLayout(self.series_header)
+        top.setContentsMargins(0, 0, 0, 0)
         self.setup_series_label = QLabel()
         top.addWidget(self.setup_series_label)
         top.addSpacing(16)
@@ -1171,65 +1104,61 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Choose frames for review, mass calibration or production; does not start a job"
         )
         top.addWidget(self.image_selection_button)
-        native_layout.addLayout(top)
-        self.setup_steps = QTabBar()
-        self.setup_steps.setObjectName("nativeSetupSteps")
-        self.setup_steps.setExpanding(False)
-        for index, (_key, label, tooltip) in enumerate(self.SETUP_STEPS):
-            self.setup_steps.addTab(label)
-            self.setup_steps.setTabToolTip(index, tooltip)
-        self.setup_steps.setCurrentIndex(self._step_index(self._setup_step))
-        native_layout.addWidget(self.setup_steps)
-        self.original_heading = QLabel(
-            "Original DarSIA workflow · mass calibration and analysis"
-        )
-        heading_font = self.original_heading.font()
-        heading_font.setBold(True)
-        self.original_heading.setFont(heading_font)
-        native_layout.addWidget(self.original_heading)
-        self.native_stack = QStackedWidget()
-        self.native_stack.addWidget(original_content)
+        right_layout.addWidget(self.series_header)
+        self.content_stack = QStackedWidget()
+        self.content_stack.addWidget(self.settings_scroll_area)
+        self.content_stack.addWidget(self.home_page)
         self.geometry_workspace = SeriesGeometryWorkspace(
             series=series, initial_series=initial_series
         )
-        # The series is named above the steps.
         self.geometry_workspace.series_label.hide()
-        self.native_stack.addWidget(self.geometry_workspace)
-        native_layout.addWidget(self.native_stack, 1)
-        self.workspace_pages.addWidget(self.native_page)
-
-        self.sidebar.setMinimumWidth(180)
-        self._section_labels = {
-            action: section.category_label
-            for action, section in self.sidebar._sections.items()
-        }
-        self._section_labels["calibration"] = "Original calibration"
-        original_calibration = self.sidebar._sections["calibration"]
-        original_calibration.category_label = "Original calibration"
-        original_calibration.refresh_style()
-        add_automatic_mass_calibration(self)
-        self.sidebar.selection_changed.connect(self._remember_native_selection)
-        self.setup_steps.currentChanged.connect(self._setup_step_changed)
-        self.run_combo.activated.connect(self._run_chosen)
+        self.content_stack.addWidget(self.geometry_workspace)
         self.phase_model_workspace = PhaseModelWorkspace(
             series=series, initial_series=initial_series
         )
-        self.workspace_pages.addWidget(self.phase_model_workspace)
+        self.content_stack.addWidget(self.phase_model_workspace)
         self.mass_analysis_page: QWidget | None = None
-        self._sync_series_display()
+        self.mass_analysis_placeholder = QLabel(
+            "Choose an experimental series before mass analysis."
+        )
+        self.content_stack.addWidget(self.mass_analysis_placeholder)
+        right_layout.addWidget(self.content_stack, 1)
+
+        sidebar_data = {}
+        for action, label, icon, rows in self.SIDEBAR_CATEGORIES:
+            groups = (
+                self.action_dispatch[action].sidebar_items()
+                if rows is None
+                else [
+                    (
+                        label,
+                        [(text, row_id, "fa5s.circle", text) for text, row_id in rows],
+                    )
+                ]
+            )
+            sidebar_data[action] = (label, icon, groups)
+        old_sidebar = self.sidebar
+        self.sidebar = Sidebar(sidebar_data)
+        # QPushButton treats a single ampersand as a keyboard mnemonic.
+        geometry_section = self.sidebar._sections["geometry_facies"]
+        geometry_section.category_label = "Geometry && facies"
+        geometry_section.refresh_style()
+        self.sidebar.setMinimumWidth(180)
+        self.sidebar.setMaximumWidth(600)
+        old_sidebar.parentWidget().layout().replaceWidget(old_sidebar, self.sidebar)
+        old_sidebar.hide()
+        old_sidebar.deleteLater()
+        self.sidebar.selection_changed.connect(self._on_sidebar_selection)
+        self.sidebar.expanded_changed.connect(self._on_sidebar_expanded)
+        # The helper captures its calibration section, so install it after replacement.
+        add_automatic_mass_calibration(self)
+        self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
+
+        self.run_combo.activated.connect(self._run_chosen)
         self.phase_model_workspace.series_selector.currentIndexChanged.connect(
             self._sync_series_display
         )
         self.image_selection_button.clicked.connect(self.open_image_selection_plan)
-        self.workspace_tabs.currentChanged.connect(self._workspace_changed)
-        central = QWidget(self)
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
-        central_layout.addWidget(self.workspace_tabs)
-        central_layout.addWidget(self.workspace_pages, 1)
-        self.setCentralWidget(central)
-
         self.home_page.new_requested.connect(self.show_setup)
         self.home_page.new_series_button.clicked.connect(self._new_series)
         self.home_page.add_existing_button.clicked.connect(self._add_existing_series)
@@ -1239,7 +1168,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.update_run_sources_requested.connect(self._show_setup_for_path)
         self.home_page.open_requested.connect(self._show_home_calibration)
         self.home_page.recent_requested.connect(self._show_training_for_path)
-        self._workspace_changed(self.workspace_tabs.currentIndex())
+        self._sync_series_display()
+        self._select_row(("start", "series"))
 
     def _series_for_path(self, path: str) -> str:
         return self.home_page.series_registry.series_by_path.get(
@@ -1352,7 +1282,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.mass_analysis_page.series_selected.connect(
                 self._mass_analysis_series_selected
             )
-            self.workspace_pages.addWidget(self.mass_analysis_page)
+            self.content_stack.addWidget(self.mass_analysis_page)
         return self.mass_analysis_page
 
     def _mass_analysis_series_selected(self, series_id: str) -> None:
@@ -1481,131 +1411,139 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.show_phase_model_workflow()
 
     def show_setup(self, step: str | None = None) -> None:
-        """Open Setup for the series selected on Start, optionally at one step."""
+        """Open the requested existing setup category for the selected series."""
         legacy_path = self.home_page.selected_legacy_project()
         if legacy_path:
             self._open_legacy_project(legacy_path, setup=True)
             return
         self._select_series(self.home_page.selected_series())
-        if step is not None:
-            self.setup_steps.setCurrentIndex(self._step_index(step))
-        self.workspace_tabs.setCurrentIndex(self._SETUP_TAB)
+        selection = {
+            "protocols": ("preprocessing", "protocols"),
+            "native": ("setup", "all"),
+            "color": ("calibration", "color"),
+        }.get(step, ("geometry_facies", "rig_frame"))
+        self._select_row(selection)
 
     def show_original_workflow(self) -> None:
-        self.workspace_tabs.setCurrentIndex(self._ORIGINAL_TAB)
+        """Compatibility entry point for the original Calibration category."""
+        self._select_row(("calibration", OPTUNA_MASS_ROW))
 
     def show_geometry_facies(self) -> None:
-        """Open Setup > Geometry and facies for the series selected on Start."""
-        self.setup_steps.setCurrentIndex(self._step_index("geometry"))
-        self.workspace_tabs.setCurrentIndex(self._SETUP_TAB)
+        self._select_row(("geometry_facies", "rig_frame"))
 
     def show_color_path(self) -> None:
-        self.setup_steps.setCurrentIndex(self._step_index("color"))
-        self.workspace_tabs.setCurrentIndex(self._SETUP_TAB)
-
-    # ------------------------------------------------------------ setup steps
-
-    def _step_index(self, key: str) -> int:
-        for index, (step, _label, _tooltip) in enumerate(self.SETUP_STEPS):
-            if step == key:
-                return index
-        raise ValueError(f"Unknown setup step: {key}")
-
-    @property
-    def setup_step(self) -> str:
-        """Key of the current Setup step (see SETUP_STEPS)."""
-        return self._setup_step
-
-    def _setup_step_changed(self, index: int) -> None:
-        self._setup_step = self.SETUP_STEPS[index][0]
-        if self.workspace_tabs.currentIndex() == self._SETUP_TAB:
-            self._show_setup_step()
+        self._select_row(("calibration", "color"))
 
     def _darsia_visible(self) -> bool:
-        """Whether DarSIA's sidebar and settings are on screen."""
-        tab = self.workspace_tabs.currentIndex()
-        return tab == self._ORIGINAL_TAB or (
-            tab == self._SETUP_TAB and self._setup_step != "geometry"
-        )
+        return getattr(self, "_current_category", None) in self.action_dispatch
+
+    def _guard_custom_play(self) -> None:
+        """A background workflow may finish after navigation to a custom page."""
+        action = self.toolbar_builder.play_action
+        if self.selected_action not in self.action_dispatch and action.isEnabled():
+            action.setEnabled(False)
 
     def _update_run_action(self) -> None:
         self.toolbar_builder.play_action.setEnabled(
-            self._darsia_visible() and not self.process_runner.active
+            self._darsia_visible()
+            and self.selected_action in self.action_dispatch
+            and self.selected_checkbox_id is not None
+            and not self.process_runner.active
         )
-
-    def _configure_sidebar(
-        self, visible: dict[str, set[str] | None], labels: dict[str, str]
-    ) -> None:
-        """Show the given DarSIA sidebar sections and, in each, the given rows."""
-        for action, section in self.sidebar._sections.items():
-            section.setVisible(action in visible)
-            rows = visible.get(action)
-            for row_id, row in section._rows.items():
-                row.setVisible(rows is None or row_id in rows)
-            _update_group_headers(section)
-            label = labels.get(action, self._section_labels.get(action, ""))
-            if label and section.category_label != label:
-                section.category_label = label
-                section.refresh_style()
 
     def _select_row(self, selection: tuple[str, str]) -> None:
         action, item_id = selection
         section = self.sidebar._sections.get(action)
-        row = section.get_row(item_id) if section is not None else None
-        if row is None or row.isHidden():
+        if section is None or section.get_row(item_id) is None:
             return
-        section.set_expanded(True)
+        self._selecting_sidebar = True
+        try:
+            section.set_expanded(True)
+        finally:
+            self._selecting_sidebar = False
         self.sidebar.select(action, item_id)
 
-    def _show_setup_step(self) -> None:
-        key = self._setup_step
-        if key == "geometry":
-            self._set_run_controls_visible(False)
-            self.native_stack.setCurrentWidget(self.geometry_workspace)
-            self.geometry_workspace.ensure_page()
-        else:
-            visible, labels, _default = self._STEP_SIDEBAR[key]
-            self._configure_sidebar(visible, labels)
-            self.native_stack.setCurrentWidget(self.original_content)
-            self._set_run_controls_visible(True)
-            self._ensure_run_loaded()
-            self._select_row(self._step_selection[key])
+    def _restore_selection(self) -> None:
+        """Opening a configuration clears selection in the original controller."""
+        self._select_row(self._last_sidebar_selection)
+
+    def _sync_home_series_before_navigation(self) -> None:
+        if self._current_category == "start":
+            selected = self.home_page.selected_series()
+            if selected and selected != self.phase_model_workspace.series_id:
+                self._select_series(selected)
+
+    def _on_sidebar_expanded(self, action: str, is_expanded: bool) -> None:
+        super()._on_sidebar_expanded(action, is_expanded)
+        if not hasattr(self, "content_stack"):
+            return
+        if is_expanded:
+            self._sync_home_series_before_navigation()
+            if not self._selecting_sidebar:
+                section = self.sidebar._sections[action]
+                if action not in self.action_dispatch:
+                    self.sidebar.select(action, next(iter(section._rows)))
+                else:
+                    self._current_category = action
+                    self.series_header.hide()
+                    self.content_stack.setCurrentWidget(self.settings_scroll_area)
         self._update_run_action()
 
-    def _remember_native_selection(self, action: str, item_id: str) -> None:
-        tab = self.workspace_tabs.currentIndex()
-        if tab == self._SETUP_TAB and self._setup_step in self._STEP_SIDEBAR:
-            self._step_selection[self._setup_step] = (action, item_id)
-        elif tab == self._ORIGINAL_TAB:
-            self._last_original_selection = (action, item_id)
+    def _on_sidebar_selection(self, action: str, item_id: str) -> None:
+        self._sync_home_series_before_navigation()
+        self._current_category = action
+        self._last_sidebar_selection = (action, item_id)
+        self.series_header.setVisible(action not in self.action_dispatch)
+        if action in self.action_dispatch:
+            self.content_stack.setCurrentWidget(self.settings_scroll_area)
+            self._ensure_run_loaded()
+            super()._on_sidebar_selection(action, item_id)
+        else:
+            self.selected_action = action
+            self.selected_checkbox_id = item_id
+            if action == "start":
+                self.content_stack.setCurrentWidget(self.home_page)
+                self._refresh_series()
+            elif action == "geometry_facies":
+                self.content_stack.setCurrentWidget(self.geometry_workspace)
+                self.geometry_workspace.ensure_page()
+                view = self.geometry_workspace.simple_view
+                target = getattr(
+                    view,
+                    {
+                        "rig_frame": "rig_panel",
+                        "layers": "facies_table",
+                        "export": "export_button",
+                    }[item_id],
+                    None,
+                )
+                if target is not None:
+                    target.setFocus()
+            elif action == "phase_model":
+                workspace = self.phase_model_workspace
+                # Select Training even without a series, without a lazy Studio load.
+                with QSignalBlocker(workspace.calibration_sidebar):
+                    workspace.select_calibration("training")
+                workspace._requested_mode = "training"
+                self.content_stack.setCurrentWidget(workspace)
+                if workspace.series_id:
+                    workspace.ensure_studio()
+                workspace._show_selected_studio_mode()
+            elif action == "mass_analysis":
+                page = (
+                    self.ensure_mass_analysis()
+                    if self.phase_model_workspace.series_id
+                    else self.mass_analysis_placeholder
+                )
+                self.content_stack.setCurrentWidget(page)
+            self._sync_wizard_action_state()
+        self._update_run_action()
 
-    def _restore_selection(self) -> None:
-        """Select the current step's row again (opening a file clears it)."""
-        tab = self.workspace_tabs.currentIndex()
-        if tab == self._SETUP_TAB and self._setup_step in self._STEP_SIDEBAR:
-            self._select_row(self._step_selection[self._setup_step])
-        elif tab == self._ORIGINAL_TAB:
-            self._select_row(self._last_original_selection)
-
-    def _show_native_mode(self, *, setup: bool) -> None:
-        self.workspace_pages.setCurrentWidget(self.native_page)
-        self.setup_steps.setVisible(setup)
-        self.original_heading.setVisible(not setup)
-        if setup:
-            self._show_setup_step()
-            return
-        self._configure_sidebar(self._ORIGINAL_SIDEBAR, {})
-        self.native_stack.setCurrentWidget(self.original_content)
-        self._set_run_controls_visible(True)
-        self._ensure_run_loaded()
-        if not self._row_shown(self._last_original_selection):
-            self._last_original_selection = ("calibration", OPTUNA_MASS_ROW)
-        self._select_row(self._last_original_selection)
-
-    def _row_shown(self, selection: tuple[str, str]) -> bool:
-        section = self.sidebar._sections.get(selection[0])
-        row = section.get_row(selection[1]) if section is not None else None
-        return row is not None and not row.isHidden() and not section.isHidden()
+    def _on_open_full_config(self) -> None:
+        self.series_header.hide()
+        self.content_stack.setCurrentWidget(self.settings_scroll_area)
+        super()._on_open_full_config()
+        self._update_run_action()
 
     # -------------------------------------------------------------- run files
 
@@ -1659,7 +1597,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         shown = str(path)
         if root is not None:
             try:
-                shown = Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+                shown = (
+                    Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+                )
             except (OSError, ValueError):
                 pass
         if self.run_combo.currentIndex() < 0 or not _same_file(
@@ -1674,7 +1614,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         if not path:
             return
         series_id = self.phase_model_workspace.series_id
-        QSettings().setValue(f"native_app/run/{series_id}", self.run_combo.itemText(index))
+        QSettings().setValue(
+            f"native_app/run/{series_id}", self.run_combo.itemText(index)
+        )
         self._load_run_config(path)
 
     def _load_run_config(self, path: str) -> None:
@@ -1688,7 +1630,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         path = self.run_combo.currentData()
         if not path:
             return
-        if not self.config_file or self._config_series != self.phase_model_workspace.series_id:
+        if (
+            not self.config_file
+            or self._config_series != self.phase_model_workspace.series_id
+        ):
             self._load_run_config(path)
 
     def _config_loaded(self) -> None:
@@ -1703,38 +1648,24 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.run_combo.blockSignals(False)
         self._update_run_path()
 
-    def _workspace_changed(self, index: int) -> None:
-        if index == self._START_TAB:
-            self.workspace_pages.setCurrentWidget(self.home_page)
-            self._refresh_series()
-        elif index in (self._SETUP_TAB, self._ORIGINAL_TAB):
-            selected = self.home_page.selected_series()
-            if selected and selected != self.phase_model_workspace.series_id:
-                self._select_series(selected)
-            self._show_native_mode(setup=index == self._SETUP_TAB)
-        elif index == self._PHASE_MODEL_TAB:
-            self.workspace_pages.setCurrentWidget(self.phase_model_workspace)
-            self.phase_model_workspace.ensure_studio()
-            self.phase_model_workspace._show_selected_studio_mode()
-        elif index == self._ANALYSIS_TAB:
-            self.workspace_pages.setCurrentWidget(self.ensure_mass_analysis())
-        self._update_run_action()
-
     def run_selected_workflow(self) -> None:
-        """The original Run action applies only while DarSIA's steps are shown."""
+        """Play applies only to the original DarSIA categories."""
         if self._darsia_visible():
             super().run_selected_workflow()
 
     def show_phase_model_workflow(self) -> None:
-        self.phase_model_workspace.select_calibration("training")
-        self.workspace_tabs.setCurrentIndex(self._PHASE_MODEL_TAB)
+        self._select_row(("phase_model", "training"))
 
     def show_mass_calibration(self) -> None:
-        self.phase_model_workspace.select_calibration("mass")
-        self.workspace_tabs.setCurrentIndex(self._PHASE_MODEL_TAB)
+        self._select_row(("phase_model", "training"))
+        workspace = self.phase_model_workspace
+        with QSignalBlocker(workspace.calibration_sidebar):
+            workspace.select_calibration("mass")
+        workspace._requested_mode = "mass"
+        workspace._show_selected_studio_mode()
 
     def show_mass_analysis(self) -> None:
-        self.workspace_tabs.setCurrentIndex(self._MASS_ANALYSIS_TAB)
+        self._select_row(("mass_analysis", "frozen"))
 
 
 def create_application() -> tuple[QApplication, bool]:
