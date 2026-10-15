@@ -1192,6 +1192,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._method_manifest_bytes = None
         self._saved_method = MethodSelection()
         self._method_panel_seed = MethodSelection()
+        self._scope_base_help = {}
+        self.scope_context = None
+        self.current_row_scope = None
         series = tuple(configured_series())
         initial_series = initial_series or (series[0][0] if series else "")
         if initial_series and initial_series not in {
@@ -1224,6 +1227,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "when the series has one, else config/runs/<run>.toml"
         )
         top.addWidget(self.run_combo)
+        self.run_scope_note = QLabel("applies to the whole series")
+        self.run_scope_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.run_scope_note.setObjectName("secondaryText")
+        self.run_scope_note.hide()
+        top.addWidget(self.run_scope_note)
         self.run_path = QLabel()
         self.run_path.setObjectName("secondaryText")
         self.run_path.setTextInteractionFlags(
@@ -1233,6 +1241,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         top.addStretch(1)
         right_layout.addWidget(self.series_header)
         self.method_panel = SeriesMethodPanel()
+        self.method_scope_label = QLabel()
+        self.method_scope_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.method_scope_label.setWordWrap(True)
+        self.method_panel.layout().insertWidget(1, self.method_scope_label)
         self.method_panel.hide()
         self.method_panel.use_requested.connect(self._save_method_choice)
         right_layout.addWidget(self.method_panel)
@@ -1241,6 +1253,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.analysis_method_badge.setWordWrap(True)
         self.analysis_method_badge.hide()
         right_layout.addWidget(self.analysis_method_badge)
+        self.scope_label = QLabel()
+        self.scope_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.scope_label.setWordWrap(True)
+        self.scope_label.hide()
+        right_layout.addWidget(self.scope_label)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.settings_scroll_area)
         self.content_stack.addWidget(self.home_page)
@@ -1390,6 +1407,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         self.run_combo.activated.connect(self._run_chosen)
         self.run_combo.currentIndexChanged.connect(self._update_setup_action)
+        self.run_combo.currentIndexChanged.connect(self._refresh_scope_display)
         self.home_page.table.itemSelectionChanged.connect(self._home_series_selected)
         self.phase_model_workspace.series_selector.currentIndexChanged.connect(
             self._sync_series_display
@@ -1405,6 +1423,94 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.recent_requested.connect(self._open_series_from_start)
         self._sync_series_display()
         self._select_row(("start", "series"))
+
+    def _refresh_scope_display(self, *_args) -> None:
+        """Render one read-only context across row help, header and selector."""
+        if not all(
+            hasattr(self, name)
+            for name in (
+                "scope_label",
+                "phase_model_workspace",
+                "sidebar",
+                "run_combo",
+                "method_scope_label",
+                "run_scope_note",
+                "_scope_base_help",
+            )
+        ):
+            return
+        from darsia.fluidflower.row_scope import (
+            load_scope_context,
+            row_scope,
+            series_scope,
+        )
+
+        workspace = self.phase_model_workspace
+        series_id = workspace.series_id
+        root = workspace.series_roots.get(series_id)
+        run_id = (
+            self.run_combo.currentText() if self.run_combo.currentIndex() >= 0 else ""
+        )
+        path = self.run_combo.currentData() or None
+        values = None
+        if self.config_file:
+            # Original actions use the actual open file. An unrelated File >
+            # Open Config must never be relabelled as a registered series run.
+            path = self.config_file
+            values = self.config_dict
+            loaded_index = self._run_index(path)
+            if self._config_series == series_id and loaded_index >= 0:
+                run_id = self.run_combo.itemText(loaded_index)
+        context = load_scope_context(
+            root,
+            series_id,
+            run_id,
+            path,
+            values,
+            series_label=workspace.series_selector.currentText() or series_id,
+        )
+        self.scope_context = context
+        for category in ("calibration", "analysis"):
+            section = self.sidebar._sections.get(category)
+            if section is None:
+                continue
+            for row in section._rows.values():
+                base = self._scope_base_help.setdefault(id(row), row.help_text)
+                scope = row_scope(context, row.action, row.checkbox_id)
+                if scope is None:
+                    continue
+                text = base + "\n" + scope.line
+                if scope.note:
+                    text += "\n" + scope.note
+                row.help_text = text
+                row.setToolTip(text)
+                popup = getattr(row, "_help_popup", None)
+                if popup is not None:
+                    popup._help_text = text
+                    popup._help_label.setTextFormat(Qt.TextFormat.PlainText)
+                    popup._help_label.setText(text)
+                    popup.adjustSize()
+        whole_series = series_scope(context)
+        self.method_scope_label.setText(whole_series.line)
+        self.method_scope_label.setToolTip(whole_series.note)
+        category = {"phase_model": "calibration", "mass_analysis": "analysis"}.get(
+            self._current_category, self._current_category
+        )
+        selected = self.sidebar.get_selected()
+        scope = (
+            row_scope(context, *selected)
+            if selected is not None and category in {"calibration", "analysis"}
+            else None
+        )
+        self.current_row_scope = scope
+        self.scope_label.setText(scope.line if scope is not None else "")
+        self.scope_label.setToolTip(scope.note if scope is not None else "")
+        self.scope_label.setVisible(
+            scope is not None and category in {"calibration", "analysis"}
+        )
+        series_row = scope is not None and not scope.run_selector_enabled
+        self.run_combo.setEnabled(not series_row)
+        self.run_scope_note.setVisible(series_row)
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""
@@ -1728,6 +1834,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             ):
                 self.mass_analysis_page.set_series(series_id, root)
         self._refresh_method_state()
+        self._refresh_scope_display()
 
     def ensure_mass_analysis(self) -> QWidget:
         """Create production mass analysis as its own top-level workspace."""
@@ -2192,6 +2299,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     self.series_header.show()
                     self.content_stack.setCurrentWidget(self.settings_scroll_area)
         self._update_run_action()
+        self._refresh_scope_display()
 
     def _on_sidebar_selection(self, action: str, item_id: str) -> None:
         self._sync_home_series_before_navigation()
@@ -2200,6 +2308,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.series_header.setVisible(action != "start")
         self._set_method_category_visibility(action, item_id)
         self._refresh_method_state()
+        self._refresh_scope_display()
         if (action, item_id) in {
             ("calibration", "mass"),
             ("phase_model", "mass_from_phase"),
@@ -2278,6 +2387,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.series_header.hide()
         self.method_panel.hide()
         self.analysis_method_badge.hide()
+        self.scope_label.hide()
+        self.run_scope_note.hide()
+        self.run_combo.setEnabled(True)
         self.content_stack.setCurrentWidget(self.settings_scroll_area)
         super()._on_open_full_config()
         self._update_run_action()
@@ -2316,6 +2428,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.run_combo.blockSignals(False)
         self._update_run_path()
         self._update_setup_action()
+        self._refresh_scope_display()
 
     def _run_index(self, path: str | None) -> int:
         for index in range(self.run_combo.count()):
@@ -2356,6 +2469,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             f"native_app/run/{series_id}", self.run_combo.itemText(index)
         )
         self._load_run_config(path)
+        self._refresh_scope_display()
 
     def _load_run_config(self, path: str) -> bool:
         """Open a run without letting a failed load reuse the previous config."""
@@ -2408,6 +2522,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.settings_factory.refresh_current_view()
             self._update_run_path()
             self._update_run_action()
+            self._refresh_scope_display()
             return False
         self._restore_selection()
         return True
@@ -2435,6 +2550,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.run_combo.blockSignals(False)
         self._update_run_path()
         self._refresh_method_state()
+        self._refresh_scope_display()
 
     def run_selected_workflow(self) -> None:
         """Play applies only to the original DarSIA categories."""
