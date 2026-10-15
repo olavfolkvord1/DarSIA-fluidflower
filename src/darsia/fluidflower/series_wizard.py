@@ -51,6 +51,9 @@ from darsia.fluidflower.templates import RIG_CLASSES
 
 _ID_FROM_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
+# Physical Medium rigs reference Jakub's existing profiles; extend this list.
+PHYSICAL_RIGS = (("Albus", "FF AC"), ("Bilbo", "FF Bilbo"))
+
 
 def _note(text: str = "") -> QLabel:
     label = QLabel(text)
@@ -107,7 +110,9 @@ class SeriesPage(QWizardPage):
         self.rig_class = QComboBox()
         self.rig_class.addItem("Choose the rig class…", "")
         for rig in RIG_CLASSES.values():
-            self.rig_class.addItem(rig.title(), rig.key)
+            self.rig_class.addItem(
+                rig.label if rig.key == "medium" else rig.title(), rig.key
+            )
             self.rig_class.setItemData(
                 self.rig_class.count() - 1,
                 rig.source or rig.label,
@@ -115,6 +120,17 @@ class SeriesPage(QWizardPage):
             )
         self.rig_class.currentIndexChanged.connect(self._changed)
         form.addRow("Rig class", self.rig_class)
+        self.physical_rig_label = QLabel("Physical rig")
+        self.physical_rig = QComboBox()
+        self.physical_rig.addItem("Choose the physical rig…", "")
+        for name, profile in PHYSICAL_RIGS:
+            self.physical_rig.addItem(name, profile)
+        self.physical_rig.setToolTip(
+            "Use the existing rig profile in Preprocessing; depth and corrections "
+            "are configured separately."
+        )
+        self.physical_rig.currentIndexChanged.connect(self._changed)
+        form.addRow(self.physical_rig_label, self.physical_rig)
         folder_row = QHBoxLayout()
         self.folder = QLineEdit()
         self.folder.setPlaceholderText("Folder with the experiments' image folders")
@@ -149,6 +165,11 @@ class SeriesPage(QWizardPage):
             problems.append(f"A series with the ID {self.series_id.text()} exists.")
         if not self.rig_class.currentData():
             problems.append("Choose the rig class.")
+        elif (
+            self.rig_class.currentData() == "medium"
+            and not self.physical_rig.currentData()
+        ):
+            problems.append("Choose the physical rig for this Medium series.")
         folder = self.darsia_folder()
         if folder is None:
             problems.append("Choose the experiment folder.")
@@ -165,6 +186,9 @@ class SeriesPage(QWizardPage):
         return not self.problems()
 
     def _changed(self, *_args: Any) -> None:
+        is_medium = self.rig_class.currentData() == "medium"
+        self.physical_rig_label.setVisible(is_medium)
+        self.physical_rig.setVisible(is_medium)
         problems = self.problems()
         folder = self.darsia_folder()
         if problems:

@@ -950,3 +950,332 @@ def test_split_config_without_merged_stays_disabled_until_common_is_empty(run_wi
     assert Path(window.run_combo.itemData(first)) == fixture.runs["series-a"]["first"]
     window.run_combo.setCurrentIndex(first)
     assert window.home_page.new_button.isEnabled()
+
+
+@pytest.fixture
+def new_series_flow(native_window, monkeypatch, tmp_path):
+    """Create a real local series, replacing only the modal wait of each wizard."""
+    import os
+
+    from PIL import Image
+
+    from darsia.fluidflower import native_darsia_app as native
+    from darsia.fluidflower import series_creation, series_paths, series_wizard
+    from darsia.gui.ui import preprocessing_wizard
+
+    # Registration is a TOML file, not QSettings. Keep it and every discovery
+    # source local; a workstation's registered NAS series must never be read.
+    for name in tuple(os.environ):
+        if (
+            name.startswith("DARSIA_") and name.endswith("_PROJECT_ROOT")
+        ) or name == "DARSIA_FLUIDFLOWER_DATA_ROOT":
+            monkeypatch.delenv(name)
+    registry = tmp_path / "registry.toml"
+    monkeypatch.setenv("DARSIA_SERIES_REGISTRY", str(registry))
+    monkeypatch.setenv("DARSIA_FLUIDFLOWER_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(native, "configured_series", series_paths.configured_series)
+
+    experiments = tmp_path / "experiments"
+    sources = []
+    for run in ("zrun", "arun"):
+        folder = experiments / run
+        folder.mkdir(parents=True)
+        image = folder / "frame001.png"
+        Image.new("RGB", (16, 12), (110, 140, 170)).save(image)
+        sources.append(image)
+    state = SimpleNamespace(
+        window=native_window,
+        experiments=experiments,
+        root=experiments / "DarSIA",
+        registry=registry,
+        sources={path: path.read_bytes() for path in sources},
+        rig_class="medium",
+        physical_rig="FF AC",
+        cancel_creation=False,
+        finish_preprocessing=False,
+        edited_results=None,
+        created_originals={},
+        merged_at_dialog={},
+        creations=[],
+        preprocessing=[],
+        warnings=[],
+        loads=[],
+    )
+    monkeypatch.setattr(
+        native.QMessageBox,
+        "warning",
+        lambda _parent, title, message: state.warnings.append((title, message)),
+    )
+    monkeypatch.setattr(native.QMessageBox, "information", lambda *args: None)
+    original_load = native_window.config_controller.load_config
+
+    def load_config():
+        result = original_load()
+        state.loads.append(Path(native_window.config_file))
+        return result
+
+    monkeypatch.setattr(native_window.config_controller, "load_config", load_config)
+
+    def create_dialog(wizard):
+        state.creations.append(wizard)
+        page = wizard.series_page
+        page.name.setText("New UI series")
+        page.series_id.setText("FF_UI_NEW")
+        page.folder.setText(str(experiments))
+        page.rig_class.setCurrentIndex(page.rig_class.findData(state.rig_class))
+        if state.rig_class == "medium":
+            page.physical_rig.setCurrentIndex(
+                page.physical_rig.findData(state.physical_rig)
+            )
+        assert page.isComplete()
+        if state.cancel_creation:
+            wizard.reject()
+            return wizard.result()
+        wizard.experiments_page.runs = [
+            series_creation.scan_run_folder(experiments / run)
+            for run in ("zrun", "arun")
+        ]
+        assert wizard.experiments_page.isComplete()
+        wizard.accept()
+        assert wizard.created == state.root
+        state.created_originals = {
+            path: path.read_bytes() for path in state.root.rglob("*") if path.is_file()
+        }
+        return wizard.result()
+
+    def preprocessing_dialog(dialog):
+        from darsia.gui.ui.settings import unwrap_composite_widget
+
+        preset = dialog._selected_preset
+        state.preprocessing.append(
+            {
+                "path": Path(dialog.main_window.config_file),
+                "config": copy.deepcopy(dialog.main_window.config_dict),
+                "selection": dialog.main_window.sidebar.get_selected(),
+                "preset_rig": preset.rig if preset is not None else None,
+                "preset_pieces": set(preset.pieces()) if preset is not None else set(),
+                "step": dialog._index,
+                "class": type(dialog),
+            }
+        )
+        state.merged_at_dialog = {
+            path: path.read_bytes()
+            for path in (state.root / "config/merged").glob("*.toml")
+        }
+        if state.finish_preprocessing:
+            # The main settings refresh during preset application must not
+            # replace the living wizard Data editors in its save registry.
+            dialog.show()
+            QCoreApplication.processEvents()
+            results = unwrap_composite_widget(
+                dialog.main_window.settings_inputs["data.results"]
+            )
+            assert isinstance(results, QLineEdit)
+            assert dialog.isAncestorOf(results)
+            assert results.isVisibleTo(dialog)
+            results.setText(state.edited_results)
+            dialog._on_next()
+            assert (
+                dialog.main_window.config_dict["data"]["results"]
+                == state.edited_results
+            )
+            dialog._goto(len(preprocessing_wizard.STEPS) - 1)
+            dialog.main_window.config_dict["id"]["comment"] = "Saved by UI wizard"
+            dialog._run_protocols_checkbox.setChecked(False)
+            dialog._run_depth_measurements_checkbox.setChecked(False)
+            dialog._finish()
+        else:
+            dialog.reject()
+        return dialog.result()
+
+    def unexpected_preprocessing(*args, **kwargs):
+        pytest.fail("This UI test must not start a preprocessing calculation")
+
+    monkeypatch.setattr(series_wizard.NewSeriesFolderWizard, "exec", create_dialog)
+    monkeypatch.setattr(
+        preprocessing_wizard.PreprocessingWizardDialog, "exec", preprocessing_dialog
+    )
+    monkeypatch.setattr(
+        preprocessing_wizard.PreprocessingWizardDialog,
+        "_start_preprocessing",
+        unexpected_preprocessing,
+    )
+    return state
+
+
+@pytest.mark.parametrize(
+    ("rig_class", "physical_rig", "expected_size"),
+    [
+        ("medium", "FF AC", (0.9, 0.49)),
+        ("medium", "FF Bilbo", (0.92, 0.55)),
+        ("large", None, (2.8, 1.5)),
+    ],
+)
+def test_new_series_opens_real_preprocessing_on_first_manifest_run(
+    new_series_flow, qtbot, rig_class, physical_rig, expected_size
+):
+    from darsia.gui.ui.preprocessing_wizard import PreprocessingWizardDialog
+
+    state = new_series_flow
+    state.rig_class = rig_class
+    state.physical_rig = physical_rig
+    qtbot.mouseClick(
+        state.window.home_page.new_series_button, Qt.MouseButton.LeftButton
+    )
+
+    assert len(state.creations) == 1
+    assert len(state.preprocessing) == 1
+    first = state.root / "config/merged/zrun.toml"
+    opened = state.preprocessing[0]
+    assert opened["class"] is PreprocessingWizardDialog
+    assert opened["path"] == first
+    assert first in state.loads
+    assert opened["selection"] == ("preprocessing", "protocols")
+    assert opened["preset_rig"] == physical_rig
+    assert opened["preset_pieces"] == ({"rig"} if physical_rig else set())
+    assert opened["step"] == 0
+    assert state.window.run_combo.currentText() == "zrun"
+    manifest = tomllib.loads((state.root / "series.toml").read_text("utf-8"))
+    assert manifest["rig_class"] == rig_class
+    assert manifest["runs"]["ids"] == ["zrun", "arun"]
+    for run in ("zrun", "arun"):
+        path = state.root / f"config/merged/{run}.toml"
+        assert path.is_file()
+        values = tomllib.loads(path.read_text("utf-8"))
+        assert (values["rig"]["width"], values["rig"]["height"]) == expected_size
+        assert values["id"]["run_id"] == f"FF_UI_NEW {run.upper()}"
+        assert "depth" not in values
+        assert "corrections" not in values
+        index = state.window.run_combo.findText(run)
+        assert state.window.run_combo.model().item(index).isEnabled()
+        assert Path(state.window.run_combo.itemData(index)) == path
+    assert all(
+        path.read_bytes() == raw for path, raw in state.created_originals.items()
+    )
+    assert all(path.read_bytes() == raw for path, raw in state.sources.items())
+    assert all(path.read_bytes() == raw for path, raw in state.merged_at_dialog.items())
+    assert state.warnings == []
+
+
+@pytest.mark.parametrize("physical_rig", ["FF AC", "FF Bilbo"])
+def test_new_series_preprocessing_finish_keeps_visible_data_edit_in_first_run(
+    new_series_flow, qtbot, physical_rig
+):
+    state = new_series_flow
+    state.physical_rig = physical_rig
+    state.finish_preprocessing = True
+    state.edited_results = str(state.experiments / "chosen-ui-results")
+    qtbot.mouseClick(
+        state.window.home_page.new_series_button, Qt.MouseButton.LeftButton
+    )
+
+    first = state.root / "config/merged/zrun.toml"
+    second = state.root / "config/merged/arun.toml"
+    assert len(state.preprocessing) == 1
+    saved = tomllib.loads(first.read_text("utf-8"))
+    assert saved["id"]["comment"] == "Saved by UI wizard"
+    assert saved["data"]["results"] == state.edited_results
+    assert first.read_bytes() != state.merged_at_dialog[first]
+    assert second.read_bytes() == state.merged_at_dialog[second]
+    assert all(
+        path.read_bytes() == raw for path, raw in state.created_originals.items()
+    )
+    assert all(path.read_bytes() == raw for path, raw in state.sources.items())
+    assert state.warnings == []
+
+
+def test_cancelled_new_series_does_not_register_or_open_preprocessing(
+    new_series_flow, qtbot
+):
+    state = new_series_flow
+    state.cancel_creation = True
+    qtbot.mouseClick(
+        state.window.home_page.new_series_button, Qt.MouseButton.LeftButton
+    )
+
+    assert len(state.creations) == 1
+    assert state.preprocessing == []
+    assert not state.root.exists()
+    assert not state.registry.exists()
+    assert all(path.read_bytes() == raw for path, raw in state.sources.items())
+
+
+def test_new_series_registration_failure_preserves_created_files_without_handoff(
+    new_series_flow, monkeypatch, qtbot
+):
+    from darsia.fluidflower import series_paths
+
+    state = new_series_flow
+
+    def rejected_registration(_root):
+        raise ValueError("injected duplicate registered series")
+
+    monkeypatch.setattr(series_paths, "register_series", rejected_registration)
+    qtbot.mouseClick(
+        state.window.home_page.new_series_button, Qt.MouseButton.LeftButton
+    )
+
+    assert len(state.creations) == 1
+    assert state.preprocessing == []
+    assert not (state.root / "config/merged").exists()
+    assert all(
+        path.read_bytes() == raw for path, raw in state.created_originals.items()
+    )
+    assert state.warnings and "injected duplicate" in state.warnings[-1][1]
+
+
+def test_failed_new_run_load_never_opens_preprocessing_with_previous_values(
+    new_series_flow, monkeypatch, qtbot
+):
+    state = new_series_flow
+    original_prepare = state.window._prepare_new_series_runs
+
+    def corrupt_new_run(root, **kwargs):
+        run, path = original_prepare(root, **kwargs)
+        path.write_text('value = "unterminated', encoding="utf-8")
+        return run, path
+
+    monkeypatch.setattr(state.window, "_prepare_new_series_runs", corrupt_new_run)
+    qtbot.mouseClick(
+        state.window.home_page.new_series_button, Qt.MouseButton.LeftButton
+    )
+
+    assert len(state.creations) == 1
+    assert state.preprocessing == []
+    assert state.warnings
+    assert "Error loading config file:" in state.window.log_text.toPlainText()
+    assert all(
+        path.read_bytes() == raw for path, raw in state.created_originals.items()
+    )
+    assert all(path.read_bytes() == raw for path, raw in state.sources.items())
+
+
+def test_medium_requires_a_physical_rig_without_changing_the_rig_class(
+    native_window, qtbot, tmp_path
+):
+    from darsia.fluidflower.series_wizard import NewSeriesFolderWizard
+
+    wizard = NewSeriesFolderWizard(native_window)
+    qtbot.addWidget(wizard)
+    wizard.show()
+    page = wizard.series_page
+    page.name.setText("Local UI series")
+    page.series_id.setText("FF_UI_PROFILE")
+    page.folder.setText(str(tmp_path))
+    page.rig_class.setCurrentIndex(page.rig_class.findData("medium"))
+    assert page.rig_class.currentData() == "medium"
+    assert page.rig_class.currentText() == "Medium FluidFlower"
+    assert page.physical_rig.isVisible()
+    assert page.physical_rig.currentData() in (None, "")
+    assert not page.isComplete()
+    for profile in ("FF AC", "FF Bilbo"):
+        index = page.physical_rig.findData(profile)
+        assert index >= 0
+        page.physical_rig.setCurrentIndex(index)
+        assert page.isComplete()
+        assert wizard.draft().rig_class == "medium"
+    page.rig_class.setCurrentIndex(page.rig_class.findData("large"))
+    assert not page.physical_rig.isVisible()
+    assert page.isComplete()
+    assert wizard.draft().rig_class == "large"
+    wizard.reject()

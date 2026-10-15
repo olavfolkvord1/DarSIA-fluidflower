@@ -1385,7 +1385,72 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.new_series_wizard = wizard
         if wizard.exec() != QDialog.DialogCode.Accepted or wizard.created is None:
             return
-        self.register_new_series(wizard.created)
+        series_id = self.register_new_series(wizard.created)
+        if not series_id:
+            return
+        page = wizard.series_page
+        rig_preset = (
+            (page.physical_rig.currentText(), str(page.physical_rig.currentData()))
+            if page.rig_class.currentData() == "medium"
+            else None
+        )
+        try:
+            first_run, _path = self._prepare_new_series_runs(
+                wizard.created, rig_preset=rig_preset
+            )
+        except (OSError, ValueError, KeyError) as error:
+            message = f"Series created, but Preprocessing could not be opened: {error}"
+            self.print_log(message)
+            QMessageBox.warning(self, "Series created; setup not opened", message)
+            return
+        self._populate_runs()
+        self.run_combo.setCurrentIndex(self.run_combo.findText(first_run))
+        self._open_preprocessing_for_selected_run(rig_preset=rig_preset)
+
+    @staticmethod
+    def _prepare_new_series_runs(
+        root: Path, *, rig_preset: tuple[str, str] | None = None
+    ) -> tuple[str, Path]:
+        """Prepare controller files only for a just-created series, in manifest order."""
+        from copy import deepcopy
+        import toml
+        from darsia.presets.workflows.config.utils import _deep_merge
+
+        root = Path(root)
+        manifest = _read_toml(root / "series.toml")
+        paths = manifest.get("paths") or {}
+        runs = manifest.get("runs") or {}
+        ordered_runs = [str(run) for run in runs.get("ids") or []]
+        if not ordered_runs:
+            raise ValueError("The new series contains no experiments.")
+        common = _read_toml(
+            root / str(paths.get("common_config", "config/common.toml"))
+        )
+        files = runs.get("config_files") or {}
+        run_folder = str(paths.get("run_configs", "config/runs"))
+        merged_folder = root / str(paths.get("merged_configs", "config/merged"))
+        rig = None
+        if rig_preset is not None:
+            from darsia.presets.workflows.config.catalogue import SeriesPreset
+
+            pieces = SeriesPreset(rig=rig_preset[1]).pieces()
+            if "rig" not in pieces:
+                raise ValueError(
+                    f"The existing rig profile is unavailable: {rig_preset[1]}"
+                )
+            rig = pieces["rig"][1]
+        merged_folder.mkdir(parents=True, exist_ok=True)
+        for run in ordered_runs:
+            name = Path(str(files.get(run) or f"{run_folder}/{run}.toml"))
+            source = name if name.is_absolute() else root / name
+            merged = _deep_merge(deepcopy(common), _read_toml(source))
+            if rig is not None:
+                merged["rig"] = deepcopy(rig)
+            target = merged_folder / f"{run}.toml"
+            # Never overwrite a file if creation raced or this is not a fresh series.
+            with target.open("x", encoding="utf-8", newline="\n") as stream:
+                toml.dump(merged, stream)
+        return ordered_runs[0], merged_folder / f"{ordered_runs[0]}.toml"
 
     def register_new_series(self, root: Path) -> str:
         """Register a created series folder, select it and show the next steps."""
@@ -1403,17 +1468,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             return ""
         self._refresh_series(preferred_series=series_id, show_errors=True)
         self._select_series(series_id)
-        QMessageBox.information(
-            self,
-            "Series created",
-            f"{label} was created in {root}.\n\nNext, in Setup:\n"
-            "1. Protocols: the imaging protocols and templates for the injection "
-            "and pressure-temperature protocols.\n"
-            "2. Geometry and facies: rig frame, injection points and sand layers.\n"
-            "3. Native Setup: depth, labels, facies and rig.\n"
-            "4. Color path.",
-        )
-        self.show_setup(step="protocols")
+        self.print_log(f"Series {label} created and registered in {root}.")
         return series_id
 
     def _add_existing_series(self) -> None:
@@ -1480,7 +1535,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.show_phase_model_workflow()
 
     def _home_series_selected(self) -> None:
-        """Keep the run selector above Start with the selected series."""
+        """Keep the per-run categories on the series selected on Start."""
         selected = self.home_page.selected_series()
         if selected and selected != self.phase_model_workspace.series_id:
             self._select_series(selected)
@@ -1503,7 +1558,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             else "Choose a series and an available experiment in Run above first."
         )
 
-    def _open_preprocessing_for_selected_run(self) -> None:
+    def _open_preprocessing_for_selected_run(
+        self, *, rig_preset: tuple[str, str] | None = None
+    ) -> None:
         """Load the selected run and use DarSIA's unchanged per-run wizard."""
         self._home_series_selected()
         selected = self.home_page.selected_series()
@@ -1526,7 +1583,32 @@ class NativeFluidFlowerMainWindow(MainWindow):
             QMessageBox.warning(self, "Could not set up experiment", message)
             return
         self._select_row(("preprocessing", "protocols"))
-        self.open_wizard_for("preprocessing")
+        if rig_preset is None:
+            self.open_wizard_for("preprocessing")
+            return
+        from darsia.gui.ui.main_window import load_wizard_dialog_class
+        from darsia.gui.ui.preprocessing_wizard import STEPS
+        from darsia.presets.workflows.config.catalogue import SeriesPreset
+
+        dialog = load_wizard_dialog_class("preprocessing")(self)
+        wizard_inputs = self.settings_inputs.copy()
+        # Adapt this instance only; neither Jakub's wizard nor its catalogue changes.
+        label, profile = rig_preset
+        preset_name = f"{label} (rig only)"
+        dialog._catalogue.presets[preset_name] = SeriesPreset(
+            description=f"Existing {label} rig profile ({profile}); depth and corrections are set separately.",
+            rig=profile,
+        )
+        series_page = next(
+            index for index, step in enumerate(STEPS) if step[0] == "series"
+        )
+        dialog._ensure_page(series_page)
+        dialog._series_combo.setCurrentText(preset_name)
+        # Rig-only selection leaves Data unchanged but refreshes MainWindow's
+        # registry. Keep the live first-page fields owned by this wizard.
+        self.settings_inputs.clear()
+        self.settings_inputs.update(wizard_inputs)
+        dialog.exec()
 
     def show_setup(self, step: str | None = None) -> None:
         """Open the requested existing setup category for the selected series."""

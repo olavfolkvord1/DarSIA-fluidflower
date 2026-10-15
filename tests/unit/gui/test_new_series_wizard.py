@@ -143,6 +143,9 @@ def test_new_series_all_pages_work_without_finishing(qtbot, tmp_path):
     wizard.series_page.rig_class.setCurrentIndex(
         wizard.series_page.rig_class.findData("medium")
     )
+    wizard.series_page.physical_rig.setCurrentIndex(
+        wizard.series_page.physical_rig.findData("FF AC")
+    )
     wizard.experiments_page.find_experiments(confirm=False, background=False)
     wizard.show()
     qtbot.waitUntil(wizard.isVisible)
