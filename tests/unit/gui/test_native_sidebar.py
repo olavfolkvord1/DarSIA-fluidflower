@@ -1017,9 +1017,16 @@ def test_real_wizard_finish_writes_only_the_selected_merged_file(
             if step[0] == "rig"
         )
         dialog._goto(rig_index)
-        width = unwrap_composite_widget(window.settings_inputs["rig.width"])
-        assert isinstance(width, QLineEdit)
-        width.setText("4.75")
+        assert "rig.width" not in window.settings_inputs
+        data_index = next(
+            index
+            for index, step in enumerate(preprocessing_wizard.STEPS)
+            if step[0] == "data"
+        )
+        dialog._goto(data_index)
+        results = unwrap_composite_widget(window.settings_inputs["data.results"])
+        assert isinstance(results, QLineEdit)
+        results.setText(str(target.parent / "wizard-saved-results"))
         dialog._goto(len(preprocessing_wizard.STEPS) - 1)
         dialog._run_protocols_checkbox.setChecked(False)
         dialog._run_depth_measurements_checkbox.setChecked(False)
@@ -1036,8 +1043,9 @@ def test_real_wizard_finish_writes_only_the_selected_merged_file(
 
     assert finished == [1]
     saved = tomllib.loads(target.read_text("utf-8"))
-    assert saved["rig"]["width"] == 4.75
-    assert saved["rig"]["height"] == 0.5
+    original_rig = tomllib.loads(before[target].decode("utf-8"))["rig"]
+    assert all(saved["rig"][key] == value for key, value in original_rig.items())
+    assert saved["data"]["results"] == str(target.parent / "wizard-saved-results")
     assert saved["common_marker"] == "series-b"
     assert saved["run_marker"] == "second"
     assert target.read_bytes() != before[target]
@@ -1324,13 +1332,16 @@ def test_new_series_opens_real_preprocessing_on_first_manifest_run(
     assert opened["path"] == first
     assert first in state.loads
     assert opened["selection"] == ("preprocessing", "protocols")
-    assert opened["preset_rig"] == physical_rig
-    assert opened["preset_pieces"] == ({"rig"} if physical_rig else set())
+    # The explicit Start choice was already applied; the native wizard shows
+    # a read-only summary instead of a second live preset question.
+    assert opened["preset_rig"] is None
+    assert opened["preset_pieces"] == set()
     assert opened["step"] == 0
     assert state.window.run_combo.currentText() == "zrun"
     manifest = tomllib.loads((state.root / "series.toml").read_text("utf-8"))
     assert manifest["method"] == {"active": ""}
     assert manifest["rig_class"] == rig_class
+    assert manifest.get("rig_profile") == physical_rig
     assert manifest["runs"]["ids"] == ["zrun", "arun"]
     for run in ("zrun", "arun"):
         path = state.root / f"config/merged/{run}.toml"

@@ -175,6 +175,7 @@ class SeriesDraft:
     darsia_folder: Path
     runs: list[RunDraft] = field(default_factory=list)
     created_by: str = ""
+    rig_profile: str = ""
 
 
 def _images_of(folder: Path, image_format: str) -> list[Path]:
@@ -435,6 +436,7 @@ def _path_text(path: Path | str) -> str:
 
 def _series_toml(draft: SeriesDraft, created: str) -> str:
     runs = [run.run_id for run in draft.runs]
+    rig_profile = getattr(draft, "rig_profile", "")
     lines = [
         "# Paths are relative to this manifest unless absolute.",
         f"# Created {created[:10]} by the New series wizard of DarSIA-dev.",
@@ -443,6 +445,7 @@ def _series_toml(draft: SeriesDraft, created: str) -> str:
         f"series_id = {_toml_string(draft.series_id)}",
         f"name = {_toml_string(draft.name.strip())}",
         f"rig_class = {_toml_string(draft.rig_class)}",
+        *([f"rig_profile = {_toml_string(rig_profile)}"] if rig_profile else []),
         'config_format = "darsia-dev-fluidflower"',
         "",
         "[method]",

@@ -46,8 +46,8 @@ def dialog_for(run_window, qtbot, *, explicit=True):
     before = deepcopy(window.config_dict["corrections"])
     dialog = PreprocessingWizardDialog(window)
     qtbot.addWidget(dialog)
-    # A12 adapts the original dialog; the A13 rig adapter is a later commit.
-    prepare_crop_wizard(dialog)
+    # Exercise the composed native rig/crop policy on the original dialog.
+    window.rig_context.prepare_wizard(dialog, extra_policy=prepare_crop_wizard)
     return window, dialog, before
 
 

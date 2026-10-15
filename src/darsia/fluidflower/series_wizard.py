@@ -704,6 +704,11 @@ class NewSeriesFolderWizard(QWizard):
             darsia_folder=page.darsia_folder() or Path(),
             runs=self.experiments_page.runs,
             created_by=page.created_by.text().strip(),
+            rig_profile=(
+                str(page.physical_rig.currentData() or "")
+                if page.rig_class.currentData() == "medium"
+                else ""
+            ),
         )
 
     def create(self) -> Path | None:

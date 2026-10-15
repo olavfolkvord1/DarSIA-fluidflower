@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
+from darsia.fluidflower.rig_display import NativeRigContext
 from darsia.fluidflower.crop_setup_ui import NativeCropWorkflow
 from darsia.fluidflower.crop_wizard_ui import prepare_crop_wizard
 from darsia.fluidflower.project import ProjectRegistry
@@ -1251,6 +1252,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.scope_label.setWordWrap(True)
         self.scope_label.hide()
         right_layout.addWidget(self.scope_label)
+        self.rig_label = QLabel()
+        self.rig_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.rig_label.setWordWrap(True)
+        self.rig_label.hide()
+        right_layout.addWidget(self.rig_label)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.settings_scroll_area)
         self.content_stack.addWidget(self.home_page)
@@ -1282,6 +1288,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.content_stack.addWidget(self.phase_model_workspace)
         self.depth_workflow = NativeDepthWorkflow(self)
         self.content_stack.addWidget(self.depth_workflow.panel)
+        self.rig_context = NativeRigContext(self)
         self.mass_analysis_page: QWidget | None = None
         self.mass_analysis_placeholder = QLabel(
             "Choose an experimental series before mass analysis."
@@ -1512,6 +1519,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.run_scope_note.setVisible(series_row)
         if getattr(self, "depth_workflow", None) is not None:
             self.depth_workflow.keep_selection_disabled_if_running()
+        if getattr(self, "rig_context", None) is not None:
+            self.rig_context.refresh()
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""
@@ -2136,7 +2145,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         # registry. Keep the live first-page fields owned by this wizard.
         self.settings_inputs.clear()
         self.settings_inputs.update(wizard_inputs)
-        prepare_crop_wizard(dialog)
+        self.rig_context.refresh()
+        self.rig_context.prepare_wizard(dialog, extra_policy=prepare_crop_wizard)
         dialog.exec()
 
     def open_wizard_for(self, category: str) -> None:
@@ -2150,7 +2160,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             if not self.config_file:
                 return
         dialog = load_wizard_dialog_class(category)(self)
-        prepare_crop_wizard(dialog)
+        self.rig_context.refresh()
+        self.rig_context.prepare_wizard(dialog, extra_policy=prepare_crop_wizard)
         dialog.exec()
 
     def show_setup(self, step: str | None = None) -> None:
@@ -2425,6 +2436,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.method_panel.hide()
         self.analysis_method_badge.hide()
         self.scope_label.hide()
+        self.rig_label.hide()
         self.run_scope_note.hide()
         self.run_combo.setEnabled(True)
         self.content_stack.setCurrentWidget(self.settings_scroll_area)
