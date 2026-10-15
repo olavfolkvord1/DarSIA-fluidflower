@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
 )
 
 from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
+from darsia.fluidflower.crop_setup_ui import NativeCropWorkflow
+from darsia.fluidflower.crop_wizard_ui import prepare_crop_wizard
 from darsia.fluidflower.project import ProjectRegistry
 from darsia.fluidflower.series_geometry import series_rig_class
 from darsia.fluidflower.series_geometry_workspace import SeriesGeometryWorkspace
@@ -1120,16 +1122,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Read the run protocol and produce the injection and timing records.",
         ),
         (
-            "Mark rig corners",
+            "Rig corners and injection points",
             "geometry_facies",
             "rig_frame",
             "Mark the inner rig corners and injection points on a photograph for the crop geometry.",
-        ),
-        (
-            "Crop correction",
-            "preprocessing",
-            "crop",
-            "Use the marked corners to compute straightened and cropped photographs.",
         ),
         (
             "Depth",
@@ -1144,10 +1140,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Paint the sand layers and facies, then save the geometry revision.",
         ),
         (
-            "Apply painted geometry to Setup",
+            "Apply geometry to Setup",
             "geometry_facies",
             "export",
-            "Export the saved revision as native Setup inputs; add the emitted sections using the existing export dialog.",
+            "Open the saved native export and explicitly apply registered rig corners to the run crop settings; labels and facies remain separate reference exports.",
         ),
         (
             "Segmentation (automatic)",
@@ -1267,10 +1263,14 @@ class NativeFluidFlowerMainWindow(MainWindow):
             series=series, initial_series=initial_series
         )
         self.geometry_workspace.series_label.hide()
+        self.crop_workflow = NativeCropWorkflow(self)
         show_export = self.geometry_workspace._show_export_dialog
 
         def export_finished(export):
             show_export(export)
+            self.crop_workflow.attach_export_dialog(
+                self.geometry_workspace.export_dialog, export
+            )
             self._update_painted_geometry_status()
 
         self.geometry_workspace._show_export_dialog = export_finished
@@ -2136,6 +2136,21 @@ class NativeFluidFlowerMainWindow(MainWindow):
         # registry. Keep the live first-page fields owned by this wizard.
         self.settings_inputs.clear()
         self.settings_inputs.update(wizard_inputs)
+        prepare_crop_wizard(dialog)
+        dialog.exec()
+
+    def open_wizard_for(self, category: str) -> None:
+        if category != "preprocessing":
+            return super().open_wizard_for(category)
+        from darsia.gui.ui.main_window import load_wizard_dialog_class
+
+        if not self.config_file:
+            self.print_log("Wizard: create or open a config file first.")
+            self.config_controller.new_config()
+            if not self.config_file:
+                return
+        dialog = load_wizard_dialog_class(category)(self)
+        prepare_crop_wizard(dialog)
         dialog.exec()
 
     def show_setup(self, step: str | None = None) -> None:
@@ -2163,7 +2178,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._select_row(("calibration", "color"))
 
     def _update_painted_geometry_status(self) -> None:
-        """Mark the automatic alternative after current-revision step 7 export."""
+        """An export proves reference files exist, not that all geometry is applied."""
         from darsia.fluidflower.series_geometry import geometry_package_root
         from darsia.fluidflower.setup_display import (
             completed_current_native_setup_export,
@@ -2179,27 +2194,28 @@ class NativeFluidFlowerMainWindow(MainWindow):
         )
         for item in ("segmentation", "facies"):
             row = self.sidebar._sections["setup"].get_row(f"setup:{item}")
+            if row is None:
+                continue
             title = next(
-                text
-                for text, source, key, _help in self.SETUP_WORKFLOW
-                if source == "setup" and key == item
+                (
+                    text
+                    for text, source, key, _help in self.SETUP_WORKFLOW
+                    if source == "setup" and key == item
+                ),
+                row.label,
             )
-            row.label = title + (
-                " — a painted geometry is applied" if completed else ""
-            )
+            row.label = title + (" — reference export available" if completed else "")
             row._text_label.setText(row.label)
             row._text_label.setWordWrap(True)
             row.setToolTip(
-                "Current saved geometry exported for Setup; importing its sections follows the existing export dialog."
+                "Reference labels and facies were exported. They have not been applied to other runs."
                 if completed
                 else row.help_text
             )
-            row.setEnabled(not completed)
+            row.setEnabled(True)
             effect = row.graphicsEffect()
-            if effect is None:
-                effect = QGraphicsOpacityEffect(row)
-                row.setGraphicsEffect(effect)
-            effect.setOpacity(0.45 if completed else 1.0)
+            if effect is not None:
+                effect.setOpacity(1.0)
         self._update_run_action()
 
     def _sidebar_selection_enabled(self) -> bool:
@@ -2353,6 +2369,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             elif action == "geometry_facies":
                 self.content_stack.setCurrentWidget(self.geometry_workspace)
                 self.geometry_workspace.ensure_page()
+                if item_id == "export":
+                    self.crop_workflow.open_current_export()
                 view = self.geometry_workspace.simple_view
                 target = getattr(
                     view,

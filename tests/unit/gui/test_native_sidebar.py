@@ -112,11 +112,10 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     assert [label for label, _rows in section.groups] == [""]
     assert [row.label for row in section._rows.values()] == [
         "Protocols",
-        "Mark rig corners",
-        "Crop correction",
+        "Rig corners and injection points",
         "Depth",
         "Paint layers and facies",
-        "Apply painted geometry to Setup",
+        "Apply geometry to Setup",
         "Segmentation (automatic)",
         "Facies (automatic)",
         "Compute rig geometry",
@@ -129,7 +128,10 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     for action, groups in expected.items():
         for _label, rows in groups:
             for text, row_id, _icon, _help in rows:
-                if (action, row_id) == ("preprocessing", "depth_measurements"):
+                if action == "preprocessing" and row_id in (
+                    "depth_measurements",
+                    "crop",
+                ):
                     continue  # The single Depth pane owns both existing steps.
                 row = section.get_row(f"{action}:{row_id}")
                 assert row is not None
@@ -145,7 +147,7 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_current_painted_export_greys_automatic_alternative_only_for_its_series(
+def test_reference_export_does_not_claim_other_runs_geometry_is_applied(
     native_window, monkeypatch
 ):
     from darsia.fluidflower import setup_display, series_geometry
@@ -160,30 +162,24 @@ def test_current_painted_export_greys_automatic_alternative_only_for_its_series(
         lambda root: {"revision_id": "current"} if root in exported else None,
     )
     window._select_series("series-a")
-    window._select_row(("setup", "segmentation"))
-    assert window.toolbar_builder.play_action.isEnabled()
     exported.add(roots["series-a"])
     window._update_painted_geometry_status()
-    assert not window.toolbar_builder.play_action.isEnabled()
-    window.sidebar.select("setup", "facies")
-    assert window.sidebar.get_selected() == ("setup", "segmentation")
     for key in ("segmentation", "facies"):
         row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
-        assert not row.isEnabled()
-        assert "a painted geometry is applied" in row.label
-        assert row.graphicsEffect().opacity() < 1
+        assert row.isEnabled()
+        assert "reference export available" in row.label
+        assert "not been applied to other runs" in row.toolTip()
     window._select_series("series-b")
     for key in ("segmentation", "facies"):
         row = window.sidebar._sections["setup"].get_row(f"setup:{key}")
         assert row.isEnabled()
-        assert "a painted geometry is applied" not in row.label
+        assert "reference export available" not in row.label
 
 
 @pytest.mark.parametrize(
     ("action", "row_id"),
     [
         ("preprocessing", "protocols"),
-        ("preprocessing", "crop"),
         ("setup", "all"),
         ("setup", "segmentation"),
         ("setup", "facies"),
