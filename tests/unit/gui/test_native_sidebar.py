@@ -287,3 +287,60 @@ def test_workflow_completion_cannot_enable_play_on_custom_pages(
     play.setEnabled(True)
     assert play.isEnabled()
 
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_start_jump_buttons_stay_hidden_after_refresh_and_series_selection(
+    native_window,
+):
+    home = native_window.home_page
+
+    def check_controls():
+        assert home.open_selected_button.isHidden()
+        assert home.update_run_sources_button.isHidden()
+        for button in (
+            home.new_series_button,
+            home.add_existing_button,
+            home.refresh_series_button,
+        ):
+            assert button.isVisible()
+            assert button.isEnabled()
+
+    check_controls()
+    home.refresh()
+    check_controls()
+    target = next(
+        row
+        for row in range(home.table.rowCount())
+        if home.table.item(row, 1).text() == "series-b"
+    )
+    home.table.selectRow(target)
+    assert home.selected_series() == "series-b"
+    check_controls()
+    home.refresh_series_button.click()
+    check_controls()
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_continue_button_opens_training_for_selected_series(native_window, qtbot):
+    window = native_window
+    home = window.home_page
+    target = next(
+        row
+        for row in range(home.table.rowCount())
+        if home.table.item(row, 1).text() == "series-b"
+    )
+    home.table.selectRow(target)
+    window.phase_model_workspace.select_calibration("mass")
+    assert home.open_button.isVisible()
+    assert home.open_button.isEnabled()
+    qtbot.mouseClick(home.open_button, Qt.MouseButton.LeftButton)
+
+    assert window.content_stack.currentWidget() is window.phase_model_workspace
+    assert window.sidebar.get_selected() == ("phase_model", "training")
+    assert window.phase_model_workspace.series_id == "series-b"
+    assert window.phase_model_workspace.calibration_sidebar.get_selected() == (
+        "calibration",
+        "phase_model_training",
+    )
+    assert not window.toolbar_builder.play_action.isEnabled()
+
