@@ -167,8 +167,8 @@ class NativeHomePage(HomePage):
             self.series_registry.series[0][0] if self.series_registry.series else ""
         )
         super().__init__(self.series_registry, draft_store=_NoLegacyDrafts())
-        self.new_button.setText("Set up an experiment")
-        self.open_button.setText("Continue phase and mass work")
+        self.new_button.hide()
+        self.open_button.setText("Open series")
         self.open_selected_button.setText("Open phase model training")
         self.open_selected_button.hide()
         self.update_run_sources_button.setText("Open experiment setup")
@@ -188,8 +188,7 @@ class NativeHomePage(HomePage):
             "results. Earlier project packages open in their original workspace."
         )
         self.intro.setText(
-            "Choose an experimental series, then set up its inputs or "
-            "continue phase-model and mass calibration."
+            "Choose an existing experimental series or create a new series."
         )
         self.intro.setWordWrap(True)
         self.new_series_button = QPushButton("New series…")
@@ -215,7 +214,7 @@ class NativeHomePage(HomePage):
         if not self.series_registry.series:
             self.package_note.setText(
                 "No experimental series is configured. Add an existing DarSIA "
-                "series folder, or use Setup to begin a new experiment."
+                "series folder, or choose New series… to create one."
             )
         for row in range(self.table.rowCount()):
             if self.table.item(row, 1).text() == self.initial_series:
@@ -255,9 +254,7 @@ class NativeHomePage(HomePage):
         self.new_button.setText(
             "Edit earlier project setup" if legacy else "Set up an experiment"
         )
-        self.open_button.setText(
-            "Continue earlier project" if legacy else "Continue phase and mass work"
-        )
+        self.open_button.setText("Open series")
         self.open_selected_button.setText(
             "Open earlier project" if legacy else "Open phase model training"
         )
@@ -1075,7 +1072,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         ("start", "Start", "fa5s.home", (("Series", "series"),)),
         ("setup", "Setup", "fa5s.cogs", None),
         ("calibration", "Calibration", "fa5s.balance-scale", None),
-        ("phase_model", "Phase model", "fa5s.adjust", (("Training", "training"),)),
+        (
+            "phase_model",
+            "Phase model",
+            "fa5s.adjust",
+            (("Training", "training"), ("Image selection plan…", "selection_plan")),
+        ),
         ("analysis", "Analysis", "fa5s.chart-line", None),
         (
             "mass_analysis",
@@ -1133,11 +1135,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
         )
         top.addWidget(self.run_path)
         top.addStretch(1)
-        self.image_selection_button = QPushButton("Image selection plan…")
-        self.image_selection_button.setToolTip(
-            "Choose frames for review, mass calibration or production; does not start a job"
-        )
-        top.addWidget(self.image_selection_button)
         right_layout.addWidget(self.series_header)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.settings_scroll_area)
@@ -1231,7 +1228,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.phase_model_workspace.series_selector.currentIndexChanged.connect(
             self._sync_series_display
         )
-        self.image_selection_button.clicked.connect(self.open_image_selection_plan)
         self.home_page.new_requested.connect(self._open_preprocessing_for_selected_run)
         self.home_page.new_series_button.clicked.connect(self._new_series)
         self.home_page.add_existing_button.clicked.connect(self._add_existing_series)
@@ -1448,7 +1444,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._refresh_series(preferred_series=series_id, show_errors=True)
 
     def open_image_selection_plan(self) -> None:
-        """Open the metadata-only image plan from the setup workspace."""
+        """Open the metadata-only image plan from the Phase model category."""
         from darsia.fluidflower.pages.image_correction.selection_dialog import (
             ImageSelectionPlanDialog,
         )
@@ -1660,6 +1656,17 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     target.setFocus()
             elif action == "phase_model":
                 workspace = self.phase_model_workspace
+                if item_id == "selection_plan":
+                    self.content_stack.setCurrentWidget(workspace)
+                    if workspace.series_id:
+                        self.open_image_selection_plan()
+                    else:
+                        self.print_log(
+                            "Choose a series on Start before planning images."
+                        )
+                    self._sync_wizard_action_state()
+                    self._update_run_action()
+                    return
                 # Select Training even without a series, without a lazy Studio load.
                 with QSignalBlocker(workspace.calibration_sidebar):
                     workspace.select_calibration("training")

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QSettings, Qt
-from PySide6.QtWidgets import QLineEdit
+from PySide6.QtWidgets import QLineEdit, QPushButton
 
 
 @pytest.fixture
@@ -418,15 +418,34 @@ def test_workflow_completion_cannot_enable_play_on_custom_pages(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_start_jump_buttons_stay_hidden_after_refresh_and_series_selection(
+def test_start_only_shows_series_list_and_four_actions_after_refresh(
     native_window,
 ):
+    window = native_window
     home = native_window.home_page
 
     def check_controls():
+        assert home.new_button.isHidden()
         assert home.open_selected_button.isHidden()
         assert home.update_run_sources_button.isHidden()
+        assert home.add_runs_button.isHidden()
+        assert home.table.isVisible()
+        assert not window.series_header.isVisible()
+        assert not hasattr(window, "image_selection_button")
+        visible = {
+            button
+            for button in home.findChildren(QPushButton)
+            if button.isVisibleTo(home)
+        }
+        assert visible == {
+            home.open_button,
+            home.new_series_button,
+            home.add_existing_button,
+            home.refresh_series_button,
+        }
+        assert home.open_button.text() == "Open series"
         for button in (
+            home.open_button,
             home.new_series_button,
             home.add_existing_button,
             home.refresh_series_button,
@@ -450,7 +469,7 @@ def test_start_jump_buttons_stay_hidden_after_refresh_and_series_selection(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_continue_button_opens_training_for_selected_series(native_window, qtbot):
+def test_open_series_uses_the_selected_series(native_window, qtbot):
     window = native_window
     home = window.home_page
     target = next(
@@ -472,6 +491,61 @@ def test_continue_button_opens_training_for_selected_series(native_window, qtbot
         "phase_model_training",
     )
     assert not window.toolbar_builder.play_action.isEnabled()
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_image_selection_plan_is_reached_from_phase_model_for_selected_series(
+    native_window, monkeypatch, qtbot
+):
+    from darsia.fluidflower import series_paths
+    from darsia.fluidflower.pages.image_correction import selection_dialog
+
+    window = native_window
+    table = window.home_page.table
+    row = next(
+        row
+        for row in range(table.rowCount())
+        if table.item(row, 1).text() == "series-b"
+    )
+    table.selectRow(row)
+    root = window.phase_model_workspace.series_roots["series-b"]
+    calls = []
+
+    class SelectionDialog:
+        def __init__(self, path, parent, *, series_id):
+            calls.append((path, parent, series_id))
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(series_paths, "series_root", lambda key: root)
+    monkeypatch.setattr(selection_dialog, "ImageSelectionPlanDialog", SelectionDialog)
+    window._select_row(("phase_model", "training"))
+    section = window.sidebar._sections["phase_model"]
+    plan = section.get_row("selection_plan")
+    assert plan is not None
+    assert plan.label == "Image selection plan…"
+    qtbot.mouseClick(plan, Qt.MouseButton.LeftButton)
+
+    assert calls == [(root, window, "series-b")]
+    assert window.sidebar.get_selected() == ("phase_model", "selection_plan")
+    assert window.content_stack.currentWidget() is window.phase_model_workspace
+    assert window.series_header.isVisible()
+    assert not window.toolbar_builder.play_action.isEnabled()
+    assert not window.toolbar_builder.wizard_action.isEnabled()
+
+
+def test_image_selection_plan_without_series_does_not_open_dialog(
+    native_window, monkeypatch
+):
+    from darsia.fluidflower.pages.image_correction import selection_dialog
+
+    def unexpected_dialog(*args, **kwargs):
+        pytest.fail("Choose a series before opening its image selection plan")
+
+    monkeypatch.setattr(selection_dialog, "ImageSelectionPlanDialog", unexpected_dialog)
+    native_window._select_row(("phase_model", "selection_plan"))
+    assert not native_window.toolbar_builder.play_action.isEnabled()
 
 
 @pytest.fixture
@@ -598,7 +672,7 @@ def _assert_config_restored(window, previous):
     assert window._last_settings_view == previous["view"]
 
 
-def test_setup_button_loads_selected_premerged_run_with_real_controller(
+def test_preprocessing_handoff_loads_selected_premerged_run_with_real_controller(
     run_window, monkeypatch, qtbot
 ):
     fixture = run_window
@@ -606,7 +680,7 @@ def test_setup_button_loads_selected_premerged_run_with_real_controller(
     calls = _wizard_dispatch_spy(monkeypatch)
     _select_run(window, "series-b", "second")
     assert window.home_page.new_button.isEnabled()
-    qtbot.mouseClick(window.home_page.new_button, Qt.MouseButton.LeftButton)
+    window._open_preprocessing_for_selected_run()
 
     assert len(calls) == 1
     assert Path(calls[0]["path"]) == fixture.merged["series-b"]["second"]
@@ -617,6 +691,24 @@ def test_setup_button_loads_selected_premerged_run_with_real_controller(
     assert calls[0]["selection"] == ("preprocessing", "protocols")
     assert window.content_stack.currentWidget() is window.settings_scroll_area
     assert fixture.warnings == []
+
+
+def test_run_category_wizard_loads_current_run_with_original_preprocessing_key(
+    run_window, monkeypatch
+):
+    fixture = run_window
+    window = fixture.window
+    calls = _wizard_dispatch_spy(monkeypatch)
+    _select_run(window, "series-b", "second")
+    window._select_row(("preprocessing", "protocols"))
+    assert window.toolbar_builder.wizard_action.isEnabled()
+    window.toolbar_builder.wizard_action.trigger()
+
+    assert len(calls) == 1
+    assert Path(calls[0]["path"]) == fixture.merged["series-b"]["second"]
+    assert calls[0]["config"]["run_marker"] == "second"
+    assert calls[0]["selection"] == ("preprocessing", "protocols")
+    assert window.home_page.new_button.isHidden()
 
 
 @pytest.mark.parametrize("failure", ["malformed", "missing"])
@@ -637,7 +729,7 @@ def test_invalid_selected_run_never_opens_wizard_with_previous_config(
     else:
         target.unlink()
     before = {path: path.read_bytes() for path in fixture.paths if path.exists()}
-    window.home_page.new_button.click()
+    window._open_preprocessing_for_selected_run()
 
     assert calls == []
     assert fixture.warnings
@@ -657,7 +749,7 @@ def test_same_path_failed_reload_cannot_reuse_previously_parsed_values(
     previous = _config_snapshot(window)
     calls = _wizard_dispatch_spy(monkeypatch)
     target.write_text('value = "unterminated', encoding="utf-8")
-    window.home_page.new_button.click()
+    window._open_preprocessing_for_selected_run()
 
     assert calls == []
     assert fixture.warnings
@@ -691,7 +783,7 @@ def test_post_assignment_load_failure_restores_old_config_and_editors(
         window, "refresh_sidebar_progress", fail_after_new_editors_are_built
     )
     before = {path: path.read_bytes() for path in fixture.paths}
-    window.home_page.new_button.click()
+    window._open_preprocessing_for_selected_run()
 
     assert injected == [True]
     assert calls == []
@@ -747,7 +839,7 @@ def test_real_wizard_finish_writes_only_the_selected_merged_file(
 
     monkeypatch.setattr(dialog_class, "exec", edit_and_finish)
     monkeypatch.setattr(dialog_class, "_start_preprocessing", unexpected_preprocessing)
-    window.home_page.new_button.click()
+    window._open_preprocessing_for_selected_run()
 
     assert finished == [1]
     saved = tomllib.loads(target.read_text("utf-8"))
@@ -799,7 +891,7 @@ def test_unchanged_open_run_keeps_pending_widget_edit_for_real_wizard(
         return dialog.result()
 
     monkeypatch.setattr(dialog_class, "exec", inspect_then_cancel)
-    window.home_page.new_button.click()
+    window._open_preprocessing_for_selected_run()
 
     assert seen and seen[0][0] == target
     assert seen[0][1]["width"] == 1.75
