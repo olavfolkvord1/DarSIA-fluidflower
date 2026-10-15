@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
 from darsia.fluidflower.project import ProjectRegistry
 from darsia.fluidflower.series_geometry import series_rig_class
 from darsia.fluidflower.series_geometry_workspace import SeriesGeometryWorkspace
@@ -1068,6 +1069,8 @@ class _NativeSidebar(Sidebar):
                 header.hide()
 
     def display_selection(self, action: str, item_id: str) -> tuple[str, str]:
+        if (action, item_id) == ("preprocessing", "depth_measurements"):
+            action, item_id = "setup", "depth"
         return self._display_rows.get((action, item_id), (action, item_id))
 
     def _logical_selection(self, action: str, item_id: str) -> tuple[str, str]:
@@ -1129,16 +1132,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Use the marked corners to compute straightened and cropped photographs.",
         ),
         (
-            "Depth measurements",
-            "preprocessing",
-            "depth_measurements",
-            "Read a constant or CSV of measured depths for the depth map.",
-        ),
-        (
-            "Depth map",
+            "Depth",
             "setup",
             "depth",
-            "Use the depth measurements to compute the spatial depth map.",
+            "Choose constant depth or measured points, then compute the depth map using the original two steps.",
         ),
         (
             "Paint layers and facies",
@@ -1283,6 +1280,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         )
         self.phase_model_workspace.calibration_sidebar.hide()
         self.content_stack.addWidget(self.phase_model_workspace)
+        self.depth_workflow = NativeDepthWorkflow(self)
+        self.content_stack.addWidget(self.depth_workflow.panel)
         self.mass_analysis_page: QWidget | None = None
         self.mass_analysis_placeholder = QLabel(
             "Choose an experimental series before mass analysis."
@@ -1511,6 +1510,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         series_row = scope is not None and not scope.run_selector_enabled
         self.run_combo.setEnabled(not series_row)
         self.run_scope_note.setVisible(series_row)
+        if getattr(self, "depth_workflow", None) is not None:
+            self.depth_workflow.keep_selection_disabled_if_running()
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""
@@ -1825,6 +1826,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._populate_runs()
         if self._darsia_visible():
             self._ensure_run_loaded()
+        if getattr(self, "depth_workflow", None) is not None:
+            self.depth_workflow.refresh_if_visible(reload_selected=True)
         if self.mass_analysis_page is not None:
             series_id = self.phase_model_workspace.series_id
             root = self.phase_model_workspace.series_roots.get(series_id)
@@ -2223,15 +2226,25 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.selected_action not in self.action_dispatch
             or not self._darsia_visible()
             or not self._sidebar_selection_enabled()
+            or (
+                getattr(self, "depth_workflow", None) is not None
+                and self.depth_workflow.sequence.running
+            )
         ):
             action.setEnabled(False)
 
     def _update_run_action(self) -> None:
+        if getattr(self, "depth_workflow", None) is not None:
+            self.depth_workflow.sync_play_help()
         self.toolbar_builder.play_action.setEnabled(
             self._darsia_visible()
             and self.selected_action in self.action_dispatch
             and self.selected_checkbox_id is not None
             and not self.process_runner.active
+            and not (
+                getattr(self, "depth_workflow", None) is not None
+                and self.depth_workflow.sequence.running
+            )
             and self._sidebar_selection_enabled()
         )
 
@@ -2319,6 +2332,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 "colour_path" if action == "calibration" else "phase_model"
             )
             self._sync_wizard_action_state()
+            self._update_run_action()
+            return
+        if (action, item_id) == ("setup", "depth"):
+            self.selected_action, self.selected_checkbox_id = action, item_id
+            self.depth_workflow.show()
+            self.toolbar_builder.wizard_action.setEnabled(False)
             self._update_run_action()
             return
         if action in self.action_dispatch:
@@ -2551,9 +2570,23 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._update_run_path()
         self._refresh_method_state()
         self._refresh_scope_display()
+        if getattr(self, "depth_workflow", None) is not None:
+            self.depth_workflow.refresh_if_visible()
+
+    def abort_selected_workflow(self) -> None:
+        depth = getattr(self, "depth_workflow", None)
+        if depth is not None and depth.sequence.running:
+            depth.sequence.abort()
+            return
+        super().abort_selected_workflow()
 
     def run_selected_workflow(self) -> None:
         """Play applies only to the original DarSIA categories."""
+        if (
+            getattr(self, "depth_workflow", None) is not None
+            and self.depth_workflow.sequence.running
+        ):
+            return
         if self._darsia_visible():
             super().run_selected_workflow()
 

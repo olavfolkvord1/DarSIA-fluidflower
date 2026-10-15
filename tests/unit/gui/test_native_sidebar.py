@@ -114,8 +114,7 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
         "Protocols",
         "Mark rig corners",
         "Crop correction",
-        "Depth measurements",
-        "Depth map",
+        "Depth",
         "Paint layers and facies",
         "Apply painted geometry to Setup",
         "Segmentation (automatic)",
@@ -130,6 +129,8 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     for action, groups in expected.items():
         for _label, rows in groups:
             for text, row_id, _icon, _help in rows:
+                if (action, row_id) == ("preprocessing", "depth_measurements"):
+                    continue  # The single Depth pane owns both existing steps.
                 row = section.get_row(f"{action}:{row_id}")
                 assert row is not None
                 assert row.action == action
@@ -182,10 +183,8 @@ def test_current_painted_export_greys_automatic_alternative_only_for_its_series(
     ("action", "row_id"),
     [
         ("preprocessing", "protocols"),
-        ("preprocessing", "depth_measurements"),
         ("preprocessing", "crop"),
         ("setup", "all"),
-        ("setup", "depth"),
         ("setup", "segmentation"),
         ("setup", "facies"),
         ("setup", "rig"),
