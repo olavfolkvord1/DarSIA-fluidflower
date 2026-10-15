@@ -1,32 +1,32 @@
 # INVENTORY
 
-This inventory retains sealed cleanup69 accounting and separate immutable merge058 and test-harness9f578 columns. Numerical execution is bound to commit `9f5788063daff629e1e02e8b753b426ec80e4963`; the external `gate_report_merge.json` and `gate_report_merge.md` record actual qualification, retirement and scope. A documentation-only delivery commit does not relabel those executions. The source-only code totals in the9f578 column also apply to the documentation delivery HEAD, whose source and test tree is unchanged.
+This inventory preserves the existing cleanup and upstream qualification columns and adds the Studio base `aad25fc3` and transplant source commit `96fdd8b7`. The new columns count tracked Python blobs; they do not relabel the historical numerical executions or claim completed Studio runtime gates. The transplant leaves the five method-core packages and `app.py` byte-identical to AAD. Full-suite and extended Studio results are reported separately.
 
-## Five-commit package accounting
+## Package accounting with the Studio transplant
 
 Each cell is files / physical LF lines / nonblank-and-noncomment lines. The unchanged code_accounting.py also retains literal git-grep counts and every platform difference. No scientific data is read.
 
-| Package | Jakub d49b1f6e | Worker 7a9539b2 | Cleanup 69b39630 | Merge 05843b22 | Harness 9f578806 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| other | 1 / 112 / 50 | 3 / 321 / 245 | 3 / 283 / 213 | 3 / 283 / 213 | 3 / 283 / 213 |
-| examples | 18 / 3,242 / 2,162 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 |
-| jakub_packages | 257 / 65,641 / 49,540 | 267 / 72,320 / 56,475 | 267 / 72,309 / 56,462 | 272 / 73,653 / 57,609 | 272 / 73,653 / 57,609 |
-| ↳ unchanged against Jakub d49b1f6e | 257 / 65,641 / 49,540 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 |
-| ↳ changed against Jakub d49b1f6e | 0 / 0 / 0 | 213 / 69,330 / 54,060 | 213 / 69,319 / 54,047 | 213 / 69,776 / 54,434 | 213 / 69,776 / 54,434 |
-| ↳ new against Jakub d49b1f6e | 0 / 0 / 0 | 12 / 1,746 / 1,442 | 12 / 1,746 / 1,442 | 17 / 2,633 / 2,202 | 17 / 2,633 / 2,202 |
-| fluidflower_other_toplevel | 0 / 0 / 0 | 282 / 115,006 / 103,983 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 |
-| method_core/geometry | 0 / 0 / 0 | 0 / 0 / 0 | 4 / 696 / 640 | 4 / 696 / 640 | 4 / 696 / 640 |
-| method_core/mass | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 |
-| method_core/native | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 |
-| studio/pages | 0 / 0 / 0 | 62 / 25,544 / 24,067 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 |
-| method_core/phase | 0 / 0 / 0 | 0 / 0 / 0 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 |
-| phase_training | 0 / 0 / 0 | 18 / 7,818 / 7,128 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 |
-| method_core/pipeline | 0 / 0 / 0 | 0 / 0 / 0 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 |
-| tools | 0 / 0 / 0 | 458 / 216,897 / 197,980 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 |
-| studio/ui | 0 / 0 / 0 | 13 / 8,613 / 7,958 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 |
-| studio/gui | 0 / 0 / 0 | 30 / 8,782 / 6,943 | 30 / 8,771 / 6,932 | 33 / 10,268 / 8,177 | 33 / 10,268 / 8,177 |
-| tests | 62 / 11,367 / 8,660 | 90 / 18,459 / 14,426 | 139 / 25,014 / 20,307 | 139 / 25,014 / 20,307 | 139 / 25,025 / 20,316 |
-| **Total (disjoint packages)** | **338 / 80,362 / 60,412** | **1,241 / 476,828 / 421,282** | **766 / 259,754 / 223,994** | **774 / 262,595 / 226,386** | **774 / 262,606 / 226,395** |
+| Package | Jakub d49b1f6e | Worker 7a9539b2 | Cleanup 69b39630 | Merge 05843b22 | Harness 9f578806 | Studio base aad25fc3 | Studio transplant 96fdd8b7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| other | 1 / 112 / 50 | 3 / 321 / 245 | 3 / 283 / 213 | 3 / 283 / 213 | 3 / 283 / 213 | 3 / 283 / 213 | 3 / 283 / 213 |
+| examples | 18 / 3,242 / 2,162 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 |
+| jakub_packages | 257 / 65,641 / 49,540 | 267 / 72,320 / 56,475 | 267 / 72,309 / 56,462 | 272 / 73,653 / 57,609 | 272 / 73,653 / 57,609 | 272 / 73,653 / 57,609 | 272 / 73,653 / 57,609 |
+| ↳ unchanged against Jakub d49b1f6e | 257 / 65,641 / 49,540 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 |
+| ↳ changed against Jakub d49b1f6e | 0 / 0 / 0 | 213 / 69,330 / 54,060 | 213 / 69,319 / 54,047 | 213 / 69,776 / 54,434 | 213 / 69,776 / 54,434 | 213 / 69,776 / 54,434 | 213 / 69,776 / 54,434 |
+| ↳ new against Jakub d49b1f6e | 0 / 0 / 0 | 12 / 1,746 / 1,442 | 12 / 1,746 / 1,442 | 17 / 2,633 / 2,202 | 17 / 2,633 / 2,202 | 17 / 2,633 / 2,202 | 17 / 2,633 / 2,202 |
+| fluidflower_other_toplevel | 0 / 0 / 0 | 282 / 115,006 / 103,983 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 | 132 / 61,208 / 55,517 | 140 / 71,732 / 64,768 |
+| method_core/geometry | 0 / 0 / 0 | 0 / 0 / 0 | 4 / 696 / 640 | 4 / 696 / 640 | 4 / 696 / 640 | 4 / 696 / 640 | 4 / 696 / 640 |
+| method_core/mass | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 |
+| method_core/native | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 |
+| studio/pages | 0 / 0 / 0 | 62 / 25,544 / 24,067 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 |
+| method_core/phase | 0 / 0 / 0 | 0 / 0 / 0 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 |
+| phase_training | 0 / 0 / 0 | 18 / 7,818 / 7,128 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 |
+| method_core/pipeline | 0 / 0 / 0 | 0 / 0 / 0 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 |
+| tools | 0 / 0 / 0 | 458 / 216,897 / 197,980 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 | 42 / 31,077 / 28,553 |
+| studio/ui | 0 / 0 / 0 | 13 / 8,613 / 7,958 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 |
+| studio/gui | 0 / 0 / 0 | 30 / 8,782 / 6,943 | 30 / 8,771 / 6,932 | 33 / 10,268 / 8,177 | 33 / 10,268 / 8,177 | 33 / 10,268 / 8,177 | 33 / 10,268 / 8,177 |
+| tests | 62 / 11,367 / 8,660 | 90 / 18,459 / 14,426 | 139 / 25,014 / 20,307 | 139 / 25,014 / 20,307 | 139 / 25,025 / 20,316 | 139 / 25,025 / 20,316 | 139 / 25,025 / 20,316 |
+| **Total (disjoint packages)** | **338 / 80,362 / 60,412** | **1,241 / 476,828 / 421,282** | **766 / 259,754 / 223,994** | **774 / 262,595 / 226,386** | **774 / 262,606 / 226,395** | 775 / 262,676 / 226,452 | 784 / 273,558 / 236,015 |
 
 ## Merge and candidate comparisons against the two upstream references
 
