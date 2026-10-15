@@ -37,6 +37,10 @@ class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
             before_attach = options.pop("before_attach", None)
             if before_attach is not None:
                 before_attach()
+            if "normalisation" not in options:
+                from darsia.fluidflower.normalisation_step import NormalisationStep
+
+                options["normalisation"] = NormalisationStep()
             steps = NativePhaseSteps(studio, **options)
             steps.set_context(self.project_root, self.series_id)
         except Exception as error:
