@@ -1410,6 +1410,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._capture_method_groups()
         self._install_method_analysis_guard()
         self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
+        from darsia.fluidflower.workflow_status_ui import NativeWorkflowStatus
+
+        self.workflow_status = NativeWorkflowStatus(self)
 
         self.run_combo.activated.connect(self._run_chosen)
         self.run_combo.currentIndexChanged.connect(self._update_setup_action)
@@ -1429,6 +1432,40 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.recent_requested.connect(self._open_series_from_start)
         self._sync_series_display()
         self._select_row(("start", "series"))
+
+    def refresh_sidebar_progress(self):
+        """Native metadata status; preserve unrelated shallow completion dots."""
+        adapter = getattr(self, "workflow_status", None)
+        if adapter is None:
+            return super().refresh_sidebar_progress()
+        adapter.refresh()
+        if not self.config_file or not Path(self.config_file).is_file():
+            return
+        from darsia.presets.workflows.results_folder import (
+            suggested_workflow_results_folder,
+        )
+
+        for category, manager in (
+            ("comparison", self.comparison_tab),
+            ("utils", self.utils_tab),
+        ):
+            for _group, items in manager.sidebar_items():
+                for _label, item_id, _icon, _help in items:
+                    done = False
+                    try:
+                        folder = suggested_workflow_results_folder(
+                            category,
+                            Path(self.config_file),
+                            [self.action_label_for(category, item_id)],
+                        )
+                        if folder is not None:
+                            with os.scandir(folder) as listing:
+                                done = next(listing, None) is not None
+                    except (OSError, ValueError, TypeError):
+                        pass
+                    self.sidebar.set_item_state(
+                        category, item_id, "done" if done else "none"
+                    )
 
     def _refresh_scope_display(self, *_args) -> None:
         """Render one read-only context across row help, header and selector."""
@@ -1509,6 +1546,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             else None
         )
         self.current_row_scope = scope
+        if getattr(self, "workflow_status", None) is not None:
+            self.workflow_status.refresh()
         self.scope_label.setText(scope.line if scope is not None else "")
         self.scope_label.setToolTip(scope.note if scope is not None else "")
         self.scope_label.setVisible(

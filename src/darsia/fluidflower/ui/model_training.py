@@ -456,6 +456,7 @@ class SharedPhaseModelTrainingPage(QWidget):
     """Collect evidence and train immutable cross-series phase models."""
 
     training_completed = Signal(str)
+    review_opened = Signal(object)
     _model_catalog_ready = Signal(object)
     _model_metadata_ready = Signal(object)
     _model_binding_ready = Signal(object)
@@ -4483,6 +4484,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             f"{label} opened as process {int(process_id)}. Every edit is autosaved "
                 "to the selected series review folder."
         )
+        self.review_opened.emit(dict(binding))
 
 
     def _validation_materialization_output(self) -> None:
