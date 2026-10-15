@@ -11,6 +11,8 @@ from darsia.fluidflower.phase_rig_display_canvas import pad_rig_display_mask
 
 @pytest.fixture
 def saved_view(tmp_path):
+    from darsia.fluidflower.native.config import configure_parameters, reset_parameters
+
     directory = tmp_path / "native_frames" / "sample"
     directory.mkdir(parents=True)
     shape = (10, 12)
@@ -37,7 +39,13 @@ def saved_view(tmp_path):
         manifest.write_text(json.dumps(native), encoding="utf-8")
 
     write()
-    return tmp_path, native, fields, classes, manifest, write
+    token = configure_parameters({
+        "saved_review_metadata": {"display_views": {"rig_contract": revision["contract"]}}
+    })
+    try:
+        yield tmp_path, native, fields, classes, manifest, write
+    finally:
+        reset_parameters(token)
 
 
 def test_declared_bottom_extension_preserves_every_saved_flag(saved_view):

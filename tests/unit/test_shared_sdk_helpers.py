@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -78,9 +79,11 @@ def test_saved_json_write_preserves_default_ascii_nan_newline_and_replace(tmp_pa
     target = tmp_path / "sub" / "saved.json"
     payload = {"label": "ø", "not_finite": float("nan"), "order": 1}
     _write(target, payload)
-    assert target.read_bytes() == (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    # The preserved writer uses Path.write_text with native newline translation.
+    expected = (json.dumps(payload, indent=2) + "\n").replace("\n", os.linesep)
+    assert target.read_bytes() == expected.encode("utf-8")
     _write(target, {"second": 2})
-    assert target.read_bytes() == b'{\n  "second": 2\n}\n'
+    assert target.read_bytes() == ('{\n  "second": 2\n}\n'.replace("\n", os.linesep)).encode("utf-8")
     assert list(target.parent.iterdir()) == [target]
 
 
