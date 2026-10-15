@@ -1401,8 +1401,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             lambda: self._refresh_series(show_errors=True)
         )
         self.home_page.update_run_sources_requested.connect(self._show_setup_for_path)
-        self.home_page.open_requested.connect(self._show_home_calibration)
-        self.home_page.recent_requested.connect(self._show_training_for_path)
+        self.home_page.open_requested.connect(self._open_series_from_start)
+        self.home_page.recent_requested.connect(self._open_series_from_start)
         self._sync_series_display()
         self._select_row(("start", "series"))
 
@@ -1894,8 +1894,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             return
         self._refresh_series(preferred_series=series_id, show_errors=True)
 
-        self._select_series(series_id)
-        self.show_phase_model_workflow()
+        self._open_series_from_start(str(_root))
 
     def open_image_selection_plan(self) -> None:
         """Open the metadata-only image plan from the Phase model category."""
@@ -1919,19 +1918,39 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.show_setup()
 
     def _show_training_for_path(self, path: str) -> None:
+        """Historical Start-opening entry point; opening now lands on Setup."""
+        self._open_series_from_start(path)
+
+    def _show_home_calibration(self) -> None:
+        """Historical hidden Open-button entry point; preserve the Start route."""
+        self._open_series_from_start()
+
+    def _open_series_from_start(self, path: str | None = None) -> None:
+        """Open series metadata and the first Setup row, without a wizard/model.
+
+        The table's existing single- and double-click signals share this route.
+        A repeated signal for the already-open destination is a no-op; returning
+        to Start and opening the same series again remains a normal open.
+        """
+        path = path or self.home_page._selected_project_path()
         if path in self.home_page.series_registry.legacy_by_path:
             self._open_legacy_project(path)
             return
-        self._select_series(self._series_for_path(path))
-        self.show_phase_model_workflow()
-
-    def _show_home_calibration(self) -> None:
-        legacy_path = self.home_page.selected_legacy_project()
-        if legacy_path:
-            self._open_legacy_project(legacy_path)
+        series_id = self._series_for_path(path)
+        if not series_id:
             return
-        self._select_series(self.home_page.selected_series())
-        self.show_phase_model_workflow()
+        target = ("preprocessing", "protocols")
+        if (
+            self.phase_model_workspace.series_id == series_id
+            and self.sidebar.get_selected() == target
+            and self.content_stack.currentWidget() is self.settings_scroll_area
+        ):
+            return
+        self._select_series(series_id)
+        # Retain the existing active-job guard's rejection of a series change.
+        if self.phase_model_workspace.series_id != series_id:
+            return
+        self._select_row(target)
 
     def _home_series_selected(self) -> None:
         """Keep the per-run categories on the series selected on Start."""

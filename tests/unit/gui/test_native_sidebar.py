@@ -513,7 +513,9 @@ def test_start_only_shows_series_list_and_three_actions_after_refresh(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_single_click_opens_series_without_a_separate_open_button(native_window, qtbot):
+def test_single_click_opens_setup_without_training_or_wizard(
+    native_window, qtbot, monkeypatch
+):
     window = native_window
     home = window.home_page
     target = next(
@@ -522,6 +524,22 @@ def test_single_click_opens_series_without_a_separate_open_button(native_window,
         if home.table.item(row, 1).text() == "series-b"
     )
     window.phase_model_workspace.select_calibration("mass")
+    monkeypatch.setattr(
+        window.phase_model_workspace,
+        "ensure_studio",
+        lambda: pytest.fail("Opening a series must not load Training"),
+    )
+    monkeypatch.setattr(
+        window,
+        "open_wizard_for",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Opening a series must not open a wizard"
+        ),
+    )
+    original_manifests = {
+        key: (root / "series.toml").read_bytes()
+        for key, root in window.phase_model_workspace.series_roots.items()
+    }
     assert home.open_button.isHidden()
     qtbot.mouseClick(
         home.table.viewport(),
@@ -529,14 +547,15 @@ def test_single_click_opens_series_without_a_separate_open_button(native_window,
         pos=home.table.visualItemRect(home.table.item(target, 0)).center(),
     )
 
-    assert window.content_stack.currentWidget() is window.phase_model_workspace
-    assert window.sidebar.get_selected() == ("phase_model", "training")
+    assert window.content_stack.currentWidget() is window.settings_scroll_area
+    assert window.sidebar.get_selected() == ("preprocessing", "protocols")
     assert window.phase_model_workspace.series_id == "series-b"
-    assert window.phase_model_workspace.calibration_sidebar.get_selected() == (
-        "calibration",
-        "phase_model_training",
-    )
-    assert not window.toolbar_builder.play_action.isEnabled()
+    assert window.phase_model_workspace.studio_page is None
+    assert window.toolbar_builder.wizard_action.isEnabled()
+    assert {
+        key: (root / "series.toml").read_bytes()
+        for key, root in window.phase_model_workspace.series_roots.items()
+    } == original_manifests
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
@@ -563,10 +582,113 @@ def test_add_existing_folder_registers_and_opens_series(native_window, monkeypat
         return "series-b", "series-b", root
 
     monkeypatch.setattr(series_paths, "register_series", register)
+    monkeypatch.setattr(
+        window.phase_model_workspace,
+        "ensure_studio",
+        lambda: pytest.fail("Adding a series must not load Training"),
+    )
+    monkeypatch.setattr(
+        window,
+        "open_wizard_for",
+        lambda *_args, **_kwargs: pytest.fail("Adding a series must not open a wizard"),
+    )
     window._add_existing_series()
     assert registered == [root]
     assert window.phase_model_workspace.series_id == "series-b"
-    assert window.content_stack.currentWidget() is window.phase_model_workspace
+    assert window.content_stack.currentWidget() is window.settings_scroll_area
+    assert window.sidebar.get_selected() == ("preprocessing", "protocols")
+    assert window.phase_model_workspace.studio_page is None
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_single_and_double_click_signals_share_one_setup_open(
+    native_window, monkeypatch
+):
+    window = native_window
+    home = window.home_page
+    target_row = next(
+        row
+        for row in range(home.table.rowCount())
+        if home.table.item(row, 1).text() == "series-b"
+    )
+    home.table.selectRow(target_row)
+    assert window.content_stack.currentWidget() is window.home_page
+    selected = []
+    select_row = window._select_row
+
+    def record(selection):
+        selected.append(selection)
+        return select_row(selection)
+
+    monkeypatch.setattr(window, "_select_row", record)
+    home.table.cellClicked.emit(target_row, 0)
+    home.table.cellDoubleClicked.emit(target_row, 0)
+    home.table.cellClicked.emit(target_row, 0)
+    assert selected == [("preprocessing", "protocols")]
+    assert window.phase_model_workspace.series_id == "series-b"
+    assert window.geometry_workspace.series_id == "series-b"
+    assert window.sidebar.get_selected() == ("preprocessing", "protocols")
+    assert window.phase_model_workspace.studio_page is None
+    # Idempotence must not suppress opening the same series after returning.
+    select_row(("start", "series"))
+    home.table.cellClicked.emit(target_row, 0)
+    assert selected == [("preprocessing", "protocols"), ("preprocessing", "protocols")]
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_hidden_open_signal_and_compatibility_entries_use_setup(native_window):
+    window = native_window
+    table = window.home_page.table
+    target_row = next(
+        row
+        for row in range(table.rowCount())
+        if table.item(row, 1).text() == "series-b"
+    )
+    table.selectRow(target_row)
+    root = window.phase_model_workspace.series_roots["series-b"]
+    for opening in (
+        window.home_page.open_requested.emit,
+        lambda: window._show_training_for_path(str(root)),
+        window._show_home_calibration,
+    ):
+        window._select_row(("start", "series"))
+        opening()
+        assert window.sidebar.get_selected() == ("preprocessing", "protocols")
+        assert window.content_stack.currentWidget() is window.settings_scroll_area
+        assert window.phase_model_workspace.series_id == "series-b"
+        assert window.phase_model_workspace.studio_page is None
+
+
+@pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
+def test_setup_open_respects_existing_series_change_rejection(
+    native_window, monkeypatch
+):
+    window = native_window
+    root = window.phase_model_workspace.series_roots["series-b"]
+    requested = []
+    monkeypatch.setattr(window, "_select_series", requested.append)
+    window._open_series_from_start(str(root))
+    assert requested == ["series-b"]
+    assert window.phase_model_workspace.series_id == "series-a"
+    assert window.content_stack.currentWidget() is window.home_page
+    assert window.sidebar.get_selected() == ("start", "series")
+
+
+def test_start_open_preserves_legacy_project_original_opening(
+    native_window, monkeypatch
+):
+    window = native_window
+    path = "earlier-series.json-project"
+    window.home_page.series_registry.legacy_by_path[path] = {"path": path}
+    opened = []
+    monkeypatch.setattr(
+        window,
+        "_open_legacy_project",
+        lambda *args, **kwargs: opened.append((args, kwargs)),
+    )
+    window._open_series_from_start(path)
+    assert opened == [((path,), {})]
+    assert window.content_stack.currentWidget() is window.home_page
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
