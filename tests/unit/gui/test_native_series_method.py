@@ -133,7 +133,7 @@ def test_method_choice_changes_only_manifest_and_survives_refresh_and_series_swi
     assert _files(root) == after
 
 
-def test_method_badge_is_visible_in_every_category_and_analysis_repeats_it(
+def test_method_badge_is_visible_in_workflow_categories_and_analysis_repeats_it(
     method_window,
 ):
     window = method_window
@@ -152,7 +152,7 @@ def test_method_badge_is_visible_in_every_category_and_analysis_repeats_it(
         section = window.sidebar._sections[category]
         logical = window.sidebar._logical_selection(category, next(iter(section._rows)))
         window._select_row(logical)
-        assert window.method_badge.isVisible(), category
+        assert window.method_badge.isVisible() is (category != "start"), category
         assert "Method: phase model" in window.method_badge.text()
         assert window.method_panel.isVisible() is (category == "calibration")
         assert window.analysis_method_badge.isVisible() is (category == "analysis")
@@ -160,6 +160,34 @@ def test_method_badge_is_visible_in_every_category_and_analysis_repeats_it(
             assert not window.series_header.isVisible()
         if category == "analysis":
             assert window.analysis_method_badge.text() == window.method_badge.text()
+
+
+def test_start_lists_each_series_saved_method_without_writing_or_opening_it(
+    method_window,
+):
+    window = method_window
+    roots = _roots(window)
+    _phase_choice(roots["series-a"])
+    before = {key: _files(root) for key, root in roots.items()}
+    home = window.home_page
+    home.refresh()
+    assert home.table.horizontalHeaderItem(4).text() == "Method"
+    assert not home.table.isColumnHidden(4)
+    displayed = {
+        home.table.item(row, 1).text(): home.table.item(row, 4).text()
+        for row in range(home.table.rowCount())
+    }
+    assert displayed == {"series-a": "phase model", "series-b": "–"}
+    assert window.content_stack.currentWidget() is home
+    assert not window.method_badge.isVisible()
+    assert not window.series_header.isVisible()
+    assert {key: _files(root) for key, root in roots.items()} == before
+    save_series_method(
+        roots["series-b"],
+        MethodSelection(active="colour_path", colour_calibration="colour"),
+    )
+    home.refresh()
+    assert home.table.item(1, 4).text() == "colour path"
 
 
 def test_unchanged_manifest_refresh_preserves_unsaved_panel_draft(method_window):

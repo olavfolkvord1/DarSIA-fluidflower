@@ -186,9 +186,8 @@ class NativeHomePage(HomePage):
         self.draft_heading.hide()
         self.draft_note.hide()
         self.table.setHorizontalHeaderLabels(
-            ["Series", "ID", "Runs", "Rig class", "Last opened", "Folder"]
+            ["Series", "ID", "Runs", "Rig class", "Method", "Folder"]
         )
-        self.table.setColumnHidden(4, True)
         # Open only on a user click, never on programmatic selection/refresh.
         self.table.cellClicked.connect(self._open_row)
         self.table.horizontalHeader().setSectionResizeMode(
@@ -236,6 +235,21 @@ class NativeHomePage(HomePage):
         super().refresh()
         rows = getattr(self.series_registry, "last_entries", [])
         for index, row in enumerate(rows[: self.table.rowCount()]):
+            method_item = self.table.item(index, 4)
+            root = row.get("path", "")
+            choice = (
+                read_series_method(Path(root))
+                if root in self.series_registry.series_by_path
+                else MethodSelection()
+            )
+            method_item.setText(
+                {"phase_model": "phase model", "colour_path": "colour path"}.get(
+                    choice.active, "–"
+                )
+            )
+            method_item.setToolTip(
+                choice.error or "Chosen method saved in series.toml."
+            )
             item = self.table.item(index, 3)
             rig = RIG_CLASSES.get(row.get("rig_class", ""))
             if item is None:
@@ -1528,7 +1542,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         category, _item = self.sidebar.display_selection(action, item_id)
         self.method_panel.setVisible(category == "calibration")
         self.analysis_method_badge.setVisible(category == "analysis")
-        self.method_badge.show()
+        self.method_badge.setVisible(category != "start")
 
     def _save_method_choice(self, selection: MethodSelection) -> None:
         root = self._method_series_root()
