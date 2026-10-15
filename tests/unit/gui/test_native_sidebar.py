@@ -4,8 +4,14 @@ The real window and sidebar handle every selection. Expensive page loading is
 replaced by empty local widgets, so these tests need no series, NAS or workflow.
 """
 
+import copy
+import tomllib
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from PySide6.QtCore import QCoreApplication, QSettings, Qt
+from PySide6.QtWidgets import QLineEdit
 
 
 @pytest.fixture
@@ -344,3 +350,388 @@ def test_continue_button_opens_training_for_selected_series(native_window, qtbot
     )
     assert not window.toolbar_builder.play_action.isEnabled()
 
+
+@pytest.fixture
+def run_window(native_window, monkeypatch, tmp_path):
+    """Two local series with distinct run-only and premerged configuration files."""
+    from darsia.fluidflower import native_darsia_app as native
+
+    roots = {}
+    common = {}
+    runs = {}
+    merged = {}
+    paths = []
+    for series_index, key in enumerate(("series-a", "series-b")):
+        root = tmp_path / key
+        roots[key] = root
+        for folder in ("config/runs", "config/merged"):
+            (root / folder).mkdir(parents=True)
+        manifest = root / "series.toml"
+        manifest.write_text(
+            f'schema_version = 1\nseries_id = "{key}"\nname = "{key}"\n'
+            '[runs]\nids = ["first", "second"]\n',
+            encoding="utf-8",
+        )
+        common[key] = root / "config/common.toml"
+        common[key].write_text(
+            f'common_marker = "{key}"\n[rig]\nheight = 0.5\n',
+            encoding="utf-8",
+        )
+        paths.extend((manifest, common[key]))
+        runs[key] = {}
+        merged[key] = {}
+        for run_index, run in enumerate(("first", "second")):
+            width = 1.0 + 2.0 * series_index + run_index
+            runs[key][run] = root / f"config/runs/{run}.toml"
+            merged[key][run] = root / f"config/merged/{run}.toml"
+            runs[key][run].write_text(
+                f'run_marker = "{run}"\n[rig]\nwidth = {width}\n',
+                encoding="utf-8",
+            )
+            merged[key][run].write_text(
+                f'common_marker = "{key}"\nrun_marker = "{run}"\n'
+                f"[rig]\nheight = 0.5\nwidth = {width}\n",
+                encoding="utf-8",
+            )
+            paths.extend((runs[key][run], merged[key][run]))
+    configured = tuple((key, key, root) for key, root in roots.items())
+    monkeypatch.setattr(native, "configured_series", lambda: configured)
+    warnings = []
+    monkeypatch.setattr(
+        native.QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    native_window._refresh_series(preferred_series="series-a", show_errors=True)
+    return SimpleNamespace(
+        window=native_window,
+        roots=roots,
+        common=common,
+        runs=runs,
+        merged=merged,
+        paths=paths,
+        warnings=warnings,
+    )
+
+
+def _select_run(window, series, run):
+    table = window.home_page.table
+    row = next(
+        row for row in range(table.rowCount()) if table.item(row, 1).text() == series
+    )
+    table.selectRow(row)
+    assert window.phase_model_workspace.series_id == series
+    index = window.run_combo.findText(run)
+    assert index >= 0
+    window.run_combo.setCurrentIndex(index)
+
+
+def _wizard_dispatch_spy(monkeypatch):
+    from darsia.gui.ui import main_window
+
+    calls = []
+
+    class WizardSpy:
+        def __init__(self, parent):
+            self.parent = parent
+
+        def exec(self):
+            calls.append(
+                {
+                    "path": self.parent.config_file,
+                    "config": copy.deepcopy(self.parent.config_dict),
+                    "selection": self.parent.sidebar.get_selected(),
+                }
+            )
+            return 0
+
+    def registered_dialog(category):
+        assert category == "preprocessing"
+        return WizardSpy
+
+    monkeypatch.setattr(main_window, "load_wizard_dialog_class", registered_dialog)
+    return calls
+
+
+def _config_snapshot(window):
+    return {
+        "object": window.config_dict,
+        "values": copy.deepcopy(window.config_dict),
+        "file": window.config_file,
+        "label": window.config_path_label.text(),
+        "series": window._config_series,
+        "stamp": window._config_stamp,
+        "view": copy.deepcopy(window._last_settings_view),
+    }
+
+
+def _assert_config_restored(window, previous):
+    assert window.config_dict is previous["object"]
+    assert window.config_dict == previous["values"]
+    assert window.config_file == previous["file"]
+    assert window.config_path_label.text() == previous["label"]
+    assert window._config_series == previous["series"]
+    assert window._config_stamp == previous["stamp"]
+    assert window._last_settings_view == previous["view"]
+
+
+def test_setup_button_loads_selected_premerged_run_with_real_controller(
+    run_window, monkeypatch, qtbot
+):
+    fixture = run_window
+    window = fixture.window
+    calls = _wizard_dispatch_spy(monkeypatch)
+    _select_run(window, "series-b", "second")
+    assert window.home_page.new_button.isEnabled()
+    qtbot.mouseClick(window.home_page.new_button, Qt.MouseButton.LeftButton)
+
+    assert len(calls) == 1
+    assert Path(calls[0]["path"]) == fixture.merged["series-b"]["second"]
+    assert calls[0]["config"]["common_marker"] == "series-b"
+    assert calls[0]["config"]["run_marker"] == "second"
+    assert calls[0]["config"]["rig"]["height"] == 0.5
+    assert calls[0]["config"]["rig"]["width"] == 4.0
+    assert calls[0]["selection"] == ("preprocessing", "protocols")
+    assert window.content_stack.currentWidget() is window.settings_scroll_area
+    assert fixture.warnings == []
+
+
+@pytest.mark.parametrize("failure", ["malformed", "missing"])
+def test_invalid_selected_run_never_opens_wizard_with_previous_config(
+    run_window, monkeypatch, failure
+):
+    fixture = run_window
+    window = fixture.window
+    _select_run(window, "series-a", "first")
+    assert window._load_run_config(str(fixture.merged["series-a"]["first"]))
+    previous = _config_snapshot(window)
+    calls = _wizard_dispatch_spy(monkeypatch)
+    _select_run(window, "series-a", "second")
+    assert window.home_page.new_button.isEnabled()
+    target = fixture.merged["series-a"]["second"]
+    if failure == "malformed":
+        target.write_text('value = "unterminated', encoding="utf-8")
+    else:
+        target.unlink()
+    before = {path: path.read_bytes() for path in fixture.paths if path.exists()}
+    window.home_page.new_button.click()
+
+    assert calls == []
+    assert fixture.warnings
+    _assert_config_restored(window, previous)
+    assert {path: path.read_bytes() for path in before} == before
+    assert "Error loading config file:" in window.log_text.toPlainText()
+
+
+def test_same_path_failed_reload_cannot_reuse_previously_parsed_values(
+    run_window, monkeypatch
+):
+    fixture = run_window
+    window = fixture.window
+    target = fixture.merged["series-a"]["first"]
+    _select_run(window, "series-a", "first")
+    assert window._load_run_config(str(target))
+    previous = _config_snapshot(window)
+    calls = _wizard_dispatch_spy(monkeypatch)
+    target.write_text('value = "unterminated', encoding="utf-8")
+    window.home_page.new_button.click()
+
+    assert calls == []
+    assert fixture.warnings
+    _assert_config_restored(window, previous)
+    assert target.read_text("utf-8") == 'value = "unterminated'
+
+
+def test_post_assignment_load_failure_restores_old_config_and_editors(
+    run_window, monkeypatch
+):
+    fixture = run_window
+    window = fixture.window
+    _select_run(window, "series-a", "first")
+    assert window._load_run_config(str(fixture.merged["series-a"]["first"]))
+    previous = _config_snapshot(window)
+    calls = _wizard_dispatch_spy(monkeypatch)
+    target = fixture.merged["series-a"]["second"]
+    _select_run(window, "series-a", "second")
+    original_refresh = window.refresh_sidebar_progress
+    injected = []
+
+    def fail_after_new_editors_are_built():
+        if Path(window.config_file) == target and not injected:
+            assert window.config_dict["rig"]["width"] == 2.0
+            assert "rig.width" in window.settings_inputs
+            injected.append(True)
+            raise RuntimeError("injected failure after config and editor assignment")
+        return original_refresh()
+
+    monkeypatch.setattr(
+        window, "refresh_sidebar_progress", fail_after_new_editors_are_built
+    )
+    before = {path: path.read_bytes() for path in fixture.paths}
+    window.home_page.new_button.click()
+
+    assert injected == [True]
+    assert calls == []
+    assert fixture.warnings
+    _assert_config_restored(window, previous)
+    # A later save reads these real rebuilt editors. They must not copy B's
+    # width into the restored A dictionary, even after pending Qt fills run.
+    window.settings_factory._sync_settings_inputs_to_config_dict()
+    assert window.config_dict["rig"]["width"] == 1.0
+    assert {path: path.read_bytes() for path in fixture.paths} == before
+
+
+def test_real_wizard_finish_writes_only_the_selected_merged_file(
+    run_window, monkeypatch
+):
+    from darsia.gui.ui import main_window, preprocessing_wizard
+    from darsia.gui.ui.settings import unwrap_composite_widget
+
+    fixture = run_window
+    window = fixture.window
+    _select_run(window, "series-b", "second")
+    target = fixture.merged["series-b"]["second"]
+    before = {path: path.read_bytes() for path in fixture.paths}
+    dialog_class = preprocessing_wizard.PreprocessingWizardDialog
+    monkeypatch.setattr(
+        dialog_class,
+        "_load_catalogue",
+        lambda self: preprocessing_wizard.SeriesCatalogue(),
+    )
+    monkeypatch.setattr(main_window, "load_wizard_dialog_class", lambda _: dialog_class)
+    finished = []
+
+    def edit_and_finish(dialog):
+        assert Path(dialog.main_window.config_file) == target
+        rig_index = next(
+            index
+            for index, step in enumerate(preprocessing_wizard.STEPS)
+            if step[0] == "rig"
+        )
+        dialog._goto(rig_index)
+        width = unwrap_composite_widget(window.settings_inputs["rig.width"])
+        assert isinstance(width, QLineEdit)
+        width.setText("4.75")
+        dialog._goto(len(preprocessing_wizard.STEPS) - 1)
+        dialog._run_protocols_checkbox.setChecked(False)
+        dialog._run_depth_measurements_checkbox.setChecked(False)
+        dialog._finish()
+        finished.append(dialog.result())
+        return dialog.result()
+
+    def unexpected_preprocessing(*args, **kwargs):
+        pytest.fail("Finish with both compute checkboxes off must only save")
+
+    monkeypatch.setattr(dialog_class, "exec", edit_and_finish)
+    monkeypatch.setattr(dialog_class, "_start_preprocessing", unexpected_preprocessing)
+    window.home_page.new_button.click()
+
+    assert finished == [1]
+    saved = tomllib.loads(target.read_text("utf-8"))
+    assert saved["rig"]["width"] == 4.75
+    assert saved["rig"]["height"] == 0.5
+    assert saved["common_marker"] == "series-b"
+    assert saved["run_marker"] == "second"
+    assert target.read_bytes() != before[target]
+    assert all(
+        path.read_bytes() == raw for path, raw in before.items() if path != target
+    )
+    assert fixture.warnings == []
+
+
+def test_unchanged_open_run_keeps_pending_widget_edit_for_real_wizard(
+    run_window, monkeypatch
+):
+    from darsia.gui.ui import main_window, preprocessing_wizard
+    from darsia.gui.ui.settings import unwrap_composite_widget
+
+    fixture = run_window
+    window = fixture.window
+    target = fixture.merged["series-a"]["first"]
+    _select_run(window, "series-a", "first")
+    assert window._load_run_config(str(target))
+    QCoreApplication.processEvents()
+    width = unwrap_composite_widget(window.settings_inputs["rig.width"])
+    assert isinstance(width, QLineEdit)
+    width.setText("1.75")
+    before = {path: path.read_bytes() for path in fixture.paths}
+    dialog_class = preprocessing_wizard.PreprocessingWizardDialog
+    monkeypatch.setattr(
+        dialog_class,
+        "_load_catalogue",
+        lambda self: preprocessing_wizard.SeriesCatalogue(),
+    )
+    monkeypatch.setattr(main_window, "load_wizard_dialog_class", lambda _: dialog_class)
+    seen = []
+
+    def inspect_then_cancel(dialog):
+        # The unchanged real constructor has already synchronized the fields.
+        seen.append(
+            (
+                Path(dialog.main_window.config_file),
+                dialog.main_window.config_dict["rig"],
+            )
+        )
+        dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(dialog_class, "exec", inspect_then_cancel)
+    window.home_page.new_button.click()
+
+    assert seen and seen[0][0] == target
+    assert seen[0][1]["width"] == 1.75
+    assert window.config_dict["rig"]["width"] == 1.75
+    assert {path: path.read_bytes() for path in fixture.paths} == before
+    assert fixture.warnings == []
+
+
+def test_setup_button_tracks_selected_series_run_and_missing_file(run_window):
+    fixture = run_window
+    window = fixture.window
+    window.run_combo.setCurrentIndex(-1)
+    assert not window.home_page.new_button.isEnabled()
+    assert window.home_page.new_button.toolTip()
+
+    _select_run(window, "series-a", "first")
+    assert window.home_page.new_button.isEnabled()
+    table = window.home_page.table
+    row = next(
+        row
+        for row in range(table.rowCount())
+        if table.item(row, 1).text() == "series-b"
+    )
+    table.selectRow(row)
+    assert window.phase_model_workspace.series_id == "series-b"
+    assert "series-b" in window.setup_series_label.text()
+    assert window.run_combo.currentIndex() == -1
+    assert not window.home_page.new_button.isEnabled()
+
+    _select_run(window, "series-b", "second")
+    assert window.home_page.new_button.isEnabled()
+    fixture.merged["series-b"]["second"].unlink()
+    window._update_setup_action()
+    assert not window.home_page.new_button.isEnabled()
+    assert window.home_page.new_button.toolTip()
+
+
+def test_split_config_without_merged_stays_disabled_until_common_is_empty(run_window):
+    fixture = run_window
+    window = fixture.window
+    fixture.merged["series-a"]["first"].unlink()
+    window._populate_runs()
+    first = window.run_combo.findText("first")
+    assert not window.run_combo.model().item(first).isEnabled()
+    assert not window.run_combo.itemData(first)
+    window.run_combo.setCurrentIndex(first)
+    assert not window.home_page.new_button.isEnabled()
+    assert "no merged file" in window.run_combo.itemData(first, Qt.ToolTipRole)
+
+    fixture.common["series-a"].write_text(
+        "# No common settings yet\n", encoding="utf-8"
+    )
+    window._populate_runs()
+    first = window.run_combo.findText("first")
+    assert window.run_combo.model().item(first).isEnabled()
+    assert Path(window.run_combo.itemData(first)) == fixture.runs["series-a"]["first"]
+    window.run_combo.setCurrentIndex(first)
+    assert window.home_page.new_button.isEnabled()

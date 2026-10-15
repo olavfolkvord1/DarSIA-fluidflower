@@ -1157,11 +1157,13 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
 
         self.run_combo.activated.connect(self._run_chosen)
+        self.run_combo.currentIndexChanged.connect(self._update_setup_action)
+        self.home_page.table.itemSelectionChanged.connect(self._home_series_selected)
         self.phase_model_workspace.series_selector.currentIndexChanged.connect(
             self._sync_series_display
         )
         self.image_selection_button.clicked.connect(self.open_image_selection_plan)
-        self.home_page.new_requested.connect(self.show_setup)
+        self.home_page.new_requested.connect(self._open_preprocessing_for_selected_run)
         self.home_page.new_series_button.clicked.connect(self._new_series)
         self.home_page.add_existing_button.clicked.connect(self._add_existing_series)
         self.home_page.refresh_series_button.clicked.connect(
@@ -1412,6 +1414,55 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._select_series(self.home_page.selected_series())
         self.show_phase_model_workflow()
 
+    def _home_series_selected(self) -> None:
+        """Keep the run selector above Start with the selected series."""
+        selected = self.home_page.selected_series()
+        if selected and selected != self.phase_model_workspace.series_id:
+            self._select_series(selected)
+        self._update_setup_action()
+
+    def _update_setup_action(self, _index: int = -1) -> None:
+        selected = self.home_page.selected_series()
+        path = (
+            self.run_combo.currentData()
+            if selected and selected == self.phase_model_workspace.series_id
+            else None
+        )
+        enabled = bool(path and Path(path).is_file())
+        button = self.home_page.new_button
+        button.setText("Set up an experiment")
+        button.setEnabled(enabled)
+        button.setToolTip(
+            f"Open Preprocessing for {self.run_combo.currentText()}."
+            if enabled
+            else "Choose a series and an available experiment in Run above first."
+        )
+
+    def _open_preprocessing_for_selected_run(self) -> None:
+        """Load the selected run and use DarSIA's unchanged per-run wizard."""
+        self._home_series_selected()
+        selected = self.home_page.selected_series()
+        path = self.run_combo.currentData()
+        if not selected or selected != self.phase_model_workspace.series_id or not path:
+            self._update_setup_action()
+            return
+        recorded = getattr(self, "_config_stamp", None)
+        already_loaded = (
+            _same_file(self.config_file, path)
+            and self._config_series == selected
+            and recorded is not None
+            and recorded[1] == _file_stamp(path)
+        )
+        # The unchanged wizard syncs pending form edits. Do not discard them by
+        # reloading a file which is already open and unchanged on disk.
+        if not already_loaded and not self._load_run_config(str(path)):
+            message = f"Could not load the selected experiment configuration: {path}"
+            self.print_log(message)
+            QMessageBox.warning(self, "Could not set up experiment", message)
+            return
+        self._select_row(("preprocessing", "protocols"))
+        self.open_wizard_for("preprocessing")
+
     def show_setup(self, step: str | None = None) -> None:
         """Open the requested existing setup category for the selected series."""
         legacy_path = self.home_page.selected_legacy_project()
@@ -1580,6 +1631,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.run_combo.setCurrentIndex(current)
         self.run_combo.blockSignals(False)
         self._update_run_path()
+        self._update_setup_action()
 
     def _run_index(self, path: str | None) -> int:
         for index in range(self.run_combo.count()):
@@ -1621,11 +1673,60 @@ class NativeFluidFlowerMainWindow(MainWindow):
         )
         self._load_run_config(path)
 
-    def _load_run_config(self, path: str) -> None:
-        """Open a run's configuration in DarSIA's settings panel."""
-        self.config_path_label.setText(str(path))
-        self.config_controller.load_config()
+    def _load_run_config(self, path: str) -> bool:
+        """Open a run without letting a failed load reuse the previous config."""
+        previous = (
+            self.config_dict,
+            self.config_file,
+            self.config_path_label.text(),
+            self._config_series,
+            getattr(self, "_config_stamp", None),
+            self._last_settings_view,
+        )
+        errors = []
+
+        def loading_message(text: str) -> None:
+            # ConfigController catches loading/rendering errors and returns None
+            # for both success and failure. Preserve that controller unchanged.
+            if text.startswith("Error loading config file:"):
+                errors.append(text)
+
+        self.log_message.connect(loading_message)
+        try:
+            self.config_path_label.setText(str(path))
+            self.config_controller.load_config()
+        except Exception as error:
+            errors.append(str(error))
+            self.print_log(f"Error loading config file: {error}")
+        finally:
+            self.log_message.disconnect(loading_message)
+        loaded = (
+            not errors
+            and self.config_dict is not previous[0]
+            and _same_file(self.config_file, path)
+        )
+        if not loaded:
+            # Rendering can fail after the controller replaced both the config
+            # and its widgets. Never sync the new widgets into the old config.
+            self.settings_inputs.clear()
+            (
+                self.config_dict,
+                self.config_file,
+                label,
+                self._config_series,
+                self._config_stamp,
+                self._last_settings_view,
+            ) = previous
+            self.config_path_label.setText(label)
+            if self._last_settings_view is None:
+                self.settings_factory._render_settings_tabs({})
+            else:
+                self.settings_factory.refresh_current_view()
+            self._update_run_path()
+            self._update_run_action()
+            return False
         self._restore_selection()
+        return True
 
     def _ensure_run_loaded(self) -> None:
         """Open the chosen run when no file of the selected series is open."""
