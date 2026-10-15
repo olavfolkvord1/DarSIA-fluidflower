@@ -352,6 +352,10 @@ class PhaseModelWorkspace(QWidget):
         self.series_folder.setReadOnly(True)
         self.series_folder.setToolTip("Configured DarSIA folder for this series")
         controls.addRow("Series folder", self.series_folder)
+        for field in (self.series_selector, self.series_folder):
+            controls.labelForField(field).hide()
+            field.hide()
+        heading.hide()
         layout.addLayout(controls)
         self.series_support_status = QLabel()
         self.series_support_status.setWordWrap(True)
@@ -445,12 +449,11 @@ class PhaseModelWorkspace(QWidget):
             )
             return self.studio_placeholder
         if self.studio_page is None:
-            from darsia.fluidflower.pages.phase_interpretation.subpages.train_model import (
-                PhaseModelStudioSubpage,
-            )
+            from darsia.fluidflower.native_phase_subpage import NativePhaseModelStudioSubpage
 
-            self.studio_page = PhaseModelStudioSubpage(
-                self.series_id, project_root=self.series_folder.text()
+            self.studio_page = NativePhaseModelStudioSubpage(
+                self.series_id, project_root=self.series_folder.text(),
+                step_options=getattr(self, "native_step_options", None),
             )
             self.studio_page.studio_loaded.connect(self._verify_studio_series)
             self.studio_page.studio_loaded.connect(self._show_selected_studio_mode)
@@ -505,6 +508,8 @@ class PhaseModelWorkspace(QWidget):
         """Navigate existing Studio tabs without duplicating its model/job state."""
         if self.studio_page is not None:
             self.studio_page.show()
+        if getattr(self.studio_page, "native_numbered_steps", False):
+            return
         studio = getattr(self.studio_page, "studio", None)
         tabs = getattr(studio, "tabs", None)
         mass_tab = getattr(studio, "mass_workspace_tab", None)
@@ -550,7 +555,9 @@ class PhaseModelWorkspace(QWidget):
         page.project_root = Path(self.series_folder.text())
         page._mass_series_bound = False
         if studio is not None:
-            if hasattr(studio, "set_project_root"):
+            if getattr(page, "native_numbered_steps", False):
+                page.bind_context(self.series_id, page.project_root)
+            elif hasattr(studio, "set_project_root"):
                 studio.set_project_root(page.project_root, fixed=True)
             self._bind_studio_series(studio)
             workspace = getattr(studio, "_mass_workspace", None)
@@ -1285,6 +1292,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
             series=series, initial_series=initial_series
         )
         self.phase_model_workspace.calibration_sidebar.hide()
+        self.phase_model_workspace.native_step_options = {
+            "method_panel": self.method_panel,
+            "method_use": self._save_method_choice,
+            "mass_panel": MassCalibrationDisplay(),
+            "before_attach": self._detach_phase_method_from_header,
+        }
         self.content_stack.addWidget(self.phase_model_workspace)
         self.depth_workflow = NativeDepthWorkflow(self)
         self.content_stack.addWidget(self.depth_workflow.panel)
@@ -1313,7 +1326,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 phase_rows = []
                 for text, item_id, help_text in (
                     (
-                        "Training",
+                        "Phase model",
                         "training",
                         "Choose, review and train a saved phase-model version.",
                     ),
@@ -1408,6 +1421,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         run_calibration.__wrapped__ = original_calibration
         self.calibration_tab.run_calibration = run_calibration
         self._capture_method_groups()
+        # The saved parameters now belong to step 5 of the single Phase model
+        # page. Keep its old logical route for external callers, out of the UI.
+        self.sidebar._sections["calibration"].get_row("phase_model:mass_from_phase").hide()
         self._install_method_analysis_guard()
         self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
         from darsia.fluidflower.workflow_status_ui import NativeWorkflowStatus
@@ -1597,6 +1613,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
             section._rows = rows
             self._method_group_widgets[category] = grouped
 
+    def _detach_phase_method_from_header(self) -> None:
+        header = getattr(self, "calibration_header", None)
+        if header is not None:
+            header.widgets = [widget for widget in header.widgets if widget is not self.method_panel]
+
     def _method_series_root(self) -> Path | None:
         workspace = self.phase_model_workspace
         root = workspace.series_roots.get(workspace.series_id)
@@ -1667,6 +1688,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._order_method_groups()
         if self.content_stack.currentWidget() is self.mass_calibration_display:
             self._show_mass_calibration_values(self._displayed_mass_method)
+        page = getattr(self.phase_model_workspace, "studio_page", None)
+        steps = getattr(page, "native_steps", None)
+        if steps is not None:
+            steps.refresh_mass_values()
 
     def _order_method_groups(self) -> None:
         if not hasattr(self, "_method_group_widgets"):
@@ -1703,7 +1728,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
     def _set_method_category_visibility(self, action: str, item_id: str) -> None:
         category, _item = self.sidebar.display_selection(action, item_id)
-        self.method_panel.setVisible(category == "calibration")
+        parent = self.method_panel.parentWidget()
+        self.method_panel.setVisible(parent is not None and parent.objectName() == "nativePhaseUseStep")
         self.analysis_method_badge.setVisible(category == "analysis")
         self.method_badge.setVisible(category != "start")
 

@@ -49,3 +49,12 @@ def test_switch_rows_and_restore_other_categories_without_writes(scope_window, q
         str(p): p.read_bytes() for root in roots for p in root.rglob("*") if p.is_file()
     }
     assert after == before
+
+
+def test_phase_calibration_has_one_numbered_page_entry(method_window):
+    w = method_window
+    section = w.sidebar._sections["calibration"]
+    assert section.get_row("phase_model:training").label == "Phase model"
+    assert section.get_row("phase_model:mass_from_phase").isHidden()
+    w._select_row(("calibration", "color"))
+    assert not w.method_panel.isVisible()

@@ -154,7 +154,7 @@ def test_method_badge_is_visible_in_workflow_categories_and_analysis_repeats_it(
         window._select_row(logical)
         assert window.method_badge.isVisible() is (category not in {"start", "calibration"}), category
         assert "Method: phase model" in window.method_badge.text()
-        assert window.method_panel.isVisible() is (category == "calibration")
+        assert not window.method_panel.isVisible()  # The real step page is stubbed in this navigation fixture.
         assert window.analysis_method_badge.isVisible() is (category == "analysis")
         if category == "start":
             assert not window.series_header.isVisible()
@@ -210,7 +210,7 @@ def test_unchanged_manifest_refresh_preserves_unsaved_panel_draft(method_window)
 def test_original_category_header_hides_method_panel(method_window, qtbot, category):
     window = method_window
     window._select_row(("calibration", "color"))
-    assert window.method_panel.isVisible()
+    assert not window.method_panel.isVisible()  # No permanent method panel in Calibration.
     section = window.sidebar._sections[category]
     section.set_expanded(False)
     qtbot.mouseClick(section.header_button, Qt.MouseButton.LeftButton)
@@ -286,7 +286,7 @@ def test_mass_calibration_uses_one_readonly_display_and_cannot_launch(
         assert "Not reported" in rows["Saved mass-balance error"]
 
 
-def test_each_method_has_exactly_one_visible_mass_calibration_row(method_window):
+def test_colour_mass_retains_row_and_phase_mass_moves_into_step_five(method_window):
     section = method_window.sidebar._sections["calibration"]
     rows = [
         row
@@ -295,8 +295,8 @@ def test_each_method_has_exactly_one_visible_mass_calibration_row(method_window)
     ]
     assert {(row.action, row.checkbox_id) for row in rows} == {
         ("calibration", "mass"),
-        ("phase_model", "mass_from_phase"),
     }
+    assert section.get_row("phase_model:mass_from_phase").isHidden()
     for key in ("mass_optuna", "default_mass"):
         assert section.get_row(key).isHidden()
         assert not section.get_row(key).isEnabled()
