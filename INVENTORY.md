@@ -1,38 +1,90 @@
 # INVENTORY
 
-This inventory accounts for tracked Python source in Jakub's d49b1f6e, the worker baseline 7a9539b2, and this final cleanup commit (HEAD). The external final gate report records the full final commit SHA and qualification. Documentation does not enter Python line totals, so the committed table is not a self-referential commit hash.
+This inventory retains sealed cleanup69 accounting and separate immutable merge058 and test-harness9f578 columns. Numerical execution is bound to commit `9f5788063daff629e1e02e8b753b426ec80e4963`; the external `gate_report_merge.json` and `gate_report_merge.md` record actual qualification, retirement and scope. A documentation-only delivery commit does not relabel those executions. The source-only code totals in the9f578 column also apply to the documentation delivery HEAD, whose source and test tree is unchanged.
 
-The unchanged code_accounting.py reads immutable Git blobs and uses the same blank/comment exclusion as code_accounting_claude.py. Its JSON also retains literal git-grep results and every platform difference. No numerical data is read by the counter.
+## Five-commit package accounting
 
-## Three-commit package accounting
+Each cell is files / physical LF lines / nonblank-and-noncomment lines. The unchanged code_accounting.py also retains literal git-grep counts and every platform difference. No scientific data is read.
 
-Each cell is files / physical LF lines / nonblank-and-noncomment lines. Nested Jakub relation rows are subdivisions, not additional packages.
+| Package | Jakub d49b1f6e | Worker 7a9539b2 | Cleanup 69b39630 | Merge 05843b22 | Harness 9f578806 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| other | 1 / 112 / 50 | 3 / 321 / 245 | 3 / 283 / 213 | 3 / 283 / 213 | 3 / 283 / 213 |
+| examples | 18 / 3,242 / 2,162 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 |
+| jakub_packages | 257 / 65,641 / 49,540 | 267 / 72,320 / 56,475 | 267 / 72,309 / 56,462 | 272 / 73,653 / 57,609 | 272 / 73,653 / 57,609 |
+| ↳ unchanged against Jakub d49b1f6e | 257 / 65,641 / 49,540 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 | 42 / 1,244 / 973 |
+| ↳ changed against Jakub d49b1f6e | 0 / 0 / 0 | 213 / 69,330 / 54,060 | 213 / 69,319 / 54,047 | 213 / 69,776 / 54,434 | 213 / 69,776 / 54,434 |
+| ↳ new against Jakub d49b1f6e | 0 / 0 / 0 | 12 / 1,746 / 1,442 | 12 / 1,746 / 1,442 | 17 / 2,633 / 2,202 | 17 / 2,633 / 2,202 |
+| fluidflower_other_toplevel | 0 / 0 / 0 | 282 / 115,006 / 103,983 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 | 131 / 61,138 / 55,460 |
+| method_core/geometry | 0 / 0 / 0 | 0 / 0 / 0 | 4 / 696 / 640 | 4 / 696 / 640 | 4 / 696 / 640 |
+| method_core/mass | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 | 10 / 4,487 / 4,090 |
+| method_core/native | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 | 10 / 4,338 / 4,016 |
+| studio/pages | 0 / 0 / 0 | 62 / 25,544 / 24,067 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 | 62 / 25,538 / 24,061 |
+| method_core/phase | 0 / 0 / 0 | 0 / 0 / 0 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 | 12 / 4,363 / 4,033 |
+| phase_training | 0 / 0 / 0 | 18 / 7,818 / 7,128 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 | 17 / 7,896 / 7,198 |
+| method_core/pipeline | 0 / 0 / 0 | 0 / 0 / 0 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 | 9 / 3,502 / 3,228 |
+| tools | 0 / 0 / 0 | 458 / 216,897 / 197,980 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 | 41 / 30,719 / 28,241 |
+| studio/ui | 0 / 0 / 0 | 13 / 8,613 / 7,958 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 | 13 / 7,632 / 7,036 |
+| studio/gui | 0 / 0 / 0 | 30 / 8,782 / 6,943 | 30 / 8,771 / 6,932 | 33 / 10,268 / 8,177 | 33 / 10,268 / 8,177 |
+| tests | 62 / 11,367 / 8,660 | 90 / 18,459 / 14,426 | 139 / 25,014 / 20,307 | 139 / 25,014 / 20,307 | 139 / 25,025 / 20,316 |
+| **Total (disjoint packages)** | **338 / 80,362 / 60,412** | **1,241 / 476,828 / 421,282** | **766 / 259,754 / 223,994** | **774 / 262,595 / 226,386** | **774 / 262,606 / 226,395** |
 
-| Package | Jakub d49b1f6e | Worker 7a9539b2 | Final cleanup HEAD |
-| --- | ---: | ---: | ---: |
-| jakub_packages | 257 / 65,641 / 49,540 | 267 / 72,320 / 56,475 | 267 / 72,309 / 56,462 |
-| ↳ unchanged against Jakub | 257 / 65,641 / 49,540 | 42 / 1,244 / 973 | 42 / 1,244 / 973 |
-| ↳ changed against Jakub | 0 / 0 / 0 | 213 / 69,330 / 54,060 | 213 / 69,319 / 54,047 |
-| ↳ new against Jakub | 0 / 0 / 0 | 12 / 1,746 / 1,442 | 12 / 1,746 / 1,442 |
-| method_core/native | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,338 / 4,016 |
-| method_core/phase | 0 / 0 / 0 | 0 / 0 / 0 | 12 / 4,363 / 4,033 |
-| method_core/geometry | 0 / 0 / 0 | 0 / 0 / 0 | 4 / 696 / 640 |
-| method_core/mass | 0 / 0 / 0 | 0 / 0 / 0 | 10 / 4,487 / 4,090 |
-| method_core/pipeline | 0 / 0 / 0 | 0 / 0 / 0 | 9 / 3,502 / 3,228 |
-| phase_training | 0 / 0 / 0 | 18 / 7,818 / 7,128 | 17 / 7,896 / 7,198 |
-| studio/gui | 0 / 0 / 0 | 30 / 8,782 / 6,943 | 30 / 8,771 / 6,932 |
-| studio/pages | 0 / 0 / 0 | 62 / 25,544 / 24,067 | 62 / 25,538 / 24,061 |
-| studio/ui | 0 / 0 / 0 | 13 / 8,613 / 7,958 | 13 / 7,632 / 7,036 |
-| fluidflower_other_toplevel | 0 / 0 / 0 | 282 / 115,006 / 103,983 | 131 / 61,138 / 55,460 |
-| tools | 0 / 0 / 0 | 458 / 216,897 / 197,980 | 41 / 30,719 / 28,241 |
-| tests | 62 / 11,367 / 8,660 | 90 / 18,459 / 14,426 | 139 / 25,014 / 20,307 |
-| examples | 18 / 3,242 / 2,162 | 18 / 3,068 / 2,077 | 18 / 3,068 / 2,077 |
-| other | 1 / 112 / 50 | 3 / 321 / 245 | 3 / 283 / 213 |
-| **Total (disjoint packages)** | **338 / 80,362 / 60,412** | **1,241 / 476,828 / 421,282** | **766 / 259,754 / 223,994** |
+## Merge and candidate comparisons against the two upstream references
 
-The method core has 45 files /17,386 physical /16,007 nonblank-and-noncomment lines. Two original Jakub Python paths remain absent, as in 7a9539b2. Studio stays in its existing packages. The 41 retained tools are the class-1 SDK/review/training closure.
+Merge `05843b2275bd62bc505c7366996c44401d2c8160` retains both parents. Candidate `9f5788063daff629e1e02e8b753b426ec80e4963` adds only the two test-harness files below; all src and docs blobs remain identical to the merge. The external gate reports retain the actual9f578806 execution identity and qualification state; this documentation delivery makes no claim of numerical execution on a later documentation commit.
 
-## Source sorting and qualification
+### Merge 05843b22 versus merge_base `3ace4a43`
+
+| Relation | Files | Reference physical / code lines | Target physical / code lines | Added / removed |
+| --- | ---: | ---: | ---: | ---: |
+| identical | 355 | 79,650 / 61,369 | 79,650 / 61,369 | +0 / -0 |
+| changed | 41 | 19,024 / 15,124 | 20,384 / 16,318 | +2,019 / -659 |
+| new | 378 | 0 / 0 | 162,561 / 148,699 | +162,561 / -0 |
+| removed | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+
+### Merge 05843b22 versus upstream_dev `aece8c49`
+
+| Relation | Files | Reference physical / code lines | Target physical / code lines | Added / removed |
+| --- | ---: | ---: | ---: | ---: |
+| identical | 393 | 94,771 / 73,603 | 94,771 / 73,603 | +0 / -0 |
+| changed | 11 | 6,744 / 5,282 | 7,208 / 5,703 | +528 / -64 |
+| new | 370 | 0 / 0 | 160,616 / 147,080 | +160,616 / -0 |
+| removed | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+
+### Harness 9f578806 versus merge_base `3ace4a43`
+
+| Relation | Files | Reference physical / code lines | Target physical / code lines | Added / removed |
+| --- | ---: | ---: | ---: | ---: |
+| identical | 355 | 79,650 / 61,369 | 79,650 / 61,369 | +0 / -0 |
+| changed | 41 | 19,024 / 15,124 | 20,384 / 16,318 | +2,019 / -659 |
+| new | 378 | 0 / 0 | 162,572 / 148,708 | +162,572 / -0 |
+| removed | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+
+### Harness 9f578806 versus upstream_dev `aece8c49`
+
+| Relation | Files | Reference physical / code lines | Target physical / code lines | Added / removed |
+| --- | ---: | ---: | ---: | ---: |
+| identical | 393 | 94,771 / 73,603 | 94,771 / 73,603 | +0 / -0 |
+| changed | 11 | 6,744 / 5,282 | 7,208 / 5,703 | +528 / -64 |
+| new | 370 | 0 / 0 | 160,627 / 147,089 | +160,627 / -0 |
+| removed | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+
+### Harness 9f578806 versus merged `05843b22`
+
+| Relation | Files | Reference physical / code lines | Target physical / code lines | Added / removed |
+| --- | ---: | ---: | ---: | ---: |
+| identical | 772 | 262,355 / 226,191 | 262,355 / 226,191 | +0 / -0 |
+| changed | 2 | 240 / 195 | 251 / 204 | +14 / -3 |
+| new | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+| removed | 0 | 0 / 0 | 0 / 0 | +0 / -0 |
+
+Accounting JSON: `\\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\upstream_merge_G6_candidate9f578_prepared\extended_accounting_candidate.json` SHA `cd35ad3125c21c9b1fbcec7c62cc4f97143044e9940393cfaa7270ac55443b6e` / 4827126 bytes.
+
+Full rows: `\\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\upstream_merge_G6_candidate9f578_prepared\complete_file_comparisons_candidate.md` SHA `f8771c6457f3122084bd04c2c71ff960b71f2884139410bbb0b34e8cde79cdda` / 777951 bytes.
+
+## Historical cleanup source sorting and qualification
+
+The following cleanup retirement, archive, unit and gate records describe sealed cleanup69b39630; they are preserved historical evidence, not a claim that the new merge ports have passed.
+
 
 There are 611 original source paths absent from this commit: 50 current-version class-2 paths and 561 class-3 paths. They are distinct from the 72 literal historical producer versions archived with retained-result bindings. The full deletion table is included below and in REMOVED.md, including source line counts, Git history and Studio actions. No scientific DATA, result or partial output was deleted.
 
