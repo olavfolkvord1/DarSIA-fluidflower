@@ -125,6 +125,73 @@ def read_series_manifest(series_root: Path) -> dict[str, Any]:
     return manifest
 
 
+RIG_CLASS_KEY = "rig_class"
+
+
+def series_rig_class(series_root: Path) -> str:
+    """The series' rig class (a key of ``RIG_CLASSES``), or "" if unset."""
+
+    from darsia.fluidflower.templates import RIG_CLASSES
+
+    try:
+        value = str(read_series_manifest(Path(series_root)).get(RIG_CLASS_KEY) or "")
+    except (OSError, ValueError):
+        return ""
+    return value if value in RIG_CLASSES else ""
+
+
+def set_series_rig_class(series_root: Path, rig_class: str) -> None:
+    """Write ``rig_class = "<key>"`` into series.toml, changing nothing else.
+
+    The key is placed among the top-level keys, after ``name`` (or
+    ``series_id``) when present; an existing ``rig_class`` line is replaced.
+    """
+
+    import re
+
+    from darsia.fluidflower.templates import RIG_CLASSES
+
+    if rig_class not in RIG_CLASSES:
+        raise ValueError(f"Unknown rig class: {rig_class!r}")
+    path = Path(series_root) / "series.toml"
+    raw = path.read_bytes()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    text = raw.decode("utf-8-sig")
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    entry = f'{RIG_CLASS_KEY} = "{rig_class}"{newline}'
+    first_table = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    pattern = re.compile(rf"^\s*{RIG_CLASS_KEY}\s*=")
+    existing = next(
+        (index for index in range(first_table) if pattern.match(lines[index])), None
+    )
+    if existing is not None:
+        lines[existing] = entry
+    else:
+        anchor = None
+        for key in ("name", "series_id", "schema_version"):
+            key_pattern = re.compile(rf"^\s*{key}\s*=")
+            anchor = next(
+                (i for i in range(first_table) if key_pattern.match(lines[i])), None
+            )
+            if anchor is not None:
+                break
+        position = anchor + 1 if anchor is not None else 0
+        if position > 0 and not lines[position - 1].endswith(("\n", "\r")):
+            lines[position - 1] += newline
+        lines.insert(position, entry)
+    updated = "".join(lines)
+    parsed = tomllib.loads(updated)
+    if parsed.get(RIG_CLASS_KEY) != rig_class:
+        raise ValueError(f"Could not record the rig class in {path}")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_bytes((b"\xef\xbb\xbf" if bom else b"") + updated.encode("utf-8"))
+    os.replace(temporary, path)
+
+
 def geometry_package_root(series_root: Path) -> Path:
     """Folder of the series' geometry-and-facies project package."""
 
@@ -354,7 +421,7 @@ class RigFrame:
         }
         size = payload.get("image_size")
         return cls(
-            corners=corners,
+            corners=order_corners(corners),
             width_m=_float(payload.get("width_m")),
             height_m=_float(payload.get("height_m")),
             run_id=str(payload.get("run_id") or ""),
@@ -362,6 +429,30 @@ class RigFrame:
             image=str(payload.get("image") or ""),
             image_size=(int(size[0]), int(size[1])) if size else None,
         )
+
+
+def order_corners(
+    corners: Mapping[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Name four marked corners by their position in the photograph.
+
+    Corners clicked in another order (for example counter-clockwise) are
+    renamed: the two upper points are the top corners, the left one of each
+    pair is the left corner. Incomplete sets are returned unchanged.
+    """
+
+    points = [tuple(map(float, value)) for value in corners.values()]
+    if len(corners) != 4 or set(corners) != set(CROP_CORNERS):
+        return dict(corners)
+    by_row = sorted(points, key=lambda point: (point[0], point[1]))
+    top = sorted(by_row[:2], key=lambda point: point[1])
+    bottom = sorted(by_row[2:], key=lambda point: point[1])
+    return {
+        "top_left": top[0],
+        "top_right": top[1],
+        "bottom_right": bottom[1],
+        "bottom_left": bottom[0],
+    }
 
 
 def rig_frame_from_inputs(inputs: SeriesRunInputs) -> RigFrame | None:
@@ -799,6 +890,14 @@ def native_labels_from_color_index(
     return result.astype(np.min_scalar_type(int(result.max(initial=0))))
 
 
+def _consecutive_labels(labels: np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    """Labels renumbered 0, 1, ... in increasing order, as darsia.make_consecutive."""
+
+    present = np.unique(labels)
+    lookup = {int(value): rank for rank, value in enumerate(present)}
+    return np.searchsorted(present, labels).astype(labels.dtype), lookup
+
+
 def _facies_by_label(
     present: Sequence[int], regions: Sequence[Mapping[str, Any]], grouping_mode: str
 ) -> dict[int, int]:
@@ -1140,6 +1239,16 @@ def export_native_setup(
                 "of another facies."
             )
         mapping.setdefault(int(facies_ids[best]), []).append(native_label)
+    # DarSIA's settings panel always saves [labeling] unite_labels, an empty
+    # list when nothing is united, and native Setup then numbers the labels from
+    # 0 (darsia.make_consecutive). The export writes the empty list itself and
+    # uses those numbers, so its sections give the same labels from the command
+    # line and from the panel.
+    native, consecutive = _consecutive_labels(native)
+    mapping = {
+        facies_id: [consecutive[label] for label in labels]
+        for facies_id, labels in mapping.items()
+    }
 
     properties_source = Path(str(artifacts.get("facies_properties_path") or ""))
     if not _is_file(properties_source):
@@ -1205,6 +1314,9 @@ def export_native_setup(
             f"colored_image = {_toml_string(colored_final)}",
             f"rtol = {rtol!r}",
             "ensure_connectivity = true",
+            "# The DarSIA settings panel saves unite_labels (empty) and Setup then",
+            "# numbers the labels from 0; the facies tables below use those numbers.",
+            "unite_labels = []",
             "",
             "[facies]",
             f"props = {_toml_string(props_final)}",
@@ -1332,7 +1444,9 @@ __all__ = [
     "CROP_CORNERS",
     "FRAME_FROM_CONFIGURATION",
     "FRAME_MARKED",
+    "RIG_CLASS_KEY",
     "RigFrame",
+    "order_corners",
     "protocol_injection_points",
     "remove_rig_frame",
     "rig_frame_from_inputs",
@@ -1356,6 +1470,8 @@ __all__ = [
     "native_series_link",
     "photo_size",
     "read_series_manifest",
+    "series_rig_class",
     "series_run_inputs",
     "set_reference_run",
+    "set_series_rig_class",
 ]

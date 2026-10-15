@@ -1,19 +1,29 @@
-"""Layer painting: brush strokes on a raw photograph, a proposed layer map and
-its conversion to a geometry revision for native Setup.
+"""Layer painting: polygons and brush strokes on a raw photograph, a proposed
+layer map and its conversion to a geometry revision for native Setup.
 
-The simple view of the Geometry and facies tab lets a user paint a few strokes
-per layer on the raw baseline photograph of the reference run. A pixel
-classifier (DarSIA's facies features and extremely randomized trees) is trained
-on the painted pixels and labels the rest of the photograph inside the rig
-frame. Class probabilities are smoothed, painted pixels keep their layer and
-regions smaller than a set area join their largest neighbour. Layers are
-grouped into facies that share a role, porosity and permeability. Saving
-converts the proposal to a label map on the raw photograph's grid, stores it as
-a geometry revision and exports it for native Setup.
+The simple view of the Geometry and facies tab lets a user outline layers with
+polygons and paint brush strokes on the raw baseline photograph of the
+reference run. A pixel classifier (DarSIA's facies features and extremely
+randomized trees) is trained on the marked pixels and labels the rest of the
+photograph inside the rig frame:
 
-Strokes are stored in raw-image pixels (row, col) with a brush radius in raw
-pixels, in ``<package>/annotations/layer_painting/<run>.json``. The latest
-proposal is stored next to it.
+* Inside a polygon, farther than the snap distance from every polygon edge,
+  the polygon's layer is kept. Where polygons of different layers overlap, the
+  smaller polygon wins, so a lens drawn inside a layer keeps its own layer.
+* Near polygon edges the classifier places the boundary, choosing only between
+  the layers whose polygons or strokes lie within the snap distance. Near areas
+  that no polygon covers, every layer competes.
+* Away from polygons every layer competes, as with strokes alone.
+
+Class probabilities are smoothed, painted pixels keep their layer and regions
+smaller than a set area join their largest neighbour. Layers are grouped into
+facies that share a role, porosity and permeability. Saving converts the
+proposal to a label map on the raw photograph's grid, stores it as a geometry
+revision and exports it for native Setup.
+
+Polygons and strokes are stored in raw-image pixels (row, col), strokes with a
+brush radius in raw pixels, in ``<package>/annotations/layer_painting/<run>.json``.
+The latest proposal is stored next to it.
 """
 
 from __future__ import annotations
@@ -55,6 +65,12 @@ LAYER_ROLES: dict[str, str] = {
     "free_water": "Free water",
     "excluded": "Excluded",
 }
+# Porosity of the roles without a porous medium: free water fills the whole
+# volume, excluded regions and the area outside the rig frame hold none. Native
+# DarSIA integrates mass with depth x porosity, and a facies without porosity
+# would make every integral over the rig NaN.
+ROLE_POROSITY: dict[str, float] = {"free_water": 1.0, "excluded": 0.0}
+OUTSIDE_POROSITY = 0.0
 SMOOTHING_SIGMA: dict[str, float] = {"low": 1.5, "medium": 3.0, "high": 6.0}
 PERMEABILITY_UNITS = ("darcy", "mD", "m2")
 LAYER_COLORS = (
@@ -83,6 +99,11 @@ OUTSIDE_FACIES = "Outside the rig frame"
 PLACEHOLDER_DEPTH_M = 0.01
 # Pixels whose largest smoothed class probability is below this are uncertain.
 UNCERTAIN_BELOW = 0.6
+# How far polygon edges may lie from the true boundary, by default.
+DEFAULT_SNAP_MM = 10.0
+MAX_SNAP_MM = 100.0
+# Without a rig size, the photograph is taken to be this wide.
+NOMINAL_IMAGE_WIDTH_M = 1.0
 
 ProgressCallback = Callable[[str], None]
 
@@ -119,6 +140,13 @@ class FaciesEntry:
     porosity: float | None = None
     permeability: float | None = None
 
+    def effective_porosity(self) -> float | None:
+        """The porosity exported: entered for a porous medium, else the role's."""
+
+        if self.role == "porous_medium":
+            return self.porosity
+        return ROLE_POROSITY.get(self.role)
+
 
 @dataclass
 class Stroke:
@@ -145,12 +173,46 @@ class Stroke:
         )
 
 
+@dataclass
+class Polygon:
+    """A closed polygon of one layer; vertices in raw-image pixels (row, col)."""
+
+    layer_id: int
+    points: list[tuple[float, float]]
+
+    def area(self) -> float:
+        """Enclosed area in raw pixels² (shoelace formula)."""
+
+        if len(self.points) < 3:
+            return 0.0
+        rows = np.asarray([point[0] for point in self.points], dtype=np.float64)
+        cols = np.asarray([point[1] for point in self.points], dtype=np.float64)
+        return float(
+            0.5 * abs(np.dot(cols, np.roll(rows, -1)) - np.dot(rows, np.roll(cols, -1)))
+        )
+
+    def to_list(self) -> list[Any]:
+        return [
+            int(self.layer_id),
+            [[round(float(row), 1), round(float(col), 1)] for row, col in self.points],
+        ]
+
+    @classmethod
+    def from_list(cls, payload: Sequence[Any]) -> Polygon:
+        layer_id, points = payload
+        return cls(int(layer_id), [(float(row), float(col)) for row, col in points])
+
+
 _UNSET: Any = object()
 
 
 @dataclass
 class PaintingSession:
-    """Painted layers of one reference run."""
+    """Layers, facies, polygons and strokes of one reference run.
+
+    Every layer belongs to one facies. Facies keep their order and may be
+    empty (an empty facies is not exported).
+    """
 
     run_id: str
     image_path: str = ""
@@ -159,10 +221,12 @@ class PaintingSession:
     image_stamp: str = ""
     layers: list[PaintedLayer] = field(default_factory=list)
     facies: dict[str, FaciesEntry] = field(default_factory=dict)
+    polygons: list[Polygon] = field(default_factory=list)
     strokes: list[Stroke] = field(default_factory=list)
     permeability_unit: str = "darcy"
     smoothing: str = "medium"
     min_region_cm2: float = 2.0
+    snap_mm: float = DEFAULT_SNAP_MM
     updated_utc: str = ""
     updated_by: str = ""
     # Set when the run's baseline photograph differs from the one painted on.
@@ -201,6 +265,8 @@ class PaintingSession:
     def add_layer(
         self, name: str | None = None, role: str = "porous_medium"
     ) -> PaintedLayer:
+        """A new layer in a facies of its own."""
+
         layer_id = max((row.layer_id for row in self.layers), default=0) + 1
         if layer_id > 255:
             raise ValueError("At most 255 layers can be painted")
@@ -210,18 +276,24 @@ class PaintingSession:
             LAYER_COLORS[(layer_id - 1) % len(LAYER_COLORS)],
         )
         text = self._unique_name(str(name or "").strip() or f"Layer {layer_id}")
-        layer = PaintedLayer(layer_id, text, color, text)
+        facies = self._unique_facies_name(text)
+        layer = PaintedLayer(layer_id, text, color, facies)
         self.layers.append(layer)
-        if text not in self.facies:
-            self.facies[text] = FaciesEntry(
-                role=role if role in LAYER_ROLES else "porous_medium"
-            )
+        self.facies[facies] = FaciesEntry(
+            role=role if role in LAYER_ROLES else "porous_medium"
+        )
         return layer
 
     def remove_layer(self, layer_id: int) -> None:
+        """Remove a layer with its polygons and strokes; a facies left without
+        layers goes too."""
+
+        layer = self.layer(layer_id)
         self.layers = [row for row in self.layers if row.layer_id != layer_id]
         self.strokes = [row for row in self.strokes if row.layer_id != layer_id]
-        self.prune_facies()
+        self.polygons = [row for row in self.polygons if row.layer_id != layer_id]
+        if layer is not None and not self.layers_in_facies(layer.facies):
+            self.facies.pop(layer.facies, None)
 
     def rename_layer(self, layer_id: int, name: str) -> None:
         layer = self.layer(layer_id)
@@ -235,28 +307,136 @@ class PaintingSession:
         old = layer.name
         layer.name = text
         # A facies that only carries this layer's old name follows the rename.
-        alone = [row for row in self.layers if row.facies == layer.facies] == [layer]
+        alone = self.layers_in_facies(layer.facies) == [layer]
         if layer.facies == old and alone and text not in self.facies:
-            self.facies[text] = self.facies.pop(old, FaciesEntry())
-            layer.facies = text
+            self._rename_facies_key(old, text)
+
+    # ------------------------------------------------------------ facies
+
+    def _unique_facies_name(self, wanted: str) -> str:
+        used = {name.casefold() for name in self.facies}
+        if wanted.casefold() not in used:
+            return wanted
+        number = 2
+        while f"{wanted} {number}".casefold() in used:
+            number += 1
+        return f"{wanted} {number}"
+
+    def _rename_facies_key(self, old: str, new: str) -> None:
+        """Give a facies a new (unused) name in the same position."""
+
+        self.facies = {
+            (new if name == old else name): entry for name, entry in self.facies.items()
+        }
+        for row in self.layers:
+            if row.facies == old:
+                row.facies = new
+
+    def _insert_facies(
+        self, name: str, entry: FaciesEntry, *, after: str | None = None
+    ) -> None:
+        items = list(self.facies.items())
+        position = len(items)
+        if after is not None:
+            names = [key for key, _value in items]
+            if after in names:
+                position = names.index(after) + 1
+        items.insert(position, (name, entry))
+        self.facies = dict(items)
+
+    def facies_order(self) -> list[str]:
+        """All facies in their order, empty ones included."""
+
+        return list(self.facies)
+
+    def add_facies(self, name: str | None = None, role: str = "porous_medium") -> str:
+        """An empty facies; layers are added with :meth:`set_layer_in_facies`."""
+
+        text = str(name or "").strip()
+        if not text:
+            number = len(self.facies) + 1
+            text = f"Facies {number}"
+            while text.casefold() in {key.casefold() for key in self.facies}:
+                number += 1
+                text = f"Facies {number}"
+        if text in self.facies:
+            raise ValueError(f"A facies is already called {text!r}")
+        self.facies[text] = FaciesEntry(
+            role=role if role in LAYER_ROLES else "porous_medium"
+        )
+        return text
+
+    def remove_facies(self, name: str) -> None:
+        """Remove a facies; each of its layers gets a facies of its own."""
+
+        if name not in self.facies:
+            return
+        members = self.layers_in_facies(name)
+        role = self.facies[name].role
+        items: list[tuple[str, FaciesEntry]] = []
+        for key, entry in self.facies.items():
+            if key != name:
+                items.append((key, entry))
+                continue
+            taken = {other.casefold() for other in self.facies if other != name}
+            for layer in members:
+                text = layer.name
+                number = 2
+                while text.casefold() in taken:
+                    text = f"{layer.name} {number}"
+                    number += 1
+                taken.add(text.casefold())
+                layer.facies = text
+                items.append((text, FaciesEntry(role=role)))
+        self.facies = dict(items)
 
     def set_layer_facies(self, layer_id: int, facies: str) -> None:
+        """Move a layer into a facies (created when new).
+
+        A new name for a layer alone in its facies renames that facies; a
+        facies that loses its last layer this way is removed (merged).
+        """
+
         layer = self.layer(layer_id)
         if layer is None:
             return
         text = str(facies or "").strip() or layer.name
         if text == layer.facies:
             return
-        previous = self.facies.get(layer.facies, FaciesEntry())
-        alone = [row for row in self.layers if row.facies == layer.facies] == [layer]
+        old = layer.facies
+        alone = self.layers_in_facies(old) == [layer]
         if text not in self.facies:
             if alone:
-                # Renaming the layer's own facies keeps its properties.
-                self.facies[text] = self.facies.pop(layer.facies, FaciesEntry())
-            else:
-                self.facies[text] = FaciesEntry(role=previous.role)
+                self._rename_facies_key(old, text)
+                return
+            role = self.facies.get(old, FaciesEntry()).role
+            self._insert_facies(text, FaciesEntry(role=role), after=old)
         layer.facies = text
-        self.prune_facies()
+        if alone:
+            self.facies.pop(old, None)
+
+    def set_layer_in_facies(self, layer_id: int, facies: str, member: bool) -> None:
+        """Tick or untick a layer in a facies' layer list.
+
+        Ticking moves the layer from its facies (which is removed when this
+        leaves it empty). Unticking gives the layer a facies of its own, named
+        after it, and keeps the (possibly empty) facies.
+        """
+
+        layer = self.layer(layer_id)
+        if layer is None or facies not in self.facies:
+            return
+        if member:
+            if layer.facies != facies:
+                self.set_layer_facies(layer_id, facies)
+            return
+        if layer.facies != facies:
+            return
+        text = self._unique_facies_name(layer.name)
+        self._insert_facies(
+            text, FaciesEntry(role=self.facies[facies].role), after=facies
+        )
+        layer.facies = text
 
     def rename_facies(self, old: str, new: str) -> None:
         """Rename a facies; a name already in use merges the two facies."""
@@ -264,17 +444,13 @@ class PaintingSession:
         text = str(new or "").strip()
         if not text or text == old or old not in self.facies:
             return
-        entry = self.facies.pop(old)
-        self.facies.setdefault(text, entry)
+        if text not in self.facies:
+            self._rename_facies_key(old, text)
+            return
+        self.facies.pop(old)
         for row in self.layers:
             if row.facies == old:
                 row.facies = text
-        self.prune_facies()
-
-    def facies_order(self) -> list[str]:
-        """Facies names in the order of the layers."""
-
-        return list(dict.fromkeys(row.facies for row in self.layers))
 
     def set_facies(
         self,
@@ -294,13 +470,22 @@ class PaintingSession:
         if permeability is not _UNSET:
             entry.permeability = _number(permeability)
 
+    def ensure_layer_facies(self) -> None:
+        """Give every layer an existing facies."""
+
+        for row in self.layers:
+            if not row.facies:
+                row.facies = self._unique_facies_name(row.name)
+            self.facies.setdefault(row.facies, FaciesEntry())
+
     def prune_facies(self) -> None:
+        """Remove facies without layers."""
+
         used = {row.facies for row in self.layers}
         self.facies = {
             name: entry for name, entry in self.facies.items() if name in used
         }
-        for row in self.layers:
-            self.facies.setdefault(row.facies, FaciesEntry())
+        self.ensure_layer_facies()
 
     def facies_of(self, layer_id: int) -> FaciesEntry:
         layer = self.layer(layer_id)
@@ -330,6 +515,60 @@ class PaintingSession:
         before = len(self.strokes)
         self.strokes = [row for row in self.strokes if row.layer_id != layer_id]
         return before - len(self.strokes)
+
+    # ---------------------------------------------------------- polygons
+
+    def _check_polygon(self, polygon: Polygon) -> None:
+        if self.layer(polygon.layer_id) is None:
+            raise ValueError(f"Unknown layer {polygon.layer_id}")
+        points = [(float(row), float(col)) for row, col in polygon.points]
+        if len(points) < 3 or not all(
+            math.isfinite(value) for point in points for value in point
+        ):
+            raise ValueError("A polygon needs at least three points")
+        if Polygon(polygon.layer_id, points).area() < 1.0:
+            raise ValueError("The polygon encloses no area")
+
+    def add_polygon(self, polygon: Polygon) -> int:
+        """Add a polygon; returns its index."""
+
+        self._check_polygon(polygon)
+        self.polygons.append(polygon)
+        return len(self.polygons) - 1
+
+    def replace_polygon(self, index: int, polygon: Polygon) -> None:
+        self._check_polygon(polygon)
+        self.polygons[index] = polygon
+
+    def remove_polygon(self, index: int) -> Polygon:
+        return self.polygons.pop(index)
+
+    def move_polygon(self, index: int, layer_id: int) -> None:
+        """Give a polygon to another layer."""
+
+        if self.layer(layer_id) is None:
+            raise ValueError(f"Unknown layer {layer_id}")
+        self.polygons[index].layer_id = int(layer_id)
+
+    def polygon_counts(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for row in self.polygons:
+            counts[row.layer_id] = counts.get(row.layer_id, 0) + 1
+        return counts
+
+    def clear_layer_marks(self, layer_id: int) -> int:
+        """Remove the polygons and strokes of a layer; returns how many."""
+
+        before = len(self.polygons)
+        self.polygons = [row for row in self.polygons if row.layer_id != layer_id]
+        return before - len(self.polygons) + self.clear_layer_strokes(layer_id)
+
+    def marked_layers(self) -> set[int]:
+        """Layers with at least one polygon or stroke."""
+
+        return {row.layer_id for row in self.polygons} | {
+            row.layer_id for row in self.strokes if row.layer_id != ERASER
+        }
 
     # ------------------------------------------------------- persistence
 
@@ -364,11 +603,14 @@ class PaintingSession:
             "proposal_settings": {
                 "smoothing": self.smoothing,
                 "min_region_cm2": self.min_region_cm2,
+                "snap_mm": self.snap_mm,
             },
-            # One stroke per line keeps the file readable: [layer, radius, points].
-            "strokes": [row.to_list() for row in self.strokes],
             "updated_utc": self.updated_utc,
             "updated_by": self.updated_by,
+            # One polygon or stroke per line keeps the file readable:
+            # [layer, [[row, col], ...]] and [layer, radius, [[row, col], ...]].
+            "polygons": [row.to_list() for row in self.polygons],
+            "strokes": [row.to_list() for row in self.strokes],
         }
 
     @classmethod
@@ -378,6 +620,7 @@ class PaintingSession:
         image = dict(payload.get("image") or {})
         size = image.get("size")
         settings = dict(payload.get("proposal_settings") or {})
+        snap = _number(settings.get("snap_mm"))
         session = cls(
             run_id=str(payload.get("run_id") or ""),
             image_path=str(image.get("path") or ""),
@@ -386,6 +629,11 @@ class PaintingSession:
             permeability_unit=str(payload.get("permeability_unit") or "darcy"),
             smoothing=str(settings.get("smoothing") or "medium"),
             min_region_cm2=float(_number(settings.get("min_region_cm2")) or 0.0),
+            snap_mm=(
+                DEFAULT_SNAP_MM
+                if snap is None
+                else float(min(max(snap, 0.0), MAX_SNAP_MM))
+            ),
             updated_utc=str(payload.get("updated_utc") or ""),
             updated_by=str(payload.get("updated_by") or ""),
         )
@@ -407,7 +655,8 @@ class PaintingSession:
                 porosity=_number(row.get("porosity")),
                 permeability=_number(row.get("permeability")),
             )
-        known = {row.layer_id for row in session.layers} | {ERASER}
+        layer_ids = {row.layer_id for row in session.layers}
+        known = layer_ids | {ERASER}
         session.strokes = [
             stroke
             for stroke in (
@@ -415,7 +664,14 @@ class PaintingSession:
             )
             if stroke.layer_id in known and stroke.points
         ]
-        session.prune_facies()
+        session.polygons = [
+            polygon
+            for polygon in (
+                Polygon.from_list(row) for row in payload.get("polygons") or []
+            )
+            if polygon.layer_id in layer_ids and len(polygon.points) >= 3
+        ]
+        session.ensure_layer_facies()
         return session
 
 
@@ -495,14 +751,16 @@ def save_painting_session(
     session.updated_utc = utc_now()
     session.updated_by = str(actor or session.updated_by or "")
     payload = session.to_dict()
-    strokes = payload.pop("strokes")
+    marks = {key: payload.pop(key) for key in ("polygons", "strokes")}
     text = json.dumps(payload, indent=2, ensure_ascii=False)
-    # Strokes one per line: readable diffs and a compact file.
-    lines = ",\n".join(
-        "    " + json.dumps(row, separators=(",", ":")) for row in strokes
-    )
     text = text[: text.rfind("}")].rstrip()
-    text += ',\n  "strokes": [' + ("\n" + lines + "\n  " if strokes else "") + "]\n}\n"
+    # Polygons and strokes one per line: readable diffs and a compact file.
+    for key, rows in marks.items():
+        lines = ",\n".join(
+            "    " + json.dumps(row, separators=(",", ":")) for row in rows
+        )
+        text += f',\n  "{key}": [' + ("\n" + lines + "\n  " if rows else "") + "]"
+    text += "\n}\n"
     path = session_path(project, session.run_id)
     _atomic_write_text(path, text)
     return path
@@ -655,6 +913,166 @@ def rasterize_strokes(
             shift=shift,
         )
     return painted
+
+
+def _fill_polygon(
+    target: np.ndarray, polygon: Polygon, scale: tuple[float, float], value: int
+) -> None:
+    import cv2
+
+    if len(polygon.points) < 3:
+        return
+    shift = 4
+    points = _grid_points(polygon.points, scale, shift).reshape(-1, 1, 2)
+    cv2.fillPoly(target, [points], int(value), lineType=cv2.LINE_8, shift=shift)
+
+
+def rasterize_polygons(
+    polygons: Sequence[Polygon],
+    shape: tuple[int, int],
+    scale: tuple[float, float],
+) -> np.ndarray:
+    """Layer ID of the smallest polygon covering each grid pixel (0: none).
+
+    Polygons are filled from the largest to the smallest, so that where
+    polygons of different layers overlap the smaller one wins (a lens drawn
+    inside a layer keeps its own layer); equal areas keep the drawing order.
+    """
+
+    owner = np.zeros(shape, dtype=np.uint8)
+    order = sorted(range(len(polygons)), key=lambda index: -polygons[index].area())
+    for index in order:
+        _fill_polygon(owner, polygons[index], scale, polygons[index].layer_id)
+    return owner
+
+
+def _distance_to(mask: np.ndarray) -> np.ndarray:
+    """Euclidean distance (grid pixels) to the nearest pixel of ``mask``."""
+
+    import cv2
+
+    if not np.any(mask):
+        return np.full(mask.shape, np.inf, dtype=np.float32)
+    return cv2.distanceTransform(
+        np.ascontiguousarray(~mask, dtype=np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE,
+    )
+
+
+@dataclass
+class PolygonGuide:
+    """What the polygons fix, and which layers they allow, on one grid."""
+
+    # Layer of the smallest polygon at each pixel inside the frame (0: none).
+    owner: np.ndarray
+    # Polygon pixels farther than the snap distance from every polygon edge.
+    fixed: np.ndarray
+    # Pixels near polygon edges where only nearby layers compete.
+    restricted: np.ndarray
+    # Distance to each layer's polygons inside the frame (grid pixels).
+    distance: dict[int, np.ndarray]
+    # Layer of each pixel that can serve as a training sample (0: none).
+    training: np.ndarray
+    snap_px: float
+
+    def near(self, layer_id: int) -> np.ndarray | None:
+        """Pixels within the snap distance of a layer's polygons."""
+
+        distance = self.distance.get(int(layer_id))
+        return None if distance is None else distance <= self.snap_px
+
+
+def polygon_guide(
+    polygons: Sequence[Polygon],
+    shape: tuple[int, int],
+    scale: tuple[float, float],
+    inside: np.ndarray,
+    snap_px: float,
+    *,
+    min_training_pixels: int = 50,
+) -> PolygonGuide:
+    """Fixed interiors and allowed layers of a set of polygons on a grid.
+
+    A polygon pixel farther than ``snap_px`` from every polygon edge keeps the
+    polygon's layer (the smallest polygon wins where layers overlap); with
+    ``snap_px`` 0 every polygon pixel does. Edges are the outlines of each
+    layer's union of polygons, so touching polygons of one layer form no edge.
+
+    Near edges, where the area around is covered by polygons, only layers
+    whose polygons (or strokes, see :func:`propose_layers`) lie within
+    ``snap_px`` compete. Areas that no polygon covers may hold any layer, so
+    pixels within twice the snap distance of such an area are not restricted.
+    """
+
+    import cv2
+
+    owner = rasterize_polygons(polygons, shape, scale)
+    owner[~inside] = 0
+    covered = owner > 0
+    masks: dict[int, np.ndarray] = {}
+    for polygon in polygons:
+        mask = masks.get(polygon.layer_id)
+        if mask is None:
+            mask = masks[polygon.layer_id] = np.zeros(shape, dtype=np.uint8)
+        _fill_polygon(mask, polygon, scale, 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    edges = np.zeros(shape, dtype=bool)
+    distance: dict[int, np.ndarray] = {}
+    for layer_id, mask in masks.items():
+        # The image border is not an edge (erosion keeps pixels there).
+        edges |= (mask > 0) & (cv2.erode(mask, kernel) == 0)
+        distance[layer_id] = _distance_to((mask > 0) & inside)
+    edges &= inside
+    distance_edge = _distance_to(edges)
+
+    snap = max(0.0, float(snap_px))
+    fixed = covered & (distance_edge > snap) if snap > 0.0 else covered.copy()
+    if snap > 0.0 and distance:
+        nearest = np.minimum.reduce(list(distance.values()))
+        # Far from every polygon, any layer may occur.
+        free = inside & (nearest > snap)
+        restricted = inside & ~fixed & (_distance_to(free) > 2.0 * snap)
+    else:
+        restricted = np.zeros(shape, dtype=bool)
+
+    training = np.zeros(shape, dtype=np.uint8)
+    margin = max(snap, 2.0)
+    for layer_id in masks:
+        own = owner == layer_id
+        for limit in (margin, min(margin, 2.0), -1.0):
+            chosen = own & (distance_edge > limit)
+            if np.count_nonzero(chosen) >= min_training_pixels:
+                break
+        training[chosen] = layer_id
+    return PolygonGuide(
+        owner=owner,
+        fixed=fixed,
+        restricted=restricted,
+        distance=distance,
+        training=training,
+        snap_px=snap,
+    )
+
+
+def snap_pixels(
+    snap_mm: float,
+    frame: RigFrame | None,
+    scale: tuple[float, float],
+    image_size: tuple[int, int],
+) -> float:
+    """The snap distance in grid pixels.
+
+    Without a rig size the photograph is taken to be
+    ``NOMINAL_IMAGE_WIDTH_M`` wide.
+    """
+
+    if snap_mm <= 0.0:
+        return 0.0
+    per_metre = frame_pixels_per_metre(frame)
+    if per_metre is None:
+        per_metre = float(image_size[0]) / NOMINAL_IMAGE_WIDTH_M
+    return float(snap_mm) * 1.0e-3 * per_metre * math.sqrt(scale[0] * scale[1])
 
 
 def frame_polygon(frame: RigFrame, scale: tuple[float, float]) -> np.ndarray | None:
@@ -834,6 +1252,10 @@ def proposal_digest(session: PaintingSession, frame: RigFrame | None) -> str:
         "min_region_cm2": round(float(session.min_region_cm2), 4),
         "frame": _frame_key(frame),
     }
+    if session.polygons:
+        # Only with polygons, so that proposals from strokes alone stay current.
+        payload["polygons"] = [row.to_list() for row in session.polygons]
+        payload["snap_mm"] = round(float(session.snap_mm), 3)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -854,6 +1276,9 @@ class LayerProposal:
     min_region_pixels: int = 0
     frame: dict[str, Any] | None = None
     layers: list[dict[str, Any]] = field(default_factory=list)
+    polygon_count: int = 0
+    # Snap distance on the proposal's grid (pixels).
+    snap_px: float = 0.0
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -870,6 +1295,8 @@ class LayerProposal:
             "min_region_pixels": self.min_region_pixels,
             "frame": self.frame,
             "layers": self.layers,
+            "polygon_count": self.polygon_count,
+            "snap_px": self.snap_px,
         }
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         with temporary.open("wb") as stream:
@@ -899,6 +1326,8 @@ class LayerProposal:
                 min_region_pixels=int(meta.get("min_region_pixels") or 0),
                 frame=meta.get("frame"),
                 layers=list(meta.get("layers") or []),
+                polygon_count=int(meta.get("polygon_count") or 0),
+                snap_px=float(meta.get("snap_px") or 0.0),
             )
 
     def uncertain(self) -> np.ndarray:
@@ -921,6 +1350,34 @@ def _region_counts(classes: np.ndarray) -> dict[int, tuple[int, int]]:
     return result
 
 
+def _training_index(
+    layer_id: int,
+    painted: np.ndarray,
+    training: np.ndarray | None,
+    budget: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Training pixels of one layer: painted pixels first, then polygon
+    interiors (at most half the budget goes to strokes when both exist)."""
+
+    strokes = np.flatnonzero(painted.ravel() == layer_id)
+    polygons = (
+        np.flatnonzero(training.ravel() == layer_id)
+        if training is not None
+        else np.empty(0, dtype=np.int64)
+    )
+    if not polygons.size:
+        if strokes.size > budget:
+            strokes = rng.choice(strokes, int(budget), replace=False)
+        return strokes
+    if strokes.size > budget // 2:
+        strokes = rng.choice(strokes, int(budget // 2), replace=False)
+    remaining = int(budget) - int(strokes.size)
+    if polygons.size > remaining:
+        polygons = rng.choice(polygons, remaining, replace=False)
+    return np.concatenate([strokes, polygons])
+
+
 def propose_layers(
     image: PaintingImage,
     session: PaintingSession,
@@ -931,84 +1388,76 @@ def propose_layers(
     random_seed: int = 20_261_010,
     progress: ProgressCallback | None = None,
 ) -> LayerProposal:
-    """Label every pixel inside the rig frame with one of the painted layers."""
-
-    import cv2
-    from sklearn.ensemble import ExtraTreesClassifier
+    """Label every pixel inside the rig frame with one of the marked layers."""
 
     started = time.monotonic()
     if session.image_size and tuple(session.image_size) != tuple(image.image_size):
         raise ValueError(
-            "The strokes were painted on a photograph of another size "
+            "The layers were marked on a photograph of another size "
             f"({session.image_size[0]} x {session.image_size[1]} px)."
         )
     shape = image.analysis_shape
     scale = image.analysis_scale()
-    painted = rasterize_strokes(session.strokes, shape, scale)
     inside = frame_mask(frame, shape, scale)
+    painted = rasterize_strokes(session.strokes, shape, scale)
     painted[~inside] = 0
+    snap_px = snap_pixels(session.snap_mm, frame, scale, image.image_size)
+    guide: PolygonGuide | None = None
+    if session.polygons:
+        _progress(progress, "Reading the polygons…")
+        guide = polygon_guide(session.polygons, shape, scale, inside, snap_px)
+        # A stroke corrects the polygons under it.
+        guide.training[painted > 0] = 0
+
+    # Pixels whose layer is given: polygon interiors, then strokes on top.
+    hard = np.zeros(shape, dtype=np.uint8)
+    if guide is not None:
+        hard[guide.fixed] = guide.owner[guide.fixed]
+    hard[painted > 0] = painted[painted > 0]
+    todo = inside & (hard == 0)
+
     counts = np.bincount(painted.ravel(), minlength=256)
+    if guide is not None:
+        counts = counts + np.bincount(guide.training.ravel(), minlength=256)
     layer_ids = [int(value) for value in np.flatnonzero(counts) if value != 0]
-    if len(layer_ids) < 2:
-        raise ValueError(
-            "Paint at least two layers (inside the rig frame) before proposing "
-            "boundaries."
+    classes = hard.copy()
+    confidence_values = np.ones(shape, dtype=np.float32)
+    if np.any(todo):
+        if len(layer_ids) < 2:
+            raise ValueError(
+                "Mark at least two layers (inside the rig frame) before proposing "
+                "boundaries."
+            )
+        classes, confidence_values = _classify(
+            image,
+            session,
+            painted=painted,
+            guide=guide,
+            hard=hard,
+            todo=todo,
+            inside=inside,
+            layer_ids=layer_ids,
+            snap_px=snap_px,
+            n_estimators=n_estimators,
+            max_samples_per_layer=max_samples_per_layer,
+            random_seed=random_seed,
+            progress=progress,
         )
-
-    _progress(progress, "Computing image features…")
-    features = image.features()
-    rng = np.random.default_rng(int(random_seed))
-    flat = painted.ravel()
-    sample_index: list[np.ndarray] = []
-    targets: list[np.ndarray] = []
-    for layer_id in layer_ids:
-        index = np.flatnonzero(flat == layer_id)
-        if index.size > max_samples_per_layer:
-            index = rng.choice(index, int(max_samples_per_layer), replace=False)
-        sample_index.append(index)
-        targets.append(np.full(index.size, layer_id, dtype=np.uint8))
-    _progress(progress, "Training on the painted pixels…")
-    model = ExtraTreesClassifier(
-        n_estimators=max(8, int(n_estimators)),
-        min_samples_leaf=2,
-        max_features="sqrt",
-        class_weight="balanced_subsample",
-        n_jobs=-1,
-        random_state=int(random_seed),
-    )
-    model.fit(features[np.concatenate(sample_index)], np.concatenate(targets))
-    classes_order = [int(value) for value in model.classes_]
-
-    _progress(progress, "Labelling the photograph…")
-    inside_index = np.flatnonzero(inside.ravel())
-    probabilities = np.zeros((shape[0] * shape[1], len(classes_order)), np.float32)
-    chunk = 200_000
-    for start in range(0, inside_index.size, chunk):
-        part = inside_index[start : start + chunk]
-        probabilities[part] = model.predict_proba(features[part])
-    probabilities = probabilities.reshape(shape[0], shape[1], len(classes_order))
-
-    sigma = SMOOTHING_SIGMA.get(session.smoothing, SMOOTHING_SIGMA["medium"])
-    weight = cv2.GaussianBlur(inside.astype(np.float32), (0, 0), sigma)
-    np.maximum(weight, 1.0e-6, out=weight)
-    for index in range(len(classes_order)):
-        layer = np.ascontiguousarray(probabilities[..., index])
-        probabilities[..., index] = cv2.GaussianBlur(layer, (0, 0), sigma) / weight
-    best = np.argmax(probabilities, axis=2)
-    confidence = np.take_along_axis(probabilities, best[..., None], axis=2)[..., 0]
-    classes = np.asarray(classes_order, dtype=np.uint8)[best]
     classes[~inside] = OUTSIDE
-    classes[painted > 0] = painted[painted > 0]
+    classes[hard > 0] = hard[hard > 0]
 
     _progress(progress, "Merging small islands…")
     min_pixels = minimum_region_pixels(
         session.min_region_cm2, frame, scale, int(np.count_nonzero(inside))
     )
-    classes, merged = merge_small_regions(classes, min_pixels, protected=painted)
-    confidence = np.clip(np.rint(255.0 * confidence), 0, 255).astype(np.uint8)
+    classes, merged = merge_small_regions(classes, min_pixels, protected=hard)
+    confidence = np.clip(np.rint(255.0 * confidence_values), 0, 255).astype(np.uint8)
     confidence[~inside] = 255
+    confidence[hard > 0] = 255
 
     summary = _region_counts(classes)
+    marked = session.marked_layers()
+    polygon_counts = session.polygon_counts()
     layers = []
     for layer in session.layers:
         pixels, regions = summary.get(layer.layer_id, (0, 0))
@@ -1018,7 +1467,8 @@ def propose_layers(
                 "name": layer.name,
                 "pixels": pixels,
                 "regions": regions,
-                "painted": layer.layer_id in layer_ids,
+                "painted": layer.layer_id in marked,
+                "polygons": polygon_counts.get(layer.layer_id, 0),
             }
         )
     return LayerProposal(
@@ -1033,7 +1483,107 @@ def propose_layers(
         min_region_pixels=int(min_pixels),
         frame=_frame_key(frame),
         layers=layers,
+        polygon_count=len(session.polygons),
+        snap_px=round(float(snap_px), 3),
     )
+
+
+def _classify(
+    image: PaintingImage,
+    session: PaintingSession,
+    *,
+    painted: np.ndarray,
+    guide: PolygonGuide | None,
+    hard: np.ndarray,
+    todo: np.ndarray,
+    inside: np.ndarray,
+    layer_ids: Sequence[int],
+    snap_px: float,
+    n_estimators: int,
+    max_samples_per_layer: int,
+    random_seed: int,
+    progress: ProgressCallback | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classes and confidence from the pixel classifier and the smoothing."""
+
+    import cv2
+    from sklearn.ensemble import ExtraTreesClassifier
+
+    shape = painted.shape
+    _progress(progress, "Computing image features…")
+    features = image.features()
+    rng = np.random.default_rng(int(random_seed))
+    sample_index: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    training = guide.training if guide is not None else None
+    for layer_id in layer_ids:
+        index = _training_index(
+            layer_id, painted, training, int(max_samples_per_layer), rng
+        )
+        sample_index.append(index)
+        targets.append(np.full(index.size, layer_id, dtype=np.uint8))
+    _progress(progress, "Training on the marked pixels…")
+    model = ExtraTreesClassifier(
+        n_estimators=max(8, int(n_estimators)),
+        min_samples_leaf=2,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=int(random_seed),
+    )
+    model.fit(features[np.concatenate(sample_index)], np.concatenate(targets))
+    classes_order = [int(value) for value in model.classes_]
+
+    _progress(progress, "Labelling the photograph…")
+    todo_index = np.flatnonzero(todo.ravel())
+    probabilities = np.zeros((shape[0] * shape[1], len(classes_order)), np.float32)
+    chunk = 200_000
+    for start in range(0, todo_index.size, chunk):
+        part = todo_index[start : start + chunk]
+        probabilities[part] = model.predict_proba(features[part])
+    flat_hard = hard.ravel()
+    for position, layer_id in enumerate(classes_order):
+        probabilities[flat_hard == layer_id, position] = 1.0
+    probabilities = probabilities.reshape(shape[0], shape[1], len(classes_order))
+
+    # Near polygon edges only layers marked nearby compete.
+    disallowed: dict[int, np.ndarray] = {}
+    if guide is not None and np.any(guide.restricted):
+        for position, layer_id in enumerate(classes_order):
+            near = guide.near(layer_id)
+            allowed = near.copy() if near is not None else np.zeros(shape, bool)
+            strokes = painted == layer_id
+            if np.any(strokes):
+                allowed |= _distance_to(strokes) <= snap_px
+            blocked = guide.restricted & ~allowed
+            if np.any(blocked):
+                disallowed[position] = blocked
+                probabilities[blocked, position] = 0.0
+
+    sigma = SMOOTHING_SIGMA.get(session.smoothing, SMOOTHING_SIGMA["medium"])
+    weight = cv2.GaussianBlur(inside.astype(np.float32), (0, 0), sigma)
+    np.maximum(weight, 1.0e-6, out=weight)
+    for index in range(len(classes_order)):
+        layer = np.ascontiguousarray(probabilities[..., index])
+        probabilities[..., index] = cv2.GaussianBlur(layer, (0, 0), sigma) / weight
+    for position, blocked in disallowed.items():
+        probabilities[blocked, position] = 0.0
+    total = probabilities.sum(axis=2)
+    best = np.argmax(probabilities, axis=2)
+    confidence = np.take_along_axis(probabilities, best[..., None], axis=2)[..., 0]
+    confidence = confidence / np.maximum(total, 1.0e-6)
+    classes = np.asarray(classes_order, dtype=np.uint8)[best]
+    empty = inside & (total <= 1.0e-6)
+    if guide is not None and np.any(empty):
+        # No allowed layer has any support here: take the nearest polygon.
+        polygon_layers = sorted(guide.distance)
+        nearest = np.argmin(
+            np.stack([guide.distance[layer] for layer in polygon_layers]), axis=0
+        )
+        fallback = np.asarray(polygon_layers, dtype=np.uint8)[nearest]
+        classes[empty] = fallback[empty]
+        confidence[empty] = 0.0
+    return classes, confidence
 
 
 def load_proposal(project: FluidFlowerProject, run_id: str) -> LayerProposal | None:
@@ -1101,9 +1651,14 @@ def upsample_classes(
 
 
 def facies_ids(session: PaintingSession, present: Sequence[int]) -> dict[str, int]:
-    """Facies numbers 1, 2, ... in the order of the painted layers."""
+    """Facies numbers 1, 2, ... in the facies order, for facies with a layer in
+    ``present`` (empty facies get no number)."""
 
+    used = {layer.facies for layer in session.layers if layer.layer_id in present}
     order: dict[str, int] = {}
+    for name in session.facies:
+        if name in used:
+            order[name] = len(order) + 1
     for layer in session.layers:
         if layer.layer_id in present and layer.facies not in order:
             order[layer.facies] = len(order) + 1
@@ -1126,8 +1681,8 @@ def check_ready_for_revision(
         return problems
     if proposal.digest != proposal_digest(session, frame):
         problems.append(
-            "The strokes, settings or rig frame changed after the last proposal; "
-            "propose the boundaries again."
+            "The polygons, strokes, settings or rig frame changed after the last "
+            "proposal; propose the boundaries again."
         )
     size = _rig_size(frame, reference)
     if size is None:
@@ -1204,6 +1759,24 @@ def painted_label_map(
     scale = (1.0, 1.0)
     inside = frame_mask(frame, (height, width), scale)
     classes[~inside] = OUTSIDE
+    if session.polygons and session.snap_mm <= 0.0:
+        # Polygons used exactly keep their outline at full resolution; strokes
+        # inside them still correct them.
+        _progress(progress, "Drawing the polygons at full resolution…")
+        owner = rasterize_polygons(session.polygons, (height, width), scale)
+        owner[~inside] = 0
+        covered = owner > 0
+        classes[covered] = owner[covered]
+        del owner
+        painted = rasterize_strokes(session.strokes, (height, width), scale)
+        restore = covered & (painted > 0)
+        classes[restore] = painted[restore]
+        del painted, restore, covered
+        present = [
+            int(value)
+            for value in np.flatnonzero(np.bincount(classes.ravel(), minlength=256))
+            if value != OUTSIDE
+        ]
     grid_ratio = (width / proposal.classes.shape[1]) * (
         height / proposal.classes.shape[0]
     )
@@ -1249,7 +1822,7 @@ def painted_label_map(
                     "region_index": rank,
                     "pixels": int(sizes[component]),
                     "analysis_role": entry.role,
-                    "porosity": entry.porosity if porous else None,
+                    "porosity": entry.effective_porosity(),
                     "permeability": entry.permeability if porous else None,
                     "enabled": entry.role != "excluded",
                 }
@@ -1278,7 +1851,7 @@ def painted_label_map(
                     "region_index": rank,
                     "pixels": int(sizes[component]),
                     "analysis_role": "frame",
-                    "porosity": None,
+                    "porosity": OUTSIDE_POROSITY,
                     "permeability": None,
                     "enabled": False,
                 }
@@ -1427,6 +2000,8 @@ def save_painted_revision(
                 "proposal_digest": proposal.digest,
                 "proposal_created_utc": proposal.created_utc,
                 "stroke_count": len(session.strokes),
+                "polygon_count": len(session.polygons),
+                "snap_mm": session.snap_mm if session.polygons else None,
                 "layers": [
                     {
                         "layer_id": layer.layer_id,
@@ -1464,18 +2039,23 @@ def save_painted_revision(
 
 __all__ = [
     "DEFAULT_LAYERS",
+    "DEFAULT_SNAP_MM",
     "ERASER",
     "LAYER_COLORS",
     "LAYER_ROLES",
     "OUTSIDE",
     "OUTSIDE_FACIES",
+    "OUTSIDE_POROSITY",
     "PERMEABILITY_UNITS",
+    "ROLE_POROSITY",
     "SMOOTHING_SIGMA",
     "FaciesEntry",
     "LayerProposal",
     "PaintedLayer",
     "PaintingImage",
     "PaintingSession",
+    "Polygon",
+    "PolygonGuide",
     "Stroke",
     "check_ready_for_revision",
     "enhance_contrast",
@@ -1489,12 +2069,15 @@ __all__ = [
     "minimum_region_pixels",
     "painted_label_map",
     "painting_folder",
+    "polygon_guide",
     "proposal_digest",
     "proposal_path",
     "propose_layers",
+    "rasterize_polygons",
     "rasterize_strokes",
     "save_painted_revision",
     "save_painting_session",
     "session_path",
+    "snap_pixels",
     "upsample_classes",
 ]

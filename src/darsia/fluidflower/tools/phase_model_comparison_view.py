@@ -152,6 +152,79 @@ def runtime_comparison_note(catalogs):
     return " · ".join(notes)
 
 
+def _metric_rig_transform(row):
+    """One frame's recorded native-to-metric rig homography and canvas origin, or None."""
+    import numpy as np
+    revision = (row or {}).get("rig_domain_revision") or {}
+    parameters = revision.get("parameters") or {}
+    try:
+        matrix = np.asarray(parameters["H_frame_native_to_metric_pixel"], dtype=float)
+        origin = np.asarray(revision["native_origin_xy"], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (matrix.shape != (3, 3) or origin.shape != (2,)
+            or not (np.isfinite(matrix).all() and np.isfinite(origin).all())
+            or abs(float(np.linalg.det(matrix))) < 1e-12):
+        return None
+    return matrix, origin
+
+
+def metric_rig_alignment(left_row, right_row):
+    """Map a left display-canvas pixel to the right canvas pixel at the same rig point.
+
+    Display only. Canvas pixel c is native pixel c + native_origin_xy, and each
+    frame's recorded homography maps native pixels into the shared metric rig
+    frame. Returns None when either frame lacks that record.
+    """
+    import numpy as np
+    left, right = _metric_rig_transform(left_row), _metric_rig_transform(right_row)
+    if left is None or right is None:
+        return None
+    (h_left, o_left), (h_right, o_right) = left, right
+    canvas_to_native = np.array([[1.0, 0.0, o_left[0]], [0.0, 1.0, o_left[1]], [0.0, 0.0, 1.0]])
+    native_to_canvas = np.array([[1.0, 0.0, -o_right[0]], [0.0, 1.0, -o_right[1]], [0.0, 0.0, 1.0]])
+    matrix = native_to_canvas @ np.linalg.inv(h_right) @ h_left @ canvas_to_native
+    return matrix / matrix[2, 2]
+
+
+def _warp_display_mask(mask, matrix):
+    import cv2
+    import numpy as np
+    if mask is None:
+        return None
+    value = np.asarray(mask)
+    warped = cv2.warpPerspective(np.ascontiguousarray(value.astype(np.uint8)), matrix,
+                                 (value.shape[1], value.shape[0]),
+                                 flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped.astype(bool)
+
+
+def _warp_display_image(image, matrix, *, overlay):
+    """Resample a right-pane image onto the left pane's rig geometry (display only)."""
+    import cv2
+    import numpy as np
+    if image is None or image.isNull():
+        return image
+    fmt = QImage.Format.Format_ARGB32 if overlay else QImage.Format.Format_RGB32
+    source = image.convertToFormat(fmt)
+    width, height = source.width(), source.height()
+    pixels = np.frombuffer(source.constBits(), np.uint8).reshape(
+        height, source.bytesPerLine())[:, :width * 4].reshape(height, width, 4)
+    # Outside the right photograph: transparent overlay, rig-canvas background photo (BGRA).
+    border = (0, 0, 0, 0) if overlay else (0x26, 0x23, 0x20, 0xFF)
+    warped = cv2.warpPerspective(np.ascontiguousarray(pixels), matrix, (width, height),
+                                 flags=(cv2.INTER_NEAREST if overlay else cv2.INTER_LINEAR)
+                                 | cv2.WARP_INVERSE_MAP,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=border)
+    result = QImage(warped.data, width, height, warped.strides[0], fmt).copy()
+    for name in ("_photo_sand_domain", "_filled_phase_mask", "_floor_contact_fill_mask"):
+        value = getattr(image, name, None)
+        if value is not None:
+            setattr(result, name, _warp_display_mask(value, matrix))
+    return result
+
+
 def run_manifest(job):
     path = Path(job["review_root"]) / "native_frames" / job["run"] / "manifest.json"
     raw = path.read_bytes()
@@ -230,10 +303,16 @@ def align_cross_run_frames(left, right):
                            right_elapsed_h=right_elapsed,
                            source_name=source.get("source_name", ""),
                            source_sha256=source.get("source_sha256", "")))
+    # Display only: when every frame records its metric rig frame, the right pane
+    # is resampled so both panes show the same physical rig position.
+    physical = all(_metric_rig_transform(source) is not None for _frame, _elapsed, source in a + b)
     return dict(frames=frames, left_total=len(a), right_total=len(b),
-                identical_native_source=False,
+                identical_native_source=False, physical_alignment=physical,
                 time_note="Right frame nearest in recorded elapsed hours to each left frame; right frames may repeat",
-                geometry_note="Different experiments on the same saved grid; each side shows its own photograph and correction")
+                geometry_note=("Different experiments at the same physical rig position; the right pane is "
+                               "resampled through each frame's recorded metric rig frame (display only)"
+                               if physical else
+                               "Different experiments on the same saved grid; each side shows its own photograph and correction"))
 
 
 def load_run_pair(left, right, left_run, right_run=None):
@@ -376,6 +455,13 @@ def load_images(pair, frame_position, phase="all", *, raw_detail=False, display_
         rendered._floor_contact_fill_mask = pad_rig_display_mask(contact, common_rig_revision, manifest=manifest)
         payload.append((_crop(original_image if original_image is not None else QImage(str(photograph)), manifest,
             frame_index=frame[side], common_rig_revision=common_rig_revision), rendered))
+    if pair.get("physical_alignment") and len(payload) == 2:
+        rows = [manifest["frame_sources"][frame[side]]
+                for side, manifest in zip(("left", "right"), pair["manifests"])]
+        matrix = metric_rig_alignment(*rows)
+        if matrix is not None:
+            payload[1] = tuple(_warp_display_image(image, matrix, overlay=index == 1)
+                               for index, image in enumerate(payload[1]))
     return payload
 
 
