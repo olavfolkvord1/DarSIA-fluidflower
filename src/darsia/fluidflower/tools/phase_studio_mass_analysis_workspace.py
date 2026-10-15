@@ -1,7 +1,7 @@
 """Independent DarSIA mass-analysis page for a selected frozen phase model.
 
-This page selects inputs and operates the existing distributed queue. Merely
-opening it never fits a calibration, starts workers, or publishes mass output.
+This page selects frozen phase models and embeds the retained saved-result
+browser. Opening it never fits a calibration, starts workers, or publishes mass output.
 """
 
 from __future__ import annotations
@@ -18,10 +18,7 @@ from darsia.fluidflower.series_paths import configured_series
 from darsia.fluidflower.phase_model_history import (
     _model_directories, inspect_phase_model_history_entry,
 )
-from darsia.fluidflower.tools.phase_studio_native_controls import NativeConcentrationControls
-from darsia.fluidflower.tools.studio_distributed_mass_service import LocalWorkerService
-from darsia.fluidflower.tools.studio_distributed_mass_ui import DistributedMassQueuePanel
-from darsia.fluidflower.tools.phase_studio_series_ui import ModelMassLookup
+from darsia.fluidflower.tools.phase_studio_series_ui import ModelMassLookup, SeriesMassWorkspace
 
 
 def _series_models(series: str, project_root: Path,
@@ -135,23 +132,10 @@ class MassAnalysisWorkspace(QWidget):
         self.status = QLabel("Loading model versions…")
         self.status.setWordWrap(True); layout.addWidget(self.status)
 
-        self.native_controls = NativeConcentrationControls(self)
-        self.native_controls.mode.blockSignals(True)
-        self.native_controls.mode.clear()
-        self.native_controls.mode.addItem("Apply saved native fit · no refit", "frozen")
-        self.native_controls.mode.blockSignals(False)
-        self.native_controls.overflow_mode.removeItem(
-            self.native_controls.overflow_mode.findData("constrain"))
-        self.native_controls.calculate.hide()
-        self.native_controls.update_note()
-        layout.addWidget(self.native_controls)
-
-        self.distributed_panel = DistributedMassQueuePanel(
-            self, catalog_provider=lambda: self.phase_catalog,
-            selection_provider=self._selection,
-            native_request_provider=self._native_request,
-            worker_service=LocalWorkerService())
-        layout.addWidget(self.distributed_panel)
+        self.saved_results = SeriesMassWorkspace(self, selected_model=self._selected_model)
+        self.saved_results.series.setCurrentIndex(
+            self.saved_results.series.findData(self.series))
+        layout.addWidget(self.saved_results)
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_lookups)
@@ -170,8 +154,9 @@ class MassAnalysisWorkspace(QWidget):
         self.series_selector.blockSignals(False)
         self._generation += 1
         self.phase_catalog = None
-        self.native_controls.set_catalog(None)
-        self.distributed_panel.set_catalog(None)
+        self.saved_results.phase_catalog = None
+        self.saved_results.series.setCurrentIndex(
+            self.saved_results.series.findData(self.series))
         self.refresh_models()
 
     def _series_selection_changed(self, _index: int) -> None:
@@ -255,8 +240,7 @@ class MassAnalysisWorkspace(QWidget):
         self._generation += 1
         generation = self._generation
         self.phase_catalog = None
-        self.native_controls.set_catalog(None)
-        self.distributed_panel.set_catalog(None)
+        self.saved_results.phase_catalog = None
         if not path:
             return
         self.status.setText("Checking fixed phase maps and registered mass inputs for " + Path(path).name + "…")
@@ -277,23 +261,12 @@ class MassAnalysisWorkspace(QWidget):
             self.status.setText("Selected model belongs to another experimental series")
             return
         self.phase_catalog = catalog
-        self.native_controls.set_catalog(catalog)
-        self.native_controls.calculate.hide()
-        self.distributed_panel.set_catalog(catalog)
+        self.saved_results.model_results_ready(catalog, "")
         ready = sum(bool(job.get("concentration", {}).get("ready")) for job in catalog["jobs"])
         self.status.setText(f"{catalog['model_id']} · {ready}/{len(catalog['jobs'])} experiments have registered native inputs. "
-                            "Select a saved calibration and preflight a campaign below.")
+                            "Inspect saved concentration and mass results below.")
 
-    def _native_request(self) -> dict:
-        if self.phase_catalog is None:
-            raise ValueError("Choose a ready phase model first")
-        return self.native_controls.request(
-            Path(self.phase_catalog["results_root"]) / "distributed-preview")
-
-    def _selection(self) -> dict:
-        request = self._native_request()
-        return {"method": "native_frozen", "physical_profile": "registered",
-                "cohort": {"runs": request["runs"]},
-                "calibration_file": request["calibration_file"],
-                "overflow_mode": request["overflow_mode"],
-                "overflow": request["overflow"]}
+    def _selected_model(self) -> dict | None:
+        """Return the selected saved model for the retained result browser."""
+        root = self.model.currentData()
+        return {"root": root} if root else None
