@@ -894,3 +894,22 @@ def test_protocols_skip_original_singular_placeholder(ctx):
     ctx.config["data"].update(folder="No file chosen", folders=["raw"])
     ctx.config["protocols"] = {"imaging": {"raw": str(image)}}
     assert s.row_status(ctx, "preprocessing", "protocols").state == "done"
+
+
+@pytest.mark.parametrize("registered", [True, False])
+def test_jobs_overview_is_administrative_without_saved_output_lookup(ctx, monkeypatch, registered):
+    context = ctx if registered else s.WorkflowStatusContext(None)
+    before = {path: path.read_bytes() for path in ctx.series_root.rglob("*") if path.is_file()}
+
+    def forbidden_document(*args, **kwargs):
+        pytest.fail("The Jobs view has no independent output to inspect")
+
+    monkeypatch.setattr(context, "document", forbidden_document)
+    state = s.row_status(context, "jobs", "overview")
+
+    assert state.state == "not_applicable"
+    assert "selected job's progress" in state.summary
+    assert "job list and panel" in state.summary
+    assert not state.artifacts and not state.missing
+    assert not state.producer and not state.next_step and not state.date_source
+    assert {path: path.read_bytes() for path in ctx.series_root.rglob("*") if path.is_file()} == before

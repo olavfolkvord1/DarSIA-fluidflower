@@ -274,6 +274,8 @@ def _run_scope(context: ScopeContext, note: str = "") -> RowScope:
 
 def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | None:
     """Return supported rows' actual scope; unknown rows are never invented."""
+    if action == "jobs" and item_id == "overview":
+        return series_scope(context, note="Jobs retain their own explicit whole-run selections; opening this list performs no calculation.")
     if (
         (
             action == "phase_model"

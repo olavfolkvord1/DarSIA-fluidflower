@@ -1316,6 +1316,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Choose an experimental series before mass analysis."
         )
         self.content_stack.addWidget(self.mass_analysis_placeholder)
+        self.jobs_workspace = None
         right_layout.addWidget(self.content_stack, 1)
 
         sidebar_data = {}
@@ -1371,9 +1372,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     display_id = f"mass_analysis:{item_id}"
                     aliases[action][display_id] = ("mass_analysis", item_id)
                     phase_rows.append((text, display_id, "fa5s.circle", help_text))
+                aliases[action]["jobs:overview"] = ("jobs", "overview")
                 groups = [
                     ("Original method", original_rows),
                     ("Phase model", phase_rows),
+                    ("Jobs", [("Jobs", "jobs:overview", "fa5s.tasks",
+                               "Read explicitly registered jobs or choose an adopted execution plan; opening this page starts no job.")]),
                 ]
             else:
                 groups = (
@@ -1562,7 +1566,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         whole_series = series_scope(context)
         self.method_scope_label.setText(whole_series.line)
         self.method_scope_label.setToolTip(whole_series.note)
-        category = {"phase_model": "calibration", "mass_analysis": "analysis", "image_selection": "setup"}.get(
+        category = {"phase_model": "calibration", "mass_analysis": "analysis", "image_selection": "setup", "jobs": "analysis"}.get(
             self._current_category, self._current_category
         )
         selected = self.sidebar.get_selected()
@@ -1596,7 +1600,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._method_group_order = {}
         for category in ("calibration", "analysis"):
             section = self.sidebar._sections[category]
-            grouped = {"colour_path": [], "phase_model": []}
+            grouped = {"colour_path": [], "phase_model": [], "common": []}
             method = "colour_path"
             rows = {}
             for index in range(section.items_layout.count()):
@@ -1605,6 +1609,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     "Phase model"
                 ):
                     method = "phase_model"
+                elif category == "analysis" and isinstance(widget, GroupHeaderLabel) and widget.text() == "Jobs":
+                    method = "common"
                 grouped[method].append(widget)
                 if isinstance(widget, SidebarRow):
                     _category, key = self.sidebar.display_selection(
@@ -1713,7 +1719,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             section = self.sidebar._sections[category]
             keys = {id(row): key for key, row in section._rows.items()}
             rows = {}
-            for method in order:
+            for method in (*order, "common"):
                 for widget in groups[method]:
                     section.items_layout.removeWidget(widget)
                     section.items_layout.addWidget(widget)
@@ -1721,7 +1727,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                         base = self._method_row_labels[id(widget)]
                         suffix = (
                             " (not the chosen method for this series)"
-                            if category == "analysis" and method != chosen
+                            if category == "analysis" and method not in {chosen, "common"}
                             else ""
                         )
                         widget.label = base + suffix
@@ -1927,6 +1933,38 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.mass_analysis_page.set_series(series_id, root)
         self._refresh_method_state()
         self._refresh_scope_display()
+        if self.jobs_workspace is not None:
+            self._refresh_jobs_context()
+
+    def _refresh_jobs_context(self) -> None:
+        if self.jobs_workspace is None:
+            return
+        workspace = self.phase_model_workspace
+        self.jobs_workspace.set_series(
+            workspace.series_id, workspace.series_roots.get(workspace.series_id),
+            series_label=workspace.series_selector.currentText(),
+        )
+
+    def ensure_jobs(self) -> QWidget:
+        if self.jobs_workspace is None:
+            from darsia.fluidflower.native_jobs_workspace import NativeJobsWorkspace
+            self.jobs_workspace = NativeJobsWorkspace(self)
+            self.content_stack.addWidget(self.jobs_workspace)
+        self._refresh_jobs_context()
+        return self.jobs_workspace
+
+    def show_jobs(self, *, start_analysis: bool = False) -> None:
+        self._select_row(("jobs", "overview"))
+        if start_analysis:
+            self.ensure_jobs().start_analysis()
+
+    def closeEvent(self, event) -> None:
+        jobs = getattr(self, "jobs_workspace", None)
+        if jobs is not None and not jobs.can_close():
+            self.print_log("Job metadata or hardware inspection is still finishing; close after it returns. No worker was stopped.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def ensure_mass_analysis(self) -> QWidget:
         """Create production mass analysis as its own top-level workspace."""
@@ -1947,6 +1985,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             )
             self.content_stack.addWidget(self.mass_analysis_page)
             self._guard_phase_exports(self.mass_analysis_page)
+            self.ensure_jobs().install_mass_action(
+                self.mass_analysis_page, lambda: self.show_jobs(start_analysis=True)
+            )
         return self.mass_analysis_page
 
     def _mass_analysis_series_selected(self, series_id: str) -> None:
@@ -2545,6 +2586,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 if workspace.series_id:
                     workspace.ensure_studio()
                 workspace._show_selected_studio_mode()
+            elif action == "jobs":
+                self.content_stack.setCurrentWidget(self.ensure_jobs())
             elif action == "mass_analysis":
                 if item_id == "review":
                     self._open_existing_phase_review()

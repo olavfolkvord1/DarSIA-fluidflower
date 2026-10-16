@@ -1110,6 +1110,11 @@ def _delivery(context: WorkflowStatusContext) -> RowStatus:
 
 def row_status(context: WorkflowStatusContext, action: str, item_id: str) -> RowStatus:
     """Return one truthful passive row state without changing action routing."""
+    if (action, item_id) == ("jobs", "overview"):
+        return RowStatus(
+            "not_applicable",
+            "View and manage jobs; the selected job's progress is shown in the job list and panel.",
+        )
     if action == "calibration" and item_id in {"reset", "delete"}:
         return RowStatus(
             "not_applicable",
