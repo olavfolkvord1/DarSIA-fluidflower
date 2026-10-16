@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -807,7 +808,10 @@ class JobsPanel(QWidget):
         if self.resource_panel is not None:
             raise ValueError("Resource panel already connected")
         self.resource_panel = panel
-        self.resource_slot.addWidget(panel)
+        self.resource_scroll_area = QScrollArea(self)
+        self.resource_scroll_area.setWidgetResizable(True)
+        self.resource_scroll_area.setWidget(panel)
+        self.resource_slot.addWidget(self.resource_scroll_area)
         panel.workers_selected.connect(self._resource_choice)
         self._show_snapshot(self.current)
 

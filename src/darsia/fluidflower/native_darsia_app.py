@@ -1948,7 +1948,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
     def ensure_jobs(self) -> QWidget:
         if self.jobs_workspace is None:
             from darsia.fluidflower.native_jobs_workspace import NativeJobsWorkspace
-            self.jobs_workspace = NativeJobsWorkspace(self)
+            from darsia.fluidflower.resource_advisor_panel import ResourceAdvisorPanel
+
+            self.jobs_workspace = NativeJobsWorkspace(
+                self, resource_factory=ResourceAdvisorPanel
+            )
             self.content_stack.addWidget(self.jobs_workspace)
         self._refresh_jobs_context()
         return self.jobs_workspace
