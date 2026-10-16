@@ -1,52 +1,44 @@
-# Whole-run workers on a shared NAS
+# Delt jobbkø – kort bruksark (16. oktober 2026)
 
-Every machine uses the same Git commit and the same `requirements-worker.lock`.
-Use an existing environment matching that lock. No code or input installation
-is performed when a task is claimed. Run from the checkout's `src` directory
-so Python imports that checkout rather than another editable installation.
+**Status:** J1–J3 er bestått; Main J4 er **exact-39 PASS** på `24fdaace` (CPU float32, AC52, 20:54 UTC): original pause/600 s gjenopptakelse og avbrudd/600 s gjenvinning, publisering, collect og alle 24 observerte prosessinkarnasjoner avsluttet. **Olav J4 er fortsatt PENDING før Olav kan delta:** N9/N10 er fulgt; den eksisterende «DarSIA Git worker console» leste seriens UNC-manifest med samme SHA og størrelse som Moderskipet 21:55 UTC. Oppgaven og begge observerte prosessinkarnasjoner er avsluttet. Ingen Olav-beregning eller claim er forsøkt. Målt ledig plass er 49,09 GiB; hele AC52 med midlertidige filer, kode og uendret 40 GiB reserve krever 73,20 GiB før kloning (24,11 GiB mangler). Et tilstrekkelig eksisterende lokalt mål eller frigjort plass må avklares før Olav deltar; ren utsjekking, eget kart, miljø-/inndataadmisjon og exact-39 gjenstår. Kommandoene her gir ingen ny oppstartstillatelse.
 
-```powershell
-git fetch <shared-repository>
-git checkout <job-commit>
-Set-Location <checkout>/src
-python -m darsia.fluidflower.worker --job \\server\share\jobs\example --backend cpu --workers 2
+## 1. Samme jobb, hver maskins kart
+
+Bare jobbmappen deles, på ekte SMB/NFS. Synkmapper som OneDrive/Dropbox og ukjent transport avvises. Begge maskiner må ha rent Git-arbeidstre på jobbens eksakte commit og miljølås.
+
+`series.toml` deklarerer `[roots]`: `series = "."`, `raw` og `legacy_results`. De siste to peker i FF_AC på henholdsvis `//UNAS-Pro-8/UiB_FluidFlower/Albus/Raw data` og `//UNAS-Pro-8/UiB_FluidFlower/Albus/Results`. Nye jobber har `format = "darsia-alias-job-v1"`, `format_version = 1`, låst commit/miljø/SHA, kalibrerings-SHA og én presisjon. Hver inndatareferanse har nøyaktig `root_alias`, `relative_path`, `role`, `sha256`, `bytes`. Ukjent rot stopper opprettelsen før publisering; ingen maskinsti eller kartfilsti legges i jobben.
+
+Hver maskin har **sin egen lokale** `%LOCALAPPDATA%/DarSIA/stores.toml`, utenfor repo og serie. På andre systemer brukes `$XDG_CONFIG_HOME/darsia/stores.toml`, ellers `~/.config/darsia/stores.toml`. Moderskipets installerte kart er:
+
+```toml
+[machine]
+id = "Moderskipet"
+[stores.FF_AC]
+series = "//UNAS-Pro-8/UiB_FluidFlower/FF_AC/DarSIA"
+raw = "//UNAS-Pro-8/UiB_FluidFlower/Albus/Raw data"
+legacy_results = "//UNAS-Pro-8/UiB_FluidFlower/Albus/Results"
+results = "C:/FFAC_cache/darsia_results"
 ```
 
-The same command supports `--backend cuda`. One process computes each complete
-run; `--workers` controls the number of simultaneous runs. The parent is the
-single writer of its machine/backend log. A console remains active and takes
-the next compatible task. `--once` processes at most one task per worker and
-`--exit-when-idle` is useful for qualification jobs. Separate qualification job
-folders preserve each test's results.
+Olavs **planlagte, ennå ikke installerte/verifiserte** eget kart har `id = "Olav"`, de samme tre UNC-inndatarøttene og egen lokal `results = "C:/FFAC_cache/darsia_results"`. Ingenting forhåndskopieres. Jobs → Machine stores/Settings velger kartet; Check availability leser tilgjengelighet uten å starte en jobb.
 
-The worker checks its Git HEAD, clean worktree and the repository lockfile SHA
-once at startup. Each task states the same commit, frozen calibration SHA and
-working precision as `job.json`. Paths to scientific inputs and outputs are
-UNC paths. The worker reads only the claimed run's scientific configuration
-and its specified raw images, fixed phase maps, measured fields and calibration
-directly from the NAS. There are no input batches, transfer services, per-run
-generated programs or RPC calls.
+## 2. Den faste arbeiderkommandoen
 
-The job contains `queue`, `claimed/<machine>`, `results/<run>`, `done`, `failed`
-and `logs`. An atomic rename claims a task. Actual input/frame progress renews
-its claim; after ten minutes without progress it can return to the queue. Each
-attempt has a distinct output directory. A reclaimed attempt cannot publish
-over the current owner's output. Completed files are published once, without
-replacing an existing result. Partial results are preserved.
+Kjør med riktig låst utsjekkings Python-miljø og sett arbeidsmappen til `<utsjekking>/src`, slik at Python laster denne koden. Konkrete J4-eksempler: første jobb er allerede ferdig; Olav-eksemplet er kun planlagt; UNC-tilgangen er bekreftet, mens eget kart, riktig commit og de øvrige J4-portene gjenstår. For senere godkjent arbeid hentes jobbstien fra den faktiske delte jobben.
 
-Each run produces a Main-format `completed.json`, frame publications and
-scientific products. The N1 entrypoint accepts explicit saved models, measured
-geometry, the frozen calibration and ordered frame data. It neither fits nor
-selects a different method. A single precision setting selects float32 or a
-float64 check; a job cannot mix the two. Original geometry integration and
-parameter/reduction precision are recorded separately from pixel precision.
+```text
+python -m darsia.fluidflower.worker --job "//UNAS-Pro-8/UiB_FluidFlower/FF_AC/DarSIA/jobs/j4-main-ac52-alias-20261016-v3" --backend cpu --workers 1 --machine Moderskipet --stores "C:/Users/olav_/AppData/Local/DarSIA/stores.toml" --watchdog
+python -m darsia.fluidflower.worker --job "//UNAS-Pro-8/UiB_FluidFlower/FF_AC/DarSIA/jobs/j4-olav-ac52-alias-20261016-v1" --backend cpu --workers 1 --machine Olav --stores "C:/Users/olav_/AppData/Local/DarSIA/stores.toml" --once
+```
 
-Errors are written verbatim to the console, the machine log and `failed`; the
-worker continues to the next run. Startup errors stop the worker before it
-claims anything. There is no deadline to the first image.
+Før atomisk claim må alle oppgavens inndata løses og ha riktig størrelse. Etter claim hashes hver unik fysisk fil én gang før første bilde; de opprinnelige vitenskapelige SHA-kontrollene beholdes. Avvist kjøring får grunn og ny attempt-identitet; samme arbeider prøver den ikke blindt igjen. Pause/stopp fra Jobs skjer etter et committed bilde. Leien er 600 sekunder uten faktisk framdrift, målt med serverens fil-mtime; omstart omgår ikke ventingen. Startkvittering og SSH-exit er ikke framdrift. Olav bruker egen innlogget konsoll/RDP eller en uttrykkelig godkjent eksisterende innloggingsregistrering; ingen ny tjeneste eller generert startkode.
 
-Two small controllers enqueue explicit task JSON and aggregate completed
-runs. The aggregator requires the entire declared `done` set and genuine
-per-run completions. Neither controller starts a remote process or computes
-an image. Series selections, calibrations, validation scripts and job files
-belong with the series on the NAS, rather than in library code.
+## 3. Produkter og collect
+
+Produkter skrives lokalt i `<results>/<jobb>/<kjøring>/.attempts/<token>`. Delte framdriftsfiler er SHA-bundne bytekopier av små commit-filer. Fullføring publiserer uendret Main-format `completed.json`, manifest, skalarer, kvitteringer og `products_index.json` med produkt-ID, maskin, lokal opphavssti, SHA og byteantall. Master-visningen leser publiserte filer. Store kart blir lokale; `publish` kopierer bare eksisterende, merkede `film`/`lossless_export`-produkter til egen delt bundle og lager ingen produkter.
+
+```text
+python -m darsia.fluidflower.products collect --index "<faktisk delt products_index.json>" --index-sha256 "<SHA256>" --index-bytes <heltall> --product-id "mass_table.csv" --target "<ny lokal målmappe>" --stores "<eget lokalt stores.toml>"
+```
+
+Gjenta `--product-id` for flere produkter. Bruk `--published-bundle "<delt publication.json>"` for allerede publiserte store produkter, ellers eksplisitt `--source "<produkt-ID>=<tilgjengelig fil>"`. Collect kontrollerer SHA/størrelse, søker ikke etter filer og følger aldri automatisk en annen maskins C:-sti. Fullføring og faktisk prosessavslutning er separate bevis. Gamle absolutte runde-4-jobber beholder originalflyten og merkes `legacy_paths=true`.
