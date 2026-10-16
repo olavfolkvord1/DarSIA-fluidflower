@@ -13,7 +13,7 @@ import math
 import os
 import stat as stat_module
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -94,6 +94,8 @@ class RowStatus:
     producer: str = ""
     next_step: str = ""
     date_source: str = ""
+    selected_run_text: str = ""
+    counts: Mapping = field(default_factory=dict)
 
 
 @dataclass
@@ -1108,7 +1110,7 @@ def _delivery(context: WorkflowStatusContext) -> RowStatus:
         )
 
 
-def row_status(context: WorkflowStatusContext, action: str, item_id: str) -> RowStatus:
+def _saved_row_status(context: WorkflowStatusContext, action: str, item_id: str) -> RowStatus:
     """Return one truthful passive row state without changing action routing."""
     if (action, item_id) == ("jobs", "overview"):
         return RowStatus(
@@ -1258,3 +1260,150 @@ def row_status(context: WorkflowStatusContext, action: str, item_id: str) -> Row
         f"{action}/{item_id}",
         "Open the row's existing configuration/viewer explicitly; no applicability is inferred from absent settings.",
     )
+
+
+def _active_method(context: WorkflowStatusContext) -> str:
+    recorded = _map(context.manifest.get("method")).get("active")
+    return str(recorded or _reference(context.method_selection, "active"))
+
+
+
+def analysis_run_scope(context: WorkflowStatusContext) -> tuple[list[str], dict[str, str]]:
+    """Registered analysis runs and explicit exclusions; never infer exclusions."""
+    table = _map(context.manifest.get("runs"))
+    ids = table.get("ids")
+    if (not isinstance(ids, list) or len(ids) > MAX_LIST_ENTRIES
+            or any(not isinstance(run, str) or not run for run in ids)
+            or len({run.casefold() for run in ids}) != len(ids)):
+        raise ValueError("Analysis requires bounded distinct registered run IDs.")
+    names = {run.casefold(): run for run in ids}
+    excluded = table.get("excluded", {})
+    if not isinstance(excluded, Mapping) or len(excluded) > MAX_LIST_ENTRIES:
+        raise ValueError("runs.excluded must be a bounded table of explicit reasons.")
+    reasons = {}
+    for run, reason in excluded.items():
+        if (not isinstance(run, str) or run.casefold() not in names
+                or not isinstance(reason, str) or not reason.strip()):
+            raise ValueError("Every excluded run needs a registered ID and nonempty reason.")
+        canonical = names[run.casefold()]
+        if canonical in reasons:
+            raise ValueError("Duplicate excluded run identity.")
+        reasons[canonical] = reason
+    return ids, reasons
+
+
+
+def analysis_run_counts(context: WorkflowStatusContext, saved_runs: Sequence[str]) -> dict:
+    """Counts only explicitly supplied saved run identities, not computed success."""
+    ids, excluded = analysis_run_scope(context)
+    names = {run.casefold(): run for run in ids}
+    if len(saved_runs) > MAX_LIST_ENTRIES:
+        raise ValueError("Too many saved run identities for passive counts.")
+    saved = set()
+    for run in saved_runs:
+        if not isinstance(run, str) or run.casefold() not in names:
+            raise ValueError("Saved output names an unregistered run.")
+        canonical = names[run.casefold()]
+        if canonical not in excluded:
+            saved.add(canonical)
+    eligible = [run for run in ids if run not in excluded]
+    missing = [run for run in eligible if run not in saved]
+    return {"run_count": len(ids), "eligible_count": len(eligible),
+            "saved_run_count": len(saved), "excluded_count": len(excluded),
+            "missing_runs": missing, "excluded_runs": dict(excluded)}
+
+
+
+def _count_text(counts: Mapping) -> str:
+    text = f"{counts['saved_run_count']} done · {counts['excluded_count']} excluded"
+    if counts["missing_runs"]:
+        text += f" · {len(counts['missing_runs'])} not done"
+    return text
+
+
+
+def _selected_exclusion(context: WorkflowStatusContext) -> str:
+    _, reasons = analysis_run_scope(context)
+    reason = next((value for run, value in reasons.items()
+                   if run.casefold() == context.run_id.casefold()), "")
+    return f"Selected {context.run_id.upper()}: excluded: {reason}" if reason else ""
+
+
+
+def _image_selection_with_exclusions(context: WorkflowStatusContext) -> RowStatus:
+    from darsia.fluidflower.image_selection_status import saved_selection_summary
+    try:
+        info = saved_selection_summary(context.manifest)  # Original schema/source validation.
+        ids, excluded = analysis_run_scope(context)
+        if not excluded:
+            return _saved_row_status(context, "image_selection", "plan")
+        saved = [run for run in ids if run not in info["missing_runs"]]
+        counts = analysis_run_counts(context, saved)
+        table = _map(_map(context.manifest.get("image_selection")).get("runs"))
+        frames = sum(len(_map(table.get(run)).get("selected", [])) for run in saved if run not in excluded)
+        summary = f"Stored explicit choices: {frames} images · {_count_text(counts)}."
+        if counts["missing_runs"]:
+            status = _missing(summary, "Image selection",
+                              "Choose and save images for: " + ", ".join(counts["missing_runs"]),
+                              next_step="Edit image selection; no calculation starts.")
+        else:
+            status = _saved(summary + " " + info["note"], [_artifact(context.series_root / "series.toml")],
+                            "Image selection", {"saved_utc": info["saved_utc"]})
+        return replace(status, counts=counts, selected_run_text=_selected_exclusion(context))
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return _missing("Saved image choices are unavailable.", "Image selection", str(error))
+
+
+
+def row_status(context: WorkflowStatusContext, action: str, item_id: str) -> RowStatus:
+    """Method-aware passive display; original routing and Setup criteria stay intact."""
+    if context.series_root is None or context.manifest.get("schema_version") != 1:
+        return _saved_row_status(context, action, item_id)
+    active = _active_method(context)
+    colour_rows = {("calibration", item) for item in ("color", "mass", "default_mass", "mass_optuna")}
+    colour_rows.update(("analysis", item) for item in ("cropping", "mass", "segmentation", "fingers", "thresholding", "volume"))
+    phase_row = action == "phase_model" or (action == "mass_analysis" and item_id in {"frozen", "review"})
+    if (active == "phase_model" and (action, item_id) in colour_rows) or (active == "colour_path" and phase_row):
+        selected = ""
+        if action in {"analysis", "mass_analysis"}:
+            try:
+                selected = _selected_exclusion(context)
+            except (ValueError, TypeError, KeyError) as error:
+                selected = "Analysis exclusion scope unavailable: " + str(error)
+        return RowStatus("not_applicable", f"Not applicable for method {active}.", selected_run_text=selected)
+    if (action, item_id) == ("image_selection", "plan"):
+        return _image_selection_with_exclusions(context)
+    try:
+        selected = _selected_exclusion(context) if (action in {"analysis", "mass_analysis"}
+                     or (action, item_id) == ("phase_model", "selection_plan")) else ""
+        if action == "analysis" and selected:
+            return RowStatus("not_applicable", selected, selected_run_text=selected)
+        status = _saved_row_status(context, action, item_id)
+        if (action, item_id) == ("mass_analysis", "review") and status.state == "done":
+            document = context.document(_path(context.review_reference, context.series_root))
+            wanted = _identity(context.manifest.get("series_id"))
+            reviewed = {_identity(_map(job).get("run")) for job in document.get("jobs", [])
+                        if _identity(_map(job).get("dataset")) == wanted}
+            runs = [run for run in analysis_run_scope(context)[0] if _identity(run) in reviewed]
+            counts = analysis_run_counts(context, runs)
+            if counts["saved_run_count"] == 0:
+                return _missing("Review collection has no non-excluded run for this series.", "Phase review",
+                                "Choose a collection with a bound, non-excluded registered run.")
+            return replace(status, summary=status.summary + " " + _count_text(counts) + ".",
+                           counts=counts, selected_run_text=selected)
+        if (action, item_id) == ("mass_analysis", "frozen") and status.state == "done":
+            _, excluded = analysis_run_scope(context)
+            if excluded:
+                receipt = context.document(_path(context.result_receipt_reference, context.series_root))
+                run = str(_map(receipt.get("candidate")).get("run") or "")
+                reason = next((reason for key, reason in excluded.items()
+                               if key.casefold() == run.casefold()), "")
+                if reason:
+                    return RowStatus("not_applicable", f"Saved result run {run.upper()} is excluded: {reason}",
+                                     selected_run_text=selected)
+                counts = analysis_run_counts(context, [run])
+                return replace(status, summary=status.summary + " Explicit selected run receipt: " + _count_text(counts) + ".",
+                               counts=counts, selected_run_text=selected)
+        return replace(status, selected_run_text=selected) if selected else status
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return _missing("Registered analysis scope is unavailable: " + str(error), f"{action}/{item_id}", str(error))

@@ -630,6 +630,8 @@ def use_environment_python(runner) -> None:
 
     def start_workflow_process(argv, *args, **kwargs):
         argv = [str(value) for value in argv]
+        if argv[1:3] == ["-m", "darsia.presets.workflows.user_interface_setup"]:
+            argv[2] = "darsia.fluidflower.setup_rig"
         if argv and _same_executable(argv[0], sys.executable):
             argv[0] = phase_python_executable()
         return start(argv, *args, **kwargs)

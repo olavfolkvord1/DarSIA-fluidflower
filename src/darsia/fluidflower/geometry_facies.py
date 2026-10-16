@@ -353,6 +353,7 @@ def default_geometry_config(
     return {
         "schema": 1,
         "format": GEOMETRY_CONFIG_FORMAT,
+        "frame": "raw",
         "rig_type": rig_type,
         "source_rig_path": "",
         "baseline_path": "",
@@ -1369,6 +1370,8 @@ def validate_geometry_config(config: Mapping[str, Any]) -> dict[str, Any]:
         _issue(
             issues, "error", "unsupported_format", "Unsupported geometry configuration"
         )
+    if candidate.get("frame", "raw") not in {"raw", "rig-corrected"}:
+        _issue(issues, "error", "invalid_workspace_frame", "Unknown geometry workspace coordinate frame")
     width_m = _number(candidate.get("width_m"))
     height_m = _number(candidate.get("height_m"))
     if width_m is None or width_m <= 0.0:
@@ -1990,7 +1993,7 @@ def validate_geometry_config(config: Mapping[str, Any]) -> dict[str, Any]:
         severity: sum(issue["severity"] == severity for issue in issues)
         for severity in ("error", "warning", "info")
     }
-    return {
+    report = {
         "schema": 1,
         "format": "darsia-fluidflower-geometry-validation-v1",
         "validated_utc": _utc_now(),
@@ -2020,6 +2023,10 @@ def validate_geometry_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "issues": issues,
     }
+    if candidate.get("source_mode") in {"imported-rasters", "canonical-from-import"}:
+        from .geometry_raster_sources import validate_source_mode
+        return validate_source_mode(candidate, report)
+    return report
 
 
 def _canonical_facies(
@@ -2097,8 +2104,11 @@ class GeometryRevisionStore:
         actor: str,
         reason: str,
         validation: Mapping[str, Any] | None = None,
+        preserve_failed_artifacts: bool = False,
     ) -> dict[str, Any]:
         candidate = deepcopy(dict(config))
+        from .geometry_raster_sources import require_source_mode_transition
+        require_source_mode_transition(self, candidate)
         report = deepcopy(dict(validation or {}))
         if report.get("config_sha256") != geometry_config_digest(candidate):
             report = validate_geometry_config(candidate)
@@ -2128,24 +2138,29 @@ class GeometryRevisionStore:
         depth_artifact_name = f"depth{depth_input_path.suffix.casefold()}"
         try:
             shutil.copy2(depth_input_path, staging / depth_artifact_name)
-            facies, properties = _canonical_facies(candidate)
-            metadata = _darsia_metadata(Path(str(candidate["labels_path"])))
-            np.savez_compressed(staging / "facies.npz", array=facies, metadata=metadata)
-            with (staging / "facies_properties.csv").open(
-                "w", encoding="utf-8", newline=""
-            ) as stream:
-                fieldnames = [
-                    "id",
-                    "name",
-                    "porosity",
-                    "permeability",
-                    "permeability_unit",
-                    "analysis_role",
-                    "enabled",
-                ]
-                writer = csv.DictWriter(stream, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(properties)
+            source_mode_artifacts = {}
+            if candidate.get("source_mode") in {"imported-rasters", "canonical-from-import"}:
+                from .geometry_raster_sources import materialize_source_mode
+                source_mode_artifacts, properties = materialize_source_mode(candidate, staging, destination)
+            else:
+                facies, properties = _canonical_facies(candidate)
+                metadata = _darsia_metadata(Path(str(candidate["labels_path"])))
+                np.savez_compressed(staging / "facies.npz", array=facies, metadata=metadata)
+                with (staging / "facies_properties.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as stream:
+                    fieldnames = [
+                        "id",
+                        "name",
+                        "porosity",
+                        "permeability",
+                        "permeability_unit",
+                        "analysis_role",
+                        "enabled",
+                    ]
+                    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(properties)
             run_geometry = normalize_run_geometry_config(candidate.get("run_geometry"))
             geometry_policy = str(run_geometry.get("geometry_policy") or "")
             diagnostics_by_run = {
@@ -2228,7 +2243,8 @@ class GeometryRevisionStore:
                 }
             os.replace(staging, destination)
         except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            if not preserve_failed_artifacts:
+                shutil.rmtree(staging, ignore_errors=True)
             raise
 
         depth_artifact_path = destination / depth_artifact_name
@@ -2242,7 +2258,8 @@ class GeometryRevisionStore:
         )
         approved_report = validate_geometry_config(approved_candidate)
         if int((approved_report.get("summary") or {}).get("error_count") or 0) > 0:
-            shutil.rmtree(destination, ignore_errors=True)
+            if not preserve_failed_artifacts:
+                shutil.rmtree(destination, ignore_errors=True)
             raise ValueError("Materialized geometry revision failed validation")
         candidate = approved_candidate
         report = approved_report
@@ -2290,6 +2307,7 @@ class GeometryRevisionStore:
         revision = {
             "schema": 1,
             "format": GEOMETRY_REVISION_FORMAT,
+            "frame": candidate.get("frame", "raw"),
             "revision_id": revision_id,
             "recorded_utc": _utc_now(),
             "recorded_by": str(actor).strip(),
@@ -2302,6 +2320,7 @@ class GeometryRevisionStore:
                 "facies_path": str(destination / "facies.npz"),
                 "facies_properties_path": str(destination / "facies_properties.csv"),
                 "run_geometry": run_artifacts,
+                **source_mode_artifacts,
             },
             "validation": report,
         }
@@ -2410,7 +2429,12 @@ def load_geometry_preview(
     labels = np.squeeze(_load_array(Path(str(effective["labels_path"]))))
     depth = np.squeeze(_load_array(Path(str(config["depth_path"]))))
     facies_path = str(run_row.get("facies_path") or "")
-    if facies_path:
+    if effective.get("source_mode") == "imported-rasters":
+        from .geometry_raster_sources import imported_payload
+        if run_row and (str(run_row.get("labels_path") or "") or facies_path):
+            raise ValueError("Imported rasters cannot silently use a different run override.")
+        facies = imported_payload(effective)["facies"]
+    elif facies_path:
         facies = np.squeeze(_load_array(Path(facies_path)))
     else:
         facies, _properties = _canonical_facies(effective)

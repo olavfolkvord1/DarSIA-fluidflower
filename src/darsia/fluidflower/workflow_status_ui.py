@@ -19,7 +19,7 @@ from darsia.presets.workflows.results_folder import open_in_file_explorer
 STATE_LABELS = {
     "done": "Done",
     "missing": "Not done",
-    "not_applicable": "Not applicable",
+    "not_applicable": "— Not applicable",
 }
 
 
@@ -28,7 +28,13 @@ def status_text(state) -> str:
     line = STATE_LABELS[state.state]
     if state.date:
         line += " · " + state.date
-    return line + "\n" + state.summary
+    text = line + "\n" + state.summary
+    return text + "\n" + state.selected_run_text if state.selected_run_text else text
+
+
+def state_style(state, *, compact=False) -> str:
+    prefix = "font-size: 10px;" if compact else ""
+    return prefix + ("color: #667085;" if state.state == "not_applicable" else "")
 
 
 class NativeWorkflowStatus:
@@ -99,6 +105,7 @@ class NativeWorkflowStatus:
                 vertical = QVBoxLayout(controls)
                 vertical.setContentsMargins(0, 0, 0, 0)
                 vertical.setSpacing(1)
+                row._workflow_original_label_style = row._text_label.styleSheet()
                 row.layout().removeWidget(row._text_label)
                 vertical.addWidget(row._text_label)
                 text = QLabel()
@@ -247,6 +254,8 @@ class NativeWorkflowStatus:
                 state = row_status(context, *logical)
                 self.states[logical] = state
                 text.setText(status_text(state))
+                text.setStyleSheet(state_style(state, compact=True))
+                row._text_label.setStyleSheet(row._workflow_original_label_style + state_style(state))
                 details = self._details(state)
                 text.setToolTip(details)
                 button.setText("Open" if state.state == "done" else "Start")
@@ -264,6 +273,7 @@ class NativeWorkflowStatus:
             if state is None:
                 return
             self.label.setText(status_text(state))
+            self.label.setStyleSheet(state_style(state))
             self.label.setToolTip(self._details(state))
             self.open_button.setVisible(state.state == "done" and bool(state.artifacts))
             self.start_button.setVisible(state.state == "missing")
@@ -277,6 +287,8 @@ class NativeWorkflowStatus:
     @staticmethod
     def _details(state) -> str:
         lines = []
+        if state.selected_run_text:
+            lines.append(state.selected_run_text)
         if state.date_source:
             lines.append("Date source: " + state.date_source)
         lines.extend(f"Saved: {item.kind}: {item.path}" for item in state.artifacts)

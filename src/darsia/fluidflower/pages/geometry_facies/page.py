@@ -21,6 +21,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractButton,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
@@ -915,6 +918,13 @@ class GeometryFaciesPage(ModulePage):
         self.save_button.clicked.connect(self._save_revision)
         self.save_button.setEnabled(False)
         action_row.addWidget(self.save_button)
+        self.canonical_edit_button = QPushButton("Create canonical edit draft")
+        self.canonical_edit_button.setToolTip(
+            "Explicitly derive edited facies from labels and the full original CSV; "
+            "the imported parent and boundary differences remain recorded. This does not register geometry.")
+        self.canonical_edit_button.clicked.connect(self._begin_canonical_edit)
+        self.canonical_edit_button.setVisible(False)
+        action_row.addWidget(self.canonical_edit_button)
         self.busy = QProgressBar()
         self.busy.setRange(0, 1)
         self.busy.setValue(0)
@@ -1337,6 +1347,68 @@ class GeometryFaciesPage(ModulePage):
                 f"Saved edit session {incoming_session_id[:8]} is available."
             )
         self._refresh_label_edit_controls()
+        self._sync_imported_source_mode()
+
+    def _sync_imported_source_mode(self) -> None:
+        imported = self.config.get("source_mode") == "imported-rasters"
+        self.canonical_edit_button.setVisible(imported)
+        previous = getattr(self, "_imported_editor_enabled_states", [])
+        if not imported:
+            for widget, enabled in previous:
+                widget.setEnabled(enabled)
+            self._imported_editor_enabled_states = []
+            if hasattr(self, "_imported_quality_basis_before"):
+                self.geometry_quality_basis.setText(self._imported_quality_basis_before)
+            return
+        if not previous:
+            editor_types = (QAbstractButton, QAbstractSpinBox, QComboBox, QLineEdit, QTableWidget)
+            view_controls = {getattr(self, name, None) for name in ("background", "overlay", "revisions")}
+            previous = []
+            for widget in self.tabs.findChildren(QWidget):
+                if not isinstance(widget, editor_types) or widget in view_controls:
+                    continue
+                parent = widget.parentWidget()
+                while parent is not None and parent is not self.tabs:
+                    if isinstance(parent, editor_types):
+                        break
+                    parent = parent.parentWidget()
+                else:
+                    parent = None
+                # A table owns transient cell editors. Lock its persistent table,
+                # not wrappers which a later _populate_layers call replaces.
+                if parent is None or parent is self.tabs:
+                    previous.append((widget, widget.isEnabled()))
+            for name in ("import_rig", "place_injector"):
+                button = getattr(self, name, None)
+                if button is not None and all(button is not widget for widget, _enabled in previous):
+                    previous.append((button, button.isEnabled()))
+            self._imported_editor_enabled_states = previous
+            self._imported_quality_basis_before = self.geometry_quality_basis.text()
+        for widget, _enabled in previous:
+            widget.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.geometry_quality_basis.setText(
+            "Imported rasters: labels and facies are independent authoritative maps; "
+            "the FULL original properties CSV is retained. Fields are read-only. "
+            "Create a canonical edit draft to edit; registered geometry still requires Olav's decision.")
+
+    def _begin_canonical_edit(self) -> None:
+        from darsia.fluidflower.geometry_raster_sources import prepare_canonical_edit
+        try:
+            draft = prepare_canonical_edit(
+                self.project, actor=self.actor.text().strip(),
+                reason=self.reason.text().strip() or "User requested an explicit canonical edit draft")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Could not create canonical edit draft", str(exc))
+            return
+        self._populate_config(draft)
+        self.validation = None
+        self.save_button.setEnabled(False)
+        self.geometry_quality_basis.setText(
+            "Explicit canonical edit draft. Future facies are derived from edited labels and the "
+            "FULL original CSV; Save records the difference to the imported parent. "
+            "This is not registered-v2 and does not authorize a correction.")
+        self.geometry_summary.setText("Canonical edit draft; validate before saving a new revision.")
 
     def _populate_layers(self, rows: list[dict[str, Any]]) -> None:
         self.layers.setRowCount(len(rows))
@@ -1528,6 +1600,9 @@ class GeometryFaciesPage(ModulePage):
         self._update_injector_position_status()
 
     def _collect_config(self) -> dict[str, Any]:
+        if self.config.get("source_mode") == "imported-rasters":
+            # Visible read-only editor until the explicit canonical draft action.
+            return deepcopy_settings(self.config)
         regions: list[dict[str, Any]] = []
         for row in range(self.layers.rowCount()):
             role = self.layers.cellWidget(row, 4)
@@ -3294,6 +3369,11 @@ class GeometryFaciesPage(ModulePage):
             self.save_button.setEnabled(False)
             return
         summary = dict(report.get("summary") or {})
+        source_notice = str(summary.get("source_mode_notice") or "")
+        if source_notice:
+            diagnosis = (self.config.get("imported_rasters") or {}).get("diagnosis") or {}
+            self.geometry_quality_basis.setText(
+                source_notice + ("; diagnosis SHA-256 " + diagnosis["sha256"] if diagnosis.get("sha256") else ""))
         self._show_run_geometry_diagnostics(summary)
         errors = int(summary.get("error_count") or 0)
         warnings = int(summary.get("warning_count") or 0)
@@ -3343,6 +3423,7 @@ class GeometryFaciesPage(ModulePage):
         current_digest = geometry_config_digest(self._collect_config())
         self.save_button.setEnabled(
             errors == 0 and str(report.get("config_sha256") or "") == current_digest
+            and self.config.get("source_mode") != "imported-rasters"
         )
         if errors:
             self.tabs.setCurrentWidget(self.qc_tab)
@@ -3352,11 +3433,16 @@ class GeometryFaciesPage(ModulePage):
         actor = self.actor.text().strip()
         reason = self.reason.text().strip() or "Validated geometry and facies revision"
         try:
+            if config.get("source_mode") == "imported-rasters":
+                from darsia.fluidflower.geometry_raster_sources import SILENT_EDIT
+                raise ValueError(SILENT_EDIT)
             revision = self.store.save_revision(
                 config,
                 actor=actor,
                 reason=reason,
                 validation=self.validation,
+                **({"preserve_failed_artifacts": True}
+                   if config.get("frame", "raw") == "rig-corrected" else {}),
             )
             self.project.set_module_status(
                 "geometry_facies",

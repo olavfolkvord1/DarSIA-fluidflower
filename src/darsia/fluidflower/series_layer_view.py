@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from . import geometry_workspace_frame as workspace_frame
 from typing import Any
 
 import numpy as np
@@ -1195,6 +1196,8 @@ class LayerPainterView(QWidget):
         self.setObjectName("seriesLayerView")
         self.project = project
         self._reference = reference
+        self._workspace_frame_config: dict[str, Any] = {}
+        self._saved_corrected_boundaries: np.ndarray | None = None
         self.session: lp.PaintingSession | None = None
         self.image: lp.PaintingImage | None = None
         self.proposal: lp.LayerProposal | None = None
@@ -1679,9 +1682,14 @@ class LayerPainterView(QWidget):
     # ------------------------------------------------------------- state
 
     def reference(self) -> SeriesRunInputs | None:
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            return workspace_frame.workspace_reference(self._workspace_frame_config, self._reference(), check_files=False)
         return self._reference()
 
     def current_frame(self) -> RigFrame | None:
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            reference = self.reference()
+            return workspace_frame.corrected_rig_frame(self._workspace_frame_config, reference.run_id) if reference else None
         frame = self.rig_panel.frame
         if frame is None:
             reference = self.reference()
@@ -1718,6 +1726,19 @@ class LayerPainterView(QWidget):
         """Load the session, photograph and proposal of the reference run."""
 
         self.save_session()
+        try:
+            self._workspace_frame_config = workspace_frame.current_configuration(self.project)
+        except (OSError, ValueError) as error:
+            self.session = None
+            self.image = None
+            self.canvas.clear_photo()
+            self.propose_status.setText(f"Could not read the workspace coordinate frame: {error}")
+            self.propose_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            return
+        self.rig_panel.setEnabled(workspace_frame.frame_kind(self._workspace_frame_config) == "raw")
+        self._saved_corrected_boundaries = None
+        self.show_proposal.setText("Saved layer boundaries" if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected" else "Proposal")
         self._loading = True
         try:
             self.session = None
@@ -1728,7 +1749,14 @@ class LayerPainterView(QWidget):
             self.canvas.cancel_polygon()
             self._other_photo = None
             self._reference_token = None
-            reference = self.reference()
+            try:
+                reference = self.reference()
+            except (OSError, ValueError) as error:
+                self.canvas.clear_photo()
+                self.propose_status.setText(f"Could not read the selected run's corrected maps: {error}")
+                self.propose_button.setEnabled(False)
+                self.export_button.setEnabled(False)
+                return
             self.rig_panel.load()
             if reference is None or reference.baseline_image is None:
                 self.canvas.clear_photo()
@@ -1781,7 +1809,15 @@ class LayerPainterView(QWidget):
         assert reference.baseline_image is not None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            image = lp.load_painting_image(Path(reference.baseline_image))
+            if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+                image = workspace_frame.load_painting_image(self._workspace_frame_config, reference)
+                if (self.session is not None and self.session.image_size not in (None, image.image_size)
+                        and (self.session.strokes or self.session.polygons)):
+                    raise ValueError("Saved marks belong to another coordinate frame; the draft was preserved")
+                self._saved_corrected_boundaries = workspace_frame.saved_boundaries(
+                    self._workspace_frame_config, reference.run_id, image.display.shape[:2])
+            else:
+                image = lp.load_painting_image(Path(reference.baseline_image))
         except (OSError, ValueError) as error:
             self.image = None
             self.canvas.clear_photo()
@@ -1838,7 +1874,10 @@ class LayerPainterView(QWidget):
             token=self._reference_token,
             reset_view=reset_view,
         )
-        self.canvas.paint_enabled = True
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            self.canvas.paint_enabled = False
+        else:
+            self.canvas.paint_enabled = True
         self._other_photo = None
         self.rig_panel.use_host_photo(self.image.image_size, self.canvas.preview)
         self.photo_note_row.hide()
@@ -2420,6 +2459,9 @@ class LayerPainterView(QWidget):
         )
 
     def propose(self) -> None:
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            self.propose_status.setText("Saved corrected rig maps are shown. The reference labels remain editable in Advanced; production registration is a separate approved step.")
+            return
         if self.session is None or self.image is None or self.busy():
             return
         reference = self.reference()
@@ -2497,6 +2539,10 @@ class LayerPainterView(QWidget):
         self.busy_changed.emit(self.busy())
 
     def _render_proposal(self) -> None:
+        if (workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
+                and self._other_photo is None and self.proposal is None):
+            self.canvas.set_proposal(self._saved_corrected_boundaries)
+            return
         if (
             self.proposal is None
             or self.image is None
@@ -2927,6 +2973,8 @@ class LayerPainterView(QWidget):
     # ------------------------------------------------------------ export
 
     def export_problems_now(self) -> list[str]:
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            return ["Corrected-frame production export and Build run model are not qualified yet."]
         if self.session is None:
             return ["Choose a reference run with a baseline photograph."]
         return lp.check_ready_for_revision(
@@ -2934,6 +2982,9 @@ class LayerPainterView(QWidget):
         )
 
     def save_and_export(self) -> None:
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            self.export_status.setText("Corrected-frame production export and Build run model are not qualified yet.")
+            return
         if self.busy() or self.session is None or self.proposal is None:
             if self.proposal is None:
                 QMessageBox.information(
@@ -3173,6 +3224,15 @@ class LayerPainterView(QWidget):
             f"color: {_state_color(self, 'warn').name()};" if problems else ""
         )
         self.export_button.setEnabled(not busy and not problems)
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            self.propose_button.setEnabled(False)
+            self.rig_panel.setEnabled(False)
+            if self.image is not None and self._saved_corrected_boundaries is not None:
+                self.step_propose.set_status("Saved rig boundaries", "done")
+                self.proposal_summary.setText("Read-only old rig maps; no classifier or registration was run.")
+            else:
+                self.step_propose.set_status("Saved rig maps unavailable", "warn")
+                self.proposal_summary.setText("No raw-photo or common-map fallback was used.")
 
     def _proposal_text(self) -> str:
         proposal = self.proposal

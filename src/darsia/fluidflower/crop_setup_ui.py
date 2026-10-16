@@ -142,6 +142,10 @@ class NativeCropWorkflow(QObject):
 
     def attach_export_dialog(self, dialog, export: NativeSetupExport) -> None:
         """Add a button to the existing dialog; never register or apply here."""
+        from darsia.fluidflower.corrected_setup import CorrectedSetupExport
+
+        if isinstance(export, CorrectedSetupExport):
+            return  # Its own selected-run Apply never performs raw registration.
         if getattr(dialog, "apply_corners_button", None) is not None:
             return
         buttons = dialog.findChild(QDialogButtonBox)
@@ -172,6 +176,10 @@ class NativeCropWorkflow(QObject):
 
     def open_current_export(self) -> bool:
         """Read-only opening of an existing export from the Apply sidebar row."""
+        from darsia.fluidflower.corrected_setup_ui import open_current_corrected_export
+
+        if open_current_corrected_export(self.window):
+            return True
         workspace = self.window.phase_model_workspace
         root = workspace.series_roots.get(workspace.series_id)
         if root is None:

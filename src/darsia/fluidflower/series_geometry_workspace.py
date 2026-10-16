@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from . import geometry_workspace_frame as workspace_frame
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
@@ -379,6 +380,9 @@ class SeriesGeometryWorkspace(QWidget):
         return self.series_roots.get(self.series_id)
 
     def busy(self) -> bool:
+        dialog = getattr(self, "export_dialog", None)
+        if getattr(dialog, "_thread", None) is not None:
+            return True
         if self.simple_view is not None and self.simple_view.busy():
             return True
         return self._page_busy() or self._thread_running(self._export_thread)
@@ -538,11 +542,23 @@ class SeriesGeometryWorkspace(QWidget):
         parts: list[str] = []
         reference = self.reference()
         if reference is not None:
-            if reference.baseline_image is not None:
+            frame_error = ""
+            try:
+                config = workspace_frame.current_configuration(self.project) if self.project is not None else {}
+            except (OSError, ValueError) as error:
+                config = {}
+                frame_error = str(error)
+            if frame_error:
+                parts.append("Workspace coordinate frame unavailable: " + frame_error)
+            elif workspace_frame.frame_kind(config) == "rig-corrected":
+                parts.append(f"Saved corrected rig frame of {reference.run_id}. Original production maps are unchanged; production export and Build are not qualified yet.")
+            elif reference.baseline_image is not None:
                 parts.append(
                     f"Raw baseline of {reference.run_id}: {reference.baseline_image.name}."
                 )
-            if reference.rig_folder is not None:
+            if frame_error or workspace_frame.frame_kind(config) == "rig-corrected":
+                pass
+            elif reference.rig_folder is not None:
                 parts.append(
                     "A native rig exists for this run; its maps are on the corrected "
                     "grid and cannot be exported back to Setup."
@@ -660,6 +676,14 @@ class SeriesGeometryWorkspace(QWidget):
 
     @Slot(object)
     def _show_export_dialog(self, export: object) -> None:
+        from darsia.fluidflower.corrected_setup import CorrectedSetupExport
+
+        if isinstance(export, CorrectedSetupExport):
+            from darsia.fluidflower.corrected_setup_ui import CorrectedSetupExportDialog
+
+            self.export_dialog = CorrectedSetupExportDialog(export, self)
+            self.export_dialog.open()
+            return
         self.export_dialog = NativeSetupExportDialog(export, self)  # type: ignore[arg-type]
         self.export_dialog.open()
 

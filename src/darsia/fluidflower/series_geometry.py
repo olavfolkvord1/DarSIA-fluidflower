@@ -1128,6 +1128,10 @@ def export_native_setup(
         raise ValueError("Save a validated geometry revision before exporting it.")
     revision_id = str(current["revision_id"])
     config = dict(current.get("configuration") or {})
+    if config.get("frame", "raw") == "rig-corrected":
+        from darsia.fluidflower.corrected_setup import export_corrected_setup
+
+        return export_corrected_setup(project, reference=reference, actor=actor)
     artifacts = dict(current.get("artifacts") or {})
     export_root = project.root / "exports" / "native_setup"
     destination = export_root / revision_id
