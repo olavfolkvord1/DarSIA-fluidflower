@@ -32,6 +32,11 @@ from .job_queue import (
 def verify_startup(job_root: Path) -> tuple[dict, str]:
     """Check the running repository and its actual lockfile exactly once."""
     require_unc(str(job_root))
+    from ..job_filesystem import inspect_shared_folder
+
+    transport = inspect_shared_folder(job_root)
+    if not transport.allowed:
+        raise ValueError("Shared queue transport refused: " + transport.reason + ": " + transport.evidence)
     job = read_json(job_root / "job.json")
     repository = Path(__file__).resolve().parents[4]
     head = subprocess.check_output(

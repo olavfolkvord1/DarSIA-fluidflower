@@ -225,6 +225,11 @@ def test_failure_traceback_is_preserved_and_worker_takes_next(tmp_path, monkeypa
 
 @pytest.mark.parametrize("dirty,head", [(" M tracked.py\n", "1"*40), ("", "4"*40)])
 def test_startup_git_rejection_is_console_and_log_and_never_claims(tmp_path, monkeypatch, capsys, dirty, head):
+    # This isolated Git-rejection fixture already supplies synthetic UNC/Git
+    # facts. Admit only its transport so the test reaches the original Git guard.
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "Git fixture transport", "isolated unit fixture"))
     write_immutable(tmp_path / "job.json", dict(commit="1"*40,precision="float32",calibration_sha256="2"*64))
     monkeypatch.setattr(worker, "require_unc", lambda path: None)
     monkeypatch.setattr(worker.subprocess, "check_output", lambda args, **kwargs: dirty if "status" in args else head)

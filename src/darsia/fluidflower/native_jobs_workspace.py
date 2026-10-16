@@ -19,6 +19,7 @@ from .jobs_metadata import create_job_from_plan
 from .jobs_panel import JobsPanel
 from .native_jobs_registry import JobsUIRegistry
 from .pipeline.job_queue import name
+from .store_map_ui import StoreAvailabilityPanel
 
 
 class NativeJobsWorkspace(QWidget):
@@ -44,6 +45,7 @@ class NativeJobsWorkspace(QWidget):
         selection_resolver=None,
         inventory_provider=None,
         resource_factory=None,
+        store_panel_factory=StoreAvailabilityPanel,
     ):
         super().__init__(parent)
         default = (
@@ -70,6 +72,8 @@ class NativeJobsWorkspace(QWidget):
         self.association_note.setWordWrap(True)
         self.association_note.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.association_note)
+        self.stores = store_panel_factory(self)
+        layout.addWidget(self.stores)
         actions = QHBoxLayout()
         self.open_job_button = QPushButton("Open existing job…")
         self.import_plan_button = QPushButton("Import adopted execution plan…")
@@ -122,6 +126,7 @@ class NativeJobsWorkspace(QWidget):
     def _clear_context(self):
         self.series_root = self.series_id = None
         self.series_label = ""
+        self.stores.set_context(None, None)
         self.open_job_button.setEnabled(False)
         self.import_plan_button.setEnabled(False)
         self.panel.set_context(
@@ -156,6 +161,7 @@ class NativeJobsWorkspace(QWidget):
             # B4, not a displayed alias or a previously loaded run config.
             self.series_root, self.series_id = root, actual
             self.series_label = str(series_label or actual)
+            self.stores.set_context(root, actual)
             self.open_job_button.setEnabled(True)
             self.import_plan_button.setEnabled(True)
             self.association_note.setText(
@@ -335,14 +341,14 @@ class NativeJobsWorkspace(QWidget):
         return button
 
     def can_close(self):
-        return self.panel.can_close() and (
+        return self.panel.can_close() and self.stores.can_close() and (
             self.resources is None or self.resources.can_close()
         )
 
     def closeEvent(self, event):
         if not self.can_close():
             self.status_label.setText(
-                "Job metadata or optional resource work is still finishing."
+                "Job/store metadata or optional resource work is still finishing. Close the local Settings dialog first."
             )
             event.ignore()
             return
