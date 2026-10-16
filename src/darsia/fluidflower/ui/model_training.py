@@ -4724,7 +4724,10 @@ class SharedPhaseModelTrainingPage(QWidget):
                 "mil_max_iters": self.mil_iterations.value(),
                 "change_evidence_ablation": self.change_ablation.isChecked(),
             }
-            if self.radiometry_mode.currentData() in {"custom", "image"} and not self.radiometry_profile_path.text().strip():
+            native_photometry = getattr(self, "_native_training_photometry", None)
+            if native_photometry is not None:
+                settings = native_photometry.prepare_settings(settings, bundles)
+            if native_photometry is None and self.radiometry_mode.currentData() in {"custom", "image"} and not self.radiometry_profile_path.text().strip():
                 raise ValueError("Select a common ColorChecker reference image or target profile first")
             # A series owns its trained versions regardless of the library
             # currently selected for browsing historical/shared models.
@@ -4738,6 +4741,8 @@ class SharedPhaseModelTrainingPage(QWidget):
                 actor=self.reviewer.text().strip(),
                 settings=settings,
             )
+            if native_photometry is not None:
+                native_photometry.require_request(request)
             command = build_phase_training_command(request)
             self._refresh_review_sessions()
         except Exception as exc:  # noqa: BLE001 - visible GUI boundary

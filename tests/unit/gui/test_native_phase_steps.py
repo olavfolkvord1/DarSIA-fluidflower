@@ -295,9 +295,11 @@ def test_import_is_explicit_and_does_not_copy_model(setup, tmp_path, monkeypatch
     imported = tmp_path / "model"
     root = tmp_path / "series"
     calls = []
-    library = ModuleType("darsia.fluidflower.phase_model_library")
-    library.index_model = lambda *args: calls.append(args)
-    monkeypatch.setitem(sys.modules, library.__name__, library)
+    from darsia.fluidflower import model_index_names as library
+
+    monkeypatch.setattr(
+        library, "index_model_with_ui_name", lambda *args: calls.append(args)
+    )
     history = ModuleType("darsia.fluidflower.phase_model_history")
     history.inspect_phase_model_history_entry = lambda folder: {"datasets": ["seriesx"]}
     monkeypatch.setitem(sys.modules, history.__name__, history)

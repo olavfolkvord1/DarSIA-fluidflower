@@ -102,27 +102,9 @@ def save_model_ui_name(request, name, actor):
 
 
 def saved_model_ui_name(entry):
-    root = Path(str(entry.get("root") or ""))
-    path = root / "model_ui_name.json"
-    if not path.is_file():
-        return ""
-    try:
-        if path.stat().st_size > 65536:
-            return ""
-        payload = json.loads(path.read_bytes())
-        request = root / "training_request.json"
-        if request.stat().st_size > 2 * 1024 * 1024:
-            return ""
-        if (
-            payload.get("format") != "phase-model-ui-name-v1"
-            or payload.get("model_id") != entry.get("model_id")
-            or payload.get("training_request_sha256")
-            != hashlib.sha256(request.read_bytes()).hexdigest()
-        ):
-            return ""
-        return str(payload.get("display_name") or "").strip()
-    except (OSError, ValueError, TypeError):
-        return ""
+    from darsia.fluidflower.model_index_names import model_ui_display_name
+
+    return model_ui_display_name(entry)
 
 
 def _move(widget, layout):
@@ -160,14 +142,14 @@ def import_saved_model(series_root, series_id, folder):
     """Use existing inspection/filter/index APIs; never copy model assets."""
     from darsia.fluidflower.phase_model_history import inspect_phase_model_history_entry
     from darsia.fluidflower.ui.model_training import _models_for_series
-    from darsia.fluidflower.phase_model_library import index_model
+    from darsia.fluidflower.model_index_names import index_model_with_ui_name
 
     entry = inspect_phase_model_history_entry(Path(folder))
     if not series_id or not _models_for_series([entry], series_id):
         raise ValueError(
             "The selected model does not belong to this experimental series."
         )
-    return index_model(series_root, Path(folder))
+    return index_model_with_ui_name(series_root, Path(folder))
 
 
 class NativePhaseSteps(QWidget):
@@ -207,6 +189,7 @@ class NativePhaseSteps(QWidget):
             for name in ("open_model_correction", "resume_session_button")
         }
         self._guard_slots = {}
+        self._named_model_context = {}
         self._install_instance_policy()
         self.groups, self.layouts = {}, {}
         outer = QVBoxLayout(self)
@@ -336,6 +319,34 @@ class NativePhaseSteps(QWidget):
             return (name + " · " if name else "") + original_label(entry)
 
         studio._validation_model_label = label
+        original_version_text = getattr(studio, "_model_version_text", None)
+        if callable(original_version_text):
+            def version_text(entry):
+                name = saved_model_ui_name(entry)
+                return (name + " \u00b7 " if name else "") + original_version_text(entry)
+
+            studio._model_version_text = version_text
+        original_completed = getattr(studio, "_record_completed_model", None)
+        if callable(original_completed):
+            def completed(model_id, root):
+                error = None
+                context = self._named_model_context.get(str(model_id))
+                if context is not None:
+                    try:
+                        from darsia.fluidflower.model_index_names import index_model_with_ui_name
+
+                        series_root, output_root = context
+                        if Path(root).resolve() != output_root:
+                            raise ValueError("Completed model folder differs from its named training request")
+                        index_model_with_ui_name(series_root, root, expected_model_id=str(model_id))
+                    except (OSError, ValueError, TypeError, RuntimeError) as caught:
+                        error = caught
+                result = original_completed(model_id, root)
+                if error is not None:
+                    studio.status.setText("Model completed; its display name could not be indexed: " + str(error))
+                return result
+
+            studio._record_completed_model = completed
 
     def _build_basis(self):
         studio = self.studio
@@ -498,6 +509,9 @@ class NativePhaseSteps(QWidget):
     def refresh(self, *_args):
         if not hasattr(self, "groups") or not hasattr(self, "model_name"):
             return
+        photometry = getattr(self, "training_photometry", None)
+        if photometry is not None:
+            photometry.refresh()
         self.studio.open_model_correction.setText("Review and label…")
         # Saved versions, sessions and calibration values remain inspectable
         # while only the dependent actions are gated.
@@ -515,12 +529,18 @@ class NativePhaseSteps(QWidget):
             reason = "The selected model is the basis for review. A compatible existing-model training route is not available in the retained code; no fresh fit is substituted."
         else:
             reason = "The retained fresh-training route uses its recorded radiometry settings. A saved v5 status report does not configure that route; compatible v5 training is not attached."
+        if mode == "scratch" and photometry is not None:
+            reason = ("Fresh training uses the saved v5 input and the original fitting procedure."
+                      if photometry.binding is not None else photometry.reason)
         self.basis_note.setText(reason)
         self.training_note.setText(
             reason
             if not callable(route)
             else "Training reuses the admitted original callback and requires a new version name."
         )
+        training_available = self._legacy_start_available
+        if mode == "scratch" and photometry is not None:
+            training_available = photometry.fresh_ui_ready()
         name_ready = bool(self.model_name.text().strip())
         idle = getattr(self.studio, "training_process", None) is None and not getattr(
             self.studio, "_series_batch_active", False
@@ -530,7 +550,7 @@ class NativePhaseSteps(QWidget):
             and name_ready
             and idle
             and callable(route)
-            and self._legacy_start_available
+            and training_available
         )
         self.model_name.setEnabled(idle)
         if idle and self.studio.status.text() in {
@@ -589,6 +609,10 @@ class NativePhaseSteps(QWidget):
         save_model_ui_name(
             request, self.model_name.text(), self.studio.reviewer.text().strip()
         )
+        if self.series_root is not None:
+            self._named_model_context[str(request["model_id"])] = (
+                Path(self.series_root), Path(request["output_root"]).resolve()
+            )
         result = self._original_launch(request, command, working_directory, status)
         self.model_name.clear()
         self.refresh()

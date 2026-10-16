@@ -1668,7 +1668,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self._method_panel_seed = self.method_panel.selection()
         choice = self._saved_method
         if choice.active == "phase_model":
-            text = f"Method: phase model · model {choice.model_version or 'not referenced'} · mass calibration {choice.mass_calibration or 'not referenced'}"
+            from darsia.fluidflower.model_index_names import model_reference_label
+
+            model_label = model_reference_label(root, choice.model_version)
+            text = f"Method: phase model · model {model_label} · mass calibration {choice.mass_calibration or 'not referenced'}"
         elif choice.active == "colour_path":
             text = f"Method: colour path · calibration {choice.colour_calibration or 'not referenced'}"
         else:

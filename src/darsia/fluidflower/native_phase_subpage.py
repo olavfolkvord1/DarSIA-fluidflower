@@ -41,7 +41,12 @@ class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
                 from darsia.fluidflower.normalisation_step import NormalisationStep
 
                 options["normalisation"] = NormalisationStep()
+            from darsia.fluidflower.native_training_photometry import NativeTrainingPhotometry
+
+            photometry_factory = options.pop("training_photometry", NativeTrainingPhotometry)
             steps = NativePhaseSteps(studio, **options)
+            if photometry_factory is not None:
+                steps.training_photometry = photometry_factory(steps)
             steps.set_context(self.project_root, self.series_id)
         except Exception as error:
             self._load_failed = True
