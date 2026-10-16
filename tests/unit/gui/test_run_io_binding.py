@@ -502,3 +502,107 @@ def test_declared_alias_cannot_shadow_owned_output(tmp_path):
     replay = _Replay(binding, [dict(logical=logical, physical=physical)])
     with pytest.raises(InputHashMismatch, match="overlaps admitted code or owned output"):
         replay.bind_declared_aliases()
+
+
+
+def provenance_source_fixture(tmp_path, monkeypatch, *, changed_display=False):
+    """Authored code bytes stand in for exactly two tracked Git blobs."""
+    _task, _config, _bound, _host, binding = fixture(tmp_path)
+    source_relative = "src/darsia/fluidflower/native/source.py"
+    display_relative = "src/darsia/fluidflower/native/display_modes.py"
+    source = put(binding.repository / source_relative, b"# exact native processor source\n")
+    display_raw = b"# exact named display provenance source\n"
+    display = put(binding.repository / display_relative,
+                  b"# modified disk source\n" if changed_display else display_raw)
+    blobs = {source_relative: Path(source["path"]).read_bytes(), display_relative: display_raw}
+    calls = []
+    def original_git(args, **kwargs):
+        calls.append(list(args))
+        if "ls-tree" in args:
+            assert args[-1] in blobs
+            return args[-1] + "\n"
+        assert args[3] == "show"
+        commit, separator, relative = args[4].partition(":")
+        assert separator and commit == binding.commit and relative == display_relative
+        return blobs[relative]
+    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
+    native = dict(source=dict(required_execution_identity_keys=["processor_module_sha256"],
+                              execution_identity=dict(processor_module_sha256=source["sha256"])))
+    return binding, native, display, calls
+
+
+def test_named_native_provenance_reader_is_admitted_from_exact_job_commit(tmp_path, monkeypatch):
+    from darsia.fluidflower.native.io import sha256_file
+    binding, native, display, calls = provenance_source_fixture(tmp_path, monkeypatch)
+    binding._admit_native_code(native)
+    assert binding.asset_path(display["path"]) == Path(display["path"])
+    assert any(args[3] == "show" and args[4].startswith(binding.commit + ":") for args in calls)
+    monkeypatch.setattr(binding, "_input_digest", lambda row: pytest.fail("Code used the data digest cache"))
+    original_open = Path.open
+    reads = []
+    def observe(path, mode="r", *args, **kwargs):
+        if Path(path) == Path(display["path"]) and mode == "rb":
+            reads.append(str(path))
+        return original_open(path, mode, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", observe)
+    with binding.activate():
+        assert sha256_file(display["path"]) == display["sha256"]
+        assert sha256_file(display["path"]) == display["sha256"]
+    assert reads == [display["path"], display["path"]]
+    stranger = put(binding.repository / "tracked-but-not-an-admitted-reader.py", b"# unrelated code\n")
+    with pytest.raises(InputHashMismatch, match="outside"):
+        binding.asset_path(stranger["path"])
+
+
+def test_named_native_provenance_reader_rejects_disk_bytes_not_in_job_commit(tmp_path, monkeypatch):
+    binding, native, _display, _calls = provenance_source_fixture(tmp_path, monkeypatch, changed_display=True)
+    with pytest.raises(InputHashMismatch, match="exact execution binding"):
+        binding._admit_native_code(native)
+
+
+
+def test_original_display_contract_self_hash_runs_under_exact_admitted_binding(tmp_path, monkeypatch):
+    import importlib.util
+    from darsia.fluidflower.native import display_modes as original_display
+    _task, _config, _bound, _host, binding = fixture(tmp_path)
+    source_relative = "src/darsia/fluidflower/native/source.py"
+    display_relative = "src/darsia/fluidflower/native/display_modes.py"
+    processor = put(binding.repository / source_relative, b"# authored bound processor\n")
+    # Exact original module bytes, not a replacement renderer or inference.
+    display_raw = Path(original_display.__file__).read_bytes()
+    display = put(binding.repository / display_relative, display_raw)
+    def original_git(args, **kwargs):
+        if "ls-tree" in args:
+            assert args[-1] in (source_relative, display_relative)
+            return args[-1] + "\n"
+        assert args[3:] == ["show", binding.commit + ":" + display_relative]
+        return display_raw
+    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
+    native = dict(source=dict(required_execution_identity_keys=["processor_module_sha256"],
+                              execution_identity=dict(processor_module_sha256=processor["sha256"])))
+    binding._admit_native_code(native)
+    name = "darsia.fluidflower.native._isolated_original_display_contract"
+    spec = importlib.util.spec_from_file_location(name, display["path"])
+    module = importlib.util.module_from_spec(spec)
+    import sys
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    with binding.activate():
+        result = module.display_contract(parameters=dict(contract_metadata=dict(
+            contract="authored provenance fixture", display_only_never_features=True)))
+    assert result == dict(contract="authored provenance fixture",
+                         display_only_never_features=True, renderer_code_sha256=display["sha256"])
+    assert Path(display["path"]).read_bytes() == display_raw
+
+
+def test_input_alias_cannot_shadow_the_named_display_code_role(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline.run_io import _Replay
+    binding, native, display, _calls = provenance_source_fixture(tmp_path, monkeypatch)
+    binding._admit_native_code(native)
+    row = binding.verified.for_use("mass.calibration")
+    physical = dict(path=str(row.path), sha256=row.reference["sha256"], size_bytes=row.reference["bytes"])
+    logical = dict(physical, path=display["path"])
+    replay = _Replay(binding, [dict(logical=logical, physical=physical)])
+    with pytest.raises(InputHashMismatch, match="overlaps admitted code or owned output"):
+        replay.bind_declared_aliases()
+    assert binding.asset_path(display["path"]) == Path(display["path"])

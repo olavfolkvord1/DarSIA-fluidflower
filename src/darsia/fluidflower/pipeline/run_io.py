@@ -32,6 +32,14 @@ _CODE_ROLES = {
 }
 
 
+# Provenance self-hash in native.display_modes.display_contract(). This reader
+# has no field in source.execution_identity: bind this one named repository
+# module to the actual job commit, never admit arbitrary tracked source files.
+_PROVENANCE_CODE_ROLES = {
+    "display_contract_renderer_code_sha256": "src/darsia/fluidflower/native/display_modes.py",
+}
+
+
 def _key(path):
     return ntpath.normcase(ntpath.normpath(str(path)))
 
@@ -253,6 +261,10 @@ class RunIOBinding:
             if relative is None:
                 raise InputHashMismatch("Unsupported explicit native code consumer: " + role)
             self._admit_code(relative, expected[role], role)
+        for role, relative in _PROVENANCE_CODE_ROLES.items():
+            original = subprocess.check_output(
+                ["git", "-C", str(self.repository), "show", self.commit + ":" + relative])
+            self._admit_code(relative, hashlib.sha256(original).hexdigest(), role)
 
     def _admit_code(self, relative, digest, role):
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
