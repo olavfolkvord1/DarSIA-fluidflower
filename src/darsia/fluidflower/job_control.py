@@ -1,0 +1,89 @@
+"""Append-only UI commands for the existing whole-run queue.
+
+This is operational metadata, not another queue. Tasks, attempt leases,
+publication and verified resume remain with pipeline.job_queue/checkpoint.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from .pipeline.job_queue import descriptor, read_json, utc, write_immutable
+
+FORMAT = "darsia-job-ui-control-v1"
+ACTIONS = {"run", "pause", "stop"}
+
+
+def read_control(job_root):
+    """Read a complete immutable command chain; no directory is created."""
+    root = Path(job_root)
+    directory = root / "ui" / "commands"
+    paths = sorted(directory.glob("*.json"))
+    if not paths:
+        return {"action": "run", "sequence": 0}
+    job = descriptor(root / "job.json")
+    master_asset = descriptor(root / "ui" / "master.json")
+    master = read_json(Path(master_asset["path"]))
+    if master.get("format") != "darsia-job-ui-master-v1" or master.get("job") != job:
+        raise ValueError("Job UI master is not bound to this immutable job")
+    creator = master.get("machine")
+    if not isinstance(creator, str) or not creator.strip():
+        raise ValueError("Job UI master machine is missing")
+    previous = None
+    result = None
+    for sequence, path in enumerate(paths, 1):
+        if path.name != f"{sequence:020d}.json":
+            raise ValueError("Job UI control sequence is not contiguous")
+        value = read_json(path)
+        if (
+            value.get("format") != FORMAT
+            or type(value.get("sequence")) is not int
+            or value["sequence"] != sequence
+            or value.get("action") not in ACTIONS
+            or value.get("job") != job
+            or value.get("master") != master_asset
+            or value.get("machine") != creator
+            or value.get("previous") != previous
+        ):
+            raise ValueError("Job UI command identity or chain differs: " + str(path))
+        result = dict(value, command=descriptor(path))
+        previous = result["command"]
+    return result
+
+
+def publish_control(job_root, action, *, machine, expected_previous):
+    """Explicit master action only; refuse stale UI state and never overwrite.
+
+    Caller obtains the actual host name and an immutable master.json when the
+    job is created. Merely opening a Jobs page must never call this function.
+    """
+    if action not in ACTIONS:
+        raise ValueError("Unknown job action")
+    root = Path(job_root)
+    master_path = root / "ui" / "master.json"
+    master = read_json(master_path)
+    if master.get("machine") != machine:
+        raise ValueError("Only the job's recorded master machine writes commands")
+    if (
+        master.get("format") != "darsia-job-ui-master-v1"
+        or master.get("job") != descriptor(root / "job.json")
+    ):
+        raise ValueError("Job UI master is not bound to this immutable job")
+    current = read_control(root)
+    if current.get("command") != expected_previous:
+        raise ValueError("Job control changed; refresh before applying this action")
+    sequence = current["sequence"] + 1
+    document = dict(
+        format=FORMAT,
+        sequence=sequence,
+        action=action,
+        job=descriptor(root / "job.json"),
+        master=descriptor(master_path),
+        machine=machine,
+        previous=current.get("command"),
+        requested_utc=utc(),
+    )
+    # One sequence filename is an atomic winner if two UI instances race.
+    path = root / "ui" / "commands" / f"{sequence:020d}.json"
+    write_immutable(path, document)
+    return descriptor(path)

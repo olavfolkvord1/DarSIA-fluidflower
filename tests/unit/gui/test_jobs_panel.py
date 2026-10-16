@@ -89,10 +89,7 @@ def test_passive_navigation_reads_only_explicit_roots_no_creation_or_launch(pane
         not button.isEnabled()
         for button in [widget.pause_button, widget.resume_button, widget.stop_button]
     )
-    assert (
-        "whole run" in widget.pause_button.toolTip()
-        and "600 s" in widget.pause_button.toolTip()
-    )
+    assert "recorded master" in widget.pause_button.toolTip()
     assert "Unknown" in widget.progress_label.text()
 
 

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .job_control import publish_control, read_control
 from .jobs_metadata import JobSnapshotReader, create_job_from_plan
 from .pipeline.job_queue import descriptor, name, require_unc, write_immutable
 from .remote_worker_launch import (
@@ -61,7 +62,8 @@ from .job_launch_state import (
     record_launch_error,
 )
 
-CONTROL_PENDING = "Frame pause/stop unavailable: the current worker claims a whole run and finishes it before its next claim. Holding unclaimed tasks cannot stop a frame; automatic 600 s reclaim can enqueue new attempts. No worker-control commands are written."
+CONTROL_BOUNDARY = "Pause and stop exit after the current committed frame. Requested control is not proof of worker retirement or completed results; outputs and the original claim are preserved."
+CONTROL_LEASE = "Waiting for the existing claim lease to expire (up to 10 minutes)"
 REMOTE_GAP = "Remote start needs explicit existing SSH/checkout/interpreter facts and a confirmed PowerShell SSH default shell. Registration never contacts or installs a machine."
 
 
@@ -435,6 +437,8 @@ class JobsPanel(QWidget):
         selection_provider=None,
         remote_launcher=None,
         known_jobs_provider=None,
+        control_reader=None,
+        control_publisher=None,
     ):
         super().__init__(parent)
         self.jobs_provider, self.plans_provider, self.machines_provider = (
@@ -450,6 +454,8 @@ class JobsPanel(QWidget):
         self.selection_provider = selection_provider
         self.series_root = self.series_id = None
         self.known_jobs_provider = known_jobs_provider
+        self.control_reader = control_reader or read_control
+        self.control_publisher = control_publisher or publish_control
         self._known_launch_requests = []
         self._known_launch_errors = []
         self.series_label = ""
@@ -464,6 +470,9 @@ class JobsPanel(QWidget):
         self._launch_records = []
         self._refresh_pending = False
         self._session_requests = []
+        self._control_thread = self._control_worker = None
+        self._control_pending = False
+        self._resume_after_control = None
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
         layout.addWidget(self.context_label)
@@ -509,8 +518,11 @@ class JobsPanel(QWidget):
         )
         for button in (self.pause_button, self.resume_button, self.stop_button):
             button.setEnabled(False)
-            button.setToolTip(CONTROL_PENDING)
+            button.setToolTip(CONTROL_BOUNDARY)
             controls.addWidget(button)
+        self.pause_button.clicked.connect(self.pause_job)
+        self.resume_button.clicked.connect(self.resume_job)
+        self.stop_button.clicked.connect(self.stop_job)
         controls.addWidget(self.add_machine_button)
         layout.addLayout(controls)
         self.launch_state_label = _label("No launch request for the selected target.")
@@ -520,7 +532,9 @@ class JobsPanel(QWidget):
             self.declare_previous_service_stopped
         )
         layout.addWidget(self.declare_stopped_button)
-        self.control_note = _label(CONTROL_PENDING + " " + REMOTE_GAP)
+        self.control_state_label = _label("Control unavailable: no job selected.")
+        layout.addWidget(self.control_state_label)
+        self.control_note = _label(CONTROL_BOUNDARY + " " + REMOTE_GAP)
         layout.addWidget(self.control_note)
         self.backend_combo.currentIndexChanged.connect(self._target_changed)
         self.machine_table = _table(
@@ -615,7 +629,7 @@ class JobsPanel(QWidget):
             self._show_snapshot(None)
 
     def refresh(self, *_):
-        if self._read_thread is not None:
+        if self._read_thread is not None or self._control_pending:
             self._refresh_pending = True
             return
         if not self.registrations:
@@ -626,7 +640,9 @@ class JobsPanel(QWidget):
             result = []
             for row in rows:
                 try:
-                    result.append(self.reader(row))
+                    snapshot = dict(self.reader(row))
+                    snapshot["control"] = self._read_control_snapshot(row["root"])
+                    result.append(snapshot)
                 except Exception:
                     result.append(
                         {
@@ -707,6 +723,7 @@ class JobsPanel(QWidget):
         if self._read_thread is not None:
             self._read_thread.wait()
         self._read_thread = self._read_worker = None
+        self._target_changed()
         if self._refresh_pending:
             self._refresh_pending = False
             self.refresh()
@@ -983,6 +1000,23 @@ class JobsPanel(QWidget):
             ]
 
     def _start_allowed(self, machine):
+        if self._control_pending:
+            self._error(
+                "A control command is still being published; wait for its result."
+            )
+            return False
+        try:
+            control = self._read_control_snapshot(self.current["root"])
+            if control.get("error"):
+                raise ValueError(control["reason"])
+            if control["state"]["action"] != "run":
+                raise ValueError(
+                    "The job requests pause or stop. Use Resume on its recorded "
+                    "master machine before starting a service."
+                )
+        except Exception:
+            self._error(traceback.format_exc())
+            return False
         # Explicit Start revalidates only known roots, never searches the NAS.
         self._known_launch_requests, self._known_launch_errors = (
             self._read_known_launches()
@@ -1166,12 +1200,220 @@ class JobsPanel(QWidget):
                 if rows
                 else "No launch request for the selected target."
             )
+        control = job.get("control") or {}
+        if self._control_pending or control.get("error") or (
+            control.get("state", {}).get("action", "run") != "run"
+        ):
+            enabled = False
+            reason = reason or (
+                "The job is paused/stopped or its control metadata is unavailable. "
+                "Resume requires its recorded master machine."
+            )
         self.start_button.setEnabled(enabled)
         self.start_button.setToolTip(
             reason
             or "Explicit start of the existing whole-run worker; frame publications alone show progress."
         )
-        self.control_note.setText(CONTROL_PENDING + " " + (reason or REMOTE_GAP))
+        self.control_note.setText(CONTROL_BOUNDARY + " " + (reason or REMOTE_GAP))
+        self._show_control_state()
+
+    def _read_control_snapshot(self, root):
+        """Read commands and the bound master; never initialize a UI namespace."""
+        try:
+            state = self.control_reader(root)
+            path = Path(root) / "ui" / "master.json"
+            if not path.is_file():
+                return dict(
+                    available=False,
+                    state=state,
+                    reason="No recorded master is present for this job; frame controls are unavailable.",
+                )
+            asset = descriptor(path)
+            master = JobSnapshotReader().read(path, asset)
+            if (
+                master.get("format") != "darsia-job-ui-master-v1"
+                or master.get("job") != descriptor(Path(root) / "job.json")
+            ):
+                raise ValueError("Job UI master is not bound to this immutable job")
+            machine = master.get("machine")
+            if not isinstance(machine, str) or not machine.strip():
+                raise ValueError("Job UI master machine is missing")
+            return dict(
+                available=True, state=state, master=asset, master_machine=machine
+            )
+        except Exception:
+            return dict(available=False, error=True, reason=traceback.format_exc())
+
+    def _control_reason(self, action):
+        job = self.current or {}
+        control = job.get("control") or {}
+        if not job.get("job_facts") or job.get("errors"):
+            return "Control unavailable: selected job has no valid execution metadata."
+        if not control.get("available"):
+            return control.get("reason") or (
+                "Refresh the job's control metadata before applying a command."
+            )
+        if control.get("master_machine") != self.local_machine:
+            return "Only the job's recorded master machine writes commands: " + str(
+                control.get("master_machine")
+            )
+        if self._control_pending or self._read_thread is not None:
+            return "A metadata read or control publication is still finishing."
+        if job.get("complete"):
+            return "The job is complete; no remaining run needs control."
+        current = control["state"]["action"]
+        if action == "run" and current not in {"pause", "stop"}:
+            return "Resume requires a displayed pause or stop command."
+        if action == current:
+            return "This requested state is already displayed."
+        return ""
+
+    def _show_control_state(self):
+        control = (self.current or {}).get("control") or {}
+        if not control.get("available"):
+            self.control_state_label.setText(
+                "Control unavailable: "
+                + str(control.get("reason") or "no job selected.")
+            )
+        else:
+            state = control["state"]
+            command = state.get("command")
+            text = (
+                "Requested state: "
+                + state["action"]
+                + " · command sequence "
+                + str(state["sequence"])
+            )
+            text += (
+                "\nRecorded master: "
+                + control["master_machine"]
+                + " · This machine: "
+                + self.local_machine
+            )
+            if command:
+                text += (
+                    "\nDisplayed command: "
+                    + command["path"]
+                    + " · SHA-256 "
+                    + command["sha256"]
+                    + " · "
+                    + str(command["size_bytes"])
+                    + " bytes"
+                )
+            else:
+                text += "\nNo command has been recorded (sequence 0)."
+            if (
+                state["action"] == "run"
+                and state["sequence"]
+                and not (self.current or {}).get("complete")
+            ):
+                text += (
+                    "\nIf a previous claim remains: "
+                    + CONTROL_LEASE
+                    + ". Normal services retain the original 600 s actual-progress "
+                    "lease; the UI does not requeue a task."
+                )
+            elif state["action"] in {"pause", "stop"}:
+                text += "\nThe command is a request; worker exit is not inferred from it."
+            self.control_state_label.setText(text)
+        for action, button in (
+            ("pause", self.pause_button),
+            ("run", self.resume_button),
+            ("stop", self.stop_button),
+        ):
+            reason = self._control_reason(action)
+            button.setEnabled(not reason)
+            button.setToolTip(
+                reason or (CONTROL_LEASE if action == "run" else CONTROL_BOUNDARY)
+            )
+
+    def pause_job(self):
+        self._request_control("pause")
+
+    def stop_job(self):
+        self._request_control("stop")
+
+    def resume_job(self):
+        self._request_control("run")
+
+    def _request_control(self, action):
+        reason = self._control_reason(action)
+        if reason:
+            self._error(reason)
+            return
+        root, generation = self.current["root"], self._generation
+        displayed = deepcopy(self.current["control"])
+        resume = (
+            dict(
+                root=root,
+                generation=generation,
+                target=deepcopy(self.target_combo.currentData()),
+                backend=self.backend_combo.currentData(),
+                workers=self.workers_spin.value(),
+            )
+            if action == "run"
+            else None
+        )
+        self._resume_after_control = None
+        self._control_pending = True
+        self._target_changed()
+
+        def publish():
+            asset = self.control_publisher(
+                root,
+                action,
+                machine=self.local_machine,
+                expected_previous=displayed["state"].get("command"),
+            )
+            control = self._read_control_snapshot(root)
+            if not control.get("available") or control["state"].get("command") != asset:
+                raise ValueError(
+                    "Job control changed after publication; refresh before starting a service."
+                )
+            return dict(root=root, generation=generation, control=control, resume=resume)
+
+        self._control_thread, self._control_worker = self._start_call(
+            publish, self._control_ready, self._control_closed
+        )
+
+    @Slot(object)
+    def _control_ready(self, result):
+        if (
+            result["generation"] != self._generation
+            or not self.current
+            or self.current["root"] != result["root"]
+        ):
+            return
+        self.current["control"] = result["control"]
+        self._resume_after_control = result["resume"]
+        self._target_changed()
+
+    @Slot()
+    def _control_closed(self):
+        if self._control_thread is not None:
+            self._control_thread.wait()
+        self._control_thread = self._control_worker = None
+        self._control_pending = False
+        resume, self._resume_after_control = self._resume_after_control, None
+        self._target_changed()
+        if (
+            resume is not None
+            and resume["generation"] == self._generation
+            and self.current
+            and resume["root"] == self.current["root"]
+        ):
+            if (
+                resume["target"] == self.target_combo.currentData()
+                and resume["backend"] == self.backend_combo.currentData()
+                and resume["workers"] == self.workers_spin.value()
+            ):
+                self.start_selected_machine()
+            else:
+                self._error(
+                    "Run was requested, but the selected launch target changed; choose Start explicitly."
+                )
+        self._refresh_pending = False
+        self.refresh()
 
     def start_selected_machine(self):
         selected = self.target_combo.currentData() or {}
@@ -1248,6 +1490,8 @@ class JobsPanel(QWidget):
         return (
             self._read_thread is None
             and self._create_thread is None
+            and self._control_thread is None
+            and not self._control_pending
             and (self.resource_panel is None or self.resource_panel.can_close())
         )
 

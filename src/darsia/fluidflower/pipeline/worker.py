@@ -70,6 +70,27 @@ def verify_startup(job_root: Path) -> tuple[dict, str]:
     return job, head
 
 
+class _JobControlBoundary(Exception):
+    """A cooperative operational exit after a committed frame; never a task FAIL."""
+
+    def __init__(self, state, command=None, traceback_text=None):
+        self.state, self.command, self.traceback_text = state, command, traceback_text
+        super().__init__(state)
+
+
+def _job_control_boundary(root):
+    """Use existing frame hooks; do not change the executor or scientific inputs."""
+    from ..job_control import read_control
+
+    try:
+        command = read_control(root)
+    except Exception:
+        raise _JobControlBoundary("control_failure", traceback_text=traceback.format_exc())
+    if command["action"] in {"pause", "stop"}:
+        state = "paused" if command["action"] == "pause" else "control_stopped"
+        raise _JobControlBoundary(state, command=command)
+
+
 class ServiceLock:
     """One parent/log writer for this local machine, backend and UNC job."""
 
@@ -154,6 +175,12 @@ def _run_tasks(
     owner = _identity(machine)
     while not stop.is_set():
         try:
+            _job_control_boundary(root)
+        except _JobControlBoundary as requested:
+            messages.put(dict(kind=requested.state, command=requested.command,
+                              traceback=requested.traceback_text, actual_worker=owner))
+            return
+        try:
             shared.recover_publications()
             for record in shared.reclaim_stale():
                 messages.put(dict(kind="reclaimed", **record))
@@ -200,6 +227,10 @@ def _run_tasks(
                         event=event,
                     )
                 )
+                # frame_completed is emitted only after the original atomic
+                # publication. frame_started also permits a zero-frame pause.
+                if event.get("state") in {"frame_started", "frame_completed"}:
+                    _job_control_boundary(root)
 
             from .checkpoint import resume_source_for_claim
 
@@ -235,6 +266,14 @@ def _run_tasks(
             messages.put(
                 dict(kind="completed", run=task["run"], attempt_id=claim.token)
             )
+        except _JobControlBoundary as requested:
+            # Keep this claim attached to the parent slot so the existing exact
+            # child-retirement code binds its original manifest/frame receipts.
+            # Never publish failed/completed for an interrupted whole run.
+            messages.put(dict(kind=requested.state, run=claim.task["run"],
+                              attempt_id=claim.token, command=requested.command,
+                              traceback=requested.traceback_text))
+            return
         except LeaseLost:
             text = traceback.format_exc()
             messages.put(
@@ -568,6 +607,7 @@ def _parent(args, identity, job, commit, log):
         dict(kind="started", message=f"Worker service started at Git commit {commit}."),
     )
     fatal = False
+    control_failed = False
     try:
         while True:
             try:
@@ -642,6 +682,8 @@ def _parent(args, identity, job, commit, log):
                         # Terminal/revoked attempts do not need a numerical restart.
                         slot["claim"] = None
                     emit(log, event)
+                    if event.get("kind") == "control_failure":
+                        control_failed = True
             active = False
             for number, slot in enumerate(slots):
                 if slot["finished"]:
@@ -736,8 +778,10 @@ def _parent(args, identity, job, commit, log):
                 break
             if event.get("kind") != "watchdog_heartbeat":
                 emit(log, event)
+            if event.get("kind") == "control_failure":
+                control_failed = True
         emit(log, dict(kind="stopped", message="Worker service stopped."))
-    return 1 if fatal else 0
+    return 1 if fatal or control_failed else 0
 
 
 if __name__ == "__main__":
