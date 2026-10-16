@@ -382,6 +382,7 @@ class NormalisationStep(QWidget):
         self.series_root, self.series_id, self.source_folder = None, "", None
         self.snapshot, self.manifest_bytes, self.document = None, None, {}
         self.ready = False
+        self.source_import = None
         outer = QVBoxLayout(self)
         self.status = QLabel("Missing — choose an experimental series.")
         self.status.setWordWrap(True)
@@ -397,6 +398,13 @@ class NormalisationStep(QWidget):
         self.reload_button.clicked.connect(self.reload)
         actions.addWidget(self.reload_button)
         outer.addLayout(actions)
+        self.imported_fields = QTableWidget(0, 3)
+        self.imported_fields.setHorizontalHeaderLabels(("Saved field", "Literal saved value", "Bound source pointer"))
+        self.imported_fields.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.imported_fields.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.imported_fields.horizontalHeader().setStretchLastSection(True)
+        self.imported_fields.hide()
+        outer.addWidget(self.imported_fields)
         self.ranking_note = QLabel(
             "Ranking is read from saved protocol chemistry. No correction or fit runs here."
         )
@@ -467,6 +475,15 @@ class NormalisationStep(QWidget):
 
     def reload(self):
         self.snapshot, self.manifest_bytes, self.document = None, None, {}
+        self.source_import = None
+        self.provenance.setText("Saved source snapshots are shown as historical evidence; current raw protocols are not re-read or re-ranked.")
+        self.ranking_note.setText("Ranking is read from saved protocol chemistry. No correction or fit runs here.")
+        self.imported_fields.hide()
+        self.imported_fields.setRowCount(0)
+        self.table.show()
+        self.override.show()
+        self.reference.show()
+        self.save_button.show()
         self.table.setRowCount(0)
         with QSignalBlocker(self.reference), QSignalBlocker(self.override):
             self.reference.clear()
@@ -479,6 +496,11 @@ class NormalisationStep(QWidget):
             saved = document.get("phase_normalisation") or {}
             if not isinstance(saved, dict):
                 raise ValueError("The saved normalisation section is not a table.")
+            from darsia.fluidflower.saved_v5_source_import import is_source_import
+            if is_source_import(saved):
+                self._show_source_import(saved, runs)
+                self._update_controls()
+                return
             if self.source_folder is None and isinstance(
                 saved.get("source_folder"), str
             ):
@@ -549,7 +571,40 @@ class NormalisationStep(QWidget):
             self._emit_ready(False)
         self._update_controls()
 
+    def _show_source_import(self, saved, runs):
+        from darsia.fluidflower.saved_v5_source_import import read_source_import, import_label
+
+        imported = read_source_import(saved, self.series_id, runs)
+        self.source_import = imported
+        self.source_label.setText(import_label(imported))
+        self.status.setText("Imported historical V5 parameters; ranking and numerical readiness are not available from the bound sources.")
+        self.ranking_note.setText("Ranking, score, majority light class and automatic reference proposal: not available from the bound sources. No ranking or normalisation was recomputed.")
+        rows = []
+        for name, value in imported["v5_raw_photometry"].items():
+            bound = imported["field_sources"]["v5_raw_photometry"]
+            rows.append((name, value, bound["source"]["sha256"] + bound["pointer"] + "/" + name))
+        for name, value in imported["materialization"].items():
+            bound = imported["field_sources"]["materialization"]
+            rows.append((name, value, bound["source"]["sha256"] + "/" + name))
+        self.imported_fields.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                text = json.dumps(value, ensure_ascii=False) if column == 1 else str(value)
+                self.imported_fields.setItem(index, column, QTableWidgetItem(text))
+        self.table.hide()
+        self.override.hide()
+        self.reference.hide()
+        self.save_button.hide()
+        self.imported_fields.show()
+        self.provenance.setText("Read-only source import. Provisional, validation-only and no-physical-geometry flags are retained literally. Saved models and mass-calibration values remain inspectable; this is not a completed normalisation or training admission.")
+        self._emit_ready(False)
+
     def _update_controls(self):
+        self.choose_source.setEnabled(self.source_import is None)
+        self.choose_source.setToolTip(
+            "This source import has no published ranking; the bound literal fields are shown below."
+            if self.source_import is not None else ""
+        )
         usable = self.snapshot is not None and self.manifest_bytes is not None
         self.reference.setEnabled(usable and self.override.isChecked())
         self.override.setEnabled(usable)

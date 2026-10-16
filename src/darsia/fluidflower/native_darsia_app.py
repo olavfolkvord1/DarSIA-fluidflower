@@ -1290,6 +1290,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.analysis_method_badge.setWordWrap(True)
         self.analysis_method_badge.hide()
         right_layout.addWidget(self.analysis_method_badge)
+        from darsia.fluidflower.frozen_reference_line import FrozenReferenceLine
+
+        self.frozen_reference_line = FrozenReferenceLine()
+        right_layout.addWidget(self.frozen_reference_line)
         self.scope_label = QLabel()
         self.scope_label.setTextFormat(Qt.TextFormat.PlainText)
         self.scope_label.setWordWrap(True)
@@ -1720,6 +1724,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 available=root is not None,
             )
             self._method_panel_seed = self.method_panel.selection()
+        self.frozen_reference_line.set_reference(root, raw)
         choice = self._saved_method
         if choice.active == "phase_model":
             from darsia.fluidflower.model_index_names import model_reference_label
@@ -1788,6 +1793,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         parent = self.method_panel.parentWidget()
         self.method_panel.setVisible(parent is not None and parent.objectName() == "nativePhaseUseStep")
         self.analysis_method_badge.setVisible(category == "analysis")
+        self.frozen_reference_line.show_for_analysis(category == "analysis")
         self.method_badge.setVisible(category != "start")
 
     def _save_method_choice(self, selection: MethodSelection) -> None:
@@ -2657,6 +2663,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.series_header.hide()
         self.method_panel.hide()
         self.analysis_method_badge.hide()
+        self.frozen_reference_line.show_for_analysis(False)
         self.scope_label.hide()
         self.rig_label.hide()
         self.run_scope_note.hide()

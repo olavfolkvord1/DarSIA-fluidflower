@@ -76,9 +76,9 @@ def test_phase_only_reports_saved_gain_beta_and_no_fake_metric_or_anchor(
     shown = values(result)
     assert shown["Gain"] == "23.859055832362177"
     assert shown["Beta"] == "0.6513006394912089"
-    assert shown["Dilution factor"] == display.NOT_REPORTED
-    assert shown["Anchor"] == display.NOT_REPORTED
-    assert shown["Saved mass-balance error"] == display.NOT_REPORTED
+    assert shown["Dilution factor"] == display.NOT_IN_CALIBRATION
+    assert shown["Anchor"] == display.NOT_IN_CALIBRATION
+    assert shown["Saved mass-balance error"] == display.NOT_IN_CALIBRATION
     assert opened == [phase]
     assert "per-image dilution factor and per-run anchor" in " ".join(result.notes)
 
@@ -96,7 +96,7 @@ def test_bound_frame_values_are_shown_verbatim_without_recalculation(phase):
     shown = values(result)
     assert shown["Dilution factor"] == "0.625"
     assert json.loads(shown["Anchor"]) == frame["anchor"]
-    assert shown["Saved mass-balance error"] == display.NOT_REPORTED
+    assert shown["Saved mass-balance error"] == display.NOT_IN_CALIBRATION
 
 
 def test_no_first_frame_default_and_explicit_selected_frame_works(phase):
@@ -104,7 +104,7 @@ def test_no_first_frame_default_and_explicit_selected_frame_works(phase):
     result = display.read_mass_calibration_display(
         "phase_model", phase, matching_result={"frames": [frame]}
     )
-    assert values(result)["Dilution factor"] == display.NOT_REPORTED
+    assert values(result)["Dilution factor"] == display.NOT_IN_CALIBRATION
     selected = display.read_mass_calibration_display(
         "phase_model", phase, matching_result={"frames": [frame], "frame": frame}
     )
@@ -120,7 +120,7 @@ def test_declared_wrong_calibration_sha_does_not_supply_frame_values(phase):
             "dilution_factor": 0.5,
         },
     )
-    assert values(result)["Dilution factor"] == display.NOT_REPORTED
+    assert values(result)["Dilution factor"] == display.NOT_IN_CALIBRATION
     assert "another calibration" in " ".join(result.notes)
 
 
@@ -238,7 +238,7 @@ def test_relative_references_use_selected_series_and_no_missing_paths_created(
     result = display.read_mass_calibration_display(
         "phase_model", phase.name, series_root=phase.parent
     )
-    assert values(result)["Gain"] != display.NOT_REPORTED
+    assert values(result)["Gain"] != display.NOT_IN_CALIBRATION
     missing = display.read_mass_calibration_display("colour_path", tmp_path / "missing")
     assert values(missing)["Saved mass-balance error"] == display.NOT_REPORTED
     assert set(tmp_path.iterdir()) == before

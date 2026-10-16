@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import uuid
 
-from PySide6.QtCore import QSignalBlocker, Signal
+from PySide6.QtCore import QSignalBlocker, Signal, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -30,6 +30,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+def saved_method_text(selection):
+    """Literal saved method and references; no discovery or inferred choice."""
+    if selection.error:
+        return "Saved method unavailable — " + selection.error
+    if selection.active == "phase_model":
+        return ("phase_model · " + (selection.model_version or "model not referenced")
+                + " · " + (selection.mass_calibration or "calibration not referenced"))
+    if selection.active == "colour_path":
+        return "colour_path · " + (selection.colour_calibration or "calibration not referenced")
+    return "Method: not chosen"
 
 
 class SessionSettings:
@@ -226,6 +238,12 @@ class NativePhaseSteps(QWidget):
             self.attach_normalisation(normalisation)
         self._build_basis()
         self._build_review()
+        self.review_selection_notice = QLabel(
+            "Choose a review collection using the existing review controls. "
+            "No collection is selected automatically."
+        )
+        self.review_selection_notice.setWordWrap(True)
+        self.layouts[3].insertWidget(0, self.review_selection_notice)
         self._build_training()
         if mass_panel is None:
             self.layouts[5].addWidget(
@@ -233,6 +251,10 @@ class NativePhaseSteps(QWidget):
             )
         else:
             _move(mass_panel, self.layouts[5])
+        self.saved_method_label = QLabel("Method: not chosen")
+        self.saved_method_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.saved_method_label.setWordWrap(True)
+        self.layouts[6].addWidget(self.saved_method_label)
         if method_panel is None:
             self.layouts[6].addWidget(
                 QLabel("The series method panel is not attached.")
@@ -519,6 +541,10 @@ class NativePhaseSteps(QWidget):
     def refresh(self, *_args):
         if not hasattr(self, "groups") or not hasattr(self, "model_name"):
             return
+        from darsia.fluidflower.series_method import MethodSelection, read_series_method
+
+        saved = read_series_method(self.series_root) if self.series_root else MethodSelection()
+        self.saved_method_label.setText(saved_method_text(saved))
         photometry = getattr(self, "training_photometry", None)
         if photometry is not None:
             photometry.refresh()

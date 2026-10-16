@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 NOT_REPORTED = "Not reported"
+NOT_IN_CALIBRATION = "Not in this calibration document"
 MAX_JSON_BYTES = 1024 * 1024
 MAX_CSV_BYTES = 256 * 1024
 MAX_SIGNAL_FILES = 64
@@ -134,6 +135,8 @@ def _phase_display(reference, series_root, matching_result) -> SavedMassCalibrat
         if path is not None
         else "No readable explicit phase calibration reference"
     )
+    frozen_round4 = saved.get("contract") == "ffac-common-mass-round3-frozen-v1" and saved.get("frozen") is True
+    absent = NOT_IN_CALIBRATION if frozen_round4 else NOT_REPORTED
     parameters = _mapping(saved.get("parameters"))
     if not parameters:
         parameters = _mapping(_mapping(saved.get("calibration")).get("parameters"))
@@ -141,7 +144,7 @@ def _phase_display(reference, series_root, matching_result) -> SavedMassCalibrat
         parameters = _mapping(_mapping(saved.get("scalar_result")).get("parameters"))
     for title, key in (("Gain", "gain"), ("Beta", "beta")):
         rows.append(
-            (title, _text(parameters.get(key)), "Shared saved calibration; " + source)
+            (title, _text(parameters.get(key)) if key in parameters else absent, "Shared saved calibration; " + source)
         )
 
     result = _bound_matching_result(reference, matching_result, notes)
@@ -164,12 +167,12 @@ def _phase_display(reference, series_root, matching_result) -> SavedMassCalibrat
         if _text(anchor.get(key)) != NOT_REPORTED
     }
     anchor_text = (
-        json.dumps(anchor_fields, ensure_ascii=False) if anchor_fields else NOT_REPORTED
+        json.dumps(anchor_fields, ensure_ascii=False) if anchor_fields else absent
     )
     frame_source = "Selected saved image"
     rows.extend(
         (
-            ("Dilution factor", _text(factor), "Per image; " + frame_source),
+            ("Dilution factor", _text(factor) if factor is not None else absent, "Per image; " + frame_source),
             (
                 "Anchor",
                 anchor_text,
@@ -194,7 +197,7 @@ def _phase_display(reference, series_root, matching_result) -> SavedMassCalibrat
         error
         or (
             "Saved mass-balance error",
-            NOT_REPORTED,
+            absent,
             "No error is reported with this saved calibration.",
         )
     )
