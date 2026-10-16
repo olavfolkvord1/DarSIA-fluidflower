@@ -55,6 +55,7 @@ class FakeStudio(QWidget):
         self.saved_sessions = QComboBox()
         self.saved_sessions.addItem("Original saved session", "session-a")
         self.validation_model_summary = QLabel("Original model summary")
+        self.catalog_loading_status = QLabel("Original catalogue status")
         self.open_model_correction = QPushButton("Open model correction")
         self.open_model_correction.clicked.connect(
             lambda: self._launch_review("open_correction")
@@ -109,6 +110,9 @@ class FakeStudio(QWidget):
 
     def set_project_root(self, root, **kwargs):
         self.calls.append("original-project-preferences")
+
+    def set_saved_model_preference(self, root, *, context_key):
+        self.saved_preference = (root, context_key)
 
     def _sync_default_model_libraries(self):
         self.calls.append("original-library-sync")
@@ -165,6 +169,7 @@ def test_one_numbered_page_reuses_actual_widgets_and_original_parameters(setup):
     assert s.studio.validation_model is s.choices
     assert s.studio.saved_sessions is s.sessions
     assert s.choices.parentWidget() is s.steps.groups[2]
+    assert s.studio.catalog_loading_status.parentWidget() is s.steps.groups[2]
     assert s.sessions.parentWidget() is s.steps.groups[4]
     assert s.studio.open_model_correction.parentWidget() is s.steps.groups[3]
     assert s.studio.original_parameter.text() == "Original numerical setting untouched"

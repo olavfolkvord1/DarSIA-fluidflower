@@ -358,6 +358,7 @@ class NativePhaseSteps(QWidget):
         row.addWidget(self.scratch_basis)
         self.layouts[2].addLayout(row)
         _move(studio.validation_model, self.layouts[2])
+        _move(studio.catalog_loading_status, self.layouts[2])
         self.import_button = QPushButton("Import existing model…")
         self.import_button.clicked.connect(self._import_model)
         self.layouts[2].addWidget(self.import_button)
@@ -484,6 +485,15 @@ class NativePhaseSteps(QWidget):
         with QSignalBlocker(studio.training_series):
             studio.training_series.setText(canonical)
         studio._sync_default_model_libraries()
+        from .series_method import read_series_method
+
+        choice = read_series_method(self.series_root) if self.series_root is not None else None
+        model = choice.model_version if choice is not None and not choice.error else ""
+        if model:
+            model = Path(model)
+            model = model if model.is_absolute() else self.series_root / model
+        context_key = (str(self.series_root or ""), os.environ.get("DARSIA_NATIVE_CONFIGURATION_SHA256"))
+        studio.set_saved_model_preference(model or None, context_key=context_key)
         if self.normalisation is not None:
             self.normalisation.set_context(self.series_root, self.series_id)
         else:

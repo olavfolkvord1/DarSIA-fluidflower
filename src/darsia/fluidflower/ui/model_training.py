@@ -51,7 +51,9 @@ from PySide6.QtWidgets import (
 from darsia.fluidflower.execution import default_execution_cache_root
 from darsia.fluidflower.model_display import created_utc_text, friendly_model_name
 from darsia.fluidflower.phase_learning import inspect_phase_model_bundle
-from darsia.fluidflower.phase_model_history import deduplicate_model_roots, discover_phase_model_history, inspect_phase_model_history_entry, registered_phase_model_defaults, project_phase_model_roots, project_result_model_roots, metadata_only_catalog
+from contextvars import copy_context
+
+from darsia.fluidflower.phase_model_history import ModelHistoryEntries, registration_context_available, run_with_registration_context, REGISTRATION_ROOTS_UNAVAILABLE, deduplicate_model_roots, discover_phase_model_history, inspect_phase_model_history_entry, registered_phase_model_defaults, project_phase_model_roots, project_result_model_roots, metadata_only_catalog
 from darsia.fluidflower.phase_workflow import (
     build_phase_review_command,
     build_phase_review_resume_command,
@@ -566,6 +568,10 @@ class SharedPhaseModelTrainingPage(QWidget):
         self._model_catalog_priority_root = ""
         self._model_catalog_metadata_generation = 0
         self._model_catalog_auto_selection_root = ""
+        self._model_catalog_diagnostics = ()
+        self._saved_model_preference_key = None
+        self._saved_model_preference_root = ""
+        self._saved_model_preference_pending = False
         self._model_catalog_ready.connect(self._apply_async_model_catalog)
         self._model_metadata_ready.connect(self._apply_async_model_metadata)
         self._model_binding_ready.connect(self._apply_async_model_binding)
@@ -2071,6 +2077,33 @@ class SharedPhaseModelTrainingPage(QWidget):
         if self.model_library.text() != previous_library:
             self._request_async_model_refresh()
 
+    def set_saved_model_preference(self, root, *, context_key):
+        """Apply one explicit saved series choice; do not override later clicks."""
+        selected = str(resolve_review_path(root)) if root else ""
+        key = (context_key, selected)
+        if key == self._saved_model_preference_key:
+            return
+        self._saved_model_preference_key = key
+        self._saved_model_preference_root = selected
+        self._saved_model_preference_pending = bool(selected)
+        self._model_catalog_auto_selection_root = ""
+        self._model_catalog_priority_root = selected
+        if selected:
+            self._populate_validation_models(preferred_root=selected)
+        # Two series may share one catalogue path. Root-text equality alone
+        # cannot authorize old-context metadata/binding callbacks after a switch.
+        self._model_catalog_generation += 1
+        self._request_async_model_refresh()
+
+    def _catalog_notice(self, message=""):
+        notices = list(self._model_catalog_diagnostics)
+        if self._saved_model_preference_pending:
+            notices.append("The saved series model is not in the loaded catalogue: "
+                           + self._saved_model_preference_root)
+        if message:
+            notices.append(message)
+        return "\n".join(dict.fromkeys(notices))
+
     def select_validation_model(self, root: Path | str, *, series_context: bool = False) -> bool:
         """Select an explicit model even when a remembered filter hides it."""
         requested = str(resolve_review_path(root)).casefold()
@@ -2093,7 +2126,10 @@ class SharedPhaseModelTrainingPage(QWidget):
         selected_root = (str(self.validation_model.currentData() or "")
                          if preferred_root is None else preferred_root)
         entries = _models_for_series(self.model_history, self._active_model_series)
-        if not any(str(row.get("root") or "") == selected_root for row in entries):
+        explicit_pending = self._saved_model_preference_pending
+        if explicit_pending:
+            selected_root = self._saved_model_preference_root
+        if not explicit_pending and not any(str(row.get("root") or "") == selected_root for row in entries):
             preferred = _newest_review_model(entries)
             selected_root = str(preferred.get("root") or "") if preferred else ""
         self.validation_model.blockSignals(True)
@@ -2114,6 +2150,8 @@ class SharedPhaseModelTrainingPage(QWidget):
             if root == selected_root:
                 selected_index = index
         self.validation_model.setCurrentIndex(selected_index)
+        if explicit_pending and selected_index >= 0:
+            self._saved_model_preference_pending = False
         self.validation_model.blockSignals(False)
         self._validation_model_changed()
 
@@ -2128,7 +2166,8 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.review_source_form.setRowVisible(0, True)
         self.review_source_form.setRowVisible(1, True)
         entry = self._selected_validation_model()
-        self._model_catalog_priority_root = str((entry or {}).get("root") or "")
+        self._model_catalog_priority_root = (self._saved_model_preference_root if self._saved_model_preference_pending
+                                             else str((entry or {}).get("root") or ""))
         self._load_pending_evidence()
         selected_series = _model_series(entry) if entry else set()
         if len(selected_series) == 1 and hasattr(self, "review_save_root"):
@@ -2302,7 +2341,8 @@ class SharedPhaseModelTrainingPage(QWidget):
                     if matching and isinstance(job, Mapping)
                     and (value := _canonical_series(job.get("dataset")))
                 })
-        return selected
+        diagnostics = (() if registration_context_available() else (REGISTRATION_ROOTS_UNAVAILABLE,))
+        return ModelHistoryEntries(selected, diagnostics=diagnostics)
 
     def _request_async_model_refresh(self, *, bindings_only: bool = False) -> None:
         """Discover new versions without pausing the Studio interaction thread."""
@@ -2326,17 +2366,40 @@ class SharedPhaseModelTrainingPage(QWidget):
         review_sessions = tuple(dict(row) for row in self.review_sessions)
         self._model_catalog_inflight = True
         self._model_catalog_root = root_text
-        self._model_catalog_priority_root = str(self.validation_model.currentData() or "")
+        self._model_catalog_priority_root = (self._saved_model_preference_root if self._saved_model_preference_pending
+                                             else str(self.validation_model.currentData() or ""))
         selected_series = self._active_model_series
-        saved_entries = [dict(entry) for entry in self.model_history] if bindings_only else None
+        saved_entries = (ModelHistoryEntries((dict(entry) for entry in self.model_history),
+                                             diagnostics=self._model_catalog_diagnostics) if bindings_only else None)
         admitted_entries = {str(entry.get("root") or ""): dict(entry)
                             for entry in self.model_history if entry.get("validation_binding")}
 
+        registration_error = None
+        try:
+            registration_available = registration_context_available()
+        except Exception as error:  # Kept as the original visible catalogue error, never absence.
+            registration_available, registration_error = None, error
+
         def discover() -> None:
             try:
+                if registration_error is not None:
+                    raise registration_error
                 entries = saved_entries if bindings_only else self._discover_model_entries(root_text, completed_roots)
                 pending = []
                 for entry in entries:
+                    if registration_available is False:
+                        # Metadata remains visible and indexed identity unchanged.
+                        # No original admission/cache reader may adopt a later
+                        # series' global environment on behalf of this context.
+                        entry["validation_binding"] = None
+                        entry.pop("validation_binding_guard", None)
+                        entry["catalog_admission_pending"] = True
+                        entry["validation_binding_loading"] = False
+                        entry["validation_collection_error"] = REGISTRATION_ROOTS_UNAVAILABLE
+                        for key in ("p1_final_registered_complete", "p1_final2_registered_complete", "p1_final3_registered_complete"):
+                            if key in entry:
+                                entry[key] = False
+                        continue
                     old = admitted_entries.get(str(entry.get("root") or ""), {})
                     guard = old.get("validation_binding_guard")
                     if (not bindings_only and guard and not entry.get("errors")
@@ -2361,7 +2424,7 @@ class SharedPhaseModelTrainingPage(QWidget):
                 # Publish lightweight choices first. Scientific saved-map
                 # admission is needed only for the selected model.
                 self._model_metadata_ready.emit(
-                    (generation, root_text, [dict(entry) for entry in entries])
+                    (generation, root_text, [dict(entry) for entry in entries], tuple(getattr(entries, "diagnostics", ())))
                 )
                 ordered = _models_for_series(pending, selected_series)
                 priority_roots = {str(entry.get("root") or "") for entry in ordered}
@@ -2398,27 +2461,33 @@ class SharedPhaseModelTrainingPage(QWidget):
                 # The page may have closed while network discovery was running.
                 pass
 
-        Thread(target=discover, name="phase-model-catalog", daemon=True).start()
+        catalogue_context = copy_context()
+        Thread(target=lambda: catalogue_context.run(
+            run_with_registration_context, discover, available=registration_available
+        ), name="phase-model-catalog", daemon=True).start()
 
     def _apply_async_model_metadata(self, result: object) -> None:
-        generation, root_text, entries = result
+        generation, root_text, entries = result[:3]
+        diagnostics = tuple(result[3]) if len(result) > 3 else tuple(getattr(entries, "diagnostics", ()))
         if (generation != self._model_catalog_generation
                 or root_text != self.model_library.text().strip()):
             return
         self._model_catalog_metadata_generation = generation
+        self._model_catalog_diagnostics = diagnostics
         first_selection = not self.validation_model.currentData()
         self._install_model_history(entries)
-        if first_selection:
+        if first_selection and not self._saved_model_preference_root:
             self._model_catalog_auto_selection_root = str(self.validation_model.currentData() or "")
         if (self._selected_validation_model() or {}).get("validation_binding_loading") and not self.catalog_loading_status.text().startswith("Could not load"):
             self.catalog_loading_status.setText(
-                "Model versions loaded; checking the selected model's saved phase maps in the background…"
+                self._catalog_notice("Model versions loaded; checking the selected model's saved phase maps in the background…")
             )
             self.catalog_loading_status.show()
 
     def _note_model_catalog_selection(self, _index: int = -1) -> None:
         """An explicit choice must never follow background binding results."""
         self._model_catalog_auto_selection_root = ""
+        self._saved_model_preference_pending = False
 
     def _apply_async_model_binding(self, result: object) -> None:
         generation, root_text, verified = result
@@ -2484,7 +2553,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             if (entry.get("validation_binding")
                     and not self.catalog_loading_status.text().startswith("Could not load")):
                 self.catalog_loading_status.setText(
-                    "Selected model's saved phase maps are ready. Other versions are checked when selected."
+                    self._catalog_notice("Selected model's saved phase maps are ready. Other versions are checked when selected.")
                 )
 
     def _apply_async_model_catalog(self, result: object) -> None:
@@ -2493,15 +2562,19 @@ class SharedPhaseModelTrainingPage(QWidget):
         changed_root = root_text != self.model_library.text().strip()
         if generation == self._model_catalog_generation and not changed_root:
             if error is None:
+                self._model_catalog_diagnostics = tuple(getattr(entries, "diagnostics", ()))
                 if self._model_catalog_metadata_generation != generation:
                     self._install_model_history(entries)
                 selected = self._selected_validation_model() or {}
                 if selected.get("validation_binding_loading"):
-                    self.catalog_loading_status.setText("Checking the selected model's saved phase-map binding…")
+                    self.catalog_loading_status.setText(self._catalog_notice("Checking the selected model's saved phase-map binding…"))
                     self.catalog_loading_status.show()
                 elif selected.get("validation_collection_error"):
-                    self.catalog_loading_status.setText("Could not verify the selected model's saved phase maps: "
-                                                       + str(selected["validation_collection_error"]))
+                    self.catalog_loading_status.setText(self._catalog_notice("Could not verify the selected model's saved phase maps: "
+                                                        + str(selected["validation_collection_error"])))
+                    self.catalog_loading_status.show()
+                elif self._catalog_notice():
+                    self.catalog_loading_status.setText(self._catalog_notice())
                     self.catalog_loading_status.show()
                 elif not self.catalog_loading_status.text().startswith("Could not load"):
                     self.catalog_loading_status.hide()
@@ -2538,8 +2611,12 @@ class SharedPhaseModelTrainingPage(QWidget):
             self.catalog_loading_status.setText(message)
             self.catalog_loading_status.show()
             return
+        self._model_catalog_diagnostics = tuple(getattr(entries, "diagnostics", ()))
         self._install_model_history(entries, follow_newest=follow_newest,
                                     selected_root=selected_root)
+        if self._catalog_notice():
+            self.catalog_loading_status.setText(self._catalog_notice())
+            self.catalog_loading_status.show()
 
     def _catalog_validation_binding(self, entry, *, review_sessions=None):
         """A failed saved-review binding belongs to one model, not the whole list."""
@@ -3055,7 +3132,8 @@ class SharedPhaseModelTrainingPage(QWidget):
                 # The window may have closed during network discovery.
                 pass
 
-        Thread(target=discover, name="phase-review-catalog", daemon=True).start()
+        review_context = copy_context()
+        Thread(target=lambda: review_context.run(discover), name="phase-review-catalog", daemon=True).start()
 
     def _apply_async_review_sessions(self, result: object) -> None:
         sessions, error = result
@@ -3063,11 +3141,11 @@ class SharedPhaseModelTrainingPage(QWidget):
         if error is None:
             self._install_review_sessions(sessions)
             self.catalog_loading_status.setText(
-                "Saved reviews loaded; checking model versions in the background…"
+                self._catalog_notice("Saved reviews loaded; checking model versions in the background…")
             )
         else:
             self.catalog_loading_status.setText(
-                f"Could not load saved reviews: {error}. Model versions are still being checked."
+                self._catalog_notice(f"Could not load saved reviews: {error}. Model versions are still being checked.")
             )
         # Existing saved bindings were verified by the catalogue worker. Only
         # legacy, still-unbound models need the newly discovered sessions, and

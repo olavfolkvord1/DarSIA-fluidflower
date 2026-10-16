@@ -36,6 +36,7 @@ def _require(value, message):
         raise ValueError(message)
 
 def __getattr__(name):
+    if name.startswith("__") and name.endswith("__"): raise AttributeError(name)
     if name not in configured_parameters("registration")["public_exports"]:
         raise AttributeError(name)
     return _global(configured_parameters("registration")["track1"], name)

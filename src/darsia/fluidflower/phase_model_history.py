@@ -21,6 +21,49 @@ from darsia.fluidflower.review_storage import resolve_review_path
 
 PHASE_MODEL_HISTORY_FORMAT = "darsia-fluidflower-phase-model-history-v1"
 _CATALOG_METADATA_ONLY = ContextVar("phase_catalog_metadata_only", default=False)
+REGISTRATION_ROOTS_UNAVAILABLE = "registration roots unavailable: no native parameter document bound (series.toml [native])"
+_CATALOG_NATIVE_AVAILABLE = ContextVar("phase_catalog_captured_native_available", default=None)
+
+
+class ModelHistoryEntries(list):
+    """Existing list API, plus read-only discovery diagnostics for the UI."""
+
+    def __init__(self, entries=(), *, diagnostics=()):
+        super().__init__(entries)
+        self.diagnostics = tuple(dict.fromkeys(diagnostics))
+
+
+def registration_context_available():
+    """Only an absent document is optional; a present invalid binding is not."""
+    if _CATALOG_NATIVE_AVAILABLE.get() is False:
+        return False  # Explicit captured absence must never consult a later env.
+    from .native.config import require_configuration
+
+    try:
+        require_configuration()
+    except ValueError as error:
+        if str(error) != "An explicit native parameter document is required":
+            raise
+        if any(os.environ.get(key) for key in
+               ("DARSIA_NATIVE_CONFIGURATION", "DARSIA_NATIVE_CONFIGURATION_SHA256")):
+            raise ValueError("Native parameter environment needs both configuration and SHA-256") from error
+        return False
+    return True
+
+
+def run_with_registration_context(callback, *, available=None):
+    """UI catalogue-only scope; default direct callers retain their own context.
+
+    This flag is not a native parameter document and grants no saved-map
+    admission. It only preserves an explicit missing-document observation.
+    """
+    if available is None:
+        return callback()
+    token = _CATALOG_NATIVE_AVAILABLE.set(available)
+    try:
+        return callback()
+    finally:
+        _CATALOG_NATIVE_AVAILABLE.reset(token)
 
 
 def metadata_only_catalog(function):
@@ -104,7 +147,7 @@ def project_result_model_roots() -> list[Path]:
     training request but no completed model files yet.
     """
     from .series_paths import configured_series
-    from .phase_saved_registration import registered_roots
+    registration_available = registration_context_available()
 
     roots: list[Path] = []
     for _series, _label, project_root in configured_series():
@@ -112,7 +155,8 @@ def project_result_model_roots() -> list[Path]:
             path for path in _model_directories(project_root / "results", max_depth=3)
             if path.name.startswith("phase-model-")
         )
-        if _series == "ffac":
+        if _series == "ffac" and registration_available:
+            from .phase_saved_registration import registered_roots
             roots.extend(registered_roots(results=project_root / "results"))
     return sorted(deduplicate_model_roots(roots))
 
@@ -1089,8 +1133,10 @@ def discover_phase_model_history(
                    if root.is_dir() else [])
     directories = [Path(record["root"]) for record in library_records if record["available"]] + directories
     directories.extend(Path(p) for p in registered_phase_model_defaults().values())
-    from .phase_saved_registration import registered_roots
-    directories.extend(registered_roots())
+    registration_available = registration_context_available()
+    if registration_available:
+        from .phase_saved_registration import registered_roots
+        directories.extend(registered_roots())
     review_root = str(os.environ.get("DARSIA_FLUIDFLOWER_PHASE_MODEL_REVIEW_ROOT") or "").strip()
     if review_root:
         directories.extend(_review_candidate_directories(Path(review_root).expanduser()))
@@ -1109,19 +1155,21 @@ def discover_phase_model_history(
     valid_targets = {os.path.normcase(os.path.normpath(record["root"])) for record in library_records if record["available"]}
     blocked = {os.path.normcase(os.path.normpath(record["target_root"])) for record in library_records
                if not record["available"] and record.get("target_root")} - valid_targets
-    entries = [inspect_phase_model_history_entry(path)
+    inspector = (inspect_phase_model_history_entry if registration_available
+                 else metadata_only_catalog(inspect_phase_model_history_entry))
+    entries = [inspector(path)
                for path in deduplicate_versions(directories)
                if os.path.normcase(os.path.normpath(str(path))) not in blocked]
     entries.extend(unavailable_history_entry(record) for record in library_records if not record["available"])
     attach_library_metadata(entries, library_records)
-    return sorted(
+    return ModelHistoryEntries(sorted(
         entries,
         key=lambda row: (
             float(row.get("created_timestamp") or 0.0),
             str(row.get("model_id") or ""),
         ),
         reverse=True,
-    )
+    ), diagnostics=(() if registration_available else (REGISTRATION_ROOTS_UNAVAILABLE,)))
 
 
 __all__ = [

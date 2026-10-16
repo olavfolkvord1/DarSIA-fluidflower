@@ -318,6 +318,7 @@ class PhaseModelWorkspace(QWidget):
         *,
         series: Sequence[tuple[str, str, Path]] | None = None,
         initial_series: str | None = None,
+        native_context_binder=None,
     ) -> None:
         super().__init__()
         self.configured_series = tuple(
@@ -329,6 +330,7 @@ class PhaseModelWorkspace(QWidget):
         )
         self.setObjectName("phaseModelWorkspace")
         self.studio_page: QWidget | None = None
+        self.native_context_binder = native_context_binder
         self._requested_mode = "training"
 
         layout = QVBoxLayout(self)
@@ -416,6 +418,7 @@ class PhaseModelWorkspace(QWidget):
 
         self._selected_series = initial_series
         self._update_series_folder()
+        self._bind_native_context()
         self.series_selector.currentIndexChanged.connect(self._series_changed)
 
     @property
@@ -441,6 +444,30 @@ class PhaseModelWorkspace(QWidget):
         self.series_selector.blockSignals(False)
         self._series_changed(-1)
 
+    def _bind_native_context(self) -> bool:
+        """Bind before Studio construction/catalogue requests; no fallback input."""
+        if self.native_context_binder is None:
+            return True
+        previous_error = getattr(self, "_native_context_error", "")
+        try:
+            self.native_context_binder(self.series_roots.get(self.series_id))
+        except (OSError, ValueError, TypeError) as error:
+            self._native_context_error = f"Could not bind the series native configuration: {type(error).__name__}: {error}"
+            self.series_support_status.setText(self._native_context_error)
+            self.series_support_status.show()
+            return False
+        self._native_context_error = ""
+        if previous_error and self.series_support_status.text() == previous_error:
+            self.series_support_status.clear()
+            self.series_support_status.hide()
+        if getattr(self, "_native_context_disabled", False) and self.studio_page is not None:
+            self._native_context_disabled = False
+            self.studio_page.setEnabled(True)
+            studio = getattr(self.studio_page, "studio", None)
+            if studio is not None:
+                self._bind_studio_series(studio)
+        return True
+
     def ensure_studio(self) -> QWidget:
         """Create the adapter once; it creates SharedPhaseModelTrainingPage on show."""
         if not self.series_id:
@@ -449,6 +476,13 @@ class PhaseModelWorkspace(QWidget):
                 "opening phase-model training or mass calibration."
             )
             return self.studio_placeholder
+        if not self._bind_native_context():
+            if self.studio_placeholder is not None:
+                self.studio_placeholder.setText(self._native_context_error)
+                return self.studio_placeholder
+            self._native_context_disabled = True
+            self.studio_page.setEnabled(False)
+            return self.studio_page
         if self.studio_page is None:
             from darsia.fluidflower.native_phase_subpage import NativePhaseModelStudioSubpage
 
@@ -548,6 +582,10 @@ class PhaseModelWorkspace(QWidget):
                 self.series_selector.blockSignals(False)
                 return
 
+        if not self._bind_native_context():
+            with QSignalBlocker(self.series_selector):
+                self.series_selector.setCurrentIndex(self.series_selector.findData(self._selected_series))
+            return
         self._selected_series = self.series_id
         self._update_series_folder()
         if page is None:
@@ -1295,8 +1333,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         self.geometry_workspace._show_export_dialog = export_finished
         self.content_stack.addWidget(self.geometry_workspace)
+        from darsia.fluidflower.series_native_context import SeriesNativeContext
+
+        self._series_native_context = SeriesNativeContext()
         self.phase_model_workspace = PhaseModelWorkspace(
-            series=series, initial_series=initial_series
+            series=series, initial_series=initial_series,
+            native_context_binder=self._series_native_context.bind,
         )
         self.phase_model_workspace.calibration_sidebar.hide()
         self.phase_model_workspace.native_step_options = {
@@ -1969,6 +2011,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+        if event.isAccepted():
+            self._series_native_context.close()
 
     def ensure_mass_analysis(self) -> QWidget:
         """Create production mass analysis as its own top-level workspace."""
