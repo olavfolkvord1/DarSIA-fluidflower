@@ -6,6 +6,7 @@ browser. Opening it never fits a calibration, starts workers, or publishes mass 
 
 from __future__ import annotations
 
+from contextvars import copy_context
 from pathlib import Path
 from typing import Callable
 
@@ -16,14 +17,18 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
 from darsia.fluidflower.model_display import friendly_model_name
 from darsia.fluidflower.series_paths import configured_series
 from darsia.fluidflower.phase_model_history import (
-    _model_directories, inspect_phase_model_history_entry,
+    _model_directories, inspect_phase_model_history_entry, metadata_only_catalog,
+    ModelHistoryEntries, registration_context_available, REGISTRATION_ROOTS_UNAVAILABLE,
+    run_with_registration_context,
 )
 from darsia.fluidflower.tools.phase_studio_series_ui import ModelMassLookup, SeriesMassWorkspace
 
 
+@metadata_only_catalog
 def _series_models(series: str, project_root: Path,
                    cancelled: Callable[[], bool] | None = None) -> list[dict]:
     """Show every recorded model in this series, including QA-fail candidates."""
+    native_available = registration_context_available()
     root = Path(project_root).resolve()
     found: dict[str, dict] = {}
     # Scan only this series' model library and bounded result tree. The general
@@ -48,8 +53,10 @@ def _series_models(series: str, project_root: Path,
             belongs_here = False
         if belongs_here:
             found[str(model_root).casefold()] = entry
-    return sorted(found.values(), key=lambda row: (float(row.get("created_timestamp") or 0),
-                                                    str(row.get("model_id") or "")), reverse=True)
+    return ModelHistoryEntries(
+        sorted(found.values(), key=lambda row: (float(row.get("created_timestamp") or 0),
+                                              str(row.get("model_id") or "")), reverse=True),
+        diagnostics=(() if native_available else (REGISTRATION_ROOTS_UNAVAILABLE,)))
 
 
 class _ModelChoicesLookup(QThread):
@@ -59,11 +66,23 @@ class _ModelChoicesLookup(QThread):
         super().__init__(parent)
         self.series = series
         self.project_root = Path(project_root)
+        # Match Studio catalogue refresh: capture the verified owner context,
+        # including explicit absence/error, before entering a Qt worker thread.
+        self._catalogue_context = copy_context()
+        self._registration_error = None
+        try:
+            self._registration_available = registration_context_available()
+        except Exception as error:
+            self._registration_available, self._registration_error = None, error
 
     def run(self):
         try:
-            rows = _series_models(
-                self.series, self.project_root, self.isInterruptionRequested
+            if self._registration_error is not None:
+                raise self._registration_error
+            rows = self._catalogue_context.run(
+                run_with_registration_context,
+                lambda: _series_models(self.series, self.project_root, self.isInterruptionRequested),
+                available=self._registration_available,
             )
             if not self.isInterruptionRequested():
                 self.ready.emit(rows, "")
@@ -219,7 +238,9 @@ class MassAnalysisWorkspace(QWidget):
         index = self.model.findData(previous) if previous else -1
         self.model.setCurrentIndex(max(index, 0))
         self.model.blockSignals(False)
-        self.status.setText(f"{len(rows)} recorded model versions. QA warnings remain visible; choose one to load its fixed maps.")
+        diagnostics = tuple(getattr(rows, "diagnostics", ()))
+        self.status.setText(f"{len(rows)} recorded model versions. QA warnings remain visible; choose one to load its fixed maps."
+                           + ("\n" + "\n".join(diagnostics) if diagnostics else ""))
         if index > 0:
             self._selected_model_changed()
 
