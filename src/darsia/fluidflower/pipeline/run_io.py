@@ -85,6 +85,27 @@ class _Replay(InputCatalog):
         return deepcopy(ref)
 
 
+    def bind_declared_aliases(self):
+        """Admit exact authored spellings only for already consumed inputs.
+
+        The original DATA may name one input both absolutely and relatively.
+        These are explicit path/SHA/size aliases, never cwd or suffix searches.
+        An alias cannot add a resource to the verified named-consumer closure.
+        """
+        for logical, physical in self.aliases.items():
+            row = self.binding.locations.get(_key(physical["path"]))
+            if row is None:
+                continue  # An unconsumed alias is not execution admission.
+            if (physical["sha256"] != row.reference["sha256"]
+                    or ("size_bytes" in physical
+                        and physical["size_bytes"] != row.reference["bytes"])):
+                raise InputHashMismatch("Declared alias differs from its verified consumed input")
+            if (_key(logical) in self.binding.code_locations
+                    or self.binding._own_output(logical)):
+                raise InputHashMismatch("Declared input alias overlaps admitted code or owned output")
+            self.binding._input_digest(row)
+            self.binding._bind_data_path(logical, row)
+
     def doc(self, descriptor, role, use):
         """Decode the same strict JSON after exact once-per-run admission."""
         reference = self.add(descriptor, role, use)
@@ -184,6 +205,7 @@ class RunIOBinding:
         if config.get("format") == "darsia-native-phase-n1-run-v1":
             native = self._metadata_bytes(self._descriptor_location(config["native"]["configuration"]))
             self._admit_native_code(_json_bytes(native))
+        replay.bind_declared_aliases()
         self._replayed = True
         return self
 

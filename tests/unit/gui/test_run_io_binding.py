@@ -26,7 +26,7 @@ def doc(path,value):
     return put(path,json.dumps(value,sort_keys=True).encode())
 
 
-def fixture(tmp_path):
+def fixture(tmp_path, *, declared_alias=None):
     canonical=tmp_path/"old-location";canonical.mkdir()
     def payload(key):return put(canonical/(key+".npy"),b"opaque authored input; never decoded")
     def metadata(key):return doc(canonical/(key+".json"),{})
@@ -40,11 +40,15 @@ def fixture(tmp_path):
         shared=dict(physical_reference=payload("physical"),floor_curve=payload("floor"),
                     depth_points=[],reference_matrix=[],clearwater=dict(rgb=payload("clear"),valid=payload("clear_valid")),
                     optics=dict(metadata=metadata("optics"),color_paths={},signals={},flash=metadata("flash"))))
+    if declared_alias is not None:
+        config["data_aliases"] = [dict(
+            logical=dict(config["calibration"], path=declared_alias),
+            physical=dict(config["calibration"]))]
     config_bound=doc(canonical/"run.json",config)
     manifest=put(canonical/"series.toml",b'schema_version=1\nseries_id="Synthetic"\n[roots]\nseries="."\n')
     text='[[runs]]\nrun="ac52"\n[runs.configuration]\npath='+json.dumps(config_bound["path"])+'\nsha256="'+config_bound["sha256"]+'"\nsize_bytes='+str(config_bound["size_bytes"])+'\n'
     execution=put(canonical/"execution.toml",text.encode())
-    catalogue=InputCatalog({"series":str(canonical)})
+    catalogue=InputCatalog({"series":str(canonical)}, config.get("data_aliases", ()))
     series_ref=catalogue.add(execution,"configuration","run.execution_series")
     manifest_ref=catalogue.add(manifest,"configuration","run.series_manifest")
     inputs=catalogue.collect(config_bound,config);inputs["runtime_support"]="darsia-role-io-runtime-v1"
@@ -432,3 +436,69 @@ def test_native_input_overlap_cannot_shadow_code_own_or_prefix_hash(tmp_path,mon
         binding.locations[_key(logical)]=replace(input_row,path=Path(own["path"]))
         with pytest.raises(InputHashMismatch,match="overlaps"):
             sha256_file(logical)
+
+
+
+def test_native_relative_declared_alias_replays_exact_input_without_cwd_fallback(tmp_path, monkeypatch):
+    from darsia.fluidflower.native.io import resolve_asset_path, sha256_file
+    logical = r"outputs\historical-fit\ac52_baseline.json"
+    _task, config, _bound, host, binding = fixture(tmp_path, declared_alias=logical)
+    elsewhere = tmp_path / "unrelated-cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    original_open = Path.open
+    def no_relative_probe(path, *args, **kwargs):
+        assert str(path) != logical, "Relative historical spelling was opened from cwd"
+        return original_open(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", no_relative_probe)
+    with binding.activate():
+        actual = resolve_asset_path(logical, {})
+        assert actual == host / "calibration.json"
+        assert sha256_file(actual) == config["calibration"]["sha256"]
+        with pytest.raises(InputHashMismatch, match="outside"):
+            resolve_asset_path(r"other\ac52_baseline.json", {})
+
+
+@pytest.mark.parametrize("field,value", [("sha256", "0" * 64), ("size_bytes", 999)])
+def test_declared_alias_identity_mismatch_is_refused(tmp_path, field, value):
+    from darsia.fluidflower.pipeline.run_io import _Replay
+    _task, config, _bound, _host, binding = fixture(tmp_path)
+    physical = dict(config["calibration"], **{field: value})
+    logical = dict(physical, path=r"outputs\exact-but-wrong-identity.json")
+    replay = _Replay(binding, [dict(logical=logical, physical=physical)])
+    with pytest.raises(InputHashMismatch, match="verified consumed input"):
+        replay.bind_declared_aliases()
+    with pytest.raises(InputHashMismatch, match="outside"):
+        binding.asset_path(logical["path"])
+
+
+def test_unconsumed_declared_alias_does_not_add_an_input(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline.run_io import _Replay
+    _task, _config, _bound, _host, binding = fixture(tmp_path)
+    physical = dict(path=str(tmp_path / "not-consumed.npy"), sha256="0" * 64, size_bytes=123)
+    logical = dict(physical, path=r"outputs\not-consumed.npy")
+    replay = _Replay(binding, [dict(logical=logical, physical=physical)])
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: pytest.fail("Unconsumed alias was opened"))
+    replay.bind_declared_aliases()
+    with pytest.raises(InputHashMismatch, match="outside"):
+        binding.asset_path(logical["path"])
+
+
+def test_declared_alias_cannot_replace_an_existing_verified_locator(tmp_path):
+    from darsia.fluidflower.pipeline.run_io import _Replay
+    _task, config, _bound, _host, binding = fixture(tmp_path)
+    physical = config["physical_correction"]
+    logical = dict(physical, path=config["calibration"]["path"])
+    replay = _Replay(binding, [dict(logical=logical, physical=physical)])
+    with pytest.raises(InputHashMismatch, match="conflicting verified input"):
+        replay.bind_declared_aliases()
+
+
+def test_declared_alias_cannot_shadow_owned_output(tmp_path):
+    from darsia.fluidflower.pipeline.run_io import _Replay
+    _task, config, _bound, _host, binding = fixture(tmp_path)
+    physical = config["calibration"]
+    logical = dict(physical, path=str(binding.output / "own.json"))
+    replay = _Replay(binding, [dict(logical=logical, physical=physical)])
+    with pytest.raises(InputHashMismatch, match="overlaps admitted code or owned output"):
+        replay.bind_declared_aliases()
