@@ -19,56 +19,17 @@ from . import series
 from .job_queue import JobQueue, descriptor, read_json, require_unc, write_immutable
 
 
-def prepare_job(series_path, job_root, *, expected_sha256):
-    """Create the immutable job/tasks for the fixed selection, then enqueue once.
+def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None):
+    """Prepare new versioned alias metadata; legacy jobs remain readable/runnable.
 
-    This is metadata preparation only. Reusing the exact already prepared job
-    is allowed; conflicting terminal/pending/scientific task records fail.
+    The registered schema-1 manifest is explicit because an execution-series
+    plan is a different document. No missing-manifest fallback creates a new
+    absolute-path job. J3 runtime remains unavailable for these new jobs.
     """
-    value, configs, bound = series.read_series(
-        series_path, expected_sha256=expected_sha256
-    )
-    job, tasks = series.series_tasks(
-        value, configs, job_root=job_root, series_asset=bound
-    )
-    root = Path(job_root)
-    require_unc(str(root))
-    root.mkdir(parents=True, exist_ok=True)
-    target = root / "job.json"
-    if target.exists():
-        if read_json(target) != job:
-            raise ValueError("Existing job DATA differs from immutable series")
-    else:
-        write_immutable(target, job)
-    shared = JobQueue(root)
-    prepared = []
-    for task in tasks:
-        location = root / "results" / task["run"] / "task.json"
-        if location.exists():
-            prior = read_json(location)
-            projected = {
-                key: item
-                for key, item in prior.items()
-                if key not in {"attempt_id", "output_directory"}
-            }
-            if projected != task:
-                raise ValueError("Existing queued/terminal run task differs")
-            # Never republish or re-enqueue an existing run, claimed or failed.
-            prepared.append(
-                dict(run=task["run"], task=descriptor(location), already_enqueued=True)
-            )
-        else:
-            path = shared.enqueue(task)
-            prepared.append(
-                dict(run=task["run"], task=descriptor(path), already_enqueued=False)
-            )
-    return dict(
-        complete=True,
-        series=bound,
-        job=descriptor(target),
-        tasks=prepared,
-        numerical_calls_started=False,
-    )
+    from .alias_job import prepare_alias_job
+
+    return prepare_alias_job(series_path, job_root, expected_sha256=expected_sha256,
+                             series_manifest=series_manifest)
 
 
 def _phase_outputs(stage, spec, frame, inferred):
@@ -487,10 +448,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--series", type=Path, required=True)
     parser.add_argument("--series-sha256", required=True)
+    parser.add_argument("--series-manifest", type=Path, required=True,
+                        help="Registered schema-1 series.toml with declared [roots]")
     parser.add_argument("--job", type=Path, required=True)
     args = parser.parse_args(argv)
-    require_unc(str(args.series))
-    result = prepare_job(args.series, args.job, expected_sha256=args.series_sha256)
+    result = prepare_job(args.series, args.job, expected_sha256=args.series_sha256,
+                         series_manifest=descriptor(args.series_manifest))
     print(json.dumps(result, sort_keys=True), flush=True)
 
 

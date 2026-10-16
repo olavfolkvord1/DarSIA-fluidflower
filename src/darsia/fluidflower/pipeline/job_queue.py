@@ -181,7 +181,25 @@ def validate_task(task: dict) -> None:
         if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
             raise ValueError(f"Task {key} must be a full lowercase SHA")
     config = task["configuration"]
-    require_unc(config["path"])
+    if task.get("format") == "darsia-alias-task-v1":
+        from ..store_map import validate_input_reference
+        from .job_inputs import validate_catalog
+
+        if task.get("format_version") != 1 or task.get("legacy_paths") is not False:
+            raise ValueError("Explicit alias-task version/legacy flag required")
+        validate_input_reference(config)
+        validate_input_reference(task["series"])
+        validate_input_reference(task["series_manifest"])
+        catalog = validate_catalog(task["input_catalog"])
+        if catalog["run"] != task["run"] or catalog["configuration"] != config:
+            raise ValueError("Alias task/catalogue source identity differs")
+        cases = task.get("ordered_case_ids")
+        if (not isinstance(cases,list) or not cases or len({name(case) for case in cases}) != len(cases)):
+            raise ValueError("Exact distinct selected case IDs required")
+    elif task.get("format") is not None and "path" not in config:
+        raise ValueError("Unsupported explicit task format")
+    else:
+        require_unc(config["path"])
     if not re.fullmatch(r"[0-9a-f]{64}", config.get("sha256", "")):
         raise ValueError("Scientific configuration SHA required")
     if task.get("backend", "any") not in {"any", "cpu", "cuda"}:
@@ -218,8 +236,9 @@ class JobQueue:
         validate_task(task)
         run = name(task["run"])
         result_root = self.root / "results" / run
-        value = dict(task, output_directory=task.get("output_directory", str(result_root)),
-                     attempt_id=uuid.uuid4().hex)
+        output = ("results/" + run if task.get("format") == "darsia-alias-task-v1"
+                  else task.get("output_directory", str(result_root)))
+        value = dict(task, output_directory=output, attempt_id=uuid.uuid4().hex)
         self._validate_output(value)
         result_root.mkdir()  # Also reserves the case-insensitive run identity.
         write_immutable(result_root / "task.json", value)
@@ -230,10 +249,14 @@ class JobQueue:
     def _validate_output(self, task):
         actual = PureWindowsPath(task["output_directory"])
         expected = PureWindowsPath(str(self.root / "results" / name(task["run"])))
-        if actual != expected or ".." in actual.parts:
-            raise ValueError("Task output_directory must be its canonical job/results/run root")
-        if PureWindowsPath(str(self.root)).drive.startswith("\\\\"):
-            require_unc(task["output_directory"])
+        if task.get("format") == "darsia-alias-task-v1":
+            if task["output_directory"] != "results/" + name(task["run"]):
+                raise ValueError("Alias task output must be its relative canonical run identity")
+        else:
+            if actual != expected or ".." in actual.parts:
+                raise ValueError("Task output_directory must be its canonical job/results/run root")
+            if PureWindowsPath(str(self.root)).drive.startswith("\\\\"):
+                require_unc(task["output_directory"])
         job = self.root / "job.json"
         if job.exists():
             value = read_json(job)
@@ -259,6 +282,8 @@ class JobQueue:
                 continue
             if task.get("backend", "any") not in {"any", backend}:
                 continue
+            if task.get("format") == "darsia-alias-task-v1":
+                raise RuntimeError("Alias tasks are prepared metadata; J3 claim/runtime integration is not available")
             run, token = name(task["run"]), task["attempt_id"]
             if pending.name != run + ".json" or not re.fullmatch(r"[0-9a-f]{32}", token):
                 raise ValueError("Queue filename or attempt identity differs")

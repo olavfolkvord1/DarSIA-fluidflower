@@ -412,10 +412,20 @@ class JobSnapshotReader:
         master_path = root / "ui" / "master.json"
         if master_path.exists():
             ui = self.read(master_path)
-            if ui.get("format") != "darsia-job-ui-master-v1" or ui.get(
+            if ui.get("format") == "darsia-job-ui-master-v2":
+                from .pipeline.alias_job import job_metadata_reference
+                if (job.get("format") != "darsia-alias-job-v1"
+                        or ui.get("job") != job_metadata_reference(root,root/"job.json")):
+                    raise ValueError("UI master metadata belongs to another job")
+            elif ui.get("format") != "darsia-job-ui-master-v1" or ui.get(
                 "job"
             ) != descriptor(root / "job.json"):
                 raise ValueError("UI master metadata belongs to another job")
+        if job.get("format") == "darsia-alias-job-v1":
+            from .pipeline.alias_job import prepared_snapshot
+            if job.get("format_version") != 1 or job.get("execution_ready") is not False:
+                raise ValueError("Unsupported alias-job metadata/runtime version")
+            return prepared_snapshot(registration, job, ui, reader=self.read)
         created = ui.get("created_utc") or job.get("created_utc")
         created_epoch = _epoch(created)
         snapshots, machines, errors = [], {}, []
@@ -823,6 +833,7 @@ class JobSnapshotReader:
                 )
         facts = dict(
             job,
+            legacy_paths=job.get("legacy_paths", True),
             pipeline=next(iter(task_pipeline)) if len(task_pipeline) == 1 else None,
             job_id=next(iter(task_job_id)) if len(task_job_id) == 1 else None,
             name=ui.get("name") or registration.get("name") or root.name,
@@ -950,7 +961,12 @@ def create_job_from_plan(
         from darsia.fluidflower.pipeline.runner import prepare_job
 
         preparer = prepare_job
-    result = preparer(Path(plan["path"]), root, expected_sha256=plan["sha256"])
+    from .pipeline.alias_job import portable_selection_binding, job_metadata_reference
+    series_manifest = descriptor(Path(series_root) / "series.toml")
+    portable_binding = portable_selection_binding(
+        selection_binding, series_manifest=series_manifest)
+    result = preparer(Path(plan["path"]), root, expected_sha256=plan["sha256"],
+                      series_manifest=series_manifest)
     if (
         result.get("complete") is not True
         or result.get("numerical_calls_started") is not False
@@ -970,18 +986,18 @@ def create_job_from_plan(
                 + "; B4 selection changed during preparation, no worker was started"
             )
     binding_path = root / "ui" / "image_selection_binding.json"
-    write_immutable(binding_path, selection_binding)
+    write_immutable(binding_path, portable_binding)
     master = {
-        "format": "darsia-job-ui-master-v1",
-        "job": descriptor(root / "job.json"),
+        "format": "darsia-job-ui-master-v2",
+        "job": job_metadata_reference(root,root / "job.json"),
         "machine": machine or socket.gethostname(),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "name": str(display_name).strip() or document.get("job_id", root.name),
         "series_label": str(series_label),
-        "execution_plan": dict(plan),
+        "execution_plan": dict(result["series"]),
         "numerical_calls_started": False,
     }
-    master["image_selection_binding"] = descriptor(binding_path)
+    master["image_selection_binding"] = job_metadata_reference(root,binding_path)
     write_immutable(root / "ui" / "master.json", master)
     return {
         "root": str(root),

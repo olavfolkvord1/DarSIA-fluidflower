@@ -20,6 +20,7 @@ import pytest
 
 from darsia.fluidflower.mass import n1_pipeline as mass
 from darsia.fluidflower.pipeline import checkpoint, job_queue, runner, series, worker
+from darsia.fluidflower.pipeline import alias_job, job_inputs
 
 
 def _json(path, value):
@@ -46,6 +47,27 @@ def local_storage(monkeypatch, tmp_path):
     monkeypatch.setattr(job_queue, "require_unc", admit)
     monkeypatch.setattr(mass, "_is_unc", lambda path: True)
     return tmp_path
+
+
+@pytest.fixture
+def portable_prepare_storage(local_storage, monkeypatch):
+    """Real original metadata checks; tiny role graph is an explicit test double.
+
+    This authored fixture intentionally has no RAW/model graph. Full named-input
+    closure is covered independently in test_alias_job_inputs.
+    """
+    original_catalog = job_inputs.InputCatalog
+    class TinyPreparationCatalog(original_catalog):
+        def collect(self, bound, config):
+            reference = self.add(bound, "configuration", "run.configuration")
+            self.add(config["mass"]["calibration"], "calibration", "mass.calibration")
+            return dict(format=job_inputs.CATALOG_FORMAT, complete=True,
+                run=config["run"], configuration=reference,
+                inputs=list(self.entries.values()), payload_hashes_verified=False,
+                numerical_calls_started=False)
+    monkeypatch.setattr(alias_job, "InputCatalog", TinyPreparationCatalog)
+    monkeypatch.setattr(alias_job, "require_unc", lambda path: None)
+    return local_storage
 
 
 def _run_config(calibration):
@@ -81,16 +103,21 @@ def _prepared_series(root):
         "[[runs]]", 'run = "tiny"', "configuration = "+inline(config_asset),
         '[runs.resources]', 'backend = "cpu"', "threads = 1", ""
     ])
-    path=root/"series.toml"
+    path=root/"execution.toml"
     path.write_text(text, encoding="utf-8")
+    (root/"series.toml").write_text(
+        'schema_version=1\nseries_id="unit"\n[roots]\nseries="."\n',
+        encoding="utf-8")
     return path, job_queue.descriptor(path), config
 
 
-def test_prepare_job_reserves_once_and_preserves_claimed_task(local_storage):
+def test_prepare_job_reserves_once_and_preserves_claimed_task(portable_prepare_storage):
+    local_storage=portable_prepare_storage
     root=local_storage
     path, bound, _ = _prepared_series(root)
     job=root/"job"
-    first=runner.prepare_job(path, job, expected_sha256=bound["sha256"])
+    first=runner.prepare_job(path, job, expected_sha256=bound["sha256"],
+        series_manifest=job_queue.descriptor(local_storage/"series.toml"))
     pending=job/"queue"/"tiny.json"
     initial=pending.read_bytes()
     token=json.loads(initial)["attempt_id"]
@@ -98,7 +125,8 @@ def test_prepare_job_reserves_once_and_preserves_claimed_task(local_storage):
     claimed=job/"claimed"/"machine"/"tiny.json"
     claimed.parent.mkdir(parents=True)
     pending.rename(claimed)
-    second=runner.prepare_job(path, job, expected_sha256=bound["sha256"])
+    second=runner.prepare_job(path, job, expected_sha256=bound["sha256"],
+        series_manifest=job_queue.descriptor(local_storage/"series.toml"))
     assert first["numerical_calls_started"] is False
     assert first["tasks"][0]["already_enqueued"] is False
     assert second["tasks"][0]["already_enqueued"] is True
@@ -107,10 +135,12 @@ def test_prepare_job_reserves_once_and_preserves_claimed_task(local_storage):
 
 
 @pytest.mark.parametrize("conflict", ["job", "run"])
-def test_prepare_job_rejects_existing_metadata_without_republishing(local_storage, conflict):
+def test_prepare_job_rejects_existing_metadata_without_republishing(portable_prepare_storage, conflict):
+    local_storage=portable_prepare_storage
     path, bound, _ = _prepared_series(local_storage)
     job=local_storage/"job"
-    runner.prepare_job(path,job,expected_sha256=bound["sha256"])
+    runner.prepare_job(path,job,expected_sha256=bound["sha256"],
+        series_manifest=job_queue.descriptor(local_storage/"series.toml"))
     pending=job/"queue"/"tiny.json"
     original=pending.read_bytes()
     location=job/("job.json" if conflict=="job" else "results/tiny/task.json")
@@ -118,13 +148,16 @@ def test_prepare_job_rejects_existing_metadata_without_republishing(local_storag
     data["commit"]="f"*40
     _json(location,data)
     with pytest.raises(ValueError,match="differs"):
-        runner.prepare_job(path,job,expected_sha256=bound["sha256"])
+        runner.prepare_job(path,job,expected_sha256=bound["sha256"],
+        series_manifest=job_queue.descriptor(local_storage/"series.toml"))
     assert pending.read_bytes()==original
 
 
-def test_prepare_cli_emits_bound_result_and_missing_required_option_stops(local_storage, capsys):
+def test_prepare_cli_emits_bound_result_and_missing_required_option_stops(portable_prepare_storage, capsys):
+    local_storage=portable_prepare_storage
     path,bound,_=_prepared_series(local_storage)
     runner.main(["--series",str(path),"--series-sha256",bound["sha256"],
+        "--series-manifest",str(local_storage/"series.toml"),
         "--job",str(local_storage/"job")])
     value=json.loads(capsys.readouterr().out)
     assert value["job"]==job_queue.descriptor(local_storage/"job/job.json")
@@ -134,10 +167,15 @@ def test_prepare_cli_emits_bound_result_and_missing_required_option_stops(local_
     assert failure.value.code==2
 
 
-def test_prepare_cli_rejects_local_path_before_preparation(tmp_path):
-    with pytest.raises(ValueError,match="UNC path"):
+def test_prepare_cli_rejects_undeclared_source_root_before_preparation(tmp_path):
+    registered=tmp_path/"registered";registered.mkdir()
+    manifest=registered/"series.toml"
+    manifest.write_text('schema_version=1\nseries_id="unit"\n[roots]\nseries="."\n',
+                        encoding="utf-8")
+    with pytest.raises(ValueError,match="No declared root"):
         runner.main(["--series",str(tmp_path/"absent.toml"),
-            "--series-sha256","0"*64,"--job",str(tmp_path/"job")])
+            "--series-sha256","0"*64,"--series-manifest",str(manifest),
+            "--job",str(tmp_path/"job")])
     assert not (tmp_path/"job").exists()
 
 

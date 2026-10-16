@@ -148,7 +148,7 @@ def validate_run(config):
     return config
 
 
-def read_series(path, *, expected_sha256):
+def read_series(path, *, expected_sha256, reader_factory=None):
     """Read a byte-bound TOML selection; no payload or numerical call occurs."""
     path = Path(path)
     raw = path.read_bytes()
@@ -162,7 +162,8 @@ def read_series(path, *, expected_sha256):
     _no_executable_configuration(value)
     from ..mass.n1_pipeline import DataReader
 
-    reader = DataReader(value.get("data_aliases", ()), unc_only=True)
+    reader = (DataReader(value.get("data_aliases", ()), unc_only=True)
+              if reader_factory is None else reader_factory(value.get("data_aliases", ())))
     selected = reader.json(value["selection"])
     if selected.get("complete") is not True or not isinstance(
         selected.get("runs"), list

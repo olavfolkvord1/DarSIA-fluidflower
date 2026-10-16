@@ -746,6 +746,9 @@ class JobsPanel(QWidget):
             else "No active job"
         )
         if data:
+            legacy = (data.get("job_facts") or {}).get("legacy_paths", True)
+            self.master_label.setText(self.master_label.text() + "\nlegacy_paths=" +
+                                      ("true" if legacy else "false"))
             self.progress_label.setText(
                 f"Committed images: {data.get('committed', '?')} · Remaining: {data.get('remaining') if data.get('remaining') is not None else 'Unknown'} · Average: {_rate(data.get('frames_per_minute'))} · ETA: {_eta(data.get('eta_seconds'))}\n{data.get('rate_scope', '')}"
             )
@@ -1000,6 +1003,10 @@ class JobsPanel(QWidget):
             ]
 
     def _start_allowed(self, machine):
+        facts = (self.current or {}).get("job_facts") or {}
+        if facts.get("format") == "darsia-alias-job-v1":
+            self._error(facts.get("execution_blocker") or "J3 alias-job runtime is not available")
+            return False
         if self._control_pending:
             self._error(
                 "A control command is still being published; wait for its result."
@@ -1143,6 +1150,9 @@ class JobsPanel(QWidget):
         job = self.current or {}
         enabled = bool(job.get("job_facts")) and not job.get("errors")
         reason = ""
+        if (job.get("job_facts") or {}).get("format") == "darsia-alias-job-v1":
+            enabled = False
+            reason = job["job_facts"].get("execution_blocker") or "J3 alias-job runtime is not available"
         if enabled and not selected.get("local"):
             try:
                 build_remote_worker_launch(

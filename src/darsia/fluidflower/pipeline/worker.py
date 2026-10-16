@@ -38,6 +38,8 @@ def verify_startup(job_root: Path) -> tuple[dict, str]:
     if not transport.allowed:
         raise ValueError("Shared queue transport refused: " + transport.reason + ": " + transport.evidence)
     job = read_json(job_root / "job.json")
+    if job.get("format") == "darsia-alias-job-v1":
+        raise RuntimeError("Alias job metadata is prepared; J3 runtime integration is not yet available")
     repository = Path(__file__).resolve().parents[4]
     head = subprocess.check_output(
         ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True

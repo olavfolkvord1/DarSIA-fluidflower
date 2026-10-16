@@ -359,12 +359,15 @@ def test_resume_counts_only_bound_original_producer_not_an_unowned_old_output(jo
     assert invalid["committed"] == 0 and "paths differ" in invalid["errors"][0]
 
 
-def selection_fixture(tmp_path):
+def selection_fixture(tmp_path, *, portable=False):
     root = tmp_path / "series"
     root.mkdir()
     (root / "series.toml").write_text(
         'schema_version=1\nseries_id="unit"\n[runs]\nids=["ac52"]\n', encoding="utf-8"
     )
+    if portable:
+        with (root/"series.toml").open("a",encoding="utf-8") as stream:
+            stream.write('[roots]\nseries="."\n')
     protocol = put(root / "protocol.json", {"fixture": "metadata-only"})
     paths = [str(root / "not-opened-Ω.jpg"), str(root / "not-opened-9.jpg")]
     frames = [
@@ -380,6 +383,12 @@ def selection_fixture(tmp_path):
         )
         for case, path, t in zip(["ac52_f1", "ac52_f9"], paths, [0.25, 2.0])
     ]
+    if portable:
+        # Opaque authored bytes only, never a decoded/historical image.
+        for frame in frames:
+            bound=frame["native_task"]["arguments"]["camera_jpeg"]
+            Path(bound["path"]).write_bytes(b"x"*999)
+            bound["sha256"]=hashlib.sha256(b"x"*999).hexdigest()
     configuration = put(root / "scientific.json", {"frames": frames})
     planpath = root / "execution.toml"
     planpath.write_text(
@@ -438,14 +447,15 @@ def test_creation_blocks_unbound_or_mismatching_b4_before_existing_producer(
 def test_explicit_creation_original_producer_only_and_ui_b4_receipt(
     tmp_path, monkeypatch
 ):
-    root, plan, frames, resolved, admit = selection_fixture(tmp_path)
+    root, plan, frames, resolved, admit = selection_fixture(tmp_path, portable=True)
     monkeypatch.setattr(model, "require_unc", lambda path: None)
     target = tmp_path / "job"
     calls = []
     original = bytes_of(root)
 
-    def preparer(path, destination, *, expected_sha256):
-        calls.append((path, destination, expected_sha256))
+    def preparer(path, destination, *, expected_sha256, series_manifest):
+        calls.append((path, destination, expected_sha256, series_manifest))
+        assert series_manifest==model.descriptor(root/"series.toml")
         put(
             destination / "job.json",
             {"expected_runs": ["ac52"], "precision": "float32"},
@@ -454,6 +464,8 @@ def test_explicit_creation_original_producer_only_and_ui_b4_receipt(
             complete=True,
             numerical_calls_started=False,
             producer="original-injected-metadata-only",
+            series=dict(root_alias="series",relative_path="execution.toml",
+                        sha256=plan["sha256"],bytes=plan["size_bytes"],role="configuration"),
         )
 
     row = model.create_job_from_plan(
@@ -479,14 +491,18 @@ def test_explicit_creation_original_producer_only_and_ui_b4_receipt(
     assert [r["b4_input_index"] for r in binding["runs"][0]["cases"]] == [0, 8]
     assert model.read_json(target / "ui" / "master.json")[
         "image_selection_binding"
-    ] == model.descriptor(target / "ui" / "image_selection_binding.json")
-    assert bytes_of(root) == original and not any(root.glob("*.jpg"))
+    ] == dict(relative_path="ui/image_selection_binding.json",
+              sha256=model.descriptor(target/"ui/image_selection_binding.json")["sha256"],
+              bytes=model.descriptor(target/"ui/image_selection_binding.json")["size_bytes"])
+    assert bytes_of(root) == original
+    assert all(Path(frame["native_task"]["arguments"]["camera_jpeg"]["path"]).read_bytes()==b"x"*999
+               for frame in frames)
 
 
 def test_b4_changes_during_creation_preserve_original_metadata_without_false_master(
     tmp_path, monkeypatch
 ):
-    root, plan, _, resolved, admit = selection_fixture(tmp_path)
+    root, plan, _, resolved, admit = selection_fixture(tmp_path, portable=True)
     monkeypatch.setattr(model, "require_unc", lambda path: None)
     target = tmp_path / "job"
 
