@@ -200,7 +200,7 @@ class NativeRigContext:
         window.rig_label.setText(self.display.line)
         window.rig_label.setToolTip(self.display.note)
         window.rig_label.setVisible(
-            window._current_category in {"setup", "preprocessing", "geometry_facies"}
+            window._current_category in {"setup", "preprocessing", "geometry_facies", "image_selection"}
         )
         self.hide_geometry_questions()
 

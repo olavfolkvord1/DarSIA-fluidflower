@@ -1123,6 +1123,20 @@ def row_status(context: WorkflowStatusContext, action: str, item_id: str) -> Row
             "Open a registered series",
             *context.issues or ("Series manifest is unavailable.",),
         )
+    if (action, item_id) == ("image_selection", "plan"):
+        from darsia.fluidflower.image_selection_status import saved_selection_summary
+
+        try:
+            info = saved_selection_summary(context.manifest)
+            if not info["complete"]:
+                return _missing(info["summary"], "Image selection",
+                                "Choose and save images for: " + ", ".join(info["missing_runs"]),
+                                next_step="Edit image selection; no calculation starts.")
+            return _saved(info["summary"] + " " + info["note"],
+                          [_artifact(context.series_root / "series.toml")],
+                          "Image selection", {"saved_utc": info["saved_utc"]})
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            return _missing("Saved image choices are unavailable.", "Image selection", str(error))
     if action == "geometry_facies":
         return _geometry(context, item_id)
     if action == "phase_model":

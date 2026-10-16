@@ -121,6 +121,7 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     assert [label for label, _rows in section.groups] == [""]
     assert [row.label for row in section._rows.values()] == [
         "Protocols",
+        "Image selection",
         "Rig corners and injection points",
         "Depth",
         "Layers and facies",
@@ -700,11 +701,10 @@ def test_start_open_preserves_legacy_project_original_opening(
 
 
 @pytest.mark.parametrize("native_window", [("series-a", "series-b")], indirect=True)
-def test_image_selection_plan_is_reached_from_phase_model_for_selected_series(
+def test_image_selection_is_reached_from_setup_for_selected_series(
     native_window, monkeypatch, qtbot
 ):
-    from darsia.fluidflower import series_paths
-    from darsia.fluidflower.pages.image_correction import selection_dialog
+    from PySide6.QtWidgets import QComboBox
 
     window = native_window
     table = window.home_page.table
@@ -718,39 +718,44 @@ def test_image_selection_plan_is_reached_from_phase_model_for_selected_series(
     calls = []
 
     class SelectionDialog:
-        def __init__(self, path, parent, *, series_id):
-            calls.append((path, parent, series_id))
+        def __init__(self, path, parent, **_options):
+            calls.append((path, parent))
+            self.run_combo = QComboBox(parent)
+            self.saved = SimpleNamespace(connect=lambda callback: None)
 
         def exec(self):
             return 0
 
-    monkeypatch.setattr(series_paths, "series_root", lambda key: root)
-    monkeypatch.setattr(selection_dialog, "ImageSelectionPlanDialog", SelectionDialog)
-    window._select_row(("phase_model", "training"))
-    section = window.sidebar._sections["calibration"]
-    plan = section.get_row("phase_model:selection_plan")
+    monkeypatch.setattr(window.image_selection_workflow, "dialog_factory", SelectionDialog)
+    window._select_row(("image_selection", "plan"))
+    section = window.sidebar._sections["setup"]
+    plan = section.get_row("image_selection:plan")
     assert plan is not None
-    assert plan.label == "Image selection plan…"
+    assert plan.label == "Image selection"
+    assert window.sidebar._sections["calibration"].get_row("phase_model:selection_plan") is None
     qtbot.mouseClick(plan, Qt.MouseButton.LeftButton)
 
-    assert calls == [(root, window, "series-b")]
-    assert window.sidebar.get_selected() == ("phase_model", "selection_plan")
-    assert window.content_stack.currentWidget() is window.phase_model_workspace
+    # Selecting the row shows its panel; opening the editor remains explicit.
+    assert calls == []
+    assert window.sidebar.get_selected() == ("image_selection", "plan")
+    assert window.content_stack.currentWidget() is window.image_selection_workflow.panel
     assert window.series_header.isVisible()
     assert not window.toolbar_builder.play_action.isEnabled()
     assert not window.toolbar_builder.wizard_action.isEnabled()
+    qtbot.mouseClick(window.image_selection_workflow.edit_button, Qt.MouseButton.LeftButton)
+    assert calls == [(root, window)]
 
 
-def test_image_selection_plan_without_series_does_not_open_dialog(
+def test_image_selection_without_series_does_not_open_dialog(
     native_window, monkeypatch
 ):
-    from darsia.fluidflower.pages.image_correction import selection_dialog
-
     def unexpected_dialog(*args, **kwargs):
-        pytest.fail("Choose a series before opening its image selection plan")
+        pytest.fail("Choose a series before opening its image selection editor")
 
-    monkeypatch.setattr(selection_dialog, "ImageSelectionPlanDialog", unexpected_dialog)
-    native_window._select_row(("phase_model", "selection_plan"))
+    monkeypatch.setattr(native_window.image_selection_workflow, "dialog_factory", unexpected_dialog)
+    native_window._select_row(("image_selection", "plan"))
+    assert not native_window.image_selection_workflow.edit_button.isEnabled()
+    native_window.image_selection_workflow.open()
     assert not native_window.toolbar_builder.play_action.isEnabled()
 
 

@@ -289,6 +289,10 @@ class NativeWorkflowStatus:
 
     def activate(self, logical) -> None:
         state = self.states.get(logical)
+        if logical == ("image_selection", "plan") and state is not None and state.state == "done":
+            self.window._select_row(logical)
+            self.window.image_selection_workflow.open()
+            return
         if state is not None and state.state == "done" and state.artifacts:
             try:
                 open_in_file_explorer(Path(state.artifacts[0].path))

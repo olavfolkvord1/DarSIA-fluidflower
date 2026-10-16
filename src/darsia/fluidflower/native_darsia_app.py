@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from darsia.fluidflower.image_selection_ui import NativeImageSelectionWorkflow
 from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
 from darsia.fluidflower.rig_display import NativeRigContext
 from darsia.fluidflower.crop_setup_ui import NativeCropWorkflow
@@ -1131,6 +1132,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Read the run protocol and produce the injection and timing records.",
         ),
         (
+            "Image selection",
+            "image_selection",
+            "plan",
+            "Choose images per run for review and analysis; edit saved protocol-based choices in series.toml without starting a calculation.",
+        ),
+        (
             "Rig corners and injection points",
             "geometry_facies",
             "rig_frame",
@@ -1301,6 +1308,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.content_stack.addWidget(self.phase_model_workspace)
         self.depth_workflow = NativeDepthWorkflow(self)
         self.content_stack.addWidget(self.depth_workflow.panel)
+        self.image_selection_workflow = NativeImageSelectionWorkflow(self)
+        self.content_stack.addWidget(self.image_selection_workflow.panel)
         self.rig_context = NativeRigContext(self)
         self.mass_analysis_page: QWidget | None = None
         self.mass_analysis_placeholder = QLabel(
@@ -1334,11 +1343,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
                         "Mass calibration",
                         "mass_from_phase",
                         "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs.",
-                    ),
-                    (
-                        "Image selection plan…",
-                        "selection_plan",
-                        "Plan the per-series image selection without calculating images.",
                     ),
                 ):
                     display_id = f"phase_model:{item_id}"
@@ -1535,7 +1539,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             series_label=workspace.series_selector.currentText() or series_id,
         )
         self.scope_context = context
-        for category in ("calibration", "analysis"):
+        for category in ("setup", "calibration", "analysis"):
             section = self.sidebar._sections.get(category)
             if section is None:
                 continue
@@ -1558,13 +1562,13 @@ class NativeFluidFlowerMainWindow(MainWindow):
         whole_series = series_scope(context)
         self.method_scope_label.setText(whole_series.line)
         self.method_scope_label.setToolTip(whole_series.note)
-        category = {"phase_model": "calibration", "mass_analysis": "analysis"}.get(
+        category = {"phase_model": "calibration", "mass_analysis": "analysis", "image_selection": "setup"}.get(
             self._current_category, self._current_category
         )
         selected = self.sidebar.get_selected()
         scope = (
             row_scope(context, *selected)
-            if selected is not None and category in {"calibration", "analysis"}
+            if selected is not None and category in {"setup", "calibration", "analysis"}
             else None
         )
         self.current_row_scope = scope
@@ -1573,7 +1577,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.scope_label.setText(scope.line if scope is not None else "")
         self.scope_label.setToolTip(scope.note if scope is not None else "")
         self.scope_label.setVisible(
-            scope is not None and category in {"calibration", "analysis"}
+            scope is not None and category in {"setup", "calibration", "analysis"}
         )
         series_row = scope is not None and not scope.run_selector_enabled
         self.run_combo.setEnabled(not series_row)
@@ -2092,18 +2096,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._open_series_from_start(str(_root))
 
     def open_image_selection_plan(self) -> None:
-        """Open the metadata-only image plan from the Phase model category."""
-        from darsia.fluidflower.pages.image_correction.selection_dialog import (
-            ImageSelectionPlanDialog,
-        )
-        from darsia.fluidflower.series_paths import series_root
-
-        series_id = self.phase_model_workspace.series_id
-        dialog = ImageSelectionPlanDialog(
-            series_root(series_id), self, series_id=series_id
-        )
-        self.selection_dialog = dialog
-        dialog.exec()
+        """Open the series' explicit image editor; no numerical work starts."""
+        self.image_selection_workflow.open()
 
     def _show_setup_for_path(self, path: str) -> None:
         if path in self.home_page.series_registry.legacy_by_path:
@@ -2445,6 +2439,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 "preprocessing",
                 "setup",
                 "geometry_facies",
+                "image_selection",
             }:
                 self.selected_action = None
                 self.selected_checkbox_id = None
@@ -2493,6 +2488,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.selected_action, self.selected_checkbox_id = action, item_id
             self.depth_workflow.show()
             self.toolbar_builder.wizard_action.setEnabled(False)
+            self._update_run_action()
+            return
+        if (action, item_id) == ("image_selection", "plan"):
+            self.selected_action, self.selected_checkbox_id = action, item_id
+            self.image_selection_workflow.show()
+            self._sync_wizard_action_state()
             self._update_run_action()
             return
         if action in self.action_dispatch:

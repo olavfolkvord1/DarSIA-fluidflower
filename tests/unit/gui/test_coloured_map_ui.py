@@ -800,6 +800,7 @@ def test_final_setup_sidebar_rows_and_navigation_have_no_import_computation(
         rows = window.sidebar._sections["setup"]._rows
         assert list(rows) == [
             "preprocessing:protocols",
+            "image_selection:plan",
             "geometry_facies:rig_frame",
             "setup:depth",
             "geometry_facies:layers",
