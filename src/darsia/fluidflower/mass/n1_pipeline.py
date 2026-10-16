@@ -127,6 +127,10 @@ class DataReader:
         """Bind original data descriptors to declared byte-identical files."""
         self.aliases, self.verified, self.baselines = {}, {}, {}
         self.unc_only = unc_only
+        from ..pipeline.run_io import current_binding
+        self.io_binding = current_binding()
+        if self.io_binding is not None:
+            self.verified = self.io_binding.reader_verifications()
         for row in aliases:
             logical, physical = row["logical"], row["physical"]
             if logical["sha256"] != physical["sha256"]:
@@ -148,9 +152,11 @@ class DataReader:
         ):
             raise ValueError("A bound data descriptor is required")
         physical = self.aliases.get(_key(descriptor["path"]), descriptor)
+        if self.io_binding is not None:
+            physical = self.io_binding.physical_descriptor(descriptor)
         if physical["sha256"] != descriptor["sha256"]:
             raise ValueError("Alias and original data identity differ")
-        if self.unc_only and not _is_unc(physical["path"]):
+        if self.io_binding is None and self.unc_only and not _is_unc(physical["path"]):
             raise ValueError(
                 "Production inputs must resolve directly to UNC: "
                 + str(physical["path"])
@@ -868,6 +874,16 @@ def _array_identity(value):
     }
 
 
+def _storage_facts(output):
+    """Report the actual admitted output location; never an assumed NAS copy."""
+    from ..pipeline.run_io import current_binding
+    binding = current_binding()
+    if binding is None:
+        return dict(local_retained=False,direct_NAS_write=True)
+    binding.require_output(output)
+    return dict(local_retained=True,direct_NAS_write=False,direct_local_write=True)
+
+
 def _publish_frame(
     output,
     manifest,
@@ -1081,8 +1097,7 @@ def _publish_frame(
             raise ValueError("Published frame bytes differ: " + name)
     publication = dict(
         frame_id=spec["case_id"],
-        local_retained=False,
-        direct_NAS_write=True,
+        **_storage_facts(output),
         nas_directory=str(final),
         files=inventory,
         manifest_sha256=manifest_asset["sha256"],
@@ -1150,11 +1165,18 @@ def _run_n1(
     """
     from .production_precision import PixelMath
 
-    unc_only = _is_unc(output) or _is_unc(task["configuration"]["path"])
-    if unc_only and (not _is_unc(output) or not _is_unc(task["configuration"]["path"])):
-        raise ValueError("Production configuration and output must both be UNC")
+    from ..pipeline.run_io import for_task
+    io_binding = for_task(task)
+    configuration = task["configuration"] if io_binding is None else io_binding.configuration_descriptor
+    if io_binding is None:
+        unc_only = _is_unc(output) or _is_unc(configuration["path"])
+        if unc_only and (not _is_unc(output) or not _is_unc(configuration["path"])):
+            raise ValueError("Production configuration and output must both be UNC")
+    else:
+        io_binding.require_output(output)
+        unc_only = True  # DataReader requires the positive run binding for local I/O.
     config = load_n1_run(
-        task["configuration"], unc_only=unc_only, geometry_fields=geometry_fields
+        configuration, unc_only=unc_only, geometry_fields=geometry_fields
     )
     if config["run"] != task["run"] or backend not in {"cpu", "cuda"}:
         raise ValueError("Task run and explicit numerical backend are required")
@@ -1172,6 +1194,8 @@ def _run_n1(
     resume = verify_frame_prefix(
         task, config, output, backend, precision, task.get("resume_from")
     )
+    if io_binding is not None:
+        io_binding.admit_resume_root(resume["source"])
     resumed = len(resume["records"])
     records = list(resume["records"])
     frame_producers = list(resume["frame_producers"])

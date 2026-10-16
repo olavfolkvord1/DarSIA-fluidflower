@@ -300,6 +300,7 @@ def launch_local_worker(
     python=sys.executable,
     cwd=None,
     launch_directory=None,
+    stores=None,
 ):
     """Explicit existing worker command via detached QProcess, never a generated script.
 
@@ -307,7 +308,7 @@ def launch_local_worker(
     files retain startup failures before the service's own job log is opened.
     Launch PID is only a launcher fact, never evidence of numerical progress.
     """
-    require_unc(str(job_root))
+    _admit_gui_job_root(job_root)
     if backend not in {"cpu", "cuda"} or type(workers) is not int or workers < 1:
         raise ValueError("Explicit CPU/CUDA backend and positive workers required")
     if cwd is None:
@@ -315,10 +316,16 @@ def launch_local_worker(
 
         cwd = Path(implementation.__file__).resolve().parents[3]
     root = Path(job_root)
+    job_ref = _job_reference(root, root / "job.json")
     launch_dir = (
         Path(launch_directory)
         if launch_directory is not None
         else root / "ui" / "launches" / uuid.uuid4().hex
+    )
+    console = launch_dir / "console.log"
+    # Alias launch receipts are portable metadata, not copies of this host's argv.
+    alias_console = (
+        console.relative_to(root).as_posix() if "relative_path" in job_ref else None
     )
     launch_dir.mkdir(parents=True)
     command = [
@@ -335,12 +342,15 @@ def launch_local_worker(
         machine,
         "--watchdog",
     ]
+    if stores is not None:
+        if not isinstance(stores, (str, Path)) or not str(stores).strip():
+            raise ValueError("Choose an existing local store map before Start")
+        command.extend(["--stores", str(stores)])
     process = QProcess()
     process.setProgram(command[0])
     process.setArguments(command[1:])
     process.setWorkingDirectory(str(cwd))
     process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-    console = launch_dir / "console.log"
     process.setStandardOutputFile(str(console))
     started, pid = process.startDetached()
     record = {
@@ -356,6 +366,20 @@ def launch_local_worker(
         "detached": True,
         "error": process.errorString() if not started else "",
     }
+    if "relative_path" in job_ref:
+        # Keep actual local argv/cwd/stores only in this process. The shared
+        # receipt identifies the request without leaking its machine-local map.
+        record = dict(
+            format="darsia-job-local-launch-v2",
+            job=job_ref,
+            machine=machine, backend=backend, workers=workers,
+            entrypoint="python -m darsia.fluidflower.worker",
+            requested_utc=record["requested_utc"],
+            started=record["started"], launcher_pid=record["launcher_pid"],
+            console=alias_console, detached=True,
+            worker_liveness_verified=False, numerical_progress_claimed=False,
+            error=record["error"],
+        )
     write_immutable(launch_dir / "launch.json", record)
     if not started:
         raise RuntimeError(record["error"])
@@ -364,7 +388,7 @@ def launch_local_worker(
 
 def register_machine_facts(job_root, facts, *, local_machine=None, new_version=False):
     """Explicit metadata registration only. Existing registrations are not replaced."""
-    require_unc(str(job_root))
+    _admit_gui_job_root(job_root)
     machine = name(facts["machine"])
     if not all(
         isinstance(facts.get(key), str) and facts[key].strip()
@@ -397,7 +421,7 @@ def register_machine_facts(job_root, facts, *, local_machine=None, new_version=F
     record = {
         **deepcopy(facts),
         "format": "darsia-job-machine-registration-v1",
-        "job": descriptor(Path(job_root) / "job.json"),
+        "job": _job_reference(Path(job_root), Path(job_root) / "job.json"),
         "registered_utc": datetime.now(timezone.utc).isoformat(),
         "remote_contacted": False,
         "installed": False,
@@ -439,6 +463,7 @@ class JobsPanel(QWidget):
         known_jobs_provider=None,
         control_reader=None,
         control_publisher=None,
+        local_stores_path_provider=None,
     ):
         super().__init__(parent)
         self.jobs_provider, self.plans_provider, self.machines_provider = (
@@ -449,6 +474,7 @@ class JobsPanel(QWidget):
         self.reader = reader or JobSnapshotReader()
         self.job_creator = job_creator or create_job_from_plan
         self.local_launcher = local_launcher or launch_local_worker
+        self.local_stores_path_provider = local_stores_path_provider
         self.remote_launcher = remote_launcher or launch_remote_worker
         self.local_machine = local_machine or socket.gethostname()
         self.selection_provider = selection_provider
@@ -925,6 +951,14 @@ class JobsPanel(QWidget):
             return
         request = None
         try:
+            local_options = {}
+            if ((self.current.get("job_facts") or {}).get("format")
+                    == "darsia-alias-job-v1"
+                    and self.local_stores_path_provider is not None):
+                selected_stores = self.local_stores_path_provider()
+                if not isinstance(selected_stores, (str, Path)) or not str(selected_stores).strip():
+                    raise ValueError("Choose an existing local store map before Start")
+                local_options["stores"] = selected_stores
             request = self._begin_request(self.local_machine, "local")
             record = self.local_launcher(
                 self.current["root"],
@@ -932,6 +966,7 @@ class JobsPanel(QWidget):
                 workers=self.workers_spin.value(),
                 machine=self.local_machine,
                 launch_directory=request["launch_directory"],
+                **local_options,
             )
         except Exception:
             self._launch_failed(request, traceback.format_exc())
@@ -1004,7 +1039,9 @@ class JobsPanel(QWidget):
 
     def _start_allowed(self, machine):
         facts = (self.current or {}).get("job_facts") or {}
-        if facts.get("format") == "darsia-alias-job-v1":
+        if (facts.get("format") == "darsia-alias-job-v1"
+                and (facts.get("execution_ready") is not True
+                     or facts.get("runtime_support") != "darsia-role-io-runtime-v1")):
             self._error(facts.get("execution_blocker") or "J3 alias-job runtime is not available")
             return False
         if self._control_pending:
@@ -1150,7 +1187,9 @@ class JobsPanel(QWidget):
         job = self.current or {}
         enabled = bool(job.get("job_facts")) and not job.get("errors")
         reason = ""
-        if (job.get("job_facts") or {}).get("format") == "darsia-alias-job-v1":
+        if ((job.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"
+                and (job["job_facts"].get("execution_ready") is not True
+                     or job["job_facts"].get("runtime_support") != "darsia-role-io-runtime-v1")):
             enabled = False
             reason = job["job_facts"].get("execution_blocker") or "J3 alias-job runtime is not available"
         if enabled and not selected.get("local"):
@@ -1240,10 +1279,10 @@ class JobsPanel(QWidget):
                 )
             asset = descriptor(path)
             master = JobSnapshotReader().read(path, asset)
-            if (
-                master.get("format") != "darsia-job-ui-master-v1"
-                or master.get("job") != descriptor(Path(root) / "job.json")
-            ):
+            from .job_control import _bindings
+            reference, master_format, _control_format = _bindings(Path(root))
+            if (master.get("format") != master_format
+                    or master.get("job") != reference(Path(root) / "job.json")):
                 raise ValueError("Job UI master is not bound to this immutable job")
             machine = master.get("machine")
             if not isinstance(machine, str) or not machine.strip():
@@ -1303,11 +1342,11 @@ class JobsPanel(QWidget):
             if command:
                 text += (
                     "\nDisplayed command: "
-                    + command["path"]
+                    + str(command.get("relative_path", command.get("path")))
                     + " · SHA-256 "
                     + command["sha256"]
                     + " · "
-                    + str(command["size_bytes"])
+                    + str(command.get("bytes", command.get("size_bytes")))
                     + " bytes"
                 )
             else:
@@ -1523,3 +1562,19 @@ class JobsPanel(QWidget):
             return
         self.timer.stop()
         super().closeEvent(event)
+
+
+def _job_reference(root, path):
+    from .job_control import _bindings
+    return _bindings(root)[0](path)
+
+
+def _admit_gui_job_root(root):
+    from .pipeline.job_queue import read_json
+    if read_json(Path(root) / "job.json").get("format") == "darsia-alias-job-v1":
+        from .job_filesystem import inspect_shared_folder
+        admission = inspect_shared_folder(root)
+        if not admission.allowed:
+            raise ValueError(admission.reason + ": " + admission.evidence)
+    else:
+        require_unc(str(root))

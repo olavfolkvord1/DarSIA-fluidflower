@@ -256,7 +256,12 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     config["_configuration_sha256"] = task["configuration"]["sha256"]
     if backend not in {"cpu", "cuda"} or precision != task["precision"]:
         raise ValueError("Actual backend/precision differs from queue task")
-    require_unc(str(output))
+    from .run_io import for_task
+    io_binding = for_task(task)
+    if io_binding is None:
+        require_unc(str(output))
+    else:
+        io_binding.require_output(output)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
@@ -272,6 +277,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
         frame_validator=validate_frame_artifacts,
         calibration_sha256=task["calibration_sha256"],
     )
+    if io_binding is not None:
+        io_binding.admit_resume_root(prefix["source"])
     resume_asset = _write_json(
         output / "resume.json",
         dict(

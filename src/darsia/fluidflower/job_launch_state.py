@@ -38,6 +38,9 @@ def launch_key(root, machine, backend):
 
 def begin_launch_request(root, *, machine, backend, workers, kind, now=None):
     """Explicit Start only; reserve before invoking an existing launcher."""
+    if _alias_job(root):
+        from .portable_job_launch import begin
+        return begin(root, machine=machine, backend=backend, workers=workers, kind=kind, now=now)
     launch_key(root, machine, backend)
     if kind not in {"local", "ssh"} or type(workers) is not int or workers < 1:
         raise ValueError("Explicit launch kind/count required")
@@ -79,6 +82,9 @@ def begin_launch_request(root, *, machine, backend, workers, kind, now=None):
 
 def record_launch_error(request, text):
     """Keep literal launch failure visible even when no transport was created."""
+    if request.get("format") == "darsia-job-ui-launch-request-v2":
+        from .portable_job_launch import error
+        return error(request, text)
     path = Path(request["source"]["path"]).with_name(
         Path(request["source"]["path"]).name.replace(".request.json", ".error.json")
     )
@@ -141,6 +147,9 @@ def _terminal_report(request):
 
 
 def read_launch_requests(root, *, reader=None):
+    if _alias_job(root):
+        from .portable_job_launch import read
+        return read(root, reader=reader)
     root = Path(root)
     job = descriptor(root / "job.json")
     result = []
@@ -262,6 +271,9 @@ def read_registered_launch_requests(registrations):
 
 def declare_requests_stopped(root, requests):
     """Explicit operator action only. Never a worker-retirement/science proof."""
+    if _alias_job(root):
+        from .portable_job_launch import declare
+        return declare(root, requests)
     current = {row["source"]["path"]: row for row in read_launch_requests(root)}
     written = []
     for chosen in requests:
@@ -289,3 +301,7 @@ def declare_requests_stopped(root, requests):
         write_immutable(target, value)
         written.append(descriptor(target))
     return written
+
+
+def _alias_job(root):
+    return read_json(Path(root) / "job.json").get("format") == "darsia-alias-job-v1"

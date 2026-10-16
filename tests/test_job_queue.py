@@ -8,6 +8,8 @@ import threading
 import types
 from pathlib import Path
 
+from tests.server_lease_clock_fixture import server_lease_clock
+
 import pytest
 
 from darsia.fluidflower.job_queue import (
@@ -65,16 +67,17 @@ def test_duplicate_enqueue_never_replaces_task_or_terminal(tmp_path):
     assert list(complete.parent.glob("*.partial"))
 
 
-def test_real_progress_prevents_early_reclaim_and_stale_writer_cannot_publish(tmp_path):
-    now = [1000.0]
-    shared = JobQueue(tmp_path, clock=lambda: now[0])
+def test_real_progress_prevents_early_reclaim_and_stale_writer_cannot_publish(tmp_path, server_lease_clock):
+    shared = JobQueue(tmp_path, server_clock=server_lease_clock.clock)
     shared.enqueue(task())
     old = shared.claim("old-machine", "cpu", OWNER)
-    now[0] += 500
+    server_lease_clock.stamp_progress(old)
+    server_lease_clock.advance(500)
     shared.progress(old, dict(state="frame_published", frame_index=1))
-    now[0] += 599
+    server_lease_clock.stamp_progress(old)
+    server_lease_clock.advance(599)
     assert shared.reclaim_stale() == []
-    now[0] += 1
+    server_lease_clock.advance(1)
     assert len(shared.reclaim_stale()) == 1
     newer = shared.claim("new-machine", "cpu", OWNER)
     assert newer.token != old.token and newer.output != old.output
@@ -88,12 +91,12 @@ def test_real_progress_prevents_early_reclaim_and_stale_writer_cannot_publish(tm
     assert (old.output / "failed.json").exists()
 
 
-def test_publication_and_reclaim_have_one_atomic_winner(tmp_path):
-    now = [1000.0]
-    shared = JobQueue(tmp_path, clock=lambda: now[0])
+def test_publication_and_reclaim_have_one_atomic_winner(tmp_path, server_lease_clock):
+    shared = JobQueue(tmp_path, server_clock=server_lease_clock.clock)
     shared.enqueue(task())
     claim = shared.claim("machine", "cpu", OWNER)
-    now[0] += 601
+    server_lease_clock.stamp_progress(claim)
+    server_lease_clock.advance(601)
     barrier = threading.Barrier(2)
 
     def publish():

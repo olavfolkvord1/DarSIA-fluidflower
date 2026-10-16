@@ -67,6 +67,9 @@ def portable_prepare_storage(local_storage, monkeypatch):
                 numerical_calls_started=False)
     monkeypatch.setattr(alias_job, "InputCatalog", TinyPreparationCatalog)
     monkeypatch.setattr(alias_job, "require_unc", lambda path: None)
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem,"inspect_shared_folder",lambda path:
+        job_filesystem.SharedFolderAdmission(True,"smb","authored unit transport","no real FS qualification"))
     return local_storage
 
 
@@ -167,7 +170,10 @@ def test_prepare_cli_emits_bound_result_and_missing_required_option_stops(portab
     assert failure.value.code==2
 
 
-def test_prepare_cli_rejects_undeclared_source_root_before_preparation(tmp_path):
+def test_prepare_cli_rejects_undeclared_source_root_before_preparation(tmp_path,monkeypatch):
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda _path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "isolated unit transport", "not a real FS qualification"))
     registered=tmp_path/"registered";registered.mkdir()
     manifest=registered/"series.toml"
     manifest.write_text('schema_version=1\nseries_id="unit"\n[roots]\nseries="."\n',

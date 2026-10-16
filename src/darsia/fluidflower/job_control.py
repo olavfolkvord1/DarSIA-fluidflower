@@ -11,6 +11,7 @@ from pathlib import Path
 from .pipeline.job_queue import descriptor, read_json, utc, write_immutable
 
 FORMAT = "darsia-job-ui-control-v1"
+ALIAS_FORMAT = "darsia-job-ui-control-v2"
 ACTIONS = {"run", "pause", "stop"}
 
 
@@ -21,10 +22,11 @@ def read_control(job_root):
     paths = sorted(directory.glob("*.json"))
     if not paths:
         return {"action": "run", "sequence": 0}
-    job = descriptor(root / "job.json")
-    master_asset = descriptor(root / "ui" / "master.json")
-    master = read_json(Path(master_asset["path"]))
-    if master.get("format") != "darsia-job-ui-master-v1" or master.get("job") != job:
+    reference, master_format, control_format = _bindings(root)
+    job = reference(root / "job.json")
+    master_asset = reference(root / "ui" / "master.json")
+    master = read_json(root / "ui" / "master.json")
+    if master.get("format") != master_format or master.get("job") != job:
         raise ValueError("Job UI master is not bound to this immutable job")
     creator = master.get("machine")
     if not isinstance(creator, str) or not creator.strip():
@@ -36,7 +38,7 @@ def read_control(job_root):
             raise ValueError("Job UI control sequence is not contiguous")
         value = read_json(path)
         if (
-            value.get("format") != FORMAT
+            value.get("format") != control_format
             or type(value.get("sequence")) is not int
             or value["sequence"] != sequence
             or value.get("action") not in ACTIONS
@@ -46,7 +48,7 @@ def read_control(job_root):
             or value.get("previous") != previous
         ):
             raise ValueError("Job UI command identity or chain differs: " + str(path))
-        result = dict(value, command=descriptor(path))
+        result = dict(value, command=reference(path))
         previous = result["command"]
     return result
 
@@ -62,11 +64,12 @@ def publish_control(job_root, action, *, machine, expected_previous):
     root = Path(job_root)
     master_path = root / "ui" / "master.json"
     master = read_json(master_path)
+    reference, master_format, control_format = _bindings(root)
     if master.get("machine") != machine:
         raise ValueError("Only the job's recorded master machine writes commands")
     if (
-        master.get("format") != "darsia-job-ui-master-v1"
-        or master.get("job") != descriptor(root / "job.json")
+        master.get("format") != master_format
+        or master.get("job") != reference(root / "job.json")
     ):
         raise ValueError("Job UI master is not bound to this immutable job")
     current = read_control(root)
@@ -74,11 +77,11 @@ def publish_control(job_root, action, *, machine, expected_previous):
         raise ValueError("Job control changed; refresh before applying this action")
     sequence = current["sequence"] + 1
     document = dict(
-        format=FORMAT,
+        format=control_format,
         sequence=sequence,
         action=action,
-        job=descriptor(root / "job.json"),
-        master=descriptor(master_path),
+        job=reference(root / "job.json"),
+        master=reference(master_path),
         machine=machine,
         previous=current.get("command"),
         requested_utc=utc(),
@@ -86,4 +89,15 @@ def publish_control(job_root, action, *, machine, expected_previous):
     # One sequence filename is an atomic winner if two UI instances race.
     path = root / "ui" / "commands" / f"{sequence:020d}.json"
     write_immutable(path, document)
-    return descriptor(path)
+    return reference(path)
+
+
+def _bindings(root):
+    """Only own-job immutable references change syntax; control rules do not."""
+    job = read_json(root / "job.json")
+    if job.get("format") == "darsia-alias-job-v1":
+        if job.get("format_version") != 1:
+            raise ValueError("Unknown alias job version")
+        from .pipeline.alias_job import job_metadata_reference
+        return (lambda path: job_metadata_reference(root, path)), "darsia-job-ui-master-v2", ALIAS_FORMAT
+    return descriptor, "darsia-job-ui-master-v1", FORMAT

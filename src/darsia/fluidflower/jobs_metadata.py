@@ -423,9 +423,15 @@ class JobSnapshotReader:
                 raise ValueError("UI master metadata belongs to another job")
         if job.get("format") == "darsia-alias-job-v1":
             from .pipeline.alias_job import prepared_snapshot
-            if job.get("format_version") != 1 or job.get("execution_ready") is not False:
-                raise ValueError("Unsupported alias-job metadata/runtime version")
-            return prepared_snapshot(registration, job, ui, reader=self.read)
+            if job.get("format_version") != 1:
+                raise ValueError("Unsupported alias-job metadata version")
+            if job.get("execution_ready") is False:
+                return prepared_snapshot(registration, job, ui, reader=self.read)
+            if (job.get("execution_ready") is not True
+                    or job.get("runtime_support") != "darsia-role-io-runtime-v1"):
+                raise ValueError("Unsupported alias-job runtime version")
+            from .published_jobs_snapshot import published_snapshot
+            return published_snapshot(registration, job, ui, reader=self.read)
         created = ui.get("created_utc") or job.get("created_utc")
         created_epoch = _epoch(created)
         snapshots, machines, errors = [], {}, []
@@ -926,8 +932,15 @@ def create_job_from_plan(
     calibration or descriptor is manufactured from GUI strings.
     """
     _bound(plan)
-    require_unc(plan["path"])
-    require_unc(str(job_root))
+    if not Path(plan["path"]).is_absolute():
+        raise ValueError("An explicit absolute source plan path is required")
+    from .job_filesystem import inspect_shared_folder
+    existing = Path(job_root)
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    admission = inspect_shared_folder(existing)
+    if not admission.allowed:
+        raise ValueError(admission.reason + ": " + admission.evidence)
     plan = {key: plan[key] for key in ("path", "sha256", "size_bytes")}
     raw = Path(plan["path"]).read_bytes()
     if (
@@ -945,6 +958,12 @@ def create_job_from_plan(
         raise ValueError(
             "New production analysis jobs require explicit float32 in the saved plan"
         )
+    series_manifest = descriptor(Path(series_root) / "series.toml")
+    if admitter is None:
+        from .pipeline.alias_job import read_alias_series
+        def admitter(path, *, expected_sha256):
+            return read_alias_series(path, expected_sha256=expected_sha256,
+                                     series_manifest=series_manifest)
     selection_binding = validate_current_selection(
         plan,
         series_root=series_root,
@@ -962,7 +981,8 @@ def create_job_from_plan(
 
         preparer = prepare_job
     from .pipeline.alias_job import portable_selection_binding, job_metadata_reference
-    series_manifest = descriptor(Path(series_root) / "series.toml")
+    if descriptor(Path(series_root) / "series.toml") != series_manifest:
+        raise ValueError("Series roots/manifest changed during plan admission")
     portable_binding = portable_selection_binding(
         selection_binding, series_manifest=series_manifest)
     result = preparer(Path(plan["path"]), root, expected_sha256=plan["sha256"],

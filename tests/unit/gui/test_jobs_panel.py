@@ -272,6 +272,8 @@ def test_start_dialog_chooses_existing_plan_only(app):
 def test_current_worker_command_detached_and_immutable_receipt_only(
     tmp_path, monkeypatch
 ):
+    # The detached legacy launch requires an actual bound job document.
+    put(tmp_path / "job.json", dict(expected_runs=["ac52"], precision="float32"))
     monkeypatch.setattr(ui, "require_unc", lambda path: None)
     observed = []
 

@@ -8,6 +8,7 @@ import pytest
 
 from darsia.fluidflower.pipeline import alias_job, series, job_queue, worker
 from darsia.fluidflower.jobs_panel import JobsPanel
+from darsia.fluidflower.jobs_metadata import JobSnapshotReader
 from darsia.fluidflower.store_map import StoreMapError
 
 
@@ -47,6 +48,9 @@ def assembly_fixture(tmp_path,monkeypatch):
     monkeypatch.setattr(series,"read_series",lambda *a,**k:(deepcopy(value),[deepcopy(config)],dict(source)))
     monkeypatch.setattr(series,"require_unc",lambda _:None)
     monkeypatch.setattr(alias_job,"require_unc",lambda _:None)
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem,"inspect_shared_folder",lambda path:
+        job_filesystem.SharedFolderAdmission(True,"smb","authored unit transport","no real FS qualification"))
     return root,manifest,source,config,value
 
 
@@ -55,19 +59,19 @@ def test_all_portable_metadata_before_creation_and_input_bytes_unchanged(tmp_pat
     before={str(p):p.read_bytes() for p in root.iterdir() if p.is_file()}
     destination=tmp_path/"shared_job_fixture"
     result=alias_job.prepare_alias_job(source["path"],destination,expected_sha256=source["sha256"],series_manifest=manifest)
-    assert result["complete"] and not result["execution_ready"] and not result["numerical_calls_started"]
+    assert result["complete"] and result["execution_ready"] and not result["numerical_calls_started"]
     job=json.loads((destination/"job.json").read_bytes())
     task=json.loads((destination/"queue/ac52.json").read_bytes())
     assert job["legacy_paths"] is False and task["legacy_paths"] is False
     assert job["publish"] == ["film", "lossless_export"]
+    assert job["runtime_support"]==task["input_catalog"]["runtime_support"]=="darsia-role-io-runtime-v1"
     assert task["output_directory"]=="results/ac52"
     for value in (job,task):
         encoded=json.dumps(value)
         assert str(root) not in encoded and "historical/not-consumed" not in encoded
         assert "configuration" not in value or "path" not in value["configuration"]
     assert {str(p):p.read_bytes() for p in root.iterdir() if p.is_file()}==before
-    snapshot=alias_job.prepared_snapshot({"root":str(destination)},job,{},reader=lambda path:json.loads(Path(path).read_bytes()))
-    assert snapshot["state"]=="Prepared (J3 pending)"
+    snapshot=JobSnapshotReader()({"root":str(destination)})
     assert snapshot["committed"]==0 and snapshot["frames_per_minute"] is None and snapshot["eta_seconds"] is None
 
 
@@ -80,19 +84,27 @@ def test_unknown_actual_role_root_fails_before_any_job_mkdir(tmp_path,monkeypatc
     assert not destination.exists()
 
 
-def test_missing_manifest_never_falls_back_to_new_absolute_path_job(tmp_path):
+def test_missing_manifest_never_falls_back_to_new_absolute_path_job(tmp_path,monkeypatch):
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda _path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "isolated unit transport", "not a real FS qualification"))
     with pytest.raises(ValueError,match="explicit bound"):
         alias_job.prepare_alias_job(tmp_path/"plan",tmp_path/"never_created",
                                     expected_sha256="a"*64,series_manifest=None)
     assert not (tmp_path/"never_created").exists()
 
 
-def test_alias_tasks_are_readable_metadata_but_cannot_be_claimed_in_j2(tmp_path,monkeypatch):
+def test_alias_tasks_require_explicit_runtime_bindings_before_claim(tmp_path,monkeypatch):
     _root,manifest,source,_config,_value=assembly_fixture(tmp_path,monkeypatch)
     destination=tmp_path/"shared_job_fixture"
     alias_job.prepare_alias_job(source["path"],destination,expected_sha256=source["sha256"],series_manifest=manifest)
-    queue=job_queue.JobQueue(destination)
-    with pytest.raises(RuntimeError,match="J3 claim/runtime"):
+    unbound=job_queue.JobQueue(destination)
+    with pytest.raises(RuntimeError,match="explicit physical store machine_id"):
+        unbound.claim("Main","cpu",{"pid":1,"process_create_time":"1"})
+    assert (destination/"queue/ac52.json").is_file()
+    assert not list((destination/"claimed").glob("*/*.json"))
+    queue=job_queue.JobQueue(destination,machine_id="Main")
+    with pytest.raises(RuntimeError,match="requires availability"):
         queue.claim("Main","cpu",{"pid":1,"process_create_time":"1"})
     assert (destination/"queue/ac52.json").is_file()
     assert not list((destination/"claimed").glob("*/*.json"))
@@ -102,7 +114,9 @@ def test_j2_worker_start_refuses_before_git_or_any_executor(monkeypatch,tmp_path
     from darsia.fluidflower import job_filesystem
     monkeypatch.setattr(worker,"require_unc",lambda _:None)
     monkeypatch.setattr(job_filesystem,"inspect_shared_folder",lambda _:job_filesystem.SharedFolderAdmission(True,"smb","fixture","fixture"))
-    monkeypatch.setattr(worker,"read_json",lambda _:{"format":alias_job.JOB_FORMAT})
+    # Fixed old J2 wire fixture: it must never be promoted by opening/starting.
+    pending=b'{"format":"darsia-alias-job-v1","format_version":1,"legacy_paths":false,"execution_ready":false,"execution_blocker":"Alias job metadata is prepared; J3 runtime integration is not yet available"}'
+    monkeypatch.setattr(worker,"read_json",lambda _:json.loads(pending))
     monkeypatch.setattr(worker.subprocess,"check_output",lambda *_a,**_k:pytest.fail("J2 runtime must refuse before original Git checks"))
     with pytest.raises(RuntimeError,match="J3 runtime"):
         worker.verify_startup(tmp_path)

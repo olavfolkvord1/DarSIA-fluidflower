@@ -13,6 +13,8 @@ import multiprocessing as mp
 import time
 from pathlib import Path
 
+from tests.server_lease_clock_fixture import server_lease_clock
+
 import psutil
 import pytest
 
@@ -165,9 +167,8 @@ def test_resume_requires_contiguous_prefix_and_uses_original_input_not_labels(
         )
 
 
-def test_retired_reclaimed_source_is_bound_to_current_claim_generation(tmp_path):
-    clock = [1000.0]
-    shared = JobQueue(tmp_path, clock=lambda: clock[0])
+def test_retired_reclaimed_source_is_bound_to_current_claim_generation(tmp_path, server_lease_clock):
+    shared = JobQueue(tmp_path, server_clock=server_lease_clock.clock)
     task = dict(
         run="sample",
         commit="1" * 40,
@@ -178,6 +179,7 @@ def test_retired_reclaimed_source_is_bound_to_current_claim_generation(tmp_path)
     )
     shared.enqueue(task)
     old = shared.claim("first", "cpu", dict(pid=123, process_create_time="1.0"))
+    server_lease_clock.stamp_progress(old)
     proof = checkpoint.retirement_document(
         old.task,
         old.output,
@@ -185,7 +187,7 @@ def test_retired_reclaimed_source_is_bound_to_current_claim_generation(tmp_path)
         dict(pid=321, process_create_time="2.0"),
     )
     write_immutable(old.output / "retirement.json", proof)
-    clock[0] += 601
+    server_lease_clock.advance(601)
     shared.reclaim_stale()
     current = shared.claim("second", "cpu", dict(pid=456, process_create_time="3.0"))
     source = checkpoint.resume_source_for_claim(shared, current)
@@ -241,9 +243,8 @@ def test_pid_reuse_never_terminates_the_new_incarnation(monkeypatch):
     assert calls == []
 
 
-def test_control_heartbeat_never_extends_queue_progress_lease(tmp_path):
-    clock = [1000.0]
-    shared = JobQueue(tmp_path, clock=lambda: clock[0])
+def test_control_heartbeat_never_extends_queue_progress_lease(tmp_path, server_lease_clock):
+    shared = JobQueue(tmp_path, server_clock=server_lease_clock.clock)
     shared.enqueue(
         dict(
             run="sample",
@@ -253,8 +254,9 @@ def test_control_heartbeat_never_extends_queue_progress_lease(tmp_path):
         )
     )
     claim = shared.claim("machine", "cpu", dict(pid=123, process_create_time="1.0"))
+    server_lease_clock.stamp_progress(claim)
     # Parent liveness messages cannot call JobQueue.progress or create progress files.
-    clock[0] += 601
+    server_lease_clock.advance(601)
     assert not list(claim.output.glob("progress_*.json"))
     assert len(shared.reclaim_stale()) == 1
 

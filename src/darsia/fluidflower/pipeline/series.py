@@ -196,9 +196,14 @@ def read_series(path, *, expected_sha256, reader_factory=None):
     )
 
 
-def series_tasks(series, configurations, *, job_root, series_asset):
+def series_tasks(series, configurations, *, job_root, series_asset, shared_admission=None):
     """Build one static whole-run queue task per already admitted selection."""
-    require_unc(str(job_root))
+    if shared_admission is None:
+        require_unc(str(job_root))
+    else:
+        from ..job_filesystem import SharedFolderAdmission
+        if not isinstance(shared_admission,SharedFolderAdmission) or not shared_admission.allowed:
+            raise ValueError("A positive shared-folder transport admission is required")
     if len(configurations) != len(series["runs"]):
         raise ValueError("Every selected run needs exactly one configuration")
     job = deepcopy(series["job"])
@@ -244,8 +249,11 @@ def load_run(task):
         raise ValueError("This adapter requires an explicit series task")
     from ..mass.n1_pipeline import DataReader
 
+    from .run_io import for_task
+    binding = for_task(task)
     reader = DataReader(unc_only=True)
-    config = validate_run(reader.json(task["configuration"]))
+    configuration = task["configuration"] if binding is None else binding.configuration_descriptor
+    config = validate_run(reader.json(configuration))
     if (
         config["run"] != task["run"]
         or config["mass"]["calibration"]["sha256"] != task["calibration_sha256"]
@@ -308,6 +316,10 @@ class SeriesInputs:
             row["logical"]["path"]: row["physical"]["path"]
             for row in config.get("data_aliases", ())
         }
+        from .run_io import current_binding
+        binding = current_binding()
+        if binding is not None:
+            self.aliases = binding.asset_aliases()
         self.phase = self.reader.json(config["phase"]["configuration"])
         self.parameters = deepcopy(self.phase["parameters"])
         self.native_parameters = self.reader.json(config["native"]["configuration"])

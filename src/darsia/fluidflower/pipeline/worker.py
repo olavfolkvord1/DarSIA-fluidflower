@@ -29,17 +29,22 @@ from .job_queue import (
 )
 
 
-def verify_startup(job_root: Path) -> tuple[dict, str]:
+def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
+                   startup_context=None, expected_stores=None) -> tuple[dict, str]:
     """Check the running repository and its actual lockfile exactly once."""
-    require_unc(str(job_root))
     from ..job_filesystem import inspect_shared_folder
 
     transport = inspect_shared_folder(job_root)
     if not transport.allowed:
         raise ValueError("Shared queue transport refused: " + transport.reason + ": " + transport.evidence)
     job = read_json(job_root / "job.json")
-    if job.get("format") == "darsia-alias-job-v1":
-        raise RuntimeError("Alias job metadata is prepared; J3 runtime integration is not yet available")
+    alias = job.get("format") == "darsia-alias-job-v1"
+    if not alias:
+        require_unc(str(job_root))
+    elif (job.get("format_version")!=1 or job.get("legacy_paths") is not False
+            or job.get("execution_ready") is not True
+            or job.get("runtime_support")!="darsia-role-io-runtime-v1"):
+        raise RuntimeError("Alias job is not explicitly ready for J3 runtime")
     repository = Path(__file__).resolve().parents[4]
     head = subprocess.check_output(
         ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
@@ -74,6 +79,16 @@ def verify_startup(job_root: Path) -> tuple[dict, str]:
         or len({name(run) for run in job["expected_runs"]}) != len(job["expected_runs"])
     ):
         raise ValueError("Explicit distinct expected_runs required")
+    if alias:
+        from ..store_map import read_store_map
+        stores=read_store_map(stores_path,forbidden_roots=(repository,))
+        if name(stores.machine_id)!=name(machine_id or socket.gethostname()):
+            raise ValueError("Store-map machine ID differs from --machine")
+        stores.roots(job["series_id"])
+        if expected_stores is not None and stores.source!=expected_stores.source:
+            raise ValueError("Startup-admitted store map changed; running claims retain their original binding")
+        if startup_context is not None:
+            startup_context["stores"]=stores
     return job, head
 
 
@@ -174,11 +189,20 @@ def _run_tasks(
     watchdog: bool = False,
     worker_slot=None,
     worker_generation=None,
+    stores=None,
 ):
     def queue_error(event):
         messages.put(event)
 
-    shared = JobQueue(Path(root), on_error=queue_error)
+    alias=job.get("format")=="darsia-alias-job-v1"
+    io_runtime=None
+    if alias:
+        from .worker_io import WorkerRunIO
+        io_runtime=WorkerRunIO(root,job,stores,machine,backend,commit)
+        shared=JobQueue(Path(root),on_error=queue_error,machine_id=stores.machine_id)
+    else:
+        shared = JobQueue(Path(root), on_error=queue_error, machine_id=machine)
+    excluded_runs=set()
     owner = _identity(machine)
     while not stop.is_set():
         try:
@@ -191,7 +215,13 @@ def _run_tasks(
             shared.recover_publications()
             for record in shared.reclaim_stale():
                 messages.put(dict(kind="reclaimed", **record))
-            claim = shared.claim(machine, backend, owner)
+            if io_runtime is None:
+                claim = shared.claim(machine, backend, owner)
+            else:
+                claim = shared.claim(machine,backend,owner,
+                    availability=io_runtime.availability,
+                    output_factory=io_runtime.output_factory,
+                    publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
         except Exception:
             text = traceback.format_exc()
             messages.put(dict(kind="queue_failure", traceback=text))
@@ -220,6 +250,24 @@ def _run_tasks(
             if precision != job["precision"]:
                 raise ValueError("A job cannot mix working precisions")
 
+            io_binding=None
+            if io_runtime is not None:
+                from .store_runtime import InputHashMismatch,RunUnavailable
+                try:
+                    io_binding=io_runtime.prepare(claim)
+                    from .checkpoint import resume_source_for_claim
+                    prepared_resume=resume_source_for_claim(shared,claim)
+                except (InputHashMismatch,RunUnavailable):
+                    text=traceback.format_exc()
+                    record=shared.reject_before_science(claim,text,owner)
+                    excluded_runs.add(name(record["run"]))
+                    messages.put(dict(kind="input_rejected",run=task["run"],
+                        attempt_id=claim.token,traceback=text,actual_worker=owner))
+                    io_runtime.release(claim)
+                    if once:
+                        raise SystemExit(1)
+                    continue
+
             def progress(event):
                 if not isinstance(event, dict):
                     raise TypeError(
@@ -244,7 +292,8 @@ def _run_tasks(
             science_task = dict(task)
             if "environment_lock" in job:
                 science_task["environment_lock"] = job["environment_lock"]
-            resume = resume_source_for_claim(shared, claim)
+            resume = (resume_source_for_claim(shared,claim)
+                      if io_binding is None else prepared_resume)
             if resume is not None:
                 science_task["resume_from"] = resume
             pipeline = task.get("pipeline", "n1")
@@ -258,7 +307,11 @@ def _run_tasks(
                 execute = run_series
             else:
                 raise ValueError("Unknown explicit task pipeline: " + str(pipeline))
-            result = execute(science_task, claim.output, backend, precision, progress)
+            if io_binding is None:
+                result = execute(science_task, claim.output, backend, precision, progress)
+            else:
+                with io_binding.activate():
+                    result = execute(science_task, claim.output, backend, precision, progress)
             if result.get("precision") != precision or result.get("backend") != backend:
                 raise ValueError("Actual scientific backend/precision differs")
             result = dict(
@@ -307,6 +360,9 @@ def _run_tasks(
             )
             if once:
                 raise SystemExit(1)
+        finally:
+            if io_runtime is not None:
+                io_runtime.release(claim)
         if once:
             return
 
@@ -391,6 +447,8 @@ def main(argv=None):
     parser.add_argument("--backend", required=True, choices=("cpu", "cuda"))
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--machine", default=socket.gethostname())
+    parser.add_argument("--stores",type=Path,
+        help="Explicit host-local stores.toml (never written into job files)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
     parser.add_argument(
@@ -410,13 +468,19 @@ def main(argv=None):
     if not args.watchdog_seconds > 0 or not math.isfinite(args.watchdog_seconds):
         parser.error("--watchdog-seconds must be finite and positive")
     identity = name(args.machine + "-" + args.backend)
-    require_unc(str(args.job))
+    from ..job_filesystem import inspect_shared_folder
+    transport=inspect_shared_folder(args.job)
+    if not transport.allowed:
+        raise ValueError("Shared queue transport refused: "+transport.reason+": "+transport.evidence)
     with ServiceLock(identity):
         log_root = args.job / "logs"
         log_root.mkdir(parents=True, exist_ok=True)
         with (log_root / (identity + ".log")).open("a", encoding="utf-8") as log:
             try:
-                job, commit = verify_startup(args.job)
+                startup_context={}
+                job, commit = verify_startup(args.job,stores_path=args.stores,
+                    machine_id=args.machine,startup_context=startup_context)
+                args._alias_stores=startup_context.get("stores")
             except Exception:
                 emit(
                     log, dict(kind="startup_failure", traceback=traceback.format_exc())
@@ -534,6 +598,7 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
             args.watchdog,
             number,
             generation,
+            getattr(args,"_alias_stores",None),
         ),
     )
     process.start()
@@ -577,9 +642,16 @@ def _record_retirement(slot, args, identity):
             / ".attempts"
             / claim["attempt_id"]
         )
+        if claim["task"].get("format")=="darsia-alias-task-v1":
+            from .worker_io import retirement_output
+            stores=getattr(args,"_alias_stores",None)
+            output,actual_owner=retirement_output(args.job,claim["task"],identity,stores)
         document = retirement_document(
             claim["task"], output, identities, _identity(identity)
         )
+        if claim["task"].get("format")=="darsia-alias-task-v1":
+            document["machine_id"]=stores.machine_id
+            document["output_reference"]=actual_owner["output"]
         document["retired_utc"] = utc()
         document["actual_launch_wrapper"] = slot["root"]
         document["owned_launch_handle_retired"] = not slot["process"].is_alive()
@@ -602,7 +674,8 @@ def _parent(args, identity, job, commit, log):
     """Own one log and persistent slots; optionally supervise exact child liveness."""
     import psutil
 
-    shared = JobQueue(args.job)
+    shared = (JobQueue(args.job,machine_id=args._alias_stores.machine_id)
+              if job.get("format")=="darsia-alias-job-v1" else JobQueue(args.job,machine_id=identity))
     context = mp.get_context("spawn")
     messages, stop = context.Queue(), context.Event()
     slots = [
@@ -673,7 +746,11 @@ def _parent(args, identity, job, commit, log):
                             / identity
                             / (name(event["run"]) + ".json")
                         )
-                        task = read_json(path)
+                        if job.get("format")=="darsia-alias-job-v1":
+                            from .worker_io import claimed_task_after_archive
+                            task=claimed_task_after_archive(args.job,identity,event)
+                        else:
+                            task = read_json(path)
                         if task["attempt_id"] != event["attempt_id"]:
                             raise ValueError(
                                 "Claim message and actual task generation differ"
@@ -685,6 +762,7 @@ def _parent(args, identity, job, commit, log):
                         "completed",
                         "failed",
                         "lease_lost",
+                        "input_rejected",
                     }:
                         # Terminal/revoked attempts do not need a numerical restart.
                         slot["claim"] = None
@@ -749,7 +827,12 @@ def _parent(args, identity, job, commit, log):
                     slot["waiting_reclaim"] = False
                 # Re-verify the same startup admission before a replacement imports
                 # checkout code. No per-file code guard or generated start code.
-                same_job, same_commit = verify_startup(args.job)
+                if job.get("format")=="darsia-alias-job-v1":
+                    same_job,same_commit=verify_startup(args.job,
+                        stores_path=getattr(args,"stores",None),machine_id=args.machine,
+                        expected_stores=args._alias_stores)
+                else:
+                    same_job, same_commit = verify_startup(args.job)
                 if same_job != job or same_commit != commit:
                     raise RuntimeError("Watchdog restart startup identity differs")
                 slots[number] = _start_slot(

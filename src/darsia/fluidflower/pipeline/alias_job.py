@@ -1,4 +1,7 @@
-"""J2 portable metadata creation only; execution remains explicitly blocked."""
+"""Portable job creation; new metadata requires the explicit admitted J3 runtime.
+
+Previously prepared pending J2 files are never modified or promoted here.
+"""
 from __future__ import annotations
 from copy import deepcopy
 import hashlib
@@ -30,6 +33,48 @@ def _manifest(bound):
     return path, value, manifest_roots(path.parent,value)
 
 
+def shared_output_admission(job_root):
+    """Admit the real existing shared ancestor before any new job mkdir."""
+    from ..job_filesystem import inspect_shared_folder
+    selected=Path(job_root).expanduser()
+    parent=selected
+    while not parent.exists():
+        if parent==parent.parent:
+            raise ValueError("No existing shared job ancestor")
+        parent=parent.parent
+    if not parent.is_dir():
+        raise ValueError("Shared job ancestor is not a directory")
+    transport=inspect_shared_folder(parent)
+    if not transport.allowed:
+        raise ValueError("Shared queue transport refused: "+transport.reason+": "+transport.evidence)
+    if not selected.resolve().is_relative_to(parent.resolve()):
+        raise ValueError("New job escapes its admitted shared ancestor")
+    return transport
+
+
+def read_alias_series(path, *, expected_sha256, series_manifest, catalog_factory=None):
+    """Original series admission with explicit rooted metadata inputs only."""
+    from . import series
+    catalog_factory=catalog_factory or InputCatalog
+    _source, _manifest_value, roots=_manifest(series_manifest)
+    admission=catalog_factory(roots)
+    admission.add({"path":str(path),"sha256":expected_sha256},
+                  "configuration","execution_series")
+    admission.add(series_manifest,"configuration","series_manifest")
+    def reader_factory(aliases):
+        catalog=catalog_factory(roots,aliases)
+        class RootedReader:
+            def __init__(self):
+                self.input_index=0
+            def json(self,bound):
+                use="execution_series.input."+str(self.input_index)
+                self.input_index+=1
+                return catalog.doc(bound,"configuration",use)
+        return RootedReader()
+    return series.read_series(path,expected_sha256=expected_sha256,
+                              reader_factory=reader_factory)
+
+
 def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest,
                       catalog_factory=None):
     """Resolve all metadata input roles before creating the new shared job.
@@ -38,29 +83,19 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     configuration bytes and source SHA remain external input identities.
     """
     from . import series
+    transport = shared_output_admission(job_root)
     catalog_factory = catalog_factory or InputCatalog
     source_manifest, manifest, roots = _manifest(series_manifest)
-    admission = catalog_factory(roots)
-    # Admit the execution-series location before its ordinary byte-bound read.
-    source_path=Path(series_path)
-    source_bound={"path":str(source_path),"sha256":expected_sha256}
-    series_reference=admission.add(source_bound,"configuration","execution_series")
+    value,configs,original_series=read_alias_series(series_path,
+        expected_sha256=expected_sha256,series_manifest=series_manifest,
+        catalog_factory=catalog_factory)
+    admission=catalog_factory(roots)
+    series_reference=admission.add(original_series,"configuration","execution_series")
     manifest_reference=admission.add(series_manifest,"configuration","series_manifest")
-    def reader_factory(aliases):
-        catalog=catalog_factory(roots,aliases)
-        class RootedReader:
-            def __init__(self):
-                self.input_index = 0
-            def json(self,bound):
-                use = "execution_series.input." + str(self.input_index)
-                self.input_index += 1
-                return catalog.doc(bound,"configuration",use)
-        return RootedReader()
-    value, configs, original_series = series.read_series(
-        source_path,expected_sha256=expected_sha256,reader_factory=reader_factory)
     # Reuse original task/resource/code/calibration checks before encoding paths.
     job, original_tasks = series.series_tasks(
-        value,configs,job_root=job_root,series_asset=original_series)
+        value,configs,job_root=job_root,series_asset=original_series,
+        shared_admission=transport)
     name(value["job_id"])
     tasks=[]
     for task, config in zip(original_tasks,configs):
@@ -68,8 +103,9 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
         catalog.add(original_series,"configuration","run.execution_series")
         catalog.add(series_manifest,"configuration","run.series_manifest")
         inputs=validate_catalog(catalog.collect(task["configuration"],config))
+        inputs["runtime_support"]="darsia-role-io-runtime-v1"
         portable=dict(deepcopy(task),format=TASK_FORMAT,format_version=1,
-            legacy_paths=False,execution_ready=False,execution_blocker=RUNTIME_PENDING,
+            legacy_paths=False,execution_ready=True,execution_blocker="",
             configuration=inputs["configuration"],series=series_reference,
             series_manifest=manifest_reference,input_catalog=inputs,
             ordered_case_ids=[frame["case_id"] for frame in config["frames"]])
@@ -83,7 +119,7 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     if set(job)-allowed_job:
         raise ValueError("Unsupported alias-job fields: "+repr(sorted(set(job)-allowed_job)))
     job=dict(job,format=JOB_FORMAT,format_version=1,legacy_paths=False,
-        execution_ready=False,execution_blocker=RUNTIME_PENDING,
+        execution_ready=True,execution_blocker="",runtime_support="darsia-role-io-runtime-v1",
         series=series_reference,series_manifest=manifest_reference,
         series_id=manifest["series_id"],input_reference_format="root-alias-relative-v1")
     publish = job.get("publish", ["film", "lossless_export"])
@@ -94,7 +130,6 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
         raise ValueError("Publish must name relative products, never machine paths")
     job["publish"] = deepcopy(publish)
     root=Path(job_root)
-    require_unc(str(root))
     # Every role, root, size and metadata SHA has now been admitted.
     target=root/"job.json"
     if target.exists() and read_json(target)!=job:
@@ -123,7 +158,7 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
         prepared.append({"run":task["run"],"task":descriptor(location),"already_enqueued":already})
     return {"complete":True,"job":descriptor(root/"job.json"),"series":series_reference,
             "series_manifest":manifest_reference,"tasks":prepared,
-            "legacy_paths":False,"execution_ready":False,"execution_blocker":RUNTIME_PENDING,
+            "legacy_paths":False,"execution_ready":True,"execution_blocker":"",
             "numerical_calls_started":False}
 
 

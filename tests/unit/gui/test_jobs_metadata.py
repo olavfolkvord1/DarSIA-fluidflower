@@ -420,6 +420,9 @@ def selection_fixture(tmp_path, *, portable=False):
 def test_creation_blocks_unbound_or_mismatching_b4_before_existing_producer(
     tmp_path, monkeypatch
 ):
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda _path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "isolated unit transport", "not a real FS qualification"))
     root, plan, _, resolved, admit = selection_fixture(tmp_path)
     monkeypatch.setattr(model, "require_unc", lambda path: None)
     calls = []
@@ -447,6 +450,9 @@ def test_creation_blocks_unbound_or_mismatching_b4_before_existing_producer(
 def test_explicit_creation_original_producer_only_and_ui_b4_receipt(
     tmp_path, monkeypatch
 ):
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda _path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "isolated unit transport", "not a real FS qualification"))
     root, plan, frames, resolved, admit = selection_fixture(tmp_path, portable=True)
     monkeypatch.setattr(model, "require_unc", lambda path: None)
     target = tmp_path / "job"
@@ -502,6 +508,9 @@ def test_explicit_creation_original_producer_only_and_ui_b4_receipt(
 def test_b4_changes_during_creation_preserve_original_metadata_without_false_master(
     tmp_path, monkeypatch
 ):
+    from darsia.fluidflower import job_filesystem
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda _path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "isolated unit transport", "not a real FS qualification"))
     root, plan, _, resolved, admit = selection_fixture(tmp_path, portable=True)
     monkeypatch.setattr(model, "require_unc", lambda path: None)
     target = tmp_path / "job"

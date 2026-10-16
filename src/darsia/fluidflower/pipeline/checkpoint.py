@@ -73,6 +73,9 @@ def run_identity(task, backend, precision, calibration_sha256):
 
 def resume_source_for_claim(shared, claim):
     """Select only this claim's genuine reclaimed predecessor, never a scan."""
+    if claim.task.get("format") == "darsia-alias-task-v1":
+        from .run_io import alias_resume_source
+        return alias_resume_source(shared,claim)
     matches = []
     root = shared.root / "reclaimed" / claim.task["run"]
     for record_path in root.glob("*/reclaimed.json"):
@@ -122,6 +125,15 @@ def resume_source_for_claim(shared, claim):
     )
 
 
+def _original_storage_facts(task, publication):
+    """Verify actual storage facts without changing original product checks."""
+    if task.get("format") == "darsia-alias-task-v1":
+        return (publication.get("direct_NAS_write") is False
+                and publication.get("direct_local_write") is True
+                and publication.get("local_retained") is True)
+    return publication.get("direct_NAS_write") is True
+
+
 def verify_frame_prefix(
     task,
     config,
@@ -167,6 +179,9 @@ def verify_frame_prefix(
     if _key(attempt) in seen:
         raise ValueError("Resume predecessor cycle")
     seen.add(_key(attempt))
+    if task.get("format") == "darsia-alias-task-v1":
+        from .run_io import for_task
+        for_task(task).require_resume_location(attempt)
     proof = _bound_json(source["retirement"])
     if (
         proof.get("complete") is not True
@@ -311,7 +326,7 @@ def verify_frame_prefix(
             or _key(publication.get("nas_directory", "")) != _key(final)
             or publication.get("manifest_sha256") != manifest_asset["sha256"]
             or publication.get("files") != inventory
-            or publication.get("direct_NAS_write") is not True
+            or not _original_storage_facts(task,publication)
         ):
             raise ValueError("Resume original frame registration/publication differs")
         result_asset = dict(files["result.json"], path=str(final / "result.json"))
@@ -345,7 +360,15 @@ def verify_frame_prefix(
             ):
                 raise ValueError("Resume result source/science bindings differ")
         else:
-            frame_validator(spec, result, final, config)
+            if task.get("format") == "darsia-alias-task-v1":
+                # Original artifact checks may read the producer's preparation
+                # files. Permit only this exact same-machine candidate while
+                # those unchanged checks run; no permanent prefix is admitted.
+                from .run_io import for_task
+                with for_task(task).prefix_validation(source):
+                    frame_validator(spec, result, final, config)
+            else:
+                frame_validator(spec, result, final, config)
         records.append(
             publication
         )  # Literal original record, never reserialized as a new producer.

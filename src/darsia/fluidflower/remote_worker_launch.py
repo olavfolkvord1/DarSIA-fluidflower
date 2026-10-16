@@ -137,6 +137,15 @@ def launch_remote_worker(job_root, *, target, backend, workers,
         "worker_startup_verified": False, "numerical_progress_claimed": False,
         "error": "" if started else process.errorString(),
     }
+    # New alias-job launch records bind only the immutable job identity. The
+    # original command/checkout remain passive actual-launch provenance.
+    job_path = Path(launch.job_root) / "job.json"
+    if job_path.is_file():
+        from .pipeline.job_queue import read_json
+        if read_json(job_path).get("format") == "darsia-alias-job-v1":
+            from .pipeline.alias_job import job_metadata_reference
+            record.update(format="darsia-job-ssh-launch-v2",
+                          job=job_metadata_reference(Path(launch.job_root), job_path))
     receipt_writer(directory / "launch.json", record)
     if not started:
         raise RuntimeError(record["error"])

@@ -94,6 +94,7 @@ class NativeJobsWorkspace(QWidget):
             local_launcher=local_launcher,
             remote_launcher=remote_launcher,
             known_jobs_provider=self.registry.known_jobs,
+            local_stores_path_provider=lambda: self.stores.path,
         )
         self.resources = None
         if resource_factory is not None:

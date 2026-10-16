@@ -300,7 +300,10 @@ def test_parent_keeps_controlled_claim_for_existing_retirement(
         value["retired"] = True
         return []
 
-    monkeypatch.setattr(worker, "JobQueue", lambda *args: object())
+    def queue_for_service(root, *, machine_id):
+        assert root==tmp_path and machine_id=="Main-cpu"
+        return object()
+    monkeypatch.setattr(worker, "JobQueue", queue_for_service)
     monkeypatch.setattr(worker.mp, "get_context", lambda *args: context)
     monkeypatch.setattr(worker, "_start_slot", lambda *args: slot)
     monkeypatch.setattr(worker, "read_json", lambda path: task)
@@ -358,7 +361,10 @@ def test_final_message_drain_preserves_control_failure_exit_status(
         value["retired"] = True
         return []
 
-    monkeypatch.setattr(worker, "JobQueue", lambda *args: object())
+    def queue_for_service(root, *, machine_id):
+        assert root==tmp_path and machine_id=="Main-cpu"
+        return object()
+    monkeypatch.setattr(worker, "JobQueue", queue_for_service)
     monkeypatch.setattr(worker.mp, "get_context", lambda *args: context)
     monkeypatch.setattr(worker, "_start_slot", lambda *args: slot)
     monkeypatch.setattr(worker, "_record_retirement", retire)
