@@ -491,6 +491,11 @@ def _results(context: WorkflowStatusContext) -> Path | None:
 
 
 def _protocols(context: WorkflowStatusContext) -> RowStatus:
+    """Attach extra metadata to every original configured-protocol outcome."""
+    return _protocol_extra_summary(context, _configured_protocols(context))
+
+
+def _configured_protocols(context: WorkflowStatusContext) -> RowStatus:
     table = _map(context.config.get("protocols"))
     imaging = table.get("imaging")
     data = _map(context.config.get("data"))
@@ -565,6 +570,33 @@ def _protocols(context: WorkflowStatusContext) -> RowStatus:
         return _missing(
             "Saved configured protocols are not established.", "Protocols", str(error)
         )
+
+
+def _protocol_extra_summary(context: WorkflowStatusContext, status: RowStatus) -> RowStatus:
+    """Report one loaded run's extra metadata without changing completion."""
+    if context.series_root is None or not context.run_id:
+        return status
+    folder = _path(_map(context.manifest.get("paths")).get("protocols", "protocols"),
+                   context.series_root)
+    if folder is None:
+        return status
+    import csv
+    from .series_convert import inspect_protocol_extras
+    try:
+        extras = inspect_protocol_extras(folder / context.run_id)
+    except (OSError, ValueError, TypeError, UnicodeError, csv.Error) as error:
+        return replace(status, summary=status.summary +
+            " Extra protocol metadata not inspected: " + str(error))
+    if not extras:
+        return status
+    details = []
+    for item in extras:
+        name = Path(item.get("path") or item["file"]["path"]).name
+        if item["role"] == "image_blacklist":
+            name += " (" + str(item["row_count"]) + " image blacklist rows)"
+        details.append(name)
+    return replace(status, summary=status.summary +
+        " Extra metadata ignored for completion: " + "; ".join(details) + ".")
 
 
 def _depth(context: WorkflowStatusContext) -> RowStatus:
