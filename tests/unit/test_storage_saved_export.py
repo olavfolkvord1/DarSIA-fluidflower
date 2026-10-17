@@ -3,6 +3,7 @@ from copy import deepcopy
 import csv
 import hashlib
 import importlib.util
+import importlib.machinery
 import json
 from pathlib import Path
 import types
@@ -19,12 +20,12 @@ from darsia.fluidflower import storage_outputs as output
 from darsia.fluidflower import storage_saved_products as saved
 # Frozen original reader is a validation-only fixture, never a DarSIA product module.
 _ORACLE_NAME = "ffac_test_fixture_storage_default_reader"
-_ORACLE_PATH = Path(__file__).parents[1] / "fixtures" / "storage_saved_products_default_oracle.py"
+_ORACLE_PATH = Path(__file__).parents[1] / "fixtures" / "storage_saved_products_default_oracle.py.fixture"
 _ORACLE_RAW = _ORACLE_PATH.read_bytes()
 if (hashlib.sha256(_ORACLE_RAW).hexdigest() != "4a0eef912849ef32bca560326817483db37e53fb88e817094664f305eb2682d0"
         or len(_ORACLE_RAW) != 21213):
     raise RuntimeError("Frozen original default-reader test fixture changed")
-_ORACLE_SPEC = importlib.util.spec_from_file_location(_ORACLE_NAME, _ORACLE_PATH)
+_ORACLE_SPEC = importlib.util.spec_from_file_location(_ORACLE_NAME, _ORACLE_PATH, loader=importlib.machinery.SourceFileLoader(_ORACLE_NAME, str(_ORACLE_PATH)))
 original_reader = importlib.util.module_from_spec(_ORACLE_SPEC)
 original_reader.__package__ = "darsia.fluidflower"
 sys.modules[_ORACLE_NAME] = original_reader
