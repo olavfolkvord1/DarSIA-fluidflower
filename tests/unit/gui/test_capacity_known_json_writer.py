@@ -56,6 +56,8 @@ def fixture_git(tmp_path, measured, current, *, eol="lf", relative=WRITER):
             "commit", "--allow-empty", "-m", label)
         commits.append(git("rev-parse", "HEAD"))
     git("checkout-index", "--force", "--all")
+    if eol == "crlf":
+        path.write_bytes(current.replace(b"\n", b"\r\n"))
     assert not git("status", "--porcelain=v1", "--untracked-files=all")
     assert path.read_bytes().replace(b"\r\n", b"\n") == current
     row = dict(relative_path=relative, measured_sha256=sha(measured), sha256=sha(current))
