@@ -115,9 +115,12 @@ class Phase2Storage:
 
 
 def write_n1_frame(temporary, final, *, manifest, manifest_asset, spec, config,
-                   evaluated, capture, context):
+                   evaluated, capture, context, extensive_inputs=None):
     """Use the four unchanged reducers, then add only new immutable flat files."""
     from PIL import Image
+    if extensive_inputs is not None:
+        from .storage_extensive_io import validate_inputs
+        validate_inputs(extensive_inputs)
     temporary, final = Path(temporary), Path(final)
     if (final.name != spec["case_id"] or final.parent.name != "frames"
             or temporary.parent != final.parent or not temporary.name.startswith("." + spec["case_id"] + ".")
@@ -235,5 +238,12 @@ def write_n1_frame(temporary, final, *, manifest, manifest_asset, spec, config,
         coarse=dict(reduced["metadata"], arrays={k: output._array_identity(v) for k, v in arrays.items()},
                     per_frame_geometry=True, shared_static_geometry_assumed=False),
         files=files, existing_native_products_unchanged=True)
+    if extensive_inputs is not None:
+        from .storage_extensive_io import prepare_payload, write_payload, declared_files
+        product = prepare_payload(extensive_inputs, grid, labels=labels,
+            saturation=evaluated["export"]["products"]["saturation_free_gas"],
+            masses=masses, totals=totals)
+        document["extensive"] = write_payload(temporary, final, product, document)
+        files.extend(declared_files(document["extensive"]).values())
     output._write_json(temporary / "storage_completed.json", document)
     return {Path(bound["path"]).name: bound["kind"] for bound in files} | {"storage_completed.json": "operational_receipt"}

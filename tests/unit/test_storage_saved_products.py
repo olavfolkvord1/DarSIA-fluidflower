@@ -23,7 +23,7 @@ def _sha_size(path):
 
 
 def _fixture(tmp_path, *, precision="float32", pending=False, case="ac52_f1",
-             storage_resolution_mm=1., grid_origin=(0.,0.)):
+             storage_resolution_mm=1., grid_origin=(0.,0.), extensive_inputs=None):
     root = tmp_path / "attempt"
     dtype = np.dtype(precision)
     stage = root / "preparation" / case
@@ -59,7 +59,10 @@ def _fixture(tmp_path, *, precision="float32", pending=False, case="ac52_f1",
         extent_m=[grid_origin[0],grid_origin[0]+.003*storage_resolution_mm,
                   grid_origin[1],grid_origin[1]+.003*storage_resolution_mm])}, precision)
     entry = output.write_frame(root, task, spec, phase,
-        dict(labels=labels, classes={"rig_domain": eligible}), capture, mass, evaluated, request)
+        dict(labels=labels, classes={"rig_domain": eligible}), capture, mass, evaluated, request,
+        **({} if extensive_inputs is None else {"extensive_inputs":
+            _synthetic_extensive_inputs(labels, frame.pixel_area_m2,
+                products["saturation_free_gas"]) if extensive_inputs is True else extensive_inputs}))
     binding = dict(format="darsia-series-frame-v1", complete=True, case_id=case,
         configuration_sha256=config["sha256"], source=source,
         native={"source_sha256": "d" * 64}, phase=phase,
@@ -109,9 +112,135 @@ def _resolver(state):
         state["calls"].append(bound["path"])
         name = Path(bound["path"]).name
         assert name in {"manifest.json", "commit.json", "result.json", "storage_completed.json",
-                        "storage_stored_frame.npz", "storage_gas_probability_before_rules.png"}
+                         "storage_stored_frame.npz", "storage_gas_probability_before_rules.png",
+                         *({"storage_extensive_frame.npz", "storage_extensive_frame.json"}
+                           if state["document"].get("extensive") else set())}
         return Path(bound["path"])
     return resolve
+
+
+def _synthetic_extensive_inputs(labels, area, saturation, *, hidden_last=False):
+    """Explicit tiny synthetic physical inputs, never a dataset mask producer."""
+    from darsia.fluidflower import storage_extensive as extensive
+    from darsia.fluidflower import storage_extensive_io as payload
+    shape = labels.shape
+    physical = np.ones(shape, bool)
+    hidden = np.zeros(shape, bool)
+    if hidden_last:
+        hidden.flat[-1] = True
+    pv = np.asarray(area, np.float64) * .5
+    return dict(format=payload.INPUT_FORMAT, qualification=payload.QUALIFICATION,
+        physical_producer_admitted=False, physical_inputs=dict(
+            depth_m=np.ones(shape), porosity=np.full(shape, .5), pixel_pore_volume_m3=pv,
+            facies=np.ones(shape, np.uint8), physical_mask=physical,
+            physical_properties_valid_mask=physical.copy(), mass_support_mask=physical.copy(),
+            hidden_mask=hidden, coverage_masks=dict(measured=~hidden, estimated=np.zeros(shape, bool), hidden=hidden.copy()),
+            intensive_validity_masks={name: ~hidden for name in extensive.INTENSIVE},
+            saturation_valid_mask=np.ones(shape, bool),
+            native_extensive_totals=dict(physical_area_m2=float(area.sum()), bulk_volume_m3=float(area.sum()),
+                pore_volume_m3=float(pv.sum()), gas_pore_volume_m3=float((pv[labels == 2] * saturation[labels == 2]).sum())),
+            channels=dict.fromkeys(extensive.CHANNELS), provenance=dict(synthetic_fixture=True,
+                actual_physical_fields="OUTSTANDING", camera_clock=None)))
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_optional_extensive_native_writer_commit_reader_retains_independent_masses(tmp_path, precision):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state = _fixture(tmp_path, precision=precision, extensive_inputs=True)
+    coarse = saved.read_stored_frame(state["record"], resolve_asset=_resolver(state))
+    assert not any(Path(p).name.startswith("storage_extensive") for p in state["calls"])
+    value = payload.read_committed_payload(state["record"], producer_kind="native-phase-n1", resolve_asset=_resolver(state))
+    assert value["state"] == "synthetic_io_only"
+    assert value["physical_binding_admitted"] is value["producer_identity_admitted"] is False
+    assert value["metadata"]["precision"] == precision
+    for name, scalar in (("total", 9.), ("aqueous", 3.), ("gas", 3.)):
+        assert value["arrays"]["cell_mass_" + name + "_g"].dtype == np.dtype(precision)
+        assert value["arrays"]["cell_mass_" + name + "_g"].sum(dtype=np.float64) == scalar
+    assert coarse["mass_totals_g"] == dict(total=9., aqueous=3., gas=3.)
+    assert not any("cell_" + channel + "_g" in value["arrays"] for channel in ("M_maalt", "M_kant", "U"))
+
+
+def test_optional_extensive_keeps_old_coarse_bytes_and_positive_hidden_PV_nan(tmp_path):
+    from darsia.fluidflower import storage_extensive_io as payload
+    labels = np.array([[0, 1], [2, 255]], np.uint8)
+    explicit = _synthetic_extensive_inputs(labels, np.full((2, 2), 1e-6), np.full((2, 2), .5), hidden_last=True)
+    old = _fixture(tmp_path / "old")
+    state = _fixture(tmp_path / "new", extensive_inputs=explicit)
+    for name in ("storage_stored_frame.npz", "storage_gas_probability_before_rules.png"):
+        assert (old["root"] / "preparation/ac52_f1" / name).read_bytes() == (state["root"] / "preparation/ac52_f1" / name).read_bytes()
+    value = payload.read_committed_payload(state["record"], producer_kind="native-phase-n1", resolve_asset=_resolver(state))
+    arrays = value["arrays"]
+    assert arrays["pore_volume_m3"][1, 1] > 0
+    assert arrays["coverage_hidden_pore_volume_fraction"][1, 1] == 1
+    assert np.isnan(arrays["concentration_aqueous"][1, 1])
+    assert arrays["cell_mass_total_g"][1, 1] == 0
+
+
+@pytest.mark.parametrize("bad", ["format", "qualification", "admission", "extra", "missing", "mass_override"])
+def test_optional_extensive_input_is_closed_and_never_admits_a_physical_producer(tmp_path, bad):
+    value = _synthetic_extensive_inputs(np.array([[0, 1], [2, 255]], np.uint8), np.full((2, 2), 1e-6), np.full((2, 2), .5))
+    if bad == "format": value["format"] = "unknown"
+    elif bad == "qualification": value["qualification"] = "production"
+    elif bad == "admission": value["physical_producer_admitted"] = True
+    elif bad == "extra": value["extra"] = None
+    elif bad == "missing": del value["physical_inputs"]["hidden_mask"]
+    else: value["physical_inputs"]["native_mass_totals_g"] = dict(total=1., aqueous=1., gas=0.)
+    with pytest.raises(ValueError, match="closed synthetic-only"):
+        _fixture(tmp_path, extensive_inputs=value)
+    assert not list(tmp_path.rglob("storage_extensive*"))
+
+
+@pytest.mark.parametrize("bad", ["source", "configuration", "precision", "admission", "archive", "grid", "totals", "metadata"])
+def test_resealed_extensive_envelope_cannot_disagree_with_committed_native_identity(tmp_path, bad):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state = _fixture(tmp_path, extensive_inputs=True)
+    section = state["document"]["extensive"]
+    path = Path(section["receipt"]["path"])
+    envelope = json.loads(path.read_bytes())
+    if bad == "admission": envelope["physical_producer_admitted"] = True
+    elif bad == "archive": envelope["archive"]["sha256"] = "0" * 64
+    elif bad == "grid": envelope["api_metadata"]["grid"]["extent_m"][0] = -1.
+    elif bad == "totals": envelope["api_metadata"]["native_mass_totals_g"]["total"] = 6.
+    elif bad == "metadata": envelope["api_metadata"] = None
+    else: envelope["frame_identity"][bad] = "changed"
+    _json(path, envelope)
+    updated = dict(output._asset(path), kind="operational_receipt")
+    section["receipt"] = updated
+    state["entry"]["extensive"] = deepcopy(section)
+    state["entry"]["files"] = [updated if Path(row["path"]).name == payload.RECEIPT else row for row in state["entry"]["files"]]
+    _reseal(state)
+    with pytest.raises(ValueError):
+        payload.read_committed_payload(state["record"], producer_kind="native-phase-n1", resolve_asset=_resolver(state))
+
+
+@pytest.mark.parametrize("bad", ["archive", "missing", "kind", "extra"])
+def test_optional_extensive_cannot_escape_actual_native_inventory(tmp_path, bad):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state = _fixture(tmp_path, extensive_inputs=True)
+    if bad == "archive":
+        path = Path(state["document"]["extensive"]["archive"]["path"])
+        path.write_bytes(path.read_bytes() + b"changed")
+    elif bad == "missing":
+        state["entry"]["files"] = [r for r in state["entry"]["files"] if Path(r["path"]).name != payload.ARCHIVE]
+        _reseal(state)
+    elif bad == "kind":
+        state["entry"]["extensive"]["archive"]["kind"] = "frame_scalar"
+        state["document"]["extensive"] = deepcopy(state["entry"]["extensive"])
+        _reseal(state)
+    else:
+        extra = dict(state["entry"]["files"][-1], path=str(state["root"] / "preparation/ac52_f1/storage_unknown.npz"))
+        state["entry"]["files"].append(extra)
+        _reseal(state)
+    with pytest.raises(ValueError):
+        payload.read_committed_payload(state["record"], producer_kind="native-phase-n1", resolve_asset=_resolver(state))
+
+
+def test_native_resolution_cannot_activate_synthetic_extensive_payload(tmp_path):
+    value = _synthetic_extensive_inputs(np.zeros((1, 1), np.uint8), np.ones((1, 1)), np.zeros((1, 1)))
+    with pytest.raises(ValueError, match="coarse grid"):
+        output.write_frame(None, None, None, None, None, None, None, None,
+                           {"resolution_mm": "native"}, extensive_inputs=value)
+    assert not list(tmp_path.iterdir())
 
 
 def _alter_archive(state, mutate):

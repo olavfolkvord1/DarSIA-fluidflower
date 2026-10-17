@@ -69,17 +69,18 @@ def _photo_inputs(root, spec):
                 saved_native_review=review, geometry_producer_sha256=GEOMETRY)
 
 
-def _inputs(tmp_path, tiny_config, phase1_data, *, before=True, photo=False):
+def _inputs(tmp_path, tiny_config, phase1_data, *, before=True, photo=False, precision="float32"):
     """Seal real tiny saved fields as synthetic phase-one input commits."""
     config, _ = tiny_config
     config = deepcopy(config)
-    config["precision"] = "float32"
+    config["precision"] = precision
     config["geometry_fields"] = dict(source_to_native="H_ac28_to_frame_native",
         original_domain_to_native="H_ac28_to_frame_native", carried_homography_provenance="original_H_ac28_to_native")
     config["shared"]["reference_matrix"] = [[.001, 0., .0005], [0., -.001, .0025], [0., 0., 1.]]
     config["shared"]["depth_points"] = [[0., .001, .01], [.003, .001, .01], [0., .003, .01], [.003, .003, .01]]
     config["summary"]["anchor_target_h"] = config["anchor"]["elapsed_h"]
     data = deepcopy(phase1_data)
+    data["precision"] = precision
     data.update(run=config["run"], frames=[], ordered_case_ids=[])
     data["statistics"] = {key: deepcopy(config[key]) for key in ("shared", "geometry_fields", "physical_correction",
         "recipe", "dimensions_m", "boxes", "summary", "bindings", "contracts")}
@@ -130,7 +131,7 @@ def _inputs(tmp_path, tiny_config, phase1_data, *, before=True, photo=False):
         request = _photo_inputs(tmp_path / ("photo_" + spec["case_id"]), spec) if photo else None
         if request:
             data["photographs"][spec["case_id"]] = request
-        photograph = stage._save_original_photo(root, dict(run=config["run"], precision="float32"),
+        photograph = stage._save_original_photo(root, dict(run=config["run"], precision=precision),
                                                spec, request, n1.DataReader())
         statistics = stage._save_statistics(root, dict(statistics=dict(original_synthetic_count=9), sandmap={}))
         native_products.append((root, native, native_receipt, phase, before_evidence, photograph, statistics))
@@ -138,12 +139,12 @@ def _inputs(tmp_path, tiny_config, phase1_data, *, before=True, photo=False):
     staged.validate_phase1_run(data)
     configuration = _json(tmp_path / "phase1_configuration.json", data)
     for spec, (root, native, native_receipt, phase, before_evidence, photograph, statistics) in zip(original_specs, native_products):
-        commit = stage._commit_phase1(root, spec, task=dict(run=config["run"], precision="float32"),
+        commit = stage._commit_phase1(root, spec, task=dict(run=config["run"], precision=precision),
             configuration=configuration, native=dict(record=native, record_asset=native_receipt), phase=phase,
             statistics=statistics, before=before_evidence, photograph=photograph)
         records.append((commit, json.loads(Path(commit["path"]).read_bytes())))
     completion = _json(tmp_path / "phase1_completed.json", dict(format=staged.COMPLETION_FORMAT, complete=True,
-        run=config["run"], configuration=configuration, precision="float32", code_commit="1" * 40,
+        run=config["run"], configuration=configuration, precision=precision, code_commit="1" * 40,
         ordered_case_ids=data["ordered_case_ids"], frames=[bound for bound, _ in records], history_complete=True))
     config["frames"] = [bind_mass_frame(spec, record["native"], record["phase"], baseline=data["phase"]["reference"]["full"])
                          for spec, (_, record) in zip(original_specs, records)]
@@ -155,11 +156,81 @@ def _inputs(tmp_path, tiny_config, phase1_data, *, before=True, photo=False):
     return config
 
 
-def _run(tmp_path, config):
+def _run(tmp_path, config, *, precision="float32"):
     bound = _json(tmp_path / "n1_configuration.json", config)
     completion = n1.run_n1(dict(run=config["run"], configuration=bound, commit=COMMIT, job_id="tiny-n1"),
-                           tmp_path / "mass", "cpu", "float32")
+                           tmp_path / "mass", "cpu", precision)
     return completion
+
+
+def _run_with_extensive(tmp_path, config, monkeypatch, *, precision="float32"):
+    """Pass the optional keyword at its direct API seam, never alter evaluation.
+
+    Production callers intentionally cannot activate synthetic physical data.
+    This test-only forwarding shim calls the real writer once per original case.
+    """
+    from .test_storage_saved_products import _synthetic_extensive_inputs
+    original, calls = output.write_n1_frame, []
+    def forward(*args, **kwargs):
+        frame = kwargs["capture"]["frame"]
+        labels = frame.phase_labels
+        area = np.broadcast_to(np.asarray(frame.pixel_area_m2), labels.shape)
+        saturation = kwargs["evaluated"]["export"]["products"]["saturation_free_gas"]
+        calls.append(kwargs["spec"]["case_id"])
+        return original(*args, **kwargs,
+            extensive_inputs=_synthetic_extensive_inputs(labels, area, saturation))
+    with monkeypatch.context() as context:
+        context.setattr(output, "write_n1_frame", forward)
+        completed = _run(tmp_path, config, precision=precision)
+    assert calls == [spec["case_id"] for spec in config["frames"]]
+    return completed
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_optional_extensive_real_N1_commit_and_reader_keep_genuine_producer(tiny_config, phase1_data, tmp_path, monkeypatch, precision):
+    from darsia.fluidflower import storage_extensive_io as payload
+    config = _inputs(tmp_path, tiny_config, phase1_data, precision=precision)
+    completed = _run_with_extensive(tmp_path, config, monkeypatch, precision=precision)
+    manifest = json.loads(Path(completed["manifest"]["path"]).read_bytes())
+    for record in completed["records"]:
+        def resolve(bound):
+            assert Path(bound["path"]).name not in {"products.npz", "native_geometry.npz"}
+            return Path(bound["path"])
+        stored = saved_n1.read_n1_stored_frame(record, manifest=manifest,
+            manifest_asset=completed["manifest"], resolve_asset=resolve)
+        value = payload.read_committed_payload(record, producer_kind="n1-mass-only",
+            manifest=manifest, manifest_asset=completed["manifest"], resolve_asset=resolve)
+        assert value["state"] == "synthetic_io_only"
+        assert value["physical_binding_admitted"] is value["producer_identity_admitted"] is False
+        assert value["metadata"]["precision"] == precision
+        assert value["original_frame_identity"]["format"] == output.FRAME_FORMAT
+        assert value["original_frame_identity"]["source_binding"] == manifest["frames"][record["frame_id"]]["source_binding"]
+        for name, total in stored["mass_totals_g"].items():
+            array = value["arrays"]["cell_mass_" + name + "_g"]
+            assert array.dtype == np.dtype(precision)
+            assert abs(array.sum(dtype=np.float64) - total) <= 1e-6 * abs(total)
+
+
+def test_optional_extensive_genuine_N1_index_collect_remains_saved_only(tiny_config, phase1_data, tmp_path, monkeypatch):
+    from darsia.fluidflower import storage_extensive_io as payload
+    from darsia.fluidflower.pipeline import products_publication as publication
+    config = _inputs(tmp_path, tiny_config, phase1_data)
+    completion = _run_with_extensive(tmp_path, config, monkeypatch)
+    index = _index(tmp_path, completion)
+    _root, _doc, rows = publication._read_index(index)
+    wanted = [key for key, row in rows.items() if key.startswith("frames/") and row["kind"] == "map"
+              and Path(row["local_path"]).name.startswith("storage_")]
+    collection = publication.collect_products(index, wanted, tmp_path / "collected_extensive",
+        current_machine_id="Olav", file_writers_closed=True)
+    original_read = Path.read_bytes
+    def guard(path):
+        assert not str(path).startswith(str(tmp_path / "mass")), "Producer payload fallback"
+        return original_read(path)
+    monkeypatch.setattr(Path, "read_bytes", guard)
+    run = payload.read_indexed_extensive_run(index, producer_kind="n1-mass-only",
+        current_machine_id="Olav", collections=[collection])
+    assert not isinstance(run["frames"], list)
+    assert len(list(run["frames"])) == 2
 
 
 @pytest.mark.parametrize("before", [False, True])

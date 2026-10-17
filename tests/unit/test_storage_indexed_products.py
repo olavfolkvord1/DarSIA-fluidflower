@@ -21,8 +21,8 @@ def _write(path, value):
     return output._asset(path)
 
 
-def _published(tmp_path, *, pending=False):
-    state = _fixture(tmp_path / "producer", pending=pending)
+def _published(tmp_path, *, pending=False, extensive_inputs=None):
+    state = _fixture(tmp_path / "producer", pending=pending, extensive_inputs=extensive_inputs)
     manifest = output._asset(state["manifest_path"])
     completion = dict(complete=True, worker_references_closed=True, pipeline="native-phase-n1",
         run="ac52", frames=1, case_count=1, ordered_case_ids=["ac52_f1"],
@@ -45,7 +45,7 @@ def _published(tmp_path, *, pending=False):
     add("producer/result.json", output._asset(state["directory"] / "result.json"), "frame_scalar")
     add("storage/receipt.json", state["entry"]["receipt"], "operational_receipt")
     for bound in state["entry"]["files"]:
-        add("storage/" + Path(bound["path"]).name, bound, "map")
+        add("storage/" + Path(bound["path"]).name, bound, bound.get("kind", "map"))
     # The original native archive is deliberately unavailable and must never be
     # opened by this storage reader, publication, or targeted collect.
     rows.append(publication.product("native/products.npz", machine_id="Main",
@@ -56,12 +56,70 @@ def _published(tmp_path, *, pending=False):
     return state, index, completion
 
 
-def _collect(tmp_path, index, *, include_before=True):
+def _collect(tmp_path, index, *, include_before=True, include_extensive=True):
     _root, _document, rows = publication._read_index(index)
     keys = [key for key in rows if key.startswith("storage/") and rows[key]["kind"] == "map"
-            and (include_before or not key.endswith(".png"))]
+             and (include_before or not key.endswith(".png"))
+             and (include_extensive or not key.endswith("storage_extensive_frame.npz"))]
     return publication.collect_products(index, keys, tmp_path / "collected",
         current_machine_id="Main", file_writers_closed=True)
+
+
+def test_explicit_extensive_index_reader_streams_original_committed_payload(tmp_path):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state, index, completion = _published(tmp_path, extensive_inputs=True)
+    original = deepcopy(completion)
+    run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1", current_machine_id="Main")
+    assert not isinstance(run["frames"], list)
+    value = next(run["frames"])
+    assert value["state"] == "synthetic_io_only"
+    assert value["arrays"]["cell_mass_total_g"].sum(dtype=np.float64) == 9.
+    assert run["physical_binding_admitted"] is run["producer_identity_admitted"] is False
+    assert original == completion and not (state["directory"] / "products.npz").exists()
+    with pytest.raises(StopIteration): next(run["frames"])
+
+
+def test_unrequested_extensive_does_not_force_collect_but_explicit_reader_does(tmp_path, monkeypatch):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state, index, _ = _published(tmp_path, extensive_inputs=True)
+    collection = _collect(tmp_path, index, include_extensive=False)
+    original_stat = Path.stat
+    def guard(path, *args, **kwargs):
+        assert not str(path).startswith(str(state["root"])), "Foreign producer path was probed"
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", guard)
+    old = indexed.read_indexed_stored_run(index, current_machine_id="Olav", collections=[collection])
+    assert old["frames"][0]["mass_totals_g"]["total"] == 9.
+    run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
+        current_machine_id="Olav", collections=[collection])
+    with pytest.raises(saved.StoredProductCollectionRequired) as caught:
+        next(run["frames"])
+    assert Path(caught.value.descriptor["path"]).name == payload.ARCHIVE
+
+
+def test_explicit_extensive_real_collect_uses_no_producer_or_native_fallback(tmp_path, monkeypatch):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state, index, _ = _published(tmp_path, extensive_inputs=True)
+    collection = _collect(tmp_path, index)
+    original_read = Path.read_bytes
+    def guard(path):
+        assert not str(path).startswith(str(state["root"])), "Producer payload fallback"
+        return original_read(path)
+    monkeypatch.setattr(Path, "read_bytes", guard)
+    run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
+        current_machine_id="Olav", collections=[collection])
+    assert next(run["frames"])["metadata"]["native_mass_totals_g"] == dict(total=9., aqueous=3., gas=3.)
+
+
+def test_collected_extensive_archive_still_checks_original_SHA(tmp_path):
+    from darsia.fluidflower import storage_extensive_io as payload
+    _state, index, _ = _published(tmp_path, extensive_inputs=True)
+    collection = _collect(tmp_path, index)
+    path = Path(collection["path"]).parent / "products/storage/storage_extensive_frame.npz"
+    path.write_bytes(path.read_bytes() + b"changed")
+    run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
+        current_machine_id="Olav", collections=[collection])
+    with pytest.raises(ValueError): next(run["frames"])
 
 
 def test_same_machine_reads_indexed_storage_with_original_completion_untouched(tmp_path):

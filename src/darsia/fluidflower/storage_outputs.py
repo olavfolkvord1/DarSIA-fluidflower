@@ -204,13 +204,18 @@ def _identity(task, spec, request):
 
 
 def write_frame(output, task, spec, phase, inferred, phase_capture,
-                mass_capture, evaluated, request):
+                mass_capture, evaluated, request, *, extensive_inputs=None):
     """Close new immutable outputs BEFORE the caller's original frame commit.
 
     Failure preserves this own partial directory. Nothing in old native
     outputs is rewritten. Range/absent BEFORE has an honest final-only receipt.
     """
     from PIL import Image
+    if extensive_inputs is not None:
+        from .storage_extensive_io import validate_inputs
+        validate_inputs(extensive_inputs)
+        if request["resolution_mm"] == "native":
+            raise ValueError("Extensive I/O requires an explicitly requested coarse grid")
     output = Path(output)
     parent = output / "preparation" / spec["case_id"]
     if not parent.is_dir():
@@ -297,6 +302,15 @@ def write_frame(output, task, spec, phase, inferred, phase_capture,
         native_mass_density_identities=density_ids, native_transport_weight_l_identity=weight_id,
         native_mass_totals_g=totals, native_pixel_mass_checks=checks, coarse=coarse,
         files=bound_files, existing_native_products_unchanged=True)
+    if extensive_inputs is not None:
+        from .storage_extensive_io import prepare_payload, write_payload, declared_files
+        product = prepare_payload(extensive_inputs, grid, labels=labels,
+            saturation=evaluated["export"]["products"]["saturation_free_gas"],
+            masses=masses, totals=totals)
+        document["extensive"] = write_payload(temporary, parent, product, document)
+        added = declared_files(document["extensive"])
+        bound_files.extend(added.values())
+        files.extend(temporary / name for name in added)
     receipt_path = temporary / "storage_completed.json"
     _write_json(receipt_path, document)
     # Only our new flat namespace is moved; old native files are never touched.
@@ -309,6 +323,8 @@ def write_frame(output, task, spec, phase, inferred, phase_capture,
     entry = dict(format=FRAME_FORMAT, case_id=spec["case_id"], attempt_directory=str(output),
                  receipt=dict(_asset(parent / "storage_completed.json"), kind="operational_receipt"),
                  files=bound_files)
+    if extensive_inputs is not None:
+        entry["extensive"] = document["extensive"]
     verify_entry(entry, task, spec, request, phase["labels"], result,
                  evaluated["export"]["products"], mass_capture["volume_m3"])
     return entry
@@ -332,13 +348,23 @@ def verify_entry(entry, task, spec, request, phase_asset, native_result,
             or document.get("existing_native_products_unchanged") is not True):
         raise ValueError("Storage closure source/configuration/owner differs")
     seen = set()
+    added = {}
+    if document.get("extensive") is not None:
+        from .storage_extensive_io import declared_files
+        added = declared_files(document["extensive"])
+    if document.get("extensive") != entry.get("extensive"):
+        raise ValueError("Extensive I/O entry differs from its original receipt")
     for bound in entry["files"]:
         _owned(bound, root)
         name = PureWindowsPath(bound["path"]).name
-        if name in seen or name not in {"storage_gas_probability_before_rules.png", "storage_stored_frame.npz"}:
+        if name in seen or name not in {"storage_gas_probability_before_rules.png", "storage_stored_frame.npz", *added}:
             raise ValueError("Unexpected or repeated storage output")
+        if name in added and bound != added[name]:
+            raise ValueError("Extensive I/O asset differs from its declared entry")
         seen.add(name)
         _bound_path(bound, reader)
+    if not added.keys() <= seen:
+        raise ValueError("Extensive I/O file is missing from its original entry")
     before = document["before_rules"]
     if before.get("state") == "complete":
         if before.get("encoding") != LA_ENCODING or "storage_gas_probability_before_rules.png" not in seen:
@@ -426,6 +452,10 @@ def validate_publication_binding(binding):
         raise ValueError("Storage namespace differs from the original phase producer")
     inventory = binding["files"]
     expected = {}
+    added = {}
+    if entry.get("extensive") is not None:
+        from .storage_extensive_io import declared_files
+        added = declared_files(entry["extensive"])
     for bound in [entry["receipt"], *entry["files"]]:
         _owned(bound, root)
         name = PureWindowsPath(bound["path"]).name
@@ -435,11 +465,15 @@ def validate_publication_binding(binding):
             kind = "operational_receipt"
         elif name in {"storage_gas_probability_before_rules.png", "storage_stored_frame.npz"}:
             kind = "map"
+        elif name in added and bound == added[name]:
+            kind = added[name]["kind"]
         else:
             raise ValueError("Unknown new storage inventory row")
         if bound.get("kind") != kind:
             raise ValueError("Storage output has a different declared product role")
         expected[name] = bound
+    if not added.keys() <= expected.keys():
+        raise ValueError("Extensive I/O file is outside its original publication inventory")
     if set(name for name in inventory if name.startswith("storage_")) != set(expected):
         raise ValueError("Unlisted storage file in the original native inventory")
     return entry

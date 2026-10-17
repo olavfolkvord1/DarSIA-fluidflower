@@ -165,6 +165,13 @@ def read_n1_stored_frame(record, *, manifest, manifest_asset, resolve_asset, loa
         by_name[name] = bound
     expected_names = {"storage_phase1_completed.json", "storage_phase1_commit.json",
                       "storage_phase1_before.json", "storage_stored_frame.npz"}
+    added = {}
+    if document.get("extensive") is not None:
+        from .storage_extensive_io import declared_files
+        added = declared_files(document["extensive"])
+    if any(not _same(by_name.get(name), row) for name, row in added.items()):
+        raise ValueError("Extensive I/O file is outside its committed N1 entry")
+    expected_names |= added.keys()
     if document["before_rules"]["state"] == "complete":
         expected_names.add("storage_gas_probability_before_rules.png")
     if document["photograph"]["state"] == "complete":

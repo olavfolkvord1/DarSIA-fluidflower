@@ -273,8 +273,16 @@ def read_stored_frame(native_frame_metadata, *, resolve_asset, load_before=False
     entry = output.validate_publication_binding(binding)
     document = _json(_read_bytes(entry["receipt"], resolve_asset, loaded))
     _identity(record, commit, result, binding, entry, document, expected)
+    if document.get("extensive") != entry.get("extensive"):
+        raise ValueError("Extensive I/O entry differs from its committed receipt")
+    added = {}
+    if document.get("extensive") is not None:
+        from .storage_extensive_io import declared_files
+        added = declared_files(document["extensive"])
     _request(document)
     by_name = {PureWindowsPath(row["path"]).name: row for row in entry["files"]}
+    if any(by_name.get(name) != row for name, row in added.items()):
+        raise ValueError("Extensive I/O file is outside its committed native entry")
     before = document["before_rules"]
     if before.get("state") == "complete":
         if before.get("encoding") != output.LA_ENCODING or "storage_gas_probability_before_rules.png" not in by_name:
