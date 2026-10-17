@@ -221,7 +221,7 @@ def test_optional_extensive_genuine_N1_index_collect_remains_saved_only(tiny_con
     wanted = [key for key, row in rows.items() if key.startswith("frames/") and row["kind"] == "map"
               and Path(row["local_path"]).name.startswith("storage_")]
     collection = publication.collect_products(index, wanted, tmp_path / "collected_extensive",
-        current_machine_id="Olav", file_writers_closed=True)
+        current_machine_id="Main", file_writers_closed=True)
     original_read = Path.read_bytes
     def guard(path):
         assert not str(path).startswith(str(tmp_path / "mass")), "Producer payload fallback"
