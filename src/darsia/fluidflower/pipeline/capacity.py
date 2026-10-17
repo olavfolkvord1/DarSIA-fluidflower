@@ -244,7 +244,7 @@ def _profile_writer_identity(repository, measured_commit, current_commit, row):
                 if isinstance(node, ast.FunctionDef) and node.name == "json"]
             if (len(methods) != 1 or
                     hashlib.sha256(ast.dump(methods[0], include_attributes=False).encode()).hexdigest() != function_sha):
-                raise ValueError("The writer delta is not the exact reviewed DataReader.json hash recheck")
+                raise ValueError("An actual writer/executor body changed; the writer delta is not the exact reviewed DataReader.json hash recheck")
             classes[0].body.remove(methods[0])
         if ast.dump(parsed[0], include_attributes=False) != ast.dump(parsed[1], include_attributes=False):
             raise ValueError("An actual writer/executor body changed; a new measured profile is required")
