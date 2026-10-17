@@ -21,8 +21,10 @@ def _write(path, value):
     return output._asset(path)
 
 
-def _published(tmp_path, *, pending=False, extensive_inputs=None):
+def _published(tmp_path, *, pending=False, extensive_inputs=None, alter_state=None):
     state = _fixture(tmp_path / "producer", pending=pending, extensive_inputs=extensive_inputs)
+    if alter_state is not None:
+        alter_state(state)
     manifest = output._asset(state["manifest_path"])
     completion = dict(complete=True, worker_references_closed=True, pipeline="native-phase-n1",
         run="ac52", frames=1, case_count=1, ordered_case_ids=["ac52_f1"],
@@ -120,6 +122,26 @@ def test_collected_extensive_archive_still_checks_original_SHA(tmp_path):
     run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
         current_machine_id="Olav", collections=[collection])
     with pytest.raises(ValueError): next(run["frames"])
+
+
+def test_resealed_spatial_mass_attack_is_rejected_after_real_foreign_collect(tmp_path):
+    from darsia.fluidflower import storage_extensive_io as payload
+    from .test_storage_saved_products import _reseal, _reseal_extensive_array_values
+    def alter(state):
+        def permute(arrays):
+            original = arrays["cell_mass_total_g"].copy()
+            arrays["cell_mass_total_g"][0, 0], arrays["cell_mass_total_g"][1, 1] = original[1, 1], original[0, 0]
+            assert arrays["cell_mass_total_g"].sum(dtype=np.float64) == original.sum(dtype=np.float64)
+        updated = _reseal_extensive_array_values(state["document"]["extensive"], permute)
+        state["entry"]["extensive"] = deepcopy(state["document"]["extensive"])
+        state["entry"]["files"] = [updated.get(Path(row["path"]).name, row) for row in state["entry"]["files"]]
+        _reseal(state)
+    _state, index, _ = _published(tmp_path, extensive_inputs=True, alter_state=alter)
+    collection = _collect(tmp_path, index)
+    run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
+        current_machine_id="Olav", collections=[collection])
+    with pytest.raises(ValueError, match="Extensive total cell masses differ from committed coarse arrays"):
+        next(run["frames"])
 
 
 def test_same_machine_reads_indexed_storage_with_original_completion_untouched(tmp_path):

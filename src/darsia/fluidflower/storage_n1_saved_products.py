@@ -178,6 +178,8 @@ def read_n1_stored_frame(record, *, manifest, manifest_asset, resolve_asset, loa
         expected_names |= {"storage_phase1_photo.json", "storage_original_photo.json", "storage_original_photo.png"}
     if set(by_name) != expected_names:
         raise ValueError("N1 storage has an incomplete or unexplained flat file inventory")
+    if {name for name in record["files"] if name.startswith("storage_")} != expected_names | {"storage_completed.json"}:
+        raise ValueError("N1 committed storage inventory differs from its declared flat files")
     for key, name in (("core_copy", "storage_phase1_completed.json"),
                       ("commit_copy", "storage_phase1_commit.json"),
                       ("before_copy", "storage_phase1_before.json")):

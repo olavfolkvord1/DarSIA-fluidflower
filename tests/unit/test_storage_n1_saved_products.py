@@ -471,6 +471,82 @@ def test_byte_reanchored_synthetic_metadata_control_is_still_readable(tiny_confi
     assert len(value["frames"]) == 2 and value["producer_kind"] == "n1-mass-only"
 
 
+def _reseal_n1_storage_record(record, document, *, extra_files=()):
+    """Commit a deliberately altered tiny storage document with valid outer hashes."""
+    directory = Path(record["nas_directory"])
+    _json(directory / "storage_completed.json", document)
+    commit = json.loads((directory / "commit.json").read_bytes())
+    for name in extra_files:
+        commit["files"][name] = dict(kind="operational_receipt")
+    for name, old in list(commit["files"].items()):
+        row = n1.asset(directory / name)
+        commit["files"][name] = {key: row[key] for key in ("sha256", "size_bytes")}
+        if "kind" in old:
+            commit["files"][name]["kind"] = old["kind"]
+    bound = _json(directory / "commit.json", commit)
+    record["files"] = dict(commit["files"], **{"commit.json": {key: bound[key] for key in ("sha256", "size_bytes")}})
+    for name, row in record["files"].items():
+        actual = n1.asset(directory / name)
+        assert all(row[key] == actual[key] for key in ("sha256", "size_bytes"))
+
+
+@pytest.mark.parametrize("omitted", ["both", "archive", "receipt", "unknown"])
+def test_committed_N1_storage_cannot_be_hidden_from_document_inventory(tiny_config, phase1_data, tmp_path, monkeypatch, omitted):
+    from darsia.fluidflower import storage_extensive_io as payload
+    config = _inputs(tmp_path, tiny_config, phase1_data)
+    completed = _run_with_extensive(tmp_path, config, monkeypatch)
+    record = completed["records"][0]
+    directory = Path(record["nas_directory"])
+    document = json.loads((directory / "storage_completed.json").read_bytes())
+    if omitted == "both":
+        document.pop("extensive")
+        document["files"] = [row for row in document["files"] if Path(row["path"]).name not in {payload.ARCHIVE, payload.RECEIPT}]
+    elif omitted == "unknown":
+        _json(directory / "storage_undeclared.json", dict(synthetic_unexplained=True))
+    else:
+        document.pop("extensive")
+        # Remove both declarations so the old document-only set was valid,
+        # while retaining exactly the selected extensive file in the commit.
+        document["files"] = [row for row in document["files"] if Path(row["path"]).name not in {payload.ARCHIVE, payload.RECEIPT}]
+        other = payload.RECEIPT if omitted == "archive" else payload.ARCHIVE
+        commit = json.loads((directory / "commit.json").read_bytes())
+        del commit["files"][other]
+        _json(directory / "commit.json", commit)
+    _reseal_n1_storage_record(record, document, extra_files=("storage_undeclared.json",) if omitted == "unknown" else ())
+    manifest = json.loads(Path(completed["manifest"]["path"]).read_bytes())
+    reads = []
+    def resolve(bound):
+        reads.append(Path(bound["path"]).name)
+        return Path(bound["path"])
+    with pytest.raises(ValueError, match="N1 committed storage inventory differs from its declared flat files"):
+        saved_n1.read_n1_stored_frame(record, manifest=manifest, manifest_asset=completed["manifest"], resolve_asset=resolve)
+    assert not any(name.endswith(".npz") for name in reads)
+
+
+def test_resealed_extensive_mass_permutation_cannot_replace_genuine_N1_coarse_map(tiny_config, phase1_data, tmp_path, monkeypatch):
+    from .test_storage_saved_products import _reseal_extensive_array_values
+    from darsia.fluidflower import storage_extensive_io as payload
+    completed = _run_with_extensive(tmp_path, _inputs(tmp_path, tiny_config, phase1_data), monkeypatch)
+    record = completed["records"][0]
+    document = json.loads((Path(record["nas_directory"]) / "storage_completed.json").read_bytes())
+    def permute(arrays):
+        key = "cell_mass_total_g"
+        before = arrays[key].copy()
+        valid = np.flatnonzero(arrays["pore_volume_m3"].ravel() > 0)
+        first = int(valid[np.argmin(before.ravel()[valid])])
+        second = int(valid[np.argmax(before.ravel()[valid])])
+        assert before.flat[first] != before.flat[second]
+        arrays[key].flat[first], arrays[key].flat[second] = before.flat[second], before.flat[first]
+        assert arrays[key].sum(dtype=np.float64) == before.sum(dtype=np.float64)
+    updated = _reseal_extensive_array_values(document["extensive"], permute)
+    document["files"] = [updated.get(Path(row["path"]).name, row) for row in document["files"]]
+    _reseal_n1_storage_record(record, document)
+    manifest = json.loads(Path(completed["manifest"]["path"]).read_bytes())
+    with pytest.raises(ValueError, match="Extensive total cell masses differ from committed coarse arrays"):
+        payload.read_committed_payload(record, producer_kind="n1-mass-only", manifest=manifest,
+            manifest_asset=completed["manifest"], resolve_asset=lambda bound: Path(bound["path"]))
+
+
 @pytest.mark.parametrize("bad", ["algorithm", "digest"])
 def test_manifest_original_commit_ASCII_identity_is_consistent_beyond_outer_SHA(tiny_config, phase1_data, tmp_path, bad):
     completion = _run(tmp_path, _inputs(tmp_path, tiny_config, phase1_data))

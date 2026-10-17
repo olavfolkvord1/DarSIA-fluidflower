@@ -7,6 +7,8 @@ from copy import deepcopy
 from pathlib import Path, PureWindowsPath
 import re
 
+import numpy as np
+
 from . import storage_extensive as extensive
 from . import storage_outputs as output
 
@@ -133,6 +135,11 @@ def _read_payload(stored, resolve_asset):
         native_extensive_totals=metadata["native_extensive_totals"],
         expected_channels=metadata["channels"], expected_provenance=metadata["provenance"],
         expected_grid_metadata=stored["grid"])
+    for component in output.TOTALS:
+        key = "cell_mass_" + component + "_g"
+        actual, original = result["arrays"][key], stored["arrays"][key]
+        if actual.dtype != original.dtype or not np.array_equal(actual, original):
+            raise ValueError("Extensive " + component + " cell masses differ from committed coarse arrays")
     return dict(result, state="synthetic_io_only", loaded_assets=loaded,
                 original_frame_identity=deepcopy(envelope["frame_identity"]))
 

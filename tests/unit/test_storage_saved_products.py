@@ -243,6 +243,57 @@ def test_native_resolution_cannot_activate_synthetic_extensive_payload(tmp_path)
     assert not list(tmp_path.iterdir())
 
 
+def _reseal_extensive_array_values(section, mutate):
+    """Re-anchor an internally valid synthetic archive, never its original coarse map."""
+    from darsia.fluidflower import storage_extensive as extensive
+    archive_path, receipt_path = Path(section["archive"]["path"]), Path(section["receipt"]["path"])
+    envelope = json.loads(receipt_path.read_bytes())
+    metadata = envelope["api_metadata"]
+    with np.load(archive_path, allow_pickle=False) as archive:
+        arrays = {key: archive[key].copy() for key in archive.files}
+    mutate(arrays)
+    metadata["arrays"] = {key: extensive._identity(value) for key, value in arrays.items()}
+    buffer = io.BytesIO()
+    np.savez_compressed(buffer, **arrays)
+    # The attack must pass the pure API's original schema and scalar checks;
+    # only its disagreement with the independently committed cell map is new.
+    extensive.read_extensive_archive(buffer.getvalue(), metadata,
+        expected_input_identities=metadata["input_identities"],
+        native_mass_totals_g=metadata["native_mass_totals_g"],
+        native_extensive_totals=metadata["native_extensive_totals"],
+        expected_channels=metadata["channels"], expected_provenance=metadata["provenance"],
+        expected_grid_metadata=metadata["grid"])
+    archive_path.write_bytes(buffer.getvalue())
+    section["archive"] = dict(output._asset(archive_path), kind="map")
+    envelope["archive"] = deepcopy(section["archive"])
+    _json(receipt_path, envelope)
+    section["receipt"] = dict(output._asset(receipt_path), kind="operational_receipt")
+    return {Path(row["path"]).name: row for row in (section["archive"], section["receipt"])}
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+@pytest.mark.parametrize("component", ["total", "aqueous", "gas"])
+def test_resealed_extensive_spatial_mass_permutation_cannot_replace_native_coarse_map(tmp_path, precision, component):
+    from darsia.fluidflower import storage_extensive_io as payload
+    state = _fixture(tmp_path, precision=precision, extensive_inputs=True)
+    def permute(arrays):
+        key = "cell_mass_" + component + "_g"
+        before = arrays[key].copy()
+        arrays[key][0, 0], arrays[key][1, 1] = before[1, 1], before[0, 0]
+        assert not np.array_equal(arrays[key], before)
+        assert arrays[key].sum(dtype=np.float64) == before.sum(dtype=np.float64)
+        if component == "aqueous":
+            mean = arrays["concentration_aqueous"].copy()
+            arrays["concentration_aqueous"][0, 0], arrays["concentration_aqueous"][1, 1] = mean[1, 1], mean[0, 0]
+    section = state["document"]["extensive"]
+    updated = _reseal_extensive_array_values(section, permute)
+    state["entry"]["extensive"] = deepcopy(section)
+    state["entry"]["files"] = [updated.get(Path(row["path"]).name, row) for row in state["entry"]["files"]]
+    _reseal(state)
+    with pytest.raises(ValueError, match="Extensive " + component + " cell masses differ from committed coarse arrays"):
+        payload.read_committed_payload(state["record"], producer_kind="native-phase-n1", resolve_asset=_resolver(state))
+
+
 def _alter_archive(state, mutate):
     row = next(v for v in state["entry"]["files"] if Path(v["path"]).name == "storage_stored_frame.npz")
     path = Path(row["path"])
