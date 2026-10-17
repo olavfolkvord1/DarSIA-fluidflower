@@ -8,9 +8,10 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QCoreApplication, QEvent, Signal
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
+from shiboken6 import isValid
 
 from .test_jobs_metadata import model, put
 
@@ -70,6 +71,9 @@ def panel(app):
     widget.close()
     widget.deleteLater()
     app.processEvents()
+    if isValid(widget):
+        QCoreApplication.sendPostedEvents(widget, QEvent.DeferredDelete)
+    assert not isValid(widget)
 
 
 def test_passive_navigation_reads_only_explicit_roots_no_creation_or_launch(panel, app):
