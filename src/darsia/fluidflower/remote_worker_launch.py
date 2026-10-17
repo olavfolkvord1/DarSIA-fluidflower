@@ -87,7 +87,7 @@ def build_remote_worker_launch(job_root, *, target, backend, workers):
         raise ValueError("Shared job folder must not contain relative path components")
     if backend not in {"cpu", "cuda"} or type(workers) is not int or workers < 1:
         raise ValueError("Explicit CPU/CUDA backend and positive worker count required")
-    worker = (python, "-m", "darsia.fluidflower.worker", "--job", job,
+    worker = (python, "-B", "-m", "darsia.fluidflower.worker", "--job", job,
               "--backend", backend, "--workers", str(workers), "--machine", machine,
               "--watchdog")
     # This is a normal remote CLI invocation. No generated script, encoded

@@ -26,8 +26,19 @@ def bind_actual_worker_owner(owner, *, slot=None, generation=None, role=None):
     """
     lease=current_import_lease()
     actual,_=_owner()
+    expected_epoch=actual["process_create_time"]
+    if lease.manifest.get("native_launch_context") is not None:
+        import psutil
+        from .owned_process import current_native_membership
+        expected_epoch=str(psutil.Process(actual["pid"]).create_time())
+        if (any(actual.get(key)!=lease.owner.get(key)
+                for key in ("pid","creation_filetime_100ns"))
+                or current_native_membership()!=lease.manifest["native_launch_context"]
+                or (isinstance(owner,dict) and "creation_filetime_100ns" in owner
+                    and owner["creation_filetime_100ns"]!=actual["creation_filetime_100ns"])):
+            raise CachePolicyError("Current native FILETIME/Job differs from original lease owner")
     if (not isinstance(owner,dict) or owner.get("pid")!=actual["pid"]
-            or owner.get("process_create_time")!=actual["process_create_time"]):
+            or owner.get("process_create_time")!=expected_epoch):
         raise CachePolicyError("Semantic worker PID/epoch differs from current native owner")
     identity=hashlib.sha256(json.dumps(owner,sort_keys=True).encode()).hexdigest()
     return lease._record(lease.reservation["token"]+".worker-"+identity+".json",
@@ -92,6 +103,8 @@ def independent_worker_environment(stores, *, machine, series_id,
         if Path(result[POLICY_ENV]).resolve()!=Path(source["path"]).resolve():
             raise CachePolicyError("Inherited cache policy differs from the original default worker stores")
     result.pop(RECEIPT_ENV,None)
+    # Read by CPython before site/.pth/bootstrap; parent environment is untouched.
+    result["PYTHONDONTWRITEBYTECODE"] = "1"
     result[EXPECTED_STORES_ENV]=json.dumps(source,sort_keys=True,separators=(",",":"))
     return result
 
@@ -237,3 +250,137 @@ def service_retention_eligibility(original_lease, **proofs):
     """
     from .service_lifecycle import ServiceLifecycle
     return ServiceLifecycle(original_lease).retention_eligibility(**proofs)
+
+
+def _worker_metadata(path, *, expected=None):
+    """Bounded original metadata only; no result array/image or product copy."""
+    import stat
+    path = Path(path)
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink < 1
+            or getattr(before, "st_reparse_tag", 0)
+            or getattr(before, "st_file_attributes", 0) & 0x400
+            or not 0 < before.st_size <= 16 * 1024 ** 2):
+        raise CachePolicyError("Original worker publication metadata is unsafe/unbounded")
+    with path.open("rb") as stream:
+        raw = stream.read(before.st_size + 1)
+    after = path.lstat()
+    if (len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+            for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink"))):
+        raise CachePolicyError("Original worker publication metadata changed during read")
+    pin = dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
+    if expected is not None and pin != expected:
+        raise CachePolicyError("Original worker publication metadata bytes differ")
+    document = json.loads(raw)
+    if not isinstance(document, dict):
+        raise CachePolicyError("Original worker metadata document must be an object")
+    return document, pin
+
+
+def _worker_alias(root, binding):
+    from pathlib import PurePosixPath
+    from .policy import nonnegative
+    if (not isinstance(binding, dict) or set(binding) != {"relative_path", "sha256", "bytes"}
+            or not isinstance(binding["relative_path"], str)):
+        raise CachePolicyError("Exact original alias publication reference required")
+    relative = PurePosixPath(binding["relative_path"])
+    if (not binding["relative_path"] or relative.is_absolute()
+            or "\\" in binding["relative_path"] or ":" in binding["relative_path"]
+            or any(part in {"", ".", ".."} for part in binding["relative_path"].split("/"))):
+        raise CachePolicyError("Original alias publication escaped its job")
+    target = Path(root).joinpath(*relative.parts)
+    # This only resolves the producer's own immutable metadata, not native data.
+    if not target.resolve().is_relative_to(Path(root).resolve()):
+        raise CachePolicyError("Original alias publication resolved outside its job")
+    pin = dict(path=str(target), sha256=binding["sha256"],
+               size_bytes=nonnegative(binding["bytes"], "Original alias metadata bytes"))
+    return _worker_metadata(target, expected=pin)
+
+
+def seal_worker_service(*, job_root, exit_code, terminal_events, traceback_text=None):
+    """Seal only the explicit native-managed original worker; never claim exit=retirement.
+
+    Earlier cooperative and ordinary internal test/runtime entries have no
+    native retirement provider and remain unqualified, not silently finalized.
+    The public worker's original result/queue operations have already completed.
+    """
+    lease = optional_import_lease()
+    if lease is None or "native_supervision" not in lease.profile:
+        return None
+    if lease.entry_kind != "worker" or "native_launch_context" not in lease.manifest:
+        raise CachePolicyError("Native worker outcome has no original managed service")
+    if (type(exit_code) is not int or not isinstance(terminal_events, list)
+            or len(terminal_events) > lease.entry_limit):
+        raise CachePolicyError("Bounded actual worker outcome is required")
+    root = Path(job_root)
+    job, job_pin = _worker_metadata(root / "job.json")
+    if job.get("format") != "darsia-alias-job-v1":
+        raise CachePolicyError("Native publication provider supports original alias jobs only")
+    completed, failures = [], []
+    for event in terminal_events:
+        if not isinstance(event, dict):
+            raise CachePolicyError("Actual terminal worker event is malformed")
+        if event.get("kind") != "completed":
+            failures.append(dict(event))
+            continue
+        run, attempt = event.get("run"), event.get("attempt_id")
+        import re
+        if (not isinstance(run, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run) is None
+                or not isinstance(attempt, str) or re.fullmatch(r"[0-9a-f]{32}", attempt) is None):
+            raise CachePolicyError("Actual completed event has no exact run/attempt")
+        done, done_pin = _worker_metadata(root / "done" / (run + ".json"))
+        if (done.get("format") != "darsia-alias-done-v1" or done.get("run") != run
+                or done.get("attempt_id") != attempt):
+            raise CachePolicyError("Original done publication differs from actual completed event")
+        result, result_pin = _worker_alias(root, done["completed"])
+        _, index_pin = _worker_alias(root, done["products_index"])
+        if result.get("complete") is not True:
+            raise CachePolicyError("Original completed metadata remains incomplete")
+        completed.append(dict(run=run, attempt_id=attempt, done=done_pin,
+                              completed=result_pin, products_index=index_pin))
+    publication = dict(format="darsia-native-worker-service-publication-v1", job=job_pin,
+        native_launch_context=lease.manifest["native_launch_context"],
+        completed=completed, terminal_failures=failures,
+        original_done_and_product_index_metadata_verified=True,
+        native_payload_copied_or_rehashed=False, durable_results_not_cache=True)
+    binding = lease._record(lease.reservation["token"] + ".worker-publication.json", publication)
+    failed = exit_code != 0 or bool(failures) or traceback_text is not None
+    literal = traceback_text
+    if failed and literal is None:
+        literal = json.dumps(dict(exit_code=exit_code, actual_terminal_failures=failures),
+                             ensure_ascii=False, sort_keys=True)
+    return seal_current_service(logical_gate="worker-job:" + job_pin["sha256"],
+        outcome="failed" if failed else "success", utc=datetime.now(timezone.utc).isoformat(),
+        traceback_text=literal, publication=None if failed else binding)
+
+
+def verify_worker_publication(snapshot, binding):
+    """Read the original immutable small publication closure, never native arrays."""
+    from .policy import _descriptor
+    pin = _descriptor(binding)
+    manifest = snapshot["binding"]["manifest"]
+    expected = Path(manifest["native_launch_context"]["path"]).parent / (
+        manifest["token"] + ".worker-publication.json")
+    if Path(pin["path"]) != expected:
+        return False
+    document, _ = _worker_metadata(pin["path"], expected=pin)
+    if (document.get("format") != "darsia-native-worker-service-publication-v1"
+            or document.get("native_launch_context") != manifest.get("native_launch_context")
+            or document.get("terminal_failures")
+            or document.get("original_done_and_product_index_metadata_verified") is not True):
+        return False
+    job, _ = _worker_metadata(document["job"]["path"], expected=document["job"])
+    if job.get("format") != "darsia-alias-job-v1":
+        return False
+    root = Path(document["job"]["path"]).parent
+    for row in document["completed"]:
+        done, actual_done = _worker_metadata(root / "done" / (row["run"] + ".json"),
+                                            expected=row["done"])
+        result, result_pin = _worker_alias(root, done["completed"])
+        _, index_pin = _worker_alias(root, done["products_index"])
+        if (done.get("format") != "darsia-alias-done-v1"
+                or done.get("run") != row["run"] or done.get("attempt_id") != row["attempt_id"]
+                or actual_done != row["done"] or result_pin != row["completed"]
+                or index_pin != row["products_index"] or result.get("complete") is not True):
+            return False
+    return True

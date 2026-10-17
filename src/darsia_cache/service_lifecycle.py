@@ -106,8 +106,14 @@ class ServiceLifecycle:
             records = self._records()
             if ("seal", "service") in records:
                 raise CachePolicyError("Service is sealed; no new owner attachment")
-            return self._put(records, "owner", _digest(_incarnation(self.lease.owner)),
-                dict(owner=deepcopy(self.lease.owner), registration_is_not_retirement=True))
+            value = dict(owner=deepcopy(self.lease.owner), registration_is_not_retirement=True)
+            if "native_launch_context" in self.lease.manifest:
+                from .owned_process import current_native_membership
+                binding = current_native_membership()
+                if binding != self.lease.manifest["native_launch_context"]:
+                    raise CachePolicyError("Current owner differs from original native Job")
+                value["native_job_membership"] = binding
+            return self._put(records, "owner", _digest(_incarnation(self.lease.owner)), value)
 
     def record_launch(self, kind, details):
         """Every allowed intent shares the seal; legacy scope stays unqualified."""
@@ -144,6 +150,11 @@ class ServiceLifecycle:
                 child = details.get("original_native_identity")
                 if child is not None:
                     _incarnation(child)
+                    if ("native_launch_context" in self.lease.manifest
+                            and (not str(child.get("creation_filetime_100ns", "")).isdecimal()
+                                 or child.get("native_launch_context") !=
+                                    self.lease.manifest["native_launch_context"])):
+                        raise CachePolicyError("Original native launch FILETIME/Job binding missing")
                 elif details.get("epoch_unavailable") is not True:
                     raise CachePolicyError("Unbound launch must remain explicitly unresolved")
             if stage == "retired":

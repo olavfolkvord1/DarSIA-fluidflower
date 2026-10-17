@@ -533,6 +533,7 @@ def main(argv=None):
         help="Operational liveness limit; actual-progress queue lease remains 600s.",
     )
     args = parser.parse_args(argv)
+    args._cache_terminal_events = []
     if args.workers < 1:
         parser.error("--workers must be positive")
     if not args.watchdog_seconds > 0 or not math.isfinite(args.watchdog_seconds):
@@ -558,11 +559,24 @@ def main(argv=None):
                 emit(log, dict(kind="startup_code_admission",
                     environment_lock=startup_context["environment_lock_identity"]))
             except Exception:
-                emit(
-                    log, dict(kind="startup_failure", traceback=traceback.format_exc())
-                )
+                literal = traceback.format_exc()
+                emit(log, dict(kind="startup_failure", traceback=literal))
+                from darsia_cache.adapters import seal_worker_service
+                seal_worker_service(job_root=args.job, exit_code=1,
+                    terminal_events=[], traceback_text=literal)
                 return 1
-            return _parent(args, identity, job, commit, log)
+            try:
+                result = _parent(args, identity, job, commit, log)
+            except BaseException:
+                literal = traceback.format_exc()
+                from darsia_cache.adapters import seal_worker_service
+                seal_worker_service(job_root=args.job, exit_code=1,
+                    terminal_events=args._cache_terminal_events, traceback_text=literal)
+                raise
+            from darsia_cache.adapters import seal_worker_service
+            seal_worker_service(job_root=args.job, exit_code=result,
+                terminal_events=args._cache_terminal_events)
+            return result
 
 
 class _SlotMessages:
@@ -587,11 +601,20 @@ def _heartbeat(messages, finished, machine):
 
 
 def _process_identity(process):
-    return dict(
-        pid=process.pid,
-        process_create_time=str(process.create_time()),
-        command_line=process.cmdline(),
-    )
+    value = dict(pid=process.pid, process_create_time=str(process.create_time()),
+                 command_line=process.cmdline())
+    from darsia_cache.owned_process import native_launch_identity
+    try:
+        native = native_launch_identity(process)
+    except OSError as error:
+        # Preserve missing native evidence without breaking original science.
+        # Such an observation cannot satisfy automatic retirement eligibility.
+        value["native_identity_unavailable"] = dict(
+            exception_type=type(error).__name__, message=str(error))
+    else:
+        if native is not None:
+            value.update(native)
+    return value
 
 
 def _same_process(identity):
@@ -685,7 +708,19 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
     try:
         bound = _process_identity(psutil.Process(process.pid))
     except psutil.NoSuchProcess:
-        bound = None  # A completed launch has no invented create_time.
+        bound = None  # A completed launch has no invented psutil epoch/argv.
+    # multiprocessing retains the actual original process HANDLE even when a
+    # very short launch has exited; bind its native FILETIME before dropping it.
+    from darsia_cache.owned_process import native_launch_identity, bind_retained_native_observation
+    try:
+        native = native_launch_identity(process, sentinel=getattr(process, "sentinel", None))
+    except OSError as error:
+        native = None
+        if bound is not None:
+            bound["native_identity_unavailable"] = dict(
+                exception_type=type(error).__name__, message=str(error))
+    if native is not None:
+        bound = bind_retained_native_observation(native, bound)
     slot = dict(
         number=number,
         generation=generation,
@@ -776,6 +811,8 @@ def _parent(args, identity, job, commit, log):
     """Own one log and persistent slots; optionally supervise exact child liveness."""
     import psutil
 
+    if not hasattr(args, "_cache_terminal_events"):
+        args._cache_terminal_events = []
     shared = (JobQueue(args.job,machine_id=args._alias_stores.machine_id)
               if job.get("format")=="darsia-alias-job-v1" else JobQueue(args.job,machine_id=identity))
     context = mp.get_context("spawn")
@@ -869,6 +906,9 @@ def _parent(args, identity, job, commit, log):
                         # Terminal/revoked attempts do not need a numerical restart.
                         slot["claim"] = None
                     emit(log, event)
+                    if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
+                            "control_failure", "paused", "control_stopped"}:
+                        args._cache_terminal_events.append(dict(event))
                     if event.get("kind") == "control_failure":
                         control_failed = True
             active = False
@@ -970,6 +1010,9 @@ def _parent(args, identity, job, commit, log):
                 break
             if event.get("kind") != "watchdog_heartbeat":
                 emit(log, event)
+            if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
+                    "control_failure", "paused", "control_stopped"}:
+                args._cache_terminal_events.append(dict(event))
             if event.get("kind") == "control_failure":
                 control_failed = True
         emit(log, dict(kind="stopped", message="Worker service stopped."))

@@ -349,6 +349,8 @@ class ImportLease:
                     root=str(self.root),root_identity=self.directories[""],
                     reservation=self.reservation,maximum_bytes=self.maximum,
                     fresh_scope_provenance=fresh,external_writer_file_ownership_not_yet_frozen=True)
+                if getattr(self, "native_launch_context", None) is not None:
+                    manifest["native_launch_context"] = dict(self.native_launch_context)
                 self.ledger.require_unbound_scope(token)
                 self.ledger.control.write_once("cache-s-"+token+".json",_encoded(manifest))
             finally:
@@ -460,6 +462,15 @@ def before_darsia_import(*,package_file):
     entry_kind=receipt["entry_kind"] if receipt else _entry_kind()
     role_identifier=receipt["role_identifier"] if receipt else None
     lease=ImportLease(document,source,package_file,entry_kind=entry_kind,role_identifier=role_identifier)
+    # Only a separately qualified explicit profile enables native supervision.
+    # Earlier cooperative profiles remain visible/unqualified for auto cleanup.
+    native = "native_supervision" in getattr(lease, "profile", {})
+    if native:
+        from .owned_process import prepare_native_entry
+        lease.native_launch_context = prepare_native_entry(lease,
+            inherited_receipt=receipt is not None)
+    elif "DARSIA_CACHE_NATIVE_LAUNCH" in os.environ:
+        raise CachePolicyError("Native launch binding has no qualified original profile")
     try:
         if receipt:
             lease.receipt=binding;lease.attach(receipt)
@@ -475,6 +486,9 @@ def before_darsia_import(*,package_file):
         # This also covers already-imported stdlib tempfile in a legacy parent.
         import tempfile
         tempfile.tempdir=None
+        if native:
+            from .owned_process import report_native_service
+            report_native_service(lease)
         _LEASE=lease;atexit.register(lease.exit_intent)
         return lease
     except BaseException:
