@@ -59,6 +59,22 @@ def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     return _write_metadata(path, payload, copy_payload=True)
 
 
+def _bounded_revision_text(revision: Mapping[str, Any]) -> str:
+    """Count the unchanged writer's actual UTF-8/platform-newline bytes."""
+    from io import BytesIO, TextIOWrapper
+    from .geometry_workspace_frame import METADATA_LIMIT
+
+    text = json.dumps(revision, indent=2, ensure_ascii=False) + "\n"
+    with BytesIO() as buffer:
+        with TextIOWrapper(buffer, encoding="utf-8", newline=None) as stream:
+            stream.write(text)
+            stream.flush()
+            size = buffer.tell()
+    if size > METADATA_LIMIT:
+        raise ValueError("Geometry revision exceeds the original 1 MiB metadata limit; materialized arrays were preserved and no revision metadata was published.")
+    return text
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -2334,7 +2350,7 @@ class GeometryRevisionStore:
             "validation": report,
         }
         (destination / "revision.json").write_text(
-            json.dumps(revision, indent=2, ensure_ascii=False) + "\n",
+            _bounded_revision_text(revision),
             encoding="utf-8",
         )
         _append_jsonl(self.revisions_path, revision)
