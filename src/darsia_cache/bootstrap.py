@@ -467,8 +467,7 @@ def before_darsia_import(*,package_file):
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
         environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))
-        for key in ("TEMP","TMP","TMPDIR","NUMBA_CACHE_DIR","NUMBA_CACHE_LOCATOR_CLASSES","MPLCONFIGDIR",
-                    "PYTHONPYCACHEPREFIX","DARSIA_FLUIDFLOWER_CACHE","DARSIA_PHASE_DISPLAY_CACHE",RECEIPT_ENV):
+        for key in (*WRITER_ENVIRONMENT_KEYS, RECEIPT_ENV):
             os.environ[key]=environment[key]
         # CPython uses this live attribute, not a later environment assignment.
         # Startup and the imports needed to reach this line are not covered.
