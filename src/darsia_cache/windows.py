@@ -222,7 +222,7 @@ class _API:
                                     None, 0x80, 0x1 if directory and not mutable else 0,
                                     2 if create else 1, options, None, 0)
         evidence = dict(parent_identity=parent_identity, component=name, directory=directory,
-                        create_requested=create, ntstatus=status & 0xffffffff,
+                        create_requested=create, handle_returned=bool(result.value), ntstatus=status & 0xffffffff,
                         nt_success=status == 0, new_object_created=bool(create) if status == 0 else None,
                         io_information=int(iosb.Information) if status == 0 else None,
                         handle_close_confirmed=False)
@@ -247,7 +247,7 @@ class _API:
                 evidence["close_failures"] = list(close_error.close_failures)
             raise CacheObjectIncomplete(str(error), evidence) from error
 
-    def names(self, handle):
+    def names(self, handle, *, with_types=False):
         names, folded, restart = [], set(), True
         offset_name = _FILE_ID_EXTD_DIR_INFO.FileName.offset
         while True:
@@ -274,9 +274,11 @@ class _API:
                     if name.casefold() in folded or len(names) >= 65536:
                         raise CachePolicyError("Duplicate/oversized frozen directory inventory")
                     folded.add(name.casefold())
-                    names.append(name)
-                    if row.FileAttributes & 0x400 or row.ReparsePointTag:
+                    reparse = bool(row.FileAttributes & 0x400 or row.ReparsePointTag)
+                    if reparse and not with_types:
                         raise CachePolicyError("Unowned reparse entry preserved")
+                    names.append(dict(name=name, directory=bool(row.FileAttributes & 0x10),
+                                      reparse=reparse) if with_types else name)
                 step = int(row.NextEntryOffset)
                 if not step:
                     break

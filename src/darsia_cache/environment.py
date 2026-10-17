@@ -9,6 +9,12 @@ from pathlib import PureWindowsPath
 import re
 
 
+WRITER_SUBDIRECTORIES = ("tmp", "numba", "matplotlib", "pycache", "display", "cupy")
+WRITER_ENVIRONMENT_KEYS = ("TEMP", "TMP", "TMPDIR", "NUMBA_CACHE_DIR",
+    "NUMBA_CACHE_LOCATOR_CLASSES", "MPLCONFIGDIR", "PYTHONPYCACHEPREFIX",
+    "DARSIA_FLUIDFLOWER_CACHE", "DARSIA_PHASE_DISPLAY_CACHE", "CUPY_CACHE_DIR")
+
+
 def derive_cache_environment(stores_document, *, purpose, token, scope_root, parent_environment):
     """Return new child environment; metadata alone grants no allocation right."""
     if purpose not in {"jobs", "gates", "tests", "display", "logs"}:
@@ -33,6 +39,7 @@ def derive_cache_environment(stores_document, *, purpose, token, scope_root, par
     result.update(NUMBA_CACHE_DIR=str(expected / "numba"),
                   NUMBA_CACHE_LOCATOR_CLASSES="UserProvidedCacheLocator",
                   MPLCONFIGDIR=str(expected / "matplotlib"),
+                  CUPY_CACHE_DIR=str(expected / "cupy"),
                   PYTHONPYCACHEPREFIX=str(expected / "pycache"),
                   DARSIA_FLUIDFLOWER_CACHE=str(expected),
                   DARSIA_PHASE_DISPLAY_CACHE=str(expected / "display"))

@@ -26,7 +26,7 @@ from .policy import CachePolicyError, cache_settings, nonnegative, _descriptor
 from .windows import WindowsNamespace, _parts
 from .control import CacheBudgetLedger, _encoded
 from .capacity import _capacity_host_context, read_bound, volume_info
-from .environment import derive_cache_environment
+from .environment import derive_cache_environment, WRITER_SUBDIRECTORIES, WRITER_ENVIRONMENT_KEYS
 
 _LEASE = None
 POLICY_ENV = "DARSIA_CACHE_POLICY"
@@ -328,13 +328,27 @@ class ImportLease:
             try:
                 parent=WindowsNamespace(bound["path"],bound["identity"])
                 tree=parent.scope(token,create=True)
-                for name in ("tmp","numba","matplotlib","pycache","display"):
+                # FILE_CREATE plus this still-exclusive handle establishes that
+                # no inherited cache contents precede this service's writers.
+                initial_names=tree.api.names(tree.handles[""])
+                if initial_names:
+                    raise CachePolicyError("New exclusive UUID scope was not observed empty")
+                fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
+                    token=token, owner=dict(self.owner), purpose=self.purpose,
+                    root_identity=dict(tree.directories[""]),
+                    creation_disposition="NtCreateFile.FILE_CREATE", exclusive_root_handle=True,
+                    initial_names=[], initial_empty_observed_utc=_utc(),
+                    observation_precedes_writer_subdirectories_and_imports=True,
+                    writer_subdirectories=list(WRITER_SUBDIRECTORIES),
+                    writer_environment_keys=list(WRITER_ENVIRONMENT_KEYS))
+                for name in WRITER_SUBDIRECTORIES:
                     tree._parent(tuple(_parts(name)))  # Validated directory components; no phantom file.
                 self.directories=dict(tree.directories);self.root=container/token
                 manifest=dict(format="darsia-cache-external-import-scope-v1",token=token,owner=self.owner,
                     purpose=self.purpose,role_identifier=self.role_identifier,entry_kind=self.entry_kind,
                     root=str(self.root),root_identity=self.directories[""],
-                    reservation=self.reservation,maximum_bytes=self.maximum,external_writer_file_ownership_not_yet_frozen=True)
+                    reservation=self.reservation,maximum_bytes=self.maximum,
+                    fresh_scope_provenance=fresh,external_writer_file_ownership_not_yet_frozen=True)
                 self.ledger.require_unbound_scope(token)
                 self.ledger.control.write_once("cache-s-"+token+".json",_encoded(manifest))
             finally:
