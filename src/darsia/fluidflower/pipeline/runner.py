@@ -254,6 +254,10 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
 
     config = series.load_run(task)
     config["_configuration_sha256"] = task["configuration"]["sha256"]
+    storage_request = None
+    if "storage" in config:
+        from .. import storage_outputs
+        storage_request = storage_outputs.parse_request(config, precision)
     if backend not in {"cpu", "cuda"} or precision != task["precision"]:
         raise ValueError("Actual backend/precision differs from queue task")
     from .run_io import for_task
@@ -279,6 +283,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     )
     if io_binding is not None:
         io_binding.admit_resume_root(prefix["source"])
+    if storage_request is not None:
+        storage_outputs.verify_prefix(prefix, task, config, storage_request)
     resume_asset = _write_json(
         output / "resume.json",
         dict(
@@ -361,15 +367,27 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             start = time.perf_counter()
             native = inputs.native(spec, output / "preparation" / spec["case_id"])
             frame = inputs.frame(spec, native)
-            inferred = infer_labels(
-                frame, inputs.previous, inputs.model_bundle, inputs.parameters
-            )
+            if storage_request is None:
+                inferred = infer_labels(
+                    frame, inputs.previous, inputs.model_bundle, inputs.parameters
+                )
+            else:
+                phase_capture = {}
+                inferred = infer_labels(frame, inputs.previous, inputs.model_bundle,
+                                        inputs.parameters, output_capture=phase_capture)
             stage = output / "preparation" / spec["case_id"]
             phase = _phase_outputs(stage, spec, frame, inferred)
             mass_spec = series.bind_mass_frame(
                 spec, native["record"], phase, baseline=inputs.mass_baseline
             )
-            evaluated = mass.evaluate(mass_spec)
+            if storage_request is None:
+                evaluated = mass.evaluate(mass_spec)
+            else:
+                mass_capture = {}
+                evaluated = mass.evaluate(mass_spec, output_capture=mass_capture)
+                storage_entry = storage_outputs.write_frame(
+                    output, task, spec, phase, inferred, phase_capture,
+                    mass_capture, evaluated, storage_request)
             stage_binding = dict(
                 format="darsia-series-frame-v1",
                 complete=True,
@@ -381,6 +399,11 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                 files=_inventory(stage),
                 numerical_phase_calls=1,
             )
+            if storage_request is not None:
+                stage_binding["storage"] = storage_entry
+                for bound in [storage_entry["receipt"], *storage_entry["files"]]:
+                    stage_binding["files"][Path(bound["path"]).name] = bound
+                storage_outputs.validate_publication_binding(stage_binding)
             evaluated["prediction"]["pipeline"] = stage_binding
             elapsed = time.perf_counter() - start
             record = _publish_frame(
@@ -400,6 +423,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             # from the original callback prevents any later queue publication.
             inputs.advance(frame)
             del frame, inferred, evaluated, native
+            if storage_request is not None:
+                del phase_capture, mass_capture, storage_entry
             if on_progress:
                 on_progress(
                     dict(

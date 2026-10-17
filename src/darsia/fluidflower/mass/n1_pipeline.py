@@ -709,7 +709,7 @@ class N1Pipeline:
         )
         return frame, x, y, photo_support, report
 
-    def evaluate(self, spec):
+    def evaluate(self, spec, *, output_capture=None):
         """Compute fields and the original paired E/U_rest summary once."""
         import numpy as np
         import darsia
@@ -792,6 +792,9 @@ class N1Pipeline:
             calibration_sha256=config["calibration"]["sha256"],
             domain_masks=masks,
         )
+        if output_capture is not None:
+            output_capture.update(frame=frame, x_m=x, y_m=y,
+                                  volume_m3=response["analysis"].geometry.cached_voxel_volume)
         prediction = exact_prediction(row, result, self.parameters, config["anchor"])
         return dict(
             response=response,

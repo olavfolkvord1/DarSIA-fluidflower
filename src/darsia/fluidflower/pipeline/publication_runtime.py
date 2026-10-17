@@ -161,6 +161,9 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
             continue  # Original standalone N1 output has no native/phase stage.
         if binding.get("complete") is not True or binding.get("case_id") != record["frame_id"]:
             raise ValueError("Original native/phase stage belongs to another frame")
+        if "storage" in binding:
+            from ..storage_outputs import validate_publication_binding
+            validate_publication_binding(binding)
         # The existing producer's exact inventory includes phase maps and the
         # temporal predecessor assets. No preparation directory is scanned.
         for asset in binding["files"].values():

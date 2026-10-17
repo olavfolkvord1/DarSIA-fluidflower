@@ -589,7 +589,7 @@ def apply_locked_postprocessing(
     )
 
 
-def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping):
+def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, output_capture=None):
     """Infer one acquisition on its unchanged native and complete rig grids.
 
     ``frame`` contains admitted source arrays, photograph masks, transforms,
@@ -707,6 +707,10 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping):
             input_provenance=frame["input_provenance"],
             matched_encoding_receipt=frame["encoding_contract"],
         )
+        if output_capture is not None:
+            output_capture.update(g3_pixel=centre.g3_pixel, flatfield_valid=centre.flatfield_valid,
+                                  source_box_xywh=source_box,
+                                  probability_encoding=centre.provenance["probability_encoding"])
         working_shape = centre.provenance["probability_encoding"][
             "regional_working_shape_hw"
         ]
