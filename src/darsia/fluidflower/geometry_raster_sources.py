@@ -378,6 +378,353 @@ def registration_pixel_shift(*, dx_mm, dy_mm, pixel_size_mm):
                 sign_convention="positive dx right; positive dy down", interpolation=False)
 
 
+CARRIED = "carried-reference-homography-v1"
+
+
+def _carried_keys(value, keys, name):
+    if type(value) is not dict or set(value) != set(keys):
+        raise ValueError("Carried " + name + " has an unknown or incomplete schema.")
+
+
+def _carried_descriptor(value):
+    _carried_keys(value, ("path", "sha256", "size_bytes"), "file binding")
+    return _verify(value)
+
+
+def _carried_data(reference):
+    """Read only one explicitly bound JSON member; never discover other files."""
+    _carried_keys(reference, ("document", "pointer"), "JSON reference")
+    bound = reference["document"]
+    _carried_descriptor(bound)
+    if bound["size_bytes"] > 1024 * 1024 or type(reference["pointer"]) is not str:
+        raise ValueError("Carried evidence needs bounded JSON and an explicit pointer.")
+    raw = Path(bound["path"]).read_bytes()
+    if len(raw) != bound["size_bytes"] or hashlib.sha256(raw).hexdigest() != bound["sha256"]:
+        raise ValueError("Carried JSON changed while being read.")
+    value = json.loads(raw)
+    pointer = reference["pointer"]
+    if pointer and not pointer.startswith("/"):
+        raise ValueError("Carried JSON pointers must start at the bound document root.")
+    for token in pointer.split("/")[1:] if pointer else ():
+        if re.search(r"~(?![01])", token):
+            raise ValueError("Carried JSON pointer contains an invalid escape.")
+        key = token.replace("~1", "/").replace("~0", "~")
+        if type(value) is list:
+            if re.fullmatch(r"0|[1-9][0-9]*", key) is None:
+                raise ValueError("Carried JSON array pointer is not an explicit index.")
+            value = value[int(key)]
+        elif type(value) is dict:
+            value = value[key]
+        else:
+            raise ValueError("Carried JSON pointer does not identify a member.")
+    _carried_descriptor(bound)
+    return value
+
+
+def _carried_shape(value):
+    if (type(value) is not list or len(value) != 2
+            or any(type(item) is not int or item <= 0 for item in value)):
+        raise ValueError("Carried native shape must contain two positive integers.")
+    return tuple(value)
+
+
+def _carried_matrix(value):
+    if (type(value) is not list or len(value) != 3
+            or any(type(row) is not list or len(row) != 3 for row in value)
+            or any(type(item) not in {int, float} for row in value for item in row)):
+        raise ValueError("Carried homography needs an explicit finite numeric 3x3 matrix.")
+    matrix = np.asarray(value, np.float64)
+    if not np.isfinite(matrix).all() or np.linalg.det(matrix) == 0:
+        raise ValueError("Carried homography must be finite and invertible.")
+    return matrix
+
+
+def _carried_u8(labels):
+    values = np.asarray(labels)
+    if (values.ndim != 2 or not np.issubdtype(values.dtype, np.integer)
+            or not values.size or np.min(values) < 0 or np.max(values) > 255):
+        raise ValueError("Carried categorical values require a lossless integer 0..255 representation.")
+    working = values.astype(np.uint8)
+    if not np.array_equal(working.astype(values.dtype), values):
+        raise ValueError("Carried categorical uint8 conversion is not lossless.")
+    return values, working
+
+
+def _carried_mask(value, shape):
+    mask = np.asarray(value)
+    if mask.dtype != np.dtype(bool) or mask.shape != tuple(shape):
+        raise ValueError("Carried source flags must be exact boolean native-grid masks.")
+    return mask
+
+
+def _carried_array_identity(value):
+    array = np.ascontiguousarray(value)
+    return dict(dtype=array.dtype.str, shape=list(array.shape),
+                sha256=hashlib.sha256(memoryview(array).cast("B")).hexdigest())
+
+
+def carried_label_reference(labels, *, reference_shift, source_fill_status,
+                            source_filled=None, source_support=None):
+    """Apply the original integer primitive once to a DATA-selected reference."""
+    values, _ = _carried_u8(labels)
+    if type(reference_shift) is not dict:
+        raise ValueError("Carried reference shift must be explicit typed metadata.")
+    converted = registration_pixel_shift(dx_mm=reference_shift.get("candidate_dx_mm"),
+        dy_mm=reference_shift.get("candidate_dy_mm"), pixel_size_mm=reference_shift.get("pixel_size_mm"))
+    if not _same_grid_metadata(reference_shift, converted):
+        raise ValueError("Carried reference shift differs from its explicit metric conversion.")
+    if type(source_fill_status) is not str or source_fill_status not in {"KNOWN", "NOT_RECORDED"}:
+        raise ValueError("Carried source fill status must remain explicit.")
+    if (source_fill_status == "KNOWN") != (source_filled is not None):
+        raise ValueError("Carried known source fill needs its actual mask; unknown fill cannot be invented.")
+    arguments = dict(row_shift=converted["row_shift"], column_shift=converted["column_shift"],
+                     pixel_size_mm=converted["pixel_size_mm"])
+    shifted, metrics = integer_label_edge_replication(values, **arguments)
+    filled = np.zeros(values.shape, bool)
+    for edge in metrics["geometry_filled"]["edges"].values():
+        r0, r1, c0, c1 = edge["bounds_rc"]
+        filled[r0:r1, c0:c1] = True
+    if source_filled is not None:
+        inherited, _ = integer_label_edge_replication(
+            _carried_mask(source_filled, values.shape).astype(np.uint8), **arguments)
+        filled |= inherited.astype(bool)
+    support = None
+    if source_support is not None:
+        support, _ = integer_label_edge_replication(
+            _carried_mask(source_support, values.shape).astype(np.uint8), **arguments)
+        support = support.astype(bool)
+        # Replicated geometry does not establish previously unobserved support.
+        for edge in metrics["geometry_filled"]["edges"].values():
+            r0, r1, c0, c1 = edge["bounds_rc"]
+            support[r0:r1, c0:c1] = False
+    return dict(labels=shifted, geometry_filled=filled, support=support,
+        metrics=dict(reference_shift=converted, source_fill_status=source_fill_status,
+            input_labels=_carried_array_identity(values), labels=_carried_array_identity(shifted),
+            geometry_filled=_carried_array_identity(filled),
+            support=None if support is None else _carried_array_identity(support),
+            original_edge_metrics=metrics))
+
+
+def carry_label_reference(reference_labels, *, reference_matrix, target_matrix,
+                          target_shape_hw, reference_filled, source_fill_status,
+                          reference_support=None):
+    """Original forward categorical homography, with explicit edge/flag policy.
+
+    The matrix order is the established target @ inverse(reference) transport.
+    The original nearest-neighbour uint8 primitive is retained. Replication is
+    explicit here; the older native categorical helpers use a zero border.
+    """
+    import cv2
+    values, working = _carried_u8(reference_labels)
+    shape = _carried_shape(target_shape_hw)
+    if type(source_fill_status) is not str or source_fill_status not in {"KNOWN", "NOT_RECORDED"}:
+        raise ValueError("Carried source fill status must remain explicit.")
+    source = _carried_matrix(reference_matrix)
+    target = _carried_matrix(target_matrix)
+    transform = target @ np.linalg.inv(source)
+    if not np.isfinite(transform).all():
+        raise ValueError("Carried composition is not finite.")
+    dsize = (shape[1], shape[0])
+    carried = cv2.warpPerspective(working, transform, dsize,
+        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE).astype(values.dtype)
+    coverage = cv2.warpPerspective(np.ones(values.shape, np.uint8), transform, dsize,
+        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    inherited = cv2.warpPerspective(_carried_mask(reference_filled, values.shape).astype(np.uint8),
+        transform, dsize, flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    filled = inherited | ~coverage
+    support = None
+    if reference_support is not None:
+        support = cv2.warpPerspective(_carried_mask(reference_support, values.shape).astype(np.uint8),
+            transform, dsize, flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    return dict(labels=carried, geometry_filled=filled, support=support,
+        metrics=dict(composition=transform.tolist(), interpolation="nearest", border="edge-replication",
+            source_fill_status=source_fill_status, source_labels=_carried_array_identity(values),
+            labels=_carried_array_identity(carried), geometry_filled=_carried_array_identity(filled),
+            uncovered_pixel_count=int(np.count_nonzero(~coverage)),
+            inherited_filled_pixel_count=int(np.count_nonzero(inherited)),
+            geometry_filled_pixel_count=int(np.count_nonzero(filled)),
+            support=None if support is None else _carried_array_identity(support)))
+
+
+def _carried_geometry(value, run, shape):
+    _carried_keys(value, ("run_id", "matrix", "run_identity", "shape"), "geometry source")
+    if (type(value["run_id"]) is not str or value["run_id"] != run
+            or not _same_grid_metadata(value["matrix"]["document"], value["run_identity"]["document"])
+            or not _same_grid_metadata(value["matrix"]["document"], value["shape"]["document"])
+            or not _same_grid_metadata(_carried_data(value["run_identity"]), run)
+            or _carried_shape(_carried_data(value["shape"])) != tuple(shape)):
+        raise ValueError("Carried homography belongs to another run or native grid.")
+    matrix = _carried_data(value["matrix"])
+    _carried_matrix(matrix)
+    return matrix
+
+
+def _carried_chart(reference, run, geometry, source_image, shape, proof):
+    value = _carried_data(reference)
+    _carried_keys(value, ("format", "run_id", "source_image", "geometry_document",
+                         "native_shape_hw", "offset_xy", "status", "proof"), "chart result")
+    if (value["format"] != "darsia-native-raster-chart-v1" or value["status"] != "PASS"
+            or not _same_grid_metadata(value["run_id"], run)
+            or not _same_grid_metadata(value["source_image"], source_image)
+            or not _same_grid_metadata(value["geometry_document"], geometry["matrix"]["document"])
+            or _carried_shape(value["native_shape_hw"]) != tuple(shape)
+            or not _same_grid_metadata(value["offset_xy"], [0, 0])
+            or not _same_grid_metadata(value["proof"], proof)
+            or _carried_data(value["proof"]) is not True):
+        raise ValueError("Carried geometry lacks its positive source-bound raster chart.")
+    _carried_descriptor(value["source_image"])
+
+
+def _carried_load_mask(binding, shape, metadata):
+    from .geometry_facies import _load_array, _darsia_metadata
+    _carried_descriptor(binding)
+    if Path(binding["path"]).suffix.casefold() != ".npz":
+        raise ValueError("Carried flags require their original NPZ representation.")
+    if not _same_grid_metadata(_darsia_metadata(Path(binding["path"])), metadata):
+        raise ValueError("Carried flags changed native grid metadata.")
+    return _carried_mask(_load_array(Path(binding["path"])), shape)
+
+
+def _carried_file_bindings(record):
+    """The closed new branch's consumed files, retained for original CAS rechecks."""
+    evidence = _carried_data(record["carried_evidence"])
+    recipe = _carried_data(evidence["recipe"])
+    references = [record["carried_evidence"], evidence["recipe"], recipe["authority"],
+                  recipe["chart_proof"], evidence["gate"], evidence["source_fill"]["provenance"],
+                  evidence["reference_chart"], evidence["target_chart"]]
+    for name in ("reference_geometry", "target_geometry"):
+        references.extend(evidence[name][key] for key in ("matrix", "run_identity", "shape"))
+    files = [reference["document"] for reference in references]
+    files.extend(recipe["evaluators"])
+    files.extend(evidence[key] for key in ("reference_labels", "reference_filled", "filled"))
+    files.extend(evidence[key] for key in ("reference_support", "support") if evidence[key] is not None)
+    files.extend(evidence["source_fill"][key] for key in ("mask", "support")
+                 if evidence["source_fill"][key] is not None)
+    for name in ("reference_chart", "target_chart"):
+        files.append(_carried_data(evidence[name])["source_image"])
+    unique = {}
+    for bound in files:
+        _carried_descriptor(bound)
+        unique[(bound["path"], bound["sha256"], bound["size_bytes"])] = deepcopy(bound)
+    return list(unique.values())
+
+
+def _validate_carried_registered_run(config, payload, parent, row):
+    from .geometry_facies import _darsia_metadata
+    record = row["registration"]
+    _carried_keys(record, ("kind", "parent_revision_id", "parent_labels", "status", "authority",
+        "measurement", "labels", "source_image", "carried_evidence"), "registration")
+    run = str(row["run_id"]).strip().casefold()
+    if (record["status"] != "carried" or record["parent_revision_id"] != parent["revision_id"]
+            or not _same_grid_metadata(record["parent_labels"], payload["actual"]["labels"])
+            or str(row.get("facies_path") or "").strip()):
+        raise ValueError("Carried registration needs its genuine imported parent and canonical facies.")
+    _carried_descriptor(record["authority"])
+    _carried_descriptor(record["measurement"])
+    actual = _carried_descriptor(record["labels"])
+    if (Path(actual["path"]).suffix.casefold() != ".npz"
+            or Path(actual["path"]) != Path(row["labels_path"]).resolve()):
+        raise ValueError("Carried registration lacks its actual NPZ labels.")
+    metadata = _darsia_metadata(Path(payload["actual"]["labels"]["path"]))
+    if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])), metadata):
+        raise ValueError("Carried labels changed the imported grid metadata.")
+    evidence = _carried_data(record["carried_evidence"])
+    _carried_keys(evidence, ("format", "run_id", "reference_run", "recipe", "reference_geometry",
+        "target_geometry", "reference_chart", "target_chart", "source_fill", "reference_labels",
+        "reference_filled", "reference_support", "filled", "support", "reference_metrics", "metrics", "gate"), "run evidence")
+    if evidence["format"] != "darsia-carried-registration-evidence-v1" or evidence["run_id"] != run:
+        raise ValueError("Carried evidence belongs to another run.")
+    recipe = _carried_data(evidence["recipe"])
+    _carried_keys(recipe, ("format", "reference_run", "reference_shift", "authority", "gate_limits",
+                          "chart_proof", "evaluators", "source_fill"), "reference recipe")
+    reference_run = evidence["reference_run"]
+    if (type(reference_run) is not str or not reference_run or recipe["format"] != "darsia-carried-reference-recipe-v1"
+            or not _same_grid_metadata(recipe["reference_run"], reference_run)
+            or not _same_grid_metadata(recipe["authority"]["document"], record["authority"])):
+        raise ValueError("Carried reference or authority differs from its admitted recipe.")
+    _carried_data(recipe["authority"])
+    shape = payload["labels"].shape
+    reference_matrix = _carried_geometry(evidence["reference_geometry"], reference_run, shape)
+    target_matrix = _carried_geometry(evidence["target_geometry"], run, shape)
+    frame_runs = (config.get("frame_binding") or {}).get("runs") or {}
+    photographs = {}
+    for selected in (reference_run, run):
+        photographs[selected] = ((frame_runs.get(selected) or {}).get("fields") or {}).get("shape_corrected_baseline")
+        _carried_descriptor(photographs[selected])
+    source = _carried_descriptor(record["source_image"])
+    if (Path(source["path"]) != Path(row["source_image_path"]).resolve()
+            or not _same_grid_metadata(record["source_image"], photographs[run])):
+        raise ValueError("Carried run photograph is not its bound corrected baseline.")
+    _carried_chart(evidence["reference_chart"], reference_run, evidence["reference_geometry"], photographs[reference_run], shape, recipe["chart_proof"])
+    _carried_chart(evidence["target_chart"], run, evidence["target_geometry"], photographs[run], shape, recipe["chart_proof"])
+    fill = evidence["source_fill"]
+    _carried_keys(fill, ("status", "mask", "support", "provenance"), "source fill lineage")
+    if not _same_grid_metadata(fill, recipe["source_fill"]):
+        raise ValueError("Carried source fill lineage differs from its admitted recipe.")
+    _carried_data(fill["provenance"])
+    source_mask = None if fill["mask"] is None else _carried_load_mask(fill["mask"], shape, metadata)
+    source_support = None if fill["support"] is None else _carried_load_mask(fill["support"], shape, metadata)
+    reference = carried_label_reference(payload["labels"], reference_shift=recipe["reference_shift"],
+        source_fill_status=fill["status"], source_filled=source_mask, source_support=source_support)
+    _carried_descriptor(evidence["reference_labels"])
+    reference_labels = _integer_map(evidence["reference_labels"]["path"])
+    if (reference_labels.dtype != reference["labels"].dtype or not np.array_equal(reference_labels, reference["labels"])
+            or not _same_grid_metadata(_darsia_metadata(Path(evidence["reference_labels"]["path"])), metadata)
+            or not _same_grid_metadata(evidence["reference_metrics"], reference["metrics"])):
+        raise ValueError("Carried reference labels differ from their once-registered parent.")
+    reference_filled = _carried_load_mask(evidence["reference_filled"], shape, metadata)
+    if not np.array_equal(reference_filled, reference["geometry_filled"]):
+        raise ValueError("Carried reference lost source or newly filled geometry.")
+    reference_support = None if evidence["reference_support"] is None else _carried_load_mask(evidence["reference_support"], shape, metadata)
+    if ((reference_support is None) != (reference["support"] is None)
+            or (reference_support is not None and not np.array_equal(reference_support, reference["support"]))):
+        raise ValueError("Carried reference support differs from its actual source.")
+    target = carry_label_reference(reference_labels, reference_matrix=reference_matrix,
+        target_matrix=target_matrix, target_shape_hw=list(shape), reference_filled=reference_filled,
+        source_fill_status=fill["status"], reference_support=reference_support)
+    labels = _integer_map(actual["path"])
+    filled = _carried_load_mask(evidence["filled"], shape, metadata)
+    support = None if evidence["support"] is None else _carried_load_mask(evidence["support"], shape, metadata)
+    if (labels.dtype != target["labels"].dtype or not np.array_equal(labels, target["labels"])
+            or not np.array_equal(filled, target["geometry_filled"])
+            or (support is None) != (target["support"] is None)
+            or (support is not None and not np.array_equal(support, target["support"]))
+            or not _same_grid_metadata(evidence["metrics"], target["metrics"])):
+        raise ValueError("Carried labels, fill lineage or metrics differ from the exact source transport.")
+    gate = _carried_data(evidence["gate"])
+    _carried_keys(gate, ("format", "status", "run_id", "reference_run", "labels", "recipe", "target_geometry",
+        "reference_geometry", "target_chart", "sharp_boundary_count", "median_mm", "maximum_mm",
+        "missing_prior_witnesses", "ambiguous_boundaries", "evaluators"), "boundary gate")
+    limits = recipe["gate_limits"]
+    _carried_keys(limits, ("median_mm", "maximum_mm"), "gate limits")
+    if (gate["format"] != "darsia-carried-boundary-gate-v1" or gate["status"] != "PASS"
+            or not _same_grid_metadata(record["measurement"], evidence["gate"]["document"])
+            or not _same_grid_metadata(gate["run_id"], run)
+            or not _same_grid_metadata(gate["reference_run"], reference_run)
+            or any(not _same_grid_metadata(gate[key], value) for key, value in
+                (("labels", record["labels"]), ("recipe", evidence["recipe"]),
+                 ("target_geometry", evidence["target_geometry"]), ("reference_geometry", evidence["reference_geometry"]),
+                 ("target_chart", evidence["target_chart"])))
+            or type(gate["sharp_boundary_count"]) is not int or gate["sharp_boundary_count"] <= 0
+            or not _same_grid_metadata(gate["missing_prior_witnesses"], [])
+            or not _same_grid_metadata(gate["ambiguous_boundaries"], [])
+            or type(gate["evaluators"]) is not list or not gate["evaluators"]
+            or not _same_grid_metadata(gate["evaluators"], recipe["evaluators"])):
+        raise ValueError("Carried labels lack their positive exact source-bound boundary gate.")
+    for key in ("median_mm", "maximum_mm"):
+        if (type(gate[key]) is not float or type(limits[key]) is not float
+                or not np.isfinite(gate[key]) or not np.isfinite(limits[key])
+                or gate[key] < 0 or limits[key] < 0 or gate[key] > limits[key]):
+            raise ValueError("Carried boundary gate exceeds its explicit finite metric limits.")
+    if gate["median_mm"] > gate["maximum_mm"]:
+        raise ValueError("Carried boundary gate statistics are inconsistent.")
+    for evaluator in gate["evaluators"]:
+        _carried_descriptor(evaluator)
+    _carried_file_bindings(record)
+
+
 def _validate_registered_runs(config, payload, parent, *, run_id=None):
     """Admit explicit original-Store run rows, not unbound arbitrary overrides."""
     from .geometry_facies import _darsia_metadata, _effective_run_geometry_choice
@@ -402,6 +749,9 @@ def _validate_registered_runs(config, payload, parent, *, run_id=None):
             raise ValueError("Registered run identifiers must be explicit and unique.")
         seen.add(run)
         record = row.get("registration") or {}
+        if record.get("kind") == CARRIED:
+            _validate_carried_registered_run(config, payload, parent, row)
+            continue
         if (record.get("parent_revision_id") != parent["revision_id"]
                 or record.get("parent_labels") != payload["actual"]["labels"]
                 or record.get("status") not in {"registered", "provisional - Olav to review"}):
@@ -508,11 +858,15 @@ def registered_run_sources(project_root, current, run_id):
     guarded = [current_file, revision_file, config["canonical_import_parent"]["revision"],
                payload["diagnosis"], *payload["actual"].values(),
                *[row["registration"][key] for key in ("authority", "measurement", "labels", "source_image")]]
+    if row["registration"].get("kind") == CARRIED:
+        guarded.extend(_carried_file_bindings(row["registration"]))
     result = dict(revision_id=revision_id, run_id=run, current=current_file,
         revision=revision_file, files=files, labels_shape=list(labels.shape),
         registration=deepcopy(row["registration"]), guarded_sources=guarded,
         label_serialization="Original Store int32; exact numeric equality to parent-typed translation",
         provenance="Fresh observed Store product SHA bound to genuine UUID/record and exact arrays; not historical source SHA")
+    if row["registration"].get("kind") == CARRIED:
+        result["label_serialization"] = "Original Store int32; exact numeric equality to admitted carried labels"
     verify_registered_sources(result)
     return result
 
