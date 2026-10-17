@@ -277,15 +277,39 @@ class RunIOBinding:
         path = (self.repository / relative).resolve(strict=True)
         if not path.is_relative_to(self.repository):
             raise InputHashMismatch("Current source escapes its admitted checkout")
-        raw = path.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != digest:
+        original = subprocess.check_output(
+            ["git", "-C", str(self.repository), "show", self.commit + ":" + relative])
+        if hashlib.sha256(original).hexdigest() != digest:
             raise InputHashMismatch("Current source differs from its exact execution binding: " + role)
+        before = path.stat()
+        raw = path.read_bytes()
+        if (_version(before) != _version(path.stat())
+                or raw.replace(b"\r\n", b"\n") != original.replace(b"\r\n", b"\n")):
+            raise InputHashMismatch("Current source differs from its exact execution binding: " + role)
+        raw_digest = hashlib.sha256(raw).hexdigest()
         old = self.code_locations.get(_key(path))
-        if old is not None and old["sha256"] != digest:
-            raise InputHashMismatch("Conflicting explicit source roles")
-        self.code_locations[_key(path)] = dict(path=str(path),sha256=digest,size_bytes=len(raw))
-        self.code_audit.append(dict(role=role,commit=self.commit,
-            repo_relative_path=relative,sha256=digest,size_bytes=len(raw),actual_path=str(path)))
+        if old is not None and (old["sha256"] != digest
+                or old["working_tree_sha256"] != raw_digest
+                or old["working_tree_size_bytes"] != len(raw)):
+            raise InputHashMismatch("Conflicting or changed explicit source roles")
+        record = dict(path=str(path), sha256=digest, size_bytes=len(original),
+            identity_algorithm="sha256-git-blob-content", commit=self.commit,
+            repo_relative_path=relative, working_tree_sha256=raw_digest,
+            working_tree_size_bytes=len(raw), EOL_only_representation=(raw != original))
+        self.code_locations[_key(path)] = record
+        self.code_audit.append(dict(role=role, actual_path=str(path),
+            **{key: value for key, value in record.items() if key != "path"}))
+
+    def _checked_code_digest(self, code):
+        """Recheck this checkout's raw snapshot; return its canonical Git identity."""
+        path = Path(code["path"])
+        before = path.stat()
+        raw = path.read_bytes()
+        if (_version(before) != _version(path.stat())
+                or len(raw) != code["working_tree_size_bytes"]
+                or hashlib.sha256(raw).hexdigest() != code["working_tree_sha256"]):
+            raise InputHashMismatch("Admitted current code changed")
+        return code["sha256"]
 
     def _input_digest(self, row):
         """Use only actual run-admission evidence, with a fresh file version."""
@@ -299,9 +323,12 @@ class RunIOBinding:
         return digest
 
     def native_input_digest(self, path):
-        """Known inputs reuse admission; code and own outputs hash freshly."""
-        # No catalogue entry may shadow original source/output verification.
-        if _key(path) in self.code_locations or self._own_output(path):
+        """Data stay byte-bound; named code uses Git identity after a fresh raw check."""
+        # Code identities and raw input/output hashes are separate contracts.
+        code = self.code_locations.get(_key(path))
+        if code is not None:
+            return self._checked_code_digest(code)
+        if self._own_output(path):
             return None
         row = self.locations.get(_key(path))
         if row is not None:
@@ -366,8 +393,7 @@ class RunIOBinding:
             return row.path
         code = self.code_locations.get(_key(path))
         if code is not None:
-            if hashlib.sha256(Path(code["path"]).read_bytes()).hexdigest() != code["sha256"]:
-                raise InputHashMismatch("Admitted current code changed")
+            self._checked_code_digest(code)
             return Path(code["path"])
         if self._own_output(path):
             return Path(path)

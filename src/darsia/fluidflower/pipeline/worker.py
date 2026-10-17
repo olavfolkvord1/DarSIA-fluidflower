@@ -65,8 +65,30 @@ def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
     actual = (repository / relative).resolve(strict=True)
     if not actual.is_relative_to(repository):
         raise ValueError("Environment lock escapes the repository")
-    if hashlib.sha256(actual.read_bytes()).hexdigest() != lock["sha256"]:
+    git_relative = relative.as_posix()
+    tracked = subprocess.check_output(
+        ["git", "-C", str(repository), "ls-tree", "--name-only",
+         head, "--", git_relative], text=True).splitlines()
+    if tracked != [git_relative]:
+        raise RuntimeError("Environment lock is not tracked at the admitted Git commit")
+    original = subprocess.check_output(
+        ["git", "-C", str(repository), "show", head + ":" + git_relative])
+    if hashlib.sha256(original).hexdigest() != lock["sha256"]:
         raise RuntimeError("Actual repository environment lock SHA differs")
+    before = actual.stat()
+    raw = actual.read_bytes()
+    after = actual.stat()
+    stamp = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    if (stamp(before) != stamp(after)
+            or raw.replace(b"\r\n", b"\n") != original.replace(b"\r\n", b"\n")):
+        raise RuntimeError("Actual repository environment lock differs from its Git content")
+    if startup_context is not None:
+        startup_context["environment_lock_identity"] = dict(
+            commit=head, repo_relative_path=git_relative,
+            identity_algorithm="sha256-git-blob-content",
+            sha256=hashlib.sha256(original).hexdigest(), size_bytes=len(original),
+            working_tree_sha256=hashlib.sha256(raw).hexdigest(),
+            working_tree_size_bytes=len(raw), EOL_only_representation=(raw != original))
     if job.get("precision") not in {"float32", "float64"}:
         raise ValueError("One explicit job precision is required")
     import re
@@ -481,6 +503,8 @@ def main(argv=None):
                 job, commit = verify_startup(args.job,stores_path=args.stores,
                     machine_id=args.machine,startup_context=startup_context)
                 args._alias_stores=startup_context.get("stores")
+                emit(log, dict(kind="startup_code_admission",
+                    environment_lock=startup_context["environment_lock_identity"]))
             except Exception:
                 emit(
                     log, dict(kind="startup_failure", traceback=traceback.format_exc())

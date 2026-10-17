@@ -129,7 +129,12 @@ def test_actual_native_code_is_tracked_and_exact_sha_not_arbitrary_repo_data(tmp
     bound=put(binding.repository/relative,b"# authored source bytes\n")
     calls=[]
     def tracked(args,**kwargs):
-        calls.append(args);return args[-1]+"\n"
+        calls.append(args)
+        if args[3] == "show":
+            assert args[4] == binding.commit + ":" + relative
+            return Path(bound["path"]).read_bytes()
+        assert args[3] == "ls-tree" and args[-1] == relative
+        return args[-1]+"\n"
     monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output",tracked)
     binding._admit_code(relative,bound["sha256"],"processor_module_sha256")
     assert calls[0][5]==binding.commit
@@ -364,8 +369,13 @@ def test_native_code_and_own_outputs_keep_original_fresh_hashing(tmp_path,monkey
     _task,_config,_bound,_host,binding=fixture(tmp_path)
     relative="src/darsia/fluidflower/native/source.py"
     code=put(binding.repository/relative,b"# original source bytes\n")
-    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output",
-                        lambda args,**kwargs:args[-1]+"\n")
+    def original_git(args, **kwargs):
+        if args[3] == "show":
+            assert args[4] == binding.commit + ":" + relative
+            return Path(code["path"]).read_bytes()
+        assert args[3] == "ls-tree" and args[-1] == relative
+        return args[-1]+"\n"
+    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
     binding._admit_code(relative,code["sha256"],"processor_module_sha256")
     output=doc(binding.output/"own.json",{})
     original_open=Path.open
@@ -385,7 +395,8 @@ def test_native_code_and_own_outputs_keep_original_fresh_hashing(tmp_path,monkey
         with pytest.raises(ValueError,match="Source artifact changed"):
             read_bound_json(output["path"],output["sha256"])
         Path(code["path"]).write_bytes(b"# changed source bytes\n")
-        assert sha256_file(code["path"])!=code["sha256"]
+        with pytest.raises(InputHashMismatch,match="current code changed"):
+            sha256_file(code["path"])
         with pytest.raises(InputHashMismatch,match="current code changed"):
             binding.asset_path(code["path"])
 
@@ -415,8 +426,13 @@ def test_native_input_overlap_cannot_shadow_code_own_or_prefix_hash(tmp_path,mon
     _task,_config,binding,source,prepared=candidate_prefix_fixture(tmp_path)
     relative="src/darsia/fluidflower/native/source.py"
     code=put(binding.repository/relative,b"# exact current source\n")
-    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output",
-                        lambda args,**kwargs:args[-1]+"\n")
+    def original_git(args, **kwargs):
+        if args[3] == "show":
+            assert args[4] == binding.commit + ":" + relative
+            return Path(code["path"]).read_bytes()
+        assert args[3] == "ls-tree" and args[-1] == relative
+        return args[-1]+"\n"
+    monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
     binding._admit_code(relative,code["sha256"],"processor_module_sha256")
     own=put(binding.output/"own.npy",b"own output bytes")
     input_row=next(row for row in binding.verified.rows if row.path.name=="log.npy")
@@ -523,7 +539,7 @@ def provenance_source_fixture(tmp_path, monkeypatch, *, changed_display=False):
             return args[-1] + "\n"
         assert args[3] == "show"
         commit, separator, relative = args[4].partition(":")
-        assert separator and commit == binding.commit and relative == display_relative
+        assert separator and commit == binding.commit and relative in blobs
         return blobs[relative]
     monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
     native = dict(source=dict(required_execution_identity_keys=["processor_module_sha256"],
@@ -575,8 +591,9 @@ def test_original_display_contract_self_hash_runs_under_exact_admitted_binding(t
         if "ls-tree" in args:
             assert args[-1] in (source_relative, display_relative)
             return args[-1] + "\n"
-        assert args[3:] == ["show", binding.commit + ":" + display_relative]
-        return display_raw
+        assert args[3] == "show"
+        assert args[4] in (binding.commit + ":" + source_relative, binding.commit + ":" + display_relative)
+        return Path(processor["path"]).read_bytes() if args[4].endswith(":" + source_relative) else display_raw
     monkeypatch.setattr("darsia.fluidflower.pipeline.run_io.subprocess.check_output", original_git)
     native = dict(source=dict(required_execution_identity_keys=["processor_module_sha256"],
                               execution_identity=dict(processor_module_sha256=processor["sha256"])))
