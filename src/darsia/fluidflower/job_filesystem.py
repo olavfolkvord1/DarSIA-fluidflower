@@ -231,6 +231,29 @@ def linux_local_facts(path, mountinfo):
     return LocalFilesystemFacts(filesystem, True if filesystem in known_local else None, evidence)
 
 
+def windows_mapped_drive_target(drive):
+    """Read one current-token drive mapping; never connect, enumerate or write."""
+    if not isinstance(drive, str) or re.fullmatch(r"[A-Z]:", drive) is None:
+        raise ValueError("One explicit uppercase drive letter and colon required")
+    import ctypes
+    from ctypes import wintypes
+    try:
+        mpr = ctypes.WinDLL("mpr", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        raise OSError("Current-token Windows drive mapping query unavailable") from error
+    query = mpr.WNetGetConnectionW
+    query.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = wintypes.DWORD(len(buffer))
+    status = int(query(drive, buffer, ctypes.byref(length)))
+    if status != 0:
+        raise OSError(status, "Current-token drive mapping unavailable: " + drive)
+    if not 0 < length.value <= len(buffer) or not buffer.value:
+        raise OSError("Current-token drive mapping returned no bounded target")
+    return buffer.value
+
+
 def _windows_local_facts(container):
     """Query the containing volume, including mounted volumes and mapped drives."""
     import ctypes

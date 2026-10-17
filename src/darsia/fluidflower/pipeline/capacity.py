@@ -604,8 +604,21 @@ def _owner_scope(document, binding, results_root, context):
     aliases = document["aliases"]
     if not isinstance(aliases, list) or not 0 < len(aliases) <= 128:
         raise ValueError("Bounded explicit NAS alias list required")
-    keys = [_authority_alias(value) for value in aliases]
-    if keys != sorted(set(keys)):
+    keys, drives = [], []
+    for value in aliases:
+        if isinstance(value, str):
+            if drives:
+                raise ValueError("UNC aliases must precede explicit drive aliases")
+            keys.append(_authority_alias(value))
+        elif (isinstance(value, dict) and set(value) == {"drive", "target_unc"}
+                and isinstance(value["drive"], str)
+                and re.fullmatch(r"[A-Z]:", value["drive"]) is not None):
+            drives.append(dict(drive=value["drive"], target_unc=_authority_alias(value["target_unc"])))
+        else:
+            raise ValueError("NAS aliases must be UNC roots or exact drive/target_unc bindings")
+    if (keys != sorted(set(keys))
+            or [value["drive"] for value in drives] != sorted({value["drive"] for value in drives})
+            or any(value["target_unc"] not in keys for value in drives)):
         raise ValueError("NAS authority aliases must be unique and canonically ordered")
     canonical = document["canonical_owner_path"]
     if (not isinstance(canonical, str) or not canonical or "\x00" in canonical
@@ -616,8 +629,9 @@ def _owner_scope(document, binding, results_root, context):
             or _authority_alias(PureWindowsPath(canonical).anchor) not in keys):
         raise ValueError("NAS owner descriptor must name its canonical shared NAS_OWNER.json")
     actual = PureWindowsPath(str(results_root))
-    if (not actual.is_absolute() or ".." in actual.parts
-            or _authority_alias(actual.anchor) not in keys):
+    in_scope = (_authority_alias(actual.anchor) in keys if actual.drive.startswith("\\\\")
+                else any(value["drive"] == actual.drive.upper() for value in drives))
+    if not actual.is_absolute() or ".." in actual.parts or not in_scope:
         raise RunUnavailable("NAS results root is outside the complete operator-listed authority scope; use local outputs; no task claimed")
     owner = document["owner"]
     if (not isinstance(owner, dict) or set(owner) != {"machine_id", "host", "service_account_sid"}
@@ -633,11 +647,35 @@ def _owner_scope(document, binding, results_root, context):
         raise RunUnavailable("This NAS results authority is assigned to another actual computing host/account; use local outputs; no task claimed")
     return dict(format="darsia-single-host-nas-authority-scope-v1",
         owner_document=dict(path=canonical, sha256=binding["sha256"], size_bytes=binding["size_bytes"]),
-        aliases=keys, owner=dict(owner),
+        aliases=keys + drives, owner=dict(owner),
         accounting="one conservative host/authority pool across every listed namespace; no physical-volume equivalence claimed")
 
 
-def remote_results_owner(stores, series_id, results_root, *, admission=None, context=None):
+def _mapped_results_alias(scope, results_root):
+    if scope is None:
+        return None
+    actual = PureWindowsPath(str(results_root))
+    return next((value for value in scope["aliases"] if isinstance(value, dict)
+                 and value["drive"] == actual.drive.upper()), None)
+
+
+def _verify_mapped_results(scope, results_root, mapping_provider):
+    selected = _mapped_results_alias(scope, results_root)
+    if selected is None:
+        return
+    from ..job_filesystem import windows_mapped_drive_target
+    provider = windows_mapped_drive_target if mapping_provider is None else mapping_provider
+    try:
+        target = provider(selected["drive"])
+        observed = _authority_alias(target)
+    except (OSError, ValueError, TypeError) as error:
+        raise RunUnavailable("Current mapped results target is unavailable; no task claimed: " + str(error)) from error
+    if observed != selected["target_unc"]:
+        raise RunUnavailable("Mapped results drive changed its exact approved UNC target; no task claimed")
+
+
+def remote_results_owner(stores, series_id, results_root, *, admission=None, context=None,
+                         mapping_provider=None):
     """Read only one pinned static document; never elect, create, renew or write."""
     from ..job_filesystem import inspect_results_root, valid_results_admission, LocalFileAdmission
     proof = inspect_results_root(results_root) if admission is None else admission
@@ -657,14 +695,16 @@ def remote_results_owner(stores, series_id, results_root, *, admission=None, con
         document, _ = read_bound(binding)
     except (OSError, ValueError) as error:
         raise RunUnavailable("The pinned NAS owner document is missing or changed; no task claimed: " + str(error)) from error
-    return _owner_scope(document, binding, results_root,
-                        _capacity_host_context() if context is None else context)
+    scope = _owner_scope(document, binding, results_root,
+                         _capacity_host_context() if context is None else context)
+    _verify_mapped_results(scope, results_root, mapping_provider)
+    return scope
 
 
 class CapacityLedger:
     """Immutable own reservation/progress/release files, shared across jobs."""
     def __init__(self, stores, series_id, results_root, *, volume_provider=volume_info,
-                 context_provider=_capacity_host_context):
+                 context_provider=_capacity_host_context, mapping_provider=None):
         from ..job_filesystem import inspect_local_file
         from ..store_map import capacity_settings
         configured=capacity_settings(stores.document)
@@ -681,8 +721,11 @@ class CapacityLedger:
         if self.directory.exists() and not self.directory.is_dir():
             raise RunUnavailable("Configured capacity state_directory is not a directory; no host binding or claim")
         self.volume_provider,self.context_provider=volume_provider,context_provider
+        self.stores,self.series_id,self.mapping_provider=stores,series_id,mapping_provider
+        self.mapping_observation=None
         context=context_provider()
-        self.remote_scope=remote_results_owner(stores,series_id,self.results_root,context=context)
+        self.remote_scope=remote_results_owner(stores,series_id,self.results_root,context=context,
+                                               mapping_provider=self._mapped_target)
         self.volume=volume_provider(self.results_root)
         if (not isinstance(context,dict) or set(context)!={"host","service_account_sid","common_root"}
                 or not isinstance(context["host"],str) or not context["host"]
@@ -747,10 +790,26 @@ class CapacityLedger:
                 write_immutable(path,marker)
             yield self
 
+    def _mapped_target(self, drive):
+        from ..job_filesystem import windows_mapped_drive_target
+        provider = windows_mapped_drive_target if self.mapping_provider is None else self.mapping_provider
+        target = provider(drive)
+        self.mapping_observation = dict(drive=drive, target_unc=target,
+            provider="WNetGetConnectionW" if self.mapping_provider is None else "injected mapping provider")
+        return target
+
     def fresh_volume(self):
+        if _mapped_results_alias(self.remote_scope, self.results_root) is not None:
+            self.mapping_observation = None
+            current = remote_results_owner(self.stores, self.series_id, self.results_root,
+                context=self.context_provider(), mapping_provider=self._mapped_target)
+            if current != self.remote_scope:
+                raise RunUnavailable("Mapped results owner authority changed; no task claimed")
         value = self.volume_provider(self.results_root)
         if value["volume_id"] != self.volume["volume_id"]:
             raise RunUnavailable("Results volume changed during capacity admission")
+        if self.mapping_observation is not None:
+            value = dict(value, mapped_drive_observation=dict(self.mapping_observation))
         return value
 
     def remaining(self, *, exclude_job=None):
