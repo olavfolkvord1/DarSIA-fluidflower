@@ -107,9 +107,11 @@ def _statistics_template(value):
     _bound(value["physical_correction"], where="statistics physical correction")
     _geometry_fields(value)
     summary = value["summary"]
-    _keys(summary, {"baseline_gain", "anchor_target_h", "intervals", "max_column_distance_m",
-                    "max_depth_m", "max_porosity"}, {"contract"}, where="historical statistics summary")
+    _keys(summary, {"baseline_gain", "intervals", "max_column_distance_m",
+                    "max_depth_m", "max_porosity"}, {"contract", "anchor_target_h"}, where="historical statistics summary")
     for field in ("baseline_gain", "anchor_target_h", "max_column_distance_m", "max_depth_m", "max_porosity"):
+        if field == "anchor_target_h" and field not in summary:
+            continue
         _finite(summary[field], where="summary " + field, positive=True)
     if summary["intervals"] != 32768 or type(summary["intervals"]) is not int:
         raise ValueError("Original 32768-interval summary definition required")

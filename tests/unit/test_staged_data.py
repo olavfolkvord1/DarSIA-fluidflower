@@ -196,7 +196,7 @@ def test_phase1_template_has_no_new_fitted_mass_parameters(phase1_data, field):
         staged.validate_phase1_run(phase1_data)
 
 
-@pytest.mark.parametrize("field", ["baseline_gain", "anchor_target_h", "intervals", "max_column_distance_m", "max_depth_m", "max_porosity"])
+@pytest.mark.parametrize("field", ["baseline_gain", "intervals", "max_column_distance_m", "max_depth_m", "max_porosity"])
 def test_historical_summary_definitions_are_required(phase1_data, field):
     phase1_data["statistics"]["summary"].pop(field)
     with pytest.raises(ValueError, match="missing"):
@@ -414,3 +414,29 @@ def test_all_saved_source_receipts_preserve_nested_JSON_types(phase1_data, tmp_p
     with pytest.raises(ValueError, match="BEFORE receipt/source/state differs|history is not its actual native acquisition"):
         staged.verify_phase1_completion(completion, closure["configuration"],
             expected_commit="1" * 40, reader=DataReader())
+
+
+def test_historical_summary_anchor_may_be_omitted_without_materializing_default(phase1_data):
+    phase1_data["statistics"]["summary"].pop("anchor_target_h")
+    before = deepcopy(phase1_data)
+    assert staged.validate_phase1_run(phase1_data) is phase1_data
+    assert phase1_data == before
+    assert "anchor_target_h" not in phase1_data["statistics"]["summary"]
+
+
+@pytest.mark.parametrize("anchor", [1.75, 3])
+def test_present_historical_summary_anchor_preserves_exact_value_and_type(phase1_data, anchor):
+    phase1_data["statistics"]["summary"]["anchor_target_h"] = anchor
+    before = deepcopy(phase1_data)
+    assert staged.validate_phase1_run(phase1_data) is phase1_data
+    actual = phase1_data["statistics"]["summary"]["anchor_target_h"]
+    assert type(actual) is type(anchor)
+    assert actual == anchor
+    assert phase1_data == before
+
+
+@pytest.mark.parametrize("anchor", [None, True, 0, -1, float("nan"), float("inf"), "2.25"])
+def test_present_historical_summary_anchor_keeps_all_original_rejections(phase1_data, anchor):
+    phase1_data["statistics"]["summary"]["anchor_target_h"] = anchor
+    with pytest.raises(ValueError):
+        staged.validate_phase1_run(phase1_data)
