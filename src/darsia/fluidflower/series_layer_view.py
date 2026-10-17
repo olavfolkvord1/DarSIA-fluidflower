@@ -1815,7 +1815,7 @@ class LayerPainterView(QWidget):
                         and (self.session.strokes or self.session.polygons)):
                     raise ValueError("Saved marks belong to another coordinate frame; the draft was preserved")
                 self._saved_corrected_boundaries = workspace_frame.saved_boundaries(
-                    self._workspace_frame_config, reference.run_id, image.display.shape[:2])
+                    self._workspace_frame_config, reference.run_id, image.display.shape[:2], project=self.project)
             else:
                 image = lp.load_painting_image(Path(reference.baseline_image))
         except (OSError, ValueError) as error:

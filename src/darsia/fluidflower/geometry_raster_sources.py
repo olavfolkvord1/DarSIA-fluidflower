@@ -220,7 +220,7 @@ def prepare_canonical_edit(project, *, actor, reason):
     return config
 
 
-def canonical_parent_payload(config):
+def canonical_parent_payload(config, *, run_id=None):
     parent = config.get("canonical_import_parent") or {}
     record = _verify(parent.get("revision"))
     revision = json.loads(Path(record["path"]).read_bytes())
@@ -236,10 +236,7 @@ def canonical_parent_payload(config):
     labels = _integer_map(config["labels_path"])
     if labels.shape != payload["labels"].shape:
         raise ValueError("A canonical edit cannot silently change the imported grid.")
-    from .geometry_facies import _effective_run_geometry_choice
-    if any(_effective_run_geometry_choice(row) == "run_override"
-           for row in (config.get("run_geometry") or {}).get("runs") or []):
-        raise ValueError("Per-run canonical registration remains unqualified and requires Olav's decision.")
+    _validate_registered_runs(config, payload, parent, run_id=run_id)
     from .geometry_facies import _load_properties
     props = _load_properties(Path(payload["actual"]["facies_properties"]["path"]))
     for row in config.get("regions") or []:
@@ -248,6 +245,191 @@ def canonical_parent_payload(config):
             raise ValueError("A canonical edit cannot silently change the original physical CSV properties.")
     return payload
 
+
+
+def integer_label_translation(labels, *, row_shift, column_shift, fill_label):
+    """Translate categorical pixel values; explicit fill, no wrap/interpolation.
+
+    This is a geometry-representation operation only. It never selects a shift,
+    a fill category, an epoch, or a scientific acceptance threshold.
+    """
+    values = np.asarray(labels)
+    if values.ndim != 2 or not np.issubdtype(values.dtype, np.integer):
+        raise ValueError("A label translation needs a two-dimensional integer raster.")
+    if any(type(value) is not int for value in (row_shift, column_shift, fill_label)):
+        raise ValueError("Label translation offsets and fill must be explicit integers.")
+    if fill_label not in set(map(int, np.unique(values))):
+        raise ValueError("The explicit fill must be an existing parent label category.")
+    height, width = values.shape
+    if abs(row_shift) >= height or abs(column_shift) >= width:
+        raise ValueError("A label translation must retain overlapping parent pixels.")
+    source_r = slice(max(0, -row_shift), min(height, height - row_shift))
+    source_c = slice(max(0, -column_shift), min(width, width - column_shift))
+    target_r = slice(max(0, row_shift), min(height, height + row_shift))
+    target_c = slice(max(0, column_shift), min(width, width + column_shift))
+    translated = np.full_like(values, fill_label)
+    translated[target_r, target_c] = values[source_r, source_c]
+    retained = np.zeros(values.shape, dtype=bool)
+    retained[source_r, source_c] = True
+    ids, counts = np.unique(values[~retained], return_counts=True)
+    metrics = dict(row_shift=row_shift, column_shift=column_shift, fill_label=fill_label,
+                   source_shape=list(values.shape), source_dtype=values.dtype.str,
+                   clipped_source_pixel_count=int(np.count_nonzero(~retained)),
+                   clipped_source_label_counts={str(int(k)): int(v) for k, v in zip(ids, counts)},
+                   introduced_fill_pixel_count=int(np.count_nonzero(~retained)),
+                   interpolation=False, wrapping=False)
+    return translated, metrics
+
+
+def registration_pixel_shift(*, dx_mm, dy_mm, pixel_size_mm):
+    """Explicit metric-to-integer display-grid conversion, with residuals."""
+    values = (dx_mm, dy_mm, pixel_size_mm)
+    if (any(not isinstance(value, (int, float, np.integer, np.floating))
+            or isinstance(value, (bool, np.bool_)) for value in values)
+            or not all(np.isfinite(value) for value in values) or pixel_size_mm <= 0):
+        raise ValueError("Registration displacement and explicit pixel size must be finite.")
+    row, column = int(round(dy_mm / pixel_size_mm)), int(round(dx_mm / pixel_size_mm))
+    return dict(row_shift=row, column_shift=column, pixel_size_mm=float(pixel_size_mm),
+                candidate_dx_mm=float(dx_mm), candidate_dy_mm=float(dy_mm),
+                represented_dx_mm=column * pixel_size_mm, represented_dy_mm=row * pixel_size_mm,
+                residual_dx_mm=dx_mm - column * pixel_size_mm,
+                residual_dy_mm=dy_mm - row * pixel_size_mm,
+                sign_convention="positive dx right; positive dy down", interpolation=False)
+
+
+def _validate_registered_runs(config, payload, parent, *, run_id=None):
+    """Admit explicit original-Store run rows, not unbound arbitrary overrides."""
+    from .geometry_facies import _darsia_metadata, _effective_run_geometry_choice
+    rows = (config.get("run_geometry") or {}).get("runs") or []
+    overrides = [row for row in rows if _effective_run_geometry_choice(row) == "run_override"]
+    if overrides:
+        old = parent["imported_configuration"]
+        if any(config.get(key) != old.get(key) for key in
+               ("frame", "width_m", "height_m", "frame_binding", "baseline_path")):
+            raise ValueError("Registered runs cannot change their imported frame or photograph bindings.")
+    if run_id is not None:
+        key = str(run_id).strip().casefold()
+        rows = [row for row in rows if str(row.get("run_id") or "").strip().casefold() == key]
+        if len(rows) != 1 or _effective_run_geometry_choice(rows[0]) != "run_override":
+            raise ValueError("The selected run has no explicit registered override.")
+    seen = set()
+    for row in rows:
+        if _effective_run_geometry_choice(row) != "run_override":
+            continue
+        run = str(row.get("run_id") or "").strip().casefold()
+        if not run or run in seen or not all(c.isalnum() or c in "-_" for c in run):
+            raise ValueError("Registered run identifiers must be explicit and unique.")
+        seen.add(run)
+        record = row.get("registration") or {}
+        if (record.get("parent_revision_id") != parent["revision_id"]
+                or record.get("parent_labels") != payload["actual"]["labels"]
+                or record.get("status") not in {"registered", "provisional - Olav to review"}):
+            raise ValueError("A registered run needs its actual imported parent and explicit status.")
+        _verify(record.get("authority"))
+        _verify(record.get("measurement"))
+        actual = _verify(record.get("labels"), row.get("labels_path"))
+        if (Path(actual["path"]).suffix.casefold() != ".npz"
+                or str(row.get("facies_path") or "").strip()):
+            raise ValueError("Registered run facies must be derived canonically from its NPZ labels.")
+        target = _integer_map(actual["path"])
+        metric = record.get("candidate") or {}
+        converted = registration_pixel_shift(dx_mm=metric.get("candidate_dx_mm"),
+            dy_mm=metric.get("candidate_dy_mm"), pixel_size_mm=metric.get("pixel_size_mm"))
+        if (metric != converted or any(record.get(key) != converted[key]
+                                      for key in ("row_shift", "column_shift"))):
+            raise ValueError("Registered candidate metadata disagrees with its integer pixel shift.")
+        expected, metrics = integer_label_translation(payload["labels"], row_shift=record.get("row_shift"),
+            column_shift=record.get("column_shift"), fill_label=record.get("fill_label"))
+        if record.get("metrics") != metrics:
+            raise ValueError("Registered translation metrics disagree with the actual parent pixels.")
+        if target.dtype != expected.dtype or not np.array_equal(target, expected):
+            raise ValueError("Registered labels differ from the explicit integer parent translation.")
+        if _digest(_darsia_metadata(Path(actual["path"]))) != _digest(
+                _darsia_metadata(Path(payload["actual"]["labels"]["path"]))):
+            raise ValueError("Registered labels changed the imported grid metadata.")
+        source = _verify(record.get("source_image"), row.get("source_image_path"))
+        binding = config.get("frame_binding") or {}
+        if binding:
+            fields = ((binding.get("runs") or {}).get(run) or {}).get("fields") or {}
+            declared = fields.get("shape_corrected_baseline") or {}
+            if any(source.get(key) != declared.get(key) for key in ("path", "sha256", "size_bytes")):
+                raise ValueError("Registered run photograph is not its existing bound corrected baseline.")
+
+
+def registered_run_sources(project_root, current, run_id):
+    """Read one genuine saved Store run; no new map, cache, or fallback.
+
+    Store admission still validates all run rows by default. This explicit
+    selected-run read verifies only the selected translation and its sources.
+    """
+    from .geometry_facies import GEOMETRY_REVISION_FORMAT, _canonical_facies, _darsia_metadata, resolve_run_geometry_artifacts
+    root = Path(project_root).resolve()
+    current_path = root / "overrides" / "geometry_facies" / "current.json"
+    if current_path.stat().st_size > 1024 * 1024:
+        raise ValueError("Registered current metadata exceeds 1 MiB.")
+    current_file = descriptor(current_path)
+    saved = json.loads(current_path.read_bytes())
+    revision_id = current.get("revision_id")
+    if (saved != current or current.get("schema") != 1
+            or current.get("format") != GEOMETRY_REVISION_FORMAT
+            or re.fullmatch(r"[0-9a-f]{32}", str(revision_id)) is None):
+        raise ValueError("Registered geometry needs its genuine current Store UUID and record.")
+    revision_path = root / "results" / "geometry" / revision_id / "revision.json"
+    if revision_path.stat().st_size > 1024 * 1024:
+        raise ValueError("Registered revision metadata exceeds 1 MiB.")
+    revision_file = descriptor(revision_path)
+    if json.loads(revision_path.read_bytes()) != current:
+        raise ValueError("Registered current differs from the actual immutable Store revision.")
+    config = current["configuration"]
+    payload = canonical_parent_payload(config, run_id=run_id)
+    run = str(run_id).strip().casefold()
+    row = next(row for row in config["run_geometry"]["runs"]
+               if str(row.get("run_id") or "").strip().casefold() == run)
+    artifacts = resolve_run_geometry_artifacts(current, run)
+    if artifacts.get("scope") != "run_override" or artifacts.get("run_id") != run:
+        raise ValueError("No genuine Store run artifact exists; series fallback is forbidden.")
+    destination = root / "results" / "geometry" / revision_id / "runs" / run
+    files = {}
+    for name, filename in (("labels", "labels.npz"), ("facies", "facies.npz"),
+                           ("facies_properties", "facies_properties.csv")):
+        path = Path(str(artifacts.get(name + "_path") or "")).resolve()
+        if path != destination / filename:
+            raise ValueError("Registered artifacts belong to another Store UUID or run.")
+        files[name] = descriptor(path)
+    labels = _integer_map(files["labels"]["path"])
+    expected = _integer_map(row["registration"]["labels"]["path"])
+    if labels.dtype != np.dtype(np.int32) or not np.array_equal(labels, expected):
+        raise ValueError("Stored registered labels differ numerically from the admitted translation.")
+    if _digest(_darsia_metadata(Path(files["labels"]["path"]))) != _digest(
+            _darsia_metadata(Path(row["registration"]["labels"]["path"]))):
+        raise ValueError("Stored registered labels changed their grid metadata.")
+    run_config = deepcopy(config)
+    run_config["labels_path"] = files["labels"]["path"]
+    expected_facies, _ = _canonical_facies(run_config)
+    facies = _integer_map(files["facies"]["path"])
+    if facies.dtype != np.dtype(np.int32) or not np.array_equal(facies, expected_facies):
+        raise ValueError("Stored registered facies are not the exact canonical label mapping.")
+    if _digest(_darsia_metadata(Path(files["facies"]["path"]))) != _digest(
+            _darsia_metadata(Path(files["labels"]["path"]))):
+        raise ValueError("Stored registered facies changed their grid metadata.")
+    if Path(files["facies_properties"]["path"]).read_bytes() != Path(payload["actual"]["facies_properties"]["path"]).read_bytes():
+        raise ValueError("Stored registered run lost the FULL original properties CSV.")
+    guarded = [current_file, revision_file, config["canonical_import_parent"]["revision"],
+               payload["diagnosis"], *payload["actual"].values(),
+               *[row["registration"][key] for key in ("authority", "measurement", "labels", "source_image")]]
+    result = dict(revision_id=revision_id, run_id=run, current=current_file,
+        revision=revision_file, files=files, labels_shape=list(labels.shape),
+        registration=deepcopy(row["registration"]), guarded_sources=guarded,
+        label_serialization="Original Store int32; exact numeric equality to parent-typed translation",
+        provenance="Fresh observed Store product SHA bound to genuine UUID/record and exact arrays; not historical source SHA")
+    verify_registered_sources(result)
+    return result
+
+
+def verify_registered_sources(binding):
+    """Recheck the exact already-admitted files without decoding them again."""
+    for row in [*binding["guarded_sources"], *binding["files"].values()]:
+        _verify(row)
 
 def require_source_mode_transition(store, config):
     """The simple editor cannot remove the mode and bypass its authority."""

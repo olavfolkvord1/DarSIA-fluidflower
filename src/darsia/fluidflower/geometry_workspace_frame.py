@@ -169,12 +169,30 @@ def load_painting_image(config, reference, *, analysis_width=None, display_limit
         np.ascontiguousarray(display, dtype=np.float32), np.ascontiguousarray(analysis, dtype=np.float32))
 
 
-def saved_boundaries(config, run_id, display_shape):
+def saved_boundaries(config, run_id, display_shape, *, project=None):
     """A transparent view of saved labels; no classification or new labels."""
     import cv2
     import numpy as np
     from .geometry_facies import _load_array, _layer_boundary_mask
     fields = selected_fields(config, run_id)
+    registered_selected = False
+    if config.get("source_mode") == "canonical-from-import":
+        from .geometry_facies import _effective_run_geometry_choice
+        registered_selected = any(str(row.get("run_id") or "").strip().casefold() == str(run_id).strip().casefold()
+            and _effective_run_geometry_choice(row) == "run_override"
+            for row in (config.get("run_geometry") or {}).get("runs") or [])
+    if registered_selected:
+        if project is None:
+            raise ValueError("A registered boundary view needs its actual project/current Store.")
+        from .geometry_facies import GeometryRevisionStore
+        from .geometry_raster_sources import registered_run_sources, verify_registered_sources
+        current = GeometryRevisionStore(project).current()
+        if current.get("configuration") != config:
+            raise ValueError("The boundary view differs from the genuine saved registered revision.")
+        registered = registered_run_sources(project.root, current, run_id)
+        fields = deepcopy(fields)
+        fields["labels"] = {**registered["files"]["labels"], "shape": registered["labels_shape"]}
+        verify_registered_sources(registered)
     labels = _load_array(Path(fields["labels"]["path"]))
     if list(labels.shape) != fields["labels"]["shape"] or not np.issubdtype(labels.dtype, np.integer):
         raise ValueError("Saved corrected labels no longer match their recorded integer grid")

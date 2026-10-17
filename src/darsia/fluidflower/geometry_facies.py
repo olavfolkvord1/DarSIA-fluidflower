@@ -2206,23 +2206,32 @@ class GeometryRevisionStore:
                     array=np.asarray(run_facies, dtype=np.int32),
                     metadata=_darsia_metadata(Path(labels_text or facies_text)),
                 )
-                with (run_root / "facies_properties.csv").open(
-                    "w", encoding="utf-8", newline=""
-                ) as stream:
-                    writer = csv.DictWriter(
-                        stream,
-                        fieldnames=[
-                            "id",
-                            "name",
-                            "porosity",
-                            "permeability",
-                            "permeability_unit",
-                            "analysis_role",
-                            "enabled",
-                        ],
-                    )
-                    writer.writeheader()
-                    writer.writerows(run_properties)
+                if candidate.get("source_mode") == "canonical-from-import":
+                    # The parent FULL CSV is already verified and materialized by
+                    # materialize_source_mode. Keep unused IDs and extra columns.
+                    source_csv = staging / "facies_properties.csv"
+                    target_csv = run_root / "facies_properties.csv"
+                    shutil.copyfile(source_csv, target_csv)
+                    if target_csv.read_bytes() != source_csv.read_bytes():
+                        raise ValueError("Registered run lost its FULL original properties CSV.")
+                else:
+                    with (run_root / "facies_properties.csv").open(
+                        "w", encoding="utf-8", newline=""
+                    ) as stream:
+                        writer = csv.DictWriter(
+                            stream,
+                            fieldnames=[
+                                "id",
+                                "name",
+                                "porosity",
+                                "permeability",
+                                "permeability_unit",
+                                "analysis_role",
+                                "enabled",
+                            ],
+                        )
+                        writer.writeheader()
+                        writer.writerows(run_properties)
                 run_artifacts[run_id] = {
                     "facies_path": str(destination / "runs" / run_id / "facies.npz"),
                     "facies_properties_path": str(

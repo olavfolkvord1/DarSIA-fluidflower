@@ -253,6 +253,9 @@ def _verify_immutable_export_inputs(receipt):
         _verified(item)
     if data.get("common_configuration") is not None:
         _verified(data["common_configuration"])
+    if data.get("registered_geometry") is not None:
+        from .geometry_raster_sources import verify_registered_sources
+        verify_registered_sources(data["registered_geometry"])
 
 
 def _verify_reusable_export(receipt, destination, *, revision, run, display, planned, current_sha, binding=None):
@@ -309,16 +312,26 @@ def require_corrected_export_for_build(paths):
     actual_root, selected, recorded_display, planned = _canonical_location(root.parent.parent.parent, config, revision, run)
     if current.get("revision_id") != revision or not _same(selected, destination) or recorded_display != display:
         raise ValueError("Corrected Build export belongs to another current revision or selected run.")
-    _require_unedited_adoption(current, config)
+    registered = _registered_binding(root.parent.parent.parent, current, config, run)
+    if registered is None:
+        _require_unedited_adoption(current, config)
     _verify_reusable_export(receipt, destination, revision=revision, run=run, display=display,
                             planned=planned, current_sha=hashlib.sha256(current_bytes).hexdigest())
     binding = receipt["binding"]
     saved = config["frame_binding"]["runs"][run]
+    expected_sources = {name: _identity(saved["fields"][name])
+                        for name in ("shape_corrected_baseline", "labels", "facies", "depth")}
+    if registered is not None:
+        expected_sources.update({name: registered["files"][name] for name in ("labels", "facies")})
+        if binding.get("registered_geometry") != registered:
+            raise ValueError("Corrected Build lacks this genuine registered Store binding.")
+    elif "registered_geometry" in binding:
+        raise ValueError("An unedited adoption cannot claim a registered Store binding.")
     if (binding["configuration"] != _identity(saved["configuration"])
             or binding["properties"] != _identity(saved["facies_properties"])
             or binding["configured_depth_source"] != _identity(saved["configured_depth_map"])
             or binding["replacements"] != _replacements(destination)
-            or any(binding["sources"][name] != _identity(saved["fields"][name])
+            or any(binding["sources"][name] != expected_sources[name]
                    for name in ("shape_corrected_baseline", "labels", "facies", "depth"))):
         raise ValueError("Corrected Build export inputs differ from this run's current revision binding.")
     if run != display:
@@ -345,8 +358,18 @@ def require_corrected_export_for_build(paths):
             _verified(common)
         elif not any(_same(path, row["after"]["path"]) for row in completion["configurations"]):
             raise ValueError("The selected run configuration is not an actual completed Apply target.")
+    if registered is not None:
+        from .geometry_raster_sources import verify_registered_sources
+        verify_registered_sources(registered)
     return receipt
 
+
+
+def _registered_binding(project_root, current, config, run):
+    if config.get("source_mode") != "canonical-from-import":
+        return None
+    from .geometry_raster_sources import registered_run_sources
+    return registered_run_sources(project_root, current, run)
 
 def export_corrected_setup(project, *, reference, actor=""):
     """Explicit export only: full identity checks and byte copies, no Build."""
@@ -365,7 +388,9 @@ def export_corrected_setup(project, *, reference, actor=""):
     if not isinstance(revision, str) or len(revision) != 32 or any(c not in "0123456789abcdef" for c in revision):
         raise ValueError("Corrected setup requires the original Store UUID.")
     fields = selected_fields(config, run)
-    _require_unedited_adoption(current, config)
+    registered = _registered_binding(project.root, current, config, run)
+    if registered is None:
+        _require_unedited_adoption(current, config)
     export_root, destination, display, planned = _canonical_location(project.root, config, revision, run)
     current_sha = hashlib.sha256(before).hexdigest()
     existing = json.loads(_small(destination / "export.json")) if destination.exists() else None
@@ -396,6 +421,8 @@ def export_corrected_setup(project, *, reference, actor=""):
     properties = _verified(properties_binding)
     configured_depth_source = _verified(row["configured_depth_map"])
     sources = {name: _verified(fields[name]) for name in ("shape_corrected_baseline", "labels", "facies", "depth")}
+    if registered is not None:
+        sources.update({name: registered["files"][name] for name in ("labels", "facies")})
     import darsia
     baseline = darsia.imread(sources["shape_corrected_baseline"]["path"])
     for name in ("labels", "facies", "depth"):
@@ -409,6 +436,8 @@ def export_corrected_setup(project, *, reference, actor=""):
                    configured_depth_source=configured_depth_source,
                    configured_depth_pointer=depth_pointer, replacements=replacements,
                    **_configuration_bundle(series, run, configuration))
+    if registered is not None:
+        binding["registered_geometry"] = registered
     receipt_path = destination / "export.json"
     if existing is not None:
         receipt = existing
@@ -454,6 +483,9 @@ def export_corrected_setup(project, *, reference, actor=""):
         raise RuntimeError("The workspace revision changed during corrected export.")
     selected_fields(config, run)
     _original_configuration_bytes(configuration, destination, existing)
+    if registered is not None:
+        from .geometry_raster_sources import verify_registered_sources
+        verify_registered_sources(registered)
     os.rename(staging, destination)
     return CorrectedSetupExport(revision, run, destination, text, current_path, before, receipt)
 
@@ -528,14 +560,23 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
         _verify_reference_export(_export_root, revision=export.revision_id, display=display,
                                  planned=planned, current_sha=hashlib.sha256(export.current_bytes).hexdigest(), child=actual_receipt)
     saved = json.loads(export.current_bytes)["configuration"]["frame_binding"]["runs"][export.run_id]
+    registered = _registered_binding(project.root, current, config, export.run_id)
+    expected_sources = {name: _identity(saved["fields"][name])
+                        for name in ("shape_corrected_baseline", "labels", "facies", "depth")}
     binding = export.receipt["binding"]
+    if registered is not None:
+        expected_sources.update({name: registered["files"][name] for name in ("labels", "facies")})
+        if binding.get("registered_geometry") != registered:
+            raise ValueError("Corrected Apply lacks this genuine registered Store binding.")
+    elif "registered_geometry" in binding:
+        raise ValueError("An unedited adoption cannot claim a registered Store binding.")
     if binding["configuration"] != _identity(saved["configuration"]) or binding["properties"] != _identity(saved["facies_properties"]) or binding["configured_depth_source"] != _identity(saved["configured_depth_map"]) or binding["replacements"] != _replacements(export.destination):
         raise ValueError("The corrected export input identities or target paths are not bound to this revision.")
-    if any(binding["sources"][name] != _identity(saved["fields"][name]) for name in ("shape_corrected_baseline", "labels", "facies", "depth")):
+    if any(binding["sources"][name] != expected_sources[name] for name in ("shape_corrected_baseline", "labels", "facies", "depth")):
         raise ValueError("The corrected export field identities differ from this revision.")
     if set(export.receipt["files"]) != EXPORT_FILES:
         raise ValueError("The corrected export must contain exactly its five canonical named files.")
-    for name, source in ((NAMES["labels"], saved["fields"]["labels"]), (NAMES["facies"], saved["fields"]["facies"]), ("facies_properties.csv", saved["facies_properties"])):
+    for name, source in ((NAMES["labels"], expected_sources["labels"]), (NAMES["facies"], expected_sources["facies"]), ("facies_properties.csv", saved["facies_properties"])):
         row = export.receipt["files"][name]
         if not _same(row["path"], export.destination / name) or row["sha256"] != source["sha256"] or row["size_bytes"] != source["size_bytes"]:
             raise ValueError("The corrected export byte copies do not match their revision sources.")
@@ -554,6 +595,9 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
     completed = _apply_completion(export.destination, export.receipt)
     if completed is not None:
         # Pure revalidation/reuse: no new UUID, timestamp, write or replacement.
+        if registered is not None:
+            from .geometry_raster_sources import verify_registered_sources
+            verify_registered_sources(registered)
         return Path(completed["attempt_receipt"]["path"])
     targets = [Path(configuration["path"])]
     paths = manifest.get("paths") or {}
@@ -606,6 +650,9 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
             files[i]["state"] = "applied"
         _verify_export_files(export.receipt, export.destination)
         _verify_immutable_export_inputs(export.receipt)
+        if registered is not None:
+            from .geometry_raster_sources import verify_registered_sources
+            verify_registered_sources(registered)
         if export.run_id != display:
             _verify_reference_export(_export_root, revision=export.revision_id, display=display,
                                      planned=planned, current_sha=hashlib.sha256(export.current_bytes).hexdigest(), child=actual_receipt)
