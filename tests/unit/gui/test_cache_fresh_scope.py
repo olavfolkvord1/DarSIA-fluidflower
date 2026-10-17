@@ -414,20 +414,28 @@ def test_actual_ntfs_unknown_cache_and_unsafe_link_are_separated(tmp_path, extra
     finally:
         api.close(handle)
     namespace = windows.WindowsNamespace(parent_path, identity)
-    tree = namespace.scope(TOKEN, create=True)
-    root_identity = tree.directories[""]
-    assert tree.api.names(tree.handles[""]) == []
-    tree.close()
+    try:
+        tree = namespace.scope(TOKEN, create=True)
+        try:
+            root_identity = tree.directories[""]
+            assert tree.api.names(tree.handles[""]) == []
+        finally:
+            tree.close()
+    finally:
+        namespace.close()
     scope = parent_path / TOKEN
     (scope / "unpredicted-library.cache").write_bytes(b"synthetic cache")
     if extra_hardlink:
         (scope / "unsafe.cache").write_bytes(b"preserve both links")
         os.link(scope / "unsafe.cache", tmp_path / "outside-link.cache")
-    tree = namespace.scope(TOKEN, expected=root_identity)
+    namespace = windows.WindowsNamespace(parent_path, identity)
     try:
-        result = fresh_scope._cleanup_current_fresh_tree(tree, entry_limit=32)
+        tree = namespace.scope(TOKEN, expected=root_identity)
+        try:
+            result = fresh_scope._cleanup_current_fresh_tree(tree, entry_limit=32)
+        finally:
+            tree.close()
     finally:
-        tree.close()
         namespace.close()
     assert not (scope / "unpredicted-library.cache").exists()
     assert result["complete"] is (not extra_hardlink)
