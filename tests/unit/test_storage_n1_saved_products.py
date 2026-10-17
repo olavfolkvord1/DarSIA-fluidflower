@@ -471,10 +471,18 @@ def test_byte_reanchored_synthetic_metadata_control_is_still_readable(tiny_confi
     assert len(value["frames"]) == 2 and value["producer_kind"] == "n1-mass-only"
 
 
+def _replace_synthetic_storage_json(path, value):
+    """Alter existing test-owned metadata without changing the immutable producer."""
+    assert path.is_file()
+    path.write_bytes((json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                                separators=(",", ":")) + "\n").encode())
+    return n1.asset(path)
+
+
 def _reseal_n1_storage_record(record, document, *, extra_files=()):
     """Commit a deliberately altered tiny storage document with valid outer hashes."""
     directory = Path(record["nas_directory"])
-    _json(directory / "storage_completed.json", document)
+    _replace_synthetic_storage_json(directory / "storage_completed.json", document)
     commit = json.loads((directory / "commit.json").read_bytes())
     for name in extra_files:
         commit["files"][name] = dict(kind="operational_receipt")
@@ -483,7 +491,7 @@ def _reseal_n1_storage_record(record, document, *, extra_files=()):
         commit["files"][name] = {key: row[key] for key in ("sha256", "size_bytes")}
         if "kind" in old:
             commit["files"][name]["kind"] = old["kind"]
-    bound = _json(directory / "commit.json", commit)
+    bound = _replace_synthetic_storage_json(directory / "commit.json", commit)
     record["files"] = dict(commit["files"], **{"commit.json": {key: bound[key] for key in ("sha256", "size_bytes")}})
     for name, row in record["files"].items():
         actual = n1.asset(directory / name)
@@ -511,7 +519,7 @@ def test_committed_N1_storage_cannot_be_hidden_from_document_inventory(tiny_conf
         other = payload.RECEIPT if omitted == "archive" else payload.ARCHIVE
         commit = json.loads((directory / "commit.json").read_bytes())
         del commit["files"][other]
-        _json(directory / "commit.json", commit)
+        _replace_synthetic_storage_json(directory / "commit.json", commit)
     _reseal_n1_storage_record(record, document, extra_files=("storage_undeclared.json",) if omitted == "unknown" else ())
     manifest = json.loads(Path(completed["manifest"]["path"]).read_bytes())
     reads = []
