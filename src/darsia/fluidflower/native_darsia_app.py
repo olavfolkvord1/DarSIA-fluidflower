@@ -690,12 +690,26 @@ def run_configurations(root: str | Path) -> list[tuple[str, Path | None, str]]:
     paths = manifest.get("paths") or {}
     runs = manifest.get("runs") or {}
     files = runs.get("config_files") or {}
+    merged_files = runs.get("merged_files") or {}
     merged_folder = root / str(paths.get("merged_configs", "config/merged"))
     common = root / str(paths.get("common_config", "config/common.toml"))
     run_folder = str(paths.get("run_configs", "config/runs"))
     common_has_settings: bool | None = None
     choices: list[tuple[str, Path | None, str]] = []
     for run in [str(value) for value in runs.get("ids") or []]:
+        if run in merged_files:
+            name = merged_files[run]
+            if not isinstance(name, str) or not name.strip():
+                choices.append((run, None, "Registered merged configuration path is invalid"))
+                continue
+            merged = Path(name)
+            if not merged.is_absolute():
+                merged = root / merged
+            if merged.is_file():
+                choices.append((run, merged, "Registered merged configuration (common and run settings)"))
+            else:
+                choices.append((run, None, f"{name} does not exist"))
+            continue
         merged = merged_folder / f"{run}.toml"
         if merged.is_file():
             choices.append(
