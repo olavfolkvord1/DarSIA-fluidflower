@@ -1,0 +1,437 @@
+"""Explicit stdlib-only admission before DarSIA/Numba/Qt imports.
+
+Prepared only. No default quota, path, profile, cleanup or launcher. This module
+can reserve/attach an import-scope lease; it never calls an exit 'retirement'.
+Its own imports precede admission. Updating the current bytecode prefix below
+routes later imports only; it does not retroactively cover startup/bootstrap
+bytecode or an independent child's initially inherited GUI prefix.
+"""
+from __future__ import annotations
+import atexit
+import ctypes
+from ctypes import wintypes
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tomllib
+from types import SimpleNamespace
+import uuid
+
+from .policy import CachePolicyError, cache_settings, nonnegative, _descriptor
+from .windows import WindowsNamespace, _parts
+from .control import CacheBudgetLedger, _encoded
+from .capacity import _capacity_host_context, read_bound, volume_info
+from .environment import derive_cache_environment
+
+_LEASE = None
+POLICY_ENV = "DARSIA_CACHE_POLICY"
+RECEIPT_ENV = "DARSIA_CACHE_BOOTSTRAP_RECEIPT"
+EXPECTED_STORES_ENV = "DARSIA_CACHE_BOOTSTRAP_EXPECTED_STORES"
+
+
+def _utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _outside(path, package_file):
+    path = Path(path).expanduser()
+    if not path.is_absolute() or str(path).startswith("\\\\"):
+        raise CachePolicyError("Explicit outside-repository local cache metadata required")
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or getattr(before,"st_reparse_tag",0) or getattr(before,"st_file_attributes",0)&0x400:
+        raise CachePolicyError("Cache metadata reparse/nonregular file refused")
+    resolved=path.resolve(strict=True)
+    if str(resolved).startswith("\\\\") or os.path.normcase(str(resolved))!=os.path.normcase(os.path.abspath(path)):
+        raise CachePolicyError("Cache metadata aliases/reparse parents are not admitted implicitly")
+    path=resolved
+    roots = [Path(package_file).resolve().parent.parent]
+    roots += [p for p in Path(package_file).resolve().parents if (p/".git").exists()]
+    if any(path.is_relative_to(root) for root in roots):
+        raise CachePolicyError("Cache policy/receipt must be outside repository/package")
+    return path
+
+
+def _explicit_document(path, package_file):
+    path = _outside(path, package_file)
+    before = path.stat()
+    if not 0 < before.st_size <= 1024**2:
+        raise CachePolicyError("Explicit stores/policy metadata exceeds one MiB")
+    raw = path.read_bytes(); after = path.stat()
+    if before != after or len(raw) != before.st_size:
+        raise CachePolicyError("Explicit stores/cache policy changed while reading")
+    descriptor = dict(path=str(path),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+    return tomllib.loads(raw.decode("utf-8-sig")), descriptor
+
+
+def _exact(binding, package_file):
+    _outside(binding["path"],package_file)
+    return read_bound(binding)[0]
+
+
+def _python_module_invocation():
+    # Parse only interpreter options before the entry. A later script/module
+    # argument spelled '-m pytest' must never reclassify the actual entry.
+    argv=list(getattr(sys,"orig_argv",sys.argv));i=1
+    flags={"-b","-bb","-B","-d","-E","-h","-i","-I","-O","-OO","-P",
+           "-q","-R","-s","-S","-u","-v","-vv","-V","-x"}
+    while i<len(argv):
+        value=argv[i]
+        if value=="-m":
+            return (argv[i+1],argv[i+2:]) if i+1<len(argv) else None
+        if value in {"-c","--","-"} or not value.startswith("-"):
+            return None
+        if value in {"-X","-W","--check-hash-based-pycs"}:
+            if i+1>=len(argv):return None
+            i+=2
+        elif value in flags or value.startswith(("-X","-W")):
+            i+=1
+        else:
+            return None  # Unsupported interpreter form is not silently tests.
+    return None
+
+
+def _worker_arguments():
+    entry=_python_module_invocation()
+    return entry[1] if entry and entry[0]=="darsia.fluidflower.worker" else None
+
+
+def _stores_argument():
+    tail=_worker_arguments()
+    if tail is None:
+        return None
+    values=[]
+    for i,value in enumerate(tail):
+        if value=="--":break
+        if value=="--stores":
+            if i+1==len(tail) or tail[i+1].startswith("--"):
+                raise CachePolicyError("Worker --stores requires its original explicit path")
+            values.append(tail[i+1])
+        elif value.startswith("--stores="):
+            values.append(value.split("=",1)[1])
+    if len(values)>1 or (values and not values[0]):
+        raise CachePolicyError("Direct worker accepts one nonempty --stores cache policy before imports")
+    return values[0] if values else None
+
+
+def _default_store_map_path():
+    # Same locator as fluidflower.store_map.default_store_map_path, without
+    # importing darsia or probing/creating any cache root.
+    if os.name=="nt":
+        base=os.environ.get("LOCALAPPDATA")
+        return Path(base)/"DarSIA"/"stores.toml" if base else None
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home()/".config"))/"darsia"/"stores.toml"
+
+
+def _entry_kind():
+    if _worker_arguments() is not None:
+        return "worker"
+    argv=list(getattr(sys,"orig_argv",sys.argv))
+    entry=_python_module_invocation()
+    if entry and entry[0]=="pytest":
+        return "tests"
+    if any(Path(x).name.casefold() in {"pytest","pytest.exe","pytest-script.py","py.test","py.test.exe"}
+           for x in argv[:2]):
+        raise CachePolicyError("Managed pytest console entry is unqualified; exact -m pytest is required")
+    return "runtime"
+
+
+def select_entry_role(document, *, entry_kind, role_identifier=None):
+    policy=cache_settings(document,required=True)  # Pure validation before allocation.
+    boot=document.get("cache_bootstrap")
+    keys={"entry_roles","roles","namespace_admission","accounting_entry_limit"}
+    if not isinstance(boot,dict) or set(boot)!=keys:
+        raise CachePolicyError("Explicit entry roles/profiles/namespace/accounting bound required")
+    entries,roles=boot["entry_roles"],boot["roles"]
+    if (not isinstance(entries,dict) or set(entries)!={"runtime","worker","tests"}
+            or not isinstance(roles,dict) or not roles):
+        raise CachePolicyError("Configure runtime, worker and tests roles explicitly")
+    for key,value in roles.items():
+        if (not isinstance(key,str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}",key) is None
+                or not isinstance(value,dict) or set(value)!={"purpose","profile"}
+                or value["purpose"] not in {"jobs","gates","tests","display","logs"}):
+            raise CachePolicyError("Invalid explicit cache role")
+        _descriptor(value["profile"])
+        if value["purpose"] not in policy.profiles:
+            raise CachePolicyError("Every cache role purpose needs its explicit cache.profiles binding")
+    if any(not isinstance(value,str) or value not in roles for value in entries.values()):
+        raise CachePolicyError("Every entry must name an explicitly configured role")
+    if entry_kind not in entries:
+        raise CachePolicyError("Unknown cache entry kind")
+    selected=entries[entry_kind]
+    if role_identifier is not None and role_identifier!=selected:
+        raise CachePolicyError("Inherited role differs from original entry mapping")
+    role=roles[selected]
+    if ((entry_kind=="worker" and role["purpose"]!="jobs")
+            or (entry_kind=="tests" and role["purpose"]!="tests")):
+        raise CachePolicyError("Worker/tests role purpose differs from its explicit entry")
+    return dict(role_identifier=selected,entry_kind=entry_kind,
+                purpose=role["purpose"],profile=_descriptor(role["profile"]))
+
+
+def _owner():
+    if os.name!="nt":
+        raise CachePolicyError("Prepared cache bootstrap currently supports Windows local NTFS only")
+    kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+    kernel.GetCurrentProcess.restype=wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes=[wintypes.HANDLE,*([ctypes.POINTER(wintypes.FILETIME)]*4)]
+    kernel.GetProcessTimes.restype=wintypes.BOOL
+    times=[wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(kernel.GetCurrentProcess(),*[ctypes.byref(t) for t in times]):
+        raise ctypes.WinError(ctypes.get_last_error())
+    creation=(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
+    context=_capacity_host_context()
+    return dict(machine=context["host"],pid=os.getpid(),parent_pid=os.getppid(),
+        process_create_time=str((creation-116444736000000000)/10000000),
+        creation_filetime_100ns=str(creation),argv=list(sys.argv)),context
+
+
+class ImportLease:
+    """Active compatible pins, persistent reservation and actual owner records.
+
+    No automatic adoption of external files and no cleanup on atexit. A later
+    observer must prove all actual registered/declared writers retired.
+    """
+    def __init__(self,document,source,package_file,*,entry_kind,role_identifier=None):
+        self.package_file=package_file;self.document=document;self.source=source
+        self.policy=cache_settings(document,required=True)
+        role=select_entry_role(document,entry_kind=entry_kind,role_identifier=role_identifier)
+        boot=document["cache_bootstrap"]
+        self.role_identifier,self.entry_kind=role["role_identifier"],role["entry_kind"]
+        self.purpose,self.profile_binding=role["purpose"],role["profile"]
+        self.entry_limit=nonnegative(boot["accounting_entry_limit"],"Accounting entry limit")
+        if not self.entry_limit:raise CachePolicyError("Positive explicit accounting limit required")
+        self.profile=_exact(self.profile_binding,package_file)
+        if (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
+                or self.profile.get("role_identifier")!=self.role_identifier
+                or self.profile.get("entry_kind")!=self.entry_kind
+                or self.profile.get("writer_contract")!="cooperative-start-admission-v1"):
+            raise CachePolicyError("An applicable explicit import/service cache profile is required")
+        self.maximum=nonnegative(self.profile["maximum_cache_bytes"],"Import maximum cache bytes")
+        complete=_exact(self.profile["completion"],package_file)
+        if not self.maximum or complete.get("complete") is not True or complete.get("passed") is not True:
+            raise CachePolicyError("Accepted completed source-bound import cache profile required")
+        # No optional numerical/runtime identity or guessed extension of a profile.
+        executable=Path(sys.executable).resolve()
+        bound=self.profile["python_executable"]
+        if executable!=Path(bound["path"]).resolve() or hashlib.sha256(executable.read_bytes()).hexdigest()!=bound["sha256"] or executable.stat().st_size!=bound["size_bytes"]:
+            raise CachePolicyError("Import profile interpreter identity differs")
+        for bound in self.profile["module_closure"]:
+            path=Path(bound["path"]).resolve();raw=path.read_bytes()
+            if len(raw)!=bound["size_bytes"] or hashlib.sha256(raw).hexdigest()!=bound["sha256"]:
+                raise CachePolicyError("Import profile operational/source closure differs")
+        self.admission=_exact(boot["namespace_admission"],package_file)
+        self.owner,self.context=_owner();self.pins=[];self.receipt=None
+        self.ledger=CacheBudgetLedger(self.policy,SimpleNamespace(**self.context),
+            measurement_provider=self.measure,namespace_admission=self.admission,
+            verify_host_admission=self._host_binding)
+
+    def _host_binding(self,admitted,actual):
+        return (admitted.get("host")==actual["host"]
+            and actual["service_account_sid"] in admitted.get("authorized_sids",[])
+            and Path(admitted["host_ledger"]["path"])==Path(actual["common_root"]))
+
+    def measure(self,root):
+        """Filename/lstat + pinned identity accounting, no cache payload reads."""
+        if str(root)!=self.policy.root:raise CachePolicyError("Different configured cache root")
+        rootpath=Path(root);tokens={};sizes={};control=self.ledger.control
+        for name in control.names():
+            if re.fullmatch(r"cache-r-[0-9a-f]{32}\.json",name):sizes[name[8:-5]]=0
+            if re.fullmatch(r"cache-s-[0-9a-f]{32}\.json",name):
+                raw,_=control.read_once(name);row=json.loads(raw)
+                relative=Path(row["root"]).relative_to(rootpath)
+                if relative in tokens:raise CachePolicyError("Overlapping bound cache scopes")
+                tokens[relative]=row["token"]
+        entries=0;total=0
+        with_namespace=WindowsNamespace(rootpath,self.admission["cache_identity"])
+        def walk(handle,relative):
+            nonlocal entries,total
+            for name in with_namespace.api.names(handle):
+                entries+=1
+                if entries>self.entry_limit:raise CachePolicyError("Explicit accounting limit exceeded; no admission")
+                rel=relative/name;st=(rootpath/rel).lstat()
+                if getattr(st,"st_reparse_tag",0) or getattr(st,"st_file_attributes",0)&0x400:
+                    raise CachePolicyError("Reparse cache entry preserved; no accounting traversal")
+                directory=stat.S_ISDIR(st.st_mode)
+                if directory:
+                    child,identity=with_namespace.api.child(handle,name,directory=True)
+                    try:walk(child,rel)
+                    finally:with_namespace.api.close(child)
+                else:
+                    # Accounting does not open active payload files with the
+                    # exclusive immutable-reader API. It takes lstat lengths;
+                    # original remaining reservations still cover active scopes.
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1:
+                        raise CachePolicyError("Unqualified cache file type/link accounting")
+                    total+=st.st_size
+                    matches=[token for scope,token in tokens.items() if rel.is_relative_to(scope)]
+                    if len(matches)>1:raise CachePolicyError("Overlapping bound scope accounting")
+                    if matches:sizes[matches[0]]+=st.st_size
+        try:walk(with_namespace.handle,Path())
+        finally:with_namespace.close()
+        return dict(root=self.policy.root,fresh=True,root_identity=self.admission["cache_identity"],
+            no_reparse_traversal=True,active_scope_bytes=sizes,logical_bytes=total,
+            free_bytes=volume_info(root)["free_bytes"],measured_utc=_utc(),eligible_reclaimable_bytes=0)
+
+    def _record(self,name,document):
+        control=WindowsNamespace(self.admission["receipts"]["path"],self.admission["receipts"]["identity"])
+        raw=_encoded(document)
+        try:control.write_once(name,raw)
+        finally:control.close()
+        return dict(path=str(Path(self.admission["receipts"]["path"])/name),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+
+    def start(self):
+        token=uuid.uuid4().hex
+        container=self.policy.purpose(self.purpose)/("current" if self.purpose=="tests" else "")
+        bound=self.admission["purposes"][self.purpose]
+        if Path(bound["path"])!=container:raise CachePolicyError("Admitted purpose differs from explicit policy")
+        parent=tree=None
+        with self.ledger.locked():
+            self.reservation=self.ledger.reserve(token,self.owner,self.maximum)
+            self._record(token+".import-intent.json",dict(owner=self.owner,reservation=self.reservation,
+                policy=self.source,profile=self.profile_binding,maximum_bytes=self.maximum))
+            try:
+                parent=WindowsNamespace(bound["path"],bound["identity"])
+                tree=parent.scope(token,create=True)
+                for name in ("tmp","numba","matplotlib","pycache","display"):
+                    tree._parent(tuple(_parts(name)))  # Validated directory components; no phantom file.
+                self.directories=dict(tree.directories);self.root=container/token
+                manifest=dict(format="darsia-cache-external-import-scope-v1",token=token,owner=self.owner,
+                    purpose=self.purpose,role_identifier=self.role_identifier,entry_kind=self.entry_kind,
+                    root=str(self.root),root_identity=self.directories[""],
+                    reservation=self.reservation,maximum_bytes=self.maximum,external_writer_file_ownership_not_yet_frozen=True)
+                self.ledger.require_unbound_scope(token)
+                self.ledger.control.write_once("cache-s-"+token+".json",_encoded(manifest))
+            finally:
+                if tree is not None:tree.close()
+                if parent is not None:parent.close()
+        self.manifest=manifest
+        # Reopen original IDs BEFORE enabling imports or any external writer.
+        self._pin()
+        receipt=dict(format="darsia-cache-import-service-receipt-v1",utc=_utc(),policy=self.source,
+            role_identifier=self.role_identifier,entry_kind=self.entry_kind,
+            namespace=self.document["cache_bootstrap"]["namespace_admission"],
+            profile=self.profile_binding,manifest=manifest,directories=self.directories)
+        self.receipt=self._record(token+".import-service.json",receipt)
+        self.attach_owner()
+
+    def attach(self,receipt):
+        if receipt.get("format")!="darsia-cache-import-service-receipt-v1" or receipt["policy"]!=self.source:
+            raise CachePolicyError("Inherited import receipt policy differs")
+        if (receipt["namespace"]!=self.document["cache_bootstrap"]["namespace_admission"]
+                or receipt["profile"]!=self.profile_binding
+                or receipt.get("role_identifier")!=self.role_identifier
+                or receipt.get("entry_kind")!=self.entry_kind):
+            raise CachePolicyError("Inherited namespace/profile/role differs")
+        manifest=receipt["manifest"];self.root=Path(manifest["root"]);self.reservation=manifest["reservation"]
+        self.manifest=manifest
+        self.directories=receipt["directories"]
+        expected=self.policy.purpose(self.purpose)/("current" if self.purpose=="tests" else "")/self.reservation["token"]
+        if (self.root!=expected or manifest["maximum_bytes"]!=self.maximum
+                or manifest.get("role_identifier")!=self.role_identifier
+                or manifest.get("entry_kind")!=self.entry_kind
+                or manifest.get("purpose")!=self.purpose):
+            raise CachePolicyError("Inherited scope/role differs from original reservation")
+        with self.ledger.locked():
+            self.ledger.require_reservation(self.reservation,manifest["owner"],self.maximum)
+            raw,_=self.ledger.control.read_once("cache-s-"+self.reservation["token"]+".json")
+            if json.loads(raw)!=manifest:raise CachePolicyError("Inherited scope manifest differs")
+        self._pin();self.attach_owner()
+
+    def _pin(self):
+        try:
+            for relative,identity in self.directories.items():
+                if relative:_parts(relative)
+                self.pins.append(WindowsNamespace(self.root/relative,identity))
+        except BaseException:
+            self.close_pins();raise
+
+    def attach_owner(self):
+        from .service_lifecycle import ServiceLifecycle
+        ServiceLifecycle(self).register_owner()  # Atomic with the original-token seal.
+        token=self.reservation["token"]
+        self._record(token+".attach-"+str(self.owner["pid"])+"-"+self.owner["creation_filetime_100ns"]+".json",
+            dict(utc=_utc(),owner=self.owner,reservation=self.reservation,policy=self.source,
+                 registration_is_not_retirement=True,non_DarSIA_or_remote_children_not_implicitly_covered=True))
+
+    def close_pins(self):
+        errors=[]
+        while self.pins:
+            try:self.pins.pop().close()
+            except BaseException as error:errors.append(str(error))
+        if errors:raise CachePolicyError("Active pin close incomplete: "+repr(errors))
+
+    def exit_intent(self):
+        try:
+            self._record(self.reservation["token"]+".exit-intent-"+str(self.owner["pid"])+"-"+self.owner["creation_filetime_100ns"]+".json",
+                dict(utc=_utc(),owner=self.owner,reservation=self.reservation,actual_OS_retirement_not_proven=True))
+        finally:self.close_pins()
+        # No reservation close, adoption of arbitrary generated files or cleanup.
+
+
+def before_darsia_import(*,package_file):
+    global _LEASE
+    if _LEASE is not None:return _LEASE
+    worker=_worker_arguments() is not None
+    direct=_stores_argument();inherited=os.environ.get(RECEIPT_ENV)
+    if POLICY_ENV in os.environ and not os.environ[POLICY_ENV]:
+        raise CachePolicyError("Explicit cache policy environment path must be nonempty")
+    binding=json.loads(inherited) if inherited is not None else None
+    receipt=_exact(binding,package_file) if inherited is not None else None
+    policy_path=direct or (receipt["policy"]["path"] if receipt else os.environ.get(POLICY_ENV))
+    if policy_path:
+        # Explicit worker/policy/receipt requests never fall back to unmanaged.
+        document,source=_explicit_document(policy_path,package_file)
+    else:
+        policy_path=_default_store_map_path()
+        if policy_path is None:
+            if worker:raise CachePolicyError("Worker requires one configured external stores cache policy before imports")
+            return None
+        try:
+            document,source=_explicit_document(policy_path,package_file)
+        except FileNotFoundError:
+            if worker:raise CachePolicyError("Worker requires one configured external stores cache policy before imports")
+            return None
+        if "cache" not in document and "cache_bootstrap" not in document:
+            if worker:raise CachePolicyError("Worker stores needs its complete managed cache policy before imports")
+            return None
+    if receipt and source!=receipt["policy"]:raise CachePolicyError("Explicit stores differs from inherited cache policy")
+    if not inherited and any(name in sys.modules for name in ("numba","matplotlib")):
+        raise CachePolicyError("Cache producer already imported without a pre-reserved receipt; no retroactive bootstrap claim")
+    if EXPECTED_STORES_ENV in os.environ:
+        expected=json.loads(os.environ[EXPECTED_STORES_ENV])
+        if not isinstance(expected,dict) or expected!=source:
+            raise CachePolicyError("Selected/default stores identity changed before child bootstrap")
+    entry_kind=receipt["entry_kind"] if receipt else _entry_kind()
+    role_identifier=receipt["role_identifier"] if receipt else None
+    lease=ImportLease(document,source,package_file,entry_kind=entry_kind,role_identifier=role_identifier)
+    try:
+        if receipt:
+            lease.receipt=binding;lease.attach(receipt)
+        else:lease.start()
+        environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
+            scope_root=lease.root,parent_environment=os.environ)
+        environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))
+        for key in ("TEMP","TMP","TMPDIR","NUMBA_CACHE_DIR","NUMBA_CACHE_LOCATOR_CLASSES","MPLCONFIGDIR",
+                    "PYTHONPYCACHEPREFIX","DARSIA_FLUIDFLOWER_CACHE","DARSIA_PHASE_DISPLAY_CACHE",RECEIPT_ENV):
+            os.environ[key]=environment[key]
+        # CPython uses this live attribute, not a later environment assignment.
+        # Startup and the imports needed to reach this line are not covered.
+        sys.pycache_prefix=environment["PYTHONPYCACHEPREFIX"]
+        # This also covers already-imported stdlib tempfile in a legacy parent.
+        import tempfile
+        tempfile.tempdir=None
+        _LEASE=lease;atexit.register(lease.exit_intent)
+        return lease
+    except BaseException:
+        lease.close_pins()  # Persist reservation and every partial; no blind rollback.
+        raise
+
+
+def current_import_lease():
+    if _LEASE is None:raise CachePolicyError("No pre-import reservation attached")
+    return _LEASE

@@ -206,6 +206,8 @@ def parse_store_map(raw, *, source=None):
             raise StoreMapError("Each store needs explicit series and results roots")
         stores[key] = roots
     capacity_settings(doc)
+    from darsia_cache.policy import cache_settings
+    cache_settings(doc)  # Pure optional parse; missing managed policy refuses at claim.
     return StoreMap(machine["id"], stores,
         {**dict(source or {}), "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, doc)
 

@@ -71,19 +71,39 @@ def two_phase_overlay_path(source: Path, phase: str = "all", *, cache_root: Path
     """Return a versioned local display copy; the original remains read-only."""
     if phase not in {"all", "gas", "aqueous", "mixed"}:
         raise ValueError(f"Unknown phase display layer: {phase}")
+    from darsia_cache.adapters import optional_import_lease, managed_display_png, reusable_display_png
+    from darsia_cache.policy import CachePolicyError
+    managed=optional_import_lease()
+    if managed is not None and cache_root is not None:
+        if Path(cache_root).expanduser().resolve()!=(managed.root/"display").resolve():
+            raise CachePolicyError("Explicit display cache is outside the admitted service scope")
     source = Path(source).resolve()
     stat = source.stat()
     signature = f"{PHASE_DISPLAY_POLICY}:{source}:{stat.st_size}:{stat.st_mtime_ns}"
     key = hashlib.sha256(signature.encode("utf-8")).hexdigest()
-    folder = (cache_root or phase_display_cache_root()) / key
-    target = folder / f"{phase}.png"
-    if target.is_file():
-        return target
+    logical_gate=f"phase-display:{key}:{phase}"
+    if managed is not None:
+        existing=reusable_display_png(logical_gate=logical_gate)
+        if existing is not None:return existing
+    if managed is None:
+        folder = (cache_root or phase_display_cache_root()) / key
+        target = folder / f"{phase}.png"
+        if target.is_file():
+            return target
     data = source.read_bytes()
     if (source.stat().st_size, source.stat().st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
         raise RuntimeError(f"Phase map changed while loading: {source}")
     with Image.open(io.BytesIO(data)) as image:
         rgba = two_phase_rgba(np.asarray(image.convert("RGBA")), phase)
+    if managed is not None:
+        encoded=io.BytesIO()
+        Image.fromarray(rgba).save(encoded,format="PNG",compress_level=1)
+        return managed_display_png(encoded.getvalue(),{
+            "display_policy": PHASE_DISPLAY_POLICY,
+            "source": str(source), "source_sha256": hashlib.sha256(data).hexdigest(),
+            "co2_threshold": 0.5, "gas_threshold": 0.6,
+            "legacy_amber_display": "aqueous", "model_scores_changed": False,
+        },logical_gate=logical_gate)
     folder.mkdir(parents=True, exist_ok=True)
     temporary = folder / f".{phase}.{uuid.uuid4().hex}.png"
     try:

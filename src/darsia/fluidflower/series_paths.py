@@ -234,8 +234,9 @@ def local_cache_root() -> Path:
             root = registry_parent / root
     else:
         root = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache")) / "DarSIA" / "cache"
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    # Configuration/path resolution does not allocate. A named admitted writer
+    # owns allocation; importing a module's default paths must never mkdir.
+    return root.absolute()
 
 
 def package_root() -> Path:

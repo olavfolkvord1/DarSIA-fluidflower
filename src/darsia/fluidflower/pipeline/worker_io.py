@@ -30,12 +30,16 @@ class WorkerRunIO:
             raise RunUnavailable("Store-map machine differs from the actual worker service")
         self.root,self.job,self.stores=Path(job_root),deepcopy(job),stores
         self.service_id,self.commit=service_id,commit
+        self.backend=backend
+        self.repository=Path(__file__).resolve().parents[4]
         self.bindings,self.factories={},{}
         self.capacities={}
         self.capacity_refusals={}
         from .capacity import remote_results_owner
         self.remote_results_scope=remote_results_owner(stores,job["series_id"],stores.roots(job["series_id"])["results"])
         self.publications=_PublicationRouter(self)
+        from darsia_cache.worker_adapter import WorkerCacheAdapter
+        self.cache_adapter=WorkerCacheAdapter(self)
 
     def capacity_claim(self,owner,on_refusal=None):
         from .capacity import ClaimCapacity
@@ -98,10 +102,12 @@ class WorkerRunIO:
         return self.factories[claim.token]
 
     def capacity_close(self,claim):
-        capacity=self.capacities.pop(claim.token,None)
+        self.cache_adapter.close_claim(claim)
+        capacity=self.capacities.get(claim.token)
         if capacity is not None:
             ledger,reservation,owner=capacity
             ledger.release(reservation,owner)
+            self.capacities.pop(claim.token)
 
     def release(self,claim):
         self.capacity_close(claim)

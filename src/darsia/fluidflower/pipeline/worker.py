@@ -230,6 +230,8 @@ def _run_tasks(
         shared = JobQueue(Path(root), on_error=queue_error, machine_id=machine)
     excluded_runs=set()
     owner = _identity(machine)
+    from darsia_cache.adapters import bind_actual_worker_owner
+    bind_actual_worker_owner(owner,slot=worker_slot,generation=worker_generation,role="slot")
     while not stop.is_set():
         try:
             _job_control_boundary(root)
@@ -549,6 +551,10 @@ def main(argv=None):
                 job, commit = verify_startup(args.job,stores_path=args.stores,
                     machine_id=args.machine,startup_context=startup_context)
                 args._alias_stores=startup_context.get("stores")
+                from darsia_cache.adapters import bind_actual_worker_owner, require_same_startup_stores
+                if args._alias_stores is not None:
+                    require_same_startup_stores(args._alias_stores)
+                bind_actual_worker_owner(_identity(identity),role="service_parent")
                 emit(log, dict(kind="startup_code_admission",
                     environment_lock=startup_context["environment_lock_identity"]))
             except Exception:
@@ -671,6 +677,8 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
             getattr(args,"_alias_stores",None),
         ),
     )
+    from darsia_cache.adapters import record_cache_observation
+    record_cache_observation("worker_spawn_intent",dict(slot=number,generation=generation))
     process.start()
     import psutil
 
@@ -678,7 +686,7 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
         bound = _process_identity(psutil.Process(process.pid))
     except psutil.NoSuchProcess:
         bound = None  # A completed launch has no invented create_time.
-    return dict(
+    slot = dict(
         number=number,
         generation=generation,
         process=process,
@@ -689,7 +697,23 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
         retired=False,
         waiting_reclaim=False,
         finished=False,
+        cache_observation_error=None,
     )
+    try:
+        record_cache_observation("worker_spawn_observed",dict(slot=number,generation=generation,
+            original_native_identity=bound,epoch_unavailable=bound is None))
+    except Exception as error:
+        # This supplementary record must not discard the already-owned child.
+        # Its mandatory native prelude attachment remains unchanged.
+        slot["cache_observation_error"]=dict(exception_type=type(error).__name__,
+            message=str(error),observation_complete=False)
+        try:
+            import logging
+            logging.getLogger(__name__).error("Cache spawn observation incomplete: %s",
+                slot["cache_observation_error"],exc_info=True)
+        except BaseException:
+            slot["cache_observation_error"]["logging_failed"]=True
+    return slot
 
 
 def _record_retirement(slot, args, identity):
@@ -739,6 +763,11 @@ def _record_retirement(slot, args, identity):
         if claim["task"].get("format")=="darsia-alias-task-v1":
             from .capacity import release_retired_capacity
             release_retired_capacity(args.job,claim["task"],stores,document)
+    from darsia_cache.adapters import record_cache_observation
+    record_cache_observation("worker_children_retired",dict(slot=slot["number"],
+        generation=slot["generation"],original_child_identities=identities,
+        owned_launch_handle_retired=not slot["process"].is_alive(),
+        service_parent_retirement_proven=False))
     slot["retired"] = True
     return identities
 

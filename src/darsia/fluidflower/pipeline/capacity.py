@@ -780,15 +780,21 @@ class CapacityLedger:
         return False
 
     @contextmanager
-    def locked(self):
-        # Default POSIX context refuses. Synthetic injected contexts may use
-        # the same existing flock primitive in their owned common temp folder.
-        if os.name!="nt":self.common_root.mkdir(parents=True,exist_ok=True)
-        # The configured ledger is never created before its binding is checked.
+    def locked(self, *, create=True):
+        # Existing admission keeps its original create path. Read-only J6 never
+        # initializes a root, binding, identity or POSIX lock file.
+        if not create:
+            if not all(path.is_dir() for path in (self.common_root, self.directory, self.root)):
+                raise RunUnavailable("Read-only projection needs the existing result ledger")
+            if os.name != "nt" and not (self.common_root / ("mutex-" + self.key)).is_file():
+                raise RunUnavailable("Read-only projection has no existing local mutex file")
+        if os.name!="nt" and create:self.common_root.mkdir(parents=True,exist_ok=True)
         with _LocalVolumeLock(self.common_root,self.key):
-            self._common_binding(create=True)
-            self.directory.mkdir(parents=True,exist_ok=True)
-            self.root.mkdir(exist_ok=True)
+            if not self._common_binding(create=create):
+                raise RunUnavailable("Read-only projection needs the existing result binding")
+            if create:
+                self.directory.mkdir(parents=True,exist_ok=True)
+                self.root.mkdir(exist_ok=True)
             marker=dict(format="darsia-local-capacity-volume-v2",physical_host=self.host,
                 service_account_sid=self.account,volume_id=self.volume["volume_id"],
                 state_directory=str(self.directory),host_binding=str(self.binding_path))
@@ -800,8 +806,10 @@ class CapacityLedger:
             if path.exists():
                 if _read_local(path)!=marker:
                     raise RunUnavailable("Capacity directory/host/account/volume identity differs")
-            else:
+            elif create:
                 write_immutable(path,marker)
+            else:
+                raise RunUnavailable("Read-only projection needs the existing result identity")
             yield self
 
     def _mapped_target(self, drive):
@@ -982,20 +990,27 @@ class ClaimCapacity:
     def __init__(self, runtime, owner, on_refusal=None):
         self.runtime, self.owner, self.on_refusal = runtime, _owner(owner), on_refusal
         self.ledger = self.lock = self.error = None
+        self.cache = None
         self.estimates = {}
 
     def __enter__(self):
         try:
             root = self.runtime.stores.roots(self.runtime.job["series_id"])["results"]
             self.ledger = CapacityLedger(self.runtime.stores, self.runtime.job["series_id"], root)
+            from darsia_cache.control import ClaimCacheBudget
+            self.cache = ClaimCacheBudget(self.runtime, self.ledger, self.owner)
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.error = "Capacity admission unavailable: " + str(error)
         return self
 
     def _unlock(self):
-        if self.lock is not None:
-            active,self.lock=self.lock,None
-            active.__exit__(None,None,None)
+        try:
+            if self.cache is not None:
+                self.cache.unlock()  # Reverse of result-volume -> cache acquisition.
+        finally:
+            if self.lock is not None:
+                active,self.lock=self.lock,None
+                active.__exit__(None,None,None)
 
     def _refuse(self, task, error):
         text = str(error)
@@ -1017,10 +1032,14 @@ class ClaimCapacity:
                                      repository=Path(__file__).resolve().parents[4], metadata_rows=rows)
             # Slow original input admission/profile reads run outside this local
             # transaction. Only fresh space -> claim -> reservation is serialized.
+            self.cache.prepare(task, estimate)
             self.lock=self.ledger.locked()
             self.lock.__enter__()
+            self.cache.acquire()  # Fixed result-volume -> cache lock order.
             other=self.ledger.remaining()
+            cache_report = self.cache.check(task, estimate, other)
             current = report(estimate,self.ledger.fresh_volume(),other,self.ledger.reserve)
+            current["cache"] = cache_report
             if not current["sufficient"]:
                 raise RunUnavailable(current["message"] + "; leave this whole run pending")
             self.estimates[task["attempt_id"]] = estimate
@@ -1035,6 +1054,7 @@ class ClaimCapacity:
             reservation = self.ledger.bind(self.runtime.root, claim, self.owner,
                                            self.estimates[claim.token])
             self.runtime.capacities[claim.token] = (self.ledger, reservation, self.owner)
+            self.cache.bind(claim)  # Adapter must bind actual writers/temporary lifecycle before science.
 
     def __exit__(self, *args):
         self._unlock()
@@ -1056,11 +1076,12 @@ def release_retired_capacity(root, task, stores, retirement):
     ledger.release(path, retirement["supervisor"], retirement=retirement)
 
 
-def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=None):
-    """Expected whole-job allocation if this machine handles every supplied run.
+def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=None, cache_provider=None):
+    """Whole-job projection, using only an explicitly admitted cache provider.
 
-    This is read-only projection, not a lease or a claim. Existing products are
-    not subtracted. Admission always repeats a fresh check before actual claim.
+    No service is bootstrapped, profile synthesized or ledger initialized here.
+    Missing/invalid cache qualification refuses combined sufficiency. Original
+    result estimates remain visible and actual claim repeats fresh checks.
     """
     if len(tasks) != len(configs) or not tasks or len({t["run"] for t in tasks}) != len(tasks):
         raise ValueError("Exact nonempty task/configuration correspondence required")
@@ -1072,25 +1093,50 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
     ledger = CapacityLedger(stores, series_id, root)
     estimates = [load_estimate(stores, series_id, task, config, repository=repository)
                  for task, config in zip(tasks, configs)]
-    other = ledger.remaining(exclude_job=job_root)
-    volume = ledger.fresh_volume()
+    cache = dict(complete=False, sufficient=False, state="MISSING_QUALIFIED_CACHE_PROVIDER",
+        reason="Inject the actual accepted WorkerCacheAdapter; no default namespace/service/profile is constructed",
+        required_cache_bytes=None, eligible_reclaimable_logical_bytes=None,
+        quota_headroom_bytes=None, projection_only=True)
+    if cache_provider is not None:
+        try:
+            from darsia_cache.worker_adapter import WorkerCacheAdapter
+            if not isinstance(cache_provider, WorkerCacheAdapter):
+                raise RunUnavailable("Only the actual startup-admitted worker cache adapter may project cache")
+            cache = cache_provider.project_expected_space(stores, series_id, tasks, estimates, ledger,
+                                                          job_root=job_root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            cache["state"] = "REFUSED_CACHE_PROFILE_OR_EXISTING_LEDGER"
+            cache["reason"] = str(error)
+    if cache["complete"]:
+        other, volume = cache["result_other_remaining_bytes"], cache["result_volume"]
+    else:
+        other = ledger.remaining(exclude_job=job_root)
+        volume = ledger.fresh_volume()
     products = sum(row.products_estimated_bytes for row in estimates)
     transient = sum(row.transient_estimated_bytes for row in estimates)
     needed = products + transient + other + ledger.reserve
+    combined = volume["free_bytes"] >= needed and cache["complete"] and cache["sufficient"]
+    cache_message = cache["state"] + (": " + cache["reason"] if "reason" in cache else
+        f"; required total {cache['required_cache_bytes']} bytes, quota headroom {cache['quota_headroom_bytes']} bytes")
     return dict(format="darsia-whole-job-expected-space-v1", machine_id=stores.machine_id,
         results_root=str(root), results_protocol=admission.protocol, results_local=admission.local,
         runs=[asdict(row) for row in estimates], products_expected_bytes=products,
         transient_estimated_bytes=transient, other_active_remaining_bytes=other,
         reserve_bytes=ledger.reserve, needed_bytes=needed, free_bytes=volume["free_bytes"],
-        sufficient=volume["free_bytes"] >= needed, volume=volume,
-        scope="whole supplied job per machine; preserved products not subtracted; repeated fresh before claim",
+        results_space_sufficient=volume["free_bytes"] >= needed,
+        sufficient=combined, volume=volume, required_product_bytes=products,
+        required_cache_bytes=cache["required_cache_bytes"],
+        eligible_reclaimable_logical_bytes=cache["eligible_reclaimable_logical_bytes"],
+        quota_headroom_bytes=cache["quota_headroom_bytes"], cache=cache,
+        cache_policy_state=cache["state"], complete_admission_sufficient=combined,
+        scope="read-only result/cache projection for explicitly admitted service; no reservation or claim; preserved products not subtracted; fresh checks repeat before actual claim",
         remote_scope=getattr(ledger,"remote_scope",None),
-        message=f"Expected needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}" +
-            ("; NAS outputs: one approved computing host across the complete configured authority scope; other machines use local outputs"
-             if getattr(ledger,"remote_scope",None) is not None else ""))
+        message=f"Expected results needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}; cache: {cache_message}" +
+             ("; NAS outputs: one approved computing host across the complete configured authority scope; other machines use local outputs"
+              if getattr(ledger,"remote_scope",None) is not None else ""))
 
 
-def report_job_root(job_root, stores):
+def report_job_root(job_root, stores, *, cache_provider=None):
     """Explicit UI/CLI read of declared job/task/configuration metadata only."""
     from .job_queue import read_json
     root = Path(job_root)
@@ -1105,10 +1151,10 @@ def report_job_root(job_root, stores):
         raise ValueError("Original run task differs from job order")
     configs = [configuration_for_task(stores, job["series_id"], task) for task in tasks]
     return whole_job_report(stores, job["series_id"], tasks, configs,
-        repository=Path(__file__).resolve().parents[4], job_root=root)
+        repository=Path(__file__).resolve().parents[4], job_root=root, cache_provider=cache_provider)
 
 
-def prepared_reports(stores_list, series_id, tasks, configs, job_root):
+def prepared_reports(stores_list, series_id, tasks, configs, job_root, *, cache_providers=None):
     """Optional per-machine projection returned to caller, never job DATA."""
     rows = []
     seen = set()
@@ -1118,7 +1164,8 @@ def prepared_reports(stores_list, series_id, tasks, configs, job_root):
         seen.add(stores.machine_id)
         try:
             row = whole_job_report(stores, series_id, tasks, configs,
-                repository=Path(__file__).resolve().parents[4], job_root=job_root)
+                repository=Path(__file__).resolve().parents[4], job_root=job_root,
+                cache_provider=None if cache_providers is None else cache_providers.get(stores.machine_id))
         except (OSError, ValueError) as error:
             row = dict(machine_id=stores.machine_id, available=False,
                        needed_bytes=None, free_bytes=None, reason=str(error))

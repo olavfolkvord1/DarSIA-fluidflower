@@ -14,6 +14,7 @@ import uuid
 from PySide6.QtCore import (
     QObject,
     QProcess,
+    QProcessEnvironment,
     QSignalBlocker,
     QThread,
     QTimer,
@@ -311,6 +312,15 @@ def launch_local_worker(
     _admit_gui_job_root(job_root)
     if backend not in {"cpu", "cuda"} or type(workers) is not int or workers < 1:
         raise ValueError("Explicit CPU/CUDA backend and positive workers required")
+    from .store_map import read_store_map
+    from .pipeline.job_queue import read_json
+    from darsia_cache.adapters import independent_worker_environment
+    import os
+    selected_stores=read_store_map(stores)
+    selected_job=read_json(Path(job_root)/"job.json")
+    child_environment=independent_worker_environment(selected_stores,machine=machine,
+        series_id=selected_job.get("series_id"),explicit_stores=stores is not None,
+        parent_environment=os.environ)
     if cwd is None:
         from .pipeline import worker as implementation
 
@@ -347,6 +357,10 @@ def launch_local_worker(
             raise ValueError("Choose an existing local store map before Start")
         command.extend(["--stores", str(stores)])
     process = QProcess()
+    environment=QProcessEnvironment()
+    for key,value in child_environment.items():
+        environment.insert(key,value)
+    process.setProcessEnvironment(environment)
     process.setProgram(command[0])
     process.setArguments(command[1:])
     process.setWorkingDirectory(str(cwd))

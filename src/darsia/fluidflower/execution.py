@@ -582,6 +582,7 @@ class AdapterDescriptor:
 class WorkerProcessHandle:
     worker_id: str
     process: subprocess.Popen[Any]
+    cache_observation_error: dict[str, Any] | None = None
 
 
 class TaskExecutionContext:
@@ -1929,6 +1930,8 @@ def run_worker(
     idle_exit_seconds: float | None = None,
     maximum_tasks: int | None = None,
 ) -> int:
+    from darsia_cache.adapters import bind_legacy_worker_identity
+    bind_legacy_worker_identity(worker_id)
     registry = registry or default_adapter_registry()
     queue.ensure_layout()
     inventory = detect_hardware()
@@ -2001,6 +2004,10 @@ def spawn_worker_processes(
 ) -> list[WorkerProcessHandle]:
     """Start hidden, independent workers suitable for GUI use on Windows."""
 
+    from darsia_cache.adapters import cooperative_child_environment, record_cache_observation
+    # This binds import inheritance only. Legacy workspace writers/cleanup below
+    # remain explicitly unqualified; this hook is not an all-writer adapter.
+    child_environment=cooperative_child_environment(parent_environment=os.environ)
     processes: list[WorkerProcessHandle] = []
     host = _safe_identifier(_host_name(), "host")
     for index in range(max(1, int(workers))):
@@ -2021,8 +2028,27 @@ def spawn_worker_processes(
             "--idle-exit-seconds",
             str(float(idle_exit_seconds)),
         ]
-        process = subprocess.Popen(command, **_subprocess_options())
-        processes.append(WorkerProcessHandle(worker_id=worker_id, process=process))
+        record_cache_observation("legacy_spawn_intent",dict(worker_id=worker_id))
+        process = subprocess.Popen(command, env=child_environment, **_subprocess_options())
+        handle=WorkerProcessHandle(worker_id=worker_id, process=process)
+        processes.append(handle)  # Track before supplementary observation I/O.
+        import psutil
+        try:
+            native=psutil.Process(process.pid)
+            observed=dict(pid=native.pid,process_create_time=str(native.create_time()))
+        except psutil.NoSuchProcess:
+            observed=None
+        try:
+            record_cache_observation("legacy_spawn_observed",dict(worker_id=worker_id,
+                original_native_identity=observed,epoch_unavailable=observed is None))
+        except Exception as error:
+            handle.cache_observation_error=dict(exception_type=type(error).__name__,
+                message=str(error),observation_complete=False)
+            try:
+                LOG.error("Cache legacy spawn observation incomplete: %s",
+                    handle.cache_observation_error,exc_info=True)
+            except BaseException:
+                handle.cache_observation_error["logging_failed"]=True
     return processes
 
 
