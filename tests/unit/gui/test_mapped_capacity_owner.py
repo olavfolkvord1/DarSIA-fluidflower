@@ -206,11 +206,30 @@ def test_actual_preclaim_availability_refuses_remap_and_releases_local_lock(tmp_
     runtime = SimpleNamespace(stores=stores, job=dict(series_id="FF_AC"),
         capacity_refusals={}, availability=lambda task: (), capacities={})
     check = cap.ClaimCapacity(runtime, owner()); check.ledger = ledger
+    # The result-only remap test enters no real cache profile or namespace.
+    class CacheBoundary:
+        def __init__(self):
+            self.prepared = 0
+            self.calls = []
+        def prepare(self, task, value):
+            assert task["run"] == "ac52"
+            assert value == estimate()
+            self.prepared += 1
+            self.calls.append("prepare")
+        def acquire(self):
+            self.calls.append("acquire")
+        def check(self, *args):
+            self.calls.append("check")
+            return dict(TEST_ONLY_SEPARATE_CACHE_BOUNDARY=True)
+        def unlock(self):
+            self.calls.append("unlock")
+    check.cache = CacheBoundary()
     monkeypatch.setattr(cap, "configuration_for_task", lambda *args: {})
     monkeypatch.setattr(cap, "load_estimate", lambda *args, **kwargs: estimate())
     with pytest.raises(RunUnavailable, match="changed its exact"):
         check.availability(claim_fixture().task)
     assert check.lock is None and runtime.capacity_refusals
+    assert check.cache.prepared == 1
     assert not list(tmp_path.rglob("reserved.json"))
 
 

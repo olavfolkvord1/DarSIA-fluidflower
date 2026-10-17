@@ -32,6 +32,7 @@ class FakeProcess:
     starts=True
     def __init__(self):
         self.__class__.instances.append(self)
+    def setProcessEnvironment(self,value): self.environment=value
     def setProgram(self,value): self.program=value
     def setArguments(self,value): self.arguments=value
     def setWorkingDirectory(self,value): self.cwd=value
@@ -47,6 +48,31 @@ def test_explicit_local_cli_uses_chosen_map_without_persisting_it(
 ):
     root,_=alias_job(tmp_path)
     chosen=tmp_path/"machine_private"/"Chosen stores ü.toml"
+    # This test checks argv/privacy, not store-policy qualification or a worker.
+    from darsia.fluidflower import store_map
+    from darsia_cache import adapters
+    import os
+
+    selected_map = object()
+    metadata_calls = []
+    environment_calls = []
+    declared_environment = {"TEST_ONLY_SELECTED_WORKER_ENV": "chosen-map"}
+
+    def selected_metadata(path):
+        assert Path(path) == chosen
+        metadata_calls.append(Path(path))
+        return selected_map
+
+    def selected_environment(stores, *, machine, series_id, explicit_stores,
+                             parent_environment):
+        assert stores is selected_map
+        assert machine == "Main" and series_id is None and explicit_stores is True
+        assert parent_environment is os.environ
+        environment_calls.append(dict(declared_environment))
+        return dict(declared_environment)
+
+    monkeypatch.setattr(store_map, "read_store_map", selected_metadata)
+    monkeypatch.setattr(adapters, "independent_worker_environment", selected_environment)
     monkeypatch.setattr(FakeProcess,"instances",[])
     monkeypatch.setattr(FakeProcess,"starts",started)
     monkeypatch.setattr(ui,"QProcess",FakeProcess)
@@ -66,6 +92,10 @@ def test_explicit_local_cli_uses_chosen_map_without_persisting_it(
             ui.launch_local_worker(root,**kwargs)
         record=jobs.read_json(folder/"launch.json")
     process=FakeProcess.instances[-1]
+    assert metadata_calls == [chosen]
+    assert environment_calls == [declared_environment]
+    assert process.environment.keys() == list(declared_environment)
+    assert process.environment.value("TEST_ONLY_SELECTED_WORKER_ENV") == "chosen-map"
     index=process.arguments.index("--stores")
     assert process.arguments[index+1]==str(chosen)
     assert checks==[root]
@@ -151,3 +181,33 @@ def test_missing_selected_map_fails_before_reserving_or_launching(app,tmp_path):
     finally:
         assert panel.can_close()
         panel.close();panel.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize("missing", ["map", "policy"])
+def test_real_missing_map_or_policy_refuses_before_local_process(
+    app, tmp_path, monkeypatch, missing
+):
+    """The positive argv double must not relax the actual launch admission."""
+    from darsia.fluidflower import store_map
+    from darsia_cache.policy import CachePolicyError
+
+    root, _ = alias_job(tmp_path)
+    chosen = tmp_path / "selected-stores.toml"
+    if missing == "policy":
+        chosen.write_text(
+            '[machine]\nid = "Main"\n[stores.FF_AC]\n'
+            + 'series = ' + json.dumps(str(tmp_path / "series")) + '\n'
+            + 'results = ' + json.dumps(str(tmp_path / "results")) + '\n',
+            encoding="utf-8")
+    monkeypatch.setattr(FakeProcess, "instances", [])
+    monkeypatch.setattr(ui, "QProcess", FakeProcess)
+    monkeypatch.setattr(job_filesystem, "inspect_shared_folder", lambda path:
+        job_filesystem.SharedFolderAdmission(True, "smb", "fixture", "synthetic SMB fact"))
+    folder = root / "ui/launches/refused"
+    expected = (OSError, store_map.StoreMapError) if missing == "map" else CachePolicyError
+    with pytest.raises(expected):
+        ui.launch_local_worker(root, backend="cpu", workers=1, machine="Main",
+            python="not-executed", cwd=tmp_path / "checkout",
+            launch_directory=folder, stores=chosen)
+    assert not FakeProcess.instances
+    assert not folder.exists()

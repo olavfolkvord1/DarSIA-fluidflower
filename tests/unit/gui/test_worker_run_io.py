@@ -67,6 +67,15 @@ def test_pre_science_hash_rejection_does_not_publish_fail_or_enter_executor(monk
     monkeypatch.setattr(worker,"JobQueue",Shared)
     monkeypatch.setattr(worker_io,"WorkerRunIO",Runtime)
     monkeypatch.setattr(worker,"_identity",lambda machine:dict(machine=machine))
+    # Native registration is an independent dependency of this mocked loop.
+    from darsia_cache import adapters
+    native_owner_calls = []
+    def bind_owner(owner, *, slot=None, generation=None, role=None):
+        assert owner == dict(machine="main-cpu")
+        assert slot is None and generation is None and role == "slot"
+        native_owner_calls.append(dict(owner))
+        return dict(TEST_ONLY_NATIVE_OWNER_BOUNDARY=True)
+    monkeypatch.setattr(adapters, "bind_actual_worker_owner", bind_owner)
     monkeypatch.setattr(worker,"_job_control_boundary",lambda root:None)
     messages=queue.Queue()
     with pytest.raises(SystemExit) as error:
@@ -74,6 +83,7 @@ def test_pre_science_hash_rejection_does_not_publish_fail_or_enter_executor(monk
             SimpleNamespace(is_set=lambda:False),once=True,exit_when_idle=False,
             stores=SimpleNamespace(machine_id="Main"))
     assert error.value.code==1 and calls.count("rejected")==1
+    assert native_owner_calls == [dict(machine="main-cpu")]
     assert any(event["kind"]=="input_rejected" for event in list(messages.queue))
     assert not claim.output.exists()
 

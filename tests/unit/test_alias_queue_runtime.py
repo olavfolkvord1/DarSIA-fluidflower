@@ -453,8 +453,37 @@ def test_unbound_or_unrequested_payload_receipt_cannot_pass_terminal_fence(tmp_p
     queue.assert_owner(claim)
 
 
+@pytest.fixture
+def result_space_cache_boundary():
+    """Only these result-space callbacks double the separate cache protocol.
+
+    No accepted production policy, namespace, reserve or measured cache profile
+    is represented by this result-only fixture.
+    """
+    def make(expected):
+        class CacheBoundary:
+            def __init__(self):
+                self.prepares = 0
+            def prepare(self, task, estimate):
+                assert task["run"] == "ac52" and estimate is expected
+                self.prepares += 1
+            def acquire(self):
+                pass
+            def check(self, task, estimate, other):
+                assert task["run"] == "ac52" and estimate is expected and other == 0
+                return dict(TEST_ONLY_SEPARATE_CACHE_BOUNDARY=True)
+            def bind(self, claim):
+                pytest.fail("This result availability fixture must not bind a cache allocation")
+            def unlock(self):
+                pass
+        return CacheBoundary()
+    return make
+
+
 @pytest.mark.parametrize("shortfall",[0,1])
-def test_capacity_check_precedes_atomic_claim_and_refuses_without_result(tmp_path,monkeypatch,shortfall):
+def test_capacity_check_precedes_atomic_claim_and_refuses_without_result(
+    tmp_path, monkeypatch, shortfall, result_space_cache_boundary
+):
     from types import SimpleNamespace
     from contextlib import nullcontext
     from darsia.fluidflower.pipeline import capacity
@@ -466,6 +495,7 @@ def test_capacity_check_precedes_atomic_claim_and_refuses_without_result(tmp_pat
         availability=callbacks["availability"],capacity_refusals={},capacities={})
     original_owner=dict(machine="main-cpu",pid=123,process_create_time="12345.125")
     check=capacity.ClaimCapacity(runtime,original_owner);check.ledger=ledger
+    check.cache=result_space_cache_boundary(value)
     monkeypatch.setattr(capacity,"configuration_for_task",lambda *a: {})
     monkeypatch.setattr(capacity,"load_estimate",lambda *a,**k:value)
     claim=queue.claim("Main","cpu",original_owner,**dict(callbacks,availability=check.availability))
@@ -479,7 +509,9 @@ def test_capacity_check_precedes_atomic_claim_and_refuses_without_result(tmp_pat
         assert check.estimates[claim.token] is value
 
 
-def test_capacity_callback_rechecks_free_space_before_each_unclaimed_run(tmp_path,monkeypatch):
+def test_capacity_callback_rechecks_free_space_before_each_unclaimed_run(
+    tmp_path, monkeypatch, result_space_cache_boundary
+):
     from types import SimpleNamespace
     from contextlib import nullcontext
     from darsia.fluidflower.pipeline import capacity
@@ -491,7 +523,9 @@ def test_capacity_callback_rechecks_free_space_before_each_unclaimed_run(tmp_pat
         availability=callbacks["availability"],capacity_refusals={},capacities={})
     owner=dict(machine="main-cpu",pid=123,process_create_time="12345.125")
     check=capacity.ClaimCapacity(runtime,owner);check.ledger=ledger
+    check.cache=result_space_cache_boundary(value)
     monkeypatch.setattr(capacity,"configuration_for_task",lambda *a:{})
     monkeypatch.setattr(capacity,"load_estimate",lambda *a,**k:value)
     assert queue.claim("Main","cpu",owner,**dict(callbacks,availability=check.availability)) is None
     assert queue.claim("Main","cpu",owner,**dict(callbacks,availability=check.availability)) is not None
+    assert check.cache.prepares == 2

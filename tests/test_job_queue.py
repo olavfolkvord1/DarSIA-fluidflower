@@ -198,7 +198,30 @@ def test_bad_task_is_quarantined_once_and_next_valid_task_is_claimed(tmp_path, b
     assert len(errors) == 1
 
 
-def test_failure_traceback_is_preserved_and_worker_takes_next(tmp_path, monkeypatch):
+@pytest.fixture
+def native_cache_owner_binding(monkeypatch):
+    """Only this queue-loop fixture replaces its native operational boundary.
+
+    Synthetic OWNER and science already belong to this unit test. Production
+    owner/lease validation is unchanged; refusal is covered separately below.
+    """
+    from darsia_cache import adapters
+
+    calls = []
+
+    def bind(owner, *, slot=None, generation=None, role=None):
+        assert owner == OWNER
+        assert slot is None and generation is None and role == "slot"
+        calls.append(dict(owner=dict(owner), slot=slot, generation=generation, role=role))
+        return dict(TEST_ONLY_NATIVE_OWNER_BOUNDARY=True)
+
+    monkeypatch.setattr(adapters, "bind_actual_worker_owner", bind)
+    return calls
+
+
+def test_failure_traceback_is_preserved_and_worker_takes_next(
+    tmp_path, monkeypatch, native_cache_owner_binding
+):
     shared = JobQueue(tmp_path)
     shared.enqueue(task("first")); shared.enqueue(task("second"))
     calls = []
@@ -244,7 +267,9 @@ def test_startup_git_rejection_is_console_and_log_and_never_claims(tmp_path, mon
     assert not (tmp_path / "claimed").exists()
 
 
-def test_once_handles_one_task_and_leaves_next_queued(tmp_path, monkeypatch):
+def test_once_handles_one_task_and_leaves_next_queued(
+    tmp_path, monkeypatch, native_cache_owner_binding
+):
     shared = JobQueue(tmp_path)
     shared.enqueue(task("first")); shared.enqueue(task("second"))
     def science(value, output, backend, precision, on_progress):
@@ -256,3 +281,37 @@ def test_once_handles_one_task_and_leaves_next_queued(tmp_path, monkeypatch):
                  "1"*40,"machine","cpu",queue.Queue(),threading.Event(),True,False)
     assert (tmp_path / "done/first.json").exists()
     assert (tmp_path / "queue/second.json").exists()
+
+
+def test_native_cache_owner_binding_refusal_precedes_any_claim(tmp_path, monkeypatch):
+    """A cache-owner rejection cannot consume or publish the queued task."""
+    from darsia_cache import adapters
+    from darsia_cache.policy import CachePolicyError
+
+    shared = JobQueue(tmp_path)
+    shared.enqueue(task("first"))
+    queued = tmp_path / "queue/first.json"
+    original = queued.read_bytes()
+    calls = []
+
+    def refuse(owner, *, slot=None, generation=None, role=None):
+        assert owner == OWNER
+        assert slot is None and generation is None and role == "slot"
+        calls.append("binding")
+        raise CachePolicyError("Synthetic native owner binding refused before claim")
+
+    def forbidden_claim(*args, **kwargs):
+        calls.append("claim")
+        raise AssertionError("Owner-binding refusal must precede every claim")
+
+    monkeypatch.setattr(adapters, "bind_actual_worker_owner", refuse)
+    monkeypatch.setattr(JobQueue, "claim", forbidden_claim)
+    monkeypatch.setattr(worker, "_identity", lambda machine: OWNER)
+    with pytest.raises(CachePolicyError, match="Synthetic native owner binding refused"):
+        worker._work(str(tmp_path),
+            dict(commit="1"*40, calibration_sha256="2"*64, precision="float32"),
+            "1"*40, "machine", "cpu", queue.Queue(), threading.Event(), True, True)
+    assert calls == ["binding"]
+    assert queued.read_bytes() == original
+    assert not (tmp_path / "done/first.json").exists()
+    assert not (tmp_path / "failed/first.json").exists()

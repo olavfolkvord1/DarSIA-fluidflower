@@ -280,6 +280,31 @@ def test_current_worker_command_detached_and_immutable_receipt_only(
     put(tmp_path / "job.json", dict(expected_runs=["ac52"], precision="float32"))
     monkeypatch.setattr(ui, "require_unc", lambda path: None)
     observed = []
+    # This test owns only the detached argv/receipt boundary, not real policy.
+    from darsia.fluidflower import store_map
+    from darsia_cache import adapters
+    import os
+
+    selected_map = object()
+    metadata_calls = []
+    environment_calls = []
+    declared_environment = {"TEST_ONLY_LOCAL_WORKER_ENV": "original-default-map"}
+
+    def selected_metadata(path):
+        assert path is None
+        metadata_calls.append(path)
+        return selected_map
+
+    def selected_environment(stores, *, machine, series_id, explicit_stores,
+                             parent_environment):
+        assert stores is selected_map
+        assert machine == "Main" and series_id is None and explicit_stores is False
+        assert parent_environment is os.environ
+        environment_calls.append(dict(declared_environment))
+        return dict(declared_environment)
+
+    monkeypatch.setattr(store_map, "read_store_map", selected_metadata)
+    monkeypatch.setattr(adapters, "independent_worker_environment", selected_environment)
 
     class FakeProcess:
         ProcessChannelMode = ui.QProcess.ProcessChannelMode
@@ -287,6 +312,9 @@ def test_current_worker_command_detached_and_immutable_receipt_only(
         def __init__(self):
             self.values = {}
             observed.append(self)
+
+        def setProcessEnvironment(self, value):
+            self.values["environment"] = value
 
         def setProgram(self, value):
             self.values["program"] = value
@@ -318,6 +346,10 @@ def test_current_worker_command_detached_and_immutable_receipt_only(
         python="existing-python",
         cwd="existing-checkout",
     )
+    assert metadata_calls == [None]
+    assert environment_calls == [declared_environment]
+    assert observed[0].values["environment"].keys() == list(declared_environment)
+    assert observed[0].values["environment"].value("TEST_ONLY_LOCAL_WORKER_ENV") == "original-default-map"
     assert observed[0].values["arguments"] == [
         "-m",
         "darsia.fluidflower.worker",

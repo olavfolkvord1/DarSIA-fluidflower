@@ -147,8 +147,25 @@ def test_unknown_action_cannot_create_a_command(job):
     assert snapshot(job) == before
 
 
+@pytest.fixture
+def native_cache_control_owner_binding(monkeypatch):
+    """Only the three mocked worker-loop control tests own this boundary."""
+    from darsia_cache import adapters
+
+    calls = []
+    def bind(owner, *, slot=None, generation=None, role=None):
+        assert owner == {"machine": "Main-cpu"}
+        assert slot is None and generation is None and role == "slot"
+        calls.append(dict(owner))
+        return dict(TEST_ONLY_NATIVE_CONTROL_OWNER_BOUNDARY=True)
+    monkeypatch.setattr(adapters, "bind_actual_worker_owner", bind)
+    return calls
+
+
 @pytest.mark.parametrize("action,state", [("pause", "paused"), ("stop", "control_stopped")])
-def test_control_before_claim_never_reclaims_or_touches_queue(job, monkeypatch, action, state):
+def test_control_before_claim_never_reclaims_or_touches_queue(
+    job, monkeypatch, action, state, native_cache_control_owner_binding
+):
     control.publish_control(job, action, machine="Main", expected_previous=None)
     events = []
 
@@ -168,11 +185,12 @@ def test_control_before_claim_never_reclaims_or_touches_queue(job, monkeypatch, 
     )
     assert [event["kind"] for event in events] == [state]
     assert snapshot(job) == before
+    assert native_cache_control_owner_binding == [{"machine": "Main-cpu"}]
 
 
 @pytest.mark.parametrize("action,state", [("pause", "paused"), ("stop", "control_stopped")])
 def test_committed_frame_control_closes_executor_without_terminal_failure(
-    job, monkeypatch, action, state
+    job, monkeypatch, action, state, native_cache_control_owner_binding
 ):
     events, calls = [], []
     task = {
@@ -236,9 +254,12 @@ def test_committed_frame_control_closes_executor_without_terminal_failure(
     assert events[-1]["attempt_id"] == claim.token
     assert task == original_task
     assert not (job / "failed").exists() and not (job / "done").exists()
+    assert native_cache_control_owner_binding == [{"machine": "Main-cpu"}]
 
 
-def test_malformed_control_is_operational_failure_before_claim(job, monkeypatch):
+def test_malformed_control_is_operational_failure_before_claim(
+    job, monkeypatch, native_cache_control_owner_binding
+):
     control.publish_control(job, "pause", machine="Main", expected_previous=None)
     path = job / "ui/commands/00000000000000000001.json"
     path.write_bytes(b"not-json")
@@ -261,6 +282,7 @@ def test_malformed_control_is_operational_failure_before_claim(job, monkeypatch)
     assert [event["kind"] for event in events] == ["control_failure"]
     assert "JSONDecodeError" in events[0]["traceback"]
     assert snapshot(job) == before
+    assert native_cache_control_owner_binding == [{"machine": "Main-cpu"}]
 
 
 @pytest.mark.parametrize("kind,expected_exit", [("paused", 0), ("control_stopped", 0), ("control_failure", 1)])
