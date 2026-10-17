@@ -76,7 +76,7 @@ def read_alias_series(path, *, expected_sha256, series_manifest, catalog_factory
 
 
 def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest,
-                      catalog_factory=None):
+                      catalog_factory=None, capacity_stores=()):
     """Resolve all metadata input roles before creating the new shared job.
 
     No payload arrays, scientific method or executor is invoked. Original
@@ -129,6 +129,8 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
             or any(part in {"", ".", ".."} for part in item.split("/")) for item in publish)):
         raise ValueError("Publish must name relative products, never machine paths")
     job["publish"] = deepcopy(publish)
+    from .capacity import prepared_reports
+    capacity_reports=prepared_reports(capacity_stores,manifest["series_id"],tasks,configs,job_root)
     root=Path(job_root)
     # Every role, root, size and metadata SHA has now been admitted.
     target=root/"job.json"
@@ -159,12 +161,12 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     return {"complete":True,"job":descriptor(root/"job.json"),"series":series_reference,
             "series_manifest":manifest_reference,"tasks":prepared,
             "legacy_paths":False,"execution_ready":True,"execution_blocker":"",
-            "numerical_calls_started":False}
+            "numerical_calls_started":False,"capacity_reports":capacity_reports}
 
 
 
 def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
-                            series_manifest, catalog_factory=None):
+                            series_manifest, catalog_factory=None, capacity_stores=()):
     """Prepare supplied typed phase-one inputs; never assemble or infer DATA.
 
     execution_series is a real explicit parent provenance document. This API
@@ -205,6 +207,7 @@ def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
     series_reference = admission.add(execution_series, "configuration", "execution_series")
     manifest_reference = admission.add(series_manifest, "configuration", "series_manifest")
     prepared = []
+    configs = []
     for original in tasks:
         allowed = {"format", "pipeline", "run", "configuration", "commit", "precision",
                    "job_id", "backend", "threads", "device_id", "pool_limit_bytes"}
@@ -220,6 +223,7 @@ def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
         config = validate_phase1_run(catalog.doc(original["configuration"], "configuration", "run.configuration"))
         if config["run"] != original["run"] or config["precision"] != original["precision"]:
             raise ValueError("Original typed phase-one configuration differs from its task")
+        configs.append(config)
         # Recreate the catalogue with only the explicit aliases in that input.
         catalog = catalog_factory(roots, config.get("data_aliases", ()))
         catalog.add(execution_series, "configuration", "run.execution_series")
@@ -262,6 +266,8 @@ def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
             if projected != task:
                 raise ValueError("Existing phase-one alias run task differs")
             prior_tasks[task["run"]] = location
+    from .capacity import prepared_reports
+    capacity_reports=prepared_reports(capacity_stores,manifest["series_id"],bound_tasks,configs,job_root)
     root.mkdir(parents=True, exist_ok=True)
     if not target.exists():
         write_immutable(target, bound_job)
@@ -274,7 +280,8 @@ def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
     return dict(complete=True, job=descriptor(target), series=series_reference,
         series_manifest=manifest_reference, tasks=records, legacy_paths=False,
         execution_ready=True, execution_blocker="", numerical_calls_started=False,
-        preparation_scope="Explicit supplied typed inputs only; no execution-plan or DATA assembly")
+        preparation_scope="Explicit supplied typed inputs only; no execution-plan or DATA assembly",
+        capacity_reports=capacity_reports)
 
 
 def portable_selection_binding(binding, *, series_manifest, catalog_factory=None):

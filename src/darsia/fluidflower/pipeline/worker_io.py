@@ -31,7 +31,21 @@ class WorkerRunIO:
         self.root,self.job,self.stores=Path(job_root),deepcopy(job),stores
         self.service_id,self.commit=service_id,commit
         self.bindings,self.factories={},{}
+        self.capacities={}
+        self.capacity_refusals={}
+        from .capacity import remote_results_owner
+        self.remote_results_scope=remote_results_owner(stores,job["series_id"],stores.roots(job["series_id"])["results"])
         self.publications=_PublicationRouter(self)
+
+    def capacity_claim(self,owner,on_refusal=None):
+        from .capacity import ClaimCapacity
+        return ClaimCapacity(self,owner,on_refusal)
+
+    def capacity_progress(self,claim,owner,event):
+        ledger,reservation,original_owner=self.capacities[claim.token]
+        if owner!=original_owner:
+            raise ValueError("Capacity progress owner differs from actual claim")
+        ledger.progress(reservation,owner,event)
 
     def output_factory(self,task,token):
         path,evidence=local_attempt_output(self.stores,self.job["series_id"],
@@ -83,7 +97,14 @@ class WorkerRunIO:
                 producer_origin_for_attempt=self.bindings[claim.token].producer_origin_for_attempt)
         return self.factories[claim.token]
 
+    def capacity_close(self,claim):
+        capacity=self.capacities.pop(claim.token,None)
+        if capacity is not None:
+            ledger,reservation,owner=capacity
+            ledger.release(reservation,owner)
+
     def release(self,claim):
+        self.capacity_close(claim)
         self.factories.pop(claim.token,None)
         self.bindings.pop(claim.token,None)
 

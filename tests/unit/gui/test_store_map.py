@@ -70,15 +70,16 @@ def test_store_map_outside_repo_and_series_is_required(tmp_path):
             read_store_map(root / "stores.toml")
 
 
-def test_duplicate_canonical_series_and_nonlocal_results_refuse(stores):
+def test_duplicate_canonical_series_refuses_and_explicit_unc_results_are_recorded(stores):
     path, _store = stores
     raw = path.read_text()
     path.write_text(raw + '[stores.ffac]\nseries="D:/x"\nresults="D:/out"\n')
     with pytest.raises(StoreMapError, match="Duplicate"):
         read_store_map(path, locality_provider=lambda _: LocalFilesystemFacts("fixture-local", True, "synthetic proof"), sync_roots=[])
     path.write_text(raw.replace('results="E:/products"', 'results="//nas/share/out"'))
-    with pytest.raises(StoreMapError, match="results root must be local"):
-        read_store_map(path, locality_provider=lambda _: LocalFilesystemFacts("fixture-local", True, "synthetic proof"), sync_roots=[])
+    parsed=read_store_map(path, locality_provider=lambda _: LocalFilesystemFacts("fixture-local", True, "synthetic proof"), sync_roots=[])
+    assert parsed.roots("FF_AC")["results"].replace("\\","/")=="//nas/share/out"
+    # Parsing records explicit DATA; actual output transport is separately admitted.
 
 
 def test_converter_proposal_comes_only_from_literal_manifest_data():

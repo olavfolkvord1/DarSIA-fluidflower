@@ -228,7 +228,7 @@ class Claim:
 
 @dataclass(frozen=True)
 class LocalOutputBinding:
-    """In-process positive local-results admission, never serialized as a task."""
+    """In-process positive configured-results admission, never serialized as a task."""
 
     machine_id: str
     results_root: Path
@@ -490,25 +490,23 @@ class JobQueue:
         return None
 
     def _admit_output(self, binding, task, machine, token):
-        from ..job_filesystem import LocalFileAdmission
+        from ..job_filesystem import valid_results_admission
         if (not isinstance(binding, LocalOutputBinding)
-                or not isinstance(binding.admission, LocalFileAdmission)
-                or binding.admission.allowed is not True
+                or not valid_results_admission(binding.admission, binding.results_root)
                 or self._machine_id is None
                 or name(binding.machine_id) != self._machine_id):
-            raise ValueError("A positive runtime local-output admission is required")
+            raise ValueError("A positive configured result-root admission is required")
         root, output = Path(binding.results_root), Path(binding.path)
         relative = name(task["job_id"]) + "/" + name(task["run"]) + "/.attempts/" + token
         expected = root.joinpath(*relative.split("/"))
         if (not root.is_absolute() or not output.is_absolute()
-                or PureWindowsPath(str(root)).drive.startswith("\\\\")
                 or output != expected or ".." in output.parts):
-            raise ValueError("Local output differs from its declared results root/job/run/token")
+            raise ValueError("Output differs from its declared results root/job/run/token")
         checked = Path(binding.admission.checked_container).resolve(strict=True)
         actual_root = root.resolve()
         if (not actual_root.is_relative_to(checked)
                 or not output.resolve().is_relative_to(actual_root)):
-            raise ValueError("Local output escaped its positively admitted container")
+            raise ValueError("Output escaped its positively admitted container")
         return output, dict(machine_id=binding.machine_id, root_alias="results", relative_path=relative)
 
     def _quarantine(self, pending, machine, owner, text):

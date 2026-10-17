@@ -289,3 +289,77 @@ def inspect_local_file(path, *, locality_provider=None, sync_roots=None):
         reason = "The store map must be on a positively identified local filesystem"
         return LocalFileAdmission(False, facts.filesystem, reason, facts.evidence, str(container))
     return LocalFileAdmission(True, facts.filesystem, "OS-reported local filesystem; no write/space guarantee claimed", facts.evidence, str(container))
+
+
+@dataclass(frozen=True)
+class ResultsRootAdmission:
+    """Output-only OS evidence; a remote result root is never called local."""
+
+    allowed: bool
+    protocol: str
+    local: bool
+    reason: str
+    evidence: str
+    checked_container: str
+    results_root: str
+    source_admission: object
+
+
+def inspect_results_root(root, *, locality_provider=None, filesystem_provider=None,
+                         sync_roots=None):
+    """Inspect one explicit output root without creating any directory or file.
+
+    Local settings and input rules still use their original separate guards.
+    An explicit remote result needs positive SMB/NFS transport evidence; a UNC
+    spelling by itself is not admission. No lease or throughput guarantee is made.
+    """
+    selected = Path(root).expanduser().resolve()
+    container = selected
+    while not container.exists() and container != container.parent:
+        container = container.parent
+    container = container.resolve(strict=True)
+    if not container.is_dir() or not selected.is_relative_to(container):
+        raise ValueError("Results root has no containing existing directory")
+    local = inspect_local_file(selected / ".darsia-location-probe",
+                               locality_provider=locality_provider, sync_roots=sync_roots)
+    if local.allowed and not PureWindowsPath(str(selected)).drive.startswith("\\\\"):
+        return ResultsRootAdmission(True, local.filesystem, True,
+            "OS-reported local results filesystem", local.evidence,
+            local.checked_container, str(selected), local)
+    remote = inspect_shared_folder(container, filesystem_provider=filesystem_provider,
+                                   sync_roots=sync_roots)
+    return ResultsRootAdmission(remote.allowed, remote.protocol, False,
+        "Explicit remote results filesystem: " + remote.reason, remote.evidence,
+        str(container), str(selected), remote)
+
+
+def valid_results_admission(admission, root):
+    """Accept positive output proofs only, retaining the old local-only proof."""
+    try:
+        if (isinstance(admission, LocalFileAdmission) or
+                isinstance(admission, ResultsRootAdmission) and admission.local is True):
+            if PureWindowsPath(str(root)).drive.startswith("\\\\"):
+                return False
+        actual_root = Path(root).resolve()
+        checked = Path(admission.checked_container).resolve(strict=True)
+        if not checked.is_dir() or not actual_root.is_relative_to(checked):
+            return False
+        invalid = {"smb", "nfs", "remote", "unknown", "synchronized", "offline", "cloud"}
+        if isinstance(admission, LocalFileAdmission):
+            return (admission.allowed is True and isinstance(admission.filesystem, str)
+                    and bool(admission.filesystem) and admission.filesystem.casefold() not in invalid
+                    and not PureWindowsPath(str(root)).drive.startswith("\\\\"))
+        if (not isinstance(admission, ResultsRootAdmission) or admission.allowed is not True
+                or type(admission.local) is not bool or not isinstance(admission.protocol, str)
+                or not admission.protocol or Path(admission.results_root).resolve() != actual_root):
+            return False
+        source = admission.source_admission
+        if admission.local:
+            return (isinstance(source, LocalFileAdmission) and source.allowed is True
+                    and source.filesystem == admission.protocol
+                    and source.filesystem.casefold() not in invalid
+                    and Path(source.checked_container).resolve(strict=True) == checked)
+        return (isinstance(source, SharedFolderAdmission) and source.allowed is True
+                and source.protocol == admission.protocol and source.protocol in {"smb", "nfs"})
+    except (AttributeError, OSError, ValueError, TypeError):
+        return False

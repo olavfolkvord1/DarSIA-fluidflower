@@ -930,7 +930,13 @@ def _storage_facts(output):
     if binding is None:
         return dict(local_retained=False,direct_NAS_write=True)
     binding.require_output(output)
-    return dict(local_retained=True,direct_NAS_write=False,direct_local_write=True)
+    from ..job_filesystem import LocalFileAdmission, ResultsRootAdmission, valid_results_admission
+    admitted = binding.local_output
+    if not valid_results_admission(admitted.admission,admitted.results_root):
+        raise ValueError("Storage metadata requires its positive actual results-root admission")
+    local = (isinstance(admitted.admission,LocalFileAdmission)
+             or isinstance(admitted.admission,ResultsRootAdmission) and admitted.admission.local is True)
+    return dict(local_retained=local,direct_NAS_write=not local,direct_local_write=local)
 
 
 def _publish_frame(

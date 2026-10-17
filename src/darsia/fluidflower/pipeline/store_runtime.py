@@ -11,7 +11,7 @@ import hashlib
 from pathlib import Path
 import stat
 
-from ..job_filesystem import inspect_local_file
+from ..job_filesystem import inspect_results_root
 from ..store_map import resolve_input_reference, require_real_containment
 from .job_queue import name
 from .job_inputs import validate_catalog, _json_bytes, MAX_METADATA_BYTES
@@ -115,15 +115,17 @@ def verify_inputs(task, rows):
 
 
 def local_attempt_output(stores, series_id, job_id, run, attempt_id):
-    """Admit a local output location without creating any result directory."""
+    """Admit the explicit local or SMB/NFS result root without creating it."""
     roots = stores.roots(series_id)
     if "results" not in roots:
-        raise RunUnavailable("No local results root is configured")
+        raise RunUnavailable("No explicit results root is configured")
     root = Path(roots["results"])
-    evidence = inspect_local_file(root / ".darsia-location-probe")
+    evidence = inspect_results_root(root)
     if not evidence.allowed:
-        raise RunUnavailable("Results root is not admitted as local: " +
+        raise RunUnavailable("Results root is not admitted: " +
                              evidence.reason + ": " + evidence.evidence)
+    from .capacity import remote_results_owner
+    remote_results_owner(stores,series_id,root,admission=evidence)
     import re
 
     if re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
@@ -132,7 +134,7 @@ def local_attempt_output(stores, series_id, job_id, run, attempt_id):
     parent = output
     while not parent.exists():
         if parent == parent.parent:
-            raise RunUnavailable("No existing local output ancestor")
+            raise RunUnavailable("No existing configured result-root ancestor")
         parent = parent.parent
     actual_root = root.resolve()
     if not output.resolve().is_relative_to(actual_root):

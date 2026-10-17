@@ -135,16 +135,15 @@ class _Replay(InputCatalog):
 class RunIOBinding:
     def __init__(self, task, verified, local_output, *, repository, admitted_commit):
         from .job_queue import LocalOutputBinding
-        from ..job_filesystem import LocalFileAdmission
+        from ..job_filesystem import valid_results_admission
         self.task = deepcopy(task_without_resume(task))
         if (task.get("format") != TASK_FORMAT or verified.run != task["run"]
                 or admitted_commit != task["commit"]):
             raise InputHashMismatch("Run I/O needs the exact admitted task and checkout commit")
         validate_catalog(task["input_catalog"])
         if (not isinstance(local_output, LocalOutputBinding)
-                or not isinstance(local_output.admission, LocalFileAdmission)
-                or not local_output.admission.allowed):
-            raise RunUnavailable("A positive local output filesystem binding is required")
+                or not valid_results_admission(local_output.admission, local_output.results_root)):
+            raise RunUnavailable("A positive explicit results filesystem binding is required")
         self.verified = verified
         self.local_output = local_output
         from .job_queue import name
@@ -157,7 +156,7 @@ class RunIOBinding:
         if (self.output_identity != expected.resolve()
                 or not self.output_identity.is_relative_to(self.results_identity)
                 or not self.output_identity.is_relative_to(Path(local_output.admission.checked_container).resolve())):
-            raise RunUnavailable("Local output does not match its positive owned attempt proof")
+            raise RunUnavailable("Output does not match its positive owned attempt proof")
         self.machine_id = name(local_output.machine_id)
         self.repository, self.commit = Path(repository).resolve(), admitted_commit
         self.locations, self.code_locations, self.code_audit = {}, {}, []
@@ -520,7 +519,7 @@ def alias_resume_output(owner, local_output, task, previous_token):
     output=Path(local_output.results_root)/expected
     root=Path(local_output.results_root).resolve()
     if not output.resolve().is_relative_to(root):
-        raise RunUnavailable("Original local output escapes its admitted results root")
+        raise RunUnavailable("Original output escapes its admitted results root")
     return output
 
 

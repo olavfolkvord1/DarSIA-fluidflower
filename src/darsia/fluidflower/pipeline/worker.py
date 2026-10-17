@@ -244,10 +244,21 @@ def _run_tasks(
             if io_runtime is None:
                 claim = shared.claim(machine, backend, owner)
             else:
-                claim = shared.claim(machine,backend,owner,
-                    availability=io_runtime.availability,
-                    output_factory=io_runtime.output_factory,
-                    publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
+                with io_runtime.capacity_claim(owner,queue_error) as capacity:
+                    claim = shared.claim(machine,backend,owner,
+                        availability=capacity.availability,
+                        output_factory=io_runtime.output_factory,
+                        publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
+                    try:
+                        capacity.bind(claim)
+                    except Exception:
+                        if claim is not None:
+                            # An actual atomic claim exists even if local disk
+                            # bookkeeping failed; the original parent must bind
+                            # it for owned retirement before any replacement.
+                            messages.put(dict(kind="claimed",run=claim.task["run"],
+                                attempt_id=claim.token,actual_worker=owner))
+                        raise
         except Exception:
             text = traceback.format_exc()
             messages.put(dict(kind="queue_failure", traceback=text))
@@ -298,6 +309,7 @@ def _run_tasks(
                     text=traceback.format_exc()
                     record=shared.reject_before_science(claim,text,owner)
                     excluded_runs.add(name(record["run"]))
+                    io_runtime.capacity_close(claim)
                     messages.put(dict(kind="input_rejected",run=task["run"],
                         attempt_id=claim.token,traceback=text,actual_worker=owner))
                     io_runtime.release(claim)
@@ -311,6 +323,8 @@ def _run_tasks(
                         "Scientific progress must be an actual event dictionary"
                     )
                 shared.progress(claim, event)
+                if io_runtime is not None:
+                    io_runtime.capacity_progress(claim,owner,event)
                 messages.put(
                     dict(
                         kind="progress",
@@ -371,6 +385,8 @@ def _run_tasks(
                     task=task,
                 )
             shared.complete(claim, result)
+            if io_runtime is not None:
+                io_runtime.capacity_close(claim)
             messages.put(
                 dict(kind="completed", run=task["run"], attempt_id=claim.token)
             )
@@ -384,6 +400,8 @@ def _run_tasks(
             return
         except LeaseLost:
             text = traceback.format_exc()
+            if io_runtime is not None:
+                io_runtime.capacity_close(claim)
             messages.put(
                 dict(
                     kind="lease_lost",
@@ -398,6 +416,8 @@ def _run_tasks(
                 shared.fail(claim, text, owner)
             except LeaseLost:
                 pass  # Its own attempt failure stays; only the current lease publishes.
+            if io_runtime is not None:
+                io_runtime.capacity_close(claim)
             messages.put(
                 dict(
                     kind="failed",
@@ -716,6 +736,9 @@ def _record_retirement(slot, args, identity):
                 raise ValueError("A different retirement already exists; preserve it")
         else:
             write_immutable(path, document)
+        if claim["task"].get("format")=="darsia-alias-task-v1":
+            from .capacity import release_retired_capacity
+            release_retired_capacity(args.job,claim["task"],stores,document)
     slot["retired"] = True
     return identities
 

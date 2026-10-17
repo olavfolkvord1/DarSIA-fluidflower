@@ -19,7 +19,7 @@ from . import series
 from .job_queue import JobQueue, descriptor, read_json, require_unc, write_immutable
 
 
-def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None):
+def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None, capacity_stores=()):
     """Prepare new versioned alias metadata; legacy jobs remain readable/runnable.
 
     The registered schema-1 manifest is explicit because an execution-series
@@ -29,7 +29,7 @@ def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None)
     from .alias_job import prepare_alias_job
 
     return prepare_alias_job(series_path, job_root, expected_sha256=expected_sha256,
-                             series_manifest=series_manifest)
+                             series_manifest=series_manifest, capacity_stores=capacity_stores)
 
 
 def _phase_outputs(stage, spec, frame, inferred):
@@ -483,9 +483,14 @@ def main(argv=None):
     parser.add_argument("--series-manifest", type=Path, required=True,
                         help="Registered schema-1 series.toml with declared [roots]")
     parser.add_argument("--job", type=Path, required=True)
+    parser.add_argument("--stores", type=Path, action="append", default=[],
+                        help="Optional local machine map(s) for whole-job expected needed/free reports")
     args = parser.parse_args(argv)
+    from ..store_map import read_store_map
+    maps = [read_store_map(path, forbidden_roots=(Path(__file__).resolve().parents[4],
+                                                args.series_manifest.parent)) for path in args.stores]
     result = prepare_job(args.series, args.job, expected_sha256=args.series_sha256,
-                         series_manifest=descriptor(args.series_manifest))
+                         series_manifest=descriptor(args.series_manifest), capacity_stores=maps)
     print(json.dumps(result, sort_keys=True), flush=True)
 
 

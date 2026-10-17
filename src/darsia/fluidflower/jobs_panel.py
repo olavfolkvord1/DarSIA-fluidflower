@@ -498,6 +498,7 @@ class JobsPanel(QWidget):
         self._session_requests = []
         self._control_thread = self._control_worker = None
         self._control_pending = False
+        self._capacity_thread = self._capacity_worker = None
         self._resume_after_control = None
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
@@ -521,6 +522,11 @@ class JobsPanel(QWidget):
         self.master_label, self.progress_label = _label("No active job"), _label("")
         layout.addWidget(self.master_label)
         layout.addWidget(self.progress_label)
+        self.capacity_button = QPushButton("Check expected space on this machine")
+        self.capacity_button.clicked.connect(self.check_capacity)
+        self.capacity_label = _label("Expected space not checked. The worker checks fresh free space before claiming a run.")
+        layout.addWidget(self.capacity_button)
+        layout.addWidget(self.capacity_label)
         controls = QHBoxLayout()
         self.backend_combo, self.workers_spin = QComboBox(), QSpinBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -760,8 +766,57 @@ class JobsPanel(QWidget):
             self.snapshots[row] if 0 <= row < len(self.snapshots) else None
         )
 
+    @Slot()
+    def check_capacity(self):
+        if self._capacity_thread is not None or self.current is None:
+            return
+        root = self.current["root"]
+        generation = self._generation
+        stores_path = self.local_stores_path_provider() if self.local_stores_path_provider else None
+        forbidden = tuple(p for p in (self.series_root, Path(__file__).resolve().parents[3]) if p)
+        self.capacity_button.setEnabled(False)
+        self.capacity_label.setText("Reading expected allocation and fresh free space on this machine…")
+        def read_capacity():
+            from .store_map import read_store_map
+            from .pipeline.capacity import report_job_root
+            try:
+                if stores_path is None:
+                    raise ValueError("Choose this machine's local store map")
+                result = report_job_root(root,read_store_map(stores_path,forbidden_roots=forbidden))
+            except (OSError,ValueError) as error:
+                result = dict(available=False,reason=str(error))
+            return dict(generation=generation,root=root,result=result)
+        self._capacity_thread,self._capacity_worker=self._start_call(
+            read_capacity,self._capacity_ready,self._capacity_closed)
+
+    @Slot(object)
+    def _capacity_ready(self, value):
+        if value["generation"] != self._generation or value["root"] != (self.current or {}).get("root"):
+            return
+        result = value["result"]
+        if result.get("available") is False:
+            text = "Expected space unavailable: " + result["reason"]
+        else:
+            text = result["message"] + (" — enough by this estimate." if result["sufficient"] else " — insufficient by this estimate.")
+            text += " Includes preserved native outputs, optional storage additions, estimated temporary space, active reservations and reserve. Fresh check repeats before claim."
+        self.capacity_label.setText(text)
+
+    @Slot()
+    def _capacity_closed(self):
+        if self._capacity_thread is not None:
+            self._capacity_thread.wait()
+        self._capacity_thread=self._capacity_worker=None
+        self.capacity_button.setEnabled(bool(self.current and self.local_stores_path_provider
+            and (self.current.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"))
+
     def _show_snapshot(self, data):
+        old_root = (self.current or {}).get("root")
         self.current = data
+        if (data or {}).get("root") != old_root:
+            self.capacity_label.setText("Expected space not checked. The worker checks fresh free space before claiming a run.")
+        self.capacity_button.setEnabled(bool(data and self.local_stores_path_provider
+            and (data.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"
+            and self._capacity_thread is None))
         enabled = bool(data and data.get("job_facts"))
         self.start_button.setEnabled(enabled)
         self.add_machine_button.setEnabled(enabled)
@@ -1539,6 +1594,7 @@ class JobsPanel(QWidget):
         return (
             self._read_thread is None
             and self._create_thread is None
+            and self._capacity_thread is None
             and self._control_thread is None
             and not self._control_pending
             and (self.resource_panel is None or self.resource_panel.can_close())

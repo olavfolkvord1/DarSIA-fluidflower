@@ -1,5 +1,6 @@
 """Synthetic worker/parent ownership and callback wiring, no actual process."""
 from copy import deepcopy
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -55,8 +56,13 @@ def test_pre_science_hash_rejection_does_not_publish_fail_or_enter_executor(monk
     class Runtime:
         def __init__(self,*a):self.publications=SimpleNamespace(publish_progress=lambda *a:None)
         def availability(self,*a):pass
+        @contextmanager
+        def capacity_claim(self,*a):
+            # This original hash-rejection test still reaches no capacity or SCI.
+            yield SimpleNamespace(availability=self.availability,bind=lambda claim:None)
         def output_factory(self,*a):pass
         def prepare(self,*a):raise InputHashMismatch("literal fixture hash mismatch")
+        def capacity_close(self,*a):pass
         def release(self,*a):calls.append("released")
     monkeypatch.setattr(worker,"JobQueue",Shared)
     monkeypatch.setattr(worker_io,"WorkerRunIO",Runtime)

@@ -1,0 +1,1053 @@
+"""Transparent expected disk space and host-local whole-run reservations.
+
+The model uses an explicit measured native profile and saved writer metadata.
+It does not alter products, promise a codec bound, inspect arrays, or own a NAS
+lease. All services on one machine/volume MUST share capacity.state_directory.
+"""
+from __future__ import annotations
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path, PureWindowsPath
+import ctypes
+import ast
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+
+from .job_inputs import _json_bytes, MAX_METADATA_BYTES
+from .job_queue import name, write_immutable
+from .store_runtime import RunUnavailable
+
+DEFAULT_RESERVE_BYTES = 40 * 1024**3
+PROFILE_FORMAT = "darsia-expected-space-profile-v1"
+MAX_RESERVATIONS = 4096
+
+
+def _integer(value, where, *, positive=False):
+    if type(value) is not int or value < (1 if positive else 0):
+        raise ValueError(where + " must be an explicit nonnegative integer")
+    return value
+
+
+def _bound(value):
+    if (not isinstance(value, dict) or set(value) != {"path", "sha256", "size_bytes"}
+            or not isinstance(value["path"], str) or not value["path"]
+            or not isinstance(value["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is None):
+        raise ValueError("Exact capacity metadata path/SHA/size required")
+    _integer(value["size_bytes"], "Capacity metadata bytes")
+    return value
+
+
+def read_bound(value):
+    """Read only an explicitly supplied, bounded JSON metadata file."""
+    _bound(value)
+    if value["size_bytes"] > MAX_METADATA_BYTES:
+        raise ValueError("Capacity metadata exceeds the existing metadata limit")
+    path = Path(value["path"])
+    before = path.stat()
+    if before.st_size != value["size_bytes"]:
+        raise ValueError("Capacity metadata SHA/size/version changed before read: " + str(path))
+    with path.open("rb") as stream:
+        raw = stream.read(value["size_bytes"] + 1)
+    after = path.stat()
+    version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+    if (version(before) != version(after) or len(raw) != value["size_bytes"]
+            or hashlib.sha256(raw).hexdigest() != value["sha256"]):
+        raise ValueError("Capacity metadata SHA/size/version changed: " + str(path))
+    return _json_bytes(raw), raw
+
+
+def settings(stores, series_id):
+    """The map is local; capacity metadata is separate from root aliases."""
+    from ..store_map import capacity_settings
+    from ..series_paths import series_key
+    value = capacity_settings(stores.document)
+    if value is None or series_key(series_id) not in value["profiles"]:
+        raise RunUnavailable("Configure an explicit applicable capacity profile in the local store map; no claim made")
+    return Path(value["state_directory"]), value["reserve_bytes"], value["profiles"][series_key(series_id)]
+
+
+def _native_layout_shape(value, count, where):
+    if (not isinstance(value, list) or len(value) != count
+            or any(type(v) is not int or v < 1 for v in value)):
+        raise ValueError("Explicit positive native layout dimensions required: " + where)
+    return list(value)
+
+
+def _native_layout_for_task(stores, series_id, task, config, rows=None):
+    """Only already-declared JSON metadata; never array/image reads or a claim."""
+    from .store_runtime import resolve_catalog
+    if (task.get("pipeline") != "native-phase-n1"
+            or config.get("format") != "darsia-native-phase-n1-run-v1"):
+        raise ValueError("This measured layout is only for the genuine native-phase-n1 route")
+    if rows is None:
+        rows = resolve_catalog(task, stores, series_id)
+
+    def document(use, descriptor):
+        matches = [row for row in rows if use in row.uses]
+        if len(matches) != 1:
+            raise ValueError("One existing layout metadata role required: " + use)
+        row = matches[0]
+        _bound(descriptor)
+        if (row.reference.get("sha256") != descriptor["sha256"]
+                or type(row.reference.get("bytes")) is not int
+                or row.reference["bytes"] != descriptor["size_bytes"]):
+            raise ValueError("Layout role SHA/size differs from original run DATA: " + use)
+        return read_bound(dict(path=str(row.path), sha256=row.reference["sha256"],
+                               size_bytes=row.reference["bytes"]))[0]
+
+    phase = document("phase.configuration", config["phase"]["configuration"])
+    native = document("native.configuration", config["native"]["configuration"])
+    params = phase["parameters"]
+    native_hw = _native_layout_shape(params["geometry"]["native_shape_hw"], 2, "phase geometry")
+    chw = _native_layout_shape(native["photometry"]["native_shape_chw"], 3, "native photometry")
+    if chw[1:] != native_hw:
+        raise ValueError("Native channels/image dimensions disagree with phase geometry")
+    for where, value in [
+            ("native source", native["source"]["native_shape_hw"]),
+            ("native extension", native["extension"]["native_shape_hw"]),
+            ("native support", native["support"]["native_shape_hw"]),
+            ("native photometry", native["photometry"]["native_shape_hw"]),
+            ("scientific native", params["scientific"]["native_shape_hw"])]:
+        if _native_layout_shape(value, 2, where) != native_hw:
+            raise ValueError("Explicit native layout fields disagree: " + where)
+    source_box = params["geometry"]["source_box_xywh"]
+    if (not isinstance(source_box, list) or len(source_box) != 4
+            or any(type(v) is not int for v in source_box)
+            or source_box[2:] != native_hw[::-1]):
+        raise ValueError("Explicit source-box/native-shape binding required")
+    phase_hw = None
+    frames = config["frames"]
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("Actual nonempty frame layout required")
+    for frame in frames:
+        case = name(frame["case_id"])
+        if frame["native_task"]["kind"] != "rig":
+            raise ValueError("Unmeasured native processor route requires its own profile")
+        n = document("frame." + case + ".native_geometry", frame["native_task"]["geometry"])
+        g = document("frame." + case + ".rig_geometry", frame["geometry"])
+        shapes = [n["native_shape_hw"], g["source_native_shape_hw"],
+                  frame["mass_spec"]["original_domain"]["native_shape_hw"]]
+        if any(_native_layout_shape(v, 2, case) != native_hw for v in shapes):
+            raise ValueError("Requested frame native shape differs: " + case)
+        actual = _native_layout_shape(g["phase_shape_hw"], 2, case + " phase canvas")
+        if _native_layout_shape(frame["mass_spec"]["photo_top"]["shape_hw"], 2, case + " top") != actual:
+            raise ValueError("Literal phase-canvas fields disagree: " + case)
+        if phase_hw is None:
+            phase_hw = actual
+        elif actual != phase_hw:
+            raise ValueError("Mixed native canvas layouts require an explicitly measured profile")
+    dtype = params["features"]["alignment"]["rgb_dtype"]
+    if not isinstance(dtype, str) or dtype != task["precision"]:
+        raise ValueError("Original task precision and explicit feature RGB dtype differ")
+    return dict(format="darsia-native-phase-n1-measured-layout-v1",
+                pipeline="native-phase-n1", precision=task["precision"],
+                native_shape_hw=native_hw, phase_shape_hw=phase_hw,
+                native_shape_chw=chw, feature_rgb_dtype=dtype,
+                source_box_xywh=list(source_box),
+                native_configuration_sha256=config["native"]["configuration"]["sha256"],
+                phase_configuration_sha256=config["phase"]["configuration"]["sha256"])
+
+
+def _check_measured_native_layout(profile, requested):
+    fields = {"format", "pipeline", "precision", "native_shape_hw", "phase_shape_hw",
+              "native_shape_chw", "feature_rgb_dtype", "source_box_xywh",
+              "native_configuration_sha256", "phase_configuration_sha256"}
+    measured = profile.get("measured_native_layout")
+    for where, value in (("measured", measured), ("requested", requested)):
+        if (not isinstance(value, dict) or set(value) != fields
+                or value["format"] != "darsia-native-phase-n1-measured-layout-v1"
+                or value["pipeline"] != "native-phase-n1"
+                or value["precision"] not in {"float32", "float64"}
+                or value["feature_rgb_dtype"] != value["precision"]):
+            raise ValueError("Explicit closed measured/requested native layout required: " + where)
+        hw = _native_layout_shape(value["native_shape_hw"], 2, where + " native")
+        _native_layout_shape(value["phase_shape_hw"], 2, where + " phase")
+        chw = _native_layout_shape(value["native_shape_chw"], 3, where + " channels")
+        box = value["source_box_xywh"]
+        if (chw[1:] != hw or not isinstance(box, list) or len(box) != 4
+                or any(type(v) is not int for v in box) or box[2:] != hw[::-1]):
+            raise ValueError("Explicit native channel/source-box dimensions disagree: " + where)
+        for key in ("native_configuration_sha256", "phase_configuration_sha256"):
+            if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
+                raise ValueError("Explicit measured/requested native/phase configuration SHA required")
+    if json.dumps(measured, sort_keys=True, separators=(",", ":")) != json.dumps(requested, sort_keys=True, separators=(",", ":")):
+        raise ValueError("Requested native layout/configuration differs from measured profile; no size/default fallback")
+
+
+def _writer_identity(repository, commit, row):
+    if (not isinstance(row, dict) or set(row) != {"relative_path", "sha256"}
+            or not isinstance(row["relative_path"], str)
+            or not isinstance(row["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None):
+        raise ValueError("Explicit writer relative path/SHA required")
+    relative = row["relative_path"]
+    pure = PureWindowsPath(relative)
+    if pure.drive or pure.root or ".." in pure.parts or not relative.startswith("src/darsia/fluidflower/"):
+        raise ValueError("Writer identity must be repository-relative")
+    original = subprocess.check_output(["git", "-C", str(repository), "show", commit + ":" + relative])
+    actual = (Path(repository) / relative).resolve(strict=True)
+    if not actual.is_relative_to(Path(repository).resolve()):
+        raise ValueError("Capacity writer escaped repository")
+    before, raw = actual.stat(), actual.read_bytes()
+    after = actual.stat()
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or hashlib.sha256(original).hexdigest() != row["sha256"]
+            or raw.replace(b"\r\n", b"\n") != original.replace(b"\r\n", b"\n")):
+        raise ValueError("Capacity profile writer identity differs")
+
+
+def _profile_writer_identity(repository, measured_commit, current_commit, row):
+    """Whole writer identity, except the one explicit output-location flag fix."""
+    if not isinstance(row, dict):
+        raise ValueError("Explicit writer relative path/SHA required")
+    measured_sha = row.get("measured_sha256")
+    if set(row) == {"relative_path", "sha256"}:
+        _writer_identity(repository, current_commit, row)
+        original = subprocess.check_output(["git", "-C", str(repository), "show", measured_commit + ":" + row["relative_path"]])
+        if hashlib.sha256(original).hexdigest() != row["sha256"]:
+            raise ValueError("Measured/current actual writer differs; a new profile is required")
+        return
+    if (set(row) != {"relative_path", "sha256", "measured_sha256"}
+            or row.get("relative_path") != "src/darsia/fluidflower/mass/n1_pipeline.py"
+            or not isinstance(measured_sha, str) or re.fullmatch(r"[0-9a-f]{64}", measured_sha) is None):
+        raise ValueError("Only the exact n1_pipeline output-location metadata fix accepts separate measured writer provenance")
+    _writer_identity(repository, current_commit, {k: row[k] for k in ("relative_path", "sha256")})
+    trees = []
+    expected = ("a7c441225da1bee963dd411dacc28a29efe8f20b2e233bf2e3aea91293048c56",
+                "289d8766f0dedad5b5bde3b46d17cc8870e79530fd2aaa6b75d7956285b64060")
+    for commit, sha, function_sha in ((measured_commit, measured_sha, expected[0]), (current_commit, row["sha256"], expected[1])):
+        raw = subprocess.check_output(["git", "-C", str(repository), "show", commit + ":" + row["relative_path"]])
+        if hashlib.sha256(raw).hexdigest() != sha:
+            raise ValueError("Measured/current metadata-only writer provenance SHA differs")
+        tree = ast.parse(raw)
+        target = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_storage_facts"]
+        if len(target) != 1 or hashlib.sha256(ast.dump(target[0], include_attributes=False).encode()).hexdigest() != function_sha:
+            raise ValueError("The writer delta is not the exact reviewed output-location metadata fix")
+        tree.body.remove(target[0])
+        trees.append(ast.dump(tree, include_attributes=False))
+    if trees[0] != trees[1]:
+        raise ValueError("An actual writer/executor body changed; a new measured profile is required")
+
+
+def _orchestration_identity(repository, measured_commit, current_commit, row):
+    """Known reporting-only runner delta: whole SHAs are explicit provenance.
+
+    All seven unchanged execution/output functions are applicability evidence;
+    prepare_job/main reporting changes never become a scientific equivalence.
+    """
+    relative = "src/darsia/fluidflower/pipeline/runner.py"
+    functions = {"_phase_outputs", "_inventory", "validate_frame_artifacts", "_restore_predecessor",
+                 "scalar_table", "run_series", "_run_series"}
+    if (not isinstance(row, dict) or set(row) != {"relative_path", "measured_sha256", "current_sha256", "functions"}
+            or row["relative_path"] != relative or not isinstance(row["functions"], dict)
+            or set(row["functions"]) != functions):
+        raise ValueError("Exact original runner execution-function identities required")
+    for commit, field in [(measured_commit,"measured_sha256"),(current_commit,"current_sha256")]:
+        if field == "current_sha256":
+            _writer_identity(repository,commit,dict(relative_path=relative,sha256=row[field]))
+        raw = subprocess.check_output(["git","-C",str(repository),"show",commit+":"+relative])
+        if hashlib.sha256(raw).hexdigest() != row[field]:
+            raise ValueError("Runner provenance file SHA differs")
+        actual = {node.name:node for node in ast.parse(raw).body if isinstance(node,ast.FunctionDef)}
+        for key in functions:
+            expected = row["functions"][key]
+            if (not isinstance(expected,str) or re.fullmatch(r"[0-9a-f]{64}",expected) is None
+                    or hashlib.sha256(ast.dump(actual[key],include_attributes=False).encode()).hexdigest()!=expected):
+                raise ValueError("An actual runner executor/output body changed; measured profile does not apply")
+
+
+@dataclass(frozen=True)
+class SpaceEstimate:
+    run: str
+    case_count: int
+    measured_native_bytes_per_frame: int
+    native_expected_bytes: int
+    coarse_uncompressed_bytes: int
+    header_metadata_copy_estimated_bytes: int
+    transient_estimated_bytes: int
+    products_per_frame_estimated_bytes: int
+    profile: dict
+    measured_commit: str
+    model: str = "expected space; observed native profile plus uncompressed output additions and one in-flight frame allowance; no assumed compression gain"
+
+    @property
+    def products_estimated_bytes(self):
+        return self.native_expected_bytes + self.coarse_uncompressed_bytes + self.header_metadata_copy_estimated_bytes
+
+    def needed(self, *, other_remaining_bytes=0, reserve_bytes=DEFAULT_RESERVE_BYTES):
+        return (self.products_estimated_bytes + self.transient_estimated_bytes
+                + _integer(other_remaining_bytes, "Other active remaining bytes")
+                + _integer(reserve_bytes, "Reserve bytes"))
+
+
+def estimate_run(task, config, profile, *, measurement, completion, layout=None,
+                 layout_bytes=0, profile_identity=None, requested_native_layout=None):
+    """Pure metadata estimate; missing applicability is refusal, not a default."""
+    if any(not isinstance(row,dict) for row in (task,config,profile,measurement,completion)):
+        raise ValueError("Explicit typed capacity metadata objects required")
+    if task.get("pipeline") == "native-phase-statistics":
+        raise ValueError("Phase-one output layout has no separately measured capacity contract; no full-pipeline profile reuse")
+    if task.get("pipeline") == "native-phase-n1":
+        _check_measured_native_layout(profile, requested_native_layout)
+        if profile["measured_native_layout"]["precision"] != task.get("precision"):
+            raise ValueError("Measured native layout and original task precision differ")
+    cases = task.get("ordered_case_ids")
+    if (not isinstance(cases, list) or not cases or len(set(cases)) != len(cases)
+            or [s.get("case_id") for s in config.get("frames", [])] != cases
+            or profile.get("format") != PROFILE_FORMAT
+            or profile.get("pipeline") != task.get("pipeline")
+            or profile.get("precision") != task.get("precision")
+            or (task.get("pipeline") != "native-phase-n1" and config.get("precision") != task.get("precision"))
+            or (task.get("pipeline") == "native-phase-n1" and "precision" in config and config["precision"] != task.get("precision"))
+            or config.get("run") != task.get("run")
+            or re.fullmatch(r"[0-9a-f]{40}", str(profile.get("measured_commit", ""))) is None):
+        raise ValueError("Capacity profile/task pipeline, precision or exact case order differs")
+    ids = profile.get("measured_case_ids")
+    if not isinstance(ids, list) or not ids or len(set(ids)) != len(ids):
+        raise ValueError("Measured native profile requires its exact distinct case IDs")
+    ids = [name(case) for case in ids]
+    count = completion.get("actual_case_count", completion.get("case_count"))
+    measured_commit = completion.get("actual_commit", completion.get("commit"))
+    if (completion.get("complete") is not True or completion.get("passed") is not True
+            or type(count) is not int or count != len(ids)
+            or measured_commit != profile["measured_commit"]
+            or completion.get("precision") != task["precision"]):
+        raise ValueError("A complete applicable measured Main gate is required; no historical/current relabel")
+    inventory = measurement.get("inventory")
+    if not isinstance(inventory, list) or not inventory:
+        raise ValueError("Measured native file inventory required")
+    total, seen, by_case = 0, set(), dict.fromkeys(ids, 0)
+    for row in inventory:
+        if not isinstance(row,dict):
+            raise ValueError("Explicit measured file metadata required")
+        relative = row.get("relative_path")
+        if (not isinstance(relative, str) or not relative or relative in seen
+                or PureWindowsPath(relative).drive or PureWindowsPath(relative).root
+                or ".." in PureWindowsPath(relative).parts):
+            raise ValueError("Measured file inventory requires unique owned relative names")
+        seen.add(relative)
+        size = _integer(row.get("bytes"), "Observed file bytes")
+        total += size
+        matches = set(PureWindowsPath(relative).parts) & set(ids)
+        if len(matches) > 1:
+            raise ValueError("Measured file belongs to multiple cases")
+        if matches:
+            by_case[next(iter(matches))] += size
+    if (total != measurement.get("total_logical_bytes")
+            or any(value <= 0 for value in by_case.values())):
+        raise ValueError("Measured native total/case coverage differs")
+    native_bpf = (total + len(ids) - 1) // len(ids)
+    extra_raw, extra_meta = 0, 0
+    request = config.get("storage")
+    if request is not None:
+        if (not isinstance(request, dict) or request.get("format") != "darsia-storage-output-request-v1"
+                or request.get("gas_score_encoding") != "uint8-la-q255-v1"
+                or not isinstance(layout, dict) or layout.get("precision") != task["precision"]
+                or layout.get("complete") is not True
+                or layout.get("format") != ("darsia-n1-storage-frame-v1" if task.get("pipeline") == "n1" else "darsia-storage-frame-v1")):
+            raise ValueError("Explicit compatible saved writer layout required for storage estimate")
+        native_shape = (layout.get("coarse") or {}).get("grid", {}).get("native_shape")
+        native_shape = native_shape or layout.get("before_rules", {}).get("target_shape_hw")
+        if (not isinstance(native_shape, list) or len(native_shape) != 2
+                or any(type(v) is not int or v < 1 for v in native_shape)):
+            raise ValueError("Writer metadata omits the original native image shape")
+        h, w = native_shape
+        # A full uncompressed LA image plus row-filter bytes; encoded bytes are
+        # estimated without compression gain. Per-row chunk and PNG headers are
+        # a transparent allocation allowance, not an observed file measurement.
+        extra_raw += h * (2 * w + 1)
+        extra_meta += 8 + 25 + 12 + 12 * (h + 1)
+        if request.get("resolution_mm") != "native":
+            from ..storage_resolution import metric_grid_shape
+            height, width = metric_grid_shape(request.get("extent_m"), request.get("resolution_mm"))
+            coarse = layout.get("coarse")
+            identities = coarse.get("arrays") if isinstance(coarse, dict) else None
+            if not isinstance(identities, dict) or not identities:
+                raise ValueError("Original writer coarse array schema required")
+            for key, value in identities.items():
+                if not isinstance(key, str) or not key or not isinstance(value, dict):
+                    raise ValueError("Explicit writer array identities required")
+                match = re.fullmatch(r"[<>=|]([biuf])(1|2|4|8)", str(value.get("dtype", "")))
+                if match is None:
+                    raise ValueError("Unsupported actual writer array dtype")
+                extra_raw += height * width * int(match[2])
+                # Header allocation is explicitly estimated, not a codec proof.
+                # Current simple .npy headers fit here; larger/changed schemas
+                # need a new writer/profile rather than reusing this model.
+                header = repr(dict(descr=value["dtype"], fortran_order=False, shape=(height, width)))
+                extra_meta += 12 + ((len(header) + 64) // 64) * 64
+                filename = (key + ".npy").encode("utf8")
+                extra_meta += 30 + 46 + 2 * len(filename) + 20 + 28
+            extra_meta += 22 + 76  # ZIP end records, including ZIP64 allowance.
+        extra_meta += _integer(layout_bytes, "Observed layout metadata bytes")
+        for row in layout.get("files", []):
+            filename = PureWindowsPath(_bound({k: row[k] for k in ("path", "sha256", "size_bytes")} )["path"]).name
+            if filename not in {"storage_stored_frame.npz", "storage_gas_probability_before_rules.png"}:
+                extra_meta += row["size_bytes"]  # Literal already-saved copy sizes.
+    n = len(cases)
+    transient = max(by_case.values()) + extra_raw + extra_meta
+    return SpaceEstimate(name(task["run"]), n, native_bpf, native_bpf * n,
+        extra_raw * n, extra_meta * n, transient, native_bpf + extra_raw + extra_meta,
+        dict(profile_identity or {}), profile["measured_commit"])
+
+
+def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=None):
+    _state, _reserve, binding = settings(stores, series_id)
+    profile, _raw = read_bound(binding)
+    fields = {"format", "pipeline", "precision", "measured_commit", "measured_case_ids",
+              "measurement", "completion", "writers", "orchestration", "layout_receipt"}
+    if task.get("pipeline") == "native-phase-n1":
+        fields.add("measured_native_layout")
+    if set(profile) != fields:
+        raise ValueError("Exact expected-space profile schema required")
+    writers = profile["writers"]
+    required = {"src/darsia/fluidflower/mass/n1_pipeline.py",
+                "src/darsia/fluidflower/mass/n1_statistics.py"}
+    if task.get("pipeline") in {"native-phase-n1","native-phase-statistics"}:
+        required|={"src/darsia/fluidflower/pipeline/series.py","src/darsia/fluidflower/native/sidecar.py"}
+    if task.get("pipeline") == "native-phase-statistics":
+        required.add("src/darsia/fluidflower/pipeline/phase_statistics.py")
+    if config.get("storage") is not None:
+        required |= {"src/darsia/fluidflower/storage_resolution.py", "src/darsia/fluidflower/storage_outputs.py"}
+        if task.get("pipeline") == "n1":
+            required.add("src/darsia/fluidflower/storage_n1_outputs.py")
+    if (not isinstance(writers, list) or len(writers) > 32
+            or any(not isinstance(row,dict) for row in writers)
+            or len({r.get("relative_path") for r in writers}) != len(writers)
+            or not required <= {r.get("relative_path") for r in writers}):
+        raise ValueError("Profile omits an actual applicable output writer")
+    for row in writers:
+        _profile_writer_identity(repository, profile["measured_commit"], task["commit"], row)
+    orchestration = profile["orchestration"]
+    if task.get("pipeline") == "native-phase-n1":
+        if not isinstance(orchestration,list) or len(orchestration)!=1:
+            raise ValueError("Bind measured/current runner provenance and unchanged execution AST")
+        _orchestration_identity(repository,profile["measured_commit"],task["commit"],orchestration[0])
+    elif orchestration != []:
+        raise ValueError("Unused orchestration identities cannot substitute for actual stage writers")
+    measurement, _ = read_bound(profile["measurement"])
+    completion, _ = read_bound(profile["completion"])
+    layout, raw = (None, b"") if profile["layout_receipt"] is None else read_bound(profile["layout_receipt"])
+    requested = (_native_layout_for_task(stores, series_id, task, config, metadata_rows)
+                 if task.get("pipeline") == "native-phase-n1" else None)
+    return estimate_run(task, config, profile, measurement=measurement, completion=completion,
+                        layout=layout, layout_bytes=len(raw), profile_identity=binding,
+                        requested_native_layout=requested)
+
+
+def volume_info(root):
+    """Fresh space and actual containing-volume metadata; no write probe."""
+    path = Path(root).resolve()
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    path = path.resolve(strict=True)
+    stat = path.stat()
+    anchor = str(path.anchor)
+    if os.name == "nt":
+        buffer = ctypes.create_unicode_buffer(32768)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        from ctypes import wintypes
+        kernel.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        kernel.GetVolumePathNameW.restype = wintypes.BOOL
+        if not kernel.GetVolumePathNameW(str(path), buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        anchor = buffer.value
+    if not stat.st_dev:
+        raise RunUnavailable("OS did not identify the actual results volume")
+    usage = shutil.disk_usage(path)
+    return dict(volume_id=str(stat.st_dev), volume_anchor=anchor,
+                free_bytes=int(usage.free), checked_container=str(path))
+
+
+class _LocalVolumeLock:
+    """Same OS mutex/flock primitive as ServiceLock, never a NAS lock."""
+    def __init__(self, directory, key):
+        self.directory, self.key = Path(directory), key
+        self.handle = self.file = None
+
+    def __enter__(self):
+        if os.name == "nt":
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel.CreateMutexW.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.restype = wintypes.BOOL
+            self.handle = kernel.CreateMutexW(None, False, "Global\\DarSIACapacity-" + self.key)
+            if not self.handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            status = kernel.WaitForSingleObject(self.handle, 30000)
+            if status not in (0, 0x80):
+                kernel.CloseHandle(self.handle)
+                self.handle = None
+                raise RunUnavailable("Local capacity mutex is busy/unavailable; no claim made")
+        else:
+            import fcntl
+            self.file = (self.directory / ("mutex-" + self.key)).open("a")
+            fcntl.flock(self.file, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *args):
+        if self.handle is not None:
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.ReleaseMutex(self.handle)
+            kernel.CloseHandle(self.handle)
+        if self.file is not None:
+            self.file.close()
+
+
+def _owner(value):
+    if (not isinstance(value, dict) or set(value) != {"machine", "pid", "process_create_time"}
+            or type(value["pid"]) is not int or value["pid"] <= 0
+            or not isinstance(value["process_create_time"], str)
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value["process_create_time"]) is None):
+        raise ValueError("Actual original PID/string process epoch required")
+    name(value["machine"])
+    return value
+
+
+def _reservation_id(job_root, task):
+    return hashlib.sha256((str(Path(job_root).resolve()).casefold() + "\0" +
+        name(task["run"]) + "\0" + task["attempt_id"]).encode()).hexdigest()
+
+
+def _read_local(path):
+    path = Path(path)
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("Capacity record exceeds1MiB")
+    return _json_bytes(path.read_bytes())
+
+
+def _capacity_host_context():
+    """Actual OS machine-common folder/account; never process environment paths."""
+    if os.name != "nt":
+        raise RunUnavailable("Host-wide capacity binding is not implemented on this OS; no per-user fallback")
+    from ctypes import wintypes
+    kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+    shell=ctypes.WinDLL("shell32",use_last_error=True)
+    advapi=ctypes.WinDLL("advapi32",use_last_error=True)
+    common=ctypes.create_unicode_buffer(32768)
+    # CSIDL_COMMON_APPDATA, SHGFP_TYPE_CURRENT: OS KnownFolder compatibility API.
+    shell.SHGetFolderPathW.argtypes=[wintypes.HWND,ctypes.c_int,wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR]
+    shell.SHGetFolderPathW.restype=ctypes.c_long
+    if shell.SHGetFolderPathW(None,0x23,None,0,common)!=0:
+        raise RunUnavailable("OS CommonAppData is unavailable; no binding or claim")
+    host=ctypes.create_unicode_buffer(256);length=wintypes.DWORD(len(host))
+    kernel.GetComputerNameW.argtypes=[wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetComputerNameW.restype=wintypes.BOOL
+    if not kernel.GetComputerNameW(host,ctypes.byref(length)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.GetCurrentProcess.restype=wintypes.HANDLE
+    kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+    kernel.LocalFree.argtypes=[ctypes.c_void_p]
+    kernel.LocalFree.restype=ctypes.c_void_p
+    advapi.OpenProcessToken.argtypes=[wintypes.HANDLE,wintypes.DWORD,ctypes.POINTER(wintypes.HANDLE)]
+    advapi.OpenProcessToken.restype=wintypes.BOOL
+    advapi.GetTokenInformation.argtypes=[wintypes.HANDLE,ctypes.c_int,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD)]
+    advapi.GetTokenInformation.restype=wintypes.BOOL
+    advapi.ConvertSidToStringSidW.argtypes=[ctypes.c_void_p,ctypes.POINTER(wintypes.LPWSTR)]
+    advapi.ConvertSidToStringSidW.restype=wintypes.BOOL
+    token=wintypes.HANDLE();sid_text=wintypes.LPWSTR()
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(),0x0008,ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size=wintypes.DWORD()
+        advapi.GetTokenInformation(token,1,None,0,ctypes.byref(size))  # TokenUser
+        if ctypes.get_last_error()!=122 or not 0<size.value<=65536:
+            raise RunUnavailable("Actual service-account token metadata is unavailable")
+        data=ctypes.create_string_buffer(size.value)
+        if not advapi.GetTokenInformation(token,1,data,size.value,ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # TOKEN_USER begins with SID_AND_ATTRIBUTES; its first field is PSID.
+        sid=ctypes.cast(data,ctypes.POINTER(ctypes.c_void_p)).contents.value
+        if not advapi.ConvertSidToStringSidW(sid,ctypes.byref(sid_text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        account=sid_text.value
+    finally:
+        if sid_text:kernel.LocalFree(ctypes.cast(sid_text,ctypes.c_void_p))
+        kernel.CloseHandle(token)
+    return dict(host=host.value.casefold(),service_account_sid=account,
+                common_root=str(Path(common.value)/"DarSIA"/"capacity-bindings"))
+
+
+def _authority_alias(value):
+    """An explicitly listed namespace root, never a physical-volume identity."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("Explicit NAS server/share alias required")
+    pure = PureWindowsPath(value)
+    if (not pure.is_absolute() or not pure.drive.startswith("\\\\")
+            or pure.parts != (pure.anchor,) or pure.drive.startswith(("\\\\?", "\\\\."))):
+        raise ValueError("NAS alias must name one whole normalized UNC server/share root")
+    return str(pure).casefold()
+
+
+def _owner_scope(document, binding, results_root, context):
+    """Pure Q49 static config validation. It proves no physical equivalence."""
+    _bound(binding)
+    fields = {"format", "canonical_owner_path", "aliases", "owner", "single_computing_host"}
+    if (not isinstance(document, dict) or set(document) != fields
+            or document.get("format") != "darsia-single-host-nas-authority-v1"
+            or document.get("single_computing_host") is not True):
+        raise RunUnavailable("NAS results need the exact immutable single-host authority config; no task claimed")
+    aliases = document["aliases"]
+    if not isinstance(aliases, list) or not 0 < len(aliases) <= 128:
+        raise ValueError("Bounded explicit NAS alias list required")
+    keys = [_authority_alias(value) for value in aliases]
+    if keys != sorted(set(keys)):
+        raise ValueError("NAS authority aliases must be unique and canonically ordered")
+    canonical = document["canonical_owner_path"]
+    if (not isinstance(canonical, str) or not canonical or "\x00" in canonical
+            or not PureWindowsPath(canonical).is_absolute()
+            or ".." in PureWindowsPath(canonical).parts
+            or PureWindowsPath(canonical).name.casefold() != "nas_owner.json"
+            or str(PureWindowsPath(canonical)).casefold() != str(PureWindowsPath(binding["path"])).casefold()
+            or _authority_alias(PureWindowsPath(canonical).anchor) not in keys):
+        raise ValueError("NAS owner descriptor must name its canonical shared NAS_OWNER.json")
+    actual = PureWindowsPath(str(results_root))
+    if (not actual.is_absolute() or ".." in actual.parts
+            or _authority_alias(actual.anchor) not in keys):
+        raise RunUnavailable("NAS results root is outside the complete operator-listed authority scope; use local outputs; no task claimed")
+    owner = document["owner"]
+    if (not isinstance(owner, dict) or set(owner) != {"machine_id", "host", "service_account_sid"}
+            or not isinstance(owner["host"], str) or not owner["host"]
+            or owner["host"] != owner["host"].strip().casefold()
+            or not isinstance(owner["service_account_sid"], str)
+            or re.fullmatch(r"S-1-[0-9]+(?:-[0-9]+)+", owner["service_account_sid"]) is None):
+        raise ValueError("Exact actual computing host/account and machine-id provenance required")
+    name(owner["machine_id"])
+    if (not isinstance(context, dict) or not isinstance(context.get("host"), str)
+            or context["host"].casefold() != owner["host"]
+            or context.get("service_account_sid") != owner["service_account_sid"]):
+        raise RunUnavailable("This NAS results authority is assigned to another actual computing host/account; use local outputs; no task claimed")
+    return dict(format="darsia-single-host-nas-authority-scope-v1",
+        owner_document=dict(path=canonical, sha256=binding["sha256"], size_bytes=binding["size_bytes"]),
+        aliases=keys, owner=dict(owner),
+        accounting="one conservative host/authority pool across every listed namespace; no physical-volume equivalence claimed")
+
+
+def remote_results_owner(stores, series_id, results_root, *, admission=None, context=None):
+    """Read only one pinned static document; never elect, create, renew or write."""
+    from ..job_filesystem import inspect_results_root, valid_results_admission, LocalFileAdmission
+    proof = inspect_results_root(results_root) if admission is None else admission
+    if not valid_results_admission(proof, results_root):
+        raise RunUnavailable("Configured results filesystem has no positive output admission; no task claimed")
+    if isinstance(proof, LocalFileAdmission) or proof.local is True:
+        return None
+    from ..store_map import capacity_settings
+    configured = capacity_settings(stores.document)
+    binding = None if configured is None else configured.get("remote_owner")
+    if binding is None:
+        raise RunUnavailable("NAS outputs require the operator-pinned single-host NAS_OWNER.json; other machines use local outputs; no task claimed")
+    _bound(binding)
+    if not 0 < binding["size_bytes"] <= 16 * 1024:
+        raise ValueError("NAS owner metadata must fit 16 KiB")
+    try:
+        document, _ = read_bound(binding)
+    except (OSError, ValueError) as error:
+        raise RunUnavailable("The pinned NAS owner document is missing or changed; no task claimed: " + str(error)) from error
+    return _owner_scope(document, binding, results_root,
+                        _capacity_host_context() if context is None else context)
+
+
+class CapacityLedger:
+    """Immutable own reservation/progress/release files, shared across jobs."""
+    def __init__(self, stores, series_id, results_root, *, volume_provider=volume_info,
+                 context_provider=_capacity_host_context):
+        from ..job_filesystem import inspect_local_file
+        from ..store_map import capacity_settings
+        configured=capacity_settings(stores.document)
+        if configured is None:
+            raise RunUnavailable("Configure local capacity state before claiming; no measured-profile fallback")
+        self.directory,self.reserve=Path(configured["state_directory"]),configured["reserve_bytes"]
+        evidence = inspect_local_file(self.directory / ".capacity-probe")
+        if not evidence.allowed:
+            raise RunUnavailable("Capacity state must be on an admitted LOCAL filesystem")
+        from ..store_map import _external_file
+        _external_file(self.directory / "identity.json", tuple(stores.roots(series_id).values()))
+        self.machine_id, self.results_root = stores.machine_id, Path(results_root)
+        self.directory=self.directory.expanduser().resolve()
+        if self.directory.exists() and not self.directory.is_dir():
+            raise RunUnavailable("Configured capacity state_directory is not a directory; no host binding or claim")
+        self.volume_provider,self.context_provider=volume_provider,context_provider
+        context=context_provider()
+        self.remote_scope=remote_results_owner(stores,series_id,self.results_root,context=context)
+        self.volume=volume_provider(self.results_root)
+        if (not isinstance(context,dict) or set(context)!={"host","service_account_sid","common_root"}
+                or not isinstance(context["host"],str) or not context["host"]
+                or not isinstance(context["service_account_sid"],str)
+                or re.fullmatch(r"S-1-[0-9]+(?:-[0-9]+)+",context["service_account_sid"]) is None):
+            raise RunUnavailable("Actual OS host, service-account SID and common root required")
+        self.host=context["host"].casefold()
+        self.account=context["service_account_sid"]
+        self.common_root=_external_file(Path(context["common_root"])/"binding-probe.json",tuple(stores.roots(series_id).values())).parent
+        common_evidence=inspect_local_file(self.common_root/"binding-probe.json")
+        if not common_evidence.allowed:
+            raise RunUnavailable("Machine-common capacity binding must be positively LOCAL")
+        # Logical map/service aliases never create a second physical namespace.
+        pool = (str(self.volume["volume_id"]) if self.remote_scope is None else
+                "nas-authority:" + self.remote_scope["owner_document"]["sha256"])
+        self.key=hashlib.sha256((self.host+"\0"+pool).encode()).hexdigest()
+        self.root=self.directory/self.key
+        self.binding_path=self.common_root/(self.key+".json")
+
+    def _common_binding(self, *, create=False):
+        expected=dict(format="darsia-host-volume-capacity-binding-v1",physical_host=self.host,
+            volume_id=self.volume["volume_id"],service_account_sid=self.account,
+            state_directory=str(self.directory),binding_file=str(self.binding_path))
+        if self.remote_scope is not None:
+            expected=dict(format="darsia-host-nas-authority-capacity-binding-v1",physical_host=self.host,
+                service_account_sid=self.account,remote_scope=self.remote_scope,
+                state_directory=str(self.directory),binding_file=str(self.binding_path))
+        if self.binding_path.exists():
+            if _read_local(self.binding_path)!=expected:
+                raise RunUnavailable("Host-volume capacity binding names another configured directory or service-account SID; no claim")
+            return True
+        if create:
+            self.common_root.mkdir(parents=True,exist_ok=True)
+            write_immutable(self.binding_path,expected)
+            return True
+        if self.root.exists():
+            raise RunUnavailable("Preserved ledger has no authoritative host-volume binding; inspect it, no fallback")
+        return False
+
+    @contextmanager
+    def locked(self):
+        # Default POSIX context refuses. Synthetic injected contexts may use
+        # the same existing flock primitive in their owned common temp folder.
+        if os.name!="nt":self.common_root.mkdir(parents=True,exist_ok=True)
+        # The configured ledger is never created before its binding is checked.
+        with _LocalVolumeLock(self.common_root,self.key):
+            self._common_binding(create=True)
+            self.directory.mkdir(parents=True,exist_ok=True)
+            self.root.mkdir(exist_ok=True)
+            marker=dict(format="darsia-local-capacity-volume-v2",physical_host=self.host,
+                service_account_sid=self.account,volume_id=self.volume["volume_id"],
+                state_directory=str(self.directory),host_binding=str(self.binding_path))
+            if self.remote_scope is not None:
+                marker=dict(format="darsia-host-local-capacity-authority-v1",physical_host=self.host,
+                    service_account_sid=self.account,remote_scope=self.remote_scope,
+                    state_directory=str(self.directory),host_binding=str(self.binding_path))
+            path=self.root/"identity.json"
+            if path.exists():
+                if _read_local(path)!=marker:
+                    raise RunUnavailable("Capacity directory/host/account/volume identity differs")
+            else:
+                write_immutable(path,marker)
+            yield self
+
+    def fresh_volume(self):
+        value = self.volume_provider(self.results_root)
+        if value["volume_id"] != self.volume["volume_id"]:
+            raise RunUnavailable("Results volume changed during capacity admission")
+        return value
+
+    def remaining(self, *, exclude_job=None):
+        if not self._common_binding():
+            return 0  # Prospective readonly report; no v2 claim can exist unbound.
+        total = 0
+        from itertools import islice
+        paths = list(islice(self.root.glob("r-*/reserved.json"), MAX_RESERVATIONS + 1))
+        if len(paths) > MAX_RESERVATIONS:
+            raise RunUnavailable("Preserved capacity history needs explicit maintenance; no claim")
+        for path in paths:
+            row = _read_local(path)
+            if (row.get("physical_host")!=self.host or row.get("service_account_sid")!=self.account
+                    or (self.remote_scope is None and row.get("volume_id")!=self.volume["volume_id"])
+                    or (self.remote_scope is not None and row.get("remote_scope")!=self.remote_scope)):
+                raise ValueError("Reservation belongs to another actual host/account/capacity scope")
+            if (row.get("format") != "darsia-local-capacity-reservation-v1"
+                    or path.parent.name != "r-" + _reservation_id(row["job_root"], row)
+                    or type(row.get("case_count")) is not int or row["case_count"] < 1
+                    or len(row.get("ordered_case_ids", [])) != row["case_count"]
+                    or len(set(row["ordered_case_ids"])) != row["case_count"]):
+                raise ValueError("Original reservation identity/case coverage differs")
+            _owner(row["owner"])
+            _integer(row["products_per_frame_estimated_bytes"], "Reserved products")
+            _integer(row["transient_estimated_bytes"], "Reserved transient")
+            if exclude_job is not None and Path(row["job_root"]).resolve() == Path(exclude_job).resolve():
+                continue
+            release = path.parent / "released.json"
+            if release.exists():
+                ended = _read_local(release)
+                if (ended.get("reservation_sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
+                        or ended.get("owner") != row["owner"] or ended.get("attempt_id") != row["attempt_id"]
+                        or ended.get("format") != "darsia-local-capacity-release-v1"):
+                    raise ValueError("Capacity release belongs to another reservation")
+                continue
+            committed = 0
+            progress_paths = list(islice(path.parent.glob("p-*.json"), row["case_count"] + 1))
+            if len(progress_paths) > row["case_count"]:
+                raise ValueError("Capacity progress exceeds original case count")
+            for progress in progress_paths:
+                update = _read_local(progress)
+                if (update.get("owner") != row["owner"] or update.get("attempt_id") != row["attempt_id"]
+                        or update.get("case_id") not in row["ordered_case_ids"]
+                        or update.get("committed_prefix_count") != row["ordered_case_ids"].index(update["case_id"]) + 1):
+                    raise ValueError("Capacity progress ownership differs")
+                committed = max(committed, _integer(update.get("committed_prefix_count"), "Committed prefix"))
+            if committed > row["case_count"]:
+                raise ValueError("Capacity progress exceeds original case count")
+            total += ((row["case_count"] - committed) * row["products_per_frame_estimated_bytes"]
+                      + row["transient_estimated_bytes"])
+        return total
+
+    def bind(self, job_root, claim, owner, estimate):
+        _owner(owner)
+        if not self._common_binding():
+            raise RunUnavailable("Bind the authoritative host-volume directory before any reservation")
+        if claim.token != claim.task["attempt_id"] or estimate.case_count != len(claim.task["ordered_case_ids"]):
+            raise ValueError("Capacity reservation differs from the actual claim")
+        path = self.root / ("r-" + _reservation_id(job_root, claim.task))
+        if path.exists():
+            raise RunUnavailable("An original capacity reservation already exists for this claim token")
+        path.mkdir()
+        value = dict(format="darsia-local-capacity-reservation-v1", machine_id=self.machine_id,
+            physical_host=self.host,service_account_sid=self.account,
+            volume_id=self.volume["volume_id"], owner=dict(owner), job_root=str(Path(job_root).resolve()),
+            run=claim.task["run"], attempt_id=claim.token, case_count=estimate.case_count,
+            ordered_case_ids=list(claim.task["ordered_case_ids"]),
+            products_per_frame_estimated_bytes=estimate.products_per_frame_estimated_bytes,
+            transient_estimated_bytes=estimate.transient_estimated_bytes, estimate=asdict(estimate))
+        if self.remote_scope is not None:
+            value.update(remote_scope=self.remote_scope, results_root=str(self.results_root),
+                observed_client_volume=dict(self.volume),
+                volume_identity_claim="none; scope accounting spans every operator-listed alias")
+        write_immutable(path / "reserved.json", value)
+        return path
+
+    def progress(self, reservation, owner, event):
+        self._common_binding()
+        if event.get("state") not in {"frame_completed", "phase1_frame_completed"}:
+            return
+        row = _read_local(Path(reservation) / "reserved.json")
+        if row["owner"] != owner or event.get("complete") is not True or event.get("run") != row["run"]:
+            raise ValueError("Capacity progress must follow the original owned committed event")
+        case = event.get("case_id")
+        if case not in row["ordered_case_ids"]:
+            raise ValueError("Capacity progress case is outside the original task")
+        position = row["ordered_case_ids"].index(case) + 1
+        # Both original executors commit a chronological prefix, including any
+        # prefix admitted by their unchanged resume validators before this event.
+        value = dict(owner=owner, attempt_id=row["attempt_id"], case_id=case,
+                     committed_prefix_count=position, original_event=event)
+        path = Path(reservation) / ("p-" + str(position).zfill(8) + ".json")
+        if path.exists():
+            if _read_local(path) != value:
+                raise ValueError("Different original capacity progress already exists")
+        else:
+            write_immutable(path, value)
+
+    def release(self, reservation, actor, *, retirement=None):
+        self._common_binding()
+        _owner(actor)
+        path = Path(reservation) / "reserved.json"
+        row = _read_local(path)
+        if retirement is None:
+            if actor != row["owner"]:
+                raise ValueError("Only the original owner may close its own reservation")
+            basis = "original_executor_left_and_IO_scope_closed"
+        else:
+            identities = retirement.get("identities", [])
+            if (retirement.get("complete") is not True or retirement.get("all_absent") is not True
+                    or retirement.get("worker_os_references_closed") is not True
+                    or retirement.get("supervisor") != actor or retirement.get("run") != row["run"]
+                    or retirement.get("attempt_id") != row["attempt_id"]
+                    or not any(i.get("pid") == row["owner"].get("pid")
+                        and i.get("process_create_time") == row["owner"].get("process_create_time") for i in identities)):
+                raise ValueError("Original supervisor retirement does not bind this reservation owner")
+            basis = "original_owned_child_retirement"
+        value = dict(format="darsia-local-capacity-release-v1", owner=row["owner"], actor=actor,
+            attempt_id=row["attempt_id"], basis=basis,
+            reservation_sha256=hashlib.sha256(path.read_bytes()).hexdigest(), retirement=retirement)
+        destination = Path(reservation) / "released.json"
+        if not destination.exists():
+            write_immutable(destination, value)
+        # A prior own release is retained, never overwritten by later retirement.
+        elif _read_local(destination).get("reservation_sha256") != value["reservation_sha256"]:
+            raise ValueError("Capacity release changed reservation identity")
+
+
+def report(estimate, volume, other_remaining, reserve):
+    needed = estimate.needed(other_remaining_bytes=other_remaining, reserve_bytes=reserve)
+    free = _integer(volume["free_bytes"], "Actual free bytes")
+    return dict(**asdict(estimate), needed_bytes=needed, free_bytes=free,
+                other_active_remaining_bytes=other_remaining, reserve_bytes=reserve,
+                sufficient=free >= needed, volume=volume,
+                message=f"{estimate.run}: needed {needed} bytes / free {free} bytes (includes other active remaining output, estimated transient space and reserve)")
+
+
+def configuration_for_task(stores, series_id, task, rows=None):
+    """Read the one already-declared run configuration, never array payloads."""
+    from ..store_map import resolve_input_reference, require_real_containment
+    bound = task["configuration"]
+    if rows is None:
+        path = require_real_containment(stores.roots(series_id)[bound["root_alias"]],
+            resolve_input_reference(bound, stores, series_id))
+    else:
+        matches = [row.path for row in rows if "run.configuration" in row.uses
+                   and row.reference == bound]
+        if len(matches) != 1:
+            raise ValueError("One original run.configuration role is required")
+        path = matches[0]
+    return read_bound(dict(path=str(path), sha256=bound["sha256"], size_bytes=bound["bytes"]))[0]
+
+
+class ClaimCapacity:
+    """One host-local critical section spans fresh estimate, claim and reservation."""
+    def __init__(self, runtime, owner, on_refusal=None):
+        self.runtime, self.owner, self.on_refusal = runtime, _owner(owner), on_refusal
+        self.ledger = self.lock = self.error = None
+        self.estimates = {}
+
+    def __enter__(self):
+        try:
+            root = self.runtime.stores.roots(self.runtime.job["series_id"])["results"]
+            self.ledger = CapacityLedger(self.runtime.stores, self.runtime.job["series_id"], root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.error = "Capacity admission unavailable: " + str(error)
+        return self
+
+    def _unlock(self):
+        if self.lock is not None:
+            active,self.lock=self.lock,None
+            active.__exit__(None,None,None)
+
+    def _refuse(self, task, error):
+        text = str(error)
+        if self.runtime.capacity_refusals.get(task["run"]) != text:
+            if self.on_refusal is not None:
+                self.on_refusal(dict(kind="capacity_refusal", run=task["run"], message=text))
+            self.runtime.capacity_refusals[task["run"]] = text
+        raise RunUnavailable(text) from error
+
+    def availability(self, task):
+        self._unlock()  # A prior queue candidate may have lost its atomic rename.
+        if self.error is not None:
+            self._refuse(task, RunUnavailable(self.error))
+        # Original input/resume identity errors retain their original behavior.
+        rows = self.runtime.availability(task)
+        try:
+            config = configuration_for_task(self.runtime.stores, self.runtime.job["series_id"], task, rows)
+            estimate = load_estimate(self.runtime.stores, self.runtime.job["series_id"], task, config,
+                                     repository=Path(__file__).resolve().parents[4], metadata_rows=rows)
+            # Slow original input admission/profile reads run outside this local
+            # transaction. Only fresh space -> claim -> reservation is serialized.
+            self.lock=self.ledger.locked()
+            self.lock.__enter__()
+            other=self.ledger.remaining()
+            current = report(estimate,self.ledger.fresh_volume(),other,self.ledger.reserve)
+            if not current["sufficient"]:
+                raise RunUnavailable(current["message"] + "; leave this whole run pending")
+            self.estimates[task["attempt_id"]] = estimate
+            self.runtime.capacity_refusals.pop(task["run"],None)
+            return rows
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self._unlock()
+            self._refuse(task,error)
+
+    def bind(self, claim):
+        if claim is not None:
+            reservation = self.ledger.bind(self.runtime.root, claim, self.owner,
+                                           self.estimates[claim.token])
+            self.runtime.capacities[claim.token] = (self.ledger, reservation, self.owner)
+
+    def __exit__(self, *args):
+        self._unlock()
+
+
+def release_retired_capacity(root, task, stores, retirement):
+    """Use the original supervisor's proven retirement; never inspect/kill PIDs."""
+    from .job_queue import read_json
+    if stores.document.get("capacity") is None:
+        # Pre-J6 attempts cannot own a reservation in a never-configured ledger.
+        return
+    job = read_json(Path(root) / "job.json")
+    result_root = stores.roots(job["series_id"])["results"]
+    ledger = CapacityLedger(stores, job["series_id"], result_root)
+    path = ledger.root / ("r-" + _reservation_id(root, task))
+    if not (path / "reserved.json").exists():
+        # Older pre-J6 attempts have no new reservation to release.
+        return
+    ledger.release(path, retirement["supervisor"], retirement=retirement)
+
+
+def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=None):
+    """Expected whole-job allocation if this machine handles every supplied run.
+
+    This is read-only projection, not a lease or a claim. Existing products are
+    not subtracted. Admission always repeats a fresh check before actual claim.
+    """
+    if len(tasks) != len(configs) or not tasks or len({t["run"] for t in tasks}) != len(tasks):
+        raise ValueError("Exact nonempty task/configuration correspondence required")
+    root = stores.roots(series_id)["results"]
+    from ..job_filesystem import inspect_results_root
+    admission = inspect_results_root(root)
+    if not admission.allowed:
+        raise RunUnavailable("Configured results filesystem refused: " + admission.reason)
+    ledger = CapacityLedger(stores, series_id, root)
+    estimates = [load_estimate(stores, series_id, task, config, repository=repository)
+                 for task, config in zip(tasks, configs)]
+    other = ledger.remaining(exclude_job=job_root)
+    volume = ledger.fresh_volume()
+    products = sum(row.products_estimated_bytes for row in estimates)
+    transient = sum(row.transient_estimated_bytes for row in estimates)
+    needed = products + transient + other + ledger.reserve
+    return dict(format="darsia-whole-job-expected-space-v1", machine_id=stores.machine_id,
+        results_root=str(root), results_protocol=admission.protocol, results_local=admission.local,
+        runs=[asdict(row) for row in estimates], products_expected_bytes=products,
+        transient_estimated_bytes=transient, other_active_remaining_bytes=other,
+        reserve_bytes=ledger.reserve, needed_bytes=needed, free_bytes=volume["free_bytes"],
+        sufficient=volume["free_bytes"] >= needed, volume=volume,
+        scope="whole supplied job per machine; preserved products not subtracted; repeated fresh before claim",
+        remote_scope=getattr(ledger,"remote_scope",None),
+        message=f"Expected needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}" +
+            ("; NAS outputs: one approved computing host across the complete configured authority scope; other machines use local outputs"
+             if getattr(ledger,"remote_scope",None) is not None else ""))
+
+
+def report_job_root(job_root, stores):
+    """Explicit UI/CLI read of declared job/task/configuration metadata only."""
+    from .job_queue import read_json
+    root = Path(job_root)
+    job = read_json(root / "job.json")
+    if job.get("format") != "darsia-alias-job-v1":
+        raise RunUnavailable("Expected-space report is for explicit alias jobs only")
+    runs = job["expected_runs"]
+    if not isinstance(runs, list) or not runs or len(runs) > 4096 or len(set(runs)) != len(runs):
+        raise ValueError("Bounded distinct original whole-job runs required")
+    tasks = [read_json(root / "results" / name(run) / "task.json") for run in runs]
+    if any(task["run"] != run for task, run in zip(tasks, runs)):
+        raise ValueError("Original run task differs from job order")
+    configs = [configuration_for_task(stores, job["series_id"], task) for task in tasks]
+    return whole_job_report(stores, job["series_id"], tasks, configs,
+        repository=Path(__file__).resolve().parents[4], job_root=root)
+
+
+def prepared_reports(stores_list, series_id, tasks, configs, job_root):
+    """Optional per-machine projection returned to caller, never job DATA."""
+    rows = []
+    seen = set()
+    for stores in stores_list:
+        if stores.machine_id in seen:
+            raise ValueError("Supply each machine's capacity map once")
+        seen.add(stores.machine_id)
+        try:
+            row = whole_job_report(stores, series_id, tasks, configs,
+                repository=Path(__file__).resolve().parents[4], job_root=job_root)
+        except (OSError, ValueError) as error:
+            row = dict(machine_id=stores.machine_id, available=False,
+                       needed_bytes=None, free_bytes=None, reason=str(error))
+        rows.append(row)
+    return rows

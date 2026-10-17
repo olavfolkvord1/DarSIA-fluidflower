@@ -143,7 +143,7 @@ def test_claim_uses_positive_local_output_and_portable_owner_metadata(tmp_path, 
 
 def test_arbitrary_local_path_without_admission_is_refused_before_science(tmp_path, monkeypatch):
     queue, _clock, callbacks, _events = fixture(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match="positive runtime local-output"):
+    with pytest.raises(ValueError, match="positive configured result-root"):
         queue.claim("Main", "cpu", {}, **dict(callbacks, output_factory=lambda *_: tmp_path / "arbitrary"))
     assert not (tmp_path / "arbitrary").exists()
     assert not list((queue.root / "done").glob("*.json"))
@@ -451,3 +451,47 @@ def test_unbound_or_unrequested_payload_receipt_cannot_pass_terminal_fence(tmp_p
         queue.complete(claim, completion())
     assert not (queue.root / "done/ac52.json").exists()
     queue.assert_owner(claim)
+
+
+@pytest.mark.parametrize("shortfall",[0,1])
+def test_capacity_check_precedes_atomic_claim_and_refuses_without_result(tmp_path,monkeypatch,shortfall):
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    from darsia.fluidflower.pipeline import capacity
+    queue,clock,callbacks,events=fixture(tmp_path,monkeypatch)
+    value=capacity.SpaceEstimate("ac52",1,100,100,0,0,30,100,{},"a"*40)
+    free={"value":130-shortfall}
+    ledger=SimpleNamespace(reserve=0,fresh_volume=lambda:dict(free_bytes=free["value"]),remaining=lambda:0,locked=nullcontext)
+    runtime=SimpleNamespace(root=queue.root,stores=None,job=dict(series_id="Synthetic"),
+        availability=callbacks["availability"],capacity_refusals={},capacities={})
+    original_owner=dict(machine="main-cpu",pid=123,process_create_time="12345.125")
+    check=capacity.ClaimCapacity(runtime,original_owner);check.ledger=ledger
+    monkeypatch.setattr(capacity,"configuration_for_task",lambda *a: {})
+    monkeypatch.setattr(capacity,"load_estimate",lambda *a,**k:value)
+    claim=queue.claim("Main","cpu",original_owner,**dict(callbacks,availability=check.availability))
+    if shortfall:
+        assert claim is None and (queue.root/"queue/ac52.json").exists()
+        assert events==["available_before_rename"]
+        assert not (tmp_path/"local-results").exists()
+        assert not list((queue.root/"claimed").glob("*/*.json"))
+    else:
+        assert claim is not None and events[:2]==["available_before_rename","owned_output_after_rename"]
+        assert check.estimates[claim.token] is value
+
+
+def test_capacity_callback_rechecks_free_space_before_each_unclaimed_run(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    from darsia.fluidflower.pipeline import capacity
+    queue,clock,callbacks,events=fixture(tmp_path,monkeypatch)
+    value=capacity.SpaceEstimate("ac52",1,100,100,0,0,30,100,{},"a"*40)
+    spaces=iter([129,130])
+    ledger=SimpleNamespace(reserve=0,fresh_volume=lambda:dict(free_bytes=next(spaces)),remaining=lambda:0,locked=nullcontext)
+    runtime=SimpleNamespace(root=queue.root,stores=None,job=dict(series_id="Synthetic"),
+        availability=callbacks["availability"],capacity_refusals={},capacities={})
+    owner=dict(machine="main-cpu",pid=123,process_create_time="12345.125")
+    check=capacity.ClaimCapacity(runtime,owner);check.ledger=ledger
+    monkeypatch.setattr(capacity,"configuration_for_task",lambda *a:{})
+    monkeypatch.setattr(capacity,"load_estimate",lambda *a,**k:value)
+    assert queue.claim("Main","cpu",owner,**dict(callbacks,availability=check.availability)) is None
+    assert queue.claim("Main","cpu",owner,**dict(callbacks,availability=check.availability)) is not None

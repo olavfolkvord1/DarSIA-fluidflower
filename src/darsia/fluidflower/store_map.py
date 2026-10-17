@@ -139,6 +139,48 @@ def read_store_map(path=None, *, forbidden_roots=(), locality_provider=None, syn
     return parse_store_map(raw, source={"path": str(path), "locality": asdict(locality)})
 
 
+def capacity_settings(document):
+    """Pure optional machine-local expected-space settings, not root aliases."""
+    value = document.get("capacity")
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or not {"state_directory", "profiles"} <= set(value)
+            or set(value) - {"state_directory", "profiles", "reserve_bytes", "remote_owner"}):
+        raise StoreMapError("Capacity needs state_directory, profiles and optional reserve_bytes/remote_owner")
+    state = _path(value["state_directory"])
+    if isinstance(state, PureWindowsPath) and state.drive.startswith("\\\\"):
+        raise StoreMapError("Capacity coordination state must be local")
+    reserve = value.get("reserve_bytes", 40 * 1024**3)
+    if type(reserve) is not int or reserve < 0:
+        raise StoreMapError("Capacity reserve_bytes must be a nonnegative integer")
+    profiles = value["profiles"]
+    if not isinstance(profiles, dict) or not profiles or len(profiles) > MAX_ENTRIES:
+        raise StoreMapError("Capacity needs a bounded table of explicit series profiles")
+    result = {}
+    for key, item in profiles.items():
+        identity = series_key(key)
+        if identity in result:
+            raise StoreMapError("Duplicate canonical capacity-profile series")
+        if (not isinstance(item, dict) or set(item) != {"path", "sha256", "size_bytes"}
+                or not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                or type(item["size_bytes"]) is not int or not 0 < item["size_bytes"] <= 128 * 1024 * 1024):
+            raise StoreMapError("Capacity profile needs an exact metadata path/SHA/size")
+        _path(item["path"])
+        result[identity] = dict(item)
+    settings = dict(state_directory=str(state), reserve_bytes=reserve, profiles=result)
+    if "remote_owner" in value:
+        owner = value["remote_owner"]
+        if (not isinstance(owner, dict) or set(owner) != {"path", "sha256", "size_bytes"}
+                or not isinstance(owner["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", owner["sha256"]) is None
+                or type(owner["size_bytes"]) is not int or not 0 < owner["size_bytes"] <= 16 * 1024):
+            raise StoreMapError("NAS owner needs one exact path/SHA/size descriptor no larger than 16 KiB")
+        selected = _path(owner["path"])
+        if not isinstance(selected, PureWindowsPath) or not selected.drive.startswith("\\\\"):
+            raise StoreMapError("The operator-owned NAS authority document must use its canonical UNC path")
+        settings["remote_owner"] = dict(owner)
+    return settings
+
+
 def parse_store_map(raw, *, source=None):
     """Pure settings validation; unknown fields and exact text remain caller-owned."""
     if not isinstance(raw, bytes) or len(raw) > LIMIT:
@@ -161,11 +203,9 @@ def parse_store_map(raw, *, source=None):
             raise StoreMapError("Store aliases must be a bounded table")
         roots = {_alias(alias): str(_path(value)) for alias, value in values.items()}
         if not {"series", "results"}.issubset(roots):
-            raise StoreMapError("Each store needs explicit series and local results roots")
-        result_root = _path(roots["results"])
-        if isinstance(result_root, PureWindowsPath) and result_root.drive.startswith("\\\\"):
-            raise StoreMapError("The computing machine's results root must be local")
+            raise StoreMapError("Each store needs explicit series and results roots")
         stores[key] = roots
+    capacity_settings(doc)
     return StoreMap(machine["id"], stores,
         {**dict(source or {}), "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, doc)
 
