@@ -217,6 +217,28 @@ def test_data_alias_and_changed_identity_fail_closed(tmp_path):
         pipeline.DataReader([dict(logical=logical,physical=wrong)])
 
 
+def test_json_rejects_changed_bytes_with_preserved_size_and_mtime(tmp_path):
+    """The consumed payload must match its SHA even if metadata is unchanged."""
+    import os
+
+    path = tmp_path / "data.json"
+    path.write_bytes(b'{"value":1}')
+    bound = pipeline.asset(path)
+    logical = dict(bound, path="logical/source.json")
+    reader = pipeline.DataReader([dict(logical=logical, physical=bound)])
+    assert reader.json(logical) == {"value": 1}
+    before = path.stat()
+    path.write_bytes(b'{"value":2}')
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns, after.st_dev, after.st_ino) == (
+        before.st_size, before.st_mtime_ns, before.st_dev, before.st_ino
+    )
+    assert hashlib.sha256(path.read_bytes()).hexdigest() != bound["sha256"]
+    with pytest.raises(ValueError, match="changed"):
+        reader.json(logical)
+
+
 def test_existing_partial_attempt_is_preserved(tiny_config,tmp_path):
     """An attempt with existing bytes cannot be replayed or silently resumed."""
     config,bound=tiny_config

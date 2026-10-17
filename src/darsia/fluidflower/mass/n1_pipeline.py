@@ -180,7 +180,10 @@ class DataReader:
     def json(self, descriptor):
         """Read a consumed JSON data document, never a code/control snapshot."""
         path = self.path(descriptor)
-        result = _strict_json(path.read_bytes())
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != descriptor["sha256"]:
+            raise ValueError("Consumed JSON data changed: " + str(path))
+        result = _strict_json(raw)
         self.path(descriptor)
         return result
 
