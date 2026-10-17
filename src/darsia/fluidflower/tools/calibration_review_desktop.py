@@ -2,6 +2,8 @@
 """GPU-assisted desktop client for intensive FluidFlower phase validation."""
 
 from __future__ import annotations
+
+from darsia.fluidflower.series_native_context import saved_reader_ui_entrypoint
 from darsia.fluidflower.review_storage import resolve_review_path
 from darsia.fluidflower.storage_paths import configured_tool_path
 
@@ -11,6 +13,7 @@ import argparse
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from contextvars import copy_context
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -1452,7 +1455,17 @@ class ImageTaskSignals(QObject):
     persist = Signal(str, object)
 
 
-class ImageTask(QRunnable):
+class _SavedReaderContextTask(QRunnable):
+    """Capture only a saved/native-reading UI task's construction context."""
+    def __init__(self):
+        super().__init__()
+        self._saved_reader_context = copy_context()
+
+    def run(self):
+        return self._saved_reader_context.run(self._run_saved_read)
+
+
+class ImageTask(_SavedReaderContextTask):
     def __init__(self, key: str, source: Path | DeferredImage, disk_cache: LocalAssetCache) -> None:
         super().__init__()
         self.key = key
@@ -1463,7 +1476,7 @@ class ImageTask(QRunnable):
         self.allow_compute = False
         self.defer_persistence = False
 
-    def run(self) -> None:
+    def _run_saved_read(self) -> None:
         try:
             expected_stamps = []
             if isinstance(self.source, DeferredImage):
@@ -2948,7 +2961,7 @@ class QuizPreparationSignals(QObject):
     finished = Signal(object, object, str)
 
 
-class QuizPreparationTask(QRunnable):
+class QuizPreparationTask(_SavedReaderContextTask):
     """One requested experiment; the image/annotation UI remains responsive."""
 
     def __init__(self, key: tuple[str, str], campaign: Path) -> None:
@@ -2957,7 +2970,7 @@ class QuizPreparationTask(QRunnable):
         self.cancelled = threading.Event()
         self.signals = QuizPreparationSignals()
 
-    def run(self) -> None:
+    def _run_saved_read(self) -> None:
         try:
             from darsia.fluidflower.phase_saved_review_proposals import ensure_review_proposals
             from darsia.fluidflower.phase_saved_review_metadata import configured_parameters
@@ -2987,7 +3000,7 @@ class PresentationSignals(QObject):
     finished = Signal(object, str, str)
 
 
-class PresentationTask(QRunnable):
+class PresentationTask(_SavedReaderContextTask):
     """Render a requested diagnostic/video without blocking native playback."""
 
     def __init__(self, candidate, kind):
@@ -2997,7 +3010,7 @@ class PresentationTask(QRunnable):
         self.cancelled = threading.Event()
         self.signals = PresentationSignals()
 
-    def run(self):
+    def _run_saved_read(self):
         try:
             from darsia.fluidflower.phase_saved_presentation import ensure_candidate_presentation
             def progress(message):
@@ -5344,7 +5357,7 @@ class ReviewHistorySignals(QObject):
     loaded = Signal(object, str)
 
 
-class ReviewHistoryTask(QRunnable):
+class ReviewHistoryTask(_SavedReaderContextTask):
     """Read history off the UI thread; never write to the review store."""
 
     def __init__(self, **inputs: Any) -> None:
@@ -5352,7 +5365,7 @@ class ReviewHistoryTask(QRunnable):
         self.inputs = inputs
         self.signals = ReviewHistorySignals()
 
-    def run(self) -> None:
+    def _run_saved_read(self) -> None:
         try:
             from darsia.fluidflower.tools.phase_review_history import load_review_history
             result = load_review_history(**self.inputs)
@@ -5467,7 +5480,7 @@ class ComparisonRefreshTask(QRunnable):
             self.signals.finished.emit(self.generation, "", payload, "")
 
 
-class ComparisonRunLoadTask(QRunnable):
+class ComparisonRunLoadTask(_SavedReaderContextTask):
     """Read and verify a selected run entirely outside the Qt event loop."""
 
     def __init__(self, generation, run, app_model, store, reviewer, recovery_dir,
@@ -5480,7 +5493,7 @@ class ComparisonRunLoadTask(QRunnable):
         self.cancelled = threading.Event()
         self.signals = SaveSignals()
 
-    def run(self):
+    def _run_saved_read(self):
         try:
             if self.cancelled.is_set():
                 self.signals.finished.emit(self.generation, self.run_name, {}, "")
@@ -12397,6 +12410,7 @@ def build_review_model(
     return build_workspace_model(args, review_workspaces(args)["training"])
 
 
+@saved_reader_ui_entrypoint
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.online or args.review_surface == "blind_gas_validation":

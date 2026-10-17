@@ -3416,7 +3416,8 @@ class SharedPhaseModelTrainingPage(QWidget):
             except RuntimeError:
                 pass  # Studio closed while its saved evidence was being read.
 
-        Thread(target=read, name="phase-pending-evidence", daemon=True).start()
+        pending_context = copy_context()
+        Thread(target=lambda: pending_context.run(read), name="phase-pending-evidence", daemon=True).start()
 
     def _receive_pending_evidence(self, message):
         key, result, sessions = message
@@ -3983,7 +3984,8 @@ class SharedPhaseModelTrainingPage(QWidget):
             except RuntimeError:
                 pass
 
-        Thread(target=read, name="phase-saved-experiments", daemon=True).start()
+        saved_experiments_context = copy_context()
+        Thread(target=lambda: saved_experiments_context.run(read), name="phase-saved-experiments", daemon=True).start()
 
     def _apply_saved_experiments(self, result) -> None:
         generation, root, rows, error = result

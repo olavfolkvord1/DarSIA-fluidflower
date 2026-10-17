@@ -5,6 +5,8 @@ Each pane uses its own saved corrected photograph and final phase overlay.
 """
 from __future__ import annotations
 
+from darsia.fluidflower.series_native_context import saved_reader_ui_entrypoint
+
 import argparse
 import hashlib
 import json
@@ -12,6 +14,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
+from contextvars import copy_context
 from types import SimpleNamespace
 
 from PySide6.QtCore import QEvent, QPointF, Qt, Signal, QSettings, QTimer
@@ -831,7 +834,8 @@ class PhaseModelComparisonDialog(QDialog):
                 self._completed.emit((generation, kind, result, error))
             except RuntimeError:
                 pass  # Closing never waits for an unavailable network share.
-        Thread(target=work, name="phase-model-comparison-read", daemon=True).start()
+        saved_reader_context = copy_context()
+        Thread(target=lambda: saved_reader_context.run(work), name="phase-model-comparison-read", daemon=True).start()
 
     def _clear(self, *, preserve_view=False):
         self.images = None
@@ -1204,6 +1208,7 @@ def install_review_comparison_tabs(window, correction_widget):
     return tabs
 
 
+@saved_reader_ui_entrypoint
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, action="append", required=True)

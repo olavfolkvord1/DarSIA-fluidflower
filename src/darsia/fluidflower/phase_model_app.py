@@ -83,6 +83,8 @@ def _configuration_context(args):
     from .native.config import load_parameters, configure_parameters, reset_parameters
     path = args.configuration.expanduser().resolve()
     document = load_parameters(path, args.configuration_sha256)
+    from .series_native_context import _bind_current_saved_readers
+    document, current_code_bindings = _bind_current_saved_readers(document)
     token = configure_parameters(document)
     previous = {name: os.environ.get(name) for name in
                 ("DARSIA_NATIVE_CONFIGURATION", "DARSIA_NATIVE_CONFIGURATION_SHA256")}
@@ -90,7 +92,8 @@ def _configuration_context(args):
         os.environ["DARSIA_NATIVE_CONFIGURATION"] = str(path)
         os.environ["DARSIA_NATIVE_CONFIGURATION_SHA256"] = args.configuration_sha256
         yield dict(path=str(path), sha256=args.configuration_sha256,
-                   size_bytes=path.stat().st_size)
+                   size_bytes=path.stat().st_size,
+                   current_code_bindings=list(current_code_bindings))
     finally:
         for name, value in previous.items():
             if value is None:

@@ -8,6 +8,8 @@ written atomically to JSON and CSV with full candidate provenance.
 
 from __future__ import annotations
 
+from contextvars import copy_context
+
 from darsia.fluidflower.storage_paths import configured_tool_path
 from darsia.fluidflower.review_storage import resolve_review_path
 
@@ -5785,8 +5787,9 @@ class ReviewApp:
     def start_live_updates(self) -> None:
         if not self.watch or self.watcher is not None:
             return
+        watcher_context = copy_context()
         self.watcher = threading.Thread(
-            target=self._watch_loop,
+            target=lambda: watcher_context.run(self._watch_loop),
             name="ffac-review-inventory-watcher",
             daemon=True,
         )
