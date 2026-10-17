@@ -47,16 +47,20 @@ class Native_TESTONLY:
         self.calls = []
         self.nested = False
         self.suspended_inherited = False
+        self.assigned = False
+        self.resumed = False
         self.active = [1, 0]
     def current_in_job(self):
         self.calls.append("nested-check")
         return self.nested
     def new_job(self, name):
         self.calls.append(("job", name)); return 10
-    def require_independent_suspended_child(self, process):
-        self.calls.append(("suspended-job-check", process))
-        if self.suspended_inherited:
-            raise CachePolicyError("Suspended child inherited an existing Job; no launch fallback")
+    def inherited_job_membership(self, process):
+        self.calls.append(("inherited-job-observation", process))
+        return self.suspended_inherited
+    def member(self, process, job):
+        self.calls.append(("membership", process, job))
+        return self.suspended_inherited if job is None else self.assigned
     def pipe(self):
         self.calls.append("pipe"); return 11, 12
     def create_suspended(self, command, environment, cwd, channel, *, process_information=None):
@@ -81,8 +85,10 @@ class Native_TESTONLY:
         self.calls.append(("assign", job, process))
         if self.assignment_failure:
             raise OSError("TESTONLY assignment refused")
+        self.assigned = True
     def resume(self, thread):
         self.calls.append(("resume", thread))
+        self.resumed = True
         if self.resume_failure:
             raise CachePolicyError("TESTONLY unknown ResumeThread result")
     def close(self, handle):
@@ -103,6 +109,10 @@ class Native_TESTONLY:
     def terminate_before_resume(self, process):
         self.calls.append(("terminate-before-instruction", process))
     def accounting(self, job):
+        if not self.assigned:
+            return dict(total_processes=0, active_processes=0, terminated_by_limit_processes=0)
+        if not self.resumed:
+            return dict(total_processes=1, active_processes=1, terminated_by_limit_processes=0)
         active = self.active.pop(0) if len(self.active) > 1 else self.active[0]
         self.calls.append(("accounting", active))
         return dict(total_processes=3, active_processes=active, terminated_by_limit_processes=0)
@@ -139,7 +149,7 @@ def test_original_public_argv_and_child_environment_not_rewritten(native_world):
         assert created[2]["TEMP"] == "original" and parent == original
         assert owned.CONTEXT_ENV in created[2] and owned.CHANNEL_ENV in created[2]
         labels = [row[0] if isinstance(row, tuple) else row for row in api.calls]
-        assert labels.index("create-suspended") < labels.index("identity") < labels.index("suspended-job-check") < labels.index("assign") < labels.index("resume")
+        assert labels.index("create-suspended") < labels.index("identity") < labels.index("inherited-job-observation") < labels.index("assign") < labels.index("resume")
         terminal = service.await_family()
         assert terminal["accounting"]["active_processes"] == 0
         assert terminal["wrapper_exit_code"] == 17
@@ -150,21 +160,20 @@ def test_original_public_argv_and_child_environment_not_rewritten(native_world):
 
 
 @pytest.mark.parametrize("inherited", [False, True])
-def test_silent_parent_is_accepted_only_after_suspended_child_kernel_check(native_world, inherited):
+def test_existing_parent_membership_is_recorded_but_own_assignment_is_single_attempt(native_world, inherited):
     api = Native_TESTONLY(native_world); api.nested = True
     api.suspended_inherited = inherited
     service = owned.OwnedWorker(native_world, api=api)
-    if inherited:
-        with pytest.raises(CachePolicyError, match="inherited an existing Job"):
-            service.start(["TESTONLY"], {}, Path("TESTONLY"))
-        assert ("terminate-before-instruction", 20) in api.calls
-        assert not any(isinstance(row, tuple) and row[0] in ("assign", "resume") for row in api.calls)
-    else:
-        assert service.start(["TESTONLY"], {}, Path("TESTONLY")) == SERVICE
-        assert ("assign", 10, 20) in api.calls and ("resume", 21) in api.calls
+    assert service.start(["TESTONLY"], {}, Path("TESTONLY")) == SERVICE
+    assert api.calls.count(("assign", 10, 20)) == 1 and ("resume", 21) in api.calls
+    observed = next(value for name, value, _ in native_world.records if name.endswith("-observed.json"))
+    assert observed["inherited_job_membership_observed"] is inherited
+    assert observed["own_job_assignment_verified_before_resume"] is True
+    assert observed["own_job_accounting_before_resume"] == dict(
+        total_processes=1, active_processes=1, terminated_by_limit_processes=0)
     service.close()
     assert "nested-check" not in api.calls
-    assert ("suspended-job-check", 20) in api.calls
+    assert ("inherited-job-observation", 20) in api.calls
 
 
 @pytest.mark.parametrize("failure", ["assignment_failure", "create_close_failure", "create_interrupt"])
@@ -284,15 +293,32 @@ def test_actual_owner_refusal_and_unconfirmed_temporary_close_are_both_retained(
 
 
 @pytest.mark.parametrize("member", [False, True])
-def test_independent_suspended_child_check_uses_child_handle_not_parent(member):
+def test_inherited_membership_only_observes_actual_child_handle_not_parent(member):
     calls = []
     api = SimpleNamespace(member=lambda process, job: calls.append((process, job)) or member)
-    if member:
-        with pytest.raises(CachePolicyError, match="inherited an existing Job"):
-            owned.NativeAPI.require_independent_suspended_child(api, 20)
-    else:
-        owned.NativeAPI.require_independent_suspended_child(api, 20)
+    assert owned.NativeAPI.inherited_job_membership(api, 20) is member
     assert calls == [(20, None)]
+
+
+@pytest.mark.parametrize("defect", ["identity", "membership", "flags", "accounting"])
+def test_post_assignment_own_job_proof_refuses_before_resume(native_world, defect):
+    api = Native_TESTONLY(native_world)
+    original_identity, original_accounting = api.identity, api.accounting
+    if defect == "identity":
+        api.identity = lambda handle: dict(original_identity(handle), pid=999) if api.assigned else original_identity(handle)
+    elif defect == "membership":
+        api.member = lambda process, job: False
+    elif defect == "flags":
+        api.require_job_flags = lambda job: 0x1000 if api.assigned else 0
+    else:
+        api.accounting = lambda job: dict(total_processes=2, active_processes=2,
+            terminated_by_limit_processes=0) if api.assigned else original_accounting(job)
+    service = owned.OwnedWorker(native_world, api=api)
+    with pytest.raises(CachePolicyError, match="own-Job identity/flags/accounting"):
+        service.start(["TESTONLY"], {}, Path("TESTONLY"))
+    assert api.calls.count(("assign", 10, 20)) == 1
+    assert ("resume", 21) not in api.calls and ("terminate-before-instruction", 20) in api.calls
+    service.close()
 
 
 @pytest.mark.parametrize("failure", ["resume_failure", "thread_close_failure"])
@@ -392,7 +418,42 @@ def test_public_command_remains_same_original_worker_argv(monkeypatch):
         executable="TESTONLY_python", flags=SimpleNamespace(dont_write_bytecode=True)))
     monkeypatch.setattr(bootstrap, "_python_module_invocation",
         lambda: ("darsia.fluidflower.worker", ["--workers", "2"]))
-    assert owned._public_command() == argv
+    monkeypatch.setattr(owned, "_exact_source", lambda pin: None)
+    lease = SimpleNamespace(profile=dict(python_executable=dict(path="TESTONLY_python",
+        sha256="a" * 64, size_bytes=1)))
+    assert owned._public_command(lease) == argv
+
+
+@pytest.mark.parametrize("defect", [None, "foreign_argv0", "missing_base_binding", "wrong_selected", "changed_base"])
+def test_uv_base_argv0_keeps_qualified_selected_venv_and_all_worker_arguments(monkeypatch, defect):
+    selected, base = "TESTONLY_venv_python", "TESTONLY_base_python"
+    argv = [base, "-X", "utf8", "-B", "-m", "darsia.fluidflower.worker", "--once", "--stores", "TESTONLY_map"]
+    selected_pin = dict(path=selected, sha256="a" * 64, size_bytes=1)
+    base_pin = dict(path=base, sha256="b" * 64, size_bytes=1)
+    startup_pin = dict(path="TESTONLY_startup", sha256="c" * 64, size_bytes=1)
+    lease = SimpleNamespace(profile=dict(python_executable=selected_pin,
+        native_supervision=dict(startup=startup_pin)), package_file="TESTONLY_PACKAGE")
+    startup = dict(source_files=[] if defect == "missing_base_binding" else [base_pin])
+    if defect == "foreign_argv0": argv[0] = "FOREIGN_python"
+    if defect == "wrong_selected": selected_pin["path"] = "FOREIGN_python"
+    checked = []
+    def exact_source(pin):
+        checked.append(pin)
+        if defect == "changed_base" and pin is base_pin:
+            raise CachePolicyError("TESTONLY changed qualified base executable")
+    monkeypatch.setattr(owned, "_exact_source", exact_source)
+    monkeypatch.setattr(bootstrap, "_exact", lambda pin, package: startup)
+    monkeypatch.setattr(bootstrap, "_python_module_invocation", lambda: ("darsia.fluidflower.worker", argv[6:]))
+    monkeypatch.setattr(owned, "sys", SimpleNamespace(orig_argv=argv,
+        executable=selected, _base_executable=base, flags=SimpleNamespace(dont_write_bytecode=True)))
+    before = list(argv)
+    if defect is None:
+        result = owned._public_command(lease)
+        assert result == [selected, *argv[1:]] and result[0] != base
+        assert checked == [selected_pin, base_pin]
+    else:
+        with pytest.raises(CachePolicyError): owned._public_command(lease)
+    assert argv == before
 
 
 def test_close_failure_does_not_skip_remaining_original_handles():
@@ -469,9 +530,9 @@ def test_console_interrupt_observer_does_not_kill_the_running_worker(native_worl
         if count[0] == 1:
             raise KeyboardInterrupt
         return original(job)
-    api.accounting = interrupted_once
     service = owned.OwnedWorker(native_world, api=api)
     service.start(["TESTONLY"], {}, Path("TESTONLY"))
+    api.accounting = interrupted_once  # Interrupt the live observer, not empty-Job admission.
     assert service.await_family()["accounting"]["active_processes"] == 0
     assert not any(isinstance(row, tuple) and row[0] == "terminate-before-instruction" for row in api.calls)
     service.close()
@@ -536,9 +597,14 @@ while not Path(os.environ["TESTONLY_ACK"]).exists():
             raise
         identity = api.identity(info["process"])
         assert identity["pid"] == info["pid"]
-        api.require_independent_suspended_child(info["process"])
+        inherited = api.inherited_job_membership(info["process"])
+        assert type(inherited) is bool
         api.assign(job, info["process"])
         assert api.member(info["process"], job) is True
+        assert api.identity(info["process"]) == identity
+        assert api.require_job_flags(job) == 0
+        assert api.accounting(job) == dict(total_processes=1, active_processes=1,
+                                          terminated_by_limit_processes=0)
         assert api.signaled(info["process"]) is False
         resume_attempted = True
         api.resume(info["thread"])

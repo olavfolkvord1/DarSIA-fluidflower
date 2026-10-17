@@ -179,15 +179,13 @@ class NativeAPI:
                    "Cannot determine nested parent Job")
         return bool(result.value)
 
-    def require_independent_suspended_child(self, process):
-        """Observe the child, not the controller's possible venv parent Job.
+    def inherited_job_membership(self, process):
+        """Record inherited membership; kernel assignment decides valid nesting.
 
-        A supported SILENT_BREAKAWAY parent may yield an independent child
-        without any explicit breakaway flag. Unknown inherited membership is
-        refused while this exact original child is still suspended.
+        This does not open a foreign Job or promise independence from its
+        lifetime. Our one fresh own Job still forbids all breakaways.
         """
-        if self.member(process, None):
-            raise CachePolicyError("Suspended child inherited an existing Job; no launch fallback")
+        return self.member(process, None)
 
     def member(self, process, job):
         result = W.BOOL()
@@ -252,8 +250,8 @@ class NativeAPI:
         limits = _EXTENDED_LIMIT()
         self.check(self.k.QueryInformationJobObject(handle, 9, C.byref(limits),
             C.sizeof(limits), None), "Cannot revalidate native Job flags")
-        if limits.basic.flags & _FORBIDDEN_JOB_FLAGS:
-            raise CachePolicyError("Breakaway/kill-on-close changed; no retirement qualification")
+        if limits.basic.flags != 0:
+            raise CachePolicyError("Original own Job flags changed; no retirement qualification")
         return int(limits.basic.flags)
 
     def accounting(self, handle):
@@ -501,15 +499,33 @@ def _bound_control(lease, binding):
     return document
 
 
-def _public_command():
+def _public_command(lease):
     original = list(getattr(sys, "orig_argv", ()))
     from .bootstrap import _python_module_invocation
     entry = _python_module_invocation()
     if (not original or not entry or entry[0] != "darsia.fluidflower.worker"
-            or Path(original[0]).resolve() != Path(sys.executable).resolve()
             or not sys.flags.dont_write_bytecode):
         raise CachePolicyError("Native supervision keeps the exact public worker command with -B")
-    return original
+    selected = Path(sys.executable).resolve()
+    selected_binding = _descriptor(lease.profile["python_executable"])
+    if Path(selected_binding["path"]).resolve() != selected:
+        raise CachePolicyError("Selected public venv executable differs from qualified runtime")
+    _exact_source(selected_binding)
+    observed = Path(original[0]).resolve()
+    if observed != selected:
+        base = getattr(sys, "_base_executable", None)
+        if not base or observed != Path(base).resolve():
+            raise CachePolicyError("Original argv0 is neither selected venv nor its actual backing executable")
+        from .bootstrap import _exact
+        startup = _exact(lease.profile["native_supervision"]["startup"], lease.package_file)
+        bindings = [pin for pin in startup["source_files"]
+                    if Path(_descriptor(pin)["path"]).resolve() == observed]
+        if len(bindings) != 1:
+            raise CachePolicyError("Actual backing executable has no unique qualified runtime source binding")
+        _exact_source(bindings[0])
+    # uv exposes its backing interpreter in orig_argv[0]. Re-enter through the
+    # exact selected venv, preserving every original flag/module/worker argument.
+    return [sys.executable, *original[1:]]
 
 
 def native_child_context(lease, *, api=None):
@@ -525,7 +541,12 @@ def native_child_context(lease, *, api=None):
             or observed.get("intent") != context["intent"]
             or observed.get("job_name") != intent.get("job_name")
             or observed.get("assignment_before_resume") is not True
-            or observed.get("suspended_child_had_no_existing_job") is not True
+            or observed.get("own_job_assignment_verified_before_resume") is not True
+            or type(observed.get("inherited_job_membership_observed")) is not bool
+            or observed.get("own_job_flags_before_resume") != 0
+            or observed.get("own_job_accounting_before_resume") != dict(
+                total_processes=1, active_processes=1, terminated_by_limit_processes=0)
+            or observed.get("assigned_child_native_identity") != observed.get("actual_launch_wrapper")
             or observed.get("policy") != lease.source
             or observed.get("profile") != lease.profile_binding
             or intent.get("controller") == lease.owner):
@@ -677,9 +698,13 @@ class OwnedWorker:
         from .bootstrap import _owner
         controller, _ = _owner()
         self.job = self.api.new_job(name)
+        if self.api.accounting(self.job) != dict(
+                total_processes=0, active_processes=0, terminated_by_limit_processes=0):
+            raise CachePolicyError("Fresh original Job is not empty before controlled launch")
         self.read, self.write = self.api.pipe()
         intent = dict(format=FORMAT, job_name=name, controller=controller,
             command=list(command), cwd=str(cwd), policy=self.lease.source,
+            observed_interpreter_argv=list(getattr(sys, "orig_argv", ())),
             profile=self.lease.profile_binding, utc=_utc(), producer_owner_not_allocated=True)
         bound = self.lease._record("native-" + token + "-intent.json", intent)
         observed_name = "native-" + token + "-observed.json"
@@ -697,13 +722,25 @@ class OwnedWorker:
             native = self.api.identity(self.info["process"])
             if native["pid"] != self.info["pid"]:
                 raise CachePolicyError("Original CreateProcessW PID/handle identity differs")
-            self.api.require_independent_suspended_child(self.info["process"])
+            inherited = self.api.inherited_job_membership(self.info["process"])
             self.api.assign(self.job, self.info["process"])
+            assigned_native = self.api.identity(self.info["process"])
+            flags = self.api.require_job_flags(self.job)
+            accounting = self.api.accounting(self.job)
+            if (assigned_native != native or not self.api.member(self.info["process"], self.job)
+                    or flags != 0 or accounting != dict(
+                        total_processes=1, active_processes=1, terminated_by_limit_processes=0)):
+                raise CachePolicyError("Original suspended child own-Job identity/flags/accounting differs before resume")
             self.observed_binding = self.lease._record(observed_name, dict(format=FORMAT,
                 intent=bound, job_name=name, controller=controller, actual_launch_wrapper=native,
                 policy=self.lease.source, profile=self.lease.profile_binding,
                 assignment_before_resume=True, before_first_instruction=True,
-                suspended_child_had_no_existing_job=True, utc=_utc()))
+                inherited_job_membership_observed=inherited,
+                own_job_assignment_verified_before_resume=True,
+                assigned_child_native_identity=assigned_native,
+                own_job_flags_before_resume=flags,
+                own_job_accounting_before_resume=accounting,
+                independence_or_survival_of_outer_job_not_claimed=True, utc=_utc()))
             self.resume_attempted = True
             self.api.resume(self.info["thread"])
             self.resumed = True
@@ -847,7 +884,7 @@ def _budget_state(result, error, attempted):
 def supervise_original_worker(lease, *, api=None):
     """External controller; never calls lease.start/attach/reserve/register/seal."""
     contract = _checked_contract(lease)
-    command = _public_command()
+    command = _public_command(lease)
     owned = OwnedWorker(lease, api=api)
     outcome = None
     result = None
