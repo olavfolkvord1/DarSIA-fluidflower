@@ -204,7 +204,7 @@ def _writer_identity(repository, commit, row):
 
 
 def _profile_writer_identity(repository, measured_commit, current_commit, row):
-    """Whole writer identity, except the one explicit output-location flag fix."""
+    """Whole writer identity, except the exact named metadata/JSON-read fixes."""
     if not isinstance(row, dict):
         raise ValueError("Explicit writer relative path/SHA required")
     measured_sha = row.get("measured_sha256")
@@ -219,7 +219,7 @@ def _profile_writer_identity(repository, measured_commit, current_commit, row):
             or not isinstance(measured_sha, str) or re.fullmatch(r"[0-9a-f]{64}", measured_sha) is None):
         raise ValueError("Only the exact n1_pipeline output-location metadata fix accepts separate measured writer provenance")
     _writer_identity(repository, current_commit, {k: row[k] for k in ("relative_path", "sha256")})
-    trees = []
+    trees, parsed = [], []
     expected = ("a7c441225da1bee963dd411dacc28a29efe8f20b2e233bf2e3aea91293048c56",
                 "289d8766f0dedad5b5bde3b46d17cc8870e79530fd2aaa6b75d7956285b64060")
     for commit, sha, function_sha in ((measured_commit, measured_sha, expected[0]), (current_commit, row["sha256"], expected[1])):
@@ -231,9 +231,23 @@ def _profile_writer_identity(repository, measured_commit, current_commit, row):
         if len(target) != 1 or hashlib.sha256(ast.dump(target[0], include_attributes=False).encode()).hexdigest() != function_sha:
             raise ValueError("The writer delta is not the exact reviewed output-location metadata fix")
         tree.body.remove(target[0])
+        parsed.append(tree)
         trees.append(ast.dump(tree, include_attributes=False))
     if trees[0] != trees[1]:
-        raise ValueError("An actual writer/executor body changed; a new measured profile is required")
+        # Q61 is only the exact consumed-JSON hash recheck, never a general I/O
+        # exception. The original storage-facts-only path above is unchanged.
+        json_expected = ("22419d8d07474fe6ec1fced1324de3561d396f5913ab69831f1083a613ab255c",
+                         "1f23d7ade688ea081e843bfa3408c467a348e9828a89fe1b35ed8c710a67e1a1")
+        for tree, function_sha in zip(parsed, json_expected):
+            classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DataReader"]
+            methods = [] if len(classes) != 1 else [node for node in classes[0].body
+                if isinstance(node, ast.FunctionDef) and node.name == "json"]
+            if (len(methods) != 1 or
+                    hashlib.sha256(ast.dump(methods[0], include_attributes=False).encode()).hexdigest() != function_sha):
+                raise ValueError("The writer delta is not the exact reviewed DataReader.json hash recheck")
+            classes[0].body.remove(methods[0])
+        if ast.dump(parsed[0], include_attributes=False) != ast.dump(parsed[1], include_attributes=False):
+            raise ValueError("An actual writer/executor body changed; a new measured profile is required")
 
 
 def _orchestration_identity(repository, measured_commit, current_commit, row):
