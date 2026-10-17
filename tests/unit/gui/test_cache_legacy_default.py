@@ -43,9 +43,15 @@ class MemoryPath_TESTONLY:
         if self.state.vanished and self.state.stats > 1:
             raise FileNotFoundError("TESTONLY vanished during read")
         raw = self.state.raw if self.value == self.state.physical else self.state.additional_documents[self.value]
-        return SimpleNamespace(st_mode=0o100644 if self.state.regular else 0o040755,
+        fields = dict(st_dev=123, st_ino=456,
+            st_mode=0o100644 if self.state.regular else 0o040755, st_nlink=1,
             st_size=len(raw) if self.state.declared_size is None else self.state.declared_size,
-            st_mtime_ns=self.state.stats if self.state.changed else 1)
+            st_mtime_ns=self.state.stats if self.state.changed else 1,
+            st_ctime_ns=2, st_birthtime_ns=3, st_file_attributes=0x20, st_reparse_tag=0,
+            st_atime=4.0, st_atime_ns=4_000_000_000)
+        if self.state.stats > 1:
+            fields.update(self.state.after_changes)
+        return SimpleNamespace(**fields)
 
     def open(self, mode):
         assert mode == "rb"
@@ -69,7 +75,7 @@ class MemoryPath_TESTONLY:
 def default_world(monkeypatch):
     state = SimpleNamespace(raw=LEGACY, physical=PHYSICAL, path=LEXICAL,
         declared_size=None, changed=False, regular=True, missing=False, vanished=False,
-        retarget=None, alias_missing=False, additional_documents={},
+        retarget=None, alias_missing=False, additional_documents={}, after_changes={},
         resolves=[], stats=0, opens=[], closes=0, read_limits=[], strict_calls=[],
         worker=False, direct=None)
     environment = {}
@@ -194,3 +200,28 @@ def test_final_lexical_alias_change_refuses_unmanaged_classification(default_wor
     assert world.state.resolves == [LEXICAL, LEXICAL]
     assert world.state.opens == [PHYSICAL]
     assert world.state.strict_calls == [] and bootstrap._LEASE is None
+
+
+def test_access_time_only_change_during_read_remains_unmanaged(default_world):
+    world = default_world
+    world.state.after_changes = {"st_atime": 9.0, "st_atime_ns": 9_000_000_000}
+    assert bootstrap.before_darsia_import(package_file="TESTONLY_PACKAGE") is None
+    assert world.state.stats == 2 and world.state.resolves == [LEXICAL, LEXICAL]
+    assert world.state.opens == [PHYSICAL] and world.state.strict_calls == []
+    assert bootstrap._LEASE is None and world.environment == {}
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("st_dev", 124), ("st_ino", 457), ("st_mode", 0o040755), ("st_nlink", 2),
+    ("st_size", 1), ("st_mtime_ns", 99), ("st_ctime_ns", 99),
+    ("st_birthtime_ns", 99), ("st_file_attributes", 0x420),
+    ("st_reparse_tag", 0xA000000C),
+])
+def test_each_stable_identity_version_or_reparse_link_change_refuses(default_world, field, replacement):
+    world = default_world
+    world.state.after_changes = {field: replacement}
+    with pytest.raises(CachePolicyError, match="changed during unmanaged classification"):
+        bootstrap.before_darsia_import(package_file="TESTONLY_PACKAGE")
+    assert world.state.stats == 2 and world.state.resolves == [LEXICAL, LEXICAL]
+    assert world.state.opens == [PHYSICAL] and world.state.strict_calls == []
+    assert bootstrap._LEASE is None and world.environment == {}

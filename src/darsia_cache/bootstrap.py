@@ -147,7 +147,12 @@ def _legacy_default_without_cache(path):
             raise CachePolicyError("Default stores alias retargeted during unmanaged classification")
     except FileNotFoundError as error:
         raise CachePolicyError("Default stores disappeared during unmanaged classification") from error
-    if before!=after or len(raw)!=before.st_size or len(raw)>1024**2:
+    # Reads may update access time; compare identity/content-version fields only.
+    stable_fields=("st_dev","st_ino","st_mode","st_nlink","st_size",
+                   "st_mtime_ns","st_ctime_ns","st_birthtime_ns",
+                   "st_file_attributes","st_reparse_tag")
+    if (any(getattr(before,name,None)!=getattr(after,name,None) for name in stable_fields)
+            or len(raw)!=before.st_size or len(raw)>1024**2):
         raise CachePolicyError("Default stores changed during unmanaged classification")
     document=tomllib.loads(raw.decode("utf-8-sig"))
     return "cache" not in document and "cache_bootstrap" not in document
