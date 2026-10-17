@@ -1,10 +1,13 @@
 """Local Qt command publication only; no worker, executor, SSH or science."""
 
 import json
+import socket
 from pathlib import Path
 import threading
+import time
 
 import pytest
+from PySide6.QtCore import QTimer
 
 from darsia.fluidflower import job_control
 from darsia.fluidflower import jobs_panel as ui
@@ -12,8 +15,34 @@ from .test_jobs_metadata import bytes_of, job, put
 from .test_jobs_panel import app, wait
 
 
+def publish_and_wait(app, panel, action=None):
+    """Separate producer I/O from the unchanged three-second Qt wait."""
+    state = panel._test_publication
+    ticks = [time.monotonic()]
+    timer = QTimer()
+    timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+    timer.start(20)
+    try:
+        if action is not None:
+            action()
+        wait(app, lambda: state["started"].is_set() or panel.can_close())
+        if state["started"].is_set():
+            remaining = max(0, 15 - (time.monotonic() - state["started_at"]))
+            wait(app, state["finished"].is_set, timeout=remaining)
+            assert state["finished_at"] - state["started_at"] <= 15
+        wait(app, panel.can_close)
+    finally:
+        timer.stop()
+    ticks.append(time.monotonic())
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 3, (
+        "Qt event-loop heartbeat stalled during control publication"
+    )
+    state["started"].clear()
+    state["finished"].clear()
+
+
 @pytest.fixture
-def controls(app, job):
+def controls(app, job, request):
     root, _cases, _task = job
     launches = []
 
@@ -22,13 +51,38 @@ def controls(app, job):
         return dict(job_root=job_root, numerical_progress_claimed=False)
 
     panel = ui.JobsPanel(local_machine="Main", local_launcher=launcher)
+    state = dict(
+        started=threading.Event(), finished=threading.Event(), io_durations_seconds=[]
+    )
+
+    def publisher(*args, **kwargs):
+        state["started_at"] = time.monotonic()
+        state["started"].set()
+        try:
+            return job_control.publish_control(*args, **kwargs)
+        finally:
+            state["finished_at"] = time.monotonic()
+            state["io_durations_seconds"].append(
+                state["finished_at"] - state["started_at"]
+            )
+            state["finished"].set()
+
+    panel._test_publication = state
+    panel.control_publisher = publisher
     panel.set_context(jobs_provider=lambda: [dict(root=str(root), active=True)])
     wait(app, panel.can_close)
     yield panel, launches, root
-    wait(app, panel.can_close)
-    panel.close()
-    panel.deleteLater()
-    app.processEvents()
+    try:
+        wait(app, panel.can_close)
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+    finally:
+        print("N27_CONTROL_PRODUCER_IO " + json.dumps(dict(
+            nodeid=request.node.nodeid, host=socket.gethostname(), test_root=str(root),
+            publisher_calls=len(state["io_durations_seconds"]),
+            io_durations_seconds=state["io_durations_seconds"],
+        ), sort_keys=True), flush=True)
 
 
 def test_open_refresh_only_read_bound_master_and_displayed_chain(controls, app):
@@ -48,8 +102,7 @@ def test_open_refresh_only_read_bound_master_and_displayed_chain(controls, app):
 def test_pause_and_stop_append_requested_states_without_task_or_lease_changes(controls, app):
     panel, launches, root = controls
     original = bytes_of(root)
-    panel.pause_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.pause_job)
     first = job_control.read_control(root)
     first_bytes = Path(first["command"]["path"]).read_bytes()
     assert first["action"] == "pause" and first["sequence"] == 1
@@ -58,8 +111,7 @@ def test_pause_and_stop_append_requested_states_without_task_or_lease_changes(co
     assert panel.resume_button.isEnabled() and not panel.start_button.isEnabled()
     assert first["command"]["sha256"] in panel.control_state_label.text()
     assert "exit is not inferred" in panel.control_state_label.text()
-    panel.stop_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.stop_job)
     last = job_control.read_control(root)
     assert last["action"] == "stop" and last["previous"] == first["command"]
     assert Path(first["command"]["path"]).read_bytes() == first_bytes
@@ -69,8 +121,7 @@ def test_pause_and_stop_append_requested_states_without_task_or_lease_changes(co
 
 def test_resume_publishes_run_then_uses_normal_selected_service_and_original_lease(controls, app):
     panel, launches, root = controls
-    panel.pause_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.pause_job)
     pause = job_control.read_control(root)["command"]
     immutable_tasks = {
         path: raw for path, raw in bytes_of(root).items()
@@ -78,8 +129,7 @@ def test_resume_publishes_run_then_uses_normal_selected_service_and_original_lea
     }
     panel.backend_combo.setCurrentIndex(panel.backend_combo.findData("cuda"))
     panel.workers_spin.setValue(3)
-    panel.resume_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.resume_job)
     current = job_control.read_control(root)
     assert current["action"] == "run" and current["previous"] == pause
     assert len(launches) == 1
@@ -105,8 +155,7 @@ def test_stale_window_supplies_its_displayed_previous_not_a_fresh_retry(controls
     wait(app, second.can_close)
     try:
         assert second.current["control"]["state"]["sequence"] == 0
-        first.pause_job()
-        wait(app, first.can_close)
+        publish_and_wait(app, first, first.pause_job)
         requested = job_control.read_control(root)["command"]
         second.stop_job()
         wait(app, second.can_close)
@@ -148,8 +197,7 @@ def test_non_master_and_legacy_without_master_never_publish(controls, app):
 
 def test_control_read_failure_blocks_direct_start_and_command_before_reservation(controls, app):
     panel, launches, root = controls
-    panel.pause_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.pause_job)
     command = Path(job_control.read_control(root)["command"]["path"])
     document = json.loads(command.read_bytes())
     document["machine"] = "foreign"
@@ -167,35 +215,39 @@ def test_control_read_failure_blocks_direct_start_and_command_before_reservation
 
 def test_pending_publication_holds_owner_and_navigation_cannot_launch_for_new_context(controls, app):
     panel, launches, root = controls
-    panel.pause_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.pause_job)
     entered, release = threading.Event(), threading.Event()
+    publisher = panel.control_publisher
 
     def delayed(*args, **kwargs):
         entered.set()
         assert release.wait(2)
-        return job_control.publish_control(*args, **kwargs)
+        return publisher(*args, **kwargs)
 
     panel.control_publisher = delayed
     panel.resume_job()
     wait(app, entered.is_set)
     assert not panel.can_close()
+    responsive = []
+    QTimer.singleShot(0, lambda: responsive.append(
+        not release.is_set() and not panel.can_close()
+    ))
+    wait(app, lambda: bool(responsive))
+    assert responsive == [True]
     panel.set_context(jobs_provider=lambda: [])
     release.set()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel)
     assert job_control.read_control(root)["action"] == "run"
     assert panel.current is None and not launches
 
 
 def test_repeated_start_cannot_bypass_pause_or_existing_reservation(controls, app):
     panel, launches, root = controls
-    panel.pause_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.pause_job)
     before = bytes_of(root)
     panel.start_selected_machine()
     assert bytes_of(root) == before and not launches
-    panel.resume_job()
-    wait(app, panel.can_close)
+    publish_and_wait(app, panel, panel.resume_job)
     assert len(launches) == 1
     panel.start_selected_machine()
     assert len(launches) == 1
