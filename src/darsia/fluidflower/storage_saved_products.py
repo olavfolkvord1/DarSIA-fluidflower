@@ -335,9 +335,16 @@ def read_stored_frame(native_frame_metadata, *, resolve_asset, load_before=False
                 storage_receipt=deepcopy(entry["receipt"]), storage_document=deepcopy(document))
 
 
-def read_stored_run(completed_metadata, *, resolve_asset, load_before=False):
-    """Read one original complete run; never sum mass across acquisition times."""
-    value, loaded = completed_metadata, []
+def read_stored_run(completed_metadata, *, resolve_asset, load_before=False, stream=False):
+    """Read one original complete run; never sum mass across acquisition times.
+
+    The default retains the original list result. Explicit ``stream=True``
+    retains only metadata and yields one strict, individually verified frame.
+    A streaming caller must release a yielded frame before requesting another.
+    """
+    if type(stream) is not bool:
+        raise ValueError("Saved run streaming must be an explicit boolean")
+    value, loaded = (deepcopy(completed_metadata) if stream else completed_metadata), []
     records, order = value["records"], value["ordered_case_ids"]
     if (value.get("complete") is not True or value.get("pipeline") != "native-phase-n1"
             or type(value["frames"]) is not int or value["frames"] != len(records)
@@ -350,16 +357,17 @@ def read_stored_run(completed_metadata, *, resolve_asset, load_before=False):
             or manifest["settings"]["precision"] != value["precision"]
             or set(manifest["frames"]) != set(order)):
         raise ValueError("Saved run manifest/configuration/selection differs")
-    frames = []
-    for record in records:
-        case = record["frame_id"]
-        if record["manifest_sha256"] != value["manifest"]["sha256"]:
-            raise ValueError("Saved frame belongs to another run manifest")
-        frames.append(read_stored_frame(record, resolve_asset=resolve_asset, load_before=load_before,
-            expected=dict(job_id=manifest["job_id"], run=value["run"], case_id=case,
-                precision=value["precision"], code_commit=manifest["code"]["commit"],
-                configuration=value["configuration"], calibration_sha256=value["calibration"]["sha256"],
-                source=manifest["frames"][case]["source"])))
+    def frames():
+        for record in records:
+            case = record["frame_id"]
+            if record["manifest_sha256"] != value["manifest"]["sha256"]:
+                raise ValueError("Saved frame belongs to another run manifest")
+            yield read_stored_frame(record, resolve_asset=resolve_asset, load_before=load_before,
+                expected=dict(job_id=manifest["job_id"], run=value["run"], case_id=case,
+                    precision=value["precision"], code_commit=manifest["code"]["commit"],
+                    configuration=value["configuration"], calibration_sha256=value["calibration"]["sha256"],
+                    source=manifest["frames"][case]["source"]))
+    selected_frames = frames() if stream else list(frames())
     return dict(format="darsia-read-coarse-stored-run-v1", run=value["run"], precision=value["precision"],
-                ordered_case_ids=list(order), frames=frames, loaded_manifest_assets=loaded,
+                ordered_case_ids=list(order), frames=selected_frames, loaded_manifest_assets=loaded,
                 original_completion=deepcopy(value))
