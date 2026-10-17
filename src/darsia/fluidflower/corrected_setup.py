@@ -131,7 +131,78 @@ def _canonical_location(package_root, config, revision, run):
     return root, root if run == display else root / "runs" / run, display, planned
 
 
-def _configuration_bundle(series, run, configuration):
+CONFIGURATION_BINDING_FORMAT = "darsia-corrected-setup-configuration-dual-binding-v1"
+PROTOCOL_LEAVES = ("protocols.imaging", "protocols.injection", "protocols.imaging_mode")
+
+
+def _typed_equal(first, second):
+    """TOML/JSON equality without bool/int, int/float or container coercion."""
+    if type(first) is not type(second):
+        return False
+    if isinstance(first, dict):
+        return first.keys() == second.keys() and all(_typed_equal(first[key], second[key]) for key in first)
+    if isinstance(first, list):
+        return len(first) == len(second) and all(_typed_equal(a, b) for a, b in zip(first, second))
+    return first == second
+
+
+def _protocol_changes(original, current):
+    """Exactly three explicit clock-pointer/mode changes, no other difference."""
+    restored = deepcopy(current)
+    changes = {}
+    old_protocols, new_protocols = original.get("protocols"), restored.get("protocols")
+    if not isinstance(old_protocols, dict) or not isinstance(new_protocols, dict):
+        raise ValueError("Dual configuration binding requires both explicit protocol tables.")
+    for leaf in PROTOCOL_LEAVES:
+        key = leaf.split(".")[1]
+        if key not in old_protocols or key not in new_protocols or _typed_equal(old_protocols[key], new_protocols[key]):
+            raise ValueError("Dual configuration binding requires exactly the three protocol-leaf differences.")
+        changes[leaf] = dict(before=deepcopy(old_protocols[key]), after=deepcopy(new_protocols[key]))
+        new_protocols[key] = deepcopy(old_protocols[key])
+    if not _typed_equal(original, restored):
+        raise ValueError("Dual configuration binding changes a non-protocol value or TOML type.")
+    return changes
+
+
+def _configuration_identity(row):
+    if (not isinstance(row, dict) or set(row) != {"path", "sha256", "size_bytes"}
+            or not isinstance(row["path"], str) or not Path(row["path"]).is_absolute()
+            or not isinstance(row["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+            or type(row["size_bytes"]) is not int or row["size_bytes"] < 0):
+        raise ValueError("Dual configuration identities require exact absolute path/SHA/byte descriptors.")
+    return row
+
+
+def _dual_configuration_binding(value, run, configuration, selected, *, destination, receipt):
+    keys = {"format", "run_id", "source_configuration", "current_configuration",
+            "apply_configurations", "protocol_changes", "comparison_sha256"}
+    if (not isinstance(value, dict) or set(value) != keys
+            or value["format"] != CONFIGURATION_BINDING_FORMAT or value["run_id"] != run
+            or not isinstance(value["comparison_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["comparison_sha256"]) is None):
+        raise ValueError("The selected-run dual configuration metadata is not explicit and complete.")
+    original = _configuration_identity(value["source_configuration"])
+    current = _configuration_identity(value["current_configuration"])
+    targets = value["apply_configurations"]
+    if (not _typed_equal(original, configuration) or not isinstance(targets, list)
+            or len(selected) != 2 or len(targets) != 2):
+        raise ValueError("The dual configuration binding belongs to another source or selected bundle.")
+    for target, declared in zip(targets, selected):
+        _configuration_identity(target)
+        if not _same(target["path"], declared) or _same(target["path"], original["path"]):
+            raise ValueError("Dual Apply targets must be the exact current declared bundle, never the historical source.")
+    if not _typed_equal(current, targets[-1]):
+        raise ValueError("The dual current configuration must be the declared merged target.")
+    _verified(original)  # This physical source is immutable, including after Apply.
+    raw_targets = [_original_configuration_bytes(target, destination, receipt) for target in targets]
+    changes = _protocol_changes(tomllib.loads(_small(original["path"]).decode("utf-8-sig")),
+                                tomllib.loads(raw_targets[-1].decode("utf-8-sig")))
+    if not _typed_equal(value["protocol_changes"], changes):
+        raise ValueError("The dual configuration metadata does not record the exact protocol-leaf changes.")
+    return deepcopy(value)
+
+
+def _configuration_bundle(series, run, configuration, *, destination=None, receipt=None):
     """Bind exact declared config paths, never a basename or path substring."""
     manifest_path = series / "series.toml"
     manifest_bytes = _small(manifest_path)
@@ -156,7 +227,11 @@ def _configuration_bundle(series, run, configuration):
                 own.append(str(item))
         bundles[key] = own
     selected = bundles[run]
-    if not any(_same(configuration["path"], item) for item in selected):
+    dual_bindings = table.get("geometry_configuration_bindings", {})
+    if not isinstance(dual_bindings, dict):
+        raise ValueError("Selected-run geometry configuration bindings must be an explicit table.")
+    dual = dual_bindings.get(run)
+    if dual is None and not any(_same(configuration["path"], item) for item in selected):
         raise ValueError("The bound original configuration is not this run's declared configuration.")
     if any(_same(item, other) for key, rows in bundles.items() if key != run for item in selected for other in rows):
         raise ValueError("The selected corrected configuration bundle is ambiguous between runs.")
@@ -164,8 +239,12 @@ def _configuration_bundle(series, run, configuration):
     if common is not None and any(_same(common, item) for rows in bundles.values() for item in rows):
         raise ValueError("The common configuration is ambiguous with a selected-run bundle.")
     common_binding = _descriptor(common) if common is not None and common.is_file() else None
-    return dict(series_root=str(series), series_manifest=_descriptor(manifest_path),
-                configuration_bundles=bundles, common_configuration=common_binding)
+    result = dict(series_root=str(series), series_manifest=_descriptor(manifest_path),
+                  configuration_bundles=bundles, common_configuration=common_binding)
+    if dual is not None:
+        result["dual_configuration_binding"] = _dual_configuration_binding(
+            dual, run, configuration, selected, destination=destination, receipt=receipt)
+    return result
 
 
 def _verify_export_files(receipt, destination):
@@ -253,6 +332,8 @@ def _verify_immutable_export_inputs(receipt):
         _verified(item)
     if data.get("common_configuration") is not None:
         _verified(data["common_configuration"])
+    if data.get("dual_configuration_binding") is not None:
+        _verified(data["configuration"])
     if data.get("registered_geometry") is not None:
         from .geometry_raster_sources import verify_registered_sources
         verify_registered_sources(data["registered_geometry"])
@@ -338,7 +419,7 @@ def require_corrected_export_for_build(paths):
         _verify_reference_export(actual_root, revision=revision, display=display,
                                  planned=planned, current_sha=hashlib.sha256(current_bytes).hexdigest(), child=receipt)
     series = Path(binding["series_root"])
-    declared = _configuration_bundle(series, run, binding["configuration"])
+    declared = _configuration_bundle(series, run, binding["configuration"], destination=destination, receipt=receipt)
     if any(binding.get(key) != value for key, value in declared.items()):
         raise ValueError("Corrected Build configuration bundle changed since export.")
     actual_paths = [paths] if isinstance(paths, Path) else paths
@@ -435,7 +516,7 @@ def export_corrected_setup(project, *, reference, actor=""):
     binding = dict(configuration=configuration, sources=sources, properties=properties,
                    configured_depth_source=configured_depth_source,
                    configured_depth_pointer=depth_pointer, replacements=replacements,
-                   **_configuration_bundle(series, run, configuration))
+                   **_configuration_bundle(series, run, configuration, destination=destination, receipt=existing))
     if registered is not None:
         binding["registered_geometry"] = registered
     receipt_path = destination / "export.json"
@@ -486,6 +567,10 @@ def export_corrected_setup(project, *, reference, actor=""):
     if registered is not None:
         from .geometry_raster_sources import verify_registered_sources
         verify_registered_sources(registered)
+    if binding.get("dual_configuration_binding") is not None:
+        final_bundle = _configuration_bundle(series, run, configuration, destination=destination)
+        if any(binding.get(key) != value for key, value in final_bundle.items()):
+            raise RuntimeError("The current dual configuration bundle changed during corrected export.")
     os.rename(staging, destination)
     return CorrectedSetupExport(revision, run, destination, text, current_path, before, receipt)
 
@@ -589,7 +674,7 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
         _verified(row)
     if binding.get("common_configuration") is not None:
         _verified(binding["common_configuration"])
-    expected_bundle = _configuration_bundle(root, export.run_id, configuration)
+    expected_bundle = _configuration_bundle(root, export.run_id, configuration, destination=export.destination, receipt=export.receipt)
     if any(binding.get(key) != value for key, value in expected_bundle.items()):
         raise ValueError("The selected run's declared configuration bundle changed.")
     completed = _apply_completion(export.destination, export.receipt)
@@ -599,18 +684,22 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
             from .geometry_raster_sources import verify_registered_sources
             verify_registered_sources(registered)
         return Path(completed["attempt_receipt"]["path"])
-    targets = [Path(configuration["path"])]
-    paths = manifest.get("paths") or {}
-    table = manifest.get("runs") or {}
-    partial = _storage_path((table.get("config_files") or {}).get(export.run_id) or f"{paths.get('run_configs','config/runs')}/{export.run_id}.toml", root)
-    merged = _storage_path((table.get("merged_files") or {}).get(export.run_id) or f"{paths.get('merged_configs','config/merged')}/{export.run_id}.toml", root)
-    declared = [p for p in (partial, merged) if p is not None]
-    if not any(_same(configuration["path"], p) for p in declared):
-        raise ValueError("The bound original configuration is not this run's declared configuration.")
-    if partial is not None and not any(_same(partial, p) for p in targets):
-        targets.append(partial)
-    if merged is not None and merged.is_file() and not any(_same(merged, p) for p in targets):
-        targets.append(merged)
+    dual = binding.get("dual_configuration_binding")
+    if dual is not None:
+        targets = [Path(row["path"]) for row in dual["apply_configurations"]]
+    else:
+        targets = [Path(configuration["path"])]
+        paths = manifest.get("paths") or {}
+        table = manifest.get("runs") or {}
+        partial = _storage_path((table.get("config_files") or {}).get(export.run_id) or f"{paths.get('run_configs','config/runs')}/{export.run_id}.toml", root)
+        merged = _storage_path((table.get("merged_files") or {}).get(export.run_id) or f"{paths.get('merged_configs','config/merged')}/{export.run_id}.toml", root)
+        declared = [p for p in (partial, merged) if p is not None]
+        if not any(_same(configuration["path"], p) for p in declared):
+            raise ValueError("The bound original configuration is not this run's declared configuration.")
+        if partial is not None and not any(_same(partial, p) for p in targets):
+            targets.append(partial)
+        if merged is not None and merged.is_file() and not any(_same(merged, p) for p in targets):
+            targets.append(merged)
     for path in targets:
         if not path.resolve().is_relative_to(root.resolve()):
             raise ValueError("Corrected setup target is outside the selected series.")
