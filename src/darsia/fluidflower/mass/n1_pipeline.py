@@ -350,7 +350,8 @@ class N1Pipeline:
     """One run's explicit saved native data and unchanged typed arithmetic."""
 
     def __init__(
-        self, config, *, precision, pixel_math, unc_only=False, geometry_fields=None
+        self, config, *, precision, pixel_math, unc_only=False, geometry_fields=None,
+        statistics_only=False
     ):
         """Load only this run's shared data and saved scientific models."""
         import numpy as np
@@ -362,13 +363,22 @@ class N1Pipeline:
         if precision not in {"float32", "float64"} or pixel_math.precision != precision:
             raise ValueError("Provider and working precision differ")
         self.reader = DataReader(config.get("data_aliases", ()), unc_only=unc_only)
-        self.calibration = self.reader.json(config["calibration"])
-        self.parameters = dict(self.calibration["parameters"])
-        validate_parameters(self.parameters)
-        self.method_bindings = dict(config["bindings"])
-        for name in ("round4_spec_sha256", "amendment_sha256"):
-            if name not in self.method_bindings and name in self.calibration:
-                self.method_bindings[name] = self.calibration[name]
+        if type(statistics_only) is not bool:
+            raise TypeError("Statistics-only mode must be explicit")
+        self.statistics_only = statistics_only
+        if statistics_only:
+            self.method_bindings = dict(config["bindings"])
+            for name in ("round4_spec_sha256", "amendment_sha256"):
+                if name not in self.method_bindings:
+                    raise ValueError("Statistics require explicit method binding: " + name)
+        else:
+            self.calibration = self.reader.json(config["calibration"])
+            self.parameters = dict(self.calibration["parameters"])
+            validate_parameters(self.parameters)
+            self.method_bindings = dict(config["bindings"])
+            for name in ("round4_spec_sha256", "amendment_sha256"):
+                if name not in self.method_bindings and name in self.calibration:
+                    self.method_bindings[name] = self.calibration[name]
         correction = self.reader.json(config["physical_correction"])
         self.correction = np.asarray(correction["correction_matrix"], np.float64)
         if (
@@ -709,8 +719,13 @@ class N1Pipeline:
         )
         return frame, x, y, photo_support, report
 
-    def evaluate(self, spec, *, output_capture=None):
-        """Compute fields and the original paired E/U_rest summary once."""
+    def _prepare_statistics(self, spec):
+        """Run the original calibration-independent native summary prefix once.
+
+        The fixed summary baseline_gain, beta=0 and historical summary anchor
+        remain inside summarize_round3_response. No fitted mass parameters are
+        read here.
+        """
         import numpy as np
         import darsia
         from .n1_models import prepare_response, own_colour_response
@@ -776,6 +791,37 @@ class N1Pipeline:
             round4_spec_sha256=self.method_bindings.get("round4_spec_sha256"),
             round4_amendment_sha256=self.method_bindings.get("amendment_sha256"),
         )
+        return dict(frame=frame, x_m=x, y_m=y, response=response,
+                    statistics=row, sandmap=report)
+
+    def extract_statistics(self, spec):
+        """Expose the original summary row without evaluating fitted N1 mass.
+
+        A phase-one caller constructs this context with statistics_only=True.
+        This method writes no files, commits no frame and advances no history.
+        """
+        prepared = self._prepare_statistics(spec)
+        return dict(statistics=prepared["statistics"], sandmap=prepared["sandmap"])
+
+    def evaluate(self, spec, *, output_capture=None):
+        """Compute fields and the original paired E/U_rest summary once."""
+        if self.statistics_only:
+            raise ValueError("A statistics-only context cannot evaluate fitted mass")
+        import numpy as np
+        import darsia
+        from .n1_models import prepare_response, own_colour_response
+        from .n1_arithmetic import evaluate_main, main_products
+        from .n1_statistics import (
+            build_estimate_geometry,
+            summarize_round3_response,
+            exact_prediction,
+        )
+
+        prepared = self._prepare_statistics(spec)
+        frame, x, y = prepared["frame"], prepared["x_m"], prepared["y_m"]
+        response, row, report = (prepared["response"], prepared["statistics"],
+                                 prepared["sandmap"])
+        shared, math, config = self.config["shared"], self.math, self.config
         image = response["analysis"].scalar(frame.phase_labels, frame.elapsed_h)
         masks = {"full_rig": frame.domain}
         for name in ("box1", "box2"):
@@ -897,6 +943,8 @@ def _publish_frame(
     backend,
     position,
     compute_seconds,
+    *,
+    storage_context=None,
 ):
     """Publish one Main-format scientific frame directly on its owned output."""
     import numpy as np
@@ -1053,10 +1101,19 @@ def _publish_frame(
             separators=(",", ":"),
         )
     _write_json(temporary / "result.json", record)
+    storage_kinds = {}
+    if storage_context is not None:
+        from ..storage_n1_outputs import write_n1_frame
+        context, capture = storage_context
+        storage_kinds = write_n1_frame(
+            temporary, final, manifest=manifest, manifest_asset=manifest_asset,
+            spec=spec, config=config, evaluated=evaluated, capture=capture, context=context)
     files = {
         path.name: {key: value for key, value in asset(path).items() if key != "path"}
         for path in sorted(temporary.iterdir())
     }
+    for name, kind in storage_kinds.items():
+        files[name]["kind"] = kind
     commit_id = uuid.uuid4().hex
     commit = dict(
         complete=True,
@@ -1200,6 +1257,14 @@ def _run_n1(
     if io_binding is not None:
         io_binding.admit_resume_root(resume["source"])
     resumed = len(resume["records"])
+    storage_request = None
+    if "storage" in config:
+        from ..storage_outputs import parse_request
+        storage_request = parse_request(config, precision)
+        if storage_request["resolution_mm"] == "native":
+            storage_request = None  # Native/default publication remains the original path.
+    if storage_request is not None and resumed:
+        raise ValueError("Coarse N1 resume requires a separately qualified saved-storage prefix; no replay")
     records = list(resume["records"])
     frame_producers = list(resume["frame_producers"])
     resume_asset = None
@@ -1237,6 +1302,10 @@ def _run_n1(
         pipeline = N1Pipeline(
             config, precision=precision, pixel_math=math, unc_only=unc_only
         )
+        storage_context = None
+        if storage_request is not None:
+            from ..storage_n1_outputs import Phase2Storage
+            storage_context = Phase2Storage(config, pipeline.reader, storage_request)
         settings = dict(
             host=socket.gethostname(),
             backend=backend,
@@ -1265,6 +1334,9 @@ def _run_n1(
                 task, backend, precision, config["calibration"]["sha256"]
             ),
         )
+        if storage_context is not None:
+            manifest["storage"] = dict(producer_kind="n1-mass-only", request=storage_request,
+                phase1=storage_context.binding, ordered_case_ids=[frame["case_id"] for frame in config["frames"]])
         if resume_asset is not None:
             manifest["resume_checkpoint"] = resume_asset
         manifest_asset = _write_json(output / "manifest.json", manifest)
@@ -1282,7 +1354,9 @@ def _run_n1(
                     )
                 )
             started = time.perf_counter()
-            evaluated = pipeline.evaluate(spec)
+            capture = None if storage_context is None else {}
+            evaluated = (pipeline.evaluate(spec) if capture is None
+                         else pipeline.evaluate(spec, output_capture=capture))
             compute_seconds = time.perf_counter() - started
             publication = _publish_frame(
                 output,
@@ -1294,7 +1368,9 @@ def _run_n1(
                 backend,
                 position,
                 compute_seconds,
+                storage_context=None if storage_context is None else (storage_context, capture),
             )
+            del capture
             records.append(publication)
             frame_producers.append(frame_producer(output, publication, manifest_asset))
             del evaluated

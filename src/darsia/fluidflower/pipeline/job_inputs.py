@@ -178,6 +178,38 @@ class InputCatalog:
                 for key in ("labels", "classes", "area"):
                     self.add(frame[key], "model" if key in {"labels", "classes"} else "rig_model", use + "." + key)
 
+    def statistics(self, config, frames, *, standalone=False):
+        """Original summary-source consumers, omitting only fitted mass calibration."""
+        self.doc(config["physical_correction"], "rig_model", "mass.physical_correction")
+        shared = config["shared"]
+        for key in ("physical_reference", "floor_curve"):
+            self.add(shared[key], "rig_model", "mass." + key)
+        if isinstance(shared["depth_points"], dict):
+            self.add(shared["depth_points"], "rig_model", "mass.depth_points")
+        if ("reference_matrix" not in shared and isinstance(shared["physical_coordinate_provenance"], dict)
+                and "path" in shared["physical_coordinate_provenance"]):
+            self.doc(shared["physical_coordinate_provenance"], "rig_model", "mass.coordinate_provenance")
+        for key in ("rgb", "valid"):
+            self.add(shared["clearwater"][key], "image" if key == "rgb" else "rig_model", "mass.clearwater." + key)
+        optics = shared["optics"]
+        self.doc(optics["metadata"], "model", "mass.optics.metadata")
+        for group in ("color_paths", "signals"):
+            for label, bound in optics[group].items():
+                self.add(bound, "model", "mass.optics." + group + "." + str(label))
+        self.add(optics["flash"], "model", "mass.optics.flash")
+        if "path" in config["boxes"]:
+            self.add(config["boxes"], "rig_model", "mass.boxes")
+        for frame in frames:
+            use = "frame." + frame["case_id"] + ".mass"
+            self.add(frame["photo_top"], "rig_model", use + ".photo_top")
+            self.add(frame["original_domain"]["parent_labels_map"], "rig_model",
+                     use + ".original_domain.parent_labels_map")
+            if standalone:
+                self.full(frame["current"], use + ".current")
+                self.full(frame["baseline"], use + ".baseline")
+                for key in ("labels", "classes", "area"):
+                    self.add(frame[key], "model" if key in {"labels", "classes"} else "rig_model", use + "." + key)
+
     def phase(self, config):
         phase = self.doc(config["phase"]["configuration"], "configuration", "phase.configuration")
         p = phase["parameters"]
@@ -322,6 +354,37 @@ class InputCatalog:
                 self.add(roles["static"]["components"], "rig_model", use + ".static_components")
                 if roles.get("retained_source_cache") is not None:
                     self.retained(roles["retained_source_cache"], phase["parameters"]["retained"], use + ".retained")
+        elif config.get("format") == "darsia-native-phase-statistics-run-v1":
+            from .staged_data import validate_phase1_run
+            validate_phase1_run(config)
+            phase, native = self.phase(config)
+            specs = [dict(frame["mass_spec"], case_id=frame["case_id"]) for frame in config["frames"]]
+            self.statistics(config["statistics"], specs)
+            for frame in config["frames"]:
+                use = "frame." + frame["case_id"]
+                task = frame["native_task"]
+                geometry = self.doc(task["geometry"], "rig_model", use + ".native_geometry")
+                rig = self.doc(frame["geometry"], "rig_model", use + ".rig_geometry")
+                self.add(rig["frame_photo_top_keep"], "rig_model", use + ".photo_top")
+                self.native_task(task, geometry, native, use + ".native")
+                roles = frame["phase_roles"]
+                if roles.get("native_row") is not None:
+                    row = self.doc(roles["native_row"], "configuration", use + ".phase.native_row")
+                    self.original_native_row(row, phase["parameters"]["inputs"], use + ".phase")
+                    probability = self.doc(roles["probability_receipt"], "model", use + ".phase.probability_receipt")
+                    self.add(probability["files"][phase["parameters"]["inputs"]["mask_file"]], "rig_model", use + ".phase.photo_mask")
+                else:
+                    self.add(roles["photo_sand_reference"], "rig_model", use + ".phase.photo_sand_reference")
+                if roles["area"]["role"] == "measured_parent":
+                    for key in ("historical", "measured"):
+                        self.add(roles["area"][key], "rig_model", use + ".area." + key)
+                self.add(roles["static"]["components"], "rig_model", use + ".static_components")
+                if roles.get("retained_source_cache") is not None:
+                    self.retained(roles["retained_source_cache"], phase["parameters"]["retained"], use + ".retained")
+            for case, request in config.get("photographs", {}).items():
+                for field in ("native_geometry", "geometry_certificate", "current_geometry"):
+                    self.doc(request[field], "rig_model", "frame." + case + ".photo." + field)
+                self.add(request["saved_native_review"], "image", "frame." + case + ".photo.saved_native_review")
         else:
             raise ValueError("Unsupported role catalogue run format: " + str(config.get("format")))
         return {"format": CATALOG_FORMAT, "complete": True, "run": config["run"],

@@ -67,6 +67,9 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
     It returns machine_id, proof_descriptor and an explicitly accessible root.
     The current attempt instead follows this actual claim's admitted output.
     """
+    if result.get("pipeline") == "native-phase-statistics":
+        from .phase1_protocol import extract_phase1_products
+        return extract_phase1_products(result, claim, machine_id)
     if result.get("worker_references_closed") is not True or result.get("complete") is not True:
         raise ValueError("Original scientific producers have not closed their references")
     if result.get("run") != claim.task["run"] or result.get("attempt_id") != claim.token:
@@ -243,9 +246,13 @@ def make_publication_factory(job_root, job, machine_id, *, producer_origin_for_a
             target = _target(_fresh_root(Path(claim.lease) / "failure_artifacts"), "failed.json")
             _copy(candidate["path"], {"sha256": candidate["sha256"], "bytes": candidate["bytes"]}, target)
             return dict(candidate=_lease_reference(dict(candidate, path=str(target)), claim.lease))
-        if (result.get("task") != claim.task or result.get("commit") != claim.task["commit"]
-                or result.get("calibration_sha256") != claim.task["calibration_sha256"]):
-            raise ValueError("Original Main completion task, code or calibration identity differs")
+        if claim.task.get("pipeline") == "native-phase-statistics":
+            from .phase1_protocol import validate_phase1_claim
+            validate_phase1_claim(claim.task, job)
+        else:
+            if (result.get("task") != claim.task or result.get("commit") != claim.task["commit"]
+                    or result.get("calibration_sha256") != claim.task["calibration_sha256"]):
+                raise ValueError("Original Main completion task, code or calibration identity differs")
         products, metadata, accessible = extract_products(
             result, claim, machine_id, producer_origin_for_attempt=producer_origin_for_attempt)
         index = publish_run_metadata(
@@ -268,9 +275,15 @@ def make_publication_factory(job_root, job, machine_id, *, producer_origin_for_a
         return prepared
 
     def publish_progress(claim, event):
-        original = _original_frame_commit(claim, event)
+        if event.get("state") == "phase1_frame_completed":
+            from .phase1_protocol import phase1_frame_commit
+            original = _bound(phase1_frame_commit(claim, event))
+            leaf = "phase1_commit.json"
+        else:
+            original = _original_frame_commit(claim, event)
+            leaf = "commit.json"
         root = _fresh_root(Path(claim.lease) / "progress_artifacts" / name(event["case_id"]))
-        target = _target(root, "commit.json")
+        target = _target(root, leaf)
         _copy(original["path"], {"sha256": original["sha256"], "bytes": original["bytes"]}, target)
         return _lease_reference(dict(original, path=str(target)), claim.lease)
 

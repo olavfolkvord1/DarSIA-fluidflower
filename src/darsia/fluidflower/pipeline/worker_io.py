@@ -49,9 +49,15 @@ class WorkerRunIO:
         # named own-job lineage/retirement metadata; full prefix SHA checks still
         # run through original verify_frame_prefix after actual claim.
         from .checkpoint import resume_source_for_claim
-        resume_source_for_claim(SimpleNamespace(root=self.root),
-            SimpleNamespace(task=task,token=task["attempt_id"],output=output.path,
-                            local_output=output))
+        if task.get("pipeline") == "native-phase-statistics":
+            from .phase1_protocol import phase1_resume_source
+            phase1_resume_source(SimpleNamespace(root=self.root),
+                SimpleNamespace(task=task,token=task["attempt_id"],output=output.path,
+                                local_output=output))
+        else:
+            resume_source_for_claim(SimpleNamespace(root=self.root),
+                SimpleNamespace(task=task,token=task["attempt_id"],output=output.path,
+                                local_output=output))
         return rows
 
     def prepare(self,claim):

@@ -178,9 +178,13 @@ def validate_task(task: dict) -> None:
     UNC configuration path, and supported backend and working precision.
     """
     name(task["run"])
-    for key, length in (("commit", 40), ("calibration_sha256", 64)):
-        if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
-            raise ValueError(f"Task {key} must be a full lowercase SHA")
+    if task.get("pipeline") == "native-phase-statistics":
+        from .phase1_protocol import validate_phase1_task
+        validate_phase1_task(task)
+    else:
+        for key, length in (("commit", 40), ("calibration_sha256", 64)):
+            if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
+                raise ValueError(f"Task {key} must be a full lowercase SHA")
     config = task["configuration"]
     if task.get("format") == "darsia-alias-task-v1":
         from ..store_map import validate_input_reference
@@ -562,7 +566,12 @@ class JobQueue:
                 self._portable_event(event)  # Validate actual progress fields.
                 if event["state"] == "frame_completed":
                     shared["published_frame"] = self._frame_progress_reference(claim, event)
-                shared["detail_scope"] = "Original event provenance; frame evidence is published_frame within this shared bundle"
+                if event["state"] == "phase1_frame_completed":
+                    from .phase1_protocol import shared_phase1_progress
+                    shared["published_phase1_frame"] = shared_phase1_progress(self, claim, event)
+                    shared["detail_scope"] = "Original phase-one event provenance; exact phase1_commit bytes are published_phase1_frame within this shared bundle"
+                else:
+                    shared["detail_scope"] = "Original event provenance; frame evidence is published_frame within this shared bundle"
             write_immutable(claim.lease / f"progress_{sequence:08d}.json", shared,
                             create_parents=False)
             self.assert_owner(claim)

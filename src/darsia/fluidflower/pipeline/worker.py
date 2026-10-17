@@ -93,8 +93,12 @@ def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
         raise ValueError("One explicit job precision is required")
     import re
 
-    if not re.fullmatch(r"[0-9a-f]{64}", job.get("calibration_sha256", "")):
-        raise ValueError("Explicit job calibration SHA required")
+    if job.get("pipeline") == "native-phase-statistics":
+        from .phase1_protocol import validate_phase1_job
+        validate_phase1_job(job)
+    else:
+        if not re.fullmatch(r"[0-9a-f]{64}", job.get("calibration_sha256", "")):
+            raise ValueError("Explicit job calibration SHA required")
     if (
         not isinstance(job.get("expected_runs"), list)
         or not job["expected_runs"]
@@ -263,11 +267,18 @@ def _run_tasks(
         )
         try:
             task = claim.task
-            if (
-                task["commit"] != commit
-                or task["calibration_sha256"] != job["calibration_sha256"]
-            ):
-                raise ValueError("Claimed commit/calibration differs from job.json")
+            if (task.get("pipeline") == "native-phase-statistics"
+                    or job.get("pipeline") == "native-phase-statistics"):
+                from .phase1_protocol import validate_phase1_claim
+                validate_phase1_claim(task, job)
+                if task["commit"] != commit:
+                    raise ValueError("Claimed phase-one commit differs from the actual worker")
+            else:
+                if (
+                    task["commit"] != commit
+                    or task["calibration_sha256"] != job["calibration_sha256"]
+                ):
+                    raise ValueError("Claimed commit/calibration differs from job.json")
             precision = task.get("precision", job["precision"])
             if precision != job["precision"]:
                 raise ValueError("A job cannot mix working precisions")
@@ -278,7 +289,11 @@ def _run_tasks(
                 try:
                     io_binding=io_runtime.prepare(claim)
                     from .checkpoint import resume_source_for_claim
-                    prepared_resume=resume_source_for_claim(shared,claim)
+                    if task.get("pipeline") == "native-phase-statistics":
+                        from .phase1_protocol import phase1_resume_source
+                        prepared_resume=phase1_resume_source(shared,claim)
+                    else:
+                        prepared_resume=resume_source_for_claim(shared,claim)
                 except (InputHashMismatch,RunUnavailable):
                     text=traceback.format_exc()
                     record=shared.reject_before_science(claim,text,owner)
@@ -306,7 +321,9 @@ def _run_tasks(
                 )
                 # frame_completed is emitted only after the original atomic
                 # publication. frame_started also permits a zero-frame pause.
-                if event.get("state") in {"frame_started", "frame_completed"}:
+                if event.get("state") == "phase1_frame_completed":
+                    _job_control_boundary(root)
+                elif event.get("state") in {"frame_started", "frame_completed"}:
                     _job_control_boundary(root)
 
             from .checkpoint import resume_source_for_claim
@@ -327,6 +344,10 @@ def _run_tasks(
                 from .runner import run_series
 
                 execute = run_series
+            elif pipeline == "native-phase-statistics":
+                from .phase_statistics import run_phase1
+
+                execute = run_phase1
             else:
                 raise ValueError("Unknown explicit task pipeline: " + str(pipeline))
             if io_binding is None:
@@ -336,14 +357,19 @@ def _run_tasks(
                     result = execute(science_task, claim.output, backend, precision, progress)
             if result.get("precision") != precision or result.get("backend") != backend:
                 raise ValueError("Actual scientific backend/precision differs")
-            result = dict(
-                result,
-                actual_worker=owner,
-                commit=commit,
-                calibration_sha256=task["calibration_sha256"],
-                attempt_id=claim.token,
-                task=task,
-            )
+            if pipeline == "native-phase-statistics":
+                from .phase1_protocol import worker_result
+                result = worker_result(result, task=task, job=job, commit=commit,
+                                       owner=owner, token=claim.token)
+            else:
+                result = dict(
+                    result,
+                    actual_worker=owner,
+                    commit=commit,
+                    calibration_sha256=task["calibration_sha256"],
+                    attempt_id=claim.token,
+                    task=task,
+                )
             shared.complete(claim, result)
             messages.put(
                 dict(kind="completed", run=task["run"], attempt_id=claim.token)

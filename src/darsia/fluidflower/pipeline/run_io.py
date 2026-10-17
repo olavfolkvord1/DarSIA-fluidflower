@@ -210,7 +210,7 @@ class RunIOBinding:
         expected = {use for item in task["input_catalog"]["inputs"] for use in item["uses"]}
         if set(replay.used) != expected:
             raise InputHashMismatch("Prepared input catalogue has unconsumed or missing roles")
-        if config.get("format") == "darsia-native-phase-n1-run-v1":
+        if config.get("format") in {"darsia-native-phase-n1-run-v1", "darsia-native-phase-statistics-run-v1"}:
             native = self._metadata_bytes(self._descriptor_location(config["native"]["configuration"]))
             self._admit_native_code(_json_bytes(native))
         replay.bind_declared_aliases()
