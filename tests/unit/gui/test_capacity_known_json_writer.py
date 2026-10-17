@@ -50,14 +50,12 @@ def fixture_git(tmp_path, measured, current, *, eol="lf", relative=WRITER):
     path.parent.mkdir(parents=True)
     commits = []
     for label, raw in [("measured", measured), ("current", current)]:
-        path.write_bytes(raw)
+        path.write_bytes(raw.replace(b"\n", b"\r\n") if eol == "crlf" else raw)
         git("add", "--", ".gitattributes", relative)
         git("-c", "user.name=Validation fixture", "-c", "user.email=fixture@example.invalid",
             "commit", "--allow-empty", "-m", label)
         commits.append(git("rev-parse", "HEAD"))
     git("checkout-index", "--force", "--all")
-    if eol == "crlf":
-        path.write_bytes(current.replace(b"\n", b"\r\n"))
     assert not git("status", "--porcelain=v1", "--untracked-files=all")
     assert path.read_bytes().replace(b"\r\n", b"\n") == current
     row = dict(relative_path=relative, measured_sha256=sha(measured), sha256=sha(current))
