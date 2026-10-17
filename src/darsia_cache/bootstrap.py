@@ -127,6 +127,32 @@ def _default_store_map_path():
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home()/".config"))/"darsia"/"stores.toml"
 
 
+
+def _legacy_default_without_cache(path):
+    """Classify only an ordinary default; this never admits a managed alias."""
+    path=Path(path).expanduser()
+    if not path.is_absolute() or str(path).startswith(("\\\\","//")):
+        raise CachePolicyError("Default stores classification requires a local absolute path")
+    resolved=path.resolve(strict=True)
+    if str(resolved).startswith(("\\\\","//")):
+        raise CachePolicyError("Default stores classification cannot read a network alias")
+    try:
+        before=resolved.stat()
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 1024**2:
+            raise CachePolicyError("Default stores classification requires bounded regular metadata")
+        with resolved.open("rb") as stream:
+            raw=stream.read(1024**2+1)
+        after=resolved.stat()
+        if path.resolve(strict=True)!=resolved:
+            raise CachePolicyError("Default stores alias retargeted during unmanaged classification")
+    except FileNotFoundError as error:
+        raise CachePolicyError("Default stores disappeared during unmanaged classification") from error
+    if before!=after or len(raw)!=before.st_size or len(raw)>1024**2:
+        raise CachePolicyError("Default stores changed during unmanaged classification")
+    document=tomllib.loads(raw.decode("utf-8-sig"))
+    return "cache" not in document and "cache_bootstrap" not in document
+
+
 def _entry_kind():
     if _worker_arguments() is not None:
         return "worker"
@@ -392,6 +418,12 @@ def before_darsia_import(*,package_file):
             if worker:raise CachePolicyError("Worker requires one configured external stores cache policy before imports")
             return None
         try:
+            # A default legacy store map is not a managed-cache admission. Only
+            # ordinary unbound entries may classify its bounded TOML via an OS
+            # virtualized alias. Managed defaults still use the ORIGINAL path.
+            if (not worker and EXPECTED_STORES_ENV not in os.environ
+                    and _legacy_default_without_cache(policy_path)):
+                return None
             document,source=_explicit_document(policy_path,package_file)
         except FileNotFoundError:
             if worker:raise CachePolicyError("Worker requires one configured external stores cache policy before imports")
