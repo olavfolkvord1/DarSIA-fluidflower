@@ -273,7 +273,9 @@ def test_v2_requires_apply_and_refuses_historical_build_overlay(pointer):
     selected = pointer["bindings"]["ac17"]
     # Before Apply the original labels do not point to any canonical export.
     merged = Path(selected["current_configuration"]["path"])
-    with pytest.raises(ValueError): subject.require_corrected_export_for_build(merged)
+    before = inventory(data["series"])
+    with pytest.raises(FileNotFoundError): subject.require_corrected_export_for_build(merged)
+    assert inventory(data["series"]) == before
     subject.apply_corrected_selected_run(data["project"], result)
     with pytest.raises(ValueError, match="different or ambiguous"):
         subject.require_corrected_export_for_build([Path(pointer["sources"]["ac17"]["path"]), merged])
