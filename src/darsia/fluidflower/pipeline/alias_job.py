@@ -162,6 +162,121 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
             "numerical_calls_started":False}
 
 
+
+def prepare_phase1_alias_job(job, tasks, job_root, *, execution_series,
+                            series_manifest, catalog_factory=None):
+    """Prepare supplied typed phase-one inputs; never assemble or infer DATA.
+
+    execution_series is a real explicit parent provenance document. This API
+    does not define, parse or adopt a new execution-plan schema or GUI plan.
+    Every original configuration and scientific role must already exist.
+    """
+    import re
+    from .phase1_protocol import bind_phase1_identity, validate_phase1_claim, validate_phase1_job
+    from .staged_data import validate_phase1_run
+    transport = shared_output_admission(job_root)
+    catalog_factory = catalog_factory or InputCatalog
+    _source, manifest, roots = _manifest(series_manifest)
+    if (not isinstance(job, dict) or job.get("format") != JOB_FORMAT
+            or job.get("pipeline") != "native-phase-statistics"
+            or "calibration_sha256" in job):
+        raise ValueError("Supply an explicit positive phase-one alias job, never a calibrated job")
+    allowed_job = {"format", "pipeline", "commit", "environment_lock", "precision",
+                   "created_utc", "publish", "expected_runs", "phase1_configurations",
+                   "phase1_configurations_sha256"}
+    if set(job) - allowed_job:
+        raise ValueError("Unsupported supplied phase-one job fields")
+    if (not isinstance(tasks, (list, tuple)) or not tasks
+            or any(not isinstance(task, dict) for task in tasks)):
+        raise ValueError("Supply the complete explicit phase-one task list")
+    if job.get("expected_runs") != [task.get("run") for task in tasks]:
+        raise ValueError("Supplied phase-one run order differs from the immutable job")
+    if len({task.get("job_id") for task in tasks}) != 1:
+        raise ValueError("Every supplied phase-one task must belong to one explicit job_id")
+    lock = job["environment_lock"]
+    if (not isinstance(lock, dict) or not isinstance(lock.get("path"), str)
+            or not lock["path"] or not isinstance(lock.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", lock["sha256"]) is None):
+        raise ValueError("Explicit environment-lock path and full lowercase SHA required")
+    relative = PureWindowsPath(lock["path"])
+    if relative.drive or relative.root or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Environment lock must remain repository-relative")
+    admission = catalog_factory(roots)
+    series_reference = admission.add(execution_series, "configuration", "execution_series")
+    manifest_reference = admission.add(series_manifest, "configuration", "series_manifest")
+    prepared = []
+    for original in tasks:
+        allowed = {"format", "pipeline", "run", "configuration", "commit", "precision",
+                   "job_id", "backend", "threads", "device_id", "pool_limit_bytes"}
+        if (not isinstance(original, dict) or set(original) - allowed
+                or original.get("format") != TASK_FORMAT
+                or original.get("pipeline") != "native-phase-statistics"
+                or original.get("commit") != job["commit"]
+                or original.get("precision") != job["precision"]
+                or original.get("backend") not in {"cpu", "cuda", "any"}):
+            raise ValueError("Each supplied task must declare its original positive stage and job identity")
+        name(original["job_id"])
+        catalog = catalog_factory(roots)
+        config = validate_phase1_run(catalog.doc(original["configuration"], "configuration", "run.configuration"))
+        if config["run"] != original["run"] or config["precision"] != original["precision"]:
+            raise ValueError("Original typed phase-one configuration differs from its task")
+        # Recreate the catalogue with only the explicit aliases in that input.
+        catalog = catalog_factory(roots, config.get("data_aliases", ()))
+        catalog.add(execution_series, "configuration", "run.execution_series")
+        catalog.add(series_manifest, "configuration", "run.series_manifest")
+        inputs = validate_catalog(catalog.collect(original["configuration"], config))
+        inputs["runtime_support"] = "darsia-role-io-runtime-v1"
+        prepared.append(dict(deepcopy(original), format_version=1, legacy_paths=False,
+            execution_ready=True, execution_blocker="", configuration=inputs["configuration"],
+            series=series_reference, series_manifest=manifest_reference, input_catalog=inputs,
+            ordered_case_ids=deepcopy(config["ordered_case_ids"])))
+    supplied = deepcopy(job)
+    supplied.update(format_version=1, legacy_paths=False, execution_ready=True,
+        execution_blocker="", runtime_support="darsia-role-io-runtime-v1",
+        series=series_reference, series_manifest=manifest_reference,
+        series_id=manifest["series_id"], input_reference_format="root-alias-relative-v1")
+    bound_job, bound_tasks = bind_phase1_identity(supplied, prepared)
+    for key in ("phase1_configurations", "phase1_configurations_sha256"):
+        if key in job and job[key] != bound_job[key]:
+            raise ValueError("Supplied phase-one configuration-map identity differs")
+    publish = bound_job.get("publish", ["film", "lossless_export"])
+    if (not isinstance(publish, list) or any(not isinstance(item, str) or not item
+            or "\\" in item or PurePosixPath(item).is_absolute() or PureWindowsPath(item).drive
+            or any(part in {"", ".", ".."} for part in item.split("/")) for item in publish)):
+        raise ValueError("Publish must name relative products, never machine paths")
+    bound_job["publish"] = deepcopy(publish)
+    validate_phase1_job(bound_job)
+    root = Path(job_root)
+    target = root / "job.json"
+    if target.exists() and read_json(target) != bound_job:
+        raise ValueError("Existing phase-one alias job differs from immutable metadata")
+    prior_tasks = {}
+    from .job_queue import validate_task
+    for task in bound_tasks:
+        validate_task(task)
+        validate_phase1_claim(task, bound_job)
+        location = root / "results" / name(task["run"]) / "task.json"
+        if location.exists():
+            prior = read_json(location)
+            projected = {key: item for key, item in prior.items() if key not in {"attempt_id", "output_directory"}}
+            if projected != task:
+                raise ValueError("Existing phase-one alias run task differs")
+            prior_tasks[task["run"]] = location
+    root.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        write_immutable(target, bound_job)
+    shared = JobQueue(root)
+    records = []
+    for task in bound_tasks:
+        already = task["run"] in prior_tasks
+        location = prior_tasks[task["run"]] if already else shared.enqueue(task)
+        records.append(dict(run=task["run"], task=descriptor(location), already_enqueued=already))
+    return dict(complete=True, job=descriptor(target), series=series_reference,
+        series_manifest=manifest_reference, tasks=records, legacy_paths=False,
+        execution_ready=True, execution_blocker="", numerical_calls_started=False,
+        preparation_scope="Explicit supplied typed inputs only; no execution-plan or DATA assembly")
+
+
 def portable_selection_binding(binding, *, series_manifest, catalog_factory=None):
     """Encode only the existing named B4 UI proof fields, before job mkdir."""
     catalog_factory = catalog_factory or InputCatalog
@@ -210,7 +325,12 @@ def prepared_snapshot(registration, job, ui, *, reader):
     for run in job["expected_runs"]:
         task=reader(root/"results"/name(run)/"task.json")
         validate_task(task)
-        if (task.get("format")!=TASK_FORMAT or task["run"]!=run
+        if job.get("pipeline") == "native-phase-statistics":
+            from .phase1_protocol import validate_phase1_claim
+            validate_phase1_claim(task, job)
+            if task["run"] != run:
+                raise ValueError("Prepared phase-one task belongs to another run")
+        elif (task.get("format")!=TASK_FORMAT or task["run"]!=run
                 or task["commit"]!=job["commit"]
                 or task["calibration_sha256"]!=job["calibration_sha256"]
                 or task["precision"]!=job["precision"]):

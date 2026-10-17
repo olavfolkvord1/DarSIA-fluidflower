@@ -22,6 +22,19 @@ def main(argv=None):
     shared = JobQueue(args.job)
     for original in tasks:
         task = dict(original)
+        if job.get("pipeline") == "native-phase-statistics":
+            from .phase1_protocol import validate_phase1_job, validate_phase1_claim
+            validate_phase1_job(job)
+            if task.get("pipeline") != "native-phase-statistics":
+                raise ValueError("Each supplied task must already declare the positive phase-one stage")
+            for key in ("commit", "precision", "phase1_configurations_sha256"):
+                task.setdefault(key, job[key])
+                if task[key] != job[key]:
+                    raise ValueError(f"Task {key} differs from job.json")
+            validate_phase1_claim(task, job)
+            path = shared.enqueue(task)
+            print(json.dumps(dict(run=task["run"], queued=str(path))), flush=True)
+            continue
         for key in ("commit", "calibration_sha256", "precision"):
             task.setdefault(key, job[key])
             if task[key] != job[key]:

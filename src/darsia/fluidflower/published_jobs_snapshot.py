@@ -74,6 +74,132 @@ def _lease_chain(root, run, token, base_task, reader):
         token = previous
     return list(reversed(paths))
 
+
+def _phase1_progress(value, task, lease, reader):
+    from .pipeline.phase1_protocol import PIPELINE
+    from .pipeline.staged_data import FRAME_FORMAT, _same_json
+    event = value["event"]
+    case = event.get("case_id")
+    original = event.get("phase1_commit")
+    copied = value.get("published_phase1_frame")
+    if (event.get("state") != "phase1_frame_completed" or event.get("stage") != PIPELINE
+            or event.get("complete") is not True or event.get("run") != task["run"]
+            or case not in task["ordered_case_ids"] or not isinstance(original, dict)
+            or not isinstance(copied, dict) or not _same_bytes(original, copied)):
+        raise ValueError("Actual positive phase-one shared progress identity required")
+    record = _read_reference(lease, copied, reader)
+    if (record.get("format") != FRAME_FORMAT or record.get("complete") is not True
+            or record.get("run") != task["run"] or record.get("case_id") != case
+            or record.get("precision") != task["precision"]
+            or not _same_json(record.get("frame_index"), event.get("frame_index"))
+            or not _same_bytes(record.get("configuration", {}), task["configuration"])):
+        raise ValueError("Shared phase-one commit differs from the task/progress identity")
+    return case, record, value["written_unix_ns"]
+
+
+def _phase1_terminal(root, base_task, job, done, reader):
+    """Inspect only original shared indexed metadata; never producer-local paths."""
+    from .pipeline.phase1_protocol import validate_phase1_claim, RESULT_FORMAT, MANIFEST_FORMAT, MAP_SHA_FIELD
+    from .pipeline.staged_data import COMPLETION_FORMAT, _same_json, _frame_record
+    validate_phase1_claim(base_task, job)
+    if (done.get("format") != "darsia-alias-done-v1" or done.get("run") != base_task["run"]
+            or done["completed"]["relative_path"] != "results/" + base_task["run"] + "/completed.json"):
+        raise ValueError("Alias phase-one done record differs from its canonical run")
+    completed = _read_reference(root, done["completed"], reader)
+    index_path = _own_asset(root, done["products_index"])
+    index = descriptor(index_path)
+    _index_root, document, products = _read_index(index)
+    if (document["run"] != base_task["run"] or document["attempt_id"] != done["attempt_id"]
+            or not _same_bytes(document["job"], descriptor(root / "job.json"))
+            or not _same_bytes(published_metadata_descriptor(index), done["completed"])):
+        raise ValueError("Published phase-one index/job/completion identity differs")
+    actual = completed.get("task") or {}
+    validate_phase1_claim(actual, job)
+    if (completed.get("format") != RESULT_FORMAT or completed.get("pipeline") != job["pipeline"]
+            or completed.get("complete") is not True or completed.get("whole_run") is not True
+            or completed.get("worker_references_closed") is not True
+            or completed.get("run") != base_task["run"] or completed.get("attempt_id") != done["attempt_id"]
+            or not _task_identity(base_task, actual) or actual.get("attempt_id") != done["attempt_id"]
+            or completed.get("commit") != job["commit"] or completed.get("precision") != job["precision"]
+            or completed.get("backend") not in {"cpu", "cuda"}
+            or base_task.get("backend") not in {"any", completed.get("backend")}
+            or completed.get(MAP_SHA_FIELD) != job[MAP_SHA_FIELD] or "calibration_sha256" in completed
+            or completed.get("fitted_mass_calibration_read") is not False
+            or type(completed.get("mass_evaluation_calls")) is not int or completed["mass_evaluation_calls"] != 0):
+        raise ValueError("Original closed positive phase-one result identity differs")
+    lineage = _lease_chain(root, base_task["run"], done["attempt_id"], base_task, reader)
+    publication_owner = reader(index_path.parent.parent / "owner.json")
+    if (publication_owner.get("task") != actual or publication_owner.get("token") != done["attempt_id"]
+            or publication_owner.get("actual_owner") != completed.get("actual_worker")):
+        raise ValueError("Phase-one publication owner differs from original terminal task/worker")
+    machine = _owner_machine(publication_owner, base_task, done["attempt_id"])
+    completion_product = products["completed.json"]
+    if (not _same_bytes(completion_product, done["completed"])
+            or name(completion_product["machine_id"]) != name(machine)
+            or _pure(completion_product["local_path"]).name != "candidate_completed.json"):
+        raise ValueError("Indexed phase-one completion producer differs")
+    attempt = _pure(completion_product["local_path"]).parent
+    if (attempt.name != done["attempt_id"] or attempt.parent.name != ".attempts"
+            or name(attempt.parent.parent.name) != name(base_task["run"])
+            or name(attempt.parent.parent.parent.name) != name(base_task["job_id"])):
+        raise ValueError("Phase-one indexed producer is outside its genuine job/run/attempt namespace")
+    def metadata(asset, product_id):
+        row = products[product_id]
+        if (not _same_bytes(row, asset) or _pure(row["local_path"]) != _pure(asset["path"])
+                or name(row["machine_id"]) != name(machine)):
+            raise ValueError("Named phase-one metadata product differs from its original descriptor")
+        return _original_metadata(index, products, asset, attempt, machine)
+    manifest = metadata(completed["manifest"], "manifest.json")
+    core = metadata(completed["phase1_completion"], "phase1_completed.json")
+    expected_stage = dict(pipeline=job["pipeline"], configuration=base_task["configuration"],
+        run=base_task["run"], commit=job["commit"], precision=job["precision"],
+        backend=completed.get("backend"), threads=base_task["threads"],
+        attempt_id=done["attempt_id"], phase1_configurations_sha256=job[MAP_SHA_FIELD])
+    cases = base_task["ordered_case_ids"]
+    if (manifest.get("format") != MANIFEST_FORMAT or manifest.get("run") != base_task["run"]
+            or manifest.get("job_id") != base_task["job_id"]
+            or not _same_json(manifest.get("stage_identity"), expected_stage)
+            or manifest.get("code") != dict(commit=job["commit"], identity_algorithm="sha256-git-commit-ascii")
+            or manifest.get("commit_identity_digest") != hashlib.sha256(job["commit"].encode("ascii")).hexdigest()
+            or manifest.get("settings", {}).get("backend") != completed.get("backend")
+            or manifest.get("settings", {}).get("precision") != job["precision"]
+            or not _same_json(manifest.get("settings", {}).get("threads"), base_task["threads"])
+            or not _same_bytes(manifest.get("configuration", {}), base_task["configuration"])
+            or not manifest.get("native_code_admission", {}).get("entries")
+            or any(row.get("commit") != job["commit"] for row in manifest["native_code_admission"]["entries"])
+            or set(manifest.get("frames", {})) != set(cases)):
+        raise ValueError("Original phase-one manifest/code/settings/configuration differs")
+    if (core.get("format") != COMPLETION_FORMAT or core.get("complete") is not True
+            or core.get("history_complete") is not True or core.get("run") != base_task["run"]
+            or core.get("code_commit") != job["commit"] or core.get("precision") != job["precision"]
+            or not _same_json(core.get("configuration"), manifest["configuration"])
+            or not _same_json(completed.get("configuration"), manifest["configuration"])
+            or not _same_json(core.get("ordered_case_ids"), cases)
+            or not _same_json(completed.get("ordered_case_ids"), cases)
+            or type(completed.get("case_count")) is not int or completed["case_count"] != len(cases)
+            or not isinstance(core.get("frames"), list) or len(core["frames"]) != len(cases)
+            or not _same_json(core["frames"], completed.get("phase1_frames"))):
+        raise ValueError("Original phase-one core completion differs from its manifest/case order")
+    expected_products = {"completed.json", "manifest.json", "phase1_completed.json"}
+    for case, bound in zip(cases, core["frames"]):
+        if _pure(bound["path"]) != attempt / "preparation" / case / "phase1_commit.json":
+            raise ValueError("Phase-one core frame points outside its actual current attempt")
+        record = metadata(bound, "phase1/" + case + "/phase1_commit.json")
+        _frame_record(record, manifest["frames"][case], manifest["configuration"], job["precision"], bound)
+        expected_products.add("phase1/" + case + "/phase1_commit.json")
+        for leaf, asset in record["files"].items():
+            key = "phase1/" + case + "/" + leaf
+            row = products[key]
+            if (not _same_bytes(row, asset) or _pure(row["local_path"]) != _pure(asset["path"])
+                    or _pure(asset["path"]) != attempt / "preparation" / case / leaf
+                    or name(row["machine_id"]) != name(machine)):
+                raise ValueError("Indexed phase-one product differs from its original inventory")
+            expected_products.add(key)
+    if set(products) != expected_products:
+        raise ValueError("Phase-one products index has missing or extra original entries")
+    return completed, {case: machine for case in cases}, lineage
+
+
 def _events(lease, task, reader, *, token=None):
     token = token or (lease.parent.name if lease.name == "lease" else lease.name.split(".")[-1])
     events=[]
@@ -84,6 +210,12 @@ def _events(lease, task, reader, *, token=None):
                 or type(value.get("written_unix_ns")) is not int):
             raise ValueError("Published progress sequence/run/attempt/time differs")
         event=value["event"]
+        if task.get("pipeline") == "native-phase-statistics":
+            if event.get("state") == "frame_completed":
+                raise ValueError("Mass frame progress cannot belong to a positive phase-one task")
+            if event.get("state") == "phase1_frame_completed":
+                events.append(_phase1_progress(value, task, lease, reader))
+            continue
         if event.get("state") != "frame_completed":
             continue
         if event.get("complete") is not True:
@@ -227,6 +359,8 @@ def _producer_inventory(index, products, record, producer, task, job, *,
 
 
 def _terminal(root, run_root, base_task, job, done, reader):
+    if base_task.get("pipeline") == "native-phase-statistics":
+        return _phase1_terminal(root, base_task, job, done, reader)
     if (done.get("format") != "darsia-alias-done-v1" or done.get("run") != base_task["run"]
             or done["completed"]["relative_path"] != "results/"+base_task["run"]+"/completed.json"):
         raise ValueError("Alias done record differs from its canonical run")
@@ -329,7 +463,12 @@ def published_snapshot(registration,job,ui,*,reader):
                  worker="Not reported",error="",case_ids=[])
         try:
             run_root=root/"results"/name(run);task=reader(run_root/"task.json");validate_task(task)
-            if (task.get("format")!="darsia-alias-task-v1" or task.get("execution_ready") is not True
+            if task.get("pipeline") == "native-phase-statistics" or job.get("pipeline") == "native-phase-statistics":
+                from .pipeline.phase1_protocol import validate_phase1_claim
+                validate_phase1_claim(task, job)
+                if task.get("execution_ready") is not True or task["run"] != run:
+                    raise ValueError("Positive phase-one alias task is not the original runnable run")
+            elif (task.get("format")!="darsia-alias-task-v1" or task.get("execution_ready") is not True
                     or task["run"]!=run or task["commit"]!=job["commit"]
                     or task["calibration_sha256"]!=job["calibration_sha256"]
                     or task["precision"]!=job["precision"]):
