@@ -3,8 +3,10 @@
 No measured displacement, real map, export, Build, or migration is used here.
 """
 from copy import deepcopy
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import darsia
 import numpy as np
 import pytest
 
@@ -189,3 +191,96 @@ def test_recorded_clipping_metrics_must_match_actual_parent_pixels(imported):
     before=snapshot(imported.project.root)
     with pytest.raises(ValueError,match="translation metrics"):save(imported,draft)
     assert snapshot(imported.project.root)==before
+
+
+def _real_image_metadata(*, dated=False):
+    return darsia.Image(np.zeros((2, 3), np.float32), space_dim=2, indexing="ij",
+        dimensions=[.49, .9], origin=np.array([0., .49], np.float64),
+        scalar=False, series=False,
+        date=datetime(2026, 10, 4, 12, 30) if dated else None).metadata()
+
+
+@pytest.mark.parametrize("dated", [False, True])
+def test_original_image_metadata_npz_roundtrip_is_exact_without_json(tmp_path, dated):
+    metadata = _real_image_metadata(dated=dated)
+    path = tmp_path / "genuine-image-metadata.npz"
+    np.savez(path, array=np.zeros((2, 3), np.uint8), metadata=metadata)
+    actual = geometry._darsia_metadata(path)
+    assert type(actual["origin"]) is darsia.Coordinate
+    assert actual["origin"].dtype == np.dtype(np.float64)
+    assert actual["origin"].shape == (2,)
+    assert actual["type"] is darsia.Image
+    assert sources._same_grid_metadata(metadata, actual)
+    assert sources._same_grid_metadata(actual, deepcopy(actual))
+
+
+@pytest.mark.parametrize("change", ["origin_value", "origin_dtype", "origin_shape",
+    "origin_class", "dimensions_type", "integer_type", "flag_type", "missing",
+    "extra", "image_class", "date_value", "date_type", "reference_date", "numpy_scalar"])
+def test_real_metadata_equality_rejects_every_changed_field_or_type(change):
+    original = _real_image_metadata(dated=True)
+    changed = deepcopy(original)
+    if change == "origin_value": changed["origin"][0] = .001
+    elif change == "origin_dtype": changed["origin"] = changed["origin"].astype(np.float32)
+    elif change == "origin_shape": changed["origin"] = changed["origin"].reshape(1, 2)
+    elif change == "origin_class": changed["origin"] = np.asarray(changed["origin"]).copy()
+    elif change == "dimensions_type": changed["dimensions"] = tuple(changed["dimensions"])
+    elif change == "integer_type": changed["space_dim"] = 2.0
+    elif change == "flag_type": changed["scalar"] = 0
+    elif change == "missing": changed.pop("name")
+    elif change == "extra": changed["unbound"] = None
+    elif change == "image_class": changed["type"] = np.ndarray
+    elif change == "date_value": changed["date"] += timedelta(microseconds=1)
+    elif change == "date_type": changed["date"] = changed["date"].date()
+    elif change == "reference_date": changed["reference_date"] += timedelta(seconds=1)
+    elif change == "numpy_scalar":
+        original["time"] = np.float64(0.)
+        changed["time"] = np.float32(0.)
+    assert not sources._same_grid_metadata(original, changed)
+    assert not sources._same_grid_metadata(changed, original)
+
+
+def test_metadata_equality_never_forgives_nan_or_object_scalar_type_changes():
+    assert not sources._same_grid_metadata(np.array([np.nan]), np.array([np.nan]))
+    assert not sources._same_grid_metadata(float("nan"), float("nan"))
+    assert not sources._same_grid_metadata(np.array([True], object), np.array([1], object))
+    assert not sources._same_grid_metadata({True: "same"}, {1: "same"})
+
+
+def _registered_with_real_metadata(data):
+    metadata = _real_image_metadata()
+    for name, array in data.arrays.items():
+        np.savez(data.original / (name + ".npz"), array=array, metadata=metadata)
+    data.config.update(width_m=.9, height_m=.49)
+    data.config = sources.bind_imported_rasters(data.config,
+        sources={key: sources.descriptor(data.config[sources.PATH_KEYS[key]]) for key in sources.KEYS},
+        diagnosis=data.config["imported_rasters"]["diagnosis"])
+    draft, parent, translated = registered(data)
+    revision = save(data, draft)
+    return revision, translated
+
+
+def test_original_store_and_registered_reader_keep_genuine_coordinate_metadata(imported):
+    revision, expected = _registered_with_real_metadata(imported)
+    original_before = snapshot(imported.original)
+    result = sources.registered_run_sources(imported.project.root, revision, "one")
+    for name in ("labels", "facies"):
+        path = Path(result["files"][name]["path"])
+        assert sources._same_grid_metadata(geometry._darsia_metadata(path),
+            geometry._darsia_metadata(Path(imported.config["labels_path"])))
+    labels = sources._integer_map(result["files"]["labels"]["path"])
+    assert labels.dtype == np.dtype(np.int32) and np.array_equal(labels, expected)
+    assert snapshot(imported.original) == original_before
+
+
+@pytest.mark.parametrize("field", ["labels", "facies"])
+def test_registered_reader_rejects_changed_stored_coordinate_metadata(imported, field):
+    revision, _ = _registered_with_real_metadata(imported)
+    artifact = geometry.resolve_run_geometry_artifacts(revision, "one")
+    path = Path(artifact[field + "_path"])
+    values = geometry._load_array(path)
+    metadata = geometry._darsia_metadata(path)
+    metadata["origin"][0] += .001
+    np.savez(path, array=values, metadata=metadata)
+    with pytest.raises(ValueError, match="Stored registered " + field + " changed their grid metadata"):
+        sources.registered_run_sources(imported.project.root, revision, "one")
