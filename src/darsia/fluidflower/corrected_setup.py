@@ -132,6 +132,7 @@ def _canonical_location(package_root, config, revision, run):
 
 
 CONFIGURATION_BINDING_FORMAT = "darsia-corrected-setup-configuration-dual-binding-v1"
+CONFIGURATION_BINDING_V2_FORMAT = "darsia-corrected-setup-configuration-dual-binding-v2"
 PROTOCOL_LEAVES = ("protocols.imaging", "protocols.injection", "protocols.imaging_mode")
 
 
@@ -202,7 +203,157 @@ def _dual_configuration_binding(value, run, configuration, selected, *, destinat
     return deepcopy(value)
 
 
-def _configuration_bundle(series, run, configuration, *, destination=None, receipt=None):
+def _configuration_bytes_v2(row):
+    """Bind the exact bytes consumed by the new v2 TOML parser."""
+    raw = _small(row["path"])
+    if len(raw) != row["size_bytes"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
+        raise ValueError("V2 consumed configuration bytes differ from the bound SHA/size identity.")
+    return raw
+
+
+def _dual_configuration_binding_v2(value, run, configuration, selected, *, series,
+                                   project_root, revision, destination, receipt):
+    """Bind one separately migrated output pointer, never a geometry override."""
+    keys = {"format", "run_id", "source_configuration", "current_configuration",
+            "apply_configurations", "pre_pointer_configurations", "protocol_change_mode", "protocol_changes",
+            "output_pointer_change", "comparison_sha256"}
+    if (not isinstance(value, dict) or set(value) != keys
+            or value["format"] != CONFIGURATION_BINDING_V2_FORMAT or value["run_id"] != run
+            or not isinstance(value["comparison_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["comparison_sha256"]) is None):
+        raise ValueError("The v2 selected-run configuration metadata is not explicit and complete.")
+    if (project_root is None or not Path(project_root).is_absolute()
+            or not _same(project_root, Path(series) / "geometry_facies")
+            or not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{32}", revision) is None):
+        raise ValueError("The v2 output pointer requires the actual series project and revision.")
+    original = _configuration_identity(value["source_configuration"])
+    current = _configuration_identity(value["current_configuration"])
+    targets = value["apply_configurations"]
+    if (not _typed_equal(original, configuration) or not isinstance(targets, list)
+            or len(selected) != 2 or len(targets) != 2):
+        raise ValueError("The v2 binding belongs to another source or selected bundle.")
+    for target, declared in zip(targets, selected):
+        _configuration_identity(target)
+        if not _same(target["path"], declared) or _same(target["path"], original["path"]):
+            raise ValueError("V2 Apply targets must be the exact current declared bundle, never the historical source.")
+    if not _typed_equal(current, targets[-1]):
+        raise ValueError("The v2 current configuration must be the declared merged target.")
+    previous = value["pre_pointer_configurations"]
+    if not isinstance(previous, list) or len(previous) != 2:
+        raise ValueError("V2 requires exact preserved pre-pointer partial and merged identities.")
+    for before, role in zip(previous, ("runs", "merged")):
+        _configuration_identity(before)
+        path = Path(before["path"])
+        if (not path.resolve().is_relative_to(Path(series).resolve())
+                or path.parent.name != role or path.name != run + ".toml"
+                or any(_same(path, target["path"]) for target in targets)):
+            raise ValueError("V2 pre-pointer identities must be preserved inside this series in exact run partial/merged order.")
+    pointer = value["output_pointer_change"]
+    expected = Path(project_root) / "results" / "rig_models" / revision / _run_name(run)
+    if (not isinstance(pointer, dict) or set(pointer) != {"field", "before", "after"}
+            or pointer["field"] != "rig.path"
+            or not isinstance(pointer["before"], str) or not pointer["before"]
+            or not Path(pointer["before"]).is_absolute()
+            or not isinstance(pointer["after"], str) or pointer["after"] != str(expected)):
+        raise ValueError("V2 permits only the explicit rig.path change to this project's fixed revision/run destination.")
+    old_folder, new_folder = Path(pointer["before"]).resolve(), expected.resolve()
+    if old_folder.is_relative_to(new_folder) or new_folder.is_relative_to(old_folder):
+        raise ValueError("The v2 rig output must not overlap the preserved original rig folder.")
+    source = tomllib.loads(_configuration_bytes_v2(original).decode("utf-8-sig"))
+    if (source.get("rig") or {}).get("path") != pointer["before"]:
+        raise ValueError("The v2 output pointer does not bind the original rig.path.")
+    raw_targets = [_original_configuration_bytes(target, destination, receipt) for target in targets]
+    configs = [tomllib.loads(raw.decode("utf-8-sig")) for raw in raw_targets]
+    pre_configs = [tomllib.loads(_configuration_bytes_v2(before).decode("utf-8-sig")) for before in previous]
+    if any((config.get("rig") or {}).get("path") != pointer["after"] for config in configs):
+        raise ValueError("Both v2 declared Apply targets must carry the exact new rig.path.")
+    for before, after in zip(pre_configs, configs):
+        if (before.get("rig") or {}).get("path") != pointer["before"]:
+            raise ValueError("Both preserved v2 pre-pointer configurations must carry the exact old rig.path.")
+        restored = deepcopy(after)
+        restored["rig"]["path"] = pointer["before"]
+        if not _typed_equal(before, restored):
+            raise ValueError("V2 target changes a value or TOML type beyond its own preserved rig.path migration.")
+    mode = value["protocol_change_mode"]
+    if mode == "clock-migrated-three-leaves":
+        changes = _protocol_changes(source, pre_configs[-1])
+    elif mode == "unchanged-zero-leaves":
+        if not _typed_equal(source, pre_configs[-1]):
+            raise ValueError("The zero-protocol v2 binding changes another value or TOML type.")
+        changes = {}
+    else:
+        raise ValueError("V2 requires an explicit zero- or three-protocol change mode.")
+    if not _typed_equal(value["protocol_changes"], changes):
+        raise ValueError("V2 protocol metadata does not record its exact declared changes.")
+    return deepcopy(value)
+
+
+def _require_fresh_v2_build(paths, dual):
+    """Check original dispatch's output/cache boundary without creating anything."""
+    from darsia.presets.workflows.config.utils import _deep_merge
+    effective = {}
+    for path in [paths] if isinstance(paths, Path) else paths:
+        _deep_merge(effective, tomllib.loads(_small(path).decode("utf-8-sig")))
+    declared = tomllib.loads(_small(dual["current_configuration"]["path"]).decode("utf-8-sig"))
+    if not _typed_equal(effective, declared):
+        raise ValueError("V2 Build's entire effective configuration differs from its bound current merged configuration.")
+    rig = effective["rig"]
+    target = dual["output_pointer_change"]["after"]
+    if rig.get("path") != target:
+        raise ValueError("V2 Build's effective rig.path is not its bound fresh output.")
+    folder = Path(target)
+    if not _same(folder.resolve(), folder):
+        raise ValueError("The fresh v2 rig output must not resolve through another location.")
+    if folder.exists() and (not folder.is_dir() or next(folder.iterdir(), None) is not None):
+        raise ValueError("The v2 rig output is not empty; partial or completed artifacts were preserved.")
+    data = effective["data"]
+    results = data.get("results")
+    if (not isinstance(results, str) or not results or not Path(results).is_absolute()
+            or not Path(results).is_dir()):
+        raise ValueError("V2 Build requires the original data.results directory to exist before dispatch.")
+    use_cache = data.get("use_cache", False)
+    if type(use_cache) is not bool:
+        raise ValueError("V2 Build requires an explicit boolean data.use_cache when present.")
+    if use_cache:
+        cache, raw_cache = Path(results) / "cache", Path(results) / "raw_cache"
+        if not cache.is_dir() or not raw_cache.is_dir():
+            raise ValueError("V2 Build requires the original cache and raw_cache directories before dispatch.")
+        single = data.get("folder")
+        multiple = data.get("folders")
+        if single in ("", "No file chosen"):
+            single = None
+        if multiple == "":
+            multiple = None
+        if ((single is not None and (not isinstance(single, str) or not single))
+                or (multiple is not None and (not isinstance(multiple, list) or not multiple
+                    or any(not isinstance(item, str) or not item for item in multiple)))):
+            raise ValueError("V2 Build requires the original explicit data folder(s).")
+        folders = [Path(single)] if single is not None else []
+        for item in multiple or []:
+            if Path(item) not in folders:
+                folders.append(Path(item))
+        baseline = data.get("baseline")
+        if not folders or not isinstance(baseline, str) or not baseline:
+            raise ValueError("V2 Build requires the original baseline and data folder(s).")
+        baseline = Path(baseline)
+        if not baseline.is_absolute():
+            candidates = [folder / baseline for folder in folders]
+            baseline = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+        relative = None
+        for folder in folders:
+            try:
+                relative = baseline.resolve().relative_to(folder.resolve())
+                break
+            except ValueError:
+                continue
+        if relative is None:
+            relative = Path(baseline.name)
+        if not (raw_cache / relative.with_suffix(".npz")).is_file():
+            raise ValueError("V2 Build requires the original baseline raw-cache file; no raw image was read or cache created.")
+
+
+def _configuration_bundle(series, run, configuration, *, destination=None, receipt=None,
+                          project_root=None, revision=None):
     """Bind exact declared config paths, never a basename or path substring."""
     manifest_path = series / "series.toml"
     manifest_bytes = _small(manifest_path)
@@ -242,8 +393,13 @@ def _configuration_bundle(series, run, configuration, *, destination=None, recei
     result = dict(series_root=str(series), series_manifest=_descriptor(manifest_path),
                   configuration_bundles=bundles, common_configuration=common_binding)
     if dual is not None:
-        result["dual_configuration_binding"] = _dual_configuration_binding(
-            dual, run, configuration, selected, destination=destination, receipt=receipt)
+        if isinstance(dual, dict) and dual.get("format") == CONFIGURATION_BINDING_V2_FORMAT:
+            result["dual_configuration_binding"] = _dual_configuration_binding_v2(
+                dual, run, configuration, selected, series=series, project_root=project_root,
+                revision=revision, destination=destination, receipt=receipt)
+        else:
+            result["dual_configuration_binding"] = _dual_configuration_binding(
+                dual, run, configuration, selected, destination=destination, receipt=receipt)
     return result
 
 
@@ -334,6 +490,10 @@ def _verify_immutable_export_inputs(receipt):
         _verified(data["common_configuration"])
     if data.get("dual_configuration_binding") is not None:
         _verified(data["configuration"])
+        dual = data["dual_configuration_binding"]
+        if dual["format"] == CONFIGURATION_BINDING_V2_FORMAT:
+            for before in dual["pre_pointer_configurations"]:
+                _verified(before)
     if data.get("registered_geometry") is not None:
         from .geometry_raster_sources import verify_registered_sources
         verify_registered_sources(data["registered_geometry"])
@@ -419,7 +579,8 @@ def require_corrected_export_for_build(paths):
         _verify_reference_export(actual_root, revision=revision, display=display,
                                  planned=planned, current_sha=hashlib.sha256(current_bytes).hexdigest(), child=receipt)
     series = Path(binding["series_root"])
-    declared = _configuration_bundle(series, run, binding["configuration"], destination=destination, receipt=receipt)
+    declared = _configuration_bundle(series, run, binding["configuration"], destination=destination, receipt=receipt,
+                                     project_root=root.parent.parent.parent, revision=revision)
     if any(binding.get(key) != value for key, value in declared.items()):
         raise ValueError("Corrected Build configuration bundle changed since export.")
     actual_paths = [paths] if isinstance(paths, Path) else paths
@@ -442,6 +603,9 @@ def require_corrected_export_for_build(paths):
     if registered is not None:
         from .geometry_raster_sources import verify_registered_sources
         verify_registered_sources(registered)
+    dual = binding.get("dual_configuration_binding")
+    if dual is not None and dual["format"] == CONFIGURATION_BINDING_V2_FORMAT:
+        _require_fresh_v2_build(paths, dual)
     return receipt
 
 
@@ -516,7 +680,8 @@ def export_corrected_setup(project, *, reference, actor=""):
     binding = dict(configuration=configuration, sources=sources, properties=properties,
                    configured_depth_source=configured_depth_source,
                    configured_depth_pointer=depth_pointer, replacements=replacements,
-                   **_configuration_bundle(series, run, configuration, destination=destination, receipt=existing))
+                   **_configuration_bundle(series, run, configuration, destination=destination, receipt=existing,
+                                           project_root=project.root, revision=revision))
     if registered is not None:
         binding["registered_geometry"] = registered
     receipt_path = destination / "export.json"
@@ -568,7 +733,8 @@ def export_corrected_setup(project, *, reference, actor=""):
         from .geometry_raster_sources import verify_registered_sources
         verify_registered_sources(registered)
     if binding.get("dual_configuration_binding") is not None:
-        final_bundle = _configuration_bundle(series, run, configuration, destination=destination)
+        final_bundle = _configuration_bundle(series, run, configuration, destination=destination,
+                                            project_root=project.root, revision=revision)
         if any(binding.get(key) != value for key, value in final_bundle.items()):
             raise RuntimeError("The current dual configuration bundle changed during corrected export.")
     os.rename(staging, destination)
@@ -674,7 +840,8 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
         _verified(row)
     if binding.get("common_configuration") is not None:
         _verified(binding["common_configuration"])
-    expected_bundle = _configuration_bundle(root, export.run_id, configuration, destination=export.destination, receipt=export.receipt)
+    expected_bundle = _configuration_bundle(root, export.run_id, configuration, destination=export.destination, receipt=export.receipt,
+                                           project_root=project.root, revision=export.revision_id)
     if any(binding.get(key) != value for key, value in expected_bundle.items()):
         raise ValueError("The selected run's declared configuration bundle changed.")
     completed = _apply_completion(export.destination, export.receipt)
