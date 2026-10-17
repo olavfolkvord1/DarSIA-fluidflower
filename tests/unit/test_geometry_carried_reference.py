@@ -122,11 +122,16 @@ def test_matrix_types_and_invertibility_are_explicit(bad):
             source_fill_status="NOT_RECORDED")
 
 
-def carried_draft(data):
+def carried_draft(data, photo_record_fields=3):
     original_contract = deepcopy(data.config["imported_rasters"])
     photo = sources.descriptor(data.config["baseline_path"])
+    parent_photo = deepcopy(photo)
+    if photo_record_fields == 6:
+        pixels = geometry._load_array(Path(photo["path"]))
+        parent_photo.update(mtime_ns=Path(photo["path"]).stat().st_mtime_ns,
+                            shape=list(pixels.shape), dtype=pixels.dtype.str)
     data.config["frame_binding"] = {"runs": {
-        run: {"fields": {"shape_corrected_baseline": deepcopy(photo)}} for run in ("reference", "one")}}
+        run: {"fields": {"shape_corrected_baseline": deepcopy(parent_photo)}} for run in ("reference", "one")}}
     data.config = sources.bind_imported_rasters(data.config,
         sources=original_contract["sources"], diagnosis=original_contract["diagnosis"])
     parent = save(data)
@@ -197,11 +202,19 @@ def altered_evidence(data, *, evidence=None, gate=None, recipe=None):
     data["record"]["carried_evidence"] = ref(write_json(data["root"] / "altered-evidence.json", value))
 
 
-def test_genuine_store_resolver_and_source_CAS_keep_carried_artifacts_and_full_csv(imported):
+@pytest.mark.parametrize("photo_record_fields", [3, 6])
+def test_genuine_store_resolver_and_source_CAS_keep_carried_artifacts_and_full_csv(imported, photo_record_fields):
     original = snapshot(imported.original)
-    data = carried_draft(imported)
+    data = carried_draft(imported, photo_record_fields=photo_record_fields)
+    frame_binding_before = deepcopy(data["draft"]["frame_binding"])
+    assert all(len(row["fields"]["shape_corrected_baseline"]) == photo_record_fields
+               for row in frame_binding_before["runs"].values())
+    assert sources._same_grid_metadata(data["parent"]["configuration"]["frame_binding"], frame_binding_before)
     parent_before = snapshot(Path(data["parent"]["artifacts"]["facies_path"]).parent)
     revision = save(imported, data["draft"])
+    assert sources._same_grid_metadata(data["draft"]["frame_binding"], frame_binding_before)
+    assert sources._same_grid_metadata(revision["configuration"]["frame_binding"], frame_binding_before)
+    assert sources._same_grid_metadata(data["parent"]["configuration"]["frame_binding"], frame_binding_before)
     paths = geometry.resolve_run_geometry_artifacts(revision, "one")
     assert paths["scope"] == "run_override"
     assert np.array_equal(geometry._load_array(Path(paths["labels_path"])), data["labels"])

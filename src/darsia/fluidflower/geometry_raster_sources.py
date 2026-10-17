@@ -651,7 +651,12 @@ def _validate_carried_registered_run(config, payload, parent, row):
     frame_runs = (config.get("frame_binding") or {}).get("runs") or {}
     photographs = {}
     for selected in (reference_run, run):
-        photographs[selected] = ((frame_runs.get(selected) or {}).get("fields") or {}).get("shape_corrected_baseline")
+        photograph = ((frame_runs.get(selected) or {}).get("fields") or {}).get("shape_corrected_baseline")
+        if type(photograph) is dict and set(photograph) == {
+                "path", "sha256", "size_bytes", "mtime_ns", "shape", "dtype"}:
+            # Keep the parent record intact; only the new file reference is projected.
+            photograph = {key: deepcopy(photograph[key]) for key in ("path", "sha256", "size_bytes")}
+        photographs[selected] = photograph
         _carried_descriptor(photographs[selected])
     source = _carried_descriptor(record["source_image"])
     if (Path(source["path"]) != Path(row["source_image_path"]).resolve()
