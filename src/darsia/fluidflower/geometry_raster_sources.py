@@ -281,6 +281,60 @@ def integer_label_translation(labels, *, row_shift, column_shift, fill_label):
     return translated, metrics
 
 
+def integer_label_edge_replication(labels, *, row_shift, column_shift, pixel_size_mm):
+    """Explicit Q43 categorical shift and nearest covered-edge replication.
+
+    Filled strips are flagged by exact half-open rectangles in revision metrics.
+    These flags mean extrapolated geometry, not camera or physical-domain validity.
+    Existing values, including 255, retain their categorical meaning.
+    """
+    values = np.asarray(labels)
+    if values.ndim != 2 or not np.issubdtype(values.dtype, np.integer):
+        raise ValueError("A label translation needs a two-dimensional integer raster.")
+    if any(type(value) is not int for value in (row_shift, column_shift)):
+        raise ValueError("Label translation offsets must be explicit integers.")
+    registration_pixel_shift(dx_mm=0., dy_mm=0., pixel_size_mm=pixel_size_mm)
+    height, width = values.shape
+    if abs(row_shift) >= height or abs(column_shift) >= width:
+        raise ValueError("A label translation must retain overlapping parent pixels.")
+    rows = np.clip(np.arange(height) - row_shift, 0, height - 1)
+    columns = np.clip(np.arange(width) - column_shift, 0, width - 1)
+    translated = values[rows[:, None], columns[None, :]]
+    source_r = slice(max(0, -row_shift), min(height, height - row_shift))
+    source_c = slice(max(0, -column_shift), min(width, width - column_shift))
+    retained = np.zeros(values.shape, dtype=bool)
+    retained[source_r, source_c] = True
+    ids, counts = np.unique(values[~retained], return_counts=True)
+    r0, r1 = max(0, row_shift), min(height, height + row_shift)
+    c0, c1 = max(0, column_shift), min(width, width + column_shift)
+    rectangles = {"top": [0, r0, 0, width], "bottom": [r1, height, 0, width],
+                  "left": [0, height, 0, c0], "right": [0, height, c1, width]}
+    pixel_area_mm2 = float(pixel_size_mm) ** 2
+    edges = {}
+    for edge, bounds in rectangles.items():
+        ar0, ar1, ac0, ac1 = bounds
+        count = (ar1 - ar0) * (ac1 - ac0)
+        edges[edge] = dict(bounds_rc=bounds, pixel_count=count,
+                           area_mm2=count * pixel_area_mm2)
+    union_count = height * width - (r1 - r0) * (c1 - c0)
+    geometry_filled = dict(format="integer-translation-extrapolated-strips-v1",
+        shape=list(values.shape), bounds="half-open [row_start,row_stop,column_start,column_stop]",
+        pixel_count=union_count, area_mm2=union_count * pixel_area_mm2,
+        pixel_size_mm=float(pixel_size_mm), edges=edges,
+        corner_overlap_pixel_count=abs(row_shift) * abs(column_shift),
+        edge_counts_include_corner_overlap=True,
+        flag_rule="geometry_filled is true in the union of the four edge rectangles",
+        meaning="extrapolated geometry; not camera or physical-domain validity")
+    metrics = dict(row_shift=row_shift, column_shift=column_shift,
+        fill_mode="edge-replication", source_shape=list(values.shape),
+        source_dtype=values.dtype.str,
+        clipped_source_pixel_count=int(np.count_nonzero(~retained)),
+        clipped_source_label_counts={str(int(k)): int(v) for k,v in zip(ids,counts)},
+        introduced_fill_pixel_count=union_count, geometry_filled=geometry_filled,
+        interpolation=False, wrapping=False)
+    return translated, metrics
+
+
 def registration_pixel_shift(*, dx_mm, dy_mm, pixel_size_mm):
     """Explicit metric-to-integer display-grid conversion, with residuals."""
     values = (dx_mm, dy_mm, pixel_size_mm)
@@ -338,8 +392,18 @@ def _validate_registered_runs(config, payload, parent, *, run_id=None):
         if (metric != converted or any(record.get(key) != converted[key]
                                       for key in ("row_shift", "column_shift"))):
             raise ValueError("Registered candidate metadata disagrees with its integer pixel shift.")
-        expected, metrics = integer_label_translation(payload["labels"], row_shift=record.get("row_shift"),
-            column_shift=record.get("column_shift"), fill_label=record.get("fill_label"))
+        fill_mode = record.get("fill_mode")
+        if fill_mode == "edge-replication":
+            if "fill_label" in record:
+                raise ValueError("Edge replication cannot substitute a constant fill label.")
+            expected, metrics = integer_label_edge_replication(payload["labels"],
+                row_shift=record.get("row_shift"), column_shift=record.get("column_shift"),
+                pixel_size_mm=converted["pixel_size_mm"])
+        elif fill_mode is None:
+            expected, metrics = integer_label_translation(payload["labels"], row_shift=record.get("row_shift"),
+                column_shift=record.get("column_shift"), fill_label=record.get("fill_label"))
+        else:
+            raise ValueError("An unknown registered geometry fill mode is forbidden.")
         if record.get("metrics") != metrics:
             raise ValueError("Registered translation metrics disagree with the actual parent pixels.")
         if target.dtype != expected.dtype or not np.array_equal(target, expected):
