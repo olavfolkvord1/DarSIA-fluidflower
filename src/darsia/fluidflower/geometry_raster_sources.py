@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import csv
+from datetime import date, datetime
 import hashlib
 import json
 from pathlib import Path
@@ -34,6 +35,32 @@ SILENT_EDIT = (
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _same_grid_metadata(first, second):
+    """Exact original image metadata, including Coordinate and class objects."""
+    if type(first) is not type(second):
+        return False
+    if isinstance(first, np.ndarray):
+        if first.dtype != second.dtype or first.shape != second.shape:
+            return False
+        if first.dtype.hasobject and not all(
+                _same_grid_metadata(left, right) for left, right in zip(first.flat, second.flat)):
+            return False
+        return bool(np.array_equal(first, second))
+    if isinstance(first, np.generic):
+        return first.dtype == second.dtype and bool(np.array_equal(first, second))
+    if isinstance(first, dict):
+        return ({(type(key), key) for key in first} == {(type(key), key) for key in second}
+                and all(_same_grid_metadata(first[key], second[key]) for key in first))
+    if isinstance(first, (list, tuple)):
+        return len(first) == len(second) and all(
+            _same_grid_metadata(left, right) for left, right in zip(first, second))
+    if isinstance(first, type):
+        return first is second
+    if first is None or type(first) in {str, int, float, bool, date, datetime}:
+        return bool(first == second)
+    return False
 
 
 def content_digest(config):
@@ -408,7 +435,7 @@ def _validate_registered_runs(config, payload, parent, *, run_id=None):
             raise ValueError("Registered translation metrics disagree with the actual parent pixels.")
         if target.dtype != expected.dtype or not np.array_equal(target, expected):
             raise ValueError("Registered labels differ from the explicit integer parent translation.")
-        if _digest(_darsia_metadata(Path(actual["path"]))) != _digest(
+        if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])),
                 _darsia_metadata(Path(payload["actual"]["labels"]["path"]))):
             raise ValueError("Registered labels changed the imported grid metadata.")
         source = _verify(record.get("source_image"), row.get("source_image_path"))
@@ -464,7 +491,7 @@ def registered_run_sources(project_root, current, run_id):
     expected = _integer_map(row["registration"]["labels"]["path"])
     if labels.dtype != np.dtype(np.int32) or not np.array_equal(labels, expected):
         raise ValueError("Stored registered labels differ numerically from the admitted translation.")
-    if _digest(_darsia_metadata(Path(files["labels"]["path"]))) != _digest(
+    if not _same_grid_metadata(_darsia_metadata(Path(files["labels"]["path"])),
             _darsia_metadata(Path(row["registration"]["labels"]["path"]))):
         raise ValueError("Stored registered labels changed their grid metadata.")
     run_config = deepcopy(config)
@@ -473,7 +500,7 @@ def registered_run_sources(project_root, current, run_id):
     facies = _integer_map(files["facies"]["path"])
     if facies.dtype != np.dtype(np.int32) or not np.array_equal(facies, expected_facies):
         raise ValueError("Stored registered facies are not the exact canonical label mapping.")
-    if _digest(_darsia_metadata(Path(files["facies"]["path"]))) != _digest(
+    if not _same_grid_metadata(_darsia_metadata(Path(files["facies"]["path"])),
             _darsia_metadata(Path(files["labels"]["path"]))):
         raise ValueError("Stored registered facies changed their grid metadata.")
     if Path(files["facies_properties"]["path"]).read_bytes() != Path(payload["actual"]["facies_properties"]["path"]).read_bytes():
