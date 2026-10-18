@@ -230,6 +230,8 @@ class ImportLease:
     def __init__(self,document,source,package_file,*,entry_kind,role_identifier=None):
         self.package_file=package_file;self.document=document;self.source=source
         self.policy=cache_settings(document,required=True)
+        if self.policy.volume_cap is None:
+            raise CachePolicyError("Managed startup requires an accepted actual fixed-volume write-cap binding")
         role=select_entry_role(document,entry_kind=entry_kind,role_identifier=role_identifier)
         boot=document["cache_bootstrap"]
         self.role_identifier,self.entry_kind=role["role_identifier"],role["entry_kind"]

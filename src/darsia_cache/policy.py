@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import uuid
 
 PURPOSES = frozenset({"jobs", "gates", "tests", "clones", "display", "logs"})
 PHYSICAL_RESERVE_BYTES = 40 * 1024**3
@@ -45,12 +46,79 @@ def _descriptor(value):
     return dict(value)
 
 
+
+def _kernel_object(value, *, directory):
+    keys = {"volume_serial", "file_id_128", "directory", "creation_100ns"}
+    if (not isinstance(value, dict) or set(value) != keys
+            or type(value["volume_serial"]) is not int or not 0 < value["volume_serial"] < 2**64
+            or not re.fullmatch(r"[0-9a-f]{32}", str(value["file_id_128"]))
+            or value["file_id_128"] == "0"*32 or value["directory"] is not directory
+            or type(value["creation_100ns"]) is not int or value["creation_100ns"] <= 0):
+        raise CachePolicyError("Exact original kernel object identity required")
+    return dict(value)
+
+
+@dataclass(frozen=True)
+class VolumeCapBinding:
+    """Accepted immutable identities, never a self-reported successful query.
+
+    VHDX bytes, mtime and change time are deliberately NOT immutable: the
+    attached filesystem provider writes that file. FileID/creation, actual
+    VHD identifier, format, subtype and VirtualSize are checked separately.
+    """
+    volume_guid: str
+    virtual_disk_identifier: str
+    maximum_size_bytes: int
+    image_path: str
+    image_parent_identity: dict
+    image_identity: dict
+    cache_identity: dict
+
+    def document(self):
+        return dict(format="darsia-fixed-vhdx-cap-binding-v1", **self.__dict__)
+
+
+def _volume_cap(value, root, quota):
+    if value is None:
+        return None  # Explicitly logical-only internal API; managed ImportLease refuses it.
+    keys = {"format", "volume_guid", "virtual_disk_identifier", "maximum_size_bytes",
+            "image_path", "image_parent_identity", "image_identity", "cache_identity"}
+    if not isinstance(value, dict) or set(value) != keys or value["format"] != "darsia-fixed-vhdx-cap-binding-v1":
+        raise CachePolicyError("Explicit fixed-VHDX volume cap binding required")
+    guid = value["volume_guid"]
+    # Exactly the Win32 volume GUID namespace; no UNC, drive-letter or mount alias.
+    if not isinstance(guid, str) or not re.fullmatch(r"\\\\\?\\Volume\{[0-9a-fA-F-]{36}\}\\", guid):
+        raise CachePolicyError("Exact attached VolumeGUID required")
+    try:
+        volume_uuid = uuid.UUID(guid[11:-2])
+        disk_uuid = uuid.UUID(value["virtual_disk_identifier"])
+    except (ValueError, TypeError, AttributeError) as error:
+        raise CachePolicyError("Canonical nonzero volume/disk UUID required") from error
+    if not volume_uuid.int or not disk_uuid.int or str(disk_uuid) != value["virtual_disk_identifier"]:
+        raise CachePolicyError("Canonical nonzero volume/disk UUID required")
+    maximum = nonnegative(value["maximum_size_bytes"], "Virtual disk maximum")
+    if maximum != quota or not maximum or maximum % 512:
+        raise CachePolicyError("Quota must equal the exact positive sector-aligned VHDX cap")
+    image = _absolute(value["image_path"])
+    if not isinstance(root, PureWindowsPath) or not isinstance(image, PureWindowsPath) or image.suffix.casefold() != ".vhdx":
+        raise CachePolicyError("Reviewed Windows fixed VHDX image required")
+    if image.drive.casefold() == root.drive.casefold():
+        raise CachePolicyError("VHDX backing image must be outside its own capped volume")
+    parent_id = _kernel_object(value["image_parent_identity"], directory=True)
+    image_id = _kernel_object(value["image_identity"], directory=False)
+    cache_id = _kernel_object(value["cache_identity"], directory=True)
+    if parent_id["volume_serial"] != image_id["volume_serial"] or image_id["volume_serial"] == cache_id["volume_serial"]:
+        raise CachePolicyError("Backing and capped volume identities must be distinct")
+    return VolumeCapBinding(guid, str(disk_uuid), maximum, str(image), parent_id, image_id, cache_id)
+
+
 @dataclass(frozen=True)
 class CachePolicy:
     root: str
     quota_bytes: int
     failed_retention_hours: int
     profiles: dict
+    volume_cap: VolumeCapBinding | None = None
 
     def purpose(self, purpose):
         if purpose not in PURPOSES:
@@ -66,7 +134,7 @@ def cache_settings(document, *, required=False):
             raise CachePolicyError("Configure one measured [cache] policy before managed admission")
         return None
     if (not isinstance(value, dict) or set(value) - {
-            "root", "quota_bytes", "failed_retention_hours", "profiles"}
+            "root", "quota_bytes", "failed_retention_hours", "profiles", "volume_cap"}
             or not {"root", "quota_bytes", "profiles"} <= set(value)):
         raise CachePolicyError("Cache needs root, quota_bytes and measured profiles")
     root = _absolute(value["root"])
@@ -88,7 +156,8 @@ def cache_settings(document, *, required=False):
             if type(root) is type(other) and (root.is_relative_to(other) or other.is_relative_to(root)):
                 raise CachePolicyError("Managed cache must be disjoint from durable/input store roots")
     return CachePolicy(str(root), quota, hours,
-                       {key: _descriptor(row) for key, row in profiles.items()})
+                       {key: _descriptor(row) for key, row in profiles.items()},
+                       _volume_cap(value.get("volume_cap"), root, quota))
 
 
 def budget_report(policy, *, used_bytes, reserved_unwritten_bytes, request_bytes,

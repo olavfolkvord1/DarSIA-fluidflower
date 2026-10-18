@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import os
 from pathlib import PureWindowsPath
 import re
+import uuid
 
 from .policy import CachePolicyError
 
@@ -292,6 +293,186 @@ class _API:
                    "Identity-bound disposition refused; no path fallback")
 
 
+
+class _CAP_GUID(C.Structure):
+    _fields_ = [("Data1", C.c_uint32), ("Data2", C.c_uint16), ("Data3", C.c_uint16), ("Data4", C.c_ubyte*8)]
+
+
+class _CAP_STORAGE_TYPE(C.Structure):
+    _fields_ = [("DeviceId", C.c_uint32), ("VendorId", _CAP_GUID)]
+
+
+class _CAP_OPEN_V2(C.Structure):
+    _fields_ = [("GetInfoOnly", C.c_int32), ("ReadOnly", C.c_int32), ("ResiliencyGuid", _CAP_GUID)]
+
+
+class _CAP_OPEN_UNION(C.Union):
+    _fields_ = [("Version1RWDepth", C.c_uint32), ("Version2", _CAP_OPEN_V2)]
+
+
+class _CAP_OPEN(C.Structure):
+    _fields_ = [("Version", C.c_uint32), ("value", _CAP_OPEN_UNION)]
+
+
+class _CAP_SIZE(C.Structure):
+    _fields_ = [("VirtualSize", C.c_uint64), ("PhysicalSize", C.c_uint64),
+                ("BlockSize", C.c_uint32), ("SectorSize", C.c_uint32)]
+
+
+class _CAP_INFO_UNION(C.Union):
+    _fields_ = [("Size", _CAP_SIZE), ("Identifier", _CAP_GUID),
+                ("Storage", _CAP_STORAGE_TYPE), ("UInt32", C.c_uint32)]
+
+
+class _CAP_INFO(C.Structure):
+    _fields_ = [("Version", C.c_uint32), ("value", _CAP_INFO_UNION)]
+
+
+class _CAP_EXTENT(C.Structure):
+    _fields_ = [("DiskNumber", C.c_uint32), ("StartingOffset", C.c_int64), ("ExtentLength", C.c_int64)]
+
+
+class _CAP_EXTENTS_ONE(C.Structure):
+    _fields_ = [("NumberOfDiskExtents", C.c_uint32), ("Extent", _CAP_EXTENT)]
+
+
+def _match_volume_cap(binding, observed):
+    """Pure comparison of the fixed native-query result, not an admission API."""
+    if (observed["volume_guid"].casefold() != binding.volume_guid.casefold()
+            or observed["virtual_disk_identifier"] != binding.virtual_disk_identifier
+            or observed["virtual_size_bytes"] != binding.maximum_size_bytes
+            or observed["storage_device_id"] != 3 or observed["provider_subtype"] != 2
+            or observed["is_loaded"] is not True or observed["filesystem"] != "NTFS"
+            or observed["extent_count"] != 1
+            or observed["volume_disk_number"] != observed["vhdx_disk_number"]
+            or not 0 <= observed["extent_start"] < binding.maximum_size_bytes
+            or not 0 < observed["volume_total_bytes"] <= observed["extent_bytes"]
+            or observed["extent_start"] + observed["extent_bytes"] > binding.maximum_size_bytes):
+        raise CachePolicyError("Attached cache volume/backing fixed VHDX/cap differs; no fallback")
+    return dict(observed, format="darsia-readonly-fixed-vhdx-cap-observation-v1",
+                binding=binding.document(), verified=True,
+                semantics="kernel fixed-volume capacity, not a per-user quota or complete writer-coverage proof")
+
+
+class _VolumeCapQueries:
+    """Only getters. No Create/Attach/Detach/Expand/Resize or privilege API.
+
+    This deliberately supports one fixed VHDX and one nonspanning NTFS volume.
+    Unsupported access/ABI/extent/identity is refusal, never another query route.
+    """
+    def __init__(self, namespace):
+        self.ns, self.api = namespace, namespace.api
+        if (C.sizeof(_CAP_GUID), C.sizeof(_CAP_OPEN), _CAP_INFO.value.offset,
+                C.sizeof(_CAP_INFO), _CAP_EXTENTS_ONE.Extent.offset, C.sizeof(_CAP_EXTENTS_ONE)) != (16,28,8,32,8,32):
+            raise CacheNamespaceUnsupported("Reviewed x64 VirtDisk/extents ABI required")
+        self.v = C.WinDLL("virtdisk", use_last_error=True)
+        self.v.OpenVirtualDisk.argtypes = [C.POINTER(_CAP_STORAGE_TYPE), W.LPCWSTR,
+            C.c_uint32, C.c_uint32, C.POINTER(_CAP_OPEN), C.POINTER(W.HANDLE)]
+        self.v.OpenVirtualDisk.restype = C.c_uint32
+        self.v.GetVirtualDiskInformation.argtypes = [W.HANDLE, C.POINTER(C.c_uint32),
+            C.POINTER(_CAP_INFO), C.POINTER(C.c_uint32)]
+        self.v.GetVirtualDiskInformation.restype = C.c_uint32
+        self.v.GetVirtualDiskPhysicalPath.argtypes = [W.HANDLE, C.POINTER(C.c_uint32), W.LPWSTR]
+        self.v.GetVirtualDiskPhysicalPath.restype = C.c_uint32
+        self.api.k.DeviceIoControl.argtypes = [W.HANDLE, C.c_uint32, W.LPVOID,
+            C.c_uint32, W.LPVOID, C.c_uint32, C.POINTER(C.c_uint32), W.LPVOID]
+        self.api.k.DeviceIoControl.restype = W.BOOL
+        self.api.k.GetDiskFreeSpaceExW.argtypes = [W.LPCWSTR, *([C.POINTER(C.c_uint64)]*3)]
+        self.api.k.GetDiskFreeSpaceExW.restype = W.BOOL
+
+    @staticmethod
+    def status(value, label):
+        if value:
+            raise OSError(int(value), label + "; no fallback or privilege adjustment")
+
+    def info(self, handle, version):
+        info, size = _CAP_INFO(), C.c_uint32(C.sizeof(_CAP_INFO))
+        info.Version = version
+        self.status(self.v.GetVirtualDiskInformation(handle,C.byref(size),C.byref(info),None), "Read VHDX information")
+        if info.Version != version or not 8 <= size.value <= C.sizeof(info):
+            raise CacheNamespaceUnsupported("Unexpected VirtDisk information shape")
+        return info.value
+
+    def pin_image_attributes(self, parent, name):
+        # An attached provider legitimately writes its VHDX. READ_ATTRIBUTES only;
+        # allow READ/WRITE sharing, forbid DELETE, and never read/hash the payload.
+        _component(name)
+        buf=C.create_unicode_buffer(name); n=len(name.encode("utf-16-le"))
+        string=_UNICODE_STRING(n,n+2,C.cast(buf,W.LPWSTR))
+        attrs=_OBJECT_ATTRIBUTES(C.sizeof(_OBJECT_ATTRIBUTES),parent.handle,C.pointer(string),0x1040,None,None)
+        result,iosb=W.HANDLE(),_IO_STATUS_BLOCK()
+        status=self.api.n.NtCreateFile(C.byref(result),0x80|0x100000,C.byref(attrs),C.byref(iosb),
+            None,0x80,3,1,0x20|0x200000|0x40,None,0)
+        if status != 0:
+            if result.value:
+                self.api.close(result)
+            raise OSError(int(status)&0xffffffff,"Read-only no-follow VHDX identity open refused")
+        return result
+
+    def observe(self, binding):
+        parent=None; image=W.HANDLE(); disk=W.HANDLE(); volume=W.HANDLE()
+        error=None; result=None; close_failures=[]
+        try:
+            path=PureWindowsPath(binding.image_path)
+            parent=WindowsNamespace(str(path.parent),binding.image_parent_identity)
+            image=self.pin_image_attributes(parent,path.name)
+            before=self.api.identity(image)
+            tag=self.api.info(image,9,_FILE_ATTRIBUTE_TAG_INFO)
+            if (not before.same_object(binding.image_identity) or tag.FileAttributes & (0x200|0x800|0x4000)):
+                raise CachePolicyError("VHDX identity/sparse/compression/encryption differs")
+            storage=_CAP_STORAGE_TYPE()  # UNKNOWN selects by .vhdx, then actual format must be3.
+            params=_CAP_OPEN();params.Version=2
+            params.value.Version2.GetInfoOnly=1;params.value.Version2.ReadOnly=1
+            self.status(self.v.OpenVirtualDisk(C.byref(storage),str(path),0,1,C.byref(params),C.byref(disk)),
+                        "Open VHDX GetInfoOnly/ReadOnly V2 ACCESS_NONE NO_PARENTS")
+            initial=(str(uuid.UUID(bytes_le=bytes(self.info(disk,2).Identifier))),
+                     int(self.info(disk,1).Size.VirtualSize),int(self.info(disk,6).Storage.DeviceId),
+                     int(self.info(disk,7).UInt32),int(self.info(disk,13).UInt32))
+            physical=C.create_unicode_buffer(128); length=C.c_uint32(C.sizeof(physical))
+            self.status(self.v.GetVirtualDiskPhysicalPath(disk,C.byref(length),physical),"Read attached VHDX physical path")
+            matched=re.fullmatch(r"\\\\\.\\PhysicalDrive([0-9]{1,10})",physical.value)
+            if not matched or length.value > C.sizeof(physical):
+                raise CacheNamespaceUnsupported("Unexpected attached VHDX device path")
+            # Open the exact pinned GUID device for this one read-only IOCTL.
+            # No drive-number opening, mount changes or raw disk data access.
+            volume=W.HANDLE(self.api.k.CreateFileW(self.ns.volume_guid[:-1],0,3,None,3,0x00200000,None))
+            if volume.value in (None,C.c_void_p(-1).value):
+                raise OSError(C.get_last_error(),"Cannot query exact attached VolumeGUID device")
+            ext,returned=_CAP_EXTENTS_ONE(),C.c_uint32()
+            self.api.check(self.api.k.DeviceIoControl(volume,0x00560000,None,0,C.byref(ext),C.sizeof(ext),C.byref(returned),None),
+                           "One-volume disk extent query refused; no spanning fallback")
+            if returned.value != C.sizeof(ext) or ext.NumberOfDiskExtents != 1:
+                raise CacheNamespaceUnsupported("Exactly one complete NTFS volume extent required")
+            free,total,total_free=C.c_uint64(),C.c_uint64(),C.c_uint64()
+            self.api.check(self.api.k.GetDiskFreeSpaceExW(self.ns.volume_guid,C.byref(free),C.byref(total),C.byref(total_free)),
+                           "Read actual capped filesystem size")
+            final=(str(uuid.UUID(bytes_le=bytes(self.info(disk,2).Identifier))),
+                   int(self.info(disk,1).Size.VirtualSize),int(self.info(disk,6).Storage.DeviceId),
+                   int(self.info(disk,7).UInt32),int(self.info(disk,13).UInt32))
+            if initial != final or not self.api.identity(image).same_object(binding.image_identity):
+                raise CachePolicyError("VHDX identity/cap changed while querying")
+            result=dict(volume_guid=self.ns.volume_guid,virtual_disk_identifier=initial[0],virtual_size_bytes=initial[1],
+                storage_device_id=initial[2],provider_subtype=initial[3],is_loaded=initial[4]==1,filesystem="NTFS",
+                extent_count=int(ext.NumberOfDiskExtents),volume_disk_number=int(ext.Extent.DiskNumber),
+                vhdx_disk_number=int(matched.group(1)),extent_start=int(ext.Extent.StartingOffset),
+                extent_bytes=int(ext.Extent.ExtentLength),volume_total_bytes=int(total.value))
+            result=_match_volume_cap(binding,result)
+        except BaseException as caught:
+            error=caught
+        finally:
+            for handle in (volume,disk,image):
+                if handle.value not in (None,C.c_void_p(-1).value):
+                    try:self.api.close(handle)
+                    except CacheHandleCloseIncomplete as failed:close_failures.extend(failed.close_failures)
+            if parent is not None:
+                try:parent.close()
+                except CacheHandleCloseIncomplete as failed:close_failures.extend(failed.close_failures)
+        if close_failures:
+            raise CacheHandleCloseIncomplete(close_failures) from error
+        if error is not None:raise error
+        return result
+
+
 class WindowsNamespace:
     """Pinned existing root. Root identity must come from accepted host admission.
 
@@ -331,9 +512,16 @@ class WindowsNamespace:
             if not identity.same_object(expected_root):
                 raise CachePolicyError("Configured cache/control root kernel identity changed")
             self.handle, self.identity = handle, identity
+            self.volume_guid, self.volume_serial32 = volume.value, int(serial.value)
         except BaseException:
             self.close()
             raise
+
+    def verify_volume_cap(self, binding):
+        if (self.closed or not self.identity.same_object(binding.cache_identity)
+                or self.volume_guid.casefold() != binding.volume_guid.casefold()):
+            raise CachePolicyError("Capped root differs from the accepted cache identity")
+        return _VolumeCapQueries(self).observe(binding)
 
     def close(self):
         if not self.closed:

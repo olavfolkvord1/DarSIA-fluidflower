@@ -300,6 +300,7 @@ class CacheBudgetLedger:
         self.measure = measurement_provider
         self.key = hashlib.sha256((actual["host"] + "\0cache-host-pool-v2").encode()).hexdigest()
         self.bound, self.control, self.lock_active = bound, None, False
+        self.volume_cap_observation = None
 
     @contextmanager
     def locked(self, *, create_binding=True):
@@ -311,10 +312,21 @@ class CacheBudgetLedger:
             raise CachePolicyError("Read-only projection has no existing local mutex file")
         with _LocalVolumeLock(self.bound["path"], self.key):
             self.control = WindowsNamespace(self.bound["path"], self.bound["identity"])
+            cap_namespace = None
+            self.volume_cap_observation = None
             try:
+                cap = self.policy.volume_cap
+                if cap is not None:
+                    if (self.admission.get("volume_cap") != cap.document()
+                            or any(self.admission["cache_identity"].get(k) != v for k,v in cap.cache_identity.items())):
+                        raise CachePolicyError("Accepted host namespace must bind the exact volume cap/root")
+                    cap_namespace = WindowsNamespace(self.policy.root, self.admission["cache_identity"])
+                    self.volume_cap_observation = cap_namespace.verify_volume_cap(cap)
                 expected = dict(format="darsia-one-host-cache-binding-v2", host=self.capacity.host,
                     authorized_sids=sorted(self.admission["authorized_sids"]), cache_root=self.policy.root,
                     cache_identity=self.admission["cache_identity"], quota_bytes=self.policy.quota_bytes)
+                if cap is not None:
+                    expected["volume_cap"] = cap.document()
                 name = "cache-" + self.key + ".json"
                 if name in self.control.names():
                     if _json(self.control, name)[0] != expected:
@@ -327,8 +339,14 @@ class CacheBudgetLedger:
                 yield self
             finally:
                 self.lock_active = False
-                self.control.close()
+                self.volume_cap_observation = None
+                failures = []
+                for namespace in (cap_namespace, self.control):
+                    if namespace is not None:
+                        try: namespace.close()
+                        except CacheHandleCloseIncomplete as failed: failures.extend(failed.close_failures)
                 self.control = None
+                if failures: raise CacheHandleCloseIncomplete(failures)
 
     def _require_lock(self):
         if not self.lock_active:
@@ -378,6 +396,11 @@ class CacheBudgetLedger:
             required_noncache_bytes=noncache_bytes,
             eligible_reclaimable_bytes=observation.get("eligible_reclaimable_bytes", 0))
         report.update(measured_utc=observation["measured_utc"], written_scope_bytes_counted_once=True)
+        cap = getattr(self, "volume_cap_observation", None)
+        if cap is not None:
+            report.update(hard_filesystem_quota_verified=True,
+                enforcement="verified fixed-volume filesystem capacity plus logical admission; writer routing separate",
+                verified_volume_maximum_bytes=cap["virtual_size_bytes"], volume_cap_observation=cap)
         return report
 
     def project(self, maximum_bytes, *, noncache_bytes=0):
