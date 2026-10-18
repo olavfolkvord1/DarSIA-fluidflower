@@ -419,7 +419,7 @@ def test_N54_worker_validation_survives_derived_diagnostics_but_real_run_edit_in
     cls._append_run_geometry_row(page, dict(
         run_id="ac18", geometry_choice="run_override", labels_path="TESTONLY/original.npz",
     ))
-    config = geometry.normalize_geometry_config({})
+    config = geometry.default_geometry_config()
     page.config = deepcopy(config)
     page.validation = None
     page.preview_data = None
