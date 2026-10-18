@@ -812,7 +812,7 @@ class JobsPanel(QWidget):
             text = "Expected space unavailable: " + result["reason"]
         else:
             text = result["message"] + (" — enough by this estimate." if result["sufficient"] else " — insufficient by this estimate.")
-            text += " Includes preserved native outputs, optional storage additions, estimated temporary space, active reservations and reserve. Fresh check repeats before claim."
+            text += " Includes preserved native outputs, optional storage additions, estimated temporary space and reserve. Results: estimate, not coordinated across hosts. Fresh check repeats before claim; cache admission is separate."
         self.capacity_label.setText(text)
 
     @Slot()

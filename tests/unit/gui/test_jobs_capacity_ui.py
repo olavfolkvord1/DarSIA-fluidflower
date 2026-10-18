@@ -31,6 +31,8 @@ def test_explicit_background_report_shows_needed_free_and_estimation_scope(qtbot
     assert observed and observed[0]!=threading.get_ident()
     assert "1250" in value.capacity_label.text() and "1249" in value.capacity_label.text()
     assert "insufficient" in value.capacity_label.text() and "preserved native" in value.capacity_label.text()
+    assert "estimate, not coordinated across hosts" in value.capacity_label.text()
+    assert "cache admission is separate" in value.capacity_label.text()
     assert value.can_close()
 
 

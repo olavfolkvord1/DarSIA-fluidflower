@@ -769,7 +769,7 @@ def _authority_alias(value):
 
 
 def _owner_scope(document, binding, results_root, context):
-    """Pure Q49 static config validation. It proves no physical equivalence."""
+    """Validate optional legacy alias provenance; no physical/host exclusivity."""
     _bound(binding)
     fields = {"format", "canonical_owner_path", "aliases", "owner", "single_computing_host"}
     if (not isinstance(document, dict) or set(document) != fields
@@ -816,10 +816,9 @@ def _owner_scope(document, binding, results_root, context):
             or re.fullmatch(r"S-1-[0-9]+(?:-[0-9]+)+", owner["service_account_sid"]) is None):
         raise ValueError("Exact actual computing host/account and machine-id provenance required")
     name(owner["machine_id"])
-    if (not isinstance(context, dict) or not isinstance(context.get("host"), str)
-            or context["host"].casefold() != owner["host"]
-            or context.get("service_account_sid") != owner["service_account_sid"]):
-        raise RunUnavailable("This NAS results authority is assigned to another actual computing host/account; use local outputs; no task claimed")
+    # N51 withdraws Q48's single computing-host rule for RESULTS. This legacy
+    # descriptor remains optional alias/path provenance, not permission for one
+    # host/account. The ledger binds the actual local host/SID independently.
     return dict(format="darsia-single-host-nas-authority-scope-v1",
         owner_document=dict(path=canonical, sha256=binding["sha256"], size_bytes=binding["size_bytes"]),
         aliases=keys + drives, owner=dict(owner),
@@ -851,7 +850,7 @@ def _verify_mapped_results(scope, results_root, mapping_provider):
 
 def remote_results_owner(stores, series_id, results_root, *, admission=None, context=None,
                          mapping_provider=None):
-    """Read only one pinned static document; never elect, create, renew or write."""
+    """Admit RESULTS on either host; optional legacy alias metadata stays exact."""
     from ..job_filesystem import inspect_results_root, valid_results_admission, LocalFileAdmission
     proof = inspect_results_root(results_root) if admission is None else admission
     if not valid_results_admission(proof, results_root):
@@ -862,7 +861,9 @@ def remote_results_owner(stores, series_id, results_root, *, admission=None, con
     configured = capacity_settings(stores.document)
     binding = None if configured is None else configured.get("remote_owner")
     if binding is None:
-        raise RunUnavailable("NAS outputs require the operator-pinned single-host NAS_OWNER.json; other machines use local outputs; no task claimed")
+        # Positive filesystem admission is still mandatory. N51 requires no
+        # NAS owner election, hard results quota or cross-host reservation.
+        return None
     _bound(binding)
     if not 0 < binding["size_bytes"] <= 16 * 1024:
         raise ValueError("NAS owner metadata must fit 16 KiB")
@@ -1177,12 +1178,17 @@ class CapacityLedger:
 
 
 def report(estimate, volume, other_remaining, reserve):
-    needed = estimate.needed(other_remaining_bytes=other_remaining, reserve_bytes=reserve)
+    # N51 RESULTS admission is only this job estimate plus the reserve, as seen
+    # by this host. Retained local records are informative, not a NAS quota.
+    other = _integer(other_remaining, "Other active remaining bytes")
+    needed = estimate.needed(reserve_bytes=reserve)
     free = _integer(volume["free_bytes"], "Actual free bytes")
     return dict(**asdict(estimate), needed_bytes=needed, free_bytes=free,
-                other_active_remaining_bytes=other_remaining, reserve_bytes=reserve,
+                other_active_remaining_bytes=other, reserve_bytes=reserve,
+                other_active_remaining_included_in_results_estimate=False,
+                results_space_policy="estimate, not coordinated across hosts",
                 sufficient=free >= needed, volume=volume,
-                message=f"{estimate.run}: needed {needed} bytes / free {free} bytes (includes other active remaining output, estimated transient space and reserve)")
+                message=f"{estimate.run}: estimated needed {needed} bytes / free {free} bytes (this job, estimated transient space and reserve; estimate, not coordinated across hosts)")
 
 
 def configuration_for_task(stores, series_id, task, rows=None):
@@ -1345,7 +1351,7 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
         volume = ledger.fresh_volume()
     products = sum(row.products_estimated_bytes for row in estimates)
     transient = sum(row.transient_estimated_bytes for row in estimates)
-    needed = products + transient + other + ledger.reserve
+    needed = products + transient + ledger.reserve
     combined = volume["free_bytes"] >= needed and cache["complete"] and cache["sufficient"]
     cache_message = cache["state"] + (": " + cache["reason"] if "reason" in cache else
         f"; required total {cache['required_cache_bytes']} bytes, quota headroom {cache['quota_headroom_bytes']} bytes")
@@ -1353,6 +1359,8 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
         results_root=str(root), results_protocol=admission.protocol, results_local=admission.local,
         runs=[asdict(row) for row in estimates], products_expected_bytes=products,
         transient_estimated_bytes=transient, other_active_remaining_bytes=other,
+        other_active_remaining_included_in_results_estimate=False,
+        results_space_policy="estimate, not coordinated across hosts",
         reserve_bytes=ledger.reserve, needed_bytes=needed, free_bytes=volume["free_bytes"],
         results_space_sufficient=volume["free_bytes"] >= needed,
         sufficient=combined, volume=volume, required_product_bytes=products,
@@ -1362,9 +1370,7 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
         cache_policy_state=cache["state"], complete_admission_sufficient=combined,
         scope="read-only result/cache projection for explicitly admitted service; no reservation or claim; preserved products not subtracted; fresh checks repeat before actual claim",
         remote_scope=getattr(ledger,"remote_scope",None),
-        message=f"Expected results needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}; cache: {cache_message}" +
-             ("; NAS outputs: one approved computing host across the complete configured authority scope; other machines use local outputs"
-              if getattr(ledger,"remote_scope",None) is not None else ""))
+        message=f"Expected results needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}; estimate, not coordinated across hosts; cache: {cache_message}")
 
 
 def report_job_root(job_root, stores, *, cache_provider=None):

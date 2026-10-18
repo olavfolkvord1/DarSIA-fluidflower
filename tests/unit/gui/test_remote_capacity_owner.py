@@ -37,13 +37,13 @@ def test_aliases_are_one_conservative_authority_not_a_volume_proof():
 
 
 @pytest.mark.parametrize("defect", ["host", "account", "nonstring_host"])
-def test_another_actual_host_or_account_refuses_even_with_the_same_machine_id(defect):
+def test_N51_legacy_alias_provenance_does_not_elect_one_computing_host(defect):
     doc, bound, context = configured()
+    original = cap._owner_scope(doc, bound, ROOT, context)
     if defect == "host": context["host"] = "second-physical-machine"
     elif defect == "account": context["service_account_sid"] = "S-1-5-21-200"
     else: context["host"] = None
-    with pytest.raises(RunUnavailable, match="another actual computing host/account"):
-        cap._owner_scope(doc, bound, ROOT, context)
+    assert cap._owner_scope(doc, bound, ROOT, context) == original
 
 
 @pytest.mark.parametrize("root", [r"\\not-listed\share\results", r"\\nas-a\another-share\results", r"Z:\results"])
@@ -94,7 +94,7 @@ def test_remote_guard_reads_exact_config_only_and_never_self_elects(tmp_path, mo
 
 
 @pytest.mark.parametrize("defect", ["missing", "changed"])
-def test_remote_missing_or_changed_owner_is_a_refusal_not_a_write(tmp_path, monkeypatch, defect):
+def test_N51_no_owner_is_required_but_explicit_provenance_stays_SHA_bound(tmp_path, monkeypatch, defect):
     doc, bound, context = configured()
     settings = settings_doc(tmp_path)
     if defect == "changed": settings["capacity"]["remote_owner"] = bound
@@ -103,8 +103,13 @@ def test_remote_missing_or_changed_owner_is_a_refusal_not_a_write(tmp_path, monk
     def fail(_): raise ValueError("literal owner SHA changed")
     monkeypatch.setattr(cap, "read_bound", fail)
     before = list(tmp_path.rglob("*"))
-    with pytest.raises(RunUnavailable, match="no task claimed"):
-        cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", ROOT, admission=proof, context=context)
+    if defect == "missing":
+        assert cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", ROOT,
+                                        admission=proof, context=context) is None
+    else:
+        with pytest.raises(RunUnavailable, match="missing or changed"):
+            cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", ROOT,
+                                     admission=proof, context=context)
     assert list(tmp_path.rglob("*")) == before
 
 
@@ -177,3 +182,38 @@ def test_changed_metadata_size_is_refused_before_opening_payload(tmp_path, monke
     monkeypatch.setattr(Path, "open", guarded)
     with pytest.raises(ValueError, match="changed before read"):
         cap.read_bound(dict(path=str(path), sha256="0" * 64, size_bytes=2))
+
+
+@pytest.mark.parametrize("host", ["moderskipet", "olav"])
+def test_N51_both_hosts_can_use_admitted_NAS_without_owner_or_results_quota(tmp_path, monkeypatch, host):
+    settings = settings_doc(tmp_path)
+    assert "remote_owner" not in settings["capacity"]
+    proof = SimpleNamespace(local=False)
+    monkeypatch.setattr(fs, "valid_results_admission", lambda actual, root: actual is proof and root == ROOT)
+    monkeypatch.setattr(cap, "read_bound", lambda _: pytest.fail("N51 does not require NAS_OWNER.json"))
+    context = dict(host=host, service_account_sid="S-1-5-21-100")
+    assert cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", ROOT,
+                                    admission=proof, context=context) is None
+
+
+def test_N51_two_actual_hosts_keep_separate_local_bindings_for_same_NAS(tmp_path, monkeypatch):
+    local, stores, state = ledger_fixture(tmp_path, monkeypatch)
+    doc, bound, first = configured()
+    stores.document["capacity"]["remote_owner"] = bound
+    proof = SimpleNamespace(allowed=True, local=False)
+    monkeypatch.setattr(fs, "inspect_results_root", lambda _: proof)
+    monkeypatch.setattr(fs, "valid_results_admission", lambda actual, root: actual is proof)
+    monkeypatch.setattr(cap, "read_bound", lambda _: (deepcopy(doc), b"verified synthetic metadata"))
+    common = local.context_provider()
+    a = cap.CapacityLedger(stores, "FF_AC", ROOT, volume_provider=lambda _: dict(state),
+        context_provider=lambda: dict(common, host="moderskipet"))
+    b = cap.CapacityLedger(stores, "FF_AC", ROOT, volume_provider=lambda _: dict(state),
+        context_provider=lambda: dict(common, host="olav", service_account_sid="S-1-5-21-200"))
+    assert a.remote_scope == b.remote_scope
+    assert a.key != b.key and a.binding_path != b.binding_path and a.root != b.root
+    with a.locked():
+        a.bind(tmp_path / "main-job", claim_fixture(), owner(), estimate())
+    with b.locked():
+        b.bind(tmp_path / "olav-job", claim_fixture(job="two", token="2" * 32), owner(124), estimate())
+    assert a.remaining() == b.remaining() == 390
+    assert a._common_binding() is True and b._common_binding() is True

@@ -173,11 +173,16 @@ def test_requested_storage_without_layout_is_explicitly_unavailable():
     with pytest.raises(ValueError,match="layout"):estimate(data)
 
 
-def test_needed_threshold_includes_other_slots_and_reserve_once():
-    value=estimate();needed=value.needed(other_remaining_bytes=31,reserve_bytes=40)
-    assert needed==250+140+31+40
-    assert cap.report(value,{"free_bytes":needed},31,40)["sufficient"] is True
-    assert cap.report(value,{"free_bytes":needed-1},31,40)["sufficient"] is False
+def test_N51_results_threshold_is_own_estimate_plus_reserve_other_history_informative():
+    value = estimate()
+    assert value.needed(other_remaining_bytes=31, reserve_bytes=40) == 250+140+31+40
+    needed = 250+140+40
+    result = cap.report(value, {"free_bytes": needed}, 31, 40)
+    assert result["sufficient"] is True and result["needed_bytes"] == needed
+    assert result["other_active_remaining_bytes"] == 31
+    assert result["other_active_remaining_included_in_results_estimate"] is False
+    assert result["results_space_policy"] == "estimate, not coordinated across hosts"
+    assert cap.report(value, {"free_bytes": needed-1}, 31, 40)["sufficient"] is False
 
 
 def settings_doc(tmp_path):
@@ -331,7 +336,9 @@ def test_whole_job_uses_same_estimates_and_one_reserve(tmp_path,monkeypatch):
     stores=SimpleNamespace(machine_id="main",roots=lambda _:dict(results=str(tmp_path/"results")))
     before=list(tmp_path.iterdir())
     report=cap.whole_job_report(stores,"FF_AC",[task,task2],[config,config2],repository=tmp_path)
-    assert report["needed_bytes"]==2*(250+140)+31+40
+    assert report["needed_bytes"]==2*(250+140)+40
+    assert report["other_active_remaining_bytes"]==31
+    assert report["results_space_policy"]=="estimate, not coordinated across hosts"
     assert len(seen)==2 and report["results_local"] is False and report["results_protocol"]=="smb"
     assert list(tmp_path.iterdir())==before and "native" not in str(report.get("locality",""))
 
@@ -482,3 +489,36 @@ def test_actual_external_native_writer_is_mandatory_and_fresh(tmp_path,monkeypat
         (repo/writer).write_bytes(source[writer]+b"# literal source changed after valid profile SHA\n")
         message="writer identity differs"
     with pytest.raises(ValueError,match=message):cap.load_estimate(stores,"FF_AC",task,config,repository=repo)
+
+
+@pytest.mark.parametrize("free,cache_refuses,accepted", [(430, False, True), (429, False, False), (430, True, False)])
+def test_N51_actual_claim_keeps_basic_free_boundary_and_original_cache_checks(tmp_path, monkeypatch, free, cache_refuses, accepted):
+    ledger, stores, state = ledger_fixture(tmp_path, monkeypatch, free=free)
+    ledger.reserve = 40
+    with ledger.locked():
+        ledger.bind(tmp_path / "other-job", claim_fixture(job="other", token="2" * 32), owner(124), estimate())
+    task = claim_fixture().task
+    runtime = SimpleNamespace(stores=stores, job=dict(series_id="FF_AC"),
+        capacity_refusals={}, availability=lambda actual: (), capacities={})
+    check = cap.ClaimCapacity(runtime, owner()); check.ledger = ledger
+    observed = []
+    class CacheBoundary:
+        def prepare(self, actual, value): observed.append(("prepare", actual, value))
+        def acquire(self): observed.append(("acquire",))
+        def check(self, actual, value, other):
+            observed.append(("check", other))
+            if cache_refuses: raise RunUnavailable("original cache admission refused")
+            return dict(TEST_ONLY_ORIGINAL_CACHE_BOUNDARY=True)
+        def unlock(self): pass
+    check.cache = CacheBoundary()
+    monkeypatch.setattr(cap, "configuration_for_task", lambda *args: {})
+    monkeypatch.setattr(cap, "load_estimate", lambda *args, **kw: estimate())
+    if accepted:
+        try: assert check.availability(task) == ()
+        finally: check._unlock()
+    else:
+        with pytest.raises(RunUnavailable, match="original cache admission refused" if cache_refuses else "leave this whole run pending"):
+            check.availability(task)
+        assert check.lock is None
+    assert ("check", 390) in observed
+    assert len(list(ledger.root.glob("r-*/reserved.json"))) == 1

@@ -100,15 +100,18 @@ def test_remap_to_even_another_approved_unc_refuses(tmp_path, monkeypatch, targe
 
 
 @pytest.mark.parametrize("field,value", [("host", "another-host"), ("service_account_sid", "S-1-5-21-999")])
-def test_wrong_actual_owner_refuses_before_mapping_query(tmp_path, monkeypatch, field, value):
+def test_N51_second_host_keeps_explicit_mapped_target_validation(tmp_path, monkeypatch, field, value):
     document, binding, context = drive_configuration()
     proof, _ = evidence(monkeypatch, document, binding)
     settings = settings_doc(tmp_path); settings["capacity"]["remote_owner"] = binding
     context[field] = value
-    with pytest.raises(RunUnavailable, match="another actual computing host/account"):
-        cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", MAPPED,
-            admission=proof, context=context,
-            mapping_provider=lambda drive: pytest.fail("Wrong owner must not query a mapping"))
+    calls = []
+    def mapping(drive):
+        calls.append(drive)
+        return r"\\nas-a\share"
+    result = cap.remote_results_owner(SimpleNamespace(document=settings), "FF_AC", MAPPED,
+                                     admission=proof, context=context, mapping_provider=mapping)
+    assert result["owner_document"] == binding and calls == ["X:"]
 
 
 def test_positive_mapping_does_not_replace_positive_transport_admission(tmp_path, monkeypatch):
@@ -170,18 +173,16 @@ def test_fresh_volume_rereads_exact_mapping_without_forking_static_pool(tmp_path
     assert ledger.remote_scope == scope and ledger.key == key
 
 
-def test_fresh_volume_rechecks_owner_context_and_pinned_document_before_mapping(tmp_path, monkeypatch):
+def test_N51_fresh_volume_keeps_pinned_document_and_mapping_without_host_exclusion(tmp_path, monkeypatch):
     ledger, _, _, document, _, calls = mapped_ledger(tmp_path, monkeypatch)
     original_context = ledger.context_provider
     ledger.context_provider = lambda: dict(original_context(), host="changed-host")
-    with pytest.raises(RunUnavailable, match="another actual computing host/account"):
-        ledger.fresh_volume()
-    assert calls == ["X:"]
-    ledger.context_provider = original_context
+    ledger.fresh_volume()
+    assert calls == ["X:", "X:"]
     document["owner"]["machine_id"] = "changed"
     with pytest.raises(RunUnavailable, match="missing or changed"):
         ledger.fresh_volume()
-    assert calls == ["X:"]
+    assert calls == ["X:", "X:"]
 
 
 def test_unc_and_drive_use_one_capacity_reservation_pool(tmp_path, monkeypatch):
