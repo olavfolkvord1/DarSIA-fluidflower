@@ -831,7 +831,7 @@ class N1Pipeline:
         ipp_before = scientific_thread("N1Pipeline.evaluate:before")
         if self.statistics_only:
             raise ValueError("A statistics-only context cannot evaluate fitted mass")
-        if "pixel_domain" in self.config:
+        if "pixel_domain" in getattr(self, "config", {}):
             from .pixel_pipeline import evaluate
 
             evaluated = evaluate(self, spec, output_capture=output_capture)
