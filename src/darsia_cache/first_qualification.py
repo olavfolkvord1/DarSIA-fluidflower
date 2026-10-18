@@ -216,6 +216,10 @@ class FirstQualification:
             fields |= {"capacity_bound_plan", "output_entitlement_plan"}
         if self.reference_build:
             fields.add("reference_administration")
+        if "q123_cold_scope" in self.request:
+            if not self.bound_mode:
+                raise CachePolicyError("Q123 retained admission requires BOUND_REQUEST")
+            fields.add("q123_cold_scope")
         _exact_keys(self.request, fields, "Exact Root-released finite first request required")
         expected_format = (REFERENCE_REQUEST if self.reference_build else
             BOUND_REQUEST if self.bound_mode else REQUEST)
@@ -269,6 +273,11 @@ class FirstQualification:
             self.reference_administration = checked_reference_administration(
                 read(_descriptor(self.request["reference_administration"])), self, read=read,
                 read_authorities=read_authorities)
+        self.q123_cold_scope = None
+        if "q123_cold_scope" in self.request:
+            from .retained_qualification import RetainedColdScope
+            self.q123_cold_scope = RetainedColdScope(self, self.request["q123_cold_scope"],
+                read=read, read_authorities=read_authorities)
         self.started = False
         self.claim = None
 
@@ -285,7 +294,9 @@ class FirstQualification:
         key = self._once_key()
         with lease.ledger.locked():
             report=lease.ledger.project(0)
-            if (report["current_cache_logical_bytes"]!=0
+            if getattr(self, "q123_cold_scope", None) is not None:
+                self.q123_cold_scope.admit(self, lease, report)
+            elif (report["current_cache_logical_bytes"]!=0
                     or report["active_cache_remaining_bytes"]!=0
                     or (not self.reference_build
                         and report.get("hard_filesystem_quota_verified") is not True)):
@@ -342,6 +353,8 @@ class FirstQualification:
                 or marker.get("scope")!=self.provider["scope"] or marker.get("no_retry") is not True):
             raise CachePolicyError("Original one-shot first launch marker differs")
         report = lease.ledger.project(0)
+        if getattr(self, "q123_cold_scope", None) is not None:
+            self.q123_cold_scope.admit(self, lease, report)
         if self.reference_build:
             admission = self.reference_admission(lease, report=report, initial=True)
             self.administrative = dict(maximum_bytes=REFERENCE_ENTITLEMENT_BYTES,
@@ -1098,8 +1111,10 @@ def supervise_first_worker(lease, *, api=None):
     raise CachePolicyError("First observations complete; cache profile publication refused: no qualified lifetime writer coverage")
 
 
-def checked_bounded_evidence(observation, value):
+def checked_bounded_evidence(observation, value, *, first=None):
     """Read the Q106 physical bound honestly; this does not admit a profile."""
+    q123 = getattr(first, "q123_cold_scope", None)
+    q123_fields = {"q123_cold_scope"} if q123 is not None else set()
     _exact_keys(value, {"format", "request", "provider", "stores_source", "scope",
         "namespace_admission", "capacity_bound_plan", "capacity_bound", "service_namespace",
         "administrative_service_entitlement", "actual_service_reservation", "actual_service_reservation_document",
@@ -1108,8 +1123,13 @@ def checked_bounded_evidence(observation, value):
         "source_runtime_before_after_exact", "retirement", "actual_writer_IO_proven",
         "writer_lifetime_cache_bytes_proof", "sampled_highwater_is_lifetime_peak",
         "output_evidence", "original_comparison", "ordinary_use_authorization",
-        "profile_publication_state", "no_ordinary_profile_created"},
+        "profile_publication_state", "no_ordinary_profile_created"} | q123_fields,
         "Exact bounded evidence required; old measured coverage is not interchangeable")
+    external_mpl = None
+    if q123 is not None:
+        if value["q123_cold_scope"] != first.request["q123_cold_scope"] or value["q123_cold_scope"] != q123.binding:
+            raise CachePolicyError("Q123 external writer role differs from the released request")
+        external_mpl = q123.matplotlib_root(first)
     if (value["format"] != BOUNDED_EVIDENCE
             or observation.get("format") != OBSERVATION or observation.get("complete") is not True
             or any(value[key] != observation.get(key)
@@ -1172,6 +1192,9 @@ def checked_bounded_evidence(observation, value):
             if name == "NUMBA_CACHE_LOCATOR_CLASSES":
                 if path != "UserProvidedCacheLocator":
                     raise CachePolicyError("Actual Numba locator differs")
+            elif name == "MPLCONFIGDIR" and external_mpl is not None:
+                if path != external_mpl:
+                    raise CachePolicyError("Q123 Matplotlib path differs from its exact counted namespace")
             elif (not isinstance(path, str) or not PureWindowsPath(path).is_absolute()
                     or ".." in PureWindowsPath(path).parts
                     or (PureWindowsPath(path) != root and root not in PureWindowsPath(path).parents)):
@@ -1237,7 +1260,10 @@ def bounded_evidence(first, context, observation, *, service_receipt):
         writer_lifetime_cache_bytes_proof=None, sampled_highwater_is_lifetime_peak=False,
         output_evidence=None, original_comparison=None, ordinary_use_authorization=None,
         profile_publication_state="UNQUALIFIED_BOUND_OBSERVATION", no_ordinary_profile_created=True)
-    return checked_bounded_evidence(observation, value)
+    if getattr(first, "q123_cold_scope", None) is not None:
+        first.q123_cold_scope.require_service(first, context)
+        value["q123_cold_scope"] = first.request["q123_cold_scope"]
+    return checked_bounded_evidence(observation, value, first=first)
 
 
 def require_publishable(observation, writer_evidence):
@@ -1468,7 +1494,7 @@ def _bound_profile_documents(first, bindings, *, read):
     evidence, ep = _slot_read(first.provider, "writer_evidence")
     output, mp = _slot_read(first.provider, "measurement")
     native, np = _slot_read(first.provider, "native_completion")
-    checked_bounded_evidence(observation, evidence)
+    checked_bounded_evidence(observation, evidence, first=first)
     if (observation.get("actual_claim") != first.task or observation.get("output_measurement") != mp
             or native.get("format") != "darsia-native-worker-first-qualification-completion-v1"
             or any(native.get(key) != observation.get(key) for key in ("request", "provider", "stores_source", "scope", "retirement"))

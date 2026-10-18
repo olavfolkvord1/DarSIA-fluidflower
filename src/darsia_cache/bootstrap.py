@@ -559,12 +559,17 @@ def before_darsia_import(*,package_file):
         if receipt:
             lease.receipt=binding;lease.attach(receipt)
         else:lease.start()
+        q123 = getattr(getattr(lease, "first_qualification", None), "q123_cold_scope", None)
+        if q123 is not None:
+            q123.require_service(lease.first_qualification, lease)
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
         first_writers = (getattr(lease, "first_qualification", None) is not None
             or getattr(lease, "profile", {}).get("format") == "darsia-cache-volume-bound-import-profile-v1")
         if first_writers:
             environment = first_qualification_environment(environment, scope_root=lease.root)
+            if q123 is not None:
+                environment["MPLCONFIGDIR"] = q123.matplotlib_root(lease.first_qualification, lease)
         environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))
         writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
         for key in (*writer_keys, RECEIPT_ENV):

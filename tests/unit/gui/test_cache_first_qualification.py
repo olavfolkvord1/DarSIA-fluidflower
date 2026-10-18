@@ -1275,3 +1275,127 @@ def test_bound_provider_still_dispatches_to_complete_checked_DAG(monkeypatch):
         stores_source=pin("stores.toml"), read_authorities=authorities) is selected
     assert calls == [(provider_binding, actual_provider, bundle, "import",
         pin("stores.toml"), authorities)]
+
+
+def q123_admission_TESTONLY(monkeypatch):
+    import hashlib
+    from pathlib import Path
+    from darsia_cache.retained_qualification import RetainedColdScope
+    from darsia_cache.control import _encoded
+    from darsia_cache import service_context
+    state=SimpleNamespace(bound_mode=True,reference_build=False)
+    cap=SimpleNamespace(maximum_size_bytes=500*1024**3,document=lambda:{"TESTONLY":"same cap"})
+    policy=SimpleNamespace(root="C:/TESTONLY/cache",volume_cap=cap,purpose=lambda purpose:Path("C:/TESTONLY/cache/jobs"))
+    owner=dict(pid=101,process_create_time="TESTONLY-original-epoch");token="a"*32
+    row=dict(format="darsia-cache-budget-reservation-v2",token=token,pool="TESTONLY",owner=owner,maximum_bytes=100)
+    raw=_encoded(row);reservation=dict(token=token,pool="TESTONLY",sha256=hashlib.sha256(raw).hexdigest())
+    close=_encoded(dict(owner=owner,token=token,reservation_sha256=reservation["sha256"],no_further_writes=True))
+    records={"cache-r-"+token+".json":raw,"cache-c-"+token+".json":close}
+    admission=dict(cache_identity={"TESTONLY":"cache ID"},host_ledger={"path":"C:/TESTONLY/ledger"})
+    old=SimpleNamespace(policy=policy,reservation=reservation,ledger=SimpleNamespace(admission=admission),
+        manifest=dict(owner=owner,root_identity={"TESTONLY":"old service"}))
+    calls=[];value=RetainedColdScope.__new__(RetainedColdScope)
+    value.value=dict(retained_cache_inventory=pin("retained.json"));value._seal=first._digest(value.value)
+    value.close_record=dict(path="C:/TESTONLY/ledger/cache-c-"+token+".json",
+        sha256=hashlib.sha256(close).hexdigest(),size_bytes=len(close))
+    value.closed=SimpleNamespace(original=old,_retired_locked=lambda actual:calls.append(actual) or True)
+    value.read=lambda binding:dict(logical_bytes=117590)
+    monkeypatch.setattr(service_context,"verify_retained_cache_inventory",lambda document,root:document)
+    monkeypatch.setattr(value,"matplotlib_root",lambda *args,**kwargs:"C:/TESTONLY/output/diagnostic/mpl")
+    ledger=SimpleNamespace(control=SimpleNamespace(names=lambda:list(records),read_once=lambda name:(records[name],None)))
+    lease=SimpleNamespace(context=dict(host="moderskipet"),policy=policy,admission=admission,ledger=ledger)
+    report=dict(current_cache_logical_bytes=117590,active_cache_remaining_bytes=0,hard_filesystem_quota_verified=True)
+    return value,state,lease,report,records,calls
+
+
+def test_Q123_retained_bytes_stay_used_before_new_service_reservation(monkeypatch):
+    value,state,lease,report,records,calls=q123_admission_TESTONLY(monkeypatch);before=deepcopy(records)
+    assert value.admit(state,lease,report)==dict(logical_bytes=117590)
+    assert len(calls)==1 and records==before and report["current_cache_logical_bytes"]==117590
+
+
+@pytest.mark.parametrize("change",["root","cap","identity","active","used","uncapped","close"])
+def test_Q123_refuses_changed_canonical_resources_and_unaccounted_bytes(monkeypatch,change):
+    value,state,lease,report,records,_=q123_admission_TESTONLY(monkeypatch)
+    if change in {"root","cap","uncapped"}:
+        lease.policy=SimpleNamespace(**vars(lease.policy))
+        if change=="root":lease.policy.root="C:/TESTONLY/another-cache"
+        if change=="cap":lease.policy.volume_cap=SimpleNamespace(document=lambda:{"TESTONLY":"different"})
+        if change=="uncapped":lease.policy.volume_cap=None
+    if change=="identity":lease.admission=dict(lease.admission,cache_identity={"TESTONLY":"different"})
+    if change=="active":report["active_cache_remaining_bytes"]=1
+    if change=="used":report["current_cache_logical_bytes"]=0
+    if change=="close":records["cache-c-"+"a"*32+".json"]=b"{}"
+    before=deepcopy(records)
+    with pytest.raises(CachePolicyError):value.admit(state,lease,report)
+    assert records==before
+
+
+def test_Q123_fully_written_unclosed_prior_service_still_forbids_exclusivity(monkeypatch):
+    value,state,lease,report,records,_=q123_admission_TESTONLY(monkeypatch)
+    records["cache-r-"+"b"*32+".json"]=b"TESTONLY fully written live reservation"
+    assert report["active_cache_remaining_bytes"]==0
+    with pytest.raises(CachePolicyError,match="Every prior reservation"):value.admit(state,lease,report)
+
+
+@pytest.mark.parametrize("change",[None,"old-token","nonempty","opened","owner","old-identity"])
+def test_Q123_new_service_requires_original_empty_FILE_CREATE_provenance(monkeypatch,change):
+    from pathlib import Path
+    from darsia_cache.environment import FIRST_WRITER_SUBDIRECTORIES,FIRST_WRITER_ENVIRONMENT_KEYS
+    value,state,lease,_,_,_=q123_admission_TESTONLY(monkeypatch)
+    token="b"*32;owner=dict(pid=202,process_create_time="TESTONLY-new-epoch");identity={"TESTONLY":"new service"}
+    lease.reservation=dict(token=token,pool="TESTONLY",sha256="c"*64);lease.directories={"":identity}
+    fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",token=token,owner=owner,purpose="jobs",
+        root_identity=identity,creation_disposition="NtCreateFile.FILE_CREATE",exclusive_root_handle=True,
+        initial_names=[],initial_empty_observed_utc="2026-10-18T21:00:00+00:00",
+        observation_precedes_writer_subdirectories_and_imports=True,
+        writer_subdirectories=list(FIRST_WRITER_SUBDIRECTORIES),writer_environment_keys=list(FIRST_WRITER_ENVIRONMENT_KEYS))
+    lease.manifest=dict(token=token,owner=owner,purpose="jobs",reservation=lease.reservation,
+        root=str(Path(lease.policy.root)/"jobs"/token),root_identity=identity,fresh_scope_provenance=fresh)
+    if change=="old-token":lease.reservation["token"]=value.closed.original.reservation["token"]
+    if change=="nonempty":fresh["initial_names"]=["old.npy"]
+    if change=="opened":fresh["creation_disposition"]="NtCreateFile.FILE_OPEN"
+    if change=="owner":fresh["owner"]={"TESTONLY":"unrelated"}
+    if change=="old-identity":lease.manifest["root_identity"]=value.closed.original.manifest["root_identity"]
+    if change is None:assert value.require_service(state,lease) is True
+    else:
+        with pytest.raises(CachePolicyError,match="genuinely new empty exclusive"):
+            value.require_service(state,lease)
+
+
+def test_Q123_only_exact_request_bound_MPL_exception_is_readable():
+    observation,evidence=bounded_evidence_TESTONLY()
+    external="C:/TESTONLY/output/diagnostic/mpl";binding=pin("Q123-cold.json")
+    scope=SimpleNamespace(binding=binding,matplotlib_root=lambda first:external)
+    state=SimpleNamespace(q123_cold_scope=scope,request=dict(q123_cold_scope=binding))
+    evidence["q123_cold_scope"]=binding
+    evidence["registered_owner_environments"][0]["actual_writer_environment"]["MPLCONFIGDIR"]=external
+    observation["actual_registered_owner_exit_inventories"]=evidence["registered_owner_environments"]
+    evidence["observation_sha256"]=first._digest(observation)
+    assert first.checked_bounded_evidence(observation,evidence,first=state)==evidence
+    with pytest.raises(CachePolicyError):first.checked_bounded_evidence(observation,evidence)
+    for key in ("TEMP","MPLCONFIGDIR"):
+        changed=deepcopy(evidence);observed=deepcopy(observation)
+        changed["registered_owner_environments"][0]["actual_writer_environment"][key]=external+"/arbitrary"
+        observed["actual_registered_owner_exit_inventories"]=changed["registered_owner_environments"]
+        changed["observation_sha256"]=first._digest(observed)
+        with pytest.raises(CachePolicyError):first.checked_bounded_evidence(observed,changed,first=state)
+
+
+def test_Q123_external_MPL_is_empty_and_counted_in_the_watched_output(monkeypatch):
+    from darsia_cache.retained_qualification import RetainedColdScope
+    from darsia_cache import windows
+    value=RetainedColdScope.__new__(RetainedColdScope)
+    value.matplotlib_namespace=dict(path="C:/TESTONLY/output/diagnostic/mpl",identity={"TESTONLY":"exact ID"})
+    value.closed=SimpleNamespace(original=SimpleNamespace(policy=SimpleNamespace(root="C:/TESTONLY/cache")))
+    state=SimpleNamespace(output_entitlement=dict(watched_output_scope=dict(path="C:/TESTONLY/output")))
+    names=[];calls=[]
+    def namespace(path,identity):
+        calls.append((path,identity));return SimpleNamespace(names=lambda:list(names),close=lambda:None)
+    monkeypatch.setattr(windows,"WindowsNamespace",namespace)
+    assert value.matplotlib_root(state,require_empty=True)==value.matplotlib_namespace["path"]
+    assert calls==[(value.matplotlib_namespace["path"],value.matplotlib_namespace["identity"])]
+    names.append("prior-font.json")
+    with pytest.raises(CachePolicyError,match="must be empty"):value.matplotlib_root(state,require_empty=True)
+    value.matplotlib_namespace["path"]="C:/TESTONLY/cache/prior-mpl"
+    with pytest.raises(CachePolicyError,match="counted diagnostic child"):value.matplotlib_root(state)

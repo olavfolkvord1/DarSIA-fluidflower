@@ -480,3 +480,168 @@ def test_direct_new_typed_profile_refuses_before_observer_or_ledger(world, monke
     assert not any(event[0] == "actual-observer" for event in world.events)
     world.assert_no_mutation()
     world.assert_closed()
+
+
+# Q123 uses the unchanged original budget-close API through one explicit view.
+# These fixtures never authorize a real retirement, file cleanup or rearm.
+def retained_close_TESTONLY(world,monkeypatch):
+    context=object.__new__(resolver.RetainedServiceCloseContext)
+    context.original=resolve(world);context.binding=descriptor("Q123-request.json")
+    context.request={key:descriptor(key+".json") for key in ("original_service_receipt",
+        "original_lifecycle_eligibility","original_native_retirement","retained_cache_inventory")}
+    calls=[]
+    monkeypatch.setattr(context,"_retired_locked",lambda row:calls.append(deepcopy(row)) or True)
+    return context,calls
+
+
+def test_Q123_retained_close_uses_original_append_and_never_deletes_or_rearms(world,monkeypatch):
+    context,calls=retained_close_TESTONLY(world,monkeypatch)
+    before=deepcopy(world.records)
+    actual=context.close_retained()
+    assert len(calls)==1 and calls[0]==world.reservation_row
+    name="cache-c-"+TOKEN+".json"
+    assert set(world.records)-set(before)=={name}
+    assert all(world.records[key]==raw for key,raw in before.items())
+    row=capacity._json_bytes(world.records[name])
+    assert row["owner"]==PRIMARY and row["token"]==TOKEN
+    assert row["reservation_sha256"]==world.reservation["sha256"] and row["no_further_writes"] is True
+    assert actual["close_record"]["sha256"]==hashlib.sha256(world.records[name]).hexdigest()
+    assert actual["all_files_retained"] and actual["retained_bytes_are_still_used"]
+    assert actual["cleanup_authorized"] is False and actual["rearm_authorized"] is False
+    world.assert_closed()
+    with pytest.raises(CachePolicyError,match="Closed, foreign"):
+        context.close_retained()
+    assert set(world.records)-set(before)=={name}
+
+
+def test_Q123_retirement_refusal_preserves_all_records_and_original_observer_capability(world,monkeypatch):
+    context,_=retained_close_TESTONLY(world,monkeypatch);before=deepcopy(world.records)
+    def refuse(row):raise CachePolicyError("TESTONLY genuine owner still live")
+    monkeypatch.setattr(context,"_retired_locked",refuse)
+    with pytest.raises(CachePolicyError,match="still live"):context.close_retained()
+    assert world.records==before and world.writes==[]
+    with pytest.raises(CachePolicyError,match="Read-only observer"):
+        context.original.ledger.close(world.reservation,owner=PRIMARY,verify_no_further_writes=lambda row:True)
+    world.assert_closed()
+
+
+@pytest.mark.parametrize("change",["token","owner","sha","cleanup","other_name"])
+def test_Q123_close_view_refuses_any_other_token_owner_sha_or_write(change):
+    writes=[]
+    namespace=SimpleNamespace(write_once=lambda *args,**kwargs:writes.append(args))
+    reservation=dict(token=TOKEN,sha256="a"*64)
+    view=resolver._RetainedCloseMetadataOnly(namespace,reservation,PRIMARY)
+    name="cache-c-"+TOKEN+".json"
+    row=dict(owner=PRIMARY,token=TOKEN,utc="TESTONLY recorded close time",no_further_writes=True,reservation_sha256="a"*64)
+    if change=="token":row["token"]="b"*32
+    if change=="owner":row["owner"]=OBSERVER
+    if change=="sha":row["reservation_sha256"]="b"*64
+    if change=="cleanup":row["cleanup_authorized"]=True
+    if change=="other_name":name="cache-r-"+TOKEN+".json"
+    with pytest.raises(CachePolicyError,match="only the exact original"):
+        view.write_once(name,_encoded(row))
+    assert not writes
+
+
+def test_Q123_retained_inventory_preserves_real_file_and_refuses_changed_identity(tmp_path):
+    root=tmp_path/"TESTONLY-cache";root.mkdir();path=root/"fontlist.json";path.write_bytes(b"TESTONLY-font")
+    info=path.lstat()
+    inventory=dict(format="darsia-cache-retained-file-inventory-v1",root=str(root),no_cleanup=True,
+        logical_bytes=info.st_size,files=[dict(relative_path="fontlist.json",dev=info.st_dev,ino=info.st_ino,
+            size_bytes=info.st_size,mtime_ns=info.st_mtime_ns)])
+    before=path.read_bytes()
+    assert resolver.verify_retained_cache_inventory(inventory,str(root))==inventory
+    assert path.read_bytes()==before
+    changed=deepcopy(inventory);changed["files"][0]["ino"]+=1
+    with pytest.raises(CachePolicyError,match="identity/version"):
+        resolver.verify_retained_cache_inventory(changed,str(root))
+    path.write_bytes(b"TESTONLY-modified-font")
+    with pytest.raises(CachePolicyError,match="identity/version"):
+        resolver.verify_retained_cache_inventory(inventory,str(root))
+
+
+def test_Q123_close_request_without_actual_Root_release_never_resolves_service(monkeypatch):
+    from darsia_cache import first_qualification as first
+    roles=("original_service_receipt","original_request","original_native_retirement",
+        "original_lifecycle_eligibility","recorded_owner_retirement","retained_cache_inventory","answers_source","root_release")
+    request={role:descriptor(role+".json") for role in roles}
+    request.update(format="darsia-cache-retained-service-close-request-v1",authority_ids=["Q123"])
+    monkeypatch.setattr(resolver._MetadataOnce,"read",lambda self,binding:
+        {} if binding==request["root_release"] else deepcopy(request))
+    def forbidden(*args,**kwargs):raise AssertionError("No unreleased service resolution")
+    monkeypatch.setattr(resolver,"resolve_original_service_context",forbidden)
+    with pytest.raises(CachePolicyError,match="Actual Root release"):
+        resolver.RetainedServiceCloseContext(descriptor("close-request.json"),package_file=PACKAGE)
+
+
+def retained_retirement_TESTONLY(world,monkeypatch):
+    import psutil
+    from darsia_cache import service_lifecycle,first_qualification
+    context=object.__new__(resolver.RetainedServiceCloseContext);context.original=resolve(world)
+    context.request={role:descriptor(role+".json") for role in ("original_native_retirement",
+        "original_service_receipt","recorded_owner_retirement","original_lifecycle_eligibility")}
+    context.request["original_service_receipt"]=world.receipt_pin
+    context._seal=first_qualification._digest(context.request)
+    binding={"TESTONLY":"original lifecycle binding"}
+    sealed=dict(binding=descriptor("original-seal.json"),document={"value":{"outcome":"failed"}})
+    owner=dict(binding=descriptor("original-owner.json"),document={"value":{"owner":PRIMARY}})
+    records={("seal","service"):sealed,("owner","TESTONLY-owner"):owner}
+    snapshot=dict(binding=binding,seal=sealed,owners=[owner],launches=[],legacy_launches=[],
+        child_coverage=dict(entry_kind="worker",registered_launches_are_not_exhaustive_proof=True,
+            complete_external_child_coverage_provider_required=True))
+    native=dict(format="darsia-native-owned-worker-retirement-v1",service_receipt=world.receipt_pin,
+        primary=PRIMARY,whole_family_kernel_observation=True,no_process_kill_after_resume=True,
+        terminal=dict(accounting=dict(active_processes=0,terminated_by_limit_processes=0),job_flags=0))
+    eligibility=dict(binding=binding,kind="eligibility",key="TESTONLY-eligibility",
+        value=dict(registry_sha256=service_lifecycle._digest(snapshot),
+            retirement=context.request["original_native_retirement"],original_retirement_verifier_accepted=True,
+            cleanup_authorized=False,service_budget_closed=False))
+    records[("eligibility","TESTONLY-eligibility")]=dict(binding=context.request["original_lifecycle_eligibility"],document=eligibility)
+    observed=dict(actual=dict(recorded_owned_epochs=[dict(pid=PRIMARY["pid"],create_time="TESTONLY_PRIMARY_EPOCH",recorded_epoch_absent=True)],
+        original_whole_native_family_retirement=dict(context.request["original_native_retirement"],document=native)))
+    docs={context.request["original_native_retirement"]["path"]:native,
+        context.request["recorded_owner_retirement"]["path"]:observed,
+        context.request["original_lifecycle_eligibility"]["path"]:eligibility}
+    context.reads=SimpleNamespace(read=lambda pin:deepcopy(docs[pin["path"]]))
+    monkeypatch.setattr(context,"_retained_files",lambda:{"TESTONLY":"separately verified real-file inventory"})
+    monkeypatch.setattr(service_lifecycle,"ServiceLifecycle",lambda original:SimpleNamespace(binding=binding,_records=lambda:records))
+    def absent(pid):raise psutil.NoSuchProcess(pid)
+    monkeypatch.setattr(psutil,"Process",absent)
+    return context,native,eligibility,records,observed
+
+
+def test_Q123_close_verifier_requires_exact_original_native_registry_and_eligibility(world,monkeypatch):
+    context,_,_,_,_=retained_retirement_TESTONLY(world,monkeypatch)
+    before=deepcopy(world.records)
+    assert context._retired_locked(world.reservation_row) is True
+    assert world.records==before and world.writes==[]
+
+
+@pytest.mark.parametrize("kind",["active_native","kernel_limit","live_owner","unresolved_launch","registry","eligibility","wrong_owner","wrong_epoch"])
+def test_Q123_close_verifier_refuses_live_or_incomplete_original_retirement(world,monkeypatch,kind):
+    import psutil
+    context,native,eligibility,records,observed=retained_retirement_TESTONLY(world,monkeypatch)
+    row=deepcopy(world.reservation_row);before=deepcopy(world.records)
+    if kind=="active_native":native["terminal"]["accounting"]["active_processes"]=1
+    if kind=="kernel_limit":native["terminal"]["accounting"]["terminated_by_limit_processes"]=1
+    if kind=="live_owner":monkeypatch.setattr(psutil,"Process",lambda pid:SimpleNamespace(create_time=lambda:"TESTONLY_PRIMARY_EPOCH"))
+    if kind=="unresolved_launch":records[("intent","TESTONLY-unresolved")]=dict(document={})
+    if kind=="registry":eligibility["value"]["registry_sha256"]="f"*64
+    if kind=="eligibility":eligibility["value"]["cleanup_authorized"]=True
+    if kind=="wrong_owner":row["owner"]=OBSERVER
+    if kind=="wrong_epoch":observed["actual"]["recorded_owned_epochs"][0]["create_time"]="TESTONLY_OTHER_EPOCH"
+    with pytest.raises(CachePolicyError):context._retired_locked(row)
+    assert world.records==before and world.writes==[]
+
+
+def test_Q123_closed_original_requires_exact_pinned_close(world,monkeypatch):
+    context,_=retained_close_TESTONLY(world,monkeypatch)
+    result=context.close_retained();before=deepcopy(world.records)
+    with pytest.raises(CachePolicyError,match="Closed, foreign"):resolve(world)
+    observed=resolver.resolve_original_service_context(world.receipt_pin,package_file=PACKAGE,
+        retained_close=result["close_record"])
+    assert observed.manifest==context.original.manifest and world.records==before
+    wrong=deepcopy(result["close_record"]);wrong["sha256"]="f"*64
+    with pytest.raises(CachePolicyError,match="reservation/close"):
+        resolver.resolve_original_service_context(world.receipt_pin,package_file=PACKAGE,retained_close=wrong)
+    assert world.records==before

@@ -150,7 +150,7 @@ class OriginalServiceObserverContext:
     resolver_is_not_retirement_proof: bool = True
 
 
-def resolve_original_service_context(receipt_binding, *, package_file, first_request=None):
+def resolve_original_service_context(receipt_binding, *, package_file, first_request=None, retained_close=None):
     """Reopen exact metadata once; no ImportLease constructor or live handles.
 
     Requires CacheBudgetLedger.locked(create_binding=False). The original
@@ -264,7 +264,26 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
         measurement_provider=no_cache_measurement, namespace_admission=admission,
         verify_host_admission=_host_binding, service_binding=binding, observer=observer)
     with ledger.locked(create_binding=False):
-        ledger.require_reservation(reservation, original_owner, maximum)
+        if retained_close is None:
+            ledger.require_reservation(reservation, original_owner, maximum)
+        else:
+            # Q123 post-close observation only. The ordinary resolver continues
+            # refusing closed reservations; this path cannot allocate or reopen.
+            pin = _descriptor(retained_close)
+            expected = Path(ledger.bound["path"]) / ("cache-c-" + token + ".json")
+            if not _same_path(pin["path"], expected):
+                raise CachePolicyError("Retained close is outside the original canonical ledger")
+            row, raw = _json(ledger.control, "cache-r-" + token + ".json")
+            close, close_raw = _json(ledger.control, expected.name)
+            if (reservation != dict(token=token, pool=ledger.key, sha256=hashlib.sha256(raw).hexdigest())
+                    or row.get("format") != "darsia-cache-budget-reservation-v2"
+                    or row.get("owner") != original_owner or row.get("token") != token
+                    or row.get("pool") != ledger.key or row.get("maximum_bytes") != maximum
+                    or pin["sha256"] != hashlib.sha256(close_raw).hexdigest() or pin["size_bytes"] != len(close_raw)
+                    or close.get("owner") != original_owner or close.get("token") != token
+                    or close.get("reservation_sha256") != reservation["sha256"]
+                    or close.get("no_further_writes") is not True):
+                raise CachePolicyError("Actual retained reservation/close owner/token/SHA differs")
         original_scope, _ = _json(ledger.control, "cache-s-" + token + ".json")
         if original_scope != manifest:
             raise CachePolicyError("Original bound service manifest differs from current ledger")
@@ -277,3 +296,179 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
         maximum=maximum, entry_limit=entry_limit, entry_kind=role["entry_kind"],
         role_identifier=role["role_identifier"], purpose=purpose, receipt=deepcopy(receipt_binding),
         ledger=ledger, original_metadata=tuple(deepcopy(pin) for pin, _ in reads.seen.values()))
+
+
+class _RetainedCloseMetadataOnly:
+    """Only the original canonical close record; never cleanup or allocation."""
+    def __init__(self, namespace, reservation, owner):
+        self.namespace,self.reservation,self.owner=namespace,reservation,owner
+
+    def names(self):
+        return self.namespace.names()
+
+    def read_once(self, name, maximum=1024**2):
+        return self.namespace.read_once(name,maximum=maximum)
+
+    def write_once(self, name, raw, maximum=1024**2):
+        row=_json_bytes(raw)
+        if (name!="cache-c-"+self.reservation["token"]+".json"
+                or set(row)!={"owner","token","utc","no_further_writes","reservation_sha256"}
+                or row["owner"]!=self.owner or row["token"]!=self.reservation["token"]
+                or row["reservation_sha256"]!=self.reservation["sha256"]
+                or row["no_further_writes"] is not True or not isinstance(row["utc"],str)):
+            raise CachePolicyError("Retained close permits only the exact original reservation close")
+        return self.namespace.write_once(name,raw,maximum=maximum)
+
+
+class RetainedServiceCloseContext:
+    """Explicit Q123 append-only use of the existing close API, no ImportLease.
+
+    Every original cache file is retained. This is not cleanup eligibility,
+    scientific success, rearm authority or an assertion of zero retained bytes.
+    """
+    def __init__(self, binding, *, package_file, retained_close=None):
+        from .first_qualification import _digest, _exact_keys
+        self.reads=_MetadataOnce(package_file)
+        self.binding=_descriptor(binding)
+        self.request=self.reads.read(self.binding)
+        roles={"original_service_receipt","original_request","original_native_retirement",
+            "original_lifecycle_eligibility","recorded_owner_retirement","retained_cache_inventory",
+            "answers_source","root_release"}
+        _exact_keys(self.request,roles|{"format","authority_ids"},"Exact retained-service close request required")
+        if (self.request["format"]!="darsia-cache-retained-service-close-request-v1"
+                or self.request["authority_ids"]!=["Q123"]):
+            raise CachePolicyError("Explicit technical retained close authority required")
+        for role in roles:_descriptor(self.request[role])
+        release=self.reads.read(self.request["root_release"])
+        if (release.get("format")!="darsia-cache-retained-service-close-root-release-v1"
+                or release.get("execution_authorized") is not True
+                or release.get("request_payload_sha256")!=_digest({key:value for key,value in self.request.items() if key!="root_release"})):
+            raise CachePolicyError("Actual Root release for this retained close required")
+        answers=self.reads.read_authorities(self.request["answers_source"])
+        required={"Q123-answer-option1-append-only-closeout-and-new-empty-exclusive-scope-retained-bytes-counted"}
+        if not required.issubset({row.get("id") for row in answers}):
+            raise CachePolicyError("Actual Q123 authority required")
+        self.original=resolve_original_service_context(self.request["original_service_receipt"],
+            package_file=package_file,first_request=self.request["original_request"],retained_close=retained_close)
+        if self.original.entry_kind!="worker" or self.original.purpose!="jobs":
+            raise CachePolicyError("Retained close is only the original worker/jobs service")
+        self._seal=_digest(self.request)
+
+    def _retired_locked(self, reservation):
+        from .service_lifecycle import ServiceLifecycle, _digest as lifecycle_digest
+        from .first_qualification import _digest
+        import psutil
+        context=self.original
+        if _digest(self.request)!=self._seal:
+            raise CachePolicyError("Retained-close request changed in memory")
+        if (reservation["owner"]!=context.manifest["owner"]
+                or reservation["token"]!=context.reservation["token"]):
+            raise CachePolicyError("Retained close owner/token differ")
+        retirement=self.reads.read(self.request["original_native_retirement"])
+        observed=self.reads.read(self.request["recorded_owner_retirement"])
+        actual=observed.get("actual",observed)
+        rows=actual.get("recorded_owned_epochs",[])
+        native=actual.get("original_whole_native_family_retirement",{})
+        if (retirement.get("format")!="darsia-native-owned-worker-retirement-v1"
+                or retirement.get("service_receipt")!=self.request["original_service_receipt"]
+                or retirement.get("primary")!=context.manifest["owner"]
+                or retirement.get("whole_family_kernel_observation") is not True
+                or retirement.get("no_process_kill_after_resume") is not True
+                or retirement.get("terminal",{}).get("accounting",{}).get("active_processes")!=0
+                or retirement.get("terminal",{}).get("accounting",{}).get("terminated_by_limit_processes")!=0
+                or retirement.get("terminal",{}).get("job_flags")!=0
+                or {key:native.get(key) for key in ("path","sha256","size_bytes")}!=self.request["original_native_retirement"]
+                or native.get("document")!=retirement or not rows):
+            raise CachePolicyError("Original whole-kernel and recorded-owner retirement required")
+        known=set()
+        for row in rows:
+            epoch=row.get("create_time")
+            if (type(row.get("pid")) is not int or type(epoch) not in {int,float,str}
+                    or row.get("recorded_epoch_absent") is not True):
+                raise CachePolicyError("Every original exact owner epoch must be retired")
+            known.add((row["pid"],str(epoch)))
+            try:
+                if str(psutil.Process(row["pid"]).create_time())==str(epoch):
+                    raise CachePolicyError("An original retained-service owner is still live")
+            except psutil.NoSuchProcess:pass
+        lifecycle=ServiceLifecycle(context);records=lifecycle._records()
+        sealed=records.get(("seal","service"))
+        owners=sorted((row for (kind,_),row in records.items() if kind=="owner"),key=lambda row:row["binding"]["path"])
+        intents={key for kind,key in records if kind=="intent"}
+        if (sealed is None or not owners or any(("observed",key) not in records or ("retired",key) not in records for key in intents)
+                or any(key not in intents for kind,key in records if kind in {"observed","retired"})
+                or any((row["document"]["value"]["owner"]["pid"],
+                    str(row["document"]["value"]["owner"]["process_create_time"])) not in known for row in owners)):
+            raise CachePolicyError("Original registered owner/launch retirement is incomplete")
+        snapshot=dict(binding=lifecycle.binding,seal=sealed,owners=owners,
+            launches=[dict(intent=records[("intent",key)],observed=records[("observed",key)],retired=records[("retired",key)]) for key in sorted(intents)],
+            legacy_launches=[row for (kind,_),row in sorted(records.items()) if kind in {"legacy_intent","legacy_observed"}],
+            child_coverage=dict(entry_kind=context.entry_kind,registered_launches_are_not_exhaustive_proof=True,
+                complete_external_child_coverage_provider_required=True))
+        eligibility=self.reads.read(self.request["original_lifecycle_eligibility"])
+        value=eligibility.get("value",{})
+        if (snapshot["legacy_launches"] or eligibility.get("binding")!=lifecycle.binding
+                or eligibility.get("kind")!="eligibility"
+                or records.get(("eligibility",eligibility.get("key")),{}).get("binding")!=self.request["original_lifecycle_eligibility"]
+                or value.get("registry_sha256")!=lifecycle_digest(snapshot)
+                or value.get("retirement")!=self.request["original_native_retirement"]
+                or value.get("original_retirement_verifier_accepted") is not True
+                or value.get("cleanup_authorized") is not False or value.get("service_budget_closed") is not False):
+            raise CachePolicyError("Original sealed eligibility differs; no retained close")
+        self._retained_files()
+        return True
+
+    def _retained_files(self):
+        return verify_retained_cache_inventory(
+            self.reads.read(self.request["retained_cache_inventory"]),self.original.policy.root)
+
+    def close_retained(self):
+        """One original cache-c append; a failure never deletes or retries it."""
+        ledger=self.original.ledger
+        with ledger.locked(create_binding=False):
+            original=ledger.control
+            # The original observer remains read-only everywhere else.
+            ledger.control=_RetainedCloseMetadataOnly(original.namespace,
+                self.original.reservation,self.original.manifest["owner"])
+            try:
+                CacheBudgetLedger.close(ledger,self.original.reservation,
+                    owner=self.original.manifest["owner"],verify_no_further_writes=self._retired_locked)
+                name="cache-c-"+self.original.reservation["token"]+".json"
+                raw,_=ledger.control.read_once(name)
+                close_record=dict(path=str(Path(ledger.bound["path"])/name),
+                    sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+            finally:
+                ledger.control=original
+        return dict(format="darsia-cache-retained-service-close-result-v1",request=self.binding,
+            reservation=deepcopy(self.original.reservation),close_record=close_record,
+            original_service_receipt=self.request["original_service_receipt"],
+            original_lifecycle_eligibility=self.request["original_lifecycle_eligibility"],
+            original_native_retirement=self.request["original_native_retirement"],
+            retained_cache_inventory=self.request["retained_cache_inventory"],all_files_retained=True,
+            retained_bytes_are_still_used=True,cleanup_authorized=False,rearm_authorized=False)
+
+
+def verify_retained_cache_inventory(inventory, root):
+    """Exact old files remain; fresh admission separately counts the WHOLE root."""
+    import stat
+    if (inventory.get("format")!="darsia-cache-retained-file-inventory-v1"
+            or not _same_path(inventory.get("root",""),root)
+            or inventory.get("no_cleanup") is not True or not isinstance(inventory.get("files"),list)):
+        raise CachePolicyError("Exact preserved cache-file inventory required")
+    seen=set();total=0
+    for row in inventory["files"]:
+        relative=_parts(row["relative_path"])
+        if tuple(relative) in seen:raise CachePolicyError("Duplicate retained file inventory")
+        seen.add(tuple(relative));path=Path(root).joinpath(*relative)
+        for ancestor in (path,*path.parents):
+            info=ancestor.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info,"st_file_attributes",0)&0x400:
+                raise CachePolicyError("Retained cache path is a reparse entry")
+        info=path.lstat()
+        actual=dict(dev=info.st_dev,ino=info.st_ino,size_bytes=info.st_size,mtime_ns=info.st_mtime_ns)
+        if not stat.S_ISREG(info.st_mode) or actual!={key:row[key] for key in actual}:
+            raise CachePolicyError("Retained cache-file identity/version changed")
+        total+=info.st_size
+    if total!=inventory.get("logical_bytes"):
+        raise CachePolicyError("Retained cache-byte declaration differs")
+    return deepcopy(inventory)
