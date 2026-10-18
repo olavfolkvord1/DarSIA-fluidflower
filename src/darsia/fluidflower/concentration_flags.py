@@ -66,6 +66,8 @@ def dissolved_interval(blue_fraction, model: TitrationModel,
     threshold whose DIC exceeds the solubility is rejected."""
     if not 0.0 < f_min < 1.0:
         raise ValueError("f_min must lie in (0, 1)")
+    if not (np.isfinite(p_co2_atm) and p_co2_atm > 0.0):
+        raise ValueError("p_co2_atm must be a finite positive pressure")
     f = np.asarray(blue_fraction, dtype=float)
     valid = np.isfinite(f) & (f >= 0.0) & (f <= 1.0)
     if valid_mask is not None:
@@ -74,6 +76,8 @@ def dissolved_interval(blue_fraction, model: TitrationModel,
     sat = saturated_mask(f, f_min)
     threshold_dic = float(model.dic_from_blue_fraction(f_min))
     solubility = float(model.saturation_dic(p_co2_atm))
+    if not (np.isfinite(threshold_dic) and np.isfinite(solubility) and solubility > 0.0):
+        raise ValueError("the model gives no finite positive threshold and solubility for these inputs")
     if solubility < threshold_dic:
         raise ValueError("saturation threshold f_min lies above the solubility at p_co2_atm")
     value = model.dic_from_blue_fraction(np.where(sat, f_min, f))

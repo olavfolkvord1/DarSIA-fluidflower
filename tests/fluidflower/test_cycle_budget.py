@@ -67,3 +67,14 @@ def test_none_means_unknown_and_required_terms_must_be_finite():
         CycleBudgetInputs("x", None, 0.1, 0.2)
     with pytest.raises(ValueError):
         CycleBudgetInputs("x", float("nan"), 0.1, 0.2)
+
+
+def test_infinite_terms_are_rejected():
+    with pytest.raises(ValueError):
+        CycleBudgetInputs("x", float("inf"), 0.1, 0.2)
+    with pytest.raises(ValueError):
+        CycleBudgetInputs("x", 1.0, 0.1, 0.2, free_gas_g=float("inf"))
+    with pytest.raises(ValueError):
+        free_gas_mass_g(float("inf"), 1.872)
+    with pytest.raises(ValueError):
+        free_gas_mass_g(10.0, 0.0)

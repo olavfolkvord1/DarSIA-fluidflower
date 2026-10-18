@@ -69,3 +69,13 @@ def test_interval_rejects_invalid_colour_and_bad_threshold():
     labels = np.array([2, 2, 3])
     m = not_quantified_mask(labels, [2, 3], invalid_colour_mask=np.array([False, True, False]))
     assert m.tolist() == [False, True, False]
+
+
+def test_interval_requires_finite_positive_pressure():
+    model = TitrationModel()
+    f = np.array([0.5, 0.02])
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            dissolved_interval(f, model, p_co2_atm=bad)
+    iv = dissolved_interval(f, model, p_co2_atm=1.0)
+    assert np.all(np.isfinite(iv.upper)) and iv.upper[1] > iv.lower[1]

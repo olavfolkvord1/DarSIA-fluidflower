@@ -63,6 +63,9 @@ def free_gas_mass_g(displaced_water_g: float, gas_density_kg_per_m3: float,
     displaced_water_g = _as_term(displaced_water_g)
     if math.isnan(displaced_water_g):
         return float("nan")
+    if not math.isfinite(displaced_water_g) or not (0.0 < water_density_kg_per_m3 < math.inf) \
+            or not (0.0 < gas_density_kg_per_m3 < math.inf):
+        raise ValueError("displaced water and densities must be finite and the densities positive")
     volume_m3 = displaced_water_g * 1e-3 / water_density_kg_per_m3
     return volume_m3 * gas_density_kg_per_m3 * 1e3
 
@@ -89,11 +92,14 @@ class CycleBudgetInputs:
     def __post_init__(self) -> None:
         for name in ("injected_g", "dissolved_new_lower_g", "dissolved_new_upper_g"):
             v = _as_term(getattr(self, name))
-            if math.isnan(v):
+            if not math.isfinite(v):
                 raise ValueError(f"{name} must be a finite number")
             object.__setattr__(self, name, v)
         for name in ("free_gas_g", "left_overflow_g", "background_dissolved_g"):
-            object.__setattr__(self, name, _as_term(getattr(self, name)))
+            v = _as_term(getattr(self, name))
+            if math.isinf(v):
+                raise ValueError(f"{name} must be finite or unknown (NaN / None), not infinite")
+            object.__setattr__(self, name, v)
         object.__setattr__(self, "quality_flags", tuple(self.quality_flags))
 
 

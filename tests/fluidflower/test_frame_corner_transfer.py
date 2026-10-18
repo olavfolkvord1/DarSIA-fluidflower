@@ -127,3 +127,25 @@ def test_usable_requires_three_matched_corners():
                            inward=120, outward=20, search=60, refine_search=15)
     assert res.usable and res.confidence >= 0.9
     assert set(res.fit.fitted_on) == {"top_right", "bottom_right", "bottom_left"}
+
+
+def test_fit_similarity_rejects_degenerate_points():
+    with pytest.raises(ValueError):
+        fit_similarity({"a": (0.0, 0.0)}, {"a": (1.0, 1.0)})
+    with pytest.raises(ValueError):
+        fit_similarity({"a": (5.0, 5.0), "b": (5.0, 5.0)}, {"a": (1.0, 1.0), "b": (2.0, 2.0)})
+    with pytest.raises(ValueError):
+        fit_similarity({"a": (0.0, 0.0), "b": (10.0, 0.0)}, {"a": (1.0, 1.0), "b": (1.0, 1.0)})
+    with pytest.raises(ValueError):
+        fit_similarity({"a": (0.0, 0.0), "b": (10.0, 0.0)}, {"a": (float("nan"), 1.0), "b": (2.0, 2.0)})
+
+
+def test_usable_requires_a_plausible_scale():
+    from darsia.fluidflower.tools.frame_corner_transfer import CornerMatch, SimilarityFit, TransferResult
+    corners = {k: CornerMatch(k, 0.0, 0.0, 0.95, "matched", 0.0, 0.0) for k in ("a", "b", "c")}
+    good = TransferResult(corners, SimilarityFit(1.002, -0.1, 3.0, 2.0, {}, ("a", "b", "c"), False))
+    assert good.usable
+    shrunk = TransferResult(corners, SimilarityFit(0.1, 0.0, 0.0, 0.0, {}, ("a", "b", "c"), False))
+    assert not shrunk.usable
+    nan_fit = TransferResult(corners, SimilarityFit(float("nan"), 0.0, 0.0, 0.0, {}, ("a", "b", "c"), False))
+    assert not nan_fit.usable

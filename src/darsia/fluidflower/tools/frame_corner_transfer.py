@@ -27,7 +27,14 @@ import math
 import cv2
 import numpy as np
 
+MIN_SCALE, MAX_SCALE = 0.5, 2.0
+"""A camera move between positions of one series changes the scale by a
+few percent at most; a fitted scale outside this band means the matches do
+not describe the frame and the fit is treated as degenerate."""
+
 __all__ = [
+    "MIN_SCALE",
+    "MAX_SCALE",
     "CornerMatch",
     "SimilarityFit",
     "TransferResult",
@@ -84,10 +91,13 @@ class TransferResult:
 
     @property
     def usable(self) -> bool:
-        """A proposal is usable when at least three corners matched and the fit
-        is not degenerate; otherwise the caller must not offer it as a frame."""
+        """A proposal is usable when at least three corners matched, the fit is
+        not degenerate and its similarity is finite with a scale inside
+        [MIN_SCALE, MAX_SCALE]; otherwise the caller must not offer it as a frame."""
         n = sum(1 for c in self.corners.values() if c.status == "matched")
-        return n >= 3 and not self.fit.degenerate
+        f = self.fit
+        finite = all(math.isfinite(v) for v in (f.scale, f.rotation_deg, f.translation_col, f.translation_row))
+        return n >= 3 and not f.degenerate and finite and MIN_SCALE <= f.scale <= MAX_SCALE
 
     def as_dict(self) -> dict:
         return {"corners": {k: asdict(v) for k, v in self.corners.items()}, "fit": asdict(self.fit),
@@ -106,14 +116,22 @@ def fit_similarity(source_rc, target_rc) -> SimilarityFit:
     """Least-squares similarity (scale, rotation, translation) mapping source
     (row, col) points onto target points; residual per point."""
     names = list(source_rc)
+    if len(names) < 2:
+        raise ValueError("a similarity needs at least two point pairs")
     s = np.array([[source_rc[k][1], source_rc[k][0]] for k in names], float)  # x=col, y=row
     d = np.array([[target_rc[k][1], target_rc[k][0]] for k in names], float)
+    if not (np.all(np.isfinite(s)) and np.all(np.isfinite(d))):
+        raise ValueError("point coordinates must be finite")
     ms, md = s.mean(0), d.mean(0)
     S, D = s - ms, d - md
     a = float((S[:, 0] * D[:, 0] + S[:, 1] * D[:, 1]).sum())
     b = float((S[:, 0] * D[:, 1] - S[:, 1] * D[:, 0]).sum())
     n = float((S**2).sum())
+    if n <= 0.0:
+        raise ValueError("source points coincide; no similarity is defined")
     scale = math.hypot(a, b) / n
+    if not (math.isfinite(scale) and scale > 0.0):
+        raise ValueError("target points coincide or are not finite; no similarity is defined")
     th = math.atan2(b, a)
     R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]]) * scale
     t = md - R @ ms
@@ -126,12 +144,20 @@ def _fit_from_matches(corners: dict, found: dict, ncc_min: float) -> SimilarityF
     """Similarity from the corners that matched (ncc >= ncc_min). Two matched
     corners determine a similarity; with fewer than two the fit degenerates to
     a translation from the best corner (flagged), never a fit on bad matches."""
-    good = [k for k, v in found.items() if v[2] >= ncc_min]
+    good = [k for k, v in found.items() if v[2] >= ncc_min and math.isfinite(v[0]) and math.isfinite(v[1])]
     if len(good) >= 2:
-        fit = fit_similarity({k: corners[k] for k in good}, {k: (found[k][0], found[k][1]) for k in good})
-        return SimilarityFit(fit.scale, fit.rotation_deg, fit.translation_col, fit.translation_row,
-                             fit.residual_px, tuple(good), False)
-    best = max(found, key=lambda k: found[k][2])
+        try:
+            fit = fit_similarity({k: corners[k] for k in good}, {k: (found[k][0], found[k][1]) for k in good})
+        except ValueError:
+            fit = None
+        if fit is not None and math.isfinite(fit.scale) and MIN_SCALE <= fit.scale <= MAX_SCALE \
+                and all(math.isfinite(v) for v in fit.residual_px.values()):
+            return SimilarityFit(fit.scale, fit.rotation_deg, fit.translation_col, fit.translation_row,
+                                 fit.residual_px, tuple(good), False)
+    finite = [k for k, v in found.items() if math.isfinite(v[0]) and math.isfinite(v[1])]
+    if not finite:
+        return SimilarityFit(1.0, 0.0, 0.0, 0.0, {}, (), True)
+    best = max(finite, key=lambda k: found[k][2])
     dr = found[best][0] - corners[best][0]
     dc = found[best][1] - corners[best][1]
     return SimilarityFit(1.0, 0.0, dc, dr, {best: 0.0}, (best,), True)
