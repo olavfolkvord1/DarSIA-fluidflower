@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from darsia_cache import first_qualification as first
-from darsia_cache.policy import CachePolicyError, PHYSICAL_RESERVE_BYTES
+from darsia_cache.policy import CachePolicy, CachePolicyError, PHYSICAL_RESERVE_BYTES, budget_report
 from darsia_cache.worker_adapter import WorkerCacheAdapter
 
 
@@ -52,7 +52,8 @@ def protocol():
 
 def report(**changes):
     value=dict(hard_filesystem_quota_verified=True,reserve_bytes=PHYSICAL_RESERVE_BYTES,
-        quota_headroom_bytes=500,free_physical_bytes=PHYSICAL_RESERVE_BYTES+400,
+        quota_headroom_bytes=500,
+        free_physical_bytes=PHYSICAL_RESERVE_BYTES+first.BOOTSTRAP_CONTROL_MARGIN_BYTES+400,
         active_cache_remaining_bytes=20,required_noncache_bytes=30,
         current_cache_logical_bytes=0)
     value.update(changes)
@@ -91,6 +92,45 @@ def test_administrative_entitlement_uses_actual_headroom_less_existing_reserves(
     assert first.administrative_entitlement(report())==350
     assert first.administrative_entitlement(report(quota_headroom_bytes=100))==100
     # This number is not presented as an earlier observed or measured peak.
+
+
+@pytest.mark.parametrize("control_bytes,sufficient", [
+    (53248, True), (1024**3, True), (1024**3 + 1, False),
+])
+def test_q133_real_admission_guard_keeps_margin_for_control_writes(control_bytes, sufficient):
+    # Exact preclaim observations from the zero-SCI fc6713 service. The real
+    # budget calculator must still refuse if later control writes exceed 1GiB.
+    policy = CachePolicy("C:/TESTONLY/cache", 500 * 1024**3, 48, {})
+    initial_free = 536572362752
+    initial = budget_report(policy, used_bytes=117590, reserved_unwritten_bytes=0,
+        request_bytes=0, physical_free_bytes=initial_free)
+    initial["hard_filesystem_quota_verified"] = True  # Synthetic accepted cap observation.
+    maximum = first.administrative_entitlement(initial)
+    assert first.BOOTSTRAP_CONTROL_MARGIN_BYTES == 1024**3
+    assert maximum == 492548947968
+    later = budget_report(policy, used_bytes=117590, reserved_unwritten_bytes=maximum,
+        request_bytes=0, physical_free_bytes=initial_free-control_bytes)
+    assert later["sufficient"] is sufficient
+    assert later["physical_reserve_guard_satisfied"] is sufficient
+    assert later["reserve_bytes"] == PHYSICAL_RESERVE_BYTES == 40 * 1024**3
+    assert later["quota_bytes"] == 500 * 1024**3
+    if control_bytes == 53248:
+        old_saturated = budget_report(policy, used_bytes=117590,
+            reserved_unwritten_bytes=initial_free-PHYSICAL_RESERVE_BYTES,
+            request_bytes=0, physical_free_bytes=initial_free-control_bytes)
+        assert old_saturated["sufficient"] is False
+
+
+@pytest.mark.parametrize("available", [0, 1024**3-1, 1024**3])
+def test_q133_first_admission_refuses_when_only_control_margin_is_available(available):
+    value = report(free_physical_bytes=PHYSICAL_RESERVE_BYTES+20+30+available)
+    with pytest.raises(CachePolicyError, match="No actual positive"):
+        first.administrative_entitlement(value)
+
+
+def test_q133_first_admission_keeps_explicit_margin_and_existing_pending_charges():
+    value = report(free_physical_bytes=PHYSICAL_RESERVE_BYTES+20+30+1024**3+1)
+    assert first.administrative_entitlement(value) == 1
 
 
 @pytest.mark.parametrize("changes",[
@@ -162,6 +202,7 @@ def test_service_entitlement_requires_original_native_context_and_once_marker(mo
     state.consume(lease);lease.native_launch_context=pin("actual-native-launch.json")
     assert state.service_entitlement(lease)==370
     assert state.administrative["measured_profile"] is False
+    assert state.administrative["bootstrap_control_margin_bytes"] == 1024**3
     assert state.administrative["admission"]["reserve_bytes"]==PHYSICAL_RESERVE_BYTES
     assert len(lease.ledger.documents)==1  # No service reservation is duplicated here.
 

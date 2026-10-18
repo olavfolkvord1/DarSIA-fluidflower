@@ -37,6 +37,7 @@ CAPACITY_BOUND = "darsia-cache-required-capacity-bound-v1"
 BOUNDED_EVIDENCE = "darsia-cache-physical-bound-sampled-evidence-v1"
 Q104_OUTPUT_ENTITLEMENT_BYTES = 27374032352  # Historical metadata parser only; Q119 governs the active bound route.
 FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES = 65728995330
+BOOTSTRAP_CONTROL_MARGIN_BYTES = 1024**3  # Q133: retained outside the service reservation.
 BOUND_OUTPUT_ADMINISTRATION = "darsia-first-qualification-whole-output-administration-v1"
 BOUND_BUNDLE = "darsia-cache-volume-bound-completed-bundle-v1"
 BOUND_IMPORT_PROFILE = "darsia-cache-volume-bound-import-profile-v1"
@@ -188,14 +189,15 @@ def validate_startup(lease):
 
 
 def administrative_entitlement(report):
-    """Existing quota/free-minus-reserve arithmetic, explicitly NOT a profile."""
+    """Keep the original reserve plus Q133's explicit bootstrap/control margin."""
     if report.get("hard_filesystem_quota_verified") is not True:
         raise CachePolicyError("Actual enforced fixed-volume cap required before first allocation")
     if report.get("reserve_bytes") != PHYSICAL_RESERVE_BYTES:
         raise CachePolicyError("Original 40 GiB reserve cannot change in first mode")
     headroom = report["quota_headroom_bytes"]
     available = (report["free_physical_bytes"] - report["active_cache_remaining_bytes"]
-        - report["required_noncache_bytes"] - PHYSICAL_RESERVE_BYTES)
+        - report["required_noncache_bytes"] - PHYSICAL_RESERVE_BYTES
+        - BOOTSTRAP_CONTROL_MARGIN_BYTES)
     if type(headroom) is not int or type(available) is not int or min(headroom, available) <= 0:
         raise CachePolicyError("No actual positive first-mode administrative entitlement")
     return min(headroom, available)
@@ -363,7 +365,8 @@ class FirstQualification:
             return REFERENCE_ENTITLEMENT_BYTES
         maximum = administrative_entitlement(report)
         self.administrative = dict(maximum_bytes=maximum, measured_profile=False,
-            semantics="exclusive administrative entitlement from actual quota/free less original reserves",
+            bootstrap_control_margin_bytes=BOOTSTRAP_CONTROL_MARGIN_BYTES,
+            semantics="exclusive administrative entitlement from actual quota/free less original reserves and explicit bootstrap/control margin",
             admission=report)
         return maximum
 
