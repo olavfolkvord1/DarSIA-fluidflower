@@ -1,6 +1,7 @@
 """Embedded series-calibration workspace; heavy work runs outside the GUI."""
 
 from darsia.fluidflower.tools._paths import project_path, source_path, process_directory, series_root, series_path, tool_path, local_cache_root, package_root
+from darsia.fluidflower.series_paths import studio_series_keys
 import json
 import hashlib
 from pathlib import Path
@@ -151,7 +152,7 @@ class SeriesMassWorkspace(QWidget):
         layout = QVBoxLayout(self)
         bar = QHBoxLayout(); layout.addLayout(bar)
         self.series = QComboBox()
-        for name in ('ffum','ffac','ffbm'): self.series.addItem(name.upper(), name)
+        for name in studio_series_keys(): self.series.addItem(name.upper(), name)
         self.scope = QComboBox(); self.scope.addItem('Shared series model (default)', 'series')
         self.scope.addItem('Individual experiment (comparison)', 'individual')
         self.import_button = QPushButton('Import prepared results / report')

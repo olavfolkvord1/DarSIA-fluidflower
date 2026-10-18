@@ -130,6 +130,12 @@ def configured_series() -> tuple[tuple[str, str, Path], ...]:
     return tuple(rows.values())
 
 
+def studio_series_keys() -> tuple[str, ...]:
+    """Keep the original Studio choices and append explicitly configured series."""
+    return tuple(dict.fromkeys(("ffum", "ffac", "ffbm",
+        *(series_key(key) for key, _name, _root in configured_series()))))
+
+
 def register_series(root: str | Path) -> tuple[str, str, Path]:
     """Register a series root or its DarSIA subfolder in the user index."""
     root = _project_directory(Path(root))
@@ -184,6 +190,9 @@ def series_manifest(dataset: str) -> dict:
         value = tomllib.load(stream)
     if value.get("schema_version") != 1 or series_key(value["series_id"]) != series_key(dataset):
         raise ValueError(f"Wrong series manifest: {root / 'series.toml'}")
+    if "cycle_runs" in value:
+        from .series_cycles import parse_cycle_runs
+        parse_cycle_runs(value)
     return value
 
 

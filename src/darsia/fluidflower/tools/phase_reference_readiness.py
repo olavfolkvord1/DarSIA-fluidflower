@@ -12,6 +12,7 @@ from darsia.fluidflower import phase_saved_review_metadata as maps
 from darsia.fluidflower.tools.phase_injection_references import injection_end_references
 from darsia.fluidflower.review_storage import resolve_review_path
 from darsia.fluidflower.tools._paths import canonical_metadata_paths
+from darsia.fluidflower.series_paths import series_key, series_manifest
 
 RECEIPT = "phase_reference_readiness.json"
 FORMAT = "phase-reference-readiness-v1"
@@ -56,6 +57,21 @@ def mark_references_pending(validation):
     maps._write(Path(validation) / RECEIPT, {"format": FORMAT, "status": "preparing"})
 
 
+def _require_reference_series(jobs):
+    """Preserve existing series; other series need their own manifest-listed runs."""
+    manifests = {}
+    for job in jobs:
+        dataset = job["dataset"]
+        if dataset in {"ffac", "ffum", "ffbm"}:
+            continue
+        if not isinstance(dataset, str) or series_key(dataset) != dataset:
+            raise ValueError("Reference series must use its canonical registered ID")
+        if dataset not in manifests:
+            manifests[dataset] = series_manifest(dataset)
+        if job["run"] not in manifests[dataset]["runs"]["ids"]:
+            raise ValueError("Reference run is not listed in its own series manifest")
+
+
 def defer_validation_references(validation):
     """Publish ordinary maps without computing optional reference overlays.
 
@@ -74,8 +90,7 @@ def defer_validation_references(validation):
     if (not jobs or len(jobs) != len(selected)
             or {job["run"]: job["candidate_id"] for job in jobs} != selected):
         raise ValueError("Reference preparation requires the complete selected validation campaign")
-    if any(job["dataset"] not in {"ffac", "ffum", "ffbm"} for job in jobs):
-        raise ValueError("Unsupported reference experiment series")
+    _require_reference_series(jobs)
     existing_path = validation / RECEIPT
     if existing_path.is_file():
         existing = maps._read(existing_path)

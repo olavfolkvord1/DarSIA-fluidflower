@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from darsia.fluidflower.series_paths import series_key
+from darsia.fluidflower.series_cycles import CycleRun, cycle_runs_table
 from darsia.fluidflower.templates import RIG_CLASSES
 
 # Image formats of DarSIA's [data] section, by file suffix.
@@ -126,6 +127,8 @@ class RunDraft:
     candidates: list[FolderInfo] = field(default_factory=list)
     # The experiment folder the run was found in.
     source: Path | None = None
+    # Optional provenance only; ordinary configuration/baseline selection stays explicit.
+    cycle: CycleRun | None = None
 
     def folder_label(self, path: Path) -> str:
         """A folder relative to the experiment folder."""
@@ -385,6 +388,11 @@ def check_runs(runs: Sequence[RunDraft]) -> list[str]:
                 f"{label}: the baseline photograph {run.baseline or '(none)'} is not "
                 "in its image folders."
             )
+    if any(run.cycle is not None for run in runs):
+        try:
+            cycle_runs_table([run.cycle for run in runs], [run.run_id for run in runs])
+        except ValueError as error:
+            problems.append(str(error))
     return problems
 
 
@@ -467,6 +475,16 @@ def _series_toml(draft: SeriesDraft, created: str) -> str:
         f"created_by = {_toml_string(draft.created_by)}",
         "",
     ]
+    if any(run.cycle is not None for run in draft.runs):
+        table = cycle_runs_table([run.cycle for run in draft.runs], runs)
+        lines += ["[cycle_runs]", f"format = {_toml_string(table['format'])}", ""]
+        for run_id, record in table["runs"].items():
+            lines += [f"[cycle_runs.runs.{_toml_string(run_id)}]",
+                      f"experiment = {_toml_string(record['experiment'])}",
+                      f"number = {record['number']}"]
+            if "previous_run_id" in record:
+                lines.append(f"previous_run_id = {_toml_string(record['previous_run_id'])}")
+            lines.append("")
     return "\n".join(lines)
 
 
