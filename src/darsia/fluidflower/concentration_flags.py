@@ -55,32 +55,45 @@ class DissolvedInterval:
 
 def dissolved_interval(blue_fraction, model: TitrationModel,
                        f_min: float = DEFAULT_SATURATION_BLUE_FRACTION,
-                       p_co2_atm: float = 1.0) -> DissolvedInterval:
+                       p_co2_atm: float = 1.0, valid_mask=None) -> DissolvedInterval:
     """Interval of the dissolved CO2 per pixel.
 
     Below the threshold the colour is only a lower bound: ``lower`` is the DIC
     at ``f_min`` and ``upper`` the solubility at ``p_co2_atm``. Elsewhere both
-    bounds equal the closed-form DIC of the blue fraction. NaN stays NaN."""
+    bounds equal the closed-form DIC of the blue fraction. Invalid colour
+    (NaN, outside [0, 1], or False in ``valid_mask``) gives NaN in both bounds
+    and is never saturated. The bounds are ordered by construction; a
+    threshold whose DIC exceeds the solubility is rejected."""
+    if not 0.0 < f_min < 1.0:
+        raise ValueError("f_min must lie in (0, 1)")
     f = np.asarray(blue_fraction, dtype=float)
+    valid = np.isfinite(f) & (f >= 0.0) & (f <= 1.0)
+    if valid_mask is not None:
+        valid &= np.asarray(valid_mask, dtype=bool)
+    f = np.where(valid, f, np.nan)
     sat = saturated_mask(f, f_min)
-    f_eff = np.where(sat, f_min, f)
-    with np.errstate(invalid="ignore"):
-        value = np.where(np.isfinite(f_eff), model.dic_from_blue_fraction(np.where(np.isfinite(f_eff), f_eff, 0.5)), np.nan)
-    upper = np.where(sat, model.saturation_dic(p_co2_atm), value)
+    threshold_dic = float(model.dic_from_blue_fraction(f_min))
+    solubility = float(model.saturation_dic(p_co2_atm))
+    if solubility < threshold_dic:
+        raise ValueError("saturation threshold f_min lies above the solubility at p_co2_atm")
+    value = model.dic_from_blue_fraction(np.where(sat, f_min, f))
+    upper = np.where(sat, solubility, value)
+    upper = np.where(valid, np.maximum(upper, value), np.nan)
     return DissolvedInterval(lower=value, upper=upper, saturated=sat)
 
 
-def not_quantified_mask(labels, quantified_labels, gas_mask=None, outside_mask=None):
+def not_quantified_mask(labels, quantified_labels, gas_mask=None, outside_mask=None,
+                        invalid_colour_mask=None):
     """True where the colour does not measure dissolved CO2: labels without a
-    colour path (anything not in ``quantified_labels``), free gas, and pixels
-    outside the rig frame."""
+    colour path (anything not in ``quantified_labels``), free gas, pixels
+    outside the rig frame, and pixels whose colour input is invalid (NaN or
+    rejected by the caller's validity test)."""
     labels = np.asarray(labels)
     quantified = np.isin(labels, np.asarray(list(quantified_labels)))
     mask = ~quantified
-    if gas_mask is not None:
-        mask |= np.asarray(gas_mask, dtype=bool)
-    if outside_mask is not None:
-        mask |= np.asarray(outside_mask, dtype=bool)
+    for extra in (gas_mask, outside_mask, invalid_colour_mask):
+        if extra is not None:
+            mask |= np.asarray(extra, dtype=bool)
     return mask
 
 

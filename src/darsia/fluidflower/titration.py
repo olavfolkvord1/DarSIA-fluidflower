@@ -115,11 +115,21 @@ class TitrationModel:
     """Colour state <-> dissolved CO2 for one recipe and temperature."""
 
     def __init__(self, recipe: IndicatorRecipe = FFRE_RECIPE, temperature_c: float = 25.0,
-                 pka_indicator: float = 7.10) -> None:
+                 pka_indicator: float = 7.10, blue_fraction_floor: float = 1e-9,
+                 clip_negative_dic: bool = True) -> None:
+        """``blue_fraction_floor`` keeps the closed form finite at f = 0 and
+        f = 1 (proposal: 1e-9); ``clip_negative_dic`` maps the small negative
+        DIC that noise above the fresh-solution colour would give to 0
+        (proposal: True). Both are policies for Olav's decision, not physics.
+        Invalid inputs (NaN, negative DIC, f outside [0, 1]) give NaN."""
+        if not 0.0 < blue_fraction_floor < 0.5:
+            raise ValueError("blue_fraction_floor must lie in (0, 0.5)")
         self.recipe = recipe
         self.constants = TitrationConstants.at(temperature_c, pka_indicator)
         self.alkalinity = recipe.alkalinity_m
         self.btb_total = recipe.btb_total_m
+        self.blue_fraction_floor = float(blue_fraction_floor)
+        self.clip_negative_dic = bool(clip_negative_dic)
 
     # -- building blocks -----------------------------------------------------
     def blue_fraction_from_h(self, h):
@@ -145,29 +155,39 @@ class TitrationModel:
     # -- DIC -> colour --------------------------------------------------------
     def ph_from_dic(self, dic, iterations: int = 100):
         """pH of the solution holding DIC (mol/L); vectorised bisection on
-        [2, 13]. DIC may be any array shape."""
+        [2, 13]. DIC may be any array shape; NaN or negative DIC gives NaN."""
         dic = np.asarray(dic, dtype=float)
+        valid = np.isfinite(dic) & (dic >= 0.0)
+        safe = np.where(valid, dic, 0.0)
         lo = np.full(dic.shape, 2.0)
         hi = np.full(dic.shape, 13.0)
         for _ in range(iterations):
             mid = 0.5 * (lo + hi)
-            positive = self.charge_residual(10.0**-mid, dic) > 0.0
+            positive = self.charge_residual(10.0**-mid, safe) > 0.0
             lo = np.where(positive, mid, lo)
             hi = np.where(positive, hi, mid)
-        return 0.5 * (lo + hi)
+        return np.where(valid, 0.5 * (lo + hi), np.nan)
 
     def blue_fraction_from_dic(self, dic):
         return self.blue_fraction_from_ph(self.ph_from_dic(dic))
 
     # -- colour -> DIC --------------------------------------------------------
     def dic_from_blue_fraction(self, f):
-        """Closed-form DIC (mol/L) from the blue fraction f in (0, 1)."""
+        """Closed-form DIC (mol/L) from the blue fraction f in [0, 1].
+        f outside [0, 1] or NaN gives NaN; f at the ends is kept finite by
+        ``blue_fraction_floor``; negative results are clipped to 0 when
+        ``clip_negative_dic`` is set."""
         c = self.constants
-        f = np.clip(np.asarray(f, dtype=float), 1e-9, 1.0 - 1e-9)
-        h = c.k_indicator * (1.0 - f) / f
+        f = np.asarray(f, dtype=float)
+        valid = np.isfinite(f) & (f >= 0.0) & (f <= 1.0)
+        fl = self.blue_fraction_floor
+        fs = np.clip(np.where(valid, f, 0.5), fl, 1.0 - fl)
+        h = c.k_indicator * (1.0 - fs) / fs
         d = h * h + c.k1 * h + c.k1 * c.k2
-        dic = (self.alkalinity + h - c.kw / h - f * self.btb_total) * d / (c.k1 * h + 2.0 * c.k1 * c.k2)
-        return np.maximum(dic, 0.0)
+        dic = (self.alkalinity + h - c.kw / h - fs * self.btb_total) * d / (c.k1 * h + 2.0 * c.k1 * c.k2)
+        if self.clip_negative_dic:
+            dic = np.maximum(dic, 0.0)
+        return np.where(valid, dic, np.nan)
 
     # -- reference states -----------------------------------------------------
     def fresh_ph(self) -> float:
@@ -211,7 +231,9 @@ class TitrationModel:
     @staticmethod
     def mass_per_pixel_g(dic_mol_per_l, porosity, depth_m, pixel_area_m2):
         """Dissolved CO2 mass per pixel in grams: DIC (mol/L = 1000 mol/m3)
-        times the pore volume of the pixel times the molar mass."""
+        times the pore volume of the pixel times the molar mass. Every
+        argument may be a scalar or an array that broadcasts with the others
+        (native per-pixel area arrays included)."""
         dic = np.asarray(dic_mol_per_l, dtype=float)
         return dic * 1000.0 * np.asarray(porosity, dtype=float) * np.asarray(depth_m, dtype=float) \
-            * float(pixel_area_m2) * M_CO2_G_PER_MOL
+            * np.asarray(pixel_area_m2, dtype=float) * M_CO2_G_PER_MOL

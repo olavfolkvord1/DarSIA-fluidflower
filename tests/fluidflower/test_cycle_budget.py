@@ -57,3 +57,13 @@ def test_budget_rows_keep_order():
     rows = budget_rows([CycleBudgetInputs("a", 1.0, 0.1, 0.2), CycleBudgetInputs("b", 2.0, 0.5, 0.5)])
     assert [r["cycle_run"] for r in rows] == ["a", "b"]
     assert rows[1]["rest_lower_g"] == pytest.approx(1.5)
+
+
+def test_none_means_unknown_and_required_terms_must_be_finite():
+    b = cycle_budget(CycleBudgetInputs("x", 1.0, 0.1, 0.2, free_gas_g=None, left_overflow_g=None))
+    assert not b.free_gas_known and not b.overflow_known and math.isnan(b.free_gas_g)
+    assert math.isnan(free_gas_mass_g(None, 1.872))
+    with pytest.raises(ValueError):
+        CycleBudgetInputs("x", None, 0.1, 0.2)
+    with pytest.raises(ValueError):
+        CycleBudgetInputs("x", float("nan"), 0.1, 0.2)

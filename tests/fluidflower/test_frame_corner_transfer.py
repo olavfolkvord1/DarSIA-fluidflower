@@ -105,3 +105,25 @@ def test_hidden_corner_is_predicted_and_flagged():
 def test_shape_mismatch_is_an_error():
     with pytest.raises(ValueError):
         transfer_corners(np.zeros((10, 10), np.float32), np.zeros((10, 12), np.float32), CORNERS)
+
+
+def test_degenerate_case_is_flagged_not_fitted_on_bad_matches():
+    ref_img = _rig_photo(0)
+    tgt_img = np.full_like(ref_img, 40.0)  # nothing to match
+    res = transfer_corners(edge_magnitude(ref_img), edge_magnitude(tgt_img), CORNERS,
+                           inward=120, outward=20, search=40, refine_search=15)
+    assert res.fit.degenerate
+    assert not res.usable
+    assert res.confidence == -1.0
+    assert all(c.status == "unresolved" for c in res.corners.values())
+    assert res.fit.scale == 1.0 and res.fit.rotation_deg == 0.0
+
+
+def test_usable_requires_three_matched_corners():
+    ref_img = _rig_photo(0)
+    tgt_img = _warp(_rig_photo(3), 1.0, 0.0, 9.0, -4.0)
+    tgt_img[0:260, 0:260] = 40.0
+    res = transfer_corners(edge_magnitude(ref_img), edge_magnitude(tgt_img), CORNERS,
+                           inward=120, outward=20, search=60, refine_search=15)
+    assert res.usable and res.confidence >= 0.9
+    assert set(res.fit.fitted_on) == {"top_right", "bottom_right", "bottom_left"}

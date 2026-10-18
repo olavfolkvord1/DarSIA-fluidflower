@@ -66,3 +66,23 @@ def test_mass_per_pixel():
     # 1 mM in a 1 mm x 1 mm x 1 cm pixel with porosity 0.45: 1 mol/m3 * 4.5e-9 m3 * 44.01 g/mol
     g = TitrationModel.mass_per_pixel_g(1e-3, 0.45, 0.01, 1e-6)
     assert float(g) == pytest.approx(1.0 * 4.5e-9 * 44.01, rel=1e-9)
+
+
+def test_invalid_inputs_give_nan_and_policies_are_parameters():
+    model = TitrationModel()
+    ph = model.ph_from_dic(np.array([np.nan, -1e-3, 1e-3]))
+    assert np.isnan(ph[0]) and np.isnan(ph[1]) and np.isfinite(ph[2])
+    dic = model.dic_from_blue_fraction(np.array([np.nan, -0.1, 1.2, 1.0, 0.0]))
+    assert np.isnan(dic[0]) and np.isnan(dic[1]) and np.isnan(dic[2])
+    assert dic[3] == 0.0  # fully blue: clipped to zero by default
+    assert np.isfinite(dic[4]) and dic[4] > 0.03  # fully yellow: finite through the floor
+    raw = TitrationModel(clip_negative_dic=False)
+    assert float(raw.dic_from_blue_fraction(1.0)) < 0.0
+    with pytest.raises(ValueError):
+        TitrationModel(blue_fraction_floor=0.6)
+
+
+def test_mass_per_pixel_accepts_arrays():
+    area = np.array([[1e-6, 2e-6]])
+    g = TitrationModel.mass_per_pixel_g(np.array([[1e-3, 1e-3]]), 0.45, 0.01, area)
+    assert g.shape == (1, 2) and g[0, 1] == pytest.approx(2 * g[0, 0])

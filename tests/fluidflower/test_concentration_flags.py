@@ -53,3 +53,19 @@ def test_flag_fractions():
     assert out["not_quantified_fraction"] == pytest.approx(1 / 3)
     empty = flag_fractions(sat, nq, np.zeros_like(sand))
     assert empty["sand_pixels"] == 0 and np.isnan(empty["saturated_fraction"])
+
+
+def test_interval_rejects_invalid_colour_and_bad_threshold():
+    model = TitrationModel()
+    f = np.array([0.5, -0.1, 1.2, 0.02])
+    iv = dissolved_interval(f, model, valid_mask=np.array([True, True, True, False]))
+    assert np.isnan(iv.lower[1]) and np.isnan(iv.lower[2]) and np.isnan(iv.upper[3])
+    assert not iv.saturated[3]
+    assert np.all(iv.upper[np.isfinite(iv.upper)] >= iv.lower[np.isfinite(iv.lower)])
+    with pytest.raises(ValueError):
+        dissolved_interval(f, model, f_min=0.0)
+    with pytest.raises(ValueError):
+        dissolved_interval(f, model, f_min=0.05, p_co2_atm=1e-4)  # solubility below the threshold
+    labels = np.array([2, 2, 3])
+    m = not_quantified_mask(labels, [2, 3], invalid_colour_mask=np.array([False, True, False]))
+    assert m.tolist() == [False, True, False]

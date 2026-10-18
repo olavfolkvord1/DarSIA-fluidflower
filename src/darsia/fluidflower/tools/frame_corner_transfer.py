@@ -43,7 +43,7 @@ class CornerMatch:
     row: float
     col: float
     ncc: float
-    status: str  # "matched" or "predicted"
+    status: str  # "matched", "predicted" (from the fit of the matched corners) or "unresolved" (degenerate fit)
     reference_row: float
     reference_col: float
 
@@ -59,6 +59,10 @@ class SimilarityFit:
     translation_col: float
     translation_row: float
     residual_px: dict
+    fitted_on: tuple = ()
+    degenerate: bool = False
+    """True when fewer than two corners matched: the fit is then a pure
+    translation from the best corner and the result is not a frame proposal."""
 
     def apply(self, row: float, col: float) -> tuple[float, float]:
         th = math.radians(self.rotation_deg)
@@ -72,8 +76,22 @@ class TransferResult:
     corners: dict
     fit: SimilarityFit
 
+    @property
+    def confidence(self) -> float:
+        """Lowest correlation among the matched corners, or -1 when none matched."""
+        vals = [c.ncc for c in self.corners.values() if c.status == "matched"]
+        return min(vals) if vals else -1.0
+
+    @property
+    def usable(self) -> bool:
+        """A proposal is usable when at least three corners matched and the fit
+        is not degenerate; otherwise the caller must not offer it as a frame."""
+        n = sum(1 for c in self.corners.values() if c.status == "matched")
+        return n >= 3 and not self.fit.degenerate
+
     def as_dict(self) -> dict:
-        return {"corners": {k: asdict(v) for k, v in self.corners.items()}, "fit": asdict(self.fit)}
+        return {"corners": {k: asdict(v) for k, v in self.corners.items()}, "fit": asdict(self.fit),
+                "confidence": self.confidence, "usable": self.usable}
 
 
 def edge_magnitude(gray, sigma: float = 1.5):
@@ -102,6 +120,21 @@ def fit_similarity(source_rc, target_rc) -> SimilarityFit:
     pred = (R @ s.T).T + t
     res = {k: float(math.hypot(*(pred[i] - d[i]))) for i, k in enumerate(names)}
     return SimilarityFit(scale, math.degrees(th), float(t[0]), float(t[1]), res)
+
+
+def _fit_from_matches(corners: dict, found: dict, ncc_min: float) -> SimilarityFit:
+    """Similarity from the corners that matched (ncc >= ncc_min). Two matched
+    corners determine a similarity; with fewer than two the fit degenerates to
+    a translation from the best corner (flagged), never a fit on bad matches."""
+    good = [k for k, v in found.items() if v[2] >= ncc_min]
+    if len(good) >= 2:
+        fit = fit_similarity({k: corners[k] for k in good}, {k: (found[k][0], found[k][1]) for k in good})
+        return SimilarityFit(fit.scale, fit.rotation_deg, fit.translation_col, fit.translation_row,
+                             fit.residual_px, tuple(good), False)
+    best = max(found, key=lambda k: found[k][2])
+    dr = found[best][0] - corners[best][0]
+    dc = found[best][1] - corners[best][1]
+    return SimilarityFit(1.0, 0.0, dc, dr, {best: 0.0}, (best,), True)
 
 
 def _inward_extent(name_rc, centre_rc, inward: int, outward: int):
@@ -176,9 +209,7 @@ def transfer_corners(reference_edge, target_edge, corners: dict, *, inward: int 
 
     # pass 1: templates cut from the reference at the reference corners
     first = pass_match(ref, {k: v for k, v in corners.items()}, search)
-    good = {k: (v[0], v[1]) for k, v in first.items() if v[2] >= ncc_min}
-    use = good if len(good) >= 3 else {k: (v[0], v[1]) for k, v in first.items()}
-    fit1 = fit_similarity({k: corners[k] for k in use}, use)
+    fit1 = _fit_from_matches(corners, first, ncc_min)
     # pass 2: templates cut from the reference warped by the first-pass similarity, around the predicted corners
     th = math.radians(fit1.rotation_deg)
     M = np.array([[fit1.scale * math.cos(th), -fit1.scale * math.sin(th), fit1.translation_col],
@@ -186,9 +217,7 @@ def transfer_corners(reference_edge, target_edge, corners: dict, *, inward: int 
     warped = cv2.warpAffine(ref, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     predicted = {k: fit1.apply(*corners[k]) for k in corners}
     second = pass_match(warped, predicted, refine_search)
-    good2 = {k: (v[0], v[1]) for k, v in second.items() if v[2] >= ncc_min}
-    use2 = good2 if len(good2) >= 3 else {k: (v[0], v[1]) for k, v in second.items()}
-    fit2 = fit_similarity({k: corners[k] for k in use2}, use2)
+    fit2 = _fit_from_matches(corners, second, ncc_min)
     out = {}
     residual = {}
     for name, (r0, c0) in corners.items():
@@ -197,7 +226,10 @@ def transfer_corners(reference_edge, target_edge, corners: dict, *, inward: int 
         residual[name] = float(math.hypot(pr - r, pc - c))
         if ncc >= ncc_min:
             out[name] = CornerMatch(name, float(r), float(c), ncc, "matched", float(r0), float(c0))
+        elif fit2.degenerate:
+            out[name] = CornerMatch(name, float(r), float(c), ncc, "unresolved", float(r0), float(c0))
         else:
             out[name] = CornerMatch(name, float(pr), float(pc), ncc, "predicted", float(r0), float(c0))
-    fit = SimilarityFit(fit2.scale, fit2.rotation_deg, fit2.translation_col, fit2.translation_row, residual)
+    fit = SimilarityFit(fit2.scale, fit2.rotation_deg, fit2.translation_col, fit2.translation_row, residual,
+                        fit2.fitted_on, fit2.degenerate)
     return TransferResult(out, fit)

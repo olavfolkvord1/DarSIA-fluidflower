@@ -60,10 +60,19 @@ def free_gas_mass_g(displaced_water_g: float, gas_density_kg_per_m3: float,
                     water_density_kg_per_m3: float = 997.0) -> float:
     """Free gas in the rig from the water it displaced onto the scale.
     NaN in gives NaN out (no scale record)."""
-    if displaced_water_g is None or (isinstance(displaced_water_g, float) and math.isnan(displaced_water_g)):
+    displaced_water_g = _as_term(displaced_water_g)
+    if math.isnan(displaced_water_g):
         return float("nan")
     volume_m3 = displaced_water_g * 1e-3 / water_density_kg_per_m3
     return volume_m3 * gas_density_kg_per_m3 * 1e3
+
+
+def _as_term(value) -> float:
+    """Input contract of the budget: a term is a float; ``None`` means unknown
+    and becomes NaN here, so callers may pass either."""
+    if value is None:
+        return float("nan")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,16 @@ class CycleBudgetInputs:
     left_overflow_g: float = float("nan")
     background_dissolved_g: float = float("nan")
     quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        for name in ("injected_g", "dissolved_new_lower_g", "dissolved_new_upper_g"):
+            v = _as_term(getattr(self, name))
+            if math.isnan(v):
+                raise ValueError(f"{name} must be a finite number")
+            object.__setattr__(self, name, v)
+        for name in ("free_gas_g", "left_overflow_g", "background_dissolved_g"):
+            object.__setattr__(self, name, _as_term(getattr(self, name)))
+        object.__setattr__(self, "quality_flags", tuple(self.quality_flags))
 
 
 @dataclass(frozen=True)
