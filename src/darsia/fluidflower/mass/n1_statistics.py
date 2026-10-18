@@ -6,6 +6,7 @@ from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import cKDTree
 from .concentration_joint import dilution_factor
 from .n1_arithmetic import main_partition, validate_parameters
+from ..geometry.pixels import _column_neighbours
 INTERVALS = 32768
 MAX_COLUMN_DISTANCE_M = .020
 CONTRACT = "darsia-n1-estimates-v1"
@@ -59,14 +60,6 @@ def _coordinates(x_m, y_m):
     if np.any(np.diff(y, axis=0) >= 0):
         raise ValueError("Physical height must decrease down each image column; no automatic axis flip")
     return x, y
-
-
-def _column_neighbours(mask):
-    """Return previous/following same-column categorical donors."""
-    rows = np.arange(mask.shape[0], dtype=np.int32)[:, None]
-    previous = np.maximum.accumulate(np.where(mask, rows, -1), axis=0)
-    following = np.minimum.accumulate(np.where(mask, rows, mask.shape[0])[::-1], axis=0)[::-1]
-    return previous, following
 
 
 def build_estimate_geometry(x_m, y_m, facies, depth_points, *, porosity_by_facies,

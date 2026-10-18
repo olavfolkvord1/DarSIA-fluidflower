@@ -13,6 +13,18 @@ import cv2
 import numpy as np
 
 
+def _raster_polygon(points, shape_hw, *, raster_scale, raster_shift):
+    """Rasterize already placed points with the configured fixed-point rule."""
+    mask = np.zeros(shape_hw, np.uint8)
+    cv2.fillPoly(
+        mask,
+        [np.rint(points * raster_scale).astype(np.int32)],
+        1,
+        shift=raster_shift,
+    )
+    return mask.astype(bool)
+
+
 def homography(value, *, parameters: Mapping):
     """Admit a finite, nonsingular 3-by-3 projective coordinate transform.
 
@@ -200,14 +212,10 @@ def rig_frame_context(
         )
 
     def raster(points):
-        mask = np.zeros((height, width), np.uint8)
-        cv2.fillPoly(
-            mask,
-            [np.rint(points * parameters["raster_scale"]).astype(np.int32)],
-            1,
-            shift=parameters["raster_shift"],
+        return _raster_polygon(
+            points, (height, width), raster_scale=parameters["raster_scale"],
+            raster_shift=parameters["raster_shift"],
         )
-        return mask.astype(bool)
 
     outer = raster(polygon)
     by_name = {

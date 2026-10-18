@@ -240,3 +240,30 @@ def test_unindexed_alias_or_asset_never_triggers_search_or_collection(tmp_path):
     resolve = indexed.indexed_asset_resolver(index, current_machine_id="Main")
     with pytest.raises(ValueError, match="exact products-index closure"):
         resolve(dict(path="C:/unrelated/product.npz", sha256="f" * 64, size_bytes=1))
+
+
+@pytest.mark.parametrize("adjacent", [False, True])
+def test_real_N15_N16_writer_index_collect_and_foreign_extensive_reader(tmp_path, adjacent):
+    from . import test_storage_n1_saved_products as fixture
+    from darsia.fluidflower import storage_extensive_io as extensive_io
+    producer = tmp_path / "producer"
+    producer.mkdir()
+    tiny = fixture.tiny_config.__wrapped__(producer)
+    phase = fixture.phase1_data.__wrapped__()
+    config = fixture._genuine_n16_config(producer, tiny, phase, adjacent=adjacent)
+    completion = fixture._run(producer, config)
+    index = fixture._index(tmp_path, completion)
+    _, _, rows = publication._read_index(index)
+    wanted = [key for key, row in rows.items() if "/storage_" in key and row["kind"] == "map"]
+    collected = publication.collect_products(index, wanted, tmp_path / "collected", current_machine_id="Olav",
+        source_paths={key: row["local_path"] for key, row in rows.items() if key in wanted}, file_writers_closed=True)
+    result = extensive_io.read_indexed_extensive_run(index, producer_kind="n1-mass-only",
+        current_machine_id="Olav", collections=[collected], qualification=extensive_io.GENUINE_QUALIFICATION)
+    frames = list(result["frames"])
+    assert result["ordered_case_ids"] == completion["ordered_case_ids"]
+    assert len(frames) == 2
+    for frame in frames:
+        assert frame["state"] == "genuine_n15_n16_io"
+        assert ("cell_U_g" in frame["arrays"]) is adjacent
+        assert int(frame["arrays"]["hidden_pixel_count"].sum()) == 1
+        assert all("/storage_" in str(bound["path"]).replace("\\", "/") for bound in frame["loaded_assets"])

@@ -581,3 +581,182 @@ def test_backend_consistency_rejects_each_original_metadata_field_beyond_outer_S
                else "N1 saved backend differs across manifest/commit/result")
     with pytest.raises(ValueError, match=message):
         saved_n1.read_n1_stored_run(malformed, resolve_asset=lambda b: Path(b["path"]))
+
+
+def _genuine_n16_config(tmp_path, tiny_config, phase1_data, *, adjacent, bottom_strip=False):
+    """Real tiny N15 producer inputs, not supplied/fabricated mass or geometry."""
+    original, _ = tiny_config
+    config = deepcopy(original)
+    # New fixture inputs use the already-saved facies1 model everywhere. The
+    # frozen validation helper, calibration functions and old oracles stay exact.
+    with np.load(config["shared"]["physical_reference"]["path"], allow_pickle=False) as archive:
+        physical = {name: archive[name].copy() for name in archive.files}
+    physical["facies"][:] = 1
+    np.savez(tmp_path / "n16_physical.npz", **physical)
+    config["shared"]["physical_reference"] = n1.asset(tmp_path / "n16_physical.npz")
+    labels = np.ones((3, 3), np.uint8) if adjacent else np.zeros((3, 3), np.uint8)
+    if adjacent:
+        labels[0, 1] = 2
+    labels[1, 1] = 255
+    if bottom_strip:
+        labels[2] = 255
+    Image.fromarray(labels).save(tmp_path / "n16_labels.png")
+    rig = labels != 255
+    np.savez(tmp_path / "n16_classes.npz", rig_domain=rig, modelled=rig,
+             filled_observed=rig, filled_unobserved=np.zeros_like(rig))
+    for spec in config["frames"]:
+        spec["labels"] = n1.asset(tmp_path / "n16_labels.png")
+        spec["classes"] = n1.asset(tmp_path / "n16_classes.npz")
+    calibration = json.loads(Path(config["calibration"]["path"]).read_bytes())
+    calibration["sandmap"] = config["physical_correction"]
+    config["calibration"] = _json(tmp_path / "n16_calibration.json", calibration)
+    config = _inputs(tmp_path, (config, None), phase1_data)
+    classic = deepcopy(config)
+    classic.pop("storage")
+    bound = _json(tmp_path / "frozen_classic_configuration.json", classic)
+    baseline = n1.run_n1(dict(run=classic["run"], configuration=bound, commit=COMMIT),
+        tmp_path / "frozen_original", "cpu", "float32")
+    fixtures = dict(checker=[[.6, .6], [1.4, .6], [1.4, 1.4], [.6, 1.4]],
+        mounting_left=[[-5, -5], [-4, -5], [-4, -4], [-5, -4]],
+        mounting_right=[[5, 5], [6, 5], [6, 6], [5, 6]])
+    decisions = _json(tmp_path / "n15_decisions.json", dict(fixture_scope_complete=True,
+        fixture_names=list(fixtures), injector_hardware_excluded=False,
+        below_floor_phase_unknown_policy="unknown-no-capacity"))
+    authority = _json(tmp_path / "q85_decision.json", dict(
+        id="Q85-OLAV-A-hidden-255-uses-solubility-no-gas-behind-checker",
+        utc="2026-10-17T22:35:06Z", decided_by="olav",
+        answer="Synthetic saved copy of the resolved A selector for this tiny test"))
+    config["pixel_domain"] = dict(contract="darsia-pixel-domain-v1", adopted_for_execution=True,
+        fixture_scope_complete=True, fixture_names=list(fixtures), injector_hardware_excluded=False,
+        authorized_decisions=decisions, max_column_distance_m=.020, raster_scale=256, raster_shift=8,
+        geometry_chunk_pixels=100, below_floor_phase_unknown_policy="unknown-no-capacity",
+        include_estimated_mass=False, baseline_coverage_tolerance=1e-6, heldout_fit_run=False,
+        table_fields=["case_id", "M_measured_g", "M_edge_g", "U_g", "phase_unknown_no_capacity_area_cm2"],
+        n16=dict(contract="darsia-n16-q85-a-v1", authority=authority,
+                 capacity_selector="literal-R3-hidden255-solubility"))
+    for spec, old in zip(config["frames"], baseline["records"]):
+        root = Path(old["nas_directory"])
+        record = json.loads((root / "result.json").read_bytes())
+        geometry = n1.asset(root / "native_geometry.npz")
+        strip = np.zeros((3, 3), bool)
+        strip[2] = bottom_strip
+        if bottom_strip:
+            np.save(tmp_path / (spec["case_id"] + "_strip.npy"), strip)
+        masks = dict(below_photo_strip=(n1.asset(tmp_path / (spec["case_id"] + "_strip.npy"))
+                                       if bottom_strip else None), not_sand=None)
+        source = _json(tmp_path / (spec["case_id"] + "_n16_source.json"), dict(rig_geometry=dict(
+            run=config["run"], frame_index=spec["frame_index"],
+            source_sha256=spec["source_binding"]["source_sha256"],
+            frame_inner_polygon_native=spec["inner_polygon_native"],
+            frame_fixture_polygons_native=fixtures, native_origin_xy=[0, 0],
+            phase_shape_hw=[3, 3], n16_masks=masks)))
+        spec["pixel_domain_geometry"] = dict(source_receipt=source, json_pointer="/rig_geometry",
+            source_frame_index=spec["frame_index"], inner_polygon_native=spec["inner_polygon_native"],
+            fixture_polygons_native=deepcopy(fixtures), native_origin_xy=[0, 0],
+            phase_shape_hw=[3, 3], target_depth=dict(geometry, array_key="depth_m"), n16_masks=masks)
+        spec["frozen_response_basis"] = dict(result=n1.asset(root / "result.json"), geometry=geometry,
+            arrays=record["static"]["arrays"], per_frame_geometry=True,
+            source_sha256=spec["source_binding"]["source_sha256"], phase_sha256=spec["labels"]["sha256"],
+            calibration_sha256=config["calibration"]["sha256"])
+    return config
+
+
+@pytest.mark.parametrize("adjacent", [False, True])
+def test_genuine_N15_N16_producer_writer_committed_reader_roundtrip(tiny_config, phase1_data, tmp_path, adjacent):
+    from darsia.fluidflower import storage_extensive_io as extensive_io
+    config = _genuine_n16_config(tmp_path, tiny_config, phase1_data, adjacent=adjacent)
+    completion = _run(tmp_path, config)
+    manifest = json.loads(Path(completion["manifest"]["path"]).read_bytes())
+    for position, record in enumerate(completion["records"]):
+        actual = extensive_io.read_committed_payload(record, producer_kind="n1-mass-only",
+            resolve_asset=lambda b: Path(b["path"]), manifest=manifest, manifest_asset=completion["manifest"])
+        assert actual["state"] == "genuine_n15_n16_io"
+        assert actual["physical_binding_verified"] and actual["producer_identity_verified"]
+        assert actual["production_permission_granted"] is False
+        binding, arrays = actual["producer_binding"], actual["arrays"]
+        assert binding["chronological_position"] == position
+        assert binding["precision"] == "float32"
+        assert all(row["dtype"] == "<f8" for row in binding["measured_mass_identities"].values())
+        assert all(row["dtype"] == "<f4" for row in binding["provider_map_identities"].values())
+        assert binding["n16"]["gas_contact_report"]["gas_label2_within_20mm"] is adjacent
+        assert binding["n16"]["gas_contact_report"]["capacity_branch_automatically_switched"] is False
+        assert int(arrays["hidden_pixel_count"].sum()) == 1
+        assert int(arrays["physical_pixel_count"].sum()) == 9
+        assert float(arrays["coverage_hidden_pore_volume_m3"].sum()) > 0
+        for name in ("physical_area_m2", "bulk_volume_m3", "pore_volume_m3", "gas_pore_volume_m3"):
+            assert arrays[name].dtype == np.float32
+            assert abs(float(arrays[name].sum(dtype=np.float64)) - binding["native_extensive_totals"][name]) <= 1e-6 * abs(binding["native_extensive_totals"][name])
+        native = json.loads((Path(record["nas_directory"]) / "result.json").read_bytes())
+        assert native["total_mass_g"] == native["M_measured_g"]
+        assert native["prediction"]["interval_lower_g"] == native["M_measured_g"]
+        with np.load(Path(record["nas_directory"]) / "products.npz", allow_pickle=False) as exported:
+            assert ("unknown_capacity_g" in exported.files) is adjacent
+            for name in ("concentration_aqueous", "saturation_free_gas", "mass_total", "mass_aqueous", "mass_free_gas"):
+                assert exported[name].dtype == np.float32
+            if adjacent:
+                assert arrays["cell_U_g"].sum() > 0
+                assert native["U_g"] > 0 and actual["U_layer_present"]
+                assert actual["metadata"]["channels"]["U"]["status"] == "supplied, output-only sum"
+            else:
+                assert native["U_g"] == 0 and not actual["U_layer_present"]
+                assert "cell_U_g" not in arrays and "channel_U_support_pixel_count" not in arrays
+                assert actual["metadata"]["channels"]["U"]["status"] == "known_zero_by_adjacency_rule"
+                assert actual["metadata"]["channels"]["U"]["native_total_g"] == 0
+
+
+def test_genuine_known_zero_rejects_conflicting_adjacency_or_nonzero_metadata(tiny_config, phase1_data, tmp_path):
+    from darsia.fluidflower import storage_extensive_io as extensive_io
+    from darsia.fluidflower import storage_extensive as extensive
+    config = _genuine_n16_config(tmp_path, tiny_config, phase1_data, adjacent=False)
+    completion = _run(tmp_path, config)
+    manifest = json.loads(Path(completion["manifest"]["path"]).read_bytes())
+    item = extensive_io.read_committed_payload(completion["records"][0], producer_kind="n1-mass-only",
+        resolve_asset=lambda b: Path(b["path"]), manifest=manifest, manifest_asset=completion["manifest"])
+    metadata = item["metadata"]
+    for field, value in (("native_total_g", 1.), ("co2_adjacent", True), ("touching_length_mm", 1.)):
+        bad = deepcopy(metadata["channels"]["U"])
+        if field == "native_total_g":
+            bad[field] = value
+        else:
+            bad["producer_binding"]["n16"][field] = value
+        bad_metadata = deepcopy(metadata)
+        bad_metadata["channels"]["U"] = bad
+        root = Path(completion["records"][0]["nas_directory"])
+        data = (root / "storage_extensive_frame.npz").read_bytes()
+        with pytest.raises(ValueError, match="Known-zero U"):
+            extensive.read_extensive_archive(data, bad_metadata,
+                expected_input_identities=bad_metadata["input_identities"],
+                native_mass_totals_g=bad_metadata["native_mass_totals_g"],
+                native_extensive_totals=bad_metadata["native_extensive_totals"],
+                expected_channels=bad_metadata["channels"], expected_provenance=bad_metadata["provenance"],
+                expected_grid_metadata=bad_metadata["grid"])
+
+
+def test_genuine_N16_source_mask_mismatch_fails_before_storage_commit(tiny_config, phase1_data, tmp_path):
+    config = _genuine_n16_config(tmp_path, tiny_config, phase1_data, adjacent=True)
+    np.save(tmp_path / "wrong_strip.npy", np.zeros((3, 3), bool))
+    config["frames"][0]["pixel_domain_geometry"]["n16_masks"]["below_photo_strip"] = n1.asset(tmp_path / "wrong_strip.npy")
+    with pytest.raises(ValueError, match="source-bound N16"):
+        _run(tmp_path, config)
+    assert not list((tmp_path / "mass").glob("frames/*/storage_completed.json"))
+
+
+@pytest.mark.parametrize("adjacent", [False, True])
+def test_actual_source_bound_bottom_strip_is_estimated_or_zero_never_unknown(tiny_config, phase1_data, tmp_path, adjacent):
+    config = _genuine_n16_config(tmp_path, tiny_config, phase1_data,
+        adjacent=adjacent, bottom_strip=True)
+    completion = _run(tmp_path, config)
+    for record in completion["records"]:
+        root = Path(record["nas_directory"])
+        result = json.loads((root / "result.json").read_bytes())
+        with np.load(root / "products.npz", allow_pickle=False) as products:
+            assert not products["below_photo_unknown_mask"].any()
+            assert not products["concentration_unknown_mask"][2].any()
+            assert bool(products["below_photo_estimated_mask"][2].all()) is adjacent
+            assert bool(products["below_photo_zero_mask"][2].all()) is (not adjacent)
+            assert not products["main_mass_eligible_mask"][2].any()
+            if adjacent:
+                assert products["below_photo_estimated_mass_g"][2].sum() > 0
+            else:
+                assert np.all(products["below_photo_estimated_mass_g"][2] == 0)
+        assert result["pixel_domain"]["n16"]["bottom_strip_unknown_pixels"] == 0

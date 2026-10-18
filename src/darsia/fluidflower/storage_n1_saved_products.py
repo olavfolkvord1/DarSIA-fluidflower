@@ -154,6 +154,28 @@ def read_n1_stored_frame(record, *, manifest, manifest_asset, resolve_asset, loa
             or not _same(document["request"], manifest["storage"]["request"])):
         raise ValueError("N1 saved configuration/freeze/code/precision differs")
     saved._request(document)
+    if document.get("extensive", {}).get("qualification") == "genuine-n15-n16-source-producer":
+        from .storage_extensive_io import verify_producer_document
+        binding = document.get("n16_extensive_producer")
+        verify_producer_document(binding, document)
+        if (not _same(binding, result.get("n16_extensive_producer"))
+                or not _same(binding["phase"], spec["labels"])
+                or not _same(binding["classes"], spec["classes"])
+                or not _same(binding["area"], spec["area"])
+                or not _same(binding["source_geometry"], spec["pixel_domain_geometry"])
+                or not _same(binding["frozen_response_basis"], spec["frozen_response_basis"])
+                or not _same(binding["native_products"], result["products"])
+                or not _same(binding["native_geometry"], result["static"])
+                or binding["chronological_position"] != result["chronological_position"]
+                or binding["frame_index"] != result["frame_index"]
+                or binding["elapsed_h"] != result["elapsed_h"]
+                or binding["n16"]["U_total_g"] != result["U_g"]
+                or binding["n16"]["M_edge_g"] != result["M_edge_g"]
+                or binding["n16"]["M_measured_g"] != result["M_measured_g"]
+                or not _same(document["native_transport_weight_l_identity"], binding["native_geometry"]["arrays"]["transport_weight_l"])
+                or not _same(document["native_mass_density_identities"],
+                    {key: binding["provider_map_identities"][key] for key in output.DENSITIES.values()})):
+            raise ValueError("N15/N16 actual producer/configuration/geometry/chronology differs")
     by_name = {}
     for bound in document["files"]:
         from pathlib import PureWindowsPath

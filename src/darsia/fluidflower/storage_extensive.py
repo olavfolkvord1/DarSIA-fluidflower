@@ -27,6 +27,31 @@ MASS = ("total", "aqueous", "gas")
 EXTENSIVE = ("physical_area_m2", "bulk_volume_m3", "pore_volume_m3", "gas_pore_volume_m3")
 CHANNELS = ("M_maalt", "M_kant", "U")
 PENDING = "not supplied; no producer or zero value inferred"
+KNOWN_ZERO = "known_zero_by_adjacency_rule"
+
+
+def _known_zero_channel(name, row):
+    """The actual N16 zero decision is metadata, never a published U array."""
+    if (name != "U" or not isinstance(row, dict)
+            or set(row) != {"status", "native_total_g", "producer_binding"}
+            or row["status"] != KNOWN_ZERO or type(row["native_total_g"]) not in (int, float)
+            or row["native_total_g"] != 0
+            or not isinstance(row["producer_binding"], dict)):
+        raise ValueError("Known-zero U requires the exact actual N16 adjacency receipt")
+    n16 = row["producer_binding"].get("n16")
+    if (not isinstance(n16, dict) or n16.get("status") != "zero by adjacency rule"
+            or n16.get("co2_adjacent") is not False
+            or n16.get("touching_length_mm") != 0
+            or n16.get("distance_limit_mm") != 20.0
+            or n16.get("U_layer_present") is not False
+            or type(n16.get("U_total_g")) not in (int, float) or n16["U_total_g"] != 0
+            or n16.get("capacity_selector") != "literal-R3-hidden255-solubility"
+            or n16.get("authority_record", {}).get("id") != "Q85-OLAV-A-hidden-255-uses-solubility-no-gas-behind-checker"
+            or n16.get("authority_record", {}).get("decided_by") != "olav"
+            or type(n16.get("elapsed_h")) not in (int, float)
+            or not math.isfinite(n16["elapsed_h"]) or n16["elapsed_h"] < 0):
+        raise ValueError("Known-zero U conflicts with its actual original adjacency decision")
+    return copy.deepcopy(row)
 
 
 def _exact(first, second):
@@ -276,6 +301,9 @@ def aggregate_extensive(grid, *, depth_m, porosity, pixel_pore_volume_m3, facies
         if channel is None:
             channel_metadata[name] = dict(status=PENDING)
             continue
+        if isinstance(channel, dict) and channel.get("status") == KNOWN_ZERO:
+            channel_metadata[name] = _known_zero_channel(name, channel)
+            continue
         if not isinstance(channel, dict) or set(channel) != {"pixel_values_g", "support_mask", "native_total_g", "producer_binding"}:
             raise ValueError("Explicit closed native channel ABI required: " + name)
         if not isinstance(channel["producer_binding"], dict) or not channel["producer_binding"]:
@@ -295,7 +323,7 @@ def aggregate_extensive(grid, *, depth_m, porosity, pixel_pore_volume_m3, facies
                                       producer_binding=copy.deepcopy(channel["producer_binding"]))
     metadata = dict(format=FORMAT, precision=grid.precision, reduction_dtype="float64",
                     grid=grid.metadata(), facies_ids=facies_ids,
-                    fields=_fields(facies_ids, [n for n in CHANNELS if channels[n] is not None]),
+                    fields=_fields(facies_ids, [n for n in CHANNELS if channel_metadata[n]["status"] == "supplied, output-only sum"]),
                     arrays={key: _identity(value) for key, value in arrays.items()},
                     input_identities=inputs, native_mass_totals_g=dict(native_mass_totals_g),
                     native_extensive_totals=dict(native_extensive_totals), native_checks=checks,
@@ -318,7 +346,10 @@ def _not_greater(actual, expected):
 
 def _validate_arrays(arrays, metadata, mass_totals, extensive_totals):
     facies_ids, channel_rows = metadata["facies_ids"], metadata["channels"]
-    channels = [n for n in CHANNELS if channel_rows[n]["status"] != PENDING]
+    channels = [n for n in CHANNELS if channel_rows[n]["status"] == "supplied, output-only sum"]
+    for name, row in channel_rows.items():
+        if row.get("status") == KNOWN_ZERO:
+            _known_zero_channel(name, row)
     expected_fields = _fields(facies_ids, channels)
     if not _exact(metadata["fields"], expected_fields) or set(arrays) != set(expected_fields):
         raise ValueError("Extensive units/weighting/array closure differs")
@@ -476,6 +507,8 @@ def read_extensive_archive(data, metadata, *, expected_input_identities,
         if row.get("status") == PENDING:
             if set(row) != {"status"}:
                 raise ValueError("Pending channel cannot carry fabricated values")
+        elif row.get("status") == KNOWN_ZERO:
+            _known_zero_channel(name, row)
         else:
             if (set(row) != {"status", "native_total_g", "producer_binding"}
                     or row["status"] != "supplied, output-only sum"

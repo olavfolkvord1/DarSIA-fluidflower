@@ -97,7 +97,15 @@ class Phase2Storage:
             self.binding["configuration"], self.request["precision"], refs["commit"])
         expected = bind_mass_frame(original, record["native"], record["phase"],
                                   baseline=self.phase1["phase"]["reference"]["full"])
-        if not staged._same_json(expected, spec):
+        # Only the explicitly selected N16 route has these two source-bound
+        # additions; compare the unchanged phase-one mass input independently.
+        compared = spec
+        if "n16" in self.config.get("pixel_domain", {}):
+            if not {"pixel_domain_geometry", "frozen_response_basis"} <= set(spec):
+                raise ValueError("N16 requires its actual geometry and frozen original response")
+            compared = {key: value for key, value in spec.items()
+                        if key not in {"pixel_domain_geometry", "frozen_response_basis"}}
+        if not staged._same_json(expected, compared):
             raise ValueError("N1 frame differs from its exact sealed phase-one mass input")
         required = {"commit", "statistics", "before_rules"}
         staged._keys(refs, required, {"photograph"}, where="phase-two case evidence")
@@ -165,7 +173,20 @@ def write_n1_frame(temporary, final, *, manifest, manifest_asset, spec, config,
         raise ValueError("Saved phase-one class masks differ from the native grid")
     masks["main_mass_eligible"] = result["fields"]["main_mass_eligible_mask"]
     masks.update(frame.excluded_masks or {})
-    masses, density_ids, weight_id = output.pixel_masses(evaluated["export"], capture["volume_m3"], shape)
+    genuine = extensive_inputs is not None and extensive_inputs.get("qualification") == "genuine-n15-n16-source-producer"
+    if genuine:
+        from .storage_extensive_io import _producer_binding
+        binding = _producer_binding(extensive_inputs["producer_binding"])
+        masses = evaluated["n16_producer"]["measured_masses"]
+        if any(output._array_identity(masses[name]) != binding["measured_mass_identities"][name]
+               for name in output.TOTALS):
+            raise ValueError("Actual N15 measured component arrays changed before storage")
+        density_ids = {name: deepcopy(binding["provider_map_identities"][name]) for name in output.DENSITIES.values()}
+        weight_id = output._array_identity(np.asarray(capture["volume_m3"], np.float64) * 1000.)
+        if weight_id != binding["native_geometry"]["arrays"]["transport_weight_l"]:
+            raise ValueError("Actual N15 transport weight changed before storage")
+    else:
+        masses, density_ids, weight_id = output.pixel_masses(evaluated["export"], capture["volume_m3"], shape)
     totals, checks = {}, {}
     for component, name in output.TOTALS.items():
         expected = result[name]
@@ -238,6 +259,8 @@ def write_n1_frame(temporary, final, *, manifest, manifest_asset, spec, config,
         coarse=dict(reduced["metadata"], arrays={k: output._array_identity(v) for k, v in arrays.items()},
                     per_frame_geometry=True, shared_static_geometry_assumed=False),
         files=files, existing_native_products_unchanged=True)
+    if genuine:
+        document["n16_extensive_producer"] = deepcopy(binding)
     if extensive_inputs is not None:
         from .storage_extensive_io import prepare_payload, write_payload, declared_files
         product = prepare_payload(extensive_inputs, grid, labels=labels,

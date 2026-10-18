@@ -365,6 +365,10 @@ class N1Pipeline:
 
         config = dict(config, geometry_fields=_geometry_fields(config, geometry_fields))
         self.config, self.math = config, pixel_math
+        if "pixel_domain" in config:
+            from .pixel_pipeline import validate_policy
+
+            validate_policy(config["pixel_domain"])
         if precision not in {"float32", "float64"} or pixel_math.precision != precision:
             raise ValueError("Provider and working precision differ")
         self.reader = DataReader(config.get("data_aliases", ()), unc_only=unc_only)
@@ -571,6 +575,14 @@ class N1Pipeline:
         area = np.asarray(reader.array(area_descriptor), np.float64) / 1e6
         if area.shape != shape or not np.isfinite(area).all() or np.any(area <= 0):
             raise ValueError("Positive original per-pixel areas required")
+        if "pixel_domain" in config:
+            from .pixel_pipeline import prepare_frame
+
+            return prepare_frame(
+                self, spec, current=current, valid=valid, baseline=baseline,
+                coverage=coverage, clear_rgb=clear_rgb, clear_supported=clear_supported,
+                labels=labels, area=area, current_matrix=current_matrix,
+            )
         top_descriptor = dict(spec["photo_top"])
         top_descriptor.setdefault("array_key", "keep")
         top = reader.array(top_descriptor)
@@ -819,6 +831,12 @@ class N1Pipeline:
         ipp_before = scientific_thread("N1Pipeline.evaluate:before")
         if self.statistics_only:
             raise ValueError("A statistics-only context cannot evaluate fitted mass")
+        if "pixel_domain" in self.config:
+            from .pixel_pipeline import evaluate
+
+            evaluated = evaluate(self, spec, output_capture=output_capture)
+            self.last_opencv_ipp = completed_frame(ipp_before, "N1Pipeline.evaluate:after")
+            return evaluated
         import numpy as np
         import darsia
         from .n1_models import prepare_response, own_colour_response
@@ -990,6 +1008,8 @@ def _publish_frame(
         evaluated["export"]["products"],
         main_mass_eligible_mask=result["fields"]["main_mass_eligible_mask"],
     )
+    if "pixel_domain" in evaluated:
+        products.update(evaluated["extra_products"])
     for name, mask in (frame.excluded_masks or {}).items():
         products[name + "_mask"] = mask
     products["unquantified_facies_mask"] = frame.domain & np.isin(
@@ -1027,6 +1047,8 @@ def _publish_frame(
         )
         * 1000.0,
     )
+    if "pixel_domain" in evaluated:
+        geometry_fields = evaluated["geometry_fields"]
     geometry_asset = _write_npz(temporary / "native_geometry.npz", geometry_fields)
     static = dict(
         asset={
@@ -1046,6 +1068,10 @@ def _publish_frame(
             transport_weight_l="L pore volume per pixel",
         ),
     )
+    if "n16_producer" in evaluated:
+        static["units"].update(full_physical_depth_m="m", full_physical_porosity="1",
+            full_physical_pixel_pore_volume_m3="m3 pore volume per pixel",
+            full_physical_facies="category", full_physical_physical_area_m2="m2", n16_solubility_g_per_l="g/L")
     record = dict(
         contract=config.get("contracts", {}).get("result", "darsia-n1-products-v1"),
         complete=True,
@@ -1106,12 +1132,19 @@ def _publish_frame(
         scope="frozen_evaluation",
         opencv_ipp=evaluated.get("opencv_ipp"),
     )
-    for part in (
+    if "pixel_domain" in evaluated:
+        domain = evaluated["pixel_domain"]
+        record.update(
+            scope="pixel_domain_evaluation", pixel_domain=domain,
+            M_measured_g=domain["M_measured_g"], M_edge_g=domain["M_edge_g"], U_g=domain["U_g"],
+            phase_unknown_no_capacity_area_cm2=domain["phase_unknown_no_capacity_area_cm2"],
+        )
+    for part in (() if "pixel_domain" in evaluated else (
         "added_to_M",
         "filled_without_optical_support",
         "below_sand_floor",
         "removed_from_M",
-    ):
+    )):
         for quantity in ("area_cm2", "co2_area_cm2"):
             record[part + "_" + quantity] = evaluated["sandmap"][part][quantity]
     with gzip.open(
@@ -1123,6 +1156,11 @@ def _publish_frame(
             allow_nan=False,
             separators=(",", ":"),
         )
+    if "n16_producer" in evaluated:
+        from ..storage_extensive_io import bind_n16_producer
+        bind_n16_producer(evaluated, record, manifest=manifest, manifest_asset=manifest_asset,
+            spec=spec, configuration=manifest["configuration"], static=static,
+            products=record["products"], chronological_position=position)
     _write_json(temporary / "result.json", record)
     storage_kinds = {}
     if storage_context is not None:
@@ -1130,7 +1168,8 @@ def _publish_frame(
         context, capture = storage_context
         storage_kinds = write_n1_frame(
             temporary, final, manifest=manifest, manifest_asset=manifest_asset,
-            spec=spec, config=config, evaluated=evaluated, capture=capture, context=context)
+            spec=spec, config=config, evaluated=evaluated, capture=capture, context=context,
+            extensive_inputs=evaluated.get("extensive_inputs"))
     files = {
         path.name: {key: value for key, value in asset(path).items() if key != "path"}
         for path in sorted(temporary.iterdir())
@@ -1419,6 +1458,12 @@ def _run_n1(
                         publication=publication,
                     )
                 )
+        if "pixel_domain" in config:
+            from ..pipeline.runner import scalar_table
+
+            table = scalar_table(
+                records, config["pixel_domain"]["table_fields"], output / "mass_table.csv"
+            )
         wall = time.perf_counter() - clock
         outcome = dict(
             complete=True,
@@ -1449,6 +1494,9 @@ def _run_n1(
             elapsed_seconds=wall,
             opencv_ipp=require_ipp_off("run_n1:completed"),
         )
+        if "pixel_domain" in config:
+            outcome["table"] = table
+            outcome["pixel_domain"] = config["pixel_domain"]
         del pipeline
     finally:
         close = getattr(math, "close", None)

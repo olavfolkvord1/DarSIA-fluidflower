@@ -15,3 +15,9 @@ tests/test_job_queue.py text eol=lf
 tests/test_n1_pipeline.py text eol=lf
 tests/test_fluidflower_lazy_import.py text eol=lf
 docs/shared_nas_worker.md text eol=lf
+
+# Preserve the exact pinned validation fixtures and moved numerical provider.
+tests/fixtures/n1_phase2_fixture.py -text
+tests/fixtures/n1_original_pipeline.py -text
+src/darsia/fluidflower/mass/mass_cuda.py -text
+tests/fixtures/storage_saved_products_default_oracle.py.fixture -text

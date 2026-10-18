@@ -256,8 +256,18 @@ class NativeAnalysis:
         return self.signal_analysis(self.color_analysis(self.rgb(rgb)))
 
 
-def prepare_response(frame, models, math, swi_by_facies):
-    """Normalize/interpret native RGB once with the original titration flash."""
+def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=None):
+    """Interpret RGB with the original titration flash and explicit reference support.
+
+    ``solubility_domain`` may bind the physical support used when the frozen
+    calibration was evaluated. Changing the reporting domain must not silently
+    change this median and therefore the colour-to-concentration transform.
+    It is a reference for the flash only, never a mass or visibility mask.
+    Omitting it retains the existing measured physical support exactly.
+    """
+    basis = frame.known_physical_domain if solubility_domain is None else np.asarray(solubility_domain)
+    if basis.dtype != bool or basis.shape != frame.domain.shape or not basis.any():
+        raise ValueError("Flash solubility support must be a nonempty boolean grid")
     clear = frame.clear_water_rgb
     support = frame.known_physical_domain & frame.supported_mask & frame.clear_water_supported_mask
     support &= np.isfinite(clear).all(axis=2) & (clear > 0).all(axis=2)
@@ -280,7 +290,9 @@ def prepare_response(frame, models, math, swi_by_facies):
     recipe = {name: frame.recipe.get(name) for name in ("alkalinity_M", "btb_M")}
     if any(value is None or not np.isfinite(value) or value < 0 for value in recipe.values()):
         raise ValueError("Measured titration recipe is required")
-    solubility_M = float(np.median(physics.solubility_co2[frame.known_physical_domain]))/44.0095
+    if not np.isfinite(physics.solubility_co2[basis]).all() or np.any(physics.solubility_co2[basis] <= 0):
+        raise ValueError("Flash solubility support requires positive finite measured physics")
+    solubility_M = float(np.median(physics.solubility_co2[basis]))/44.0095
     flash = darsia.TitrationFlash(**models["metadata"]["flash_bounds"],
         **{name:float(value) for name,value in recipe.items()}, co2_sat_M=solubility_M)
     aqueous, gas = math.titration(signal.img, flash)
