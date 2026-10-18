@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PureWindowsPath
 import re
@@ -33,6 +34,14 @@ REFERENCE_ADMINISTRATION = "darsia-n43-reference-build-administration-v1"
 REFERENCE_ENTITLEMENT_BYTES = 65728995330
 REFERENCE_CASE_IDS = ["ac52_f" + str(i) for i in range(1, 44) if i not in {8, 15, 22, 24}]
 CAPACITY_BOUND = "darsia-cache-required-capacity-bound-v1"
+BOUNDED_EVIDENCE = "darsia-cache-physical-bound-sampled-evidence-v1"
+Q104_OUTPUT_ENTITLEMENT_BYTES = 27374032352  # Historical metadata parser only; Q119 governs the active bound route.
+FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES = 65728995330
+BOUND_OUTPUT_ADMINISTRATION = "darsia-first-qualification-whole-output-administration-v1"
+BOUND_BUNDLE = "darsia-cache-volume-bound-completed-bundle-v1"
+BOUND_IMPORT_PROFILE = "darsia-cache-volume-bound-import-profile-v1"
+BOUND_JOB_PROFILE = "darsia-cache-volume-bound-job-profile-v1"
+BOUND_WRITER_CONTRACT = "physical-volume-bound-shared-service-v1"
 OBSERVATION = "darsia-cache-first-qualification-observation-v1"
 BUNDLE = "darsia-cache-first-qualification-completed-bundle-v1"
 SLOTS = {"observation", "writer_evidence", "measurement", "completion",
@@ -211,7 +220,7 @@ class FirstQualification:
         expected_format = (REFERENCE_REQUEST if self.reference_build else
             BOUND_REQUEST if self.bound_mode else REQUEST)
         authorities = (["N43", "Q109", "Q106"] if self.reference_build else
-            ["Q97", "Q99", "Q102", "Q104", "Q106"] if self.bound_mode else ["Q97", "Q99"])
+            ["Q97", "Q99", "Q102", "Q104", "Q106", "Q109", "Q117", "Q119"] if self.bound_mode else ["Q97", "Q99"])
         if (self.request["format"] != expected_format or self.request["execution_authorized"] is not True
                 or self.request["authority_ids"] != authorities
                 or self.request["provider"] != provider_binding
@@ -252,7 +261,7 @@ class FirstQualification:
                 read(_descriptor(self.request["capacity_bound_plan"])))
             self.output_entitlement = checked_output_entitlement(
                 self.task, read(_descriptor(self.request["output_entitlement_plan"])),
-                task_binding=self.request["task"], read=read)
+                task_binding=self.request["task"], read=read, read_authorities=read_authorities)
         self.reference_administration = None
         self.reference_roots_validated = False
         self.reference_transport_observation = None
@@ -266,10 +275,11 @@ class FirstQualification:
     def consume(self, lease):
         """Native controller consumes once before CreateProcess; no recovery retry."""
         if self.bound_mode:
-            # Q106 permits a sampled operational reserve, not a hard free-floor.
-            # N43 reference/GO and the actual all-stage output/profile producer
-            # are not yet bound. Refuse before any consume marker/native launch.
-            raise CachePolicyError("N43 PRELAUNCH HOLD: OFF reference/GO, all-stage output entitlement and genuine profile producer remain unbound")
+            if (not isinstance(self.output_entitlement, dict)
+                    or self.output_entitlement.get("format") != BOUND_OUTPUT_ADMINISTRATION
+                    or not isinstance(self.required_capacity_bound, dict)
+                    or self.required_capacity_bound.get("enforcement_state") != "PREDECLARED_Q106_VOLUME_BOUND"):
+                raise CachePolicyError("Bound prelaunch requires actual Q117/Q119 reference, output and physical-bound data")
         _outputs_absent(self.provider)
         self._namespace(lease)
         key = self._once_key()
@@ -282,6 +292,19 @@ class FirstQualification:
                 raise CachePolicyError("First cold qualification requires its actual empty exclusive capped cache")
             if self.reference_build:
                 self.reference_admission(lease, report=report, initial=True)
+            elif self.bound_mode:
+                cap = getattr(lease.policy, "volume_cap", None)
+                actual = report.get("volume_cap_observation", {})
+                planned = self.required_capacity_bound["volume_cap_observation"]
+                if (cap is None or lease.policy.quota_bytes != 500*1024**3
+                        or cap.maximum_size_bytes != 500*1024**3
+                        or planned.get("binding") != cap.document()
+                        or any(actual.get(key) != planned.get(key) for key in (
+                            "binding", "virtual_size_bytes", "volume_total_bytes", "filesystem", "is_loaded", "verified"))
+                        or actual.get("virtual_size_bytes") != 500*1024**3
+                        or report.get("reserve_bytes") != PHYSICAL_RESERVE_BYTES
+                        or report.get("free_physical_bytes", 0) <= PHYSICAL_RESERVE_BYTES):
+                    raise CachePolicyError("Fresh original Q87 hard cap, same namespace and operational reserve required")
             # This lock/flat immutable marker shares the actual host reservation
             # authority. A new UUID/provider cannot repeat the same qualification.
             lease.ledger.control.write_once("cache-first-" + key + ".json", _encoded(dict(
@@ -412,12 +435,18 @@ class FirstQualification:
                 _exact_source(bound[1]);checked.add(path.casefold())
             if bound is not None:
                 actual.append(dict(name=name,source_index=bound[0]))
-        return dict(format="darsia-cache-first-actual-loaded-modules-v1",request=self.binding,
+        result = dict(format="darsia-cache-first-actual-loaded-modules-v1",request=self.binding,
             provider=self.provider_binding,actual=actual,undeclared=unknown,
             all_file_backed_modules_predeclared_and_exact=not unknown,
             predeclared_module_closure_sha256=_digest(self.provider["module_closure"]),
             module_inventory_scope="actual Python sys.modules file bindings; not an OS DLL enumeration",
             actual_task=deepcopy(self.claim),this_is_not_process_retirement=True)
+        if self.bound_mode:
+            from .environment import FIRST_WRITER_ENVIRONMENT_KEYS
+            result["actual_writer_environment"] = {
+                key: os.environ.get(key) for key in FIRST_WRITER_ENVIRONMENT_KEYS}
+            result["writer_environment_is_actual_IO_or_lifetime_proof"] = False
+        return result
 
 
 def request_existing_frame_boundary_stop(first, lease):
@@ -602,6 +631,290 @@ class FiniteObservations:
         return result
 
 
+def checked_bound_output_scope(value):
+    """One current output root, not the old reference tree or the cache cap."""
+    _exact_keys(value, {"format", "role", "path", "identity", "stat_identity", "volume_id",
+        "entry_limit", "sample_period_seconds"}, "Exact current Q104 output scope required")
+    path = PureWindowsPath(value["path"])
+    if (value["format"] != "darsia-first-q104-output-scope-v1" or value["role"] != "results"
+            or not path.is_absolute() or ".." in path.parts
+            or not isinstance(value["identity"], dict) or not value["identity"]
+            or not isinstance(value["volume_id"], str) or not value["volume_id"]
+            or type(value["entry_limit"]) is not int or not 0 < value["entry_limit"] <= 100000
+            or type(value["sample_period_seconds"]) not in {int, float}
+            or value["sample_period_seconds"] != 1):
+        raise CachePolicyError("One finite identity-bound output root and original one-second target required")
+    _exact_keys(value["stat_identity"], {"st_dev", "st_ino", "creation_ns"}, "Actual output stat identity required")
+    if any(type(v) is not int or v <= 0 for v in value["stat_identity"].values()):
+        raise CachePolicyError("Actual output stat identity cannot be UNKNOWN")
+    return deepcopy(value)
+
+
+def bound_output_snapshot(scope, *, entitlement_bytes, include_file_stats=False):
+    """N43's finite no-follow length route, confined to ONE output-only root.
+
+    No payload is read. Rename anomalies remain explicit lower-bound samples;
+    no output quota, cache-bound or complete lifetime peak is asserted.
+    """
+    import stat
+    from .capacity import volume_info
+    from .bootstrap import _utc
+    scope = checked_bound_output_scope(scope)
+    if type(entitlement_bytes) is not int or entitlement_bytes < FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES:
+        raise CachePolicyError("Actual predeclared Q119 entitlement required before sampling")
+    root = Path(scope["path"])
+    before = _reference_stat_identity(_reference_directory_stat(root))
+    if before != scope["stat_identity"]:
+        raise CachePolicyError("Q104 current output root identity changed")
+    total = entries = 0; identities = set(); anomalies = []; files = []
+    def walk(directory):
+        nonlocal total, entries
+        try:
+            start = _reference_stat_identity(_reference_directory_stat(directory))
+            with os.scandir(directory) as stream:
+                for entry in stream:
+                    entries += 1
+                    if entries > scope["entry_limit"]:
+                        raise CachePolicyError("Q104 finite output accounting entry limit exceeded")
+                    try:
+                        info = Path(entry.path).lstat()
+                    except FileNotFoundError:
+                        anomalies.append(dict(path=entry.path, state="VANISHED_DURING_SAMPLE")); continue
+                    if getattr(info, "st_reparse_tag", 0) or getattr(info, "st_file_attributes", 0) & 0x400:
+                        raise CachePolicyError("Q104 output reparse entry refused")
+                    if stat.S_ISDIR(info.st_mode):
+                        walk(Path(entry.path))
+                    else:
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise CachePolicyError("Q104 output file type/hardlink refused")
+                        identity = (info.st_dev, info.st_ino)
+                        if identity in identities:
+                            anomalies.append(dict(path=entry.path, state="IDENTITY_SEEN_TWICE_DURING_SAMPLE")); continue
+                        identities.add(identity); total += info.st_size
+                        if include_file_stats:
+                            files.append(dict(relative_path=str(Path(entry.path).relative_to(root)),
+                                size_bytes=info.st_size, st_dev=info.st_dev, st_ino=info.st_ino,
+                                mtime_ns=info.st_mtime_ns,
+                                creation_ns=getattr(info, "st_birthtime_ns", info.st_ctime_ns)))
+            if _reference_stat_identity(_reference_directory_stat(directory)) != start:
+                anomalies.append(dict(path=str(directory), state="DIRECTORY_IDENTITY_CHANGED_DURING_SAMPLE"))
+        except FileNotFoundError:
+            anomalies.append(dict(path=str(directory), state="DIRECTORY_MOVED_DURING_SAMPLE"))
+    walk(root)
+    after = _reference_stat_identity(_reference_directory_stat(root))
+    if before != after:
+        raise CachePolicyError("Q104 output root changed during length sample")
+    volume = volume_info(scope["path"])
+    if volume["volume_id"] != scope["volume_id"]:
+        raise CachePolicyError("Q104 actual output volume identity changed")
+    return dict(utc=_utc(), root=scope["path"], identity=scope["identity"],
+        stat_identity_before=before, stat_identity_after=after, logical_bytes=total,
+        entries=entries, volume=volume, entitlement_bytes=entitlement_bytes,
+        counting_scope="whole current owned result root: all preparation, in-flight, final and ops files once",
+        sampled=True, non_atomic=True, complete_lifetime_peak=False, output_hard_quota=False,
+        observed_scan_anomalies=anomalies, observed_bytes_are_lower_bound_if_scan_anomalies=bool(anomalies),
+        file_stats=(files if include_file_stats else None), payload_SHA_or_arrays_read=False)
+
+
+def latch_bound_output_stop(first, lease, reason, snapshot):
+    """Same immutable first-stop record and existing cooperative command route."""
+    name = "first-q104-stop-" + first._once_key() + ".json"
+    # The full stat inventory belongs in the existing sixteen-MiB measurement
+    # slot. Keep the existing one-MiB host-ledger control record bounded.
+    summary = {key: value for key, value in snapshot.items() if key != "file_stats"}
+    with _reference_lock(lease):
+        if name not in lease.ledger.control.names():
+            lease.ledger.control.write_once(name, _encoded(dict(
+                format="darsia-first-q104-output-stop-v1", request=first.binding,
+                provider=first.provider_binding, scope=first.provider["scope"], reason=reason,
+                observation=summary, no_retry=True, no_ordinary_profile=True, partial_files_retained=True)))
+    return request_existing_frame_boundary_stop(first, lease)
+
+
+class BoundOutputObservations(FiniteObservations):
+    """Only the existing BOUND branch adds a separate sampled output watch."""
+    def __init__(self, first, *, clock=None):
+        super().__init__(first, clock=clock)
+        if (not first.bound_mode or not isinstance(first.output_entitlement, dict)
+                or first.output_entitlement.get("format") != BOUND_OUTPUT_ADMINISTRATION):
+            raise CachePolicyError("Bound output watch requires its actual current output-scope plan")
+        self.entitlement_bytes = first.output_entitlement["administrative_output_entitlement_bytes"]
+        if type(self.entitlement_bytes) is not int or self.entitlement_bytes < FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES:
+            raise CachePolicyError("Bound output watch requires the actual predeclared Q119 entitlement")
+        self.output_scope = checked_bound_output_scope(first.output_entitlement["watched_output_scope"])
+        self.output_samples = []; self.last_output_start = None; self.final_output_snapshot = None
+        self.output_stop = None; self.output_error = None
+
+    def admit_output(self, lease):
+        output, cache = PureWindowsPath(self.output_scope["path"]), PureWindowsPath(str(lease.policy.root))
+        if output == cache or output in cache.parents or cache in output.parents:
+            raise CachePolicyError("Q104 output scope must be disjoint from cache accounting")
+        started = self.clock()
+        current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes)
+        if (current["logical_bytes"] != 0 or current["observed_scan_anomalies"]
+                or current["volume"]["free_bytes"] - PHYSICAL_RESERVE_BYTES < self.entitlement_bytes):
+            raise CachePolicyError("Fresh complete output scope and free minus original40GiB covering wholeQ104 required")
+        current["started_monotonic_seconds"] = started
+        current["elapsed_seconds"] = self.clock() - started
+        self.output_admission = current
+
+    def observe_output(self, owned, *, force=False):
+        started = self.clock()
+        if not force and self.last_output_start is not None and started - self.last_output_start < 1:
+            return
+        try:
+            current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes, include_file_stats=force)
+        except BaseException as error:
+            import traceback
+            self.output_error = dict(error_type=type(error).__name__, message=str(error), traceback=traceback.format_exc())
+            if self.output_stop is None:
+                self.output_stop = dict(reason="OUTPUT_OBSERVATION_UNAVAILABLE", diagnostic=self.output_error)
+                try:
+                    self.output_stop["response"] = latch_bound_output_stop(self.first, owned.lease,
+                        self.output_stop["reason"], self.output_error)
+                except BaseException as stop_error:
+                    self.output_stop["stop_record_error"] = dict(error_type=type(stop_error).__name__, message=str(stop_error))
+                    error.add_note("Output STOP record/command failed: " + repr(stop_error))
+            raise
+        elapsed = self.clock() - started
+        self.output_samples.append(dict(utc=current["utc"], started_monotonic_seconds=started,
+            elapsed_seconds=elapsed, actual_gap_since_previous_start_seconds=(None if self.last_output_start is None
+                else started - self.last_output_start), forced_terminal=force,
+            actual_gap_since_admission_start_seconds=(started - self.output_admission["started_monotonic_seconds"]
+                if hasattr(self, "output_admission") else None),
+            logical_bytes=current["logical_bytes"], entries=current["entries"], free_bytes=current["volume"]["free_bytes"],
+            observed_scan_anomalies=current["observed_scan_anomalies"], sampled=True, complete_lifetime_peak=False))
+        self.last_output_start = started
+        if force: self.final_output_snapshot = current
+        reason = ("OUTPUT_ENTITLEMENT_EXCEEDED" if current["logical_bytes"] > self.entitlement_bytes else
+            "OUTPUT_OPERATIONAL_RESERVE_CROSSED" if current["volume"]["free_bytes"] <= PHYSICAL_RESERVE_BYTES else None)
+        if reason is not None and self.output_stop is None:
+            self.output_stop = dict(reason=reason, sample_index=len(self.output_samples) - 1)
+            self.output_stop["response"] = latch_bound_output_stop(self.first, owned.lease, reason, current)
+
+    def observe(self, owned, accounting, *, force_cache=False):
+        # Old Q106 cache/reserve observations retain their original code.
+        try:
+            super().observe(owned, accounting, force_cache=force_cache)
+        except BaseException as error:
+            # Loss of a real cache/reserve observation is not permission to run
+            # without the watchdog. Use the same cooperative boundary command.
+            if self.output_stop is None:
+                self.output_stop = dict(reason="CACHE_OR_RESERVE_OBSERVATION_UNAVAILABLE",
+                    error_type=type(error).__name__, message=str(error))
+                try:
+                    self.output_stop["response"] = latch_bound_output_stop(self.first, owned.lease,
+                        self.output_stop["reason"], self.output_stop.copy())
+                except BaseException as stop_error:
+                    error.add_note("Observation STOP record/command failed: " + repr(stop_error))
+            raise
+        self.observe_output(owned, force=force_cache)
+
+    def output_document(self, terminal, retirement, eligibility):
+        final = self.final_output_snapshot
+        kernel_retired = (isinstance(terminal, dict) and terminal.get("accounting", {}).get("active_processes") == 0)
+        accepted_retirement = isinstance(eligibility, dict) and eligibility.get("original_retirement_verifier_accepted") is True
+        closed = (kernel_retired and retirement is not None and accepted_retirement
+            and final is not None and not final["observed_scan_anomalies"] and self.output_error is None)
+        complete = (closed and self.output_stop is None and not self.reserve_crossed
+            and terminal.get("wrapper_exit_code") == 0)
+        return dict(format="darsia-first-q104-closed-output-diagnostic-v1", request=self.first.binding,
+            provider=self.first.provider_binding, stores_source=self.first.stores_source,
+            scope=self.first.provider["scope"],
+            output_plan=self.first.request["output_entitlement_plan"], output_scope=self.output_scope,
+            entitlement_bytes=self.entitlement_bytes, admission=getattr(self, "output_admission", None),
+            output_samples=self.output_samples, target_sample_period_seconds=1,
+            sampling_scope="initial admission, native await-family observer and forced terminal stat; actual startup/blocked-scan gaps retained, not continuous coverage",
+            sampled_highwater_bytes=max((row["logical_bytes"] for row in self.output_samples), default=None),
+            sampled_highwater_is_lifetime_peak=False, final_snapshot=final, first_stop=self.output_stop,
+            first_observation_error=self.output_error, actual_terminal=terminal, actual_retirement=retirement,
+            original_retirement_accepted=accepted_retirement, closed_output_stat_observation=closed,
+            closed_output_logical_bytes=(final["logical_bytes"] if closed else None),
+            whole_output_entitlement_observed_exceeded=any(row["logical_bytes"] > self.entitlement_bytes for row in self.output_samples),
+            cache_operational_reserve_crossed=self.reserve_crossed,
+            output_hard_quota=False, file_payload_SHA_or_arrays_read=False, original_comparison=None,
+            state=("CLOSED_DIAGNOSTIC_ONLY" if complete else "STOP_OR_INCOMPLETE_DIAGNOSTIC"),
+            complete=complete, passed=False, no_result_space_profile_created=True, no_ordinary_profile_created=True)
+
+
+class BoundServiceReserveObservations:
+    """Ordinary typed-bound service: original native observer/reserve/STOP seam.
+
+    Only metadata is sampled. Original measured/direct services do not enter
+    this branch; output entitlement is a first-qualification-only concern.
+    """
+    def __init__(self, lease, command, *, clock=None):
+        from types import SimpleNamespace
+        if lease.profile.get("format") != BOUND_IMPORT_PROFILE:
+            raise CachePolicyError("The ordinary bound watchdog needs an actually resolved bound import profile")
+        positions = [i for i, value in enumerate(command) if value == "--job"]
+        if len(positions) != 1 or positions[0]+1 >= len(command):
+            raise CachePolicyError("Actual original public job argv required for bound watchdog")
+        job = PureWindowsPath(command[positions[0]+1])
+        if not job.is_absolute() or ".." in job.parts:
+            raise CachePolicyError("Actual ordinary job path required before native start")
+        # This is the actual ordinary command's metadata view for the unchanged
+        # reserve/command routine, not a first request or scientific executor.
+        actual = SimpleNamespace(bound_mode=True, reference_build=False,
+            required_capacity_bound=lease.profile["capacity_bound"],
+            request=dict(cache_stat_period_seconds=30, public_command=list(command)),
+            task=dict(job_id=job.name), provider=dict(scope=lease.profile["scope"]))
+        self.collector = FiniteObservations(actual, clock=clock)
+        self.lease, self.command = lease, list(command)
+        self.token = uuid.uuid4().hex
+        self.chunks = []; self.flushed = 0; self.error = None; self.closed = None
+
+    def admit(self):
+        from .capacity import volume_info
+        if volume_info(self.lease.policy.root)["free_bytes"] <= PHYSICAL_RESERVE_BYTES:
+            raise CachePolicyError("Actual ordinary bound service has no original40GiB reserve before native start")
+
+    def _flush(self, owned):
+        rows = self.collector.reserve_samples[self.flushed:]
+        if not rows: return
+        # Finite metadata chunks stay below the original control-document size.
+        # No sampling gap is dropped, interpolated or called lifetime coverage.
+        pin = self.lease._record("native-bound-reserve-" + self.token + "-" + str(len(self.chunks)) + ".json",
+            dict(format="darsia-native-bound-reserve-samples-v1", profile=self.lease.profile_binding,
+                actual_command=self.command, native_launch=owned.observed_binding,
+                first_sample_index=self.flushed, samples=deepcopy(rows),
+                target_period_seconds=1, samples_prove_no_crossing_between_samples=False))
+        self.chunks.append(pin); self.flushed += len(rows)
+
+    def observe(self, owned, accounting, *, force=False):
+        try:
+            self.collector.observe_reserve(owned, self.collector.clock(), force=force)
+            if len(self.collector.reserve_samples)-self.flushed >= 128:
+                self._flush(owned)
+        except BaseException as error:
+            import traceback
+            if self.error is None:
+                self.error = dict(type=type(error).__name__, message=str(error), traceback=traceback.format_exc())
+                try:
+                    self.collector.stop_response = request_existing_frame_boundary_stop(self.collector.first, owned.lease)
+                except BaseException as stop_error:
+                    error.add_note("Ordinary bound watchdog STOP failed: " + repr(stop_error))
+            raise
+
+    def finish(self, owned, terminal, retirement):
+        self._flush(owned)
+        self.closed = self.lease._record("native-bound-reserve-" + self.token + "-closed.json",
+            dict(format="darsia-native-bound-operational-reserve-closure-v1", profile=self.lease.profile_binding,
+                actual_command=self.command, native_launch=owned.observed_binding,
+                actual_terminal=terminal, actual_retirement=retirement, chunks=self.chunks,
+                sample_count=len(self.collector.reserve_samples), target_period_seconds=1,
+                operational_reserve_bytes=PHYSICAL_RESERVE_BYTES,
+                operational_reserve_crossed=self.collector.reserve_crossed,
+                stop_response=self.collector.stop_response, first_observation_error=self.error,
+                samples_prove_no_crossing_between_samples=False, lifetime_peak_proven=False,
+                complete=terminal is not None and retirement is not None and self.error is None))
+        return self.closed
+
+    def require_no_stop(self):
+        if self.collector.reserve_crossed or self.error is not None:
+            raise CachePolicyError("Ordinary bound operational reserve STOP; no recovered PASS or automatic finalization")
+
+
 def supervise_first_worker(lease, *, api=None):
     """Same exact native launch and natural retirement; never a numerical path."""
     from .owned_process import OwnedWorker, _public_command
@@ -612,10 +925,12 @@ def supervise_first_worker(lease, *, api=None):
         raise CachePolicyError("Actual normal public command differs from the finite released argv")
     first.consume(lease)
     owned = OwnedWorker(lease, api=api)
-    observations = FiniteObservations(first)
+    observations = (BoundOutputObservations(first) if first.bound_mode else FiniteObservations(first))
     native_completion=None
-    terminal=retirement=observation_pin=None
+    terminal=retirement=observation_pin=output_measurement_pin=None
     try:
+        if first.bound_mode:
+            observations.admit_output(lease)
         owned.start(command, dict(os.environ), Path.cwd())
         terminal = owned.await_family(observer=observations.observe)
         observations.observe(owned,terminal["accounting"],force_cache=True)
@@ -658,13 +973,29 @@ def supervise_first_worker(lease, *, api=None):
             inventories.append(dict(owner=owner,registration=registered["binding"],inventory=exit_pin,
                 all_file_backed_modules_predeclared_and_exact=modules.get("all_file_backed_modules_predeclared_and_exact"),
                 undeclared=modules.get("undeclared")))
+            if first.bound_mode:
+                inventories[-1]["actual_writer_environment"] = modules.get("actual_writer_environment")
+                inventories[-1]["writer_environment_is_actual_IO_or_lifetime_proof"] = modules.get(
+                    "writer_environment_is_actual_IO_or_lifetime_proof")
         if len(tasks)!=1:
             raise CachePolicyError("Exactly one actual worker-slot first claim is required")
         first.require_task(lease,tasks[0])
         observation["actual_registered_owner_exit_inventories"]=inventories
         observation["actual_claim"]=tasks[0]
         observation["source_runtime_before_after_exact"]=True
+        if first.bound_mode:
+            observation["profile_publication_state"] = "BOUND_OBSERVATION_AWAITING_ORIGINAL_COMPARISON"
+            output_measurement_pin = _slot_write(first.provider, "measurement",
+                observations.output_document(terminal, retirement, eligibility))
+            observation["output_measurement"] = output_measurement_pin
         observation_pin=_slot_write(first.provider, "observation", observation)
+        if first.bound_mode:
+            # A separate record, never translated into old measured-v1 coverage.
+            # It remains unqualified until independent output/comparison evidence
+            # and the checked completed DAG exist. Q117 permits that distinct DAG.
+            _slot_write(first.provider, "writer_evidence",
+                bounded_evidence(first, context, observation,
+                    service_receipt=_exact(context.receipt, lease.package_file)))
         seal=_exact(eligibility["seal"],lease.package_file)
         native_completion=dict(format="darsia-native-worker-first-qualification-completion-v1",
             request=first.binding,provider=first.provider_binding,stores_source=lease.source,
@@ -678,6 +1009,7 @@ def supervise_first_worker(lease, *, api=None):
                 and eligibility.get("original_retirement_verifier_accepted") is True
                 and seal.get("value",{}).get("outcome")=="success"
                  and modules_exact and bool(inventories) and not observations.reserve_crossed
+                  and not (first.bound_mode and observations.output_stop is not None)
                  and not (first.reference_build and reference_stopped(first, lease))),
             cache_profile_qualified=False)
         # Deliberately no guessed measured profile, no automatic scope adoption,
@@ -699,9 +1031,40 @@ def supervise_first_worker(lease, *, api=None):
             except BaseException as diagnostic_error:
                 error.add_note("Partial observation was not recorded; full samples are not durable: "
                     + type(diagnostic_error).__name__ + ": " + str(diagnostic_error))
+        elif first.bound_mode and observation_pin is None:
+            # Ordinary eligibility/seal can fail after a real reserve/output
+            # STOP. Preserve actual samples rather than requiring success to log
+            # the failure. This is never partial acceptance or a reusable profile.
+            try:
+                import traceback
+                original_traceback = traceback.format_exc()
+                if output_measurement_pin is None:
+                    try:
+                        output_measurement_pin = _slot_write(first.provider, "measurement",
+                            observations.output_document(terminal, retirement, None))
+                    except BaseException as diagnostic_error:
+                        error.add_note("Output diagnostic slot was not completed: " + repr(diagnostic_error))
+                observation_pin = _slot_write(first.provider, "observation", dict(format=OBSERVATION,
+                    request=first.binding, provider=first.provider_binding, scope=first.provider["scope"],
+                    state="STOP_PARTIAL_DIAGNOSTIC", complete=False, passed=False,
+                    error_type=type(error).__name__, message=str(error), traceback=original_traceback,
+                    output_measurement=output_measurement_pin,
+                    output_diagnostic_if_measurement_unwritten=(observations.output_document(terminal, retirement, None)
+                        if output_measurement_pin is None else None),
+                    actual_terminal=terminal, actual_retirement=retirement,
+                    cache_samples=observations.cache_samples, reserve_samples=observations.reserve_samples,
+                    sampled_cache_logical_high_water_bytes=observations.sampled_cache_logical_high_water_bytes,
+                    sampled_observed_highwater_is_complete=False,
+                    operational_reserve_crossed=observations.reserve_crossed,
+                    operational_stop_response=observations.stop_response,
+                    partial_files_retained=True, no_ordinary_profile_created=True,
+                    no_reference_acceptance=True))
+            except BaseException as diagnostic_error:
+                error.add_note("Bound partial observation was not recorded; full samples are not durable: "
+                    + type(diagnostic_error).__name__ + ": " + str(diagnostic_error))
         held=dict(request=first.binding,provider=first.provider_binding,error_type=type(error).__name__,
             message=str(error),no_retry=True,reservation_closed=False)
-        if first.reference_build:
+        if first.reference_build or first.bound_mode:
             held["actual_partial_observation"]=observation_pin
         try:
             lease._record("first-held-"+uuid.uuid4().hex+".json",held)
@@ -726,9 +1089,155 @@ def supervise_first_worker(lease, *, api=None):
         if not native_completion["producer_complete_unqualified"]:
             raise CachePolicyError("N43 reference producer STOP; partial products retained, no reference promotion")
         return 0  # Original external controller/SystemExit contract; not a profile PASS.
+    if first.bound_mode:
+        if not native_completion["passed"]:
+            raise CachePolicyError("Bound qualification producer STOP; diagnostics retained, no profiles")
+        return 0  # Real producer OS0 only; independent original comparison still required.
     # A successful scientific job is not an accepted cache profile. Make the
     # missing qualification explicit after durable observations and close.
     raise CachePolicyError("First observations complete; cache profile publication refused: no qualified lifetime writer coverage")
+
+
+def checked_bounded_evidence(observation, value):
+    """Read the Q106 physical bound honestly; this does not admit a profile."""
+    _exact_keys(value, {"format", "request", "provider", "stores_source", "scope",
+        "namespace_admission", "capacity_bound_plan", "capacity_bound", "service_namespace",
+        "administrative_service_entitlement", "actual_service_reservation", "actual_service_reservation_document",
+        "actual_volume_observation",
+        "registered_owner_environments", "observation_sha256",
+        "source_runtime_before_after_exact", "retirement", "actual_writer_IO_proven",
+        "writer_lifetime_cache_bytes_proof", "sampled_highwater_is_lifetime_peak",
+        "output_evidence", "original_comparison", "ordinary_use_authorization",
+        "profile_publication_state", "no_ordinary_profile_created"},
+        "Exact bounded evidence required; old measured coverage is not interchangeable")
+    if (value["format"] != BOUNDED_EVIDENCE
+            or observation.get("format") != OBSERVATION or observation.get("complete") is not True
+            or any(value[key] != observation.get(key)
+                for key in ("request", "provider", "stores_source", "scope", "retirement"))
+            or value["observation_sha256"] != _digest(observation)
+            or value["source_runtime_before_after_exact"] is not True
+            or observation.get("source_runtime_before_after_exact") is not True
+            or observation.get("actual_public_worker_exit_code") != 0
+            or observation.get("operational_reserve_crossed") is not False
+            or observation.get("sampled_cache_logical_high_water_is_lifetime_peak") is not False
+            or observation.get("reserve_samples_prove_no_crossing_between_samples") is not False
+            or value["actual_writer_IO_proven"] is not False
+            or value["writer_lifetime_cache_bytes_proof"] is not None
+            or value["sampled_highwater_is_lifetime_peak"] is not False
+            or value["output_evidence"] is not None or value["original_comparison"] is not None
+            or value["ordinary_use_authorization"] is not None
+            or value["profile_publication_state"] != "UNQUALIFIED_BOUND_OBSERVATION"
+            or value["no_ordinary_profile_created"] is not True):
+        raise CachePolicyError("Bounded evidence cannot assert writer lifetime, IO, missing comparison or ordinary PASS")
+    _descriptor(value["namespace_admission"])
+    _descriptor(value["capacity_bound_plan"])
+    checked_required_capacity_bound(value["capacity_bound"])
+    if (value["actual_volume_observation"] != value["capacity_bound"]["volume_cap_observation"]
+            or value["actual_volume_observation"].get("virtual_size_bytes") != 500 * 1024**3):
+        raise CachePolicyError("Fresh actual fixed500GiB volume observation differs from its pinned bound")
+    root = PureWindowsPath(value["service_namespace"])
+    if not root.is_absolute() or not root.drive or root.drive.startswith("\\\\") or ".." in root.parts:
+        raise CachePolicyError("Actual owned local service namespace required")
+    administrative = value["administrative_service_entitlement"]
+    if (not isinstance(administrative, dict) or administrative.get("measured_profile") is not False
+            or type(administrative.get("maximum_bytes")) is not int
+            or administrative["maximum_bytes"] <= 0
+            or administrative["maximum_bytes"] > value["capacity_bound"]["operational_admission_headroom_bytes"]):
+        raise CachePolicyError("Actual operational service reservation is separate from the physical volume bound")
+    reservation = _exact_keys(value["actual_service_reservation"], {"token", "pool", "sha256"},
+        "Original actual administrative reservation required")
+    reserved = value["actual_service_reservation_document"]
+    if (not isinstance(reserved, dict) or reserved.get("format") != "darsia-cache-budget-reservation-v2"
+            or reserved.get("maximum_bytes") != administrative["maximum_bytes"]
+            or reserved.get("token") != reservation["token"] or reserved.get("pool") != reservation["pool"]
+            or _digest(reserved) != reservation["sha256"]):
+        raise CachePolicyError("Actual reservation document/hash/administrative maximum differs")
+    from .environment import FIRST_WRITER_ENVIRONMENT_KEYS
+    rows = value["registered_owner_environments"]
+    actual = observation.get("actual_registered_owner_exit_inventories")
+    if not isinstance(rows, list) or not rows or rows != actual:
+        raise CachePolicyError("Every actual registered owner exit inventory is required")
+    owners = set()
+    for row in rows:
+        key = _digest(row["owner"])
+        if (key in owners or row.get("all_file_backed_modules_predeclared_and_exact") is not True
+                or row.get("undeclared") != []
+                or row.get("writer_environment_is_actual_IO_or_lifetime_proof") is not False):
+            raise CachePolicyError("Missing, duplicate or unknown actual owner/module evidence")
+        owners.add(key)
+        _descriptor(row["registration"]); _descriptor(row["inventory"])
+        environment = _exact_keys(row.get("actual_writer_environment"), FIRST_WRITER_ENVIRONMENT_KEYS,
+            "Every actual exiting owner's writer environment is required")
+        for name, path in environment.items():
+            if name == "NUMBA_CACHE_LOCATOR_CLASSES":
+                if path != "UserProvidedCacheLocator":
+                    raise CachePolicyError("Actual Numba locator differs")
+            elif (not isinstance(path, str) or not PureWindowsPath(path).is_absolute()
+                    or ".." in PureWindowsPath(path).parts
+                    or (PureWindowsPath(path) != root and root not in PureWindowsPath(path).parents)):
+                raise CachePolicyError("Actual owner writer environment escapes the owned service: " + name)
+    if _digest(reserved.get("owner")) not in owners:
+        raise CachePolicyError("Administrative reservation owner is absent from actual exit inventories")
+    samples = observation.get("reserve_samples")
+    if (observation.get("reserve_watchdog_period_seconds") != 1
+            or not isinstance(samples, list) or not samples
+            or observation.get("sample_count") != len(observation.get("cache_samples", []))):
+        raise CachePolicyError("Actual reserve/cache samples and gaps required")
+    previous = None
+    for sample in samples:
+        instant = sample.get("monotonic_seconds")
+        if (type(instant) not in {int, float} or not math.isfinite(instant)
+                or not isinstance(sample.get("utc"), str) or not sample["utc"]
+                or sample.get("operational_reserve_bytes") != PHYSICAL_RESERVE_BYTES
+                or sample.get("at_or_below_operational_reserve") is not False
+                or nonnegative(sample["free_volume_observation"]["free_bytes"], "Actual sampled free bytes") <= PHYSICAL_RESERVE_BYTES
+                or (previous is None and sample.get("actual_gap_since_previous_start_seconds") is not None)
+                or (previous is not None and (instant < previous
+                    or sample.get("actual_gap_since_previous_start_seconds") != instant - previous))):
+            raise CachePolicyError("Reserve crossing or inconsistent actual sample timeline")
+        previous = instant
+    previous = None; highwater = 0
+    for sample in observation["cache_samples"]:
+        instant, elapsed = sample.get("started_monotonic_seconds"), sample.get("elapsed_seconds")
+        if (type(instant) not in {int, float} or not math.isfinite(instant)
+                or type(elapsed) not in {int, float} or not math.isfinite(elapsed) or elapsed < 0
+                or (previous is None and sample.get("actual_gap_since_previous_start_seconds") is not None)
+                or (previous is not None and (instant < previous
+                    or sample.get("actual_gap_since_previous_start_seconds") != instant - previous))):
+            raise CachePolicyError("Cache samples must retain actual elapsed times and gaps")
+        highwater = max(highwater, nonnegative(sample["observation"]["logical_bytes"], "Actual sampled cache bytes"))
+        previous = instant
+    if (not observation["cache_samples"] or observation.get("final_sample") != observation["cache_samples"][-1]["observation"]
+            or highwater != observation.get("sampled_cache_logical_high_water_bytes")):
+        raise CachePolicyError("Sampled highwater must equal its retained observations, never a lifetime estimate")
+    return deepcopy(value)
+
+
+def bounded_evidence(first, context, observation, *, service_receipt):
+    """Produce observations only from the existing actual native/exit records."""
+    if not first.bound_mode:
+        raise CachePolicyError("Bounded evidence belongs only to the existing bound-request branch")
+    with context.ledger.locked(create_binding=False):
+        # This is an existing metadata-only observer ledger. project() would
+        # intentionally invoke its refusing no_cache_measurement callback.
+        actual = deepcopy(context.ledger.volume_cap_observation)
+        reserved, _ = context.ledger.require_reservation(context.reservation, context.manifest["owner"], context.maximum)
+    value = dict(format=BOUNDED_EVIDENCE, request=first.binding, provider=first.provider_binding,
+        stores_source=first.stores_source, scope=first.provider["scope"],
+        namespace_admission=first.provider["namespace_admission"],
+        capacity_bound_plan=first.request["capacity_bound_plan"],
+        capacity_bound=first.required_capacity_bound, service_namespace=str(context.root),
+        administrative_service_entitlement=service_receipt["first_qualification"]["administrative_entitlement"],
+        actual_service_reservation=context.reservation,
+        actual_service_reservation_document=reserved,
+        actual_volume_observation=actual,
+        registered_owner_environments=observation["actual_registered_owner_exit_inventories"],
+        observation_sha256=_digest(observation), source_runtime_before_after_exact=True,
+        retirement=observation["retirement"], actual_writer_IO_proven=False,
+        writer_lifetime_cache_bytes_proof=None, sampled_highwater_is_lifetime_peak=False,
+        output_evidence=None, original_comparison=None, ordinary_use_authorization=None,
+        profile_publication_state="UNQUALIFIED_BOUND_OBSERVATION", no_ordinary_profile_created=True)
+    return checked_bounded_evidence(observation, value)
 
 
 def require_publishable(observation, writer_evidence):
@@ -736,6 +1245,9 @@ def require_publishable(observation, writer_evidence):
     if (observation.get("format") != OBSERVATION or observation.get("complete") is not True
             or writer_evidence is None):
         raise CachePolicyError("Actual completed observation and all-writer lifetime evidence required")
+    if writer_evidence.get("format") == BOUNDED_EVIDENCE:
+        checked_bounded_evidence(observation, writer_evidence)
+        raise CachePolicyError("Bounded observation alone is not a profile; the checked native/output/original-comparison fixed-slot DAG is required")
     # The existing four external runtime writers do not expose an exact
     # lifetime-allocation proof seam. No caller-supplied boolean/number is a
     # qualified provider. Implement that audited source seam before accepting
@@ -746,17 +1258,21 @@ def require_publishable(observation, writer_evidence):
 def resolve_profile(binding, kind, read, *, stores_source=None, read_authorities=None):
     """Old direct profiles unchanged; incomplete new providers always refuse.
 
-    The append-once DAG reader is explicit. Final publication remains closed
-    until a genuine lifetime-writer proof format/provider exists; it cannot be
-    activated with fabricated completed JSON or test protocol fixtures.
+    The Q117 bound DAG is distinct from old lifetime-writer metadata. All actual
+    native/output/original-comparison roles are checked before applicability.
     """
     value = read(binding)
+    if value.get("format") in {BOUND_IMPORT_PROFILE, BOUND_JOB_PROFILE}:
+        raise CachePolicyError("Typed bound profiles must resolve through the original checked provider DAG")
     if value.get("format") != PROVIDER:
         return value
     provider = checked_provider(value)
     if kind not in {"import","jobs"}:
         raise CachePolicyError("Unknown typed provider profile role")
     bundle, bundle_pin = _slot_read(provider, "completion")
+    if bundle.get("format") == BOUND_BUNDLE:
+        return _resolve_bound_profile(binding, provider, bundle, kind, read,
+            stores_source=stores_source, read_authorities=read_authorities)
     _exact_keys(bundle, {"format", "request", "provider", "stores_source", "scope",
         "observation", "writer_evidence", "profiles", "retirement"}, "Exact completed provider bundle required")
     if (bundle["format"] != BUNDLE or bundle["provider"] != binding
@@ -807,6 +1323,404 @@ def resolve_profile(binding, kind, read, *, stores_source=None, read_authorities
     return selected  # Today unreachable: unproved writer evidence always refuses.
 
 
+def _checked_bound_comparison_contract(task, reference, contract, *, read):
+    """The exact reviewed adapter/source pair is bound BEFORE the single Run."""
+    _exact_keys(contract, {"format", "scope", "reference_commit", "candidate_commit",
+        "reference_completed", "sources", "source_pair_compatibility", "adapter_source_review",
+        "public_command", "report_format", "comparison_kind"}, "Exact reviewed current/current comparison contract required")
+    if (contract["format"] != "darsia-first-volume-bound-current-comparison-contract-v1"
+            or contract["scope"] != {key:task.get(key) for key in (
+                "commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
+            or contract["reference_commit"] != reference["reference_commit"]
+            or contract["candidate_commit"] != task["commit"]
+            or contract["reference_completed"] != reference["reference_completion"]
+            or contract["source_pair_compatibility"] != reference["reference_source_compatibility"]
+            or contract["comparison_kind"] != "same_precision"
+            or not isinstance(contract["report_format"], str) or not contract["report_format"]
+            or not isinstance(contract["public_command"], list) or not contract["public_command"]):
+        raise CachePolicyError("Actual comparison is not the released exact candidate/reference source pair")
+    sources = _exact_keys(contract["sources"], {"numeric_checker", "record_extractors", "adapter",
+        "read_locator", "typed_ipp_validator"}, "All original numerical/current data adapter sources required")
+    originals = {"numeric_checker": ("9949a184fef7e3b55c75336544fa04f52a2062f1b37cfdad1018f2243280b5ce", 17239),
+        "record_extractors": ("95dc41bf655c5d22a91dd5bf7cf55430f0f5a511d8d7cdabe8f8e68378b6aa13", 21587)}
+    for role, source in sources.items():
+        _module_source_descriptor(source)
+        if role in originals and (source["sha256"], source["size_bytes"]) != originals[role]:
+            raise CachePolicyError("Original comparator/extractor bytes must not change")
+    from .owned_process import _exact_source
+    for source in sources.values():
+        _exact_source(source)
+    if sources["adapter"]["path"] not in contract["public_command"]:
+        raise CachePolicyError("Actual comparator argv omits the reviewed data adapter")
+    for role in ("adapter_source_review", "source_pair_compatibility"):
+        if not isinstance(read(_descriptor(contract[role])), dict):
+            raise CachePolicyError("Actual source review/compatibility evidence required")
+    return deepcopy(contract)
+
+
+def _checked_bound_comparison(first, binding, *, candidate, read):
+    """Read actual original-comparator evidence, never execute or synthesize it."""
+    proof = read(_descriptor(binding))
+    _exact_keys(proof, {"format", "contract", "report", "actual_command", "actual_exit_code",
+        "retirement", "source_runtime_before_after", "Root_acceptance"},
+        "Actual whole39 comparison, OS return and independent closure required")
+    if (proof["format"] != "darsia-first-volume-bound-original-comparison-v1"
+            or type(proof["actual_exit_code"]) is not int or proof["actual_exit_code"] != 0
+            or proof["contract"] != first.output_entitlement["comparison_contract"]):
+        raise CachePolicyError("Original comparator did not genuinely return OS0 under the predeclared contract")
+    reference = read(_descriptor(first.output_entitlement["all_stage_reference"]))
+    contract = _checked_bound_comparison_contract(first.task, reference,
+        read(_descriptor(proof["contract"])), read=read)
+    sources = contract["sources"]
+    if proof["actual_command"] != contract["public_command"]:
+        raise CachePolicyError("Actual comparator argv differs from the predeclared original route")
+    report = read(_descriptor(proof["report"]))
+    if (report.get("format") != contract["report_format"] or report.get("complete") is not True
+            or report.get("comparison_kind") != "same_precision"
+            or report.get("numeric_checker") != sources["numeric_checker"]
+            or report.get("reference_completed") != contract["reference_completed"]
+            or report.get("candidate_completed") != candidate["reference_completion"]
+            or report.get("case_count") != 39 or report.get("new_comparisons_count") != 39
+            or report.get("ordered_case_ids") != first.task["ordered_case_ids"]
+            or report.get("accepted_prior_comparisons") != []
+            or report.get("frame_add8_limits_passed") is not True
+            or report.get("new_scientific_arrays_computed") is not False):
+        raise CachePolicyError("A genuine fresh original whole39 comparison is required, not producer completion")
+    comparisons = report.get("comparisons")
+    if (not isinstance(comparisons, list)
+            or [row.get("case_id") for row in comparisons] != first.task["ordered_case_ids"]):
+        raise CachePolicyError("Original comparison exact39 order differs")
+    old = read(contract["reference_completed"])
+    new = read(candidate["reference_completion"])
+    for index, row in enumerate(comparisons):
+        if row.get("passed") is not True or row.get("first_failure") is not None:
+            raise CachePolicyError("Original whole39 comparison contains a failed or missing case")
+        actual = read(_descriptor(row["receipt"]))
+        if (actual.get("case_id") != row["case_id"] or actual.get("limits_passed") is not True
+                or actual.get("first_failure") is not None
+                or actual.get("reference_result") != old["frame_producers"][index]["result"]
+                or actual.get("candidate_result") != new["frame_producers"][index]["result"]):
+            raise CachePolicyError("Actual original per-case comparison/result bindings differ")
+    retired = read(_descriptor(proof["retirement"]))
+    if (retired.get("format") != "darsia-first-original-comparator-retirement-v1"
+            or type(retired.get("actual_exit_code")) is not int or retired["actual_exit_code"] != 0
+            or retired.get("actual_command") != proof["actual_command"]
+            or retired.get("all_owned_retired") is not True
+            or not isinstance(retired.get("known_epochs"), list) or not retired["known_epochs"]
+            or any(type(row.get("pid")) is not int or row["pid"] <= 0
+                or type(row.get("process_create_time")) not in {int, float}
+                or not math.isfinite(row["process_create_time"]) or row["process_create_time"] <= 0
+                or row.get("exact_incarnation_absent") is not True for row in retired["known_epochs"])):
+        raise CachePolicyError("Actual comparator OS return and all exact owned epochs must be closed")
+    closure = read(_descriptor(proof["source_runtime_before_after"]))
+    if (closure.get("module_closure") != first.provider["module_closure"]
+            or closure.get("source_runtime_before_after_exact") is not True
+            or closure.get("comparison_sources") != sources):
+        raise CachePolicyError("Actual comparator source/runtime before/after evidence differs")
+    accepted = read(_descriptor(proof["Root_acceptance"]))
+    if not isinstance(accepted, dict) or not accepted:
+        raise CachePolicyError("Independent actual comparison acceptance role is missing")
+    return deepcopy(proof)
+
+
+def _checked_bound_writer_compatibility(reference, candidate):
+    """Five literal existing writer blobs, without importing DarSIA pre-admission.
+
+    Before scientific allocation, first_output_entitlement uses the original Git writer checker on
+    BOTH actual commits. Here the exact predeclared common writer SHA is checked
+    against startup-bound current bytes. No extra subprocess is spawned during
+    ordinary pre-import resolution; LF/CRLF retains the original EOL semantics.
+    """
+    root = Path(__file__).resolve().parents[2]
+    required = {"src/darsia/fluidflower/mass/n1_pipeline.py", "src/darsia/fluidflower/mass/n1_statistics.py",
+        "src/darsia/fluidflower/pipeline/series.py", "src/darsia/fluidflower/native/sidecar.py",
+        "src/darsia/fluidflower/pipeline/runner.py"}
+    writers = candidate["output_writers"]
+    if (writers != reference["output_writers"] or not isinstance(writers, list) or len(writers) != len(required)
+            or {row.get("relative_path") for row in writers} != required
+            or candidate["requested_native_layout"] != reference["requested_native_layout"]):
+        raise CachePolicyError("Qualified full native layout and all five whole output writers must remain exact")
+    for row in writers:
+        _exact_keys(row, {"relative_path", "sha256"}, "Exact original whole-writer identity required")
+        if re.fullmatch(r"[0-9a-f]{64}", str(row["sha256"])) is None:
+            raise CachePolicyError("Canonical whole-writer SHA required")
+        path = (root / row["relative_path"]).resolve(strict=True)
+        if not path.is_relative_to(root):
+            raise CachePolicyError("Actual qualified writer escaped its source root")
+        before = path.stat(); raw = path.read_bytes(); after = path.stat()
+        identity = lambda value:(value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+        if (identity(before) != identity(after)
+                or row["sha256"] not in {hashlib.sha256(raw).hexdigest(),
+                    hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()}):
+            raise CachePolicyError("Actual reference/candidate writer blobs differ; no writer exception is inferred")
+
+
+def _bound_profile_documents(first, bindings, *, read):
+    """Pure checked fixed-slot DAG composition; no Run, comparison or adoption."""
+    if (not first.bound_mode or not isinstance(first.output_entitlement, dict)
+            or first.output_entitlement.get("format") != BOUND_OUTPUT_ADMINISTRATION
+            or not isinstance(first.required_capacity_bound, dict)
+            or first.required_capacity_bound.get("enforcement_state") != "PREDECLARED_Q106_VOLUME_BOUND"):
+        raise CachePolicyError("Only the actual Q117/Q119 predeclared bound route may complete this DAG")
+    _exact_keys(bindings, {"candidate_all_stage", "original_comparison", "once_marker"},
+        "Actual closed-output, original comparison and original consume marker roles required")
+    observation, op = _slot_read(first.provider, "observation")
+    evidence, ep = _slot_read(first.provider, "writer_evidence")
+    output, mp = _slot_read(first.provider, "measurement")
+    native, np = _slot_read(first.provider, "native_completion")
+    checked_bounded_evidence(observation, evidence)
+    if (observation.get("actual_claim") != first.task or observation.get("output_measurement") != mp
+            or native.get("format") != "darsia-native-worker-first-qualification-completion-v1"
+            or any(native.get(key) != observation.get(key) for key in ("request", "provider", "stores_source", "scope", "retirement"))
+            or native.get("observation") != op or native.get("startup") != first.provider["startup"]
+            or native.get("module_closure") != first.provider["module_closure"]
+            or native.get("complete") is not True or native.get("passed") is not True
+            or native.get("observer_native_handles_closed") is not True
+            or native.get("cache_profile_qualified") is not False
+            or native.get("maximum_family_processes") != observation.get("kernel_total_processes")
+            or type(native.get("maximum_family_processes")) is not int or native["maximum_family_processes"] <= 0):
+        raise CachePolicyError("Actual native/source/startup/kernel completion is missing or differs")
+    retirement = read(_descriptor(observation["retirement"]))
+    if (retirement.get("format") != "darsia-native-owned-worker-retirement-v1"
+            or retirement.get("native_launch") != observation.get("native_launch")
+            or retirement.get("service_receipt") != observation.get("service_receipt")
+            or retirement.get("whole_family_kernel_observation") is not True
+            or retirement.get("terminal") != observation.get("original_kernel_terminal")
+            or retirement.get("terminal", {}).get("wrapper_exit_code") != 0
+            or retirement.get("terminal", {}).get("accounting", {}).get("active_processes") != 0):
+        raise CachePolicyError("Actual original whole-family kernel retirement is required")
+    primary = read(_descriptor(retirement["actual_primary_binding"]))
+    if (primary.get("actual_service_receipt") != observation["service_receipt"]
+            or primary.get("original_native_launch") != observation["native_launch"]
+            or primary.get("actual_primary") != retirement.get("primary")
+            or primary.get("held_process_handle_observed_while_live") is not True
+            or primary.get("same_original_job_membership_observed") is not True):
+        raise CachePolicyError("Actual primary was not bound by the original retained native handle")
+    eligibility = native.get("eligibility", {})
+    if (eligibility != observation.get("original_publication_and_retirement_eligibility")
+            or eligibility.get("original_retirement_verifier_accepted") is not True
+            or read(_descriptor(eligibility["seal"])).get("value", {}).get("outcome") != "success"):
+        raise CachePolicyError("Original whole-run publication/seal and retirement verifier are required")
+    marker_pin = _descriptor(bindings["once_marker"]); marker = read(marker_pin)
+    if (PureWindowsPath(marker_pin["path"]).name != "cache-first-" + first._once_key() + ".json"
+            or marker.get("format") != "darsia-cache-first-qualification-consumed-v1"
+            or any(marker.get(key) != observation.get(key) for key in ("request", "provider", "stores_source", "scope"))
+            or marker.get("no_retry") is not True):
+        raise CachePolicyError("Actual original immutable once marker differs")
+    service = read(_descriptor(observation["service_receipt"]))
+    if (service.get("format") != "darsia-cache-import-service-receipt-v1"
+            or service.get("policy") != first.stores_source or service.get("profile") != first.provider_binding
+            or service.get("manifest", {}).get("purpose") != "jobs" or service.get("entry_kind") != "worker"
+            or not isinstance(service.get("role_identifier"), str)
+            or service.get("namespace") != first.provider["namespace_admission"]
+            or service.get("manifest", {}).get("root") != evidence["service_namespace"]
+            or service.get("manifest", {}).get("reservation") != evidence["actual_service_reservation"]
+            or service.get("manifest", {}).get("owner") != evidence["actual_service_reservation_document"]["owner"]
+            or service.get("manifest", {}).get("maximum_bytes") != evidence["administrative_service_entitlement"]["maximum_bytes"]
+            or service.get("manifest", {}).get("native_launch_context") != observation["native_launch"]
+            or service.get("first_qualification", {}).get("request") != first.binding
+            or service.get("first_qualification", {}).get("provider") != first.provider_binding
+            or service.get("first_qualification", {}).get("administrative_entitlement") != evidence["administrative_service_entitlement"]):
+        raise CachePolicyError("Actual original worker service role/stores/namespace/admin differs")
+    from .environment import FIRST_WRITER_SUBDIRECTORIES, FIRST_WRITER_ENVIRONMENT_KEYS
+    fresh = service["manifest"].get("fresh_scope_provenance", {})
+    if (fresh.get("format") != "darsia-fresh-exclusive-empty-service-scope-v1"
+            or fresh.get("owner") != service["manifest"]["owner"]
+            or fresh.get("token") != evidence["actual_service_reservation"]["token"]
+            or fresh.get("purpose") != "jobs"
+            or fresh.get("root_identity") != service["manifest"].get("root_identity")
+            or fresh.get("creation_disposition") != "NtCreateFile.FILE_CREATE"
+            or fresh.get("exclusive_root_handle") is not True or fresh.get("initial_names") != []
+            or fresh.get("observation_precedes_writer_subdirectories_and_imports") is not True
+            or fresh.get("writer_subdirectories") != list(FIRST_WRITER_SUBDIRECTORIES)
+            or fresh.get("writer_environment_keys") != list(FIRST_WRITER_ENVIRONMENT_KEYS)):
+        raise CachePolicyError("Actual cold service must predate every qualified writer with its exact empty FILE_CREATE provenance")
+    from .control import _time
+    _time(fresh["initial_empty_observed_utc"])
+    lifecycle_binding = dict(reservation=service["manifest"]["reservation"], policy=first.stores_source,
+        profile=first.provider_binding, namespace=first.provider["namespace_admission"], manifest=service["manifest"])
+    for row in evidence["registered_owner_environments"]:
+        registered = read(_descriptor(row["registration"]))
+        if (registered.get("format") != "darsia-cache-service-lifecycle-v1"
+                or registered.get("kind") != "owner" or registered.get("binding") != lifecycle_binding
+                or registered.get("actor") != row["owner"]
+                or registered.get("value", {}).get("owner") != row["owner"]
+                or registered.get("value", {}).get("native_job_membership") != observation["native_launch"]):
+            raise CachePolicyError("Original namespace/owner registration is outside the actual native family")
+        exited = read(_descriptor(row["inventory"]))
+        modules = exited.get("first_qualification_modules", {})
+        if (exited.get("owner") != row["owner"]
+                or modules.get("request") != first.binding or modules.get("provider") != first.provider_binding
+                or modules.get("all_file_backed_modules_predeclared_and_exact") is not True
+                or modules.get("undeclared") != []
+                or modules.get("predeclared_module_closure_sha256") != _digest(first.provider["module_closure"])
+                or modules.get("actual_writer_environment") != row["actual_writer_environment"]
+                or modules.get("writer_environment_is_actual_IO_or_lifetime_proof") is not False):
+            raise CachePolicyError("Original owner's actual exit inventory and writer environment differ")
+    candidate = read(_descriptor(bindings["candidate_all_stage"]))
+    if (candidate.get("reference_commit") != first.task["commit"]
+            or candidate.get("candidate_commit") != first.task["commit"]):
+        raise CachePolicyError("Closed output must be the actual candidate, never a relabelled Main reference")
+    checked_all_stage_reference(first.task, candidate, read=read,
+        maximum_output_bytes=first.output_entitlement["administrative_output_entitlement_bytes"])
+    reference = read(_descriptor(first.output_entitlement["all_stage_reference"]))
+    _checked_bound_writer_compatibility(reference, candidate)
+    closed = read(_descriptor(candidate["measurement"]))
+    if (output.get("format") != "darsia-first-q104-closed-output-diagnostic-v1"
+            or output.get("request") != first.binding or output.get("provider") != first.provider_binding
+            or output.get("stores_source") != first.stores_source
+            or output.get("scope") != first.provider["scope"]
+            or output.get("output_plan") != first.request["output_entitlement_plan"]
+            or output.get("output_scope") != first.output_entitlement["watched_output_scope"]
+            or output.get("complete") is not True or output.get("first_stop") is not None
+            or output.get("first_observation_error") is not None
+            or output.get("cache_operational_reserve_crossed") is not False
+            or output.get("whole_output_entitlement_observed_exceeded") is not False
+            or output.get("actual_retirement") != observation["retirement"]
+            or output.get("actual_terminal") != observation["original_kernel_terminal"]
+            or output.get("entitlement_bytes") != first.output_entitlement["administrative_output_entitlement_bytes"]
+            or output.get("closed_output_logical_bytes") != closed["total_logical_bytes"]
+            or output.get("sampled_highwater_is_lifetime_peak") is not False
+            or output.get("output_hard_quota") is not False
+            or not _same_path(output["output_scope"]["path"], closed["root"])):
+        raise CachePolicyError("Actual closed whole-output inventory differs from the original in-run watch")
+    samples = output.get("output_samples")
+    admission = output.get("admission")
+    if (output.get("target_sample_period_seconds") != 1 or not isinstance(samples, list) or not samples
+            or not isinstance(admission, dict) or admission.get("logical_bytes") != 0
+            or admission.get("observed_scan_anomalies") != []
+            or admission.get("volume", {}).get("free_bytes", 0) - PHYSICAL_RESERVE_BYTES < output["entitlement_bytes"]):
+        raise CachePolicyError("Original empty output admission and genuine one-second-target samples are required")
+    previous = None
+    for sample in samples:
+        instant, elapsed = sample.get("started_monotonic_seconds"), sample.get("elapsed_seconds")
+        if (type(instant) not in {int, float} or not math.isfinite(instant)
+                or type(elapsed) not in {int, float} or not math.isfinite(elapsed) or elapsed < 0
+                or (previous is None and sample.get("actual_gap_since_previous_start_seconds") is not None)
+                or (previous is not None and (instant < previous
+                    or sample.get("actual_gap_since_previous_start_seconds") != instant - previous))
+                or sample.get("sampled") is not True or sample.get("complete_lifetime_peak") is not False
+                or sample.get("free_bytes", 0) <= PHYSICAL_RESERVE_BYTES
+                or nonnegative(sample["logical_bytes"], "Actual output sample bytes") > output["entitlement_bytes"]):
+            raise CachePolicyError("Output STOP or inconsistent actual sample/gap timeline cannot be qualified")
+        previous = instant
+    if (samples[-1].get("forced_terminal") is not True
+            or output.get("sampled_highwater_bytes") != max(row["logical_bytes"] for row in samples)
+            or output.get("final_snapshot", {}).get("logical_bytes") != samples[-1]["logical_bytes"]):
+        raise CachePolicyError("Actual forced terminal and sampled output highwater must remain reproducible")
+    sampled = output.get("final_snapshot", {}).get("file_stats")
+    if (not isinstance(sampled, list)
+            or len({str(PureWindowsPath(row["relative_path"])).casefold() for row in sampled}) != len(sampled)
+            or {str(PureWindowsPath(row["relative_path"])).casefold():row["size_bytes"] for row in sampled} != {
+                str(PureWindowsPath(row["relative_path"])).casefold():row["bytes"] for row in closed["inventory"]}
+            or closed["root_identity"] != output["output_scope"]["identity"]):
+        raise CachePolicyError("Closed output SHA inventory must cover every originally observed retained file")
+    _checked_bound_comparison(first, bindings["original_comparison"], candidate=candidate, read=read)
+    common = dict(request=first.binding, provider=first.provider_binding, stores_source=first.stores_source,
+        scope=first.provider["scope"], configuration=first.task["configuration"],
+        qualification=deepcopy(bindings), observation=op,
+        writer_evidence=ep, measurement=mp, completion=np,
+        namespace_admission=first.provider["namespace_admission"],
+        producer_source_closure=first.provider["producer_source_closure"],
+        runtime_source_closure=first.provider["runtime_source_closure"],
+        capacity_bound=evidence["capacity_bound"],
+        operational_service_entitlement_bytes=evidence["administrative_service_entitlement"]["maximum_bytes"],
+        sampled_cache_highwater_bytes=observation["sampled_cache_logical_high_water_bytes"],
+        sampled_highwater_is_lifetime_peak=False, actual_writer_IO_proven=False,
+        writer_contract=BOUND_WRITER_CONTRACT)
+    imported = dict(common, format=BOUND_IMPORT_PROFILE, purpose="jobs", role_identifier=service["role_identifier"], entry_kind="worker",
+        maximum_cache_bytes=common["operational_service_entitlement_bytes"],
+        python_executable=first.provider["python_executable"], module_closure=first.provider["module_closure"],
+        native_supervision=dict(format="darsia-native-worker-supervision-profile-v1",
+            startup=first.provider["startup"], completion=np,
+            maximum_family_processes=native["maximum_family_processes"],
+            publication_contract="alias-done-small-metadata-v1"))
+    # The original result-estimate model consumes genuine closed inventory; this
+    # is separate from the physical cache bound and from sampled cache peaks.
+    result_profile = dict(format="darsia-expected-space-profile-v1", pipeline=first.task["pipeline"],
+        precision=first.task["precision"], measured_commit=first.task["commit"],
+        measured_case_ids=first.task["ordered_case_ids"], measured_native_layout=candidate["requested_native_layout"],
+        writers=candidate["output_writers"], measurement=deepcopy(closed),
+        completion=dict(complete=True, passed=True, actual_commit=first.task["commit"], actual_case_count=39,
+            precision=first.task["precision"], original_comparison=bindings["original_comparison"],
+            actual_native_completion=np), reference_compatibility=reference["reference_source_compatibility"])
+    job = dict(common, format=BOUND_JOB_PROFILE, purpose="jobs", additional_claim_cache_bytes=0,
+        allocation_model="shared-service-only-no-claim-files-v1", result_estimate_excludes_cache=True,
+        result_profile=result_profile)
+    return imported, job, dict(observation=op, writer_evidence=ep, measurement=mp,
+        native_completion=np, retirement=observation["retirement"])
+
+
+def _publish_bound_profiles(first, bindings, *, read):
+    """Existing fixed slots only; called by reviewed post-comparison metadata composition.
+
+    No slot is overwritten and the final completion is written last. Neither
+    profile embeds the final completion descriptor, so the DAG has no hash cycle.
+    """
+    if not first.bound_mode:
+        raise CachePolicyError("Only the existing bound request may publish this distinct typed evidence")
+    imported, jobs, actual = _bound_profile_documents(first, bindings, read=read)
+    ip = _slot_write(first.provider, "import_profile", imported)
+    jp = _slot_write(first.provider, "job_profile", jobs)
+    return _slot_write(first.provider, "completion", dict(format=BOUND_BUNDLE,
+        request=first.binding, provider=first.provider_binding, stores_source=first.stores_source,
+        scope=first.provider["scope"], qualification=deepcopy(bindings),
+        profiles=dict(import_profile=ip, job_profile=jp), **actual))
+
+
+def _resolve_bound_profile(binding, provider, bundle, kind, read, *, stores_source, read_authorities):
+    _exact_keys(bundle, {"format", "request", "provider", "stores_source", "scope", "qualification",
+        "observation", "writer_evidence", "measurement", "native_completion", "retirement", "profiles"},
+        "Exact completed volume-bound provider DAG required")
+    if (kind not in {"import", "jobs"} or bundle["format"] != BOUND_BUNDLE or bundle["provider"] != binding
+            or bundle["scope"] != provider["scope"] or stores_source != bundle["stores_source"]):
+        raise CachePolicyError("Typed bound profile/stores/source role differs")
+    first = FirstQualification(bundle["request"], provider_binding=binding,
+        stores_source=bundle["stores_source"], namespace=provider["namespace_admission"],
+        read=read, read_authorities=read_authorities)
+    if not first.bound_mode:
+        raise CachePolicyError("Typed bound bundle cannot disguise an old direct/reference provider")
+    from .owned_process import _exact_source
+    for source in provider["module_closure"]:
+        _exact_source(source)
+    imported, jobs, actual = _bound_profile_documents(first, bundle["qualification"], read=read)
+    if any(bundle[key] != value for key, value in actual.items()):
+        raise CachePolicyError("Final bound completion does not bind all actual producer slots")
+    _exact_keys(bundle["profiles"], {"import_profile", "job_profile"}, "Both fixed typed profile slots required")
+    for role, expected in (("import_profile", imported), ("job_profile", jobs)):
+        document, pin = _slot_read(provider, role)
+        if pin != bundle["profiles"][role] or document != expected:
+            raise CachePolicyError("Actual typed profile is not the exact checked fixed-slot projection")
+    return imported if kind == "import" else jobs
+
+
+def checked_bound_import_context(profile, *, purpose, role_identifier, entry_kind, policy, namespace):
+    """Applicability of an already fully resolved distinct bounded profile.
+
+    Actual startup's original ledger still rechecks the physical volume, free
+    space, namespace and reservation. This never turns samples into a maximum.
+    """
+    if (profile.get("format") != BOUND_IMPORT_PROFILE or purpose != "jobs" or entry_kind != "worker"
+            or profile.get("purpose") != purpose or profile.get("entry_kind") != entry_kind
+            or profile.get("role_identifier") != role_identifier
+            or profile.get("namespace_admission") != namespace
+            or profile.get("writer_contract") != BOUND_WRITER_CONTRACT
+            or profile.get("sampled_highwater_is_lifetime_peak") is not False
+            or profile.get("actual_writer_IO_proven") is not False):
+        raise CachePolicyError("The actual ordinary entry/namespace is outside this qualified worker-only bound")
+    cap = policy.volume_cap
+    bound = checked_required_capacity_bound(profile["capacity_bound"])
+    maximum = nonnegative(profile["operational_service_entitlement_bytes"], "Qualified operational service entitlement")
+    if (cap is None or cap.maximum_size_bytes != 500*1024**3 or policy.quota_bytes != 500*1024**3
+            or bound["enforcement_state"] != "PREDECLARED_Q106_VOLUME_BOUND"
+            or bound["volume_cap_observation"].get("binding") != cap.document()
+            or bound["volume_cap_observation"].get("virtual_size_bytes") != 500*1024**3
+            or not 0 < maximum <= bound["operational_admission_headroom_bytes"]
+            or profile["maximum_cache_bytes"] != maximum):
+        raise CachePolicyError("Actual Q87 cap and separate operational entitlement differ")
+    return maximum
+
+
 def checked_required_capacity_bound(value):
     """Q106 hard volume bound and separate sampled operational reserve; no GO."""
     _exact_keys(value, {"format", "authority_id", "volume_cap_observation",
@@ -828,8 +1742,9 @@ def checked_required_capacity_bound(value):
             or value["exclusive_volume_writer_required"] is not True
             or type(value["reserve_watchdog_period_seconds"]) not in {int,float}
             or value["reserve_watchdog_period_seconds"] != 1
-            or value["enforcement_state"] != "PRELAUNCH_HOLD_N43_REFERENCE_OUTPUT_BUDGET_AND_PROFILE_PRODUCER"):
-        raise CachePolicyError("Actual volume-only bound, sampled reserve and truthful N43 HOLD required")
+            or value["enforcement_state"] not in {"PRELAUNCH_HOLD_N43_REFERENCE_OUTPUT_BUDGET_AND_PROFILE_PRODUCER",
+                "PREDECLARED_Q106_VOLUME_BOUND"}):
+        raise CachePolicyError("Actual volume-only bound and separately sampled operational reserve required")
     capacity = nonnegative(value["volume_capacity_bytes"], "Actual usable volume capacity")
     if (capacity != observed.get("volume_total_bytes")
             or capacity <= PHYSICAL_RESERVE_BYTES
@@ -842,8 +1757,29 @@ def checked_required_capacity_bound(value):
     return deepcopy(value)
 
 
-def checked_output_entitlement(task, value, *, task_binding, read):
+def checked_output_entitlement(task, value, *, task_binding, read, read_authorities=None):
     """Q104 source-bound administration, never an expected-space profile."""
+    if isinstance(value, dict) and value.get("format") == BOUND_OUTPUT_ADMINISTRATION:
+        return checked_whole_output_administration(task, value, task_binding=task_binding,
+            read=read, read_authorities=read_authorities)
+    if isinstance(value, dict) and value.get("format") == "darsia-first-qualification-output-entitlement-v3":
+        _exact_keys(value, {"format", "authority_id", "task", "scope", "R4_footprint",
+            "administrative_output_entitlement_bytes", "measured_profile", "enforcement_state",
+            "all_stage_reference", "watched_output_scope"}, "Exact current Q104 output-watch plan required")
+        original = {key: deepcopy(row) for key, row in value.items() if key != "watched_output_scope"}
+        original["format"] = "darsia-first-qualification-output-entitlement-v2"
+        checked_output_entitlement(task, original, task_binding=task_binding, read=read)
+        checked_bound_output_scope(value["watched_output_scope"])
+        return deepcopy(value)
+    if isinstance(value, dict) and value.get("format") == "darsia-first-qualification-output-entitlement-v2":
+        _exact_keys(value, {"format", "authority_id", "task", "scope", "R4_footprint",
+            "administrative_output_entitlement_bytes", "measured_profile", "enforcement_state",
+            "all_stage_reference"}, "Exact first-only Q104 all-stage reference required")
+        original = {key: deepcopy(row) for key, row in value.items() if key != "all_stage_reference"}
+        original["format"] = "darsia-first-qualification-output-entitlement-v1"
+        checked_output_entitlement(task, original, task_binding=task_binding, read=read)
+        checked_all_stage_reference(task, read(_descriptor(value["all_stage_reference"])), read=read)
+        return deepcopy(value)
     _exact_keys(value, {"format", "authority_id", "task", "scope", "R4_footprint",
         "administrative_output_entitlement_bytes", "measured_profile", "enforcement_state"},
         "Exact predeclared Q104 output entitlement required")
@@ -900,6 +1836,194 @@ def checked_output_entitlement(task, value, *, task_binding, read):
             or type(value["administrative_output_entitlement_bytes"]) is not int
             or value["administrative_output_entitlement_bytes"] != 2 * total):
         raise CachePolicyError("Q104 entitlement is exactly twice the bound actual R4 footprint")
+    return deepcopy(value)
+
+
+def checked_whole_output_administration(task, value, *, task_binding, read, read_authorities=None):
+    """Q119 supersedes product-only Q104, without a guessed footprint or quota."""
+    _exact_keys(value, {"format", "authority_ids", "answers_source", "task", "scope",
+        "all_stage_reference", "administrative_output_entitlement_bytes", "measured_profile",
+        "watched_output_scope", "producer_state", "comparison_contract"}, "Exact Q117/Q119 first-only output administration required")
+    scope = {key: task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
+    if (value["format"] != BOUND_OUTPUT_ADMINISTRATION
+            or value["authority_ids"] != ["Q104", "Q109", "Q117", "Q119"]
+            or value["task"] != _descriptor(task_binding) or value["scope"] != scope
+            or scope["pipeline"] != "native-phase-n1" or scope["backend"] != "cpu"
+            or scope["precision"] != "float32" or scope["run"] != "ac52"
+            or not isinstance(scope["ordered_case_ids"], list) or len(scope["ordered_case_ids"]) != 39
+            or len(set(scope["ordered_case_ids"])) != 39
+            or value["measured_profile"] is not False or value["producer_state"] != "PREDECLARED_NOT_QUALIFIED"):
+        raise CachePolicyError("Actual exact39 first task and truthful Q119 administrative state required")
+    authorities = (read if read_authorities is None else read_authorities)(_descriptor(value["answers_source"]))
+    by_id = {row.get("id"): row for row in authorities} if isinstance(authorities, list) else {}
+    required = ["Q109-answer-option-A-whole-output-entitlement-65728995330B-all-stages-count",
+        "Q117-answer-yes-this-is-the-Q102-Q104-Q106-evidence-contract",
+        "Q119-answer-Q109-entitlement-already-covers-first-qualification-or-twice-measured-allstage"]
+    if any(by_id.get(name, {}).get("decided_by") != "claude" for name in required):
+        raise CachePolicyError("Actual Q109/Q117/Q119 decisions required; no product-only fallback")
+    reference = read(_descriptor(value["all_stage_reference"]))
+    measurement = read(_descriptor(reference["measurement"]))
+    observed = nonnegative(measurement["total_logical_bytes"], "Actual complete Main all-stage footprint")
+    maximum = max(FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES, 2 * observed)
+    if (not observed or type(value["administrative_output_entitlement_bytes"]) is not int
+            or value["administrative_output_entitlement_bytes"] != maximum):
+        raise CachePolicyError("Predeclare max65,728,995,330B or twice actual all-stage bytes before Run")
+    checked_all_stage_reference(task, reference, read=read, maximum_output_bytes=maximum)
+    _checked_bound_comparison_contract(task, reference,
+        read(_descriptor(value["comparison_contract"])), read=read)
+    checked_bound_output_scope(value["watched_output_scope"])
+    return deepcopy(value)
+
+
+def checked_all_stage_reference(task, value, *, read, maximum_output_bytes=Q104_OUTPUT_ENTITLEMENT_BYTES):
+    """Q104 prelaunch data, separate from cache qualification and compression estimates.
+
+    The immutable Root-released plan must bind an actual complete current result
+    inventory. Input-layout getters or the old R4 five-product footprint alone
+    are insufficient. Reference and candidate commits deliberately stay distinct.
+    """
+    _exact_keys(value, {"format", "candidate_commit", "reference_commit", "configuration",
+        "ordered_case_ids", "reference_completion", "reference_Root_acceptance", "reference_native_host_evidence",
+        "reference_source_compatibility", "requested_native_layout", "output_writers",
+        "measurement", "not_a_cache_profile"}, "Exact current all-stage reference metadata required")
+    if (value["format"] != "darsia-first-qualification-all-stage-reference-v1"
+            or value["candidate_commit"] != task["commit"]
+            or re.fullmatch(r"[0-9a-f]{40}", str(value["reference_commit"])) is None
+            or value["configuration"] != task.get("configuration")
+            or value["ordered_case_ids"] != task["ordered_case_ids"]
+            or value["not_a_cache_profile"] is not True):
+        raise CachePolicyError("Actual reference commit, unchanged inputs and candidate commit must be explicit")
+    completed = read(_descriptor(value["reference_completion"]))
+    # Root acceptance is an explicit required immutable role in the released
+    # plan. It is not inferred from producer complete or an OS return code.
+    acceptance = read(_descriptor(value["reference_Root_acceptance"]))
+    # The unchanged CLI's main-cpu label is not physical-host evidence. Require
+    # its independent actual Root/native role too; do not invent its future schema.
+    native_host_evidence = read(_descriptor(value["reference_native_host_evidence"]))
+    compatibility = read(_descriptor(value["reference_source_compatibility"]))
+    if (not isinstance(acceptance, dict) or not acceptance
+            or not isinstance(native_host_evidence, dict) or not native_host_evidence
+            or not isinstance(compatibility, dict) or not compatibility
+            or completed.get("complete") is not True or completed.get("whole_run") is not True
+            or completed.get("worker_references_closed") is not True
+            or completed.get("pipeline") != task["pipeline"]
+            or completed.get("precision") != task["precision"]
+            or completed.get("backend") != task.get("backend") or task.get("backend") != "cpu"
+            or not isinstance(completed.get("actual_worker"), dict)
+            or completed.get("actual_worker", {}).get("machine") != "main-cpu"
+            or completed.get("commit") != value["reference_commit"]
+            or completed.get("ordered_case_ids") != task["ordered_case_ids"]
+            or completed.get("case_count") != 39 or completed.get("frames") != 39
+            or completed.get("newly_computed_frames") != 39
+            or completed.get("configuration") != task["configuration"]
+            or completed.get("reused_case_ids") != []
+            or not isinstance(completed.get("records"), list)
+            or [row.get("frame_id") for row in completed["records"]] != task["ordered_case_ids"]
+            or not isinstance(completed.get("frame_producers"), list)
+            or [row.get("case_id") for row in completed["frame_producers"]] != task["ordered_case_ids"]):
+        raise CachePolicyError("Accepted genuine fresh current whole39 reference and source-compatibility roles required")
+    measure = read(_descriptor(value["measurement"]))
+    _exact_keys(measure, {"format", "reference_completion", "root", "root_identity", "inventory",
+        "total_logical_bytes", "inventory_scope", "closed_writer_evidence", "complete"},
+        "Actual all-stage output measurement required")
+    if (measure["format"] != "darsia-first-qualification-all-stage-output-inventory-v1"
+            or measure["reference_completion"] != value["reference_completion"]
+            or measure["inventory_scope"] != "whole-owned-result-attempt-including-preparation-and-ops"
+            or measure["complete"] is not True or not isinstance(measure["root_identity"], dict)
+            or not measure["root_identity"]):
+        raise CachePolicyError("Final-products-only or incomplete output inventory is not Q104 all-stage evidence")
+    read(_descriptor(measure["closed_writer_evidence"]))
+    root = PureWindowsPath(measure["root"])
+    if not root.is_absolute() or ".." in root.parts:
+        raise CachePolicyError("One actual owned result-attempt root required")
+    inventory = measure["inventory"]
+    if not isinstance(inventory, list) or not inventory:
+        raise CachePolicyError("Actual output file inventory cannot be UNKNOWN")
+    seen = {}; total = 0
+    for row in inventory:
+        _exact_keys(row, {"relative_path", "bytes", "sha256"}, "Exact named output file size/SHA required")
+        relative = PureWindowsPath(row["relative_path"])
+        key = str(relative).casefold()
+        if (not row["relative_path"] or relative.is_absolute() or relative.drive or relative.root
+                or ".." in relative.parts or key in seen
+                or re.fullmatch(r"[0-9a-f]{64}", str(row["sha256"])) is None):
+            raise CachePolicyError("Output inventory contains an alias, duplicate or unbound file")
+        seen[key] = row; total += nonnegative(row["bytes"], "Actual all-stage output bytes")
+
+    def inventoried(binding):
+        # Payload identities can exceed the JSON control-size limit. Check only
+        # the named metadata descriptor; read() below is used solely for JSON.
+        _exact_keys(binding, {"path", "sha256", "size_bytes"}, "Exact actual publication file binding required")
+        path = PureWindowsPath(binding["path"])
+        if (not path.is_absolute() or ".." in path.parts or root not in path.parents
+                or re.fullmatch(r"[0-9a-f]{64}", str(binding["sha256"])) is None):
+            raise CachePolicyError("Reference publication file escapes the bound result-attempt root")
+        relative = str(path.relative_to(root)).casefold()
+        row = seen.get(relative)
+        if (row is None or row["bytes"] != nonnegative(binding["size_bytes"], "Published file bytes")
+                or row["sha256"] != binding["sha256"]):
+            raise CachePolicyError("Actual publication/preparation file size/SHA is absent or differs in whole-output inventory")
+        return path
+
+    inventoried(completed["manifest"])
+    inventoried(completed["table"])
+    # At minimum every case has its retained native/temporal buffers and final
+    # publication. Extra ops/metadata are counted too, never silently excluded.
+    for case in task["ordered_case_ids"]:
+        required = {str(PureWindowsPath("preparation", case, name)).casefold()
+            for name in ("native_log.npy", "native_valid.npy", "temporal_log.npy", "temporal_valid.npy", "phase_area.npz")}
+        final = [row for row in inventory if PureWindowsPath(row["relative_path"]).name == "commit.json"
+            and case in PureWindowsPath(row["relative_path"]).parts]
+        if not required <= set(seen) or len(final) != 1:
+            raise CachePolicyError("Retained preparation/final case outputs are missing from the whole-result inventory")
+    for case, record, producer in zip(task["ordered_case_ids"], completed["records"], completed["frame_producers"]):
+        _exact_keys(producer, {"case_id", "attempt_directory", "manifest", "commit",
+            "frame_registration", "publication", "result"}, "Original exact frame-producer roles required")
+        directory = PureWindowsPath(record["nas_directory"])
+        files = record.get("files")
+        if (not _same_path(producer["attempt_directory"], root) or producer["manifest"] != completed["manifest"]
+                or directory != root / "frames" / case or not isinstance(files, dict)
+                or not {"products.npz", "native_geometry.npz", "native_statistics.json.gz", "result.json", "commit.json"} <= set(files)):
+            raise CachePolicyError("Actual reference frame publication/attempt directory or final files differ")
+        for filename, identity in files.items():
+            if PureWindowsPath(filename).name != filename or filename in {".", ".."}:
+                raise CachePolicyError("Original published final file name required")
+            _exact_keys(identity, {"sha256", "size_bytes"}, "Original classic final file identity required")
+            inventoried(dict(path=str(directory / filename), **identity))
+        for role in ("commit", "result"):
+            expected = dict(path=str(directory / (role + ".json")), **files[role + ".json"])
+            if producer[role] != expected:
+                raise CachePolicyError("Actual producer JSON binding differs from its published frame: " + role)
+        commit = read(_descriptor(producer["commit"]))
+        result = read(_descriptor(producer["result"]))
+        inventoried(producer["frame_registration"]); inventoried(producer["publication"])
+        registration = read(_descriptor(producer["frame_registration"]))
+        publication = read(_descriptor(producer["publication"]))
+        expected_files = {name: row for name, row in files.items() if name != "commit.json"}
+        if (commit.get("complete") is not True or commit.get("frame_id") != case
+                or commit.get("manifest_sha256") != completed["manifest"]["sha256"]
+                or commit.get("files") != expected_files or publication != record
+                or registration.get("frame_id") != case or registration.get("commit") != producer["commit"]
+                or registration.get("files") != expected_files
+                or registration.get("manifest_sha256") != completed["manifest"]["sha256"]
+                or result.get("complete") is not True or result.get("case_id") != case):
+            raise CachePolicyError("Actual final commit/result and original ops publication/registration differ")
+        if (PureWindowsPath(producer["frame_registration"]["path"]) != root / "ops" / ("frame_commit_" + commit["commit_id"] + ".json")
+                or PureWindowsPath(producer["publication"]["path"]) != root / "ops" / ("nas_copy_" + commit["commit_id"] + ".json")):
+            raise CachePolicyError("Original ops paths differ from the committed frame identity")
+        stage = result.get("prediction", {}).get("pipeline", {})
+        stage_files = stage.get("files")
+        if (stage.get("case_id") != case or stage.get("complete") is not True
+                or stage.get("configuration_sha256") != task["configuration"]["sha256"]
+                or not isinstance(stage_files, dict) or not stage_files):
+            raise CachePolicyError("Actual result preparation inventory/configuration is missing")
+        for filename, binding in stage_files.items():
+            path = inventoried(binding)
+            if path != root / "preparation" / case / filename or PureWindowsPath(filename).name != filename:
+                raise CachePolicyError("Actual preparation file escaped its original case-stage scope")
+    if (measure["total_logical_bytes"] != total or not total
+            or total > maximum_output_bytes):
+        raise CachePolicyError("Actual all-stage output exceeds fixed Q104 entitlement or has inconsistent totals")
     return deepcopy(value)
 
 

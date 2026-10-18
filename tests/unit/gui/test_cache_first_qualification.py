@@ -387,9 +387,630 @@ def test_output_entitlement_refuses_unbound_case_source_size_or_factor(output_en
 def test_new_bound_mode_refuses_before_consumption_or_any_native_start(monkeypatch):
     state,_=protocol();state.bound_mode=True;lease=lease_for(state)
     monkeypatch.setattr(first,"_outputs_absent",lambda _:pytest.fail("No output/namespace access before HOLD"))
-    with pytest.raises(CachePolicyError,match="N43 PRELAUNCH HOLD"):
+    with pytest.raises(CachePolicyError,match="Bound prelaunch requires actual"):
         state.consume(lease)
     assert not lease.ledger.documents and state.started is False
+
+
+def test_Q104_whole_output_entitlement_never_invents_bytes_per_frame():
+    from darsia.fluidflower.pipeline.capacity import PredeclaredFirstOutputEntitlement
+    value = PredeclaredFirstOutputEntitlement("ac52", 39, first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES,
+        pin("request.json"), pin("output-plan.json"), pin("all-stage.json"), dict(TESTONLY=True))
+    assert value.products_estimated_bytes == 65728995330
+    assert value.needed(other_remaining_bytes=17, reserve_bytes=PHYSICAL_RESERVE_BYTES) == (
+        65728995330 + 17 + PHYSICAL_RESERVE_BYTES)
+    assert not hasattr(value, "products_per_frame_estimated_bytes")
+    assert "including preparation/ops/in-flight" in value.model
+
+
+def all_stage_reference_TESTONLY(*, label="reference", reference_commit="d" * 40):
+    state, _ = protocol(); task = task_for(state)
+    task["backend"] = "cpu"
+    task["configuration"] = dict(root_alias="series", relative_path="run.json", sha256="1" * 64, bytes=7)
+    completion = pin(label + "-completed.json")
+    value = dict(format="darsia-first-qualification-all-stage-reference-v1",
+        candidate_commit=task["commit"], reference_commit=reference_commit,
+        configuration=task["configuration"], ordered_case_ids=task["ordered_case_ids"],
+        reference_completion=completion, reference_Root_acceptance=pin(label + "-Root-acceptance.json"),
+        reference_native_host_evidence=pin(label + "-native-host.json"),
+        reference_source_compatibility=pin(label + "-source-compatibility.json"),
+        requested_native_layout={"TESTONLY": "no native admission"}, output_writers=[],
+        measurement=pin(label + "-all-stage-measurement.json"), not_a_cache_profile=True)
+    root = first.PureWindowsPath("C:/TESTONLY/" + label + "-attempt")
+    inventory = []; objects = {}; records = []; producers = []
+    def asset(relative):
+        inventory.append(dict(relative_path=relative, bytes=1, sha256="b" * 64))
+        return dict(path=str(root / relative), size_bytes=1, sha256="b" * 64)
+    manifest = asset("manifest.json"); table = asset("mass_table.csv")
+    for case in task["ordered_case_ids"]:
+        stage = {name: asset("preparation/" + case + "/" + name) for name in (
+            "native_log.npy", "native_valid.npy", "temporal_log.npy", "temporal_valid.npy", "phase_area.npz")}
+        files = {name: {key: val for key, val in asset("frames/" + case + "/" + name).items() if key != "path"}
+            for name in ("products.npz", "native_geometry.npz", "native_statistics.json.gz", "result.json", "commit.json")}
+        record = dict(frame_id=case, nas_directory=str(root / "frames" / case), files=files)
+        producer = dict(case_id=case, attempt_directory=str(root), manifest=manifest,
+            commit=dict(path=str(root / "frames" / case / "commit.json"), **files["commit.json"]),
+            result=dict(path=str(root / "frames" / case / "result.json"), **files["result.json"]),
+            frame_registration=asset("ops/frame_commit_" + case + ".json"),
+            publication=asset("ops/nas_copy_" + case + ".json"))
+        original_files = {name: row for name, row in files.items() if name != "commit.json"}
+        objects[producer["commit"]["path"]] = dict(complete=True, frame_id=case, commit_id=case,
+            manifest_sha256=manifest["sha256"], files=original_files)
+        objects[producer["result"]["path"]] = dict(complete=True, case_id=case,
+            prediction=dict(pipeline=dict(complete=True, case_id=case,
+                configuration_sha256=task["configuration"]["sha256"], files=stage)))
+        objects[producer["frame_registration"]["path"]] = dict(frame_id=case,
+            commit=producer["commit"], manifest_sha256=manifest["sha256"], files=original_files)
+        objects[producer["publication"]["path"]] = record
+        records.append(record); producers.append(producer)
+    objects.update({completion["path"]: dict(complete=True, whole_run=True, worker_references_closed=True,
+        commit=value["reference_commit"], newly_computed_frames=39, manifest=manifest, table=table,
+        backend="cpu", actual_worker=dict(machine="main-cpu"),
+        pipeline=task["pipeline"], precision=task["precision"], ordered_case_ids=task["ordered_case_ids"],
+        case_count=39, frames=39, configuration=task["configuration"], reused_case_ids=[],
+        records=records, frame_producers=producers),
+        value["reference_Root_acceptance"]["path"]: {"TESTONLY": "not Root authorization"},
+        value["reference_native_host_evidence"]["path"]: {"TESTONLY": "not actual native host proof"},
+        value["reference_source_compatibility"]["path"]: {"TESTONLY": "not source qualification"},
+        value["measurement"]["path"]: dict(format="darsia-first-qualification-all-stage-output-inventory-v1",
+            reference_completion=completion, root=str(root), root_identity={"TESTONLY": True},
+            inventory=inventory, total_logical_bytes=len(inventory),
+            inventory_scope="whole-owned-result-attempt-including-preparation-and-ops",
+            closed_writer_evidence=pin(label + "-closed-writers.json"), complete=True),
+        "C:/TESTONLY/" + label + "-closed-writers.json": {"TESTONLY": "not actual retirement"}})
+    return task, value, objects
+
+
+@pytest.mark.parametrize("change", [
+    lambda v, m: v.update(candidate_commit="e" * 40),
+    lambda v, m: v.update(reference_Root_acceptance=None),
+    lambda v, m: v.update(reference_native_host_evidence=None),
+    lambda v, m: m.update(inventory_scope="final-products-only"),
+    lambda v, m: m.update(complete=False),
+    lambda v, m: m.update(total_logical_bytes=m["total_logical_bytes"] + 1),
+    lambda v, m: m["inventory"].pop(0),
+    lambda v, m: m["inventory"].append(deepcopy(m["inventory"][0])),
+    lambda v, m: m["inventory"][0].update(relative_path="../unowned.npy"),
+    lambda v, m: (m["inventory"][0].update(bytes=first.Q104_OUTPUT_ENTITLEMENT_BYTES),
+        m.update(total_logical_bytes=first.Q104_OUTPUT_ENTITLEMENT_BYTES + len(m["inventory"]) - 1)),
+])
+def test_Q104_refuses_missing_all_stage_reference_or_budget_evidence(change):
+    task, value, objects = all_stage_reference_TESTONLY()
+    measure = objects[value["measurement"]["path"]]; change(value, measure)
+    with pytest.raises(CachePolicyError):
+        first.checked_all_stage_reference(task, value, read=lambda pin: deepcopy(objects[pin["path"]]))
+
+
+def test_Q104_all_stage_data_checks_every_published_and_retained_file():
+    task, value, objects = all_stage_reference_TESTONLY()
+    # TESTONLY structural metadata, not a Root release or actual measurement.
+    assert first.checked_all_stage_reference(task, value,
+        read=lambda pin: deepcopy(objects[pin["path"]])) == value
+
+
+@pytest.mark.parametrize("change", [
+    lambda c, m: c.update(backend="cuda"),
+    lambda c, m: c.update(actual_worker=None),
+    lambda c, m: c["actual_worker"].update(machine="olav-cpu"),
+    lambda c, m: c.update(commit="e" * 40),
+    lambda c, m: c.update(newly_computed_frames=38),
+    lambda c, m: c["frame_producers"].reverse(),
+    lambda c, m: c["records"].reverse(),
+    lambda c, m: c["records"][0]["files"].pop("products.npz"),
+    lambda c, m: c["records"][0]["files"]["native_geometry.npz"].update(size_bytes=2),
+    lambda c, m: c["records"][0]["files"]["native_statistics.json.gz"].update(sha256="c" * 64),
+    lambda c, m: c["frame_producers"][0]["result"].update(path="C:/TESTONLY/outside.json"),
+    lambda c, m: c["frame_producers"][0]["publication"].update(sha256="c" * 64),
+])
+def test_Q104_refuses_stale_commit_prefix_reordered_producer_or_final_file_identity(change):
+    task, value, objects = all_stage_reference_TESTONLY()
+    complete = objects[value["reference_completion"]["path"]]
+    change(complete, objects[value["measurement"]["path"]])
+    with pytest.raises(CachePolicyError):
+        first.checked_all_stage_reference(task, value, read=lambda pin: deepcopy(objects[pin["path"]]))
+
+
+def test_physical_bound_evidence_cannot_be_used_as_old_lifetime_profile():
+    # Even a purported completed observation cannot provide the mandatory exact
+    # bounded record, and the ordinary consumer must never fall back to old IO.
+    with pytest.raises(CachePolicyError, match="Exact bounded evidence"):
+        first.require_publishable(dict(format=first.OBSERVATION, complete=True),
+            dict(format=first.BOUNDED_EVIDENCE, actual_writer_IO_proven=True,
+                maximum_observed_cache_bytes=7, passed=True))
+
+
+def bounded_evidence_TESTONLY():
+    from darsia_cache.environment import FIRST_WRITER_ENVIRONMENT_KEYS
+    state, _ = protocol(); owner = dict(TESTONLY="not a process observation")
+    root = "C:/TESTONLY/service"; bound = bound_plan_TESTONLY()
+    bound["volume_cap_observation"]["virtual_size_bytes"] = 500 * 1024**3
+    env = {key: root + "/" + key.lower() for key in FIRST_WRITER_ENVIRONMENT_KEYS}
+    env["NUMBA_CACHE_LOCATOR_CLASSES"] = "UserProvidedCacheLocator"
+    row = dict(owner=owner, registration=pin("registration.json"), inventory=pin("exit.json"),
+        all_file_backed_modules_predeclared_and_exact=True, undeclared=[], actual_writer_environment=env,
+        writer_environment_is_actual_IO_or_lifetime_proof=False)
+    cache = dict(logical_bytes=7)
+    observation = dict(format=first.OBSERVATION, complete=True, request=state.binding,
+        provider=state.provider_binding, stores_source=state.stores_source, scope=state.provider["scope"],
+        retirement=pin("retirement.json"), source_runtime_before_after_exact=True,
+        actual_public_worker_exit_code=0, operational_reserve_crossed=False,
+        sampled_cache_logical_high_water_is_lifetime_peak=False,
+        reserve_samples_prove_no_crossing_between_samples=False,
+        actual_registered_owner_exit_inventories=[row], reserve_watchdog_period_seconds=1,
+        reserve_samples=[dict(utc="TESTONLY", monotonic_seconds=1.0,
+            actual_gap_since_previous_start_seconds=None, operational_reserve_bytes=PHYSICAL_RESERVE_BYTES,
+            at_or_below_operational_reserve=False, free_volume_observation=dict(free_bytes=PHYSICAL_RESERVE_BYTES+1))],
+        sample_count=1, cache_samples=[dict(started_monotonic_seconds=1.0, elapsed_seconds=.1,
+            actual_gap_since_previous_start_seconds=None, observation=cache)],
+        final_sample=cache, sampled_cache_logical_high_water_bytes=7)
+    reserved = dict(format="darsia-cache-budget-reservation-v2", token="1" * 32,
+        pool="TESTONLY", owner=owner, maximum_bytes=100)
+    value = dict(format=first.BOUNDED_EVIDENCE,
+        **{key: observation[key] for key in ("request", "provider", "stores_source", "scope", "retirement")},
+        namespace_admission=pin("namespace.json"), capacity_bound_plan=pin("bound.json"), capacity_bound=bound,
+        service_namespace=root, administrative_service_entitlement=dict(maximum_bytes=100, measured_profile=False),
+        actual_service_reservation=dict(token=reserved["token"], pool=reserved["pool"], sha256=first._digest(reserved)),
+        actual_service_reservation_document=reserved, actual_volume_observation=bound["volume_cap_observation"],
+        registered_owner_environments=[row], observation_sha256=first._digest(observation),
+        source_runtime_before_after_exact=True, actual_writer_IO_proven=False,
+        writer_lifetime_cache_bytes_proof=None, sampled_highwater_is_lifetime_peak=False,
+        output_evidence=None, original_comparison=None, ordinary_use_authorization=None,
+        profile_publication_state="UNQUALIFIED_BOUND_OBSERVATION", no_ordinary_profile_created=True)
+    return observation, value
+
+
+def test_typed_bound_record_preserves_gaps_without_minting_an_ordinary_profile():
+    observation, value = bounded_evidence_TESTONLY()
+    assert first.checked_bounded_evidence(observation, value) == value
+    with pytest.raises(CachePolicyError, match="Bounded observation alone"):
+        first.require_publishable(observation, value)
+
+
+def test_bound_producer_uses_readonly_context_cap_and_loaded_receipt_not_projection():
+    observation, value = bounded_evidence_TESTONLY(); state, _ = protocol()
+    state.bound_mode = True; state.required_capacity_bound = value["capacity_bound"]
+    state.request["capacity_bound_plan"] = value["capacity_bound_plan"]
+    class ReadOnlyLedger_TESTONLY:
+        volume_cap_observation = value["actual_volume_observation"]
+        @contextmanager
+        def locked(self, *, create_binding):
+            assert create_binding is False
+            yield self
+        def project(self, *_):
+            pytest.fail("Original observer context deliberately cannot measure producer cache")
+        def require_reservation(self, reservation, owner, maximum):
+            assert reservation == value["actual_service_reservation"]
+            assert owner == value["actual_service_reservation_document"]["owner"]
+            assert maximum == value["administrative_service_entitlement"]["maximum_bytes"]
+            return value["actual_service_reservation_document"], b"TESTONLY"
+    context = SimpleNamespace(ledger=ReadOnlyLedger_TESTONLY(), root=value["service_namespace"],
+        reservation=value["actual_service_reservation"],
+        manifest=dict(owner=value["actual_service_reservation_document"]["owner"]), maximum=100,
+        receipt=pin("service-receipt.json"))  # Real context holds a descriptor.
+    loaded = dict(first_qualification=dict(administrative_entitlement=value["administrative_service_entitlement"]))
+    assert first.bounded_evidence(state, context, observation, service_receipt=loaded) == value
+
+
+def test_forced_zero_gap_sample_is_preserved_without_claiming_continuous_coverage():
+    observation, value = bounded_evidence_TESTONLY()
+    terminal = deepcopy(observation["reserve_samples"][0]); terminal["actual_gap_since_previous_start_seconds"] = 0
+    observation["reserve_samples"].append(terminal)
+    value["observation_sha256"] = first._digest(observation)
+    assert first.checked_bounded_evidence(observation, value) == value
+
+
+@pytest.mark.parametrize("change", [
+    lambda o, v: v.update(actual_writer_IO_proven=True),
+    lambda o, v: v.update(writer_lifetime_cache_bytes_proof=pin("invented-lifetime.json")),
+    lambda o, v: v.update(ordinary_use_authorization=pin("invented-authorization.json")),
+    lambda o, v: v.update(actual_volume_observation={}),
+    lambda o, v: v.update(service_namespace="C:/TESTONLY/../service"),
+    lambda o, v: v["administrative_service_entitlement"].update(maximum_bytes=500*1024**3),
+    lambda o, v: v["registered_owner_environments"][0]["actual_writer_environment"].update(TEMP="C:/outside"),
+    lambda o, v: v["registered_owner_environments"][0].update(undeclared=["unknown.py"]),
+    lambda o, v: o.update(operational_reserve_crossed=True),
+    lambda o, v: o["reserve_samples"][0].update(actual_gap_since_previous_start_seconds=0),
+    lambda o, v: o.update(sampled_cache_logical_high_water_bytes=8),
+])
+def test_typed_bound_reader_refuses_conflicts_missing_writers_and_lifetime_claims(change):
+    observation, value = bounded_evidence_TESTONLY(); change(observation, value)
+    value["observation_sha256"] = first._digest(observation)
+    with pytest.raises(CachePolicyError):
+        first.checked_bounded_evidence(observation, value)
+
+
+def bound_output_state_TESTONLY():
+    state, _ = protocol(); state.bound_mode = True
+    scope = dict(format="darsia-first-q104-output-scope-v1", role="results",
+        path="C:/TESTONLY/current-results", identity=dict(TESTONLY="not admitted"),
+        stat_identity=dict(st_dev=1, st_ino=2, creation_ns=3), volume_id="TESTONLY",
+        entry_limit=1000, sample_period_seconds=1)
+    state.output_entitlement = dict(format=first.BOUND_OUTPUT_ADMINISTRATION,
+        administrative_output_entitlement_bytes=first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES,
+        watched_output_scope=scope)
+    state.request["output_entitlement_plan"] = pin("output-plan.json")
+    return state, scope
+
+
+@pytest.mark.parametrize("change", [
+    lambda v: v.update(path="C:/TESTONLY/../unowned"),
+    lambda v: v.update(entry_limit=0),
+    lambda v: v.update(entry_limit=100001),
+    lambda v: v.update(sample_period_seconds=2),
+    lambda v: v.update(role="cache"),
+    lambda v: v["stat_identity"].update(st_ino=0),
+])
+def test_bound_output_scope_requires_one_exact_current_root_and_original_watch_target(change):
+    _, scope = bound_output_state_TESTONLY(); change(scope)
+    with pytest.raises(CachePolicyError): first.checked_bound_output_scope(scope)
+
+
+def test_output_watch_period_and_latched_crossing_never_become_recovered_PASS(monkeypatch):
+    state, _ = bound_output_state_TESTONLY(); now = [0.0]; calls = []; stops = []
+    watcher = first.BoundOutputObservations(state, clock=lambda: now[0])
+    def snapshot(scope, *, entitlement_bytes, include_file_stats=False):
+        calls.append(now[0])
+        assert entitlement_bytes == first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES
+        size = entitlement_bytes + 1 if now[0] == 1 else 5
+        return dict(utc="TESTONLY", logical_bytes=size, entries=1,
+            volume=dict(free_bytes=PHYSICAL_RESERVE_BYTES+entitlement_bytes+1),
+            observed_scan_anomalies=[], file_stats=[] if include_file_stats else None)
+    monkeypatch.setattr(first, "bound_output_snapshot", snapshot)
+    monkeypatch.setattr(first, "latch_bound_output_stop", lambda f, l, reason, row:
+        (stops.append(reason) or dict(requested=False, state="TESTONLY_NOT_AN_ACTUAL_COMMAND")))
+    owned = SimpleNamespace(lease=object())
+    for instant in [0, .2, 1, 1.2, 2]:
+        now[0] = instant; watcher.observe_output(owned)
+    watcher.observe_output(owned, force=True)
+    doc = watcher.output_document(dict(accounting=dict(active_processes=0), wrapper_exit_code=0),
+        pin("retirement.json"), dict(original_retirement_verifier_accepted=True))
+    assert calls == [0, 1, 2, 2]
+    assert stops == ["OUTPUT_ENTITLEMENT_EXCEEDED"]
+    assert doc["sampled_highwater_bytes"] == first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES + 1
+    assert doc["closed_output_logical_bytes"] == 5  # Actual closed size is not a recovery of PASS.
+    assert doc["complete"] is False and doc["passed"] is False
+    assert doc["sampled_highwater_is_lifetime_peak"] is False
+    assert doc["state"] == "STOP_OR_INCOMPLETE_DIAGNOSTIC"
+
+
+def test_output_sampling_error_preserves_primary_exception_if_stop_record_also_fails(monkeypatch):
+    state, _ = bound_output_state_TESTONLY(); watcher = first.BoundOutputObservations(state)
+    def snapshot(*args, **kwargs): raise OSError("TESTONLY original sampling failure")
+    def stop(*args): raise RuntimeError("TESTONLY stop-record failure")
+    monkeypatch.setattr(first, "bound_output_snapshot", snapshot)
+    monkeypatch.setattr(first, "latch_bound_output_stop", stop)
+    with pytest.raises(OSError, match="original sampling failure") as caught:
+        watcher.observe_output(SimpleNamespace(lease=object()))
+    assert "stop-record failure" in caught.value.__notes__[0]
+    doc = watcher.output_document(None, None, None)
+    assert doc["first_observation_error"]["error_type"] == "OSError"
+    assert doc["complete"] is False and doc["passed"] is False
+    assert doc["closed_output_logical_bytes"] is None
+
+
+def test_closed_output_needs_original_retirement_and_never_mints_a_profile(monkeypatch):
+    state, _ = bound_output_state_TESTONLY(); watcher = first.BoundOutputObservations(state)
+    monkeypatch.setattr(first, "bound_output_snapshot", lambda *args, **kwargs:
+        dict(utc="TESTONLY", logical_bytes=7, entries=1,
+            volume=dict(free_bytes=PHYSICAL_RESERVE_BYTES+first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES+1),
+            observed_scan_anomalies=[], file_stats=[]))
+    watcher.observe_output(SimpleNamespace(lease=object()), force=True)
+    doc = watcher.output_document(dict(accounting=dict(active_processes=0), wrapper_exit_code=0),
+        pin("retirement.json"), None)
+    assert doc["closed_output_stat_observation"] is False
+    assert doc["closed_output_logical_bytes"] is None
+    assert doc["passed"] is False and doc["no_result_space_profile_created"] is True
+
+
+def test_output_admission_refuses_retained_data_and_scope_overlap_before_native_start(monkeypatch):
+    state, scope = bound_output_state_TESTONLY(); watcher = first.BoundOutputObservations(state)
+    lease = SimpleNamespace(policy=SimpleNamespace(root="Q:/TESTONLY/cache"))
+    monkeypatch.setattr(first, "bound_output_snapshot", lambda scope, **kwargs:
+        dict(logical_bytes=1, observed_scan_anomalies=[],
+            volume=dict(free_bytes=PHYSICAL_RESERVE_BYTES+first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES+1)))
+    with pytest.raises(CachePolicyError, match="Fresh complete output scope"):
+        watcher.admit_output(lease)
+    lease.policy.root = scope["path"]
+    with pytest.raises(CachePolicyError, match="disjoint"):
+        watcher.admit_output(lease)
+
+
+def comparison_contract_TESTONLY(task, reference, objects):
+    sources = dict(numeric_checker=dict(path="C:/TESTONLY/original9949.py",
+        sha256="9949a184fef7e3b55c75336544fa04f52a2062f1b37cfdad1018f2243280b5ce", size_bytes=17239),
+        record_extractors=dict(path="C:/TESTONLY/original95dc.py",
+        sha256="95dc41bf655c5d22a91dd5bf7cf55430f0f5a511d8d7cdabe8f8e68378b6aa13", size_bytes=21587),
+        adapter=pin("reviewed-current-pair.py"), read_locator=pin("locator.py"), typed_ipp_validator=pin("ipp.py"))
+    binding = pin("predeclared-comparison-contract.json")
+    review = pin("adapter-source-review.json")
+    objects[review["path"]] = {"TESTONLY": "not actual Root review"}
+    objects[binding["path"]] = dict(format="darsia-first-volume-bound-current-comparison-contract-v1",
+        scope={key:task[key] for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")},
+        reference_commit=reference["reference_commit"], candidate_commit=task["commit"],
+        reference_completed=reference["reference_completion"], sources=sources,
+        source_pair_compatibility=reference["reference_source_compatibility"], adapter_source_review=review,
+        public_command=["C:/TESTONLY/python.exe", "-B", sources["adapter"]["path"]],
+        report_format="TESTONLY-current-whole39-comparison", comparison_kind="same_precision")
+    return binding
+
+
+def whole_output_administration_TESTONLY(*, extra_retained_bytes=0):
+    task, reference, objects = all_stage_reference_TESTONLY()
+    measurement = objects[reference["measurement"]["path"]]
+    if extra_retained_bytes:
+        measurement["inventory"].append(dict(relative_path="preparation/retained.tmp",
+            bytes=extra_retained_bytes, sha256="f" * 64))
+        measurement["total_logical_bytes"] += extra_retained_bytes
+    reference_binding = pin("whole-all-stage-reference.json")
+    answers_binding = pin("Q109-Q117-Q119-answers.json")
+    objects[reference_binding["path"]] = reference
+    objects[answers_binding["path"]] = [dict(id=name, decided_by="claude") for name in (
+        "Q109-answer-option-A-whole-output-entitlement-65728995330B-all-stages-count",
+        "Q117-answer-yes-this-is-the-Q102-Q104-Q106-evidence-contract",
+        "Q119-answer-Q109-entitlement-already-covers-first-qualification-or-twice-measured-allstage")]
+    _, output_scope = bound_output_state_TESTONLY()
+    value = dict(format=first.BOUND_OUTPUT_ADMINISTRATION,
+        authority_ids=["Q104", "Q109", "Q117", "Q119"], answers_source=answers_binding,
+        task=pin("task.json"), scope={key:task[key] for key in (
+            "commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")},
+        all_stage_reference=reference_binding,
+        comparison_contract=comparison_contract_TESTONLY(task, reference, objects),
+        administrative_output_entitlement_bytes=max(first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES,
+            2 * measurement["total_logical_bytes"]),
+        measured_profile=False, watched_output_scope=output_scope,
+        producer_state="PREDECLARED_NOT_QUALIFIED")
+    return task, value, objects
+
+
+@pytest.mark.parametrize("extra", [0, 65728995330])
+def test_Q119_predeclares_whole_allstage_maximum_without_inventing_per_frame_bytes(extra, monkeypatch):
+    monkeypatch.setattr("darsia_cache.owned_process._exact_source", lambda pin: None)
+    task, value, objects = whole_output_administration_TESTONLY(extra_retained_bytes=extra)
+    result = first.checked_output_entitlement(task, value, task_binding=pin("task.json"),
+        read=lambda binding: deepcopy(objects[binding["path"]]))
+    measured = objects[objects[value["all_stage_reference"]["path"]]["measurement"]["path"]]
+    assert result == value
+    assert result["administrative_output_entitlement_bytes"] == max(
+        first.FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES, 2 * measured["total_logical_bytes"])
+    assert result["measured_profile"] is False
+
+
+@pytest.mark.parametrize("change", [
+    lambda v, o: v.update(administrative_output_entitlement_bytes=27374032352),
+    lambda v, o: v.update(administrative_output_entitlement_bytes=v["administrative_output_entitlement_bytes"]+1),
+    lambda v, o: v.update(measured_profile=True),
+    lambda v, o: v.update(producer_state="QUALIFIED"),
+    lambda v, o: v["scope"].update(backend="cuda"),
+    lambda v, o: o[v["answers_source"]["path"]].pop(),
+    lambda v, o: o[v["answers_source"]["path"]][-1].update(decided_by="UNKNOWN"),
+])
+def test_Q119_refuses_old_footprint_unbound_authority_or_unreviewed_entitlement(change, monkeypatch):
+    monkeypatch.setattr("darsia_cache.owned_process._exact_source", lambda pin: None)
+    task, value, objects = whole_output_administration_TESTONLY(); change(value, objects)
+    with pytest.raises(CachePolicyError):
+        first.checked_output_entitlement(task, value, task_binding=pin("task.json"),
+            read=lambda binding: deepcopy(objects[binding["path"]]))
+
+
+def actual_comparison_TESTONLY():
+    state, _ = protocol()
+    task, reference, objects = all_stage_reference_TESTONLY()
+    _, candidate, new = all_stage_reference_TESTONLY(label="candidate", reference_commit=task["commit"])
+    objects.update(new); state.task = task
+    refpin = pin("reference-allstage.json"); objects[refpin["path"]] = reference
+    contractpin = comparison_contract_TESTONLY(task, reference, objects)
+    state.output_entitlement = dict(all_stage_reference=refpin, comparison_contract=contractpin)
+    contract = objects[contractpin["path"]]; rows = []
+    for index, case in enumerate(task["ordered_case_ids"]):
+        receipt = pin(case + "-original-comparison.json")
+        objects[receipt["path"]] = dict(case_id=case, limits_passed=True, first_failure=None,
+            reference_result=objects[reference["reference_completion"]["path"]]["frame_producers"][index]["result"],
+            candidate_result=objects[candidate["reference_completion"]["path"]]["frame_producers"][index]["result"])
+        rows.append(dict(case_id=case, passed=True, first_failure=None, receipt=receipt))
+    reportpin, proofpin = pin("original-completed.json"), pin("original-os-retirement-proof.json")
+    objects[reportpin["path"]] = dict(format=contract["report_format"], complete=True,
+        comparison_kind="same_precision", numeric_checker=contract["sources"]["numeric_checker"],
+        reference_completed=reference["reference_completion"], candidate_completed=candidate["reference_completion"],
+        case_count=39, new_comparisons_count=39, ordered_case_ids=task["ordered_case_ids"],
+        accepted_prior_comparisons=[], frame_add8_limits_passed=True, new_scientific_arrays_computed=False,
+        comparisons=rows)
+    proof = dict(format="darsia-first-volume-bound-original-comparison-v1", contract=contractpin,
+        report=reportpin, actual_command=contract["public_command"], actual_exit_code=0,
+        retirement=pin("original-comparator-retirement.json"),
+        source_runtime_before_after=pin("original-comparison-source-post.json"), Root_acceptance=pin("comparison-Root.json"))
+    objects[proofpin["path"]] = proof
+    objects[proof["retirement"]["path"]] = dict(format="darsia-first-original-comparator-retirement-v1",
+        actual_exit_code=0, actual_command=contract["public_command"], all_owned_retired=True,
+        known_epochs=[dict(pid=7, process_create_time=123.0, exact_incarnation_absent=True)])
+    objects[proof["source_runtime_before_after"]["path"]] = dict(module_closure=state.provider["module_closure"],
+        source_runtime_before_after_exact=True, comparison_sources=contract["sources"])
+    objects[proof["Root_acceptance"]["path"]] = {"TESTONLY": "not actual acceptance"}
+    return state, candidate, proofpin, objects
+
+
+def test_original_whole39_comparison_contract_preserves_distinct_actual_source_commits(monkeypatch):
+    monkeypatch.setattr("darsia_cache.owned_process._exact_source", lambda pin: None)
+    state, candidate, proof, objects = actual_comparison_TESTONLY()
+    assert first._checked_bound_comparison(state, proof, candidate=candidate,
+        read=lambda bound: deepcopy(objects[bound["path"]])) == objects[proof["path"]]
+    assert objects[state.output_entitlement["comparison_contract"]["path"]]["reference_commit"] != state.task["commit"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda p, c, r, o: p.update(actual_exit_code=False),
+    lambda p, c, r, o: p.update(actual_exit_code=1),
+    lambda p, c, r, o: p.update(actual_command=["unreviewed-adapter"]),
+    lambda p, c, r, o: c.update(candidate_commit="e"*40),
+    lambda p, c, r, o: c["sources"]["numeric_checker"].update(sha256="f"*64),
+    lambda p, c, r, o: r.update(new_comparisons_count=8),
+    lambda p, c, r, o: r.update(accepted_prior_comparisons=["ac52_f0"]),
+    lambda p, c, r, o: r.update(new_scientific_arrays_computed=True),
+    lambda p, c, r, o: r["comparisons"].reverse(),
+    lambda p, c, r, o: r["comparisons"][0].update(passed=False),
+    lambda p, c, r, o: o[r["comparisons"][0]["receipt"]["path"]].update(candidate_result=pin("unrelated.json")),
+    lambda p, c, r, o: o[p["retirement"]["path"]]["known_epochs"][0].update(exact_incarnation_absent=False),
+    lambda p, c, r, o: o[p["source_runtime_before_after"]["path"]].update(source_runtime_before_after_exact=False),
+])
+def test_comparison_refuses_reuse_wrong_source_missing_os_or_actual_retirement(change, monkeypatch):
+    monkeypatch.setattr("darsia_cache.owned_process._exact_source", lambda pin: None)
+    state, candidate, pin_value, objects = actual_comparison_TESTONLY()
+    proof = objects[pin_value["path"]]; contract = objects[proof["contract"]["path"]]
+    report = objects[proof["report"]["path"]]; change(proof, contract, report, objects)
+    with pytest.raises(CachePolicyError):
+        first._checked_bound_comparison(state, pin_value, candidate=candidate,
+            read=lambda bound: deepcopy(objects[bound["path"]]))
+
+
+def test_typed_bound_import_requires_actual_worker_role_namespace_and_original_cap():
+    bound = bound_plan_TESTONLY(); binding = dict(TESTONLY="not actual Q87")
+    bound["enforcement_state"] = "PREDECLARED_Q106_VOLUME_BOUND"
+    bound["volume_cap_observation"].update(binding=binding, virtual_size_bytes=500*1024**3)
+    profile = dict(format=first.BOUND_IMPORT_PROFILE, purpose="jobs", entry_kind="worker",
+        role_identifier="actual_owned_jobs", namespace_admission=pin("namespace.json"),
+        writer_contract=first.BOUND_WRITER_CONTRACT, sampled_highwater_is_lifetime_peak=False,
+        actual_writer_IO_proven=False, capacity_bound=bound,
+        operational_service_entitlement_bytes=100, maximum_cache_bytes=100)
+    policy = SimpleNamespace(quota_bytes=500*1024**3,
+        volume_cap=SimpleNamespace(maximum_size_bytes=500*1024**3, document=lambda: binding))
+    arguments = dict(purpose="jobs", entry_kind="worker", role_identifier="actual_owned_jobs",
+        policy=policy, namespace=pin("namespace.json"))
+    assert first.checked_bound_import_context(profile, **arguments) == 100
+    for key, value in [("purpose", "tests"), ("entry_kind", "runtime"),
+            ("role_identifier", "other"), ("namespace", pin("other-namespace.json"))]:
+        with pytest.raises(CachePolicyError):
+            first.checked_bound_import_context(profile, **dict(arguments, **{key:value}))
+    changed = deepcopy(profile); changed["actual_writer_IO_proven"] = True
+    with pytest.raises(CachePolicyError): first.checked_bound_import_context(changed, **arguments)
+
+
+def test_bound_publication_writes_only_fixed_profiles_then_final_completion_without_cycle(monkeypatch):
+    state, _ = protocol(); state.bound_mode = True
+    documents = ({"format":first.BOUND_IMPORT_PROFILE}, {"format":first.BOUND_JOB_PROFILE},
+        dict(observation=pin("observation.json"), writer_evidence=pin("writer.json"),
+            measurement=pin("measurement.json"), native_completion=pin("native.json"), retirement=pin("retired.json")))
+    written = []
+    monkeypatch.setattr(first, "_bound_profile_documents", lambda *args, **kwargs: deepcopy(documents))
+    def slot(provider_value, role, value):
+        written.append((role, deepcopy(value))); return pin(role + ".json")
+    monkeypatch.setattr(first, "_slot_write", slot)
+    assert first._publish_bound_profiles(state, {"TESTONLY":"already checked by pure constructor"}, read=lambda p:None) == pin("completion.json")
+    assert [role for role, body in written] == ["import_profile", "job_profile", "completion"]
+    assert all("profiles" not in body for role,body in written[:-1])
+    assert written[-1][1]["profiles"] == dict(import_profile=pin("import_profile.json"), job_profile=pin("job_profile.json"))
+
+
+def bound_documents_TESTONLY(monkeypatch):
+    """Actual existing receipt shapes; no process, Root authority or array data."""
+    state, objects = protocol(); task, admin, refs = whole_output_administration_TESTONLY()
+    objects.update(refs); state.bound_mode = True; state.task = task; state.output_entitlement = admin
+    state.request["output_entitlement_plan"] = pin("current-output-admin.json")
+    _, candidate, generated = all_stage_reference_TESTONLY(label="candidate", reference_commit=task["commit"])
+    objects.update(generated); candidatepin = pin("candidate-allstage.json"); objects[candidatepin["path"]] = candidate
+    observation, evidence = bounded_evidence_TESTONLY()
+    evidence["capacity_bound"]["enforcement_state"] = "PREDECLARED_Q106_VOLUME_BOUND"
+    state.required_capacity_bound = evidence["capacity_bound"]
+    slotpins = {role:pin(role+".json") for role in ("observation", "writer_evidence", "measurement", "native_completion")}
+    terminal = dict(accounting=dict(active_processes=0, total_processes=3), wrapper_exit_code=0)
+    eligibility = dict(original_retirement_verifier_accepted=True, seal=pin("seal.json"))
+    observation.update(actual_claim=task, output_measurement=slotpins["measurement"], kernel_total_processes=3,
+        original_kernel_terminal=terminal, original_publication_and_retirement_eligibility=eligibility,
+        native_launch=pin("native-launch.json"), service_receipt=pin("actual-service.json"))
+    evidence["observation_sha256"] = first._digest(observation)
+    objects[eligibility["seal"]["path"]] = dict(value=dict(outcome="success"))
+    actual_owner = evidence["registered_owner_environments"][0]["owner"]
+    objects[observation["retirement"]["path"]] = dict(format="darsia-native-owned-worker-retirement-v1",
+        native_launch=observation["native_launch"], service_receipt=observation["service_receipt"],
+        whole_family_kernel_observation=True, terminal=terminal, primary=actual_owner,
+        actual_primary_binding=pin("actual-primary-native-handle.json"))
+    objects["C:/TESTONLY/actual-primary-native-handle.json"] = dict(actual_service_receipt=observation["service_receipt"],
+        original_native_launch=observation["native_launch"], actual_primary=actual_owner,
+        held_process_handle_observed_while_live=True, same_original_job_membership_observed=True)
+    service = dict(format="darsia-cache-import-service-receipt-v1", policy=state.stores_source,
+        profile=state.provider_binding, namespace=state.provider["namespace_admission"],
+        entry_kind="worker", role_identifier="actual_jobs_role",
+        manifest=dict(purpose="jobs", root=evidence["service_namespace"], reservation=evidence["actual_service_reservation"],
+            owner=actual_owner, maximum_bytes=100, native_launch_context=observation["native_launch"],
+            root_identity=dict(TESTONLY="not an actual file ID")),
+        first_qualification=dict(request=state.binding, provider=state.provider_binding,
+            administrative_entitlement=evidence["administrative_service_entitlement"]))
+    from darsia_cache.environment import FIRST_WRITER_ENVIRONMENT_KEYS, FIRST_WRITER_SUBDIRECTORIES
+    service["manifest"]["fresh_scope_provenance"] = dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
+        owner=actual_owner, token=evidence["actual_service_reservation"]["token"], purpose="jobs",
+        root_identity=service["manifest"]["root_identity"], creation_disposition="NtCreateFile.FILE_CREATE",
+        exclusive_root_handle=True, initial_names=[], initial_empty_observed_utc="2026-01-01T00:00:00+00:00",
+        observation_precedes_writer_subdirectories_and_imports=True,
+        writer_subdirectories=list(FIRST_WRITER_SUBDIRECTORIES), writer_environment_keys=list(FIRST_WRITER_ENVIRONMENT_KEYS))
+    objects[observation["service_receipt"]["path"]] = service
+    row = evidence["registered_owner_environments"][0]
+    objects[row["registration"]["path"]] = dict(format="darsia-cache-service-lifecycle-v1", kind="owner",
+        binding=dict(reservation=service["manifest"]["reservation"], policy=state.stores_source,
+            profile=state.provider_binding, namespace=state.provider["namespace_admission"], manifest=service["manifest"]),
+        actor=actual_owner, value=dict(owner=actual_owner, native_job_membership=observation["native_launch"]))
+    objects[row["inventory"]["path"]] = dict(owner=actual_owner, first_qualification_modules=dict(
+        request=state.binding, provider=state.provider_binding, all_file_backed_modules_predeclared_and_exact=True,
+        undeclared=[], predeclared_module_closure_sha256=first._digest(state.provider["module_closure"]),
+        actual_writer_environment=row["actual_writer_environment"], writer_environment_is_actual_IO_or_lifetime_proof=False))
+    closed = objects[candidate["measurement"]["path"]]
+    admin["watched_output_scope"].update(path=closed["root"], identity=closed["root_identity"])
+    actual_output = dict(format="darsia-first-q104-closed-output-diagnostic-v1", request=state.binding,
+        provider=state.provider_binding, stores_source=state.stores_source, scope=state.provider["scope"],
+        output_plan=state.request["output_entitlement_plan"], output_scope=admin["watched_output_scope"],
+        complete=True, first_stop=None, first_observation_error=None, cache_operational_reserve_crossed=False,
+        whole_output_entitlement_observed_exceeded=False, actual_retirement=observation["retirement"],
+        actual_terminal=terminal, entitlement_bytes=admin["administrative_output_entitlement_bytes"],
+        closed_output_logical_bytes=closed["total_logical_bytes"], sampled_highwater_is_lifetime_peak=False,
+        output_hard_quota=False, target_sample_period_seconds=1,
+        admission=dict(logical_bytes=0, observed_scan_anomalies=[],
+            volume=dict(free_bytes=PHYSICAL_RESERVE_BYTES+admin["administrative_output_entitlement_bytes"])),
+        output_samples=[dict(started_monotonic_seconds=1., elapsed_seconds=.1,
+            actual_gap_since_previous_start_seconds=None, sampled=True, complete_lifetime_peak=False,
+            free_bytes=PHYSICAL_RESERVE_BYTES+1, logical_bytes=closed["total_logical_bytes"], forced_terminal=True)],
+        sampled_highwater_bytes=closed["total_logical_bytes"],
+        final_snapshot=dict(logical_bytes=closed["total_logical_bytes"],
+            file_stats=[dict(relative_path=row["relative_path"], size_bytes=row["bytes"]) for row in closed["inventory"]]))
+    native = dict(format="darsia-native-worker-first-qualification-completion-v1",
+        **{key:observation[key] for key in ("request", "provider", "stores_source", "scope", "retirement")},
+        observation=slotpins["observation"], startup=state.provider["startup"],
+        module_closure=state.provider["module_closure"], complete=True, passed=True,
+        observer_native_handles_closed=True, cache_profile_qualified=False, maximum_family_processes=3, eligibility=eligibility)
+    slots = dict(observation=observation, writer_evidence=evidence, measurement=actual_output, native_completion=native)
+    bindings = dict(candidate_all_stage=candidatepin, original_comparison=pin("independent-original-comparison.json"),
+        once_marker=pin("cache-first-"+state._once_key()+".json"))
+    objects[bindings["once_marker"]["path"]] = dict(format="darsia-cache-first-qualification-consumed-v1",
+        **{key:observation[key] for key in ("request", "provider", "stores_source", "scope")}, no_retry=True)
+    monkeypatch.setattr(first, "_slot_read", lambda provider_value, role:(deepcopy(slots[role]), slotpins[role]))
+    monkeypatch.setattr(first, "_checked_bound_comparison", lambda *args, **kwargs:{"TESTONLY":"independently tested contract above"})
+    monkeypatch.setattr(first, "_checked_bound_writer_compatibility", lambda *args:None)
+    return state, bindings, objects, slots
+
+
+def test_completed_bound_projection_uses_real_receipt_shape_and_never_lifetime_fields(monkeypatch):
+    state, bindings, objects, slots = bound_documents_TESTONLY(monkeypatch)
+    imported, jobs, actual = first._bound_profile_documents(state, bindings,
+        read=lambda bound:deepcopy(objects[bound["path"]]))
+    assert imported["format"] == first.BOUND_IMPORT_PROFILE and imported["role_identifier"] == "actual_jobs_role"
+    assert imported["maximum_cache_bytes"] == 100  # Actual operational reservation, not500GiB+reserve.
+    assert imported["native_supervision"]["format"] == "darsia-native-worker-supervision-profile-v1"
+    assert jobs["additional_claim_cache_bytes"] == 0 and "maximum_observed_cache_bytes" not in jobs
+    assert jobs["actual_writer_IO_proven"] is False and jobs["sampled_highwater_is_lifetime_peak"] is False
+    assert jobs["result_profile"]["measurement"]["inventory"]
+    assert actual["measurement"] == slots["observation"]["output_measurement"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda b,o,s:s["native_completion"].update(passed=False),
+    lambda b,o,s:s["native_completion"].update(observer_native_handles_closed=False),
+    lambda b,o,s:o[s["observation"]["retirement"]["path"]]["terminal"]["accounting"].update(active_processes=1),
+    lambda b,o,s:o[s["observation"]["service_receipt"]["path"]]["manifest"].update(purpose="tests"),
+    lambda b,o,s:o[b["once_marker"]["path"]].update(no_retry=False),
+    lambda b,o,s:s["measurement"].update(first_stop={"reason":"OUTPUT_ENTITLEMENT_EXCEEDED"}),
+    lambda b,o,s:s["measurement"].update(output_samples=[]),
+    lambda b,o,s:s["measurement"]["final_snapshot"]["file_stats"].pop(),
+])
+def test_native_once_namespace_or_output_stop_never_projects_ordinary_profiles(change, monkeypatch):
+    state, bindings, objects, slots = bound_documents_TESTONLY(monkeypatch); change(bindings, objects, slots)
+    with pytest.raises(CachePolicyError):
+        first._bound_profile_documents(state, bindings, read=lambda bound:deepcopy(objects[bound["path"]]))
 
 
 def test_Q106_reserve_samples_are_one_second_separate_from_full_stat_and_latch_STOP(monkeypatch):
@@ -614,3 +1235,43 @@ def test_authority_list_keeps_original_raw_descriptor_and_path_guards(tmp_path,c
     elif change=="unc":binding["path"]=r"\\TESTONLY\share\answers.json"
     with pytest.raises((ValueError,OSError)):
         _exact_authority_list(binding,str(tmp_path/"source"/"darsia"/"__init__.py"))
+
+
+def test_direct_bound_import_profile_cannot_bypass_checked_provider_DAG(monkeypatch):
+    fake = dict(format=first.BOUND_IMPORT_PROFILE,
+        completion=pin("fake-complete-passed.json"))
+    def no_slot_read(*args, **kwargs):
+        raise AssertionError("Direct typed profiles must refuse before slot or allocation use")
+    monkeypatch.setattr(first, "_slot_read", no_slot_read)
+    with pytest.raises(CachePolicyError, match="original checked provider DAG"):
+        first.resolve_profile(pin("direct-import.json"), "import", lambda binding: fake)
+
+
+def test_direct_bound_job_profile_cannot_bypass_checked_provider_DAG(monkeypatch):
+    fake = dict(format=first.BOUND_JOB_PROFILE,
+        completion=pin("fake-complete-passed.json"))
+    def no_slot_read(*args, **kwargs):
+        raise AssertionError("Direct typed profiles must refuse before slot or allocation use")
+    monkeypatch.setattr(first, "_slot_read", no_slot_read)
+    with pytest.raises(CachePolicyError, match="original checked provider DAG"):
+        first.resolve_profile(pin("direct-job.json"), "jobs", lambda binding: fake)
+
+
+def test_bound_provider_still_dispatches_to_complete_checked_DAG(monkeypatch):
+    actual_provider = provider(); provider_binding = pin("provider.json")
+    bundle = dict(format=first.BOUND_BUNDLE); selected = {"TESTONLY": "validated dispatch result"}
+    calls = []
+    def slot(value, role):
+        assert value == actual_provider and role == "completion"
+        return bundle, pin("completion.json")
+    def checked(binding, value, completed, kind, read, *, stores_source, read_authorities):
+        calls.append((binding, value, completed, kind, stores_source, read_authorities))
+        return selected
+    monkeypatch.setattr(first, "_slot_read", slot)
+    monkeypatch.setattr(first, "_resolve_bound_profile", checked)
+    read = lambda binding: actual_provider
+    authorities = lambda binding: []
+    assert first.resolve_profile(provider_binding, "import", read,
+        stores_source=pin("stores.toml"), read_authorities=authorities) is selected
+    assert calls == [(provider_binding, actual_provider, bundle, "import",
+        pin("stores.toml"), authorities)]

@@ -134,6 +134,23 @@ def context_for(tmp_path):
         owner=dict(machine="TESTONLY", pid=22, process_create_time="2"))
 
 
+def test_typed_bound_scope_requires_the_same_expanded_writer_environment_as_qualification(tmp_path):
+    from darsia_cache.environment import FIRST_WRITER_ENVIRONMENT_KEYS, FIRST_WRITER_SUBDIRECTORIES
+    context = context_for(tmp_path)
+    original = deepcopy(context.manifest["fresh_scope_provenance"])
+    # The original direct path still accepts precisely its old writer list.
+    assert fresh_scope._fresh_provenance(context) == original
+    context.profile = dict(format="darsia-cache-volume-bound-import-profile-v1")
+    with pytest.raises(CachePolicyError, match="fresh-exclusive-empty"):
+        fresh_scope._fresh_provenance(context)
+    context.manifest["fresh_scope_provenance"].update(
+        writer_subdirectories=list(FIRST_WRITER_SUBDIRECTORIES),
+        writer_environment_keys=list(FIRST_WRITER_ENVIRONMENT_KEYS))
+    assert fresh_scope._fresh_provenance(context)["writer_environment_keys"] == list(FIRST_WRITER_ENVIRONMENT_KEYS)
+    context.manifest["fresh_scope_provenance"]["initial_names"] = ["old-cache"]
+    with pytest.raises(CachePolicyError): fresh_scope._fresh_provenance(context)
+
+
 def test_fresh_safe_unknown_names_are_not_a_predeclared_inventory():
     tree = tree_for({"third-party": dict(directory=True),
                      "third-party/unpredicted.cache": dict(directory=False, bytes=23)})

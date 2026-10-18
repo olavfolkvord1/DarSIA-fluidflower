@@ -313,6 +313,71 @@ class PredeclaredN43ProducerEntitlement:
     model: str = "PREDECLARED all-stage aggregate; shared cache/output entitlement counted once; NOT measured profile"
 
 
+@dataclass(frozen=True)
+class PredeclaredFirstOutputEntitlement:
+    run: str
+    case_count: int
+    maximum_output_bytes: int
+    request: dict
+    administration: dict
+    all_stage_reference: dict
+    scope: dict
+    model: str = "Q104 WHOLE retained output entitlement once, including preparation/ops/in-flight files; NOT measured bytes-per-frame"
+
+    @property
+    def products_estimated_bytes(self):
+        return self.maximum_output_bytes
+
+    @property
+    def transient_estimated_bytes(self):
+        # Not an observed zero: in-flight files are inside the same whole-tree
+        # ceiling. No separate allowance can enlarge the authorized entitlement.
+        return 0
+
+    def needed(self, *, other_remaining_bytes=0, reserve_bytes=DEFAULT_RESERVE_BYTES):
+        return (self.maximum_output_bytes + _integer(other_remaining_bytes, "Other remaining outputs")
+                + _integer(reserve_bytes, "Original reserve"))
+
+
+def first_output_entitlement(runtime, task, config, rows):
+    """First-only Q104 administration; ordinary measured estimates stay intact."""
+    first = runtime.cache_adapter.lease.first_qualification
+    from darsia_cache.first_qualification import BOUND_OUTPUT_ADMINISTRATION, FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES, checked_all_stage_reference, _same_path
+    if not first.bound_mode:
+        raise ValueError("No existing bound-request first qualification")
+    first.require_task(runtime.cache_adapter.lease, task)
+    plan = first.output_entitlement
+    _state, reserve, binding = settings(runtime.stores, runtime.job["series_id"])
+    if (binding != first.provider_binding or reserve != DEFAULT_RESERVE_BYTES
+            or plan.get("format") != BOUND_OUTPUT_ADMINISTRATION
+            or type(plan["administrative_output_entitlement_bytes"]) is not int
+            or plan["administrative_output_entitlement_bytes"] < FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES
+            or config.get("storage") is not None or config.get("pixel_domain") is not None
+            or config.get("probability_storage") is not None or "gas_probability_storage" in config
+            or [frame["case_id"] for frame in config["frames"]] != task["ordered_case_ids"]):
+        raise ValueError("First Q104 requires bound all-stage evidence, original exact39 route and original reserve")
+    if not _same_path(plan["watched_output_scope"]["path"], runtime.stores.roots(runtime.job["series_id"])["results"]):
+        raise ValueError("Q104 watch must cover the actual current whole results root, not the old reference root")
+    data = read_bound(plan["all_stage_reference"])[0]
+    checked_all_stage_reference(task, data, read=lambda pin: read_bound(pin)[0],
+        maximum_output_bytes=plan["administrative_output_entitlement_bytes"])
+    actual = _native_layout_for_task(runtime.stores, runtime.job["series_id"], task, config, rows)
+    if actual != data["requested_native_layout"]:
+        raise ValueError("First Q104 current layout differs from the actual all-stage reference")
+    writers = data["output_writers"]
+    required = {"src/darsia/fluidflower/mass/n1_pipeline.py",
+        "src/darsia/fluidflower/mass/n1_statistics.py", "src/darsia/fluidflower/pipeline/series.py",
+        "src/darsia/fluidflower/native/sidecar.py", "src/darsia/fluidflower/pipeline/runner.py"}
+    if not isinstance(writers, list) or {row.get("relative_path") for row in writers} != required or len(writers) != len(required):
+        raise ValueError("First Q104 requires the exact five existing output writers")
+    for writer in writers:
+        _writer_identity(runtime.repository, data["reference_commit"], writer)
+        _writer_identity(runtime.repository, task["commit"], writer)
+    return PredeclaredFirstOutputEntitlement(task["run"], len(task["ordered_case_ids"]),
+        plan["administrative_output_entitlement_bytes"], first.binding, first.request["output_entitlement_plan"],
+        plan["all_stage_reference"], plan["scope"])
+
+
 def n43_entitlement(runtime, task, config, rows):
     """Explicit released producer route; ordinary load_estimate is unchanged."""
     first=runtime.cache_adapter.lease.first_qualification
@@ -465,6 +530,16 @@ def estimate_run(task, config, profile, *, measurement, completion, layout=None,
 def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=None):
     _state, _reserve, binding = settings(stores, series_id)
     profile, _raw = read_bound(binding)
+    from darsia_cache.first_qualification import PROVIDER, BOUND_JOB_PROFILE, resolve_profile
+    if profile.get("format") == PROVIDER:
+        from darsia_cache.bootstrap import _exact_authority_list
+        profile = resolve_profile(binding, "jobs", lambda pin:read_bound(pin)[0],
+            stores_source={key:stores.source[key] for key in ("path", "sha256", "size_bytes")},
+            read_authorities=lambda pin:_exact_authority_list(pin, __file__))
+        if profile.get("format") != BOUND_JOB_PROFILE:
+            raise ValueError("Only an actually completed typed bound provider supplies this result profile")
+        return _bound_result_estimate(stores, series_id, task, config, profile, binding,
+            repository=repository, metadata_rows=metadata_rows)
     fields = {"format", "pipeline", "precision", "measured_commit", "measured_case_ids",
               "measurement", "completion", "writers", "orchestration", "layout_receipt"}
     if task.get("pipeline") == "native-phase-n1":
@@ -512,6 +587,34 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
     return estimate_run(task, config, profile, measurement=measurement, completion=completion,
                         layout=layout, layout_bytes=len(raw), profile_identity=binding,
                         requested_native_layout=requested)
+
+
+def _bound_result_estimate(stores, series_id, task, config, profile, binding, *, repository, metadata_rows):
+    """Original estimate arithmetic on genuine closed whole-allstage inventory."""
+    scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
+    if (profile.get("scope") != scope or profile.get("configuration") != task.get("configuration")
+            or scope["pipeline"] != "native-phase-n1" or scope["backend"] != "cpu"
+            or scope["precision"] != "float32" or scope["run"] != "ac52"
+            or len(scope["ordered_case_ids"]) != 39
+            or config.get("storage") is not None or config.get("pixel_domain") is not None
+            or "gas_probability_storage" in config or config.get("probability_storage") is not None):
+        raise ValueError("Qualified output profile does not cover this exact full/allstage scientific task")
+    actual = profile["result_profile"]
+    required = {"src/darsia/fluidflower/mass/n1_pipeline.py", "src/darsia/fluidflower/mass/n1_statistics.py",
+        "src/darsia/fluidflower/pipeline/series.py", "src/darsia/fluidflower/native/sidecar.py",
+        "src/darsia/fluidflower/pipeline/runner.py"}
+    if (actual.get("format") != PROFILE_FORMAT or actual.get("measured_commit") != task["commit"]
+            or actual.get("measured_case_ids") != task["ordered_case_ids"]
+            or not isinstance(actual.get("writers"), list)
+            or len(actual["writers"]) != len(required)
+            or {row.get("relative_path") for row in actual["writers"]} != required):
+        raise ValueError("Actual closed output writer/case/source profile is incomplete")
+    for writer in actual["writers"]:
+        _profile_writer_identity(repository, actual["measured_commit"], task["commit"], writer)
+    requested = _native_layout_for_task(stores, series_id, task, config, metadata_rows)
+    return estimate_run(task, config, actual, measurement=actual["measurement"],
+        completion=actual["completion"], requested_native_layout=requested,
+        profile_identity=dict(binding))
 
 
 def volume_info(root):
@@ -907,7 +1010,7 @@ class CapacityLedger:
                     or (self.remote_scope is not None and row.get("remote_scope")!=self.remote_scope)):
                 raise ValueError("Reservation belongs to another actual host/account/capacity scope")
             if (row.get("format") not in {"darsia-local-capacity-reservation-v1",
-                    "darsia-n43-predeclared-capacity-mirror-v1"}
+                    "darsia-n43-predeclared-capacity-mirror-v1", "darsia-first-whole-output-reservation-v1"}
                     or path.parent.name != "r-" + _reservation_id(row["job_root"], row)
                     or type(row.get("case_count")) is not int or row["case_count"] < 1
                     or len(row.get("ordered_case_ids", [])) != row["case_count"]
@@ -924,6 +1027,26 @@ class CapacityLedger:
                 _bound(row["request"]);_bound(row["administration"])
                 if row["shared_service_reservation"]!=row["estimate"]["shared_service_reservation"]:
                     raise ValueError("N43 mirror differs from the actual one service entitlement")
+            elif row.get("reservation_model") == "first-Q104-whole-output-once":
+                from darsia_cache.first_qualification import BOUND_OUTPUT_ADMINISTRATION, FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES
+                if (row["format"] != "darsia-first-whole-output-reservation-v1"
+                        or type(row.get("maximum_output_bytes")) is not int
+                        or row["maximum_output_bytes"] < FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES
+                        or row["case_count"] != 39 or row["run"] != "ac52"
+                        or row.get("not_a_measured_profile") is not True
+                        or row.get("estimate", {}).get("maximum_output_bytes") != row["maximum_output_bytes"]):
+                    raise ValueError("First Q104 whole-claim entitlement differs")
+                for role in ("request", "administration", "all_stage_reference"):
+                    _bound(row[role])
+                    if row[role] != row["estimate"].get(role):
+                        raise ValueError("First Q104 reservation binding differs: " + role)
+                admin = read_bound(row["administration"])[0]
+                if (admin.get("format") != BOUND_OUTPUT_ADMINISTRATION
+                        or admin.get("administrative_output_entitlement_bytes") != row["maximum_output_bytes"]
+                        or admin.get("scope") != row.get("scope")
+                        or row["scope"] != row["estimate"].get("scope")
+                        or row["scope"].get("ordered_case_ids") != row["ordered_case_ids"]):
+                    raise ValueError("First Q119 reservation differs from actual predeclared whole-output plan")
             else:
                 if row["format"]!="darsia-local-capacity-reservation-v1":
                     raise ValueError("Unknown typed capacity reservation model")
@@ -954,6 +1077,10 @@ class CapacityLedger:
                 raise ValueError("Capacity progress exceeds original case count")
             if row.get("reservation_model")=="N43-shared-aggregate-service-mirror":
                 total += row["maximum_aggregate_bytes"]
+            elif row.get("reservation_model") == "first-Q104-whole-output-once":
+                # Never divide by 39 or shrink a whole-tree ceiling with prefix
+                # progress. Actual committed/preparation files remain retained.
+                total += row["maximum_output_bytes"]
             else:
                 total += ((row["case_count"] - committed) * row["products_per_frame_estimated_bytes"]
                           + row["transient_estimated_bytes"])
@@ -979,6 +1106,12 @@ class CapacityLedger:
                 maximum_aggregate_bytes=estimate.maximum_aggregate_bytes,
                 shared_service_reservation=estimate.shared_service_reservation,
                 request=estimate.request,administration=estimate.administration,
+                not_a_measured_profile=True, estimate=asdict(estimate))
+        elif isinstance(estimate, PredeclaredFirstOutputEntitlement):
+            value = dict(common, format="darsia-first-whole-output-reservation-v1",
+                reservation_model="first-Q104-whole-output-once", maximum_output_bytes=estimate.maximum_output_bytes,
+                request=estimate.request, administration=estimate.administration,
+                all_stage_reference=estimate.all_stage_reference, scope=estimate.scope,
                 not_a_measured_profile=True, estimate=asdict(estimate))
         else:
             value = dict(common,format="darsia-local-capacity-reservation-v1",
@@ -1114,6 +1247,8 @@ class ClaimCapacity:
             first=getattr(getattr(getattr(self.runtime,"cache_adapter",None),"lease",None),"first_qualification",None)
             if first is not None and first.reference_build:
                 estimate=n43_entitlement(self.runtime,task,config,rows)
+            elif first is not None and first.bound_mode:
+                estimate = first_output_entitlement(self.runtime, task, config, rows)
             else:
                 estimate = load_estimate(self.runtime.stores, self.runtime.job["series_id"], task, config,
                                          repository=Path(__file__).resolve().parents[4], metadata_rows=rows)

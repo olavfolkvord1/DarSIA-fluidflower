@@ -112,9 +112,21 @@ class WorkerCacheAdapter:
         for task, estimate in zip(tasks, estimates):
             maximum, binding, profile, measured, completion = applicable_job_cache_profile(
                 self.lease.policy, self, task, estimate, projection=True)
-            profiles.append(dict(run=task["run"], profile=binding, maximum_new_claim_bytes=maximum,
-                measurement=profile["measurement"], completion=profile["completion"],
-                observed_service_peak_bytes=measured["worker_cache_service_coverage"]["maximum_service_cache_bytes"]))
+            from .first_qualification import BOUND_JOB_PROFILE
+            if profile.get("format") == BOUND_JOB_PROFILE:
+                profiles.append(dict(run=task["run"], profile=binding, maximum_new_claim_bytes=maximum,
+                    measurement=profile["measurement"], completion=profile["completion"],
+                    physical_bound=profile["capacity_bound"],
+                    operational_service_entitlement_bytes=profile["operational_service_entitlement_bytes"],
+                    sampled_cache_highwater_bytes=profile["sampled_cache_highwater_bytes"],
+                    sampled_highwater_is_lifetime_peak=False, actual_writer_IO_proven=False))
+            else:
+                profiles.append(dict(run=task["run"], profile=binding, maximum_new_claim_bytes=maximum,
+                    measurement=profile["measurement"], completion=profile["completion"],
+                    observed_service_peak_bytes=measured["worker_cache_service_coverage"]["maximum_service_cache_bytes"]))
+        bounded = ["physical_bound" in row for row in profiles]
+        if any(bounded) and not all(bounded):
+            raise CachePolicyError("Mixed measured-lifetime and volume-bound projections require their own applicability")
         # The current qualified service-only adapter supports only zero new
         # claim-local bytes. Sum is conservative even if later adapters retain
         # per-run allocations; no service budget is multiplied by frame count.
@@ -131,11 +143,10 @@ class WorkerCacheAdapter:
                         and cache_volume["volume_id"] == result_volume["volume_id"])
                 noncache = products + transient + other if same else 0
                 budget = ledger.project(additional, noncache_bytes=noncache)
-        return dict(complete=True, state="QUALIFIED_EXISTING_SERVICE_READ_PROJECTION",
+        result = dict(complete=True, state="QUALIFIED_EXISTING_SERVICE_READ_PROJECTION",
             sufficient=budget["sufficient"], required_cache_bytes=self.lease.maximum + additional,
             additional_cache_reservation_bytes=additional,
             already_reserved_service_maximum_bytes=self.lease.maximum,
-            observed_service_peak_bytes=max(row["observed_service_peak_bytes"] for row in profiles),
             existing_service_reservation=self.lease.reservation,
             service_reservation_original_owner=reservation_owner,
             attached_service_actor=self.lease.owner,
@@ -151,6 +162,13 @@ class WorkerCacheAdapter:
             scope="all supplied runs on this actual sequential worker slot; already active other services counted by shared ledger; no new service/concurrency promise",
             projection_only=True, reservation_created=False, claim_created=False,
             cleanup_performed=False, physical_reclaim_not_inferred=True)
+        if all(bounded):
+            result.update(qualification_kind="physical-volume-bound-sampled-operational-reserve",
+                sampled_cache_highwater_bytes=max(row["sampled_cache_highwater_bytes"] for row in profiles),
+                sampled_highwater_is_lifetime_peak=False, actual_writer_IO_proven=False)
+        else:
+            result["observed_service_peak_bytes"] = max(row["observed_service_peak_bytes"] for row in profiles)
+        return result
 
     def measure(self, root):
         return self.lease.measure(root)
@@ -178,6 +196,9 @@ class WorkerCacheAdapter:
         must additionally bind this adapter's service-only writer qualification;
         no profile is synthesized from39 products or absence of a search hit.
         """
+        from .first_qualification import BOUND_JOB_PROFILE
+        if profile.get("format") == BOUND_JOB_PROFILE:
+            return self._verify_bound_profile(task, estimate, binding, profile, measured, complete, remember=remember)
         if (self.runtime.backend != "cpu" or task.get("pipeline") not in {"native-phase-n1", "n1"}
                 or task.get("precision") != "float32"):
             raise CachePolicyError("This adapter requires a separately observed CPU float32 native-phase-n1 or N1 writer route")
@@ -244,6 +265,51 @@ class WorkerCacheAdapter:
         if remember:
             self.profiles[task["attempt_id"]] = dict(task=deepcopy(task), binding=dict(binding),
                 coverage_sha256=_coverage_hash(coverage))
+        return True
+
+    def _verify_bound_profile(self, task, estimate, binding, profile, measured, complete, *, remember):
+        from .first_qualification import BOUND_WRITER_CONTRACT
+        scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
+        if (scope != profile.get("scope") or scope["commit"] != self.runtime.commit
+                or scope["backend"] != self.runtime.backend or self.runtime.backend != "cpu"
+                or scope["pipeline"] != "native-phase-n1" or scope["precision"] != "float32"
+                or scope["run"] != "ac52" or len(scope["ordered_case_ids"]) != 39
+                or profile.get("provider") != binding or binding != self.lease.profile_binding
+                or profile.get("namespace_admission") != self.lease.document["cache_bootstrap"]["namespace_admission"]
+                or profile.get("stores_source") != self.lease.source
+                or profile.get("writer_contract") != BOUND_WRITER_CONTRACT
+                or profile.get("additional_claim_cache_bytes") != 0
+                or profile.get("allocation_model") != "shared-service-only-no-claim-files-v1"
+                or profile.get("actual_writer_IO_proven") is not False
+                or profile.get("sampled_highwater_is_lifetime_peak") is not False
+                or profile.get("operational_service_entitlement_bytes") != self.lease.maximum
+                or measured.get("complete") is not True
+                or measured.get("cache_operational_reserve_crossed") is not False
+                or measured.get("first_stop") is not None
+                or complete.get("complete") is not True or complete.get("passed") is not True
+                or complete.get("scope") != scope):
+            raise CachePolicyError("Typed physical-bound qualification is not applicable to this actual service/task")
+        cap = self.lease.policy.volume_cap
+        if (cap is None or cap.maximum_size_bytes != 500*1024**3
+                or profile["capacity_bound"]["volume_cap_observation"].get("binding") != cap.document()):
+            raise CachePolicyError("This ordinary service has another physical cache bound")
+        producers = _source_pins(profile["producer_source_closure"])
+        runtime_sources = _source_pins(profile["runtime_source_closure"])
+        root = self.runtime.repository / "src" / "darsia" / "fluidflower" / "pipeline"
+        required = [Path(__file__), root / "worker_io.py", root / "capacity.py", root / "runner.py",
+            root / "series.py", root.parent / "native" / "sidecar.py", root.parent / "mass" / "n1_pipeline.py"]
+        combined = profile["producer_source_closure"] + profile["runtime_source_closure"]
+        if (not {_key(path) for path in required} <= producers
+                or len({_key(pin["path"]) for pin in combined}) != len(combined)
+                or {_coverage_hash(pin) for pin in combined} != {
+                    _coverage_hash(pin) for pin in self.lease.profile["module_closure"]}):
+            raise CachePolicyError("Typed qualification differs from the actual startup writer/source/runtime closure")
+        for suffix in ("numba/core/caching.py", "matplotlib/font_manager.py", "tempfile.py", "importlib/_bootstrap_external.py"):
+            if not any(path.replace("\\", "/").endswith(suffix) for path in runtime_sources):
+                raise CachePolicyError("Actual bounded runtime writer is missing: " + suffix)
+        if remember:
+            self.profiles[task["attempt_id"]] = dict(task=deepcopy(task), binding=dict(binding),
+                coverage_sha256=_coverage_hash(profile["qualification"]), qualification_kind="physical-volume-bound")
         return True
 
     def register_claim_allocation(self, claim, ledger, reservation, owner, maximum, profile):

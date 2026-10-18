@@ -290,7 +290,13 @@ class ImportLease:
                 and self.first_qualification.reference_build
                 and self.first_qualification.reference_administration["host_policy"]=="olav-n43-one-run-uncapped-d"):
             raise CachePolicyError("Managed startup requires an accepted actual fixed-volume write-cap binding")
-        if self.first_qualification is None and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
+        from .first_qualification import BOUND_IMPORT_PROFILE, checked_bound_import_context
+        bounded = self.first_qualification is None and self.profile.get("format") == BOUND_IMPORT_PROFILE
+        if bounded:
+            self.maximum = checked_bound_import_context(self.profile, purpose=self.purpose,
+                role_identifier=self.role_identifier, entry_kind=self.entry_kind,
+                policy=self.policy, namespace=boot["namespace_admission"])
+        if self.first_qualification is None and not bounded and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
                 or self.profile.get("role_identifier")!=self.role_identifier
                 or self.profile.get("entry_kind")!=self.entry_kind
                 or self.profile.get("writer_contract")!="cooperative-start-admission-v1"):
@@ -389,7 +395,8 @@ class ImportLease:
                 initial_names=tree.api.names(tree.handles[""])
                 if initial_names:
                     raise CachePolicyError("New exclusive UUID scope was not observed empty")
-                first_writers = getattr(self, "first_qualification", None) is not None
+                first_writers = (getattr(self, "first_qualification", None) is not None
+                    or self.profile.get("format") == "darsia-cache-volume-bound-import-profile-v1")
                 writer_directories = FIRST_WRITER_SUBDIRECTORIES if first_writers else WRITER_SUBDIRECTORIES
                 writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
                 fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
@@ -554,7 +561,8 @@ def before_darsia_import(*,package_file):
         else:lease.start()
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
-        first_writers = getattr(lease, "first_qualification", None) is not None
+        first_writers = (getattr(lease, "first_qualification", None) is not None
+            or lease.profile.get("format") == "darsia-cache-volume-bound-import-profile-v1")
         if first_writers:
             environment = first_qualification_environment(environment, scope_root=lease.root)
         environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))

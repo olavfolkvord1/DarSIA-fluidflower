@@ -673,3 +673,94 @@ def test_public_backing_executable_lookup_accepts_empty_python_source_in_closure
     owned._exact_source(empty_pin)
     assert owned._public_command(lease) == [str(selected), *argv[1:]]
     assert argv[0] == str(base)
+
+
+def bound_supervisor_TESTONLY(monkeypatch, *, typed=True):
+    """Original supervisor function and observer seam; no native/API/SCI call."""
+    from darsia_cache import first_qualification as first, fresh_scope
+    from darsia_cache.policy import PHYSICAL_RESERVE_BYTES
+    lease = Lease_TESTONLY(); lease.package_file = "TESTONLY_PACKAGE"
+    lease.profile = dict(format=first.BOUND_IMPORT_PROFILE if typed else "darsia-cache-import-profile-v1",
+        scope=dict(commit="c"*40), capacity_bound=dict(reserve_watchdog_period_seconds=1))
+    lease.policy = SimpleNamespace(root="Q:/TESTONLY/cache")
+    command = ["TESTONLY_python", "-B", "-m", "darsia.fluidflower.worker",
+        "--job", "C:/TESTONLY/actual-job", "--workers", "1", "--once"]
+    events = []; stopped = []
+    monkeypatch.setattr(owned, "_checked_contract", lambda value: dict(maximum_family_processes=3))
+    monkeypatch.setattr(owned, "_public_command", lambda value: list(command))
+    monkeypatch.setattr("darsia_cache.capacity.volume_info", lambda root:
+        dict(free_bytes=PHYSICAL_RESERVE_BYTES+100, volume_id="TESTONLY"))
+    monkeypatch.setattr(first, "request_existing_frame_boundary_stop", lambda context, actual:
+        (stopped.append(deepcopy(context.request["public_command"])) or dict(requested=False, state="TESTONLY")))
+    monkeypatch.setattr(fresh_scope, "finalize_original_fresh_scope", lambda *args, **kwargs:
+        (events.append("original-finalizer") or dict(TESTONLY=True)))
+    class NativeController_TESTONLY:
+        def __init__(self, value, *, api):
+            self.lease = value; self.observed_binding = SERVICE; self.service_binding = SERVICE
+            self.info = {"TESTONLY": "not a native handle"}; self.resume_attempted = False
+            self.close_failures = []; events.append("controller")
+        def start(self, argv, environment, cwd):
+            assert argv == command
+            assert environment == dict(os.environ)
+            self.resume_attempted = True; events.append("one-original-start")
+        def await_family(self, *, observer=None):
+            events.append(("await", observer is not None))
+            row = dict(accounting=dict(active_processes=0, total_processes=3), wrapper_exit_code=0)
+            if observer is not None: observer(self, row["accounting"])
+            return row
+        def record_closed_family(self, terminal):
+            events.append("actual-kernel-close"); return SERVICE
+        def verify_retirement(self, *args): return True
+        def close(self): events.append("close-original-handles")
+    monkeypatch.setattr(owned, "OwnedWorker", NativeController_TESTONLY)
+    return lease, command, events, stopped
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_ordinary_bound_dispatch_uses_existing_observer_without_changing_direct_argv(monkeypatch, typed):
+    lease, command, events, stopped = bound_supervisor_TESTONLY(monkeypatch, typed=typed)
+    assert owned.supervise_original_worker(lease) == 0
+    assert events.count("one-original-start") == 1
+    assert ("await", typed) in events and events.count("original-finalizer") == 1
+    assert not stopped
+    closures = [body for _,body,_ in lease.records if body.get("format") == "darsia-native-bound-operational-reserve-closure-v1"]
+    assert len(closures) == int(typed)
+    if typed:
+        assert closures[0]["actual_command"] == command
+        assert closures[0]["operational_reserve_crossed"] is False
+        assert closures[0]["samples_prove_no_crossing_between_samples"] is False
+
+
+def test_ordinary_bound_crossing_is_latched_and_prevents_original_finalization(monkeypatch):
+    from darsia_cache.policy import PHYSICAL_RESERVE_BYTES
+    lease, command, events, stopped = bound_supervisor_TESTONLY(monkeypatch)
+    values = iter([PHYSICAL_RESERVE_BYTES+100, PHYSICAL_RESERVE_BYTES, PHYSICAL_RESERVE_BYTES+100])
+    monkeypatch.setattr("darsia_cache.capacity.volume_info", lambda root:
+        dict(free_bytes=next(values), volume_id="TESTONLY"))
+    with pytest.raises(CachePolicyError, match="reserve STOP"):
+        owned.supervise_original_worker(lease)
+    assert stopped == [command] and "original-finalizer" not in events
+    assert events.count("one-original-start") == 1
+    assert events[-1] == "close-original-handles"
+    closure = next(body for _,body,_ in lease.records
+        if body.get("format") == "darsia-native-bound-operational-reserve-closure-v1")
+    assert closure["operational_reserve_crossed"] is True
+    assert closure["samples_prove_no_crossing_between_samples"] is False
+
+
+def test_ordinary_bound_watchdog_primary_error_survives_failed_diagnostics(monkeypatch):
+    from darsia_cache.policy import PHYSICAL_RESERVE_BYTES
+    lease, command, events, stopped = bound_supervisor_TESTONLY(monkeypatch)
+    calls = [0]
+    def volume(root):
+        calls[0] += 1
+        if calls[0] == 1: return dict(free_bytes=PHYSICAL_RESERVE_BYTES+100)
+        raise OSError("TESTONLY actual reserve query failed")
+    monkeypatch.setattr("darsia_cache.capacity.volume_info", volume)
+    def fail_record(*args): raise RuntimeError("TESTONLY diagnostics unwritable")
+    lease._record = fail_record
+    with pytest.raises(OSError, match="actual reserve query failed") as caught:
+        owned.supervise_original_worker(lease)
+    assert stopped == [command] and events.count("one-original-start") == 1
+    assert "original-finalizer" not in events and events[-1] == "close-original-handles"
+    assert any("diagnostics" in note or "record" in note for note in caught.value.__notes__)

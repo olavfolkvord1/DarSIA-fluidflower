@@ -73,6 +73,66 @@ def test_native_uses_observed_total_divided_by_actual_case_count():
     assert "expected space" in value.model and "no assumed compression" in value.model
 
 
+def bound_output_profile_TESTONLY():
+    from darsia_cache.first_qualification import BOUND_JOB_PROFILE
+    task, config, profile, measurement, completion = measured()
+    ids = ["ac52_f" + str(index) for index in range(1, 40)]
+    task.update(backend="cpu", ordered_case_ids=ids,
+        configuration=dict(root_alias="series", relative_path="run.json", sha256="b"*64, bytes=7))
+    config["frames"] = [dict(case_id=case) for case in ids]
+    profile["measured_case_ids"] = ids
+    writers = [dict(relative_path=path, sha256="c"*64) for path in (
+        "src/darsia/fluidflower/mass/n1_pipeline.py", "src/darsia/fluidflower/mass/n1_statistics.py",
+        "src/darsia/fluidflower/pipeline/series.py", "src/darsia/fluidflower/native/sidecar.py",
+        "src/darsia/fluidflower/pipeline/runner.py")]
+    inventory = [dict(relative_path=directory+"/"+case+"/"+filename, bytes=size)
+        for case in ids for directory,filename,size in (
+            ("preparation", "native_log.npy", 101), ("frames", "products.npz", 53))]
+    inventory.append(dict(relative_path="manifest.json", bytes=7))
+    measurement.update(inventory=inventory, total_logical_bytes=sum(row["bytes"] for row in inventory))
+    completion["actual_case_count"] = 39
+    actual = dict(profile, writers=writers, measurement=measurement, completion=completion)
+    wrapped = dict(format=BOUND_JOB_PROFILE,
+        scope={key:task[key] for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")},
+        configuration=task["configuration"], result_profile=actual)
+    return task, config, wrapped
+
+
+def test_bound_output_reader_uses_original_estimate_arithmetic_for_all_retained_stages(monkeypatch):
+    task, config, wrapped = bound_output_profile_TESTONLY(); actual = wrapped["result_profile"]
+    checked = []
+    monkeypatch.setattr(cap, "_profile_writer_identity", lambda repository, measured, current, row:
+        checked.append((measured, current, row["relative_path"])))
+    monkeypatch.setattr(cap, "_native_layout_for_task", lambda *args: native_layout())
+    binding = dict(path="TESTONLY/provider.json", sha256="a"*64, size_bytes=1)
+    result = cap._bound_result_estimate(None, "FF_AC", task, config, wrapped, binding,
+        repository="TESTONLY", metadata_rows=None)
+    expected = cap.estimate_run(task, config, actual, measurement=actual["measurement"],
+        completion=actual["completion"], requested_native_layout=native_layout(), profile_identity=binding)
+    assert result == expected
+    assert len(checked) == 5 and all(a == b == task["commit"] for a,b,_ in checked)
+    assert result.measured_native_bytes_per_frame == (actual["measurement"]["total_logical_bytes"]+38)//39
+
+
+@pytest.mark.parametrize("change", [
+    lambda t,c,p:p["configuration"].update(sha256="f"*64),
+    lambda t,c,p:c.update(storage={"TESTONLY":"not measured by this profile"}),
+    lambda t,c,p:c.update(gas_probability_storage={"TESTONLY":"not measured"}),
+    lambda t,c,p:p["result_profile"]["writers"].pop(),
+    lambda t,c,p:p["result_profile"].update(measured_commit="e"*40),
+    lambda t,c,p:p["result_profile"]["completion"].update(passed=False),
+])
+def test_bound_output_profile_refuses_unqualified_config_source_layout_or_completion(change, monkeypatch):
+    task, config, wrapped = bound_output_profile_TESTONLY()
+    # The immutable task and resulting profile are separate parsed documents.
+    wrapped = deepcopy(wrapped); change(task, config, wrapped)
+    monkeypatch.setattr(cap, "_profile_writer_identity", lambda *args: None)
+    monkeypatch.setattr(cap, "_native_layout_for_task", lambda *args: native_layout())
+    with pytest.raises(ValueError):
+        cap._bound_result_estimate(None, "FF_AC", task, config, wrapped, {},
+            repository="TESTONLY", metadata_rows=None)
+
+
 @pytest.mark.parametrize("field,value",[("precision","float64"),("pipeline","native-phase-statistics"),("measured_commit","not-a-commit")])
 def test_profile_applicability_cannot_be_assumed(field,value):
     data=measured();data[2][field]=value

@@ -481,8 +481,24 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
     if binding is None:
         raise CachePolicyError("No measured applicable job-cache profile")
     from .first_qualification import resolve_profile
+    from .bootstrap import _exact_authority_list
     profile = resolve_profile(binding, "jobs", lambda pin:read_bound(pin)[0],
-        stores_source=getattr(getattr(adapter,"lease",None),"source",None))
+        stores_source=getattr(getattr(adapter,"lease",None),"source",None),
+        read_authorities=lambda pin:_exact_authority_list(pin, adapter.lease.package_file))
+    from .first_qualification import BOUND_JOB_PROFILE, BOUND_WRITER_CONTRACT
+    if profile.get("format") == BOUND_JOB_PROFILE:
+        scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
+        if (profile.get("scope") != scope or profile.get("purpose") != "jobs"
+                or profile.get("writer_contract") != BOUND_WRITER_CONTRACT
+                or profile.get("additional_claim_cache_bytes") != 0
+                or profile.get("allocation_model") != "shared-service-only-no-claim-files-v1"
+                or profile.get("result_estimate_excludes_cache") is not True):
+            raise CachePolicyError("Bound cache profile is outside the exact qualified worker scope")
+        measured, _ = read_bound(profile["measurement"])
+        complete, _ = read_bound(profile["completion"])
+        if verify(task, estimate, binding, profile, measured, complete) is not True:
+            raise CachePolicyError("Typed physical-bound writer profile is not applicable")
+        return 0, dict(binding), profile, measured, complete
     fields = {"format", "purpose", "pipeline", "precision", "case_count", "commit",
               "maximum_cache_bytes", "measurement", "completion",
               "result_estimate_excludes_cache", "writer_contract"}

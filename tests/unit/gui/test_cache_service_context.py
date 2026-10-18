@@ -463,3 +463,20 @@ def test_typed_authorities_cache_cannot_relabel_an_object_or_invalid_rows(docume
     once.remember(pin,document)
     with pytest.raises(CachePolicyError,match="list of record objects"):
         once.read_authorities(pin)
+
+
+@pytest.mark.parametrize("new_format", [
+    "darsia-cache-volume-bound-import-profile-v1",
+    "darsia-cache-volume-bound-job-profile-v1",
+])
+def test_direct_new_typed_profile_refuses_before_observer_or_ledger(world, monkeypatch, new_format):
+    world.profile["format"] = new_format
+    def forbidden_owner():
+        raise AssertionError("Unresolved direct typed profile reached actual observer construction")
+    monkeypatch.setattr(resolver, "_owner", forbidden_owner)
+    with pytest.raises(CachePolicyError, match="original checked provider DAG"):
+        resolver.resolve_original_service_context(world.receipt_pin, package_file=PACKAGE)
+    assert world.ledgers == []
+    assert not any(event[0] == "actual-observer" for event in world.events)
+    world.assert_no_mutation()
+    world.assert_closed()

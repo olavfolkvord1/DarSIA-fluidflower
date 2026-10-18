@@ -36,6 +36,10 @@ def _fresh_provenance(context):
     if context.purpose == "tests":
         expected /= "current"
     fresh = manifest.get("fresh_scope_provenance")
+    writer_directories, writer_keys = WRITER_SUBDIRECTORIES, WRITER_ENVIRONMENT_KEYS
+    if getattr(context, "profile", {}).get("format") == "darsia-cache-volume-bound-import-profile-v1":
+        from .environment import FIRST_WRITER_ENVIRONMENT_KEYS, FIRST_WRITER_SUBDIRECTORIES
+        writer_directories, writer_keys = FIRST_WRITER_SUBDIRECTORIES, FIRST_WRITER_ENVIRONMENT_KEYS
     required = {"format", "token", "owner", "purpose", "root_identity",
         "creation_disposition", "exclusive_root_handle", "initial_names",
         "initial_empty_observed_utc", "observation_precedes_writer_subdirectories_and_imports",
@@ -49,8 +53,8 @@ def _fresh_provenance(context):
             or fresh.get("exclusive_root_handle") is not True
             or fresh.get("initial_names") != []
             or fresh.get("observation_precedes_writer_subdirectories_and_imports") is not True
-            or fresh.get("writer_subdirectories") != list(WRITER_SUBDIRECTORIES)
-            or fresh.get("writer_environment_keys") != list(WRITER_ENVIRONMENT_KEYS)
+            or fresh.get("writer_subdirectories") != list(writer_directories)
+            or fresh.get("writer_environment_keys") != list(writer_keys)
             or context.root != expected / token
             or manifest.get("root") != str(context.root)
             or manifest.get("reservation") != context.reservation

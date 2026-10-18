@@ -908,10 +908,22 @@ def supervise_original_worker(lease, *, api=None):
     outcome = None
     result = None
     finalization_attempted = False
+    from .first_qualification import BOUND_IMPORT_PROFILE, BoundServiceReserveObservations
+    bound_watch = (BoundServiceReserveObservations(lease, command)
+        if lease.profile.get("format") == BOUND_IMPORT_PROFILE else None)
+    terminal = None
     try:
+        if bound_watch is not None:
+            bound_watch.admit()
         owned.start(command, dict(os.environ), Path.cwd())
-        terminal = owned.await_family()
+        terminal = (owned.await_family(observer=bound_watch.observe)
+            if bound_watch is not None else owned.await_family())
+        if bound_watch is not None:
+            bound_watch.observe(owned, terminal["accounting"], force=True)
         outcome = owned.record_closed_family(terminal)
+        if bound_watch is not None:
+            bound_watch.finish(owned, terminal, outcome)
+            bound_watch.require_no_stop()
         if terminal["accounting"]["total_processes"] > contract["maximum_family_processes"]:
             raise CachePolicyError("Actual native process count exceeds qualified profile; cache remains charged")
         from .fresh_scope import finalize_original_fresh_scope
@@ -930,6 +942,11 @@ def supervise_original_worker(lease, *, api=None):
         # Failure retention/unsealed crash stays charged. No positive proof is
         # reconstructed from PIDs; no original scientific output is modified.
         try:
+            if bound_watch is not None and bound_watch.closed is None:
+                try:
+                    bound_watch.finish(owned, terminal, outcome)
+                except BaseException as diagnostic_error:
+                    error.add_note("Bound reserve diagnostics incomplete: " + repr(diagnostic_error))
             lease._record("native-observer-held-" + uuid.uuid4().hex + ".json", dict(
                 utc=_utc(), exception_type=type(error).__name__, message=str(error),
                 native_launch=owned.observed_binding, service_receipt=owned.service_binding,
@@ -938,6 +955,10 @@ def supervise_original_worker(lease, *, api=None):
                 resume_attempted=owned.resume_attempted,
                 service_budget_closed=_budget_state(result, error, finalization_attempted),
                 structured_finalization_state=getattr(error, "finalization_state", None)))
+        except BaseException as diagnostic_error:
+            if bound_watch is None:
+                raise
+            error.add_note("Bound observer held record failed: " + repr(diagnostic_error))
         finally:
             # A started live family must finish naturally even if metadata failed.
             if owned.resume_attempted and owned.info is not None:
