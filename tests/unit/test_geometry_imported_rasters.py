@@ -400,3 +400,59 @@ def test_N54_changed_label_path_does_not_relabel_original_registration_descripto
     assert actual["labels_path"]=="TESTONLY/different.npz"
     assert actual["registration"]==original["registration"]
     # Existing _verify(record.labels, row.labels_path) refuses this mismatch.
+
+
+@pytest.mark.parametrize("diagnostic,expected_status", [
+    (None, "Not checked"),
+    ({"run_id": "ac18", "status": "not_comparable", "reason": "TESTONLY missing comparable map"}, "Not comparable"),
+    ({"run_id": "ac18", "status": "comparable", "p95_displacement_m": .001,
+      "affected_boundary_fraction": .05, "substantial_change": False}, "Within threshold"),
+    ({"run_id": "ac18", "status": "comparable", "p95_displacement_m": .003,
+      "affected_boundary_fraction": .25, "substantial_change": True}, "Review"),
+])
+def test_N54_worker_validation_survives_derived_diagnostics_but_real_run_edit_invalidates(
+    diagnostic, expected_status,
+):
+    from PySide6.QtWidgets import QLabel, QPushButton, QTableWidget
+
+    app, page, cls = registered_table_page_TESTONLY()
+    cls._append_run_geometry_row(page, dict(
+        run_id="ac18", geometry_choice="run_override", labels_path="TESTONLY/original.npz",
+    ))
+    config = geometry.normalize_geometry_config({})
+    page.config = deepcopy(config)
+    page.validation = None
+    page.preview_data = None
+    page._applying = False
+    page.save_button = QPushButton()
+    page.geometry_summary = QLabel()
+    page.geometry_quality_basis = QLabel()
+    page.validation_details = QLabel()
+    page.issues = QTableWidget(0, 3)
+    page._collect_config = lambda: deepcopy(page.config)
+    page._populate_config = lambda _config: None
+    page._finish_worker = lambda: None
+    page._show_run_geometry_diagnostics = lambda summary: cls._show_run_geometry_diagnostics(page, summary)
+    page._show_validation = lambda report: cls._show_validation(page, report)
+    page.run_geometry_table.itemChanged.connect(lambda *args: cls._mark_dirty(page, *args))
+    report = dict(config_sha256=geometry.geometry_config_digest(config), issues=[], summary=dict(
+        label_count=2, facies_count=1, error_count=0, warning_count=0,
+        run_geometry_change_diagnostics=[] if diagnostic is None else [diagnostic],
+    ))
+
+    # The real finished callback and actual Qt itemChanged signal route reproduce
+    # the old loss of validation; no worker, scientific input or preview is run.
+    cls._worker_finished(page, dict(config=config, validation=report, preview=None))
+    assert page.validation == report
+    assert page.save_button.isEnabled()
+    assert expected_status in page.run_geometry_table.item(0, 7).text()
+    assert "0 errors" in page.geometry_summary.text()
+    assert not page.run_geometry_table.signalsBlocked()
+
+    # Only derived writes are blocked. A genuine edit still uses the original
+    # handler, clears the report and closes the Save gate.
+    page.run_geometry_table.item(0, 5).setText("TESTONLY/changed-by-user.npz")
+    assert page.validation is None
+    assert not page.save_button.isEnabled()
+    assert page.geometry_summary.text() == "Local changes need validation."
+    assert app is not None

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QPointF, QRectF, QSignalBlocker, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -3334,46 +3334,48 @@ class GeometryFaciesPage(ModulePage):
             str(row.get("run_id") or "").strip().casefold(): dict(row)
             for row in summary.get("run_geometry_change_diagnostics") or []
         }
-        for row_index in range(self.run_geometry_table.rowCount()):
-            run_item = self.run_geometry_table.item(row_index, 1)
-            status_item = self.run_geometry_table.item(row_index, 7)
-            if run_item is None or status_item is None:
-                continue
-            run_id = run_item.text().strip().casefold()
-            diagnostic = diagnostics.get(run_id)
-            if diagnostic is None:
-                labels_item = self.run_geometry_table.item(row_index, 5)
-                status_item.setText(
-                    "No run labels"
-                    if labels_item is None or not labels_item.text().strip()
-                    else "Not checked"
+        # Derived status is not a user edit to the selected geometry.
+        with QSignalBlocker(self.run_geometry_table):
+            for row_index in range(self.run_geometry_table.rowCount()):
+                run_item = self.run_geometry_table.item(row_index, 1)
+                status_item = self.run_geometry_table.item(row_index, 7)
+                if run_item is None or status_item is None:
+                    continue
+                run_id = run_item.text().strip().casefold()
+                diagnostic = diagnostics.get(run_id)
+                if diagnostic is None:
+                    labels_item = self.run_geometry_table.item(row_index, 5)
+                    status_item.setText(
+                        "No run labels"
+                        if labels_item is None or not labels_item.text().strip()
+                        else "Not checked"
+                    )
+                    status_item.setToolTip(
+                        "A comparable per-run layer-label map is required for screening."
+                    )
+                    status_item.setForeground(QColor("#9aa4ad"))
+                    continue
+                status = str(diagnostic.get("status") or "not_comparable")
+                if status == "not_comparable":
+                    status_item.setText("Not comparable")
+                    status_item.setToolTip(str(diagnostic.get("reason") or ""))
+                    status_item.setForeground(QColor("#e3b65c"))
+                    continue
+                p95_mm = 1000.0 * float(diagnostic.get("p95_displacement_m") or 0.0)
+                affected = 100.0 * float(
+                    diagnostic.get("affected_boundary_fraction") or 0.0
                 )
+                if bool(diagnostic.get("substantial_change")):
+                    status_item.setText(f"Review · {p95_mm:.2f} mm")
+                    status_item.setForeground(QColor("#e3b65c"))
+                else:
+                    status_item.setText(f"Within threshold · {p95_mm:.2f} mm")
+                    status_item.setForeground(QColor("#76c893"))
                 status_item.setToolTip(
-                    "A comparable per-run layer-label map is required for screening."
+                    f"95th-percentile boundary displacement: {p95_mm:.3f} mm\n"
+                    f"Boundary samples beyond threshold: {affected:.1f}%\n"
+                    "This screen is advisory and does not change the selected geometry."
                 )
-                status_item.setForeground(QColor("#9aa4ad"))
-                continue
-            status = str(diagnostic.get("status") or "not_comparable")
-            if status == "not_comparable":
-                status_item.setText("Not comparable")
-                status_item.setToolTip(str(diagnostic.get("reason") or ""))
-                status_item.setForeground(QColor("#e3b65c"))
-                continue
-            p95_mm = 1000.0 * float(diagnostic.get("p95_displacement_m") or 0.0)
-            affected = 100.0 * float(
-                diagnostic.get("affected_boundary_fraction") or 0.0
-            )
-            if bool(diagnostic.get("substantial_change")):
-                status_item.setText(f"Review · {p95_mm:.2f} mm")
-                status_item.setForeground(QColor("#e3b65c"))
-            else:
-                status_item.setText(f"Within threshold · {p95_mm:.2f} mm")
-                status_item.setForeground(QColor("#76c893"))
-            status_item.setToolTip(
-                f"95th-percentile boundary displacement: {p95_mm:.3f} mm\n"
-                f"Boundary samples beyond threshold: {affected:.1f}%\n"
-                "This screen is advisory and does not change the selected geometry."
-            )
 
     def _show_validation(self, report: Mapping[str, Any] | None) -> None:
         self.issues.setRowCount(0)
