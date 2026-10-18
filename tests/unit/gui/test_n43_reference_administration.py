@@ -635,3 +635,24 @@ def test_live_snapshot_refuses_actual_hardlink(monkeypatch,tmp_path):
     monkeypatch.setattr(first,"reference_writer_coverage",lambda *args:[])
     with pytest.raises(CachePolicyError,match="file type/hardlink refused"):
         first.reference_scope_snapshot(state,object())
+
+
+
+def test_typed_authority_callback_is_used_only_for_exact_answers_role():
+    state,value,old_read=administration_TESTONLY();events=[]
+    def read(binding):
+        assert binding!=value["answers_source"]
+        events.append(("object",binding));return old_read(binding)
+    def authorities(binding):
+        assert binding==value["answers_source"]
+        events.append(("authority",binding));return old_read(binding)
+    assert first.checked_reference_administration(value,state,read=read,
+        read_authorities=authorities)==value
+    assert events==[("authority",value["answers_source"]),("object",value["accepted_plan"])]
+
+
+def test_direct_old_profile_never_uses_typed_authority_callback():
+    value={"format":"darsia-cache-import-profile-v1","TESTONLY":"original object"}
+    def forbidden(binding):raise AssertionError("Unrelated ordinary profile used authority reader")
+    assert first.resolve_profile(pin_TESTONLY("old.json"),"import",lambda binding:value,
+        read_authorities=forbidden) is value

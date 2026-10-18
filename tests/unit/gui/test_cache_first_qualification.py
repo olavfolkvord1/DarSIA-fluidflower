@@ -494,3 +494,123 @@ def test_module_source_descriptor_keeps_positive_executable_and_16MiB_boundary()
         del value[missing]
         with pytest.raises(CachePolicyError):
             first._pins([value])
+
+
+
+def test_full_14736_source_hash_is_canonical_without_widening_control_records():
+    import hashlib
+    import json
+    from darsia_cache.control import _encoded
+    sources=[dict(path=f"C:/TESTONLY/runtime/module_{i:05d}.py",
+        sha256="a"*64,size_bytes=i) for i in range(14736)]
+    raw=(json.dumps(sources,sort_keys=True,ensure_ascii=False,allow_nan=False,
+        separators=(",",":"))+"\n").encode("utf-8")
+    assert len(raw)>1024**2
+    assert first._digest(sources)==hashlib.sha256(raw).hexdigest()
+    with pytest.raises(CachePolicyError,match="one MiB"):_encoded(sources)
+    for invalid in [float("nan"),float("inf"),float("-inf")]:
+        with pytest.raises(ValueError):first._digest({"invalid":invalid})
+
+
+def test_first_slot_records_large_closure_with_existing_16mib_write_bound(monkeypatch):
+    import hashlib
+    events=[]
+    class Namespace_TESTONLY:
+        def __init__(self,path,identity):events.append((path,identity))
+        def write_once(self,name,raw,*,maximum):events.append((name,raw,maximum))
+        def close(self):events.append("closed")
+    monkeypatch.setattr("darsia_cache.windows.WindowsNamespace",Namespace_TESTONLY)
+    value={"module_closure":[dict(path=f"C:/TESTONLY/m{i}.py",sha256="a"*64,size_bytes=1)
+        for i in range(14736)]}
+    raw=first._slot_encoded(value)
+    assert 1024**2<len(raw)<16*1024**2
+    actual=first._slot_write(provider(),"native_completion",value)
+    assert events[1]==("native_completion.json",raw,16*1024**2)
+    assert events[-1]=="closed"
+    assert actual["sha256"]==hashlib.sha256(raw).hexdigest() and actual["size_bytes"]==len(raw)
+
+
+def test_first_slot_exact_limit_and_oversize_refusal_before_namespace(monkeypatch):
+    empty=first._slot_encoded({"padding":""})
+    value={"padding":"x"*(16*1024**2-len(empty))}
+    assert len(first._slot_encoded(value))==16*1024**2
+    opened=[]
+    monkeypatch.setattr("darsia_cache.windows.WindowsNamespace",lambda *args:opened.append(args))
+    value["padding"]+="x"
+    with pytest.raises(CachePolicyError,match="full samples not recorded"):
+        first._slot_write(provider(),"observation",value)
+    assert opened==[]
+
+
+@pytest.mark.parametrize("value",[None,[],0,{"invalid":float("nan")},{"invalid":float("inf")}])
+def test_first_slot_keeps_object_and_finite_contract_before_namespace(monkeypatch,value):
+    opened=[]
+    monkeypatch.setattr("darsia_cache.windows.WindowsNamespace",lambda *args:opened.append(args))
+    with pytest.raises((CachePolicyError,ValueError)):
+        first._slot_write(provider(),"observation",value)
+    assert opened==[]
+
+
+@pytest.mark.parametrize("failed_diagnostic",["observation","held","both"])
+def test_secondary_diagnostic_failure_preserves_original_primary_exception(monkeypatch,failed_diagnostic):
+    state,_=protocol();state.reference_build=True
+    lease=lease_for(state);primary=RuntimeError("TESTONLY primary native failure")
+    events=[]
+    class Owned_TESTONLY:
+        resume_attempted=False;info=None
+        def __init__(self,*args,**kwargs):pass
+        def start(self,*args):raise primary
+        def close(self):events.append("closed")
+    monkeypatch.setattr(first,"validate_startup",lambda lease:None)
+    monkeypatch.setattr(state,"consume",lambda lease:None)
+    monkeypatch.setattr("darsia_cache.owned_process._public_command",lambda lease:state.request["public_command"])
+    monkeypatch.setattr("darsia_cache.owned_process.OwnedWorker",Owned_TESTONLY)
+    def slot(*args):
+        if failed_diagnostic in {"observation","both"}:raise CachePolicyError("TESTONLY slot full")
+        return pin("partial.json")
+    def record(*args):
+        if failed_diagnostic in {"held","both"}:raise CachePolicyError("TESTONLY held full")
+    monkeypatch.setattr(first,"_slot_write",slot);lease._record=record
+    with pytest.raises(RuntimeError) as captured:first.supervise_first_worker(lease)
+    assert captured.value is primary and events==["closed"]
+    notes=" ".join(primary.__notes__)
+    assert "not recorded" in notes
+    if failed_diagnostic in {"observation","both"}:assert "full samples are not durable" in notes
+
+
+def authority_file_TESTONLY(tmp_path,raw):
+    import hashlib
+    path=tmp_path/"answers.json";path.write_bytes(raw)
+    return dict(path=str(path),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+
+
+def test_authority_list_exact_raw_source_and_original_object_reader_stays_strict(tmp_path):
+    from darsia_cache.bootstrap import _exact,_exact_authority_list
+    binding=authority_file_TESTONLY(tmp_path,b'[{"id":"N43","decided_by":"olav"}]\n')
+    package=str(tmp_path/"source"/"darsia"/"__init__.py")
+    assert _exact_authority_list(binding,package)==[{"id":"N43","decided_by":"olav"}]
+    with pytest.raises(ValueError,match="JSON object"):_exact(binding,package)
+
+
+@pytest.mark.parametrize("raw",[b'{}',b'[null]',b'[1]',b'[{"id":1,"id":2}]',
+    b'[{"id":NaN}]',b'[{"id":Infinity}]',b'[{"id":-Infinity}]',b'[],"extra":{}'])
+def test_authority_list_preserves_typed_duplicate_and_nonfinite_rejections(tmp_path,raw):
+    from darsia_cache.bootstrap import _exact_authority_list
+    binding=authority_file_TESTONLY(tmp_path,raw)
+    with pytest.raises(ValueError):
+        _exact_authority_list(binding,str(tmp_path/"source"/"darsia"/"__init__.py"))
+
+
+@pytest.mark.parametrize("change",["wrong-sha","changed-bytes","negative","oversize","missing","unc"])
+def test_authority_list_keeps_original_raw_descriptor_and_path_guards(tmp_path,change):
+    from pathlib import Path
+    from darsia_cache.bootstrap import _exact_authority_list
+    binding=authority_file_TESTONLY(tmp_path,b'[{"id":"N43"}]')
+    if change=="wrong-sha":binding["sha256"]="0"*64
+    elif change=="changed-bytes":Path(binding["path"]).write_bytes(b'[{"id":"BAD"}]')
+    elif change=="negative":binding["size_bytes"]=-1
+    elif change=="oversize":binding["size_bytes"]=16*1024**2+1
+    elif change=="missing":binding["path"]=str(tmp_path/"not-created.json")
+    elif change=="unc":binding["path"]=r"\\TESTONLY\share\answers.json"
+    with pytest.raises((ValueError,OSError)):
+        _exact_authority_list(binding,str(tmp_path/"source"/"darsia"/"__init__.py"))

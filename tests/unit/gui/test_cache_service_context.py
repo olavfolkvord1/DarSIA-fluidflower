@@ -436,3 +436,30 @@ def test_observer_view_refuses_wrong_actor_and_non_eligibility_writes(world, cas
     world.assert_no_mutation()
     world.assert_closed()
 
+
+
+
+def test_typed_authorities_cache_uses_actual_reader_once_and_returns_copies(tmp_path,monkeypatch):
+    path=tmp_path/"answers.json";raw=b'[{"id":"N43","decided_by":"olav"}]\n'
+    path.write_bytes(raw)
+    pin=dict(path=str(path),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+    once=resolver._MetadataOnce(str(tmp_path/"package"/"darsia"/"__init__.py"))
+    original=resolver._exact_authority_list;calls=[]
+    def actual(binding,package_file):
+        calls.append(deepcopy(binding));return original(binding,package_file)
+    monkeypatch.setattr(resolver,"_exact_authority_list",actual)
+    value=once.read_authorities(pin);value[0]["decided_by"]="changed copy"
+    assert once.read_authorities(pin)==[{"id":"N43","decided_by":"olav"}]
+    assert calls==[pin]
+    assert once.seen[path_key(path)]==(pin,[{"id":"N43","decided_by":"olav"}])
+    with pytest.raises(CachePolicyError,match="descriptor changed"):
+        once.read_authorities({**pin,"sha256":"f"*64})
+    assert calls==[pin]
+
+
+@pytest.mark.parametrize("document",[{},[None],[1]])
+def test_typed_authorities_cache_cannot_relabel_an_object_or_invalid_rows(document):
+    once=resolver._MetadataOnce(PACKAGE);pin=descriptor("answers.json")
+    once.remember(pin,document)
+    with pytest.raises(CachePolicyError,match="list of record objects"):
+        once.read_authorities(pin)

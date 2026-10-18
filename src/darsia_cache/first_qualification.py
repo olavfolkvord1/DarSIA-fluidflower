@@ -45,7 +45,22 @@ def _same_path(a, b):
 
 
 def _digest(value):
-    return hashlib.sha256(_encoded(value)).hexdigest()
+    # Hash-only identity is not a generic control record or an output write.
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _canonical_json(value):
+    return (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _slot_encoded(value):
+    if not isinstance(value, dict):
+        raise CachePolicyError("First-qualification slot must be a JSON object")
+    raw = _canonical_json(value)
+    if not 0 < len(raw) <= 16 * 1024**2:
+        raise CachePolicyError("First-qualification slot exceeds existing sixteen MiB bound; full samples not recorded")
+    return raw
 
 
 def _exact_keys(value, keys, message):
@@ -116,7 +131,7 @@ def _slot_read(provider, role):
 
 def _slot_write(provider, role, value):
     from .windows import WindowsNamespace
-    target = provider["output_namespace"]; raw = _encoded(value)
+    target = provider["output_namespace"]; raw = _slot_encoded(value)
     namespace = WindowsNamespace(target["path"], target["identity"])
     try:
         namespace.write_once(provider["slots"][role], raw, maximum=16*1024**2)
@@ -179,7 +194,8 @@ def administrative_entitlement(report):
 
 class FirstQualification:
     """Read exact metadata on init; no cache/output writes or environment changes."""
-    def __init__(self, binding, *, provider_binding, stores_source, namespace, read):
+    def __init__(self, binding, *, provider_binding, stores_source, namespace, read,
+                 read_authorities=None):
         self.binding = _descriptor(binding)
         self.request = read(self.binding)
         self.reference_build = self.request.get("format") == REFERENCE_REQUEST
@@ -242,7 +258,8 @@ class FirstQualification:
         self.reference_transport_observation = None
         if self.reference_build:
             self.reference_administration = checked_reference_administration(
-                read(_descriptor(self.request["reference_administration"])), self, read=read)
+                read(_descriptor(self.request["reference_administration"])), self, read=read,
+                read_authorities=read_authorities)
         self.started = False
         self.claim = None
 
@@ -669,20 +686,28 @@ def supervise_first_worker(lease, *, api=None):
         if first.reference_build and observation_pin is None:
             # Preserve genuine samples even if cooperative STOP prevents the
             # ordinary whole-run publication/eligibility or a final scan fails.
-            observation_pin=_slot_write(first.provider,"observation",dict(format=OBSERVATION,
-                request=first.binding,provider=first.provider_binding,scope=first.provider["scope"],
-                state="STOP_PARTIAL_DIAGNOSTIC",complete=False,passed=False,
-                error_type=type(error).__name__,message=str(error),actual_terminal=terminal,
-                actual_retirement=retirement,reference_aggregate_samples=observations.aggregate_samples,
-                final_reference_aggregate=observations.last_aggregate,
-                reserve_samples=observations.reserve_samples,operational_reserve_crossed=observations.reserve_crossed,
-                sampled_observed_highwater_is_complete=False,partial_files_retained=True,
-                no_ordinary_profile_created=True,no_reference_acceptance=True))
+            try:
+                observation_pin=_slot_write(first.provider,"observation",dict(format=OBSERVATION,
+                    request=first.binding,provider=first.provider_binding,scope=first.provider["scope"],
+                    state="STOP_PARTIAL_DIAGNOSTIC",complete=False,passed=False,
+                    error_type=type(error).__name__,message=str(error),actual_terminal=terminal,
+                    actual_retirement=retirement,reference_aggregate_samples=observations.aggregate_samples,
+                    final_reference_aggregate=observations.last_aggregate,
+                    reserve_samples=observations.reserve_samples,operational_reserve_crossed=observations.reserve_crossed,
+                    sampled_observed_highwater_is_complete=False,partial_files_retained=True,
+                    no_ordinary_profile_created=True,no_reference_acceptance=True))
+            except BaseException as diagnostic_error:
+                error.add_note("Partial observation was not recorded; full samples are not durable: "
+                    + type(diagnostic_error).__name__ + ": " + str(diagnostic_error))
         held=dict(request=first.binding,provider=first.provider_binding,error_type=type(error).__name__,
             message=str(error),no_retry=True,reservation_closed=False)
         if first.reference_build:
             held["actual_partial_observation"]=observation_pin
-        lease._record("first-held-"+uuid.uuid4().hex+".json",held)
+        try:
+            lease._record("first-held-"+uuid.uuid4().hex+".json",held)
+        except BaseException as diagnostic_error:
+            error.add_note("First-held diagnostic was not recorded: "
+                + type(diagnostic_error).__name__ + ": " + str(diagnostic_error))
         if owned.resume_attempted and owned.info is not None:
             owned.await_family()
         raise
@@ -718,7 +743,7 @@ def require_publishable(observation, writer_evidence):
     raise CachePolicyError("No qualified all-writer lifetime allocation evidence provider is implemented")
 
 
-def resolve_profile(binding, kind, read, *, stores_source=None):
+def resolve_profile(binding, kind, read, *, stores_source=None, read_authorities=None):
     """Old direct profiles unchanged; incomplete new providers always refuse.
 
     The append-once DAG reader is explicit. Final publication remains closed
@@ -739,7 +764,8 @@ def resolve_profile(binding, kind, read, *, stores_source=None):
             or (stores_source is not None and bundle["stores_source"] != stores_source)):
         raise CachePolicyError("Completed provider differs from actual stores/source/cases")
     first = FirstQualification(bundle["request"], provider_binding=binding,
-        stores_source=bundle["stores_source"], namespace=provider["namespace_admission"], read=read)
+        stores_source=bundle["stores_source"], namespace=provider["namespace_admission"], read=read,
+        read_authorities=read_authorities)
     observation, pin = _slot_read(provider, "observation")
     evidence, evidence_pin = _slot_read(provider, "writer_evidence")
     if (bundle["observation"] != pin or bundle["writer_evidence"] != evidence_pin
@@ -877,7 +903,7 @@ def checked_output_entitlement(task, value, *, task_binding, read):
     return deepcopy(value)
 
 
-def checked_reference_administration(value, first, *, read):
+def checked_reference_administration(value, first, *, read, read_authorities=None):
     """N43/Q109 is an explicit producer entitlement, never a measured profile."""
     _exact_keys(value, {"format", "authority_ids", "answers_source", "accepted_plan",
         "scope", "task", "host", "host_policy", "owned_roots", "entry_limit",
@@ -903,7 +929,8 @@ def checked_reference_administration(value, first, *, read):
     nonnegative(value["entry_limit"], "N43 finite accounting entry limit")
     if not value["entry_limit"]:
         raise CachePolicyError("Positive N43 finite accounting entry limit required")
-    authorities=read(_descriptor(value["answers_source"]))
+    authorities=(read if read_authorities is None else read_authorities)(
+        _descriptor(value["answers_source"]))
     ids={row.get("id"):row for row in authorities} if isinstance(authorities,list) else {}
     required={"N43-OLAV-GO-execute-plan-9dc0979d-tonight-Main-reference-and-Olav-qualification":"olav",
         "Q109-answer-option-A-whole-output-entitlement-65728995330B-all-stages-count":"claude",

@@ -13,7 +13,7 @@ import hashlib
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
-from .bootstrap import _explicit_document, _outside, _owner, select_entry_role
+from .bootstrap import _explicit_document, _outside, _owner, select_entry_role, _exact_authority_list
 from .capacity import _json_bytes, read_bound
 from .control import CacheBudgetLedger, _encoded, _json, _owner as checked_owner, _token
 from .policy import CachePolicyError, _descriptor, cache_settings, nonnegative
@@ -57,6 +57,21 @@ class _MetadataOnce:
         document, _ = read_bound(pin)
         self.remember(pin, document)
         return document
+
+
+    def read_authorities(self, binding):
+        pin = _descriptor(binding)
+        key = str(PureWindowsPath(pin["path"])).casefold()
+        if key in self.seen:
+            original, document = self.seen[key]
+            if original != pin:
+                raise CachePolicyError("Original authority descriptor changed during resolution")
+            if not isinstance(document, list) or any(not isinstance(row, dict) for row in document):
+                raise CachePolicyError("Authority metadata must be a list of record objects")
+            return deepcopy(document)
+        document = _exact_authority_list(pin, self.package_file)
+        self.remember(pin, document)
+        return deepcopy(document)
 
 
 class _EligibilityMetadataOnly:
@@ -170,7 +185,8 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
         if profile.get("format")!=PROVIDER:
             raise CachePolicyError("Explicit first observer requires the original immutable provider")
         first=FirstQualification(first_request,provider_binding=role["profile"],
-            stores_source=policy_binding,namespace=receipt["namespace"],read=reads.read)
+            stores_source=policy_binding,namespace=receipt["namespace"],read=reads.read,
+            read_authorities=reads.read_authorities)
         admin=receipt.get("first_qualification",{})
         entitlement=admin.get("administrative_entitlement",{})
         if (admin.get("request")!=first.binding or admin.get("provider")!=role["profile"]
@@ -185,7 +201,8 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
             native_supervision=dict(startup=first.provider["startup"]))
     elif profile.get("format")=="darsia-cache-qualified-profile-provider-v1":
         from .first_qualification import resolve_profile
-        profile=resolve_profile(role["profile"],"import",reads.read,stores_source=policy_binding)
+        profile=resolve_profile(role["profile"],"import",reads.read,stores_source=policy_binding,
+            read_authorities=reads.read_authorities)
     if first is None and (profile.get("format") != "darsia-cache-import-profile-v1"
             or profile.get("purpose") != role["purpose"]
             or profile.get("role_identifier") != role["role_identifier"]

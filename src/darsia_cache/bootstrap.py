@@ -74,6 +74,33 @@ def _exact(binding, package_file):
     return read_bound(binding)[0]
 
 
+def _exact_authority_list(binding, package_file):
+    """The N43 answers role alone is a pinned local list of record objects."""
+    pin = _descriptor(binding)
+    path = _outside(pin["path"], package_file)
+    before = path.stat()
+    if before.st_size != pin["size_bytes"]:
+        raise CachePolicyError("Authority metadata SHA/size/version changed before read")
+    with path.open("rb") as stream:
+        raw = stream.read(pin["size_bytes"] + 1)
+    after = path.stat()
+    version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+    if (version(before) != version(after) or len(raw) != pin["size_bytes"]
+            or hashlib.sha256(raw).hexdigest() != pin["sha256"]):
+        raise CachePolicyError("Authority metadata SHA/size/version changed")
+    from .capacity import _json_bytes
+    # Reuse the original duplicate-key/nonfinite parser without changing the
+    # original artifact bytes or the ordinary object-only metadata reader.
+    wrapped = _json_bytes(('{"authority_records":' + raw.decode("utf-8-sig")
+        + '}').encode("utf-8"))
+    if set(wrapped) != {"authority_records"}:
+        raise CachePolicyError("Authority metadata must be one list document")
+    document = wrapped["authority_records"]
+    if not isinstance(document, list) or any(not isinstance(row, dict) for row in document):
+        raise CachePolicyError("Authority metadata must be a list of record objects")
+    return document
+
+
 def _python_module_invocation():
     # Parse only interpreter options before the entry. A later script/module
     # argument spelled '-m pytest' must never reclassify the actual entry.
@@ -246,7 +273,8 @@ class ImportLease:
                 raise CachePolicyError("Finite first qualification requires the original worker/jobs entry")
             self.first_qualification=FirstQualification(json.loads(os.environ[REQUEST_ENV]),
                 provider_binding=self.profile_binding,stores_source=self.source,
-                namespace=boot["namespace_admission"],read=lambda pin:_exact(pin,package_file))
+                namespace=boot["namespace_admission"],read=lambda pin:_exact(pin,package_file),
+                read_authorities=lambda pin:_exact_authority_list(pin,package_file))
             first=self.first_qualification.provider
             # Operational predeclared closure, explicitly NOT a measured profile.
             self.profile=dict(format="darsia-cache-first-entry-contract-v1",
@@ -255,7 +283,8 @@ class ImportLease:
             self.maximum=0  # Not an entitlement: derived under the host lock in start().
         else:
             self.profile=resolve_profile(self.profile_binding,"import",lambda pin:_exact(pin,package_file),
-                stores_source=self.source)
+                stores_source=self.source,
+                read_authorities=lambda pin:_exact_authority_list(pin,package_file))
         if self.policy.volume_cap is None and not (self.first_qualification is not None
                 and self.first_qualification.reference_build
                 and self.first_qualification.reference_administration["host_policy"]=="olav-n43-one-run-uncapped-d"):
