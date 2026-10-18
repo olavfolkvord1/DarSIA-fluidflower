@@ -155,7 +155,10 @@ def validate_phase1_run(config):
     _data(config)
     _keys(config, {"format", "run", "precision", "frames", "native", "phase", "statistics",
                    "history_policy", "selection_index_field", "ordered_case_ids", "storage"},
-          {"data_aliases", "provenance", "photographs"}, where="phase-one configuration")
+          {"data_aliases", "provenance", "photographs", "gas_probability_storage"}, where="phase-one configuration")
+    if "gas_probability_storage" in config:
+        from ..phase.probability_storage import parse_request
+        parse_request(config)
     if config["format"] != PHASE1_FORMAT or config["precision"] not in {"float32", "float64"}:
         raise ValueError("Explicit phase-one format and precision required")
     name(config["run"])
@@ -401,7 +404,7 @@ def _before_metadata(evidence, target_shape):
 def _frame_record(record, spec, configuration, precision, commit_bound):
     _keys(record, {"format", "complete", "run", "case_id", "frame_index", "elapsed_h", "source",
                    "configuration", "precision", "native", "native_receipt", "phase", "statistics",
-                   "before_rules", "files"}, {"photograph", "opencv_ipp"}, where="phase-one frame receipt")
+                   "before_rules", "files"}, {"photograph", "opencv_ipp", "probabilities"}, where="phase-one frame receipt")
     from darsia._opencv_runtime import validate_observation
     if "opencv_ipp" in record:
         validate_observation(record["opencv_ipp"])
@@ -469,6 +472,13 @@ def _frame_record(record, spec, configuration, precision, commit_bound):
         _owned(photo["receipt"], inventory, where="saved photograph receipt")
         if "png" in photo:
             _owned(photo["png"], inventory, where="saved photograph PNG")
+    if "probabilities" in record:
+        roles = _keys(record["probabilities"], {"archive", "receipt"}, where="decision probability roles")
+        for field in ("archive", "receipt"):
+            _owned(roles[field], inventory, where="decision probability " + field)
+        if (PureWindowsPath(roles["archive"]["path"]).name != "phase_probabilities.npz"
+                or PureWindowsPath(roles["receipt"]["path"]).name != "phase_probabilities_receipt.json"):
+            raise ValueError("Decision probabilities require their exact owned output leaves")
     return record
 
 
@@ -552,6 +562,18 @@ def verify_phase1_completion(completion_bound, configuration_bound, *, expected_
                     or evidence.get("state") != "pending" or evidence.get("reason") != "explicit_saved_pre_light_photograph_not_bound"
                     or not _same_json(evidence.get("source"), spec["source"])):
                 raise ValueError("Saved photograph pending evidence differs")
+        if ("probabilities" in record) != ("gas_probability_storage" in config):
+            raise ValueError("Phase-one probability request/actual product differs")
+        if "probabilities" in record:
+            from ..phase.probability_storage import validate_receipt, _head_bindings, same_metadata
+            roles = record["probabilities"]
+            saved = validate_receipt(reader.json(roles["receipt"]), roles, source=spec["source"],
+                                     case_id=spec["case_id"], shape=record["native"]["full"]["phase_shape_hw"])
+            models = reader.json(config["phase"]["configuration"])["model_bundles"]
+            if (not same_metadata(saved["phase_configuration"], config["phase"]["configuration"])
+                    or not same_metadata(saved["head_bindings"], _head_bindings(models))
+                    or not same_metadata(saved["labels"], record["phase"]["labels"])):
+                raise ValueError("Probability head/configuration provenance differs from the actual producer")
         records.append(dict(commit=deepcopy(bound), record=record))
     return dict(configuration=config, completion=completion, records=records,
                 configuration_descriptor=deepcopy(configuration_bound), completion_descriptor=deepcopy(completion_bound),

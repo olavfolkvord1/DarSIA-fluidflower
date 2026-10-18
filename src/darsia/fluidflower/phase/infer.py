@@ -99,6 +99,7 @@ def infer_native_centre(
     parameters: Mapping,
     input_provenance: Mapping,
     matched_encoding_receipt=None,
+    output_capture=None,
 ):
     """Infer the native centre from its own colour and independently bound references.
 
@@ -308,10 +309,14 @@ def infer_native_centre(
             nominal_area,
             model_bundle["gas_decision_settings"],
             parameters=parameters["decisions"],
+            **({} if output_capture is None else dict(output_capture=output_capture)),
         )
         preminimum = decisions.preminimum_gas_selection(
-            decoded_pixel, decoded_region, parameters=parameters["decisions"]
+            decoded_pixel, decoded_region, parameters=parameters["decisions"],
+            **({} if output_capture is None else dict(output_capture=output_capture.setdefault("seam_pair", {}))),
         )
+    if output_capture is not None and "seam_pair" in output_capture:
+        output_capture["seam_pair"]["actual_returned_selection"] = preminimum.copy()
     provenance = dict(
         runtime["provenance"],
         inference_performed=True,
@@ -361,6 +366,7 @@ def infer_rig_edge(
     feature_shape_hw,
     model_bundle: Mapping,
     parameters: Mapping,
+    output_capture=None,
 ):
     """Infer supported rig pixels with masked filters and measured area guards.
 
@@ -460,12 +466,20 @@ def infer_rig_edge(
         & (gas_region >= runtime["regional_threshold"])
     )
     preminimum_gas = gas_selected.copy()
+    if output_capture is not None:
+        from .probability_storage import pair
+        pair(output_capture, gas_scores, gas_region, valid & flat_valid, co2,
+             preminimum_gas, branch="edge", pixel_threshold=runtime["pixel_threshold"],
+             regional_threshold=runtime["regional_threshold"])
     gas_selected, minimum_audit = area_filtered_gas(
         gas_selected,
         pixel_area_mm2,
         minimum_area_mm2=runtime["minimum_area_mm2"],
         connectivity=runtime["gas_connectivity"],
     )
+    if output_capture is not None:
+        from .probability_storage import transition
+        transition(output_capture, "edge-minimum", preminimum_gas, gas_selected)
     labels[co2] = np.where(gas_selected[co2], 2, 1)
     labels, final_support, support_audit = (
         decisions.require_categorical_feature_support(
@@ -486,7 +500,7 @@ def infer_rig_edge(
 
 
 def apply_locked_postprocessing(
-    inputs, shift_context, delta, envelopes, *, backend, parameters: Mapping
+    inputs, shift_context, delta, envelopes, *, backend, parameters: Mapping, output_capture=None
 ):
     """Apply frozen gas placement, top removal and ordered floor decisions.
 
@@ -522,7 +536,11 @@ def apply_locked_postprocessing(
         parameters=dp,
         heads_parameters=parameters["heads"],
         regional_parameters=parameters["regional"],
+        **({} if output_capture is None else dict(output_capture=output_capture["placement"])),
     )
+    if output_capture is not None:
+        from .probability_storage import state
+        state(output_capture["postprocessing"], "placement", p1)
     top = decisions.apply_top_rule(
         p1,
         p1,
@@ -531,6 +549,8 @@ def apply_locked_postprocessing(
         backend=backend,
         parameters=dp,
     )
+    if output_capture is not None:
+        state(output_capture["postprocessing"], "top", top.labels)
     ordinal = envelope_ordinal(
         inputs["elapsed_h"], envelopes["u1_elapsed_h"], envelopes["u2_elapsed_h"]
     )
@@ -554,6 +574,8 @@ def apply_locked_postprocessing(
         corrected_domain_mask=inputs["corrected_domain"],
         parameters=dp,
     )
+    if output_capture is not None:
+        state(output_capture["postprocessing"], "ordered-floor", floor.labels)
     if not floor.qa["all_pass"]:
         raise ValueError("Phase frame failed the unchanged ordered floor QA")
     labels = decisions.remove_contact_fill_b(
@@ -563,6 +585,8 @@ def apply_locked_postprocessing(
         floor.step_masks[runtime["contact_step"]],
         parameters=dp,
     )
+    if output_capture is not None:
+        state(output_capture["postprocessing"], "contact-fill-removal", labels)
     if floor.fill_reason_b.any():
         raise AssertionError("An absent carryover mask cannot create contact reason b")
     audit = dict(
@@ -608,6 +632,11 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
     """
     from darsia._opencv_runtime import scientific_thread, completed_frame
     ipp_before = scientific_thread("infer_labels:before")
+    probability_capture = None if output_capture is None else output_capture.get("gas_probability_storage")
+    if probability_capture is not None:
+        if type(probability_capture) is not dict or probability_capture:
+            raise ValueError("A fresh optional probability capture is required for every frame")
+        probability_capture.update(edge={}, centre={}, composition={}, placement={}, postprocessing={})
     runtime, gp, dp = rules["chain"], rules["geometry"], rules["decisions"]
     baseline = model_bundle["baseline"]
     source = frame["source"]
@@ -657,6 +686,7 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
         feature_shape_hw=gp["native_shape_hw"],
         model_bundle=model_bundle["edge"],
         parameters=rules,
+        **({} if probability_capture is None else dict(output_capture=probability_capture["edge"])),
     )
     fresh_support &= context.rig_domain & full_valid & baseline_support
     if previous_support is not None:
@@ -675,6 +705,10 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
             barrier_mask=components["barrier_mask"],
             parameters=dp,
         )
+        if probability_capture is not None:
+            from .probability_storage import state
+            state(probability_capture["composition"], "edge-before-Rule-B", fresh)
+            state(probability_capture["composition"], "edge-Rule-B", base)
         base, classes = domain.fill_rig_labels(
             base,
             context.rig_domain,
@@ -682,6 +716,8 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
             hidden=context.hardware_excluded,
             parameters=rules["domain"],
         )
+        if probability_capture is not None:
+            state(probability_capture["composition"], "categorical-fill", base)
         centre_audit = dict(runtime["changed_source_provenance"])
         seam_audit = dict(rule_b=base_b, **runtime["changed_source_seam_provenance"])
         masks = {}
@@ -714,11 +750,14 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
             parameters=rules,
             input_provenance=frame["input_provenance"],
             matched_encoding_receipt=frame["encoding_contract"],
+            **({} if probability_capture is None else dict(output_capture=probability_capture["centre"])),
         )
         if output_capture is not None:
             output_capture.update(g3_pixel=centre.g3_pixel, flatfield_valid=centre.flatfield_valid,
                                   source_box_xywh=source_box,
                                   probability_encoding=centre.provenance["probability_encoding"])
+        if probability_capture is not None:
+            probability_capture["centre"]["encoding"] = centre.provenance["probability_encoding"]
         working_shape = centre.provenance["probability_encoding"][
             "regional_working_shape_hw"
         ]
@@ -758,6 +797,7 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
             parameters=rules["domain"],
             rule_parameters=dp,
             prior_cache=frame["prior_cache"],
+            **({} if probability_capture is None else dict(output_capture=probability_capture["composition"])),
         )
         centre_audit = centre.provenance
         seam_audit = dict(
@@ -837,6 +877,7 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
         model_bundle["envelopes"],
         backend=runtime["rule_backend"],
         parameters=rules,
+        **({} if probability_capture is None else dict(output_capture=probability_capture)),
     )
     classes.update(
         rig_domain=corrected,
@@ -877,6 +918,9 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
         mass_computed=False,
     )
     qa["opencv_ipp"] = completed_frame(ipp_before, "infer_labels:after")
+    if probability_capture is not None:
+        from .probability_storage import finish
+        finish(probability_capture, labels, classes, source_box)
     return dict(
         labels=labels,
         classes=classes,

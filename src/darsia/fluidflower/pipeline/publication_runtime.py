@@ -50,7 +50,8 @@ def _kind(filename):
     if filename.endswith((".mp4", ".mkv", ".mov")):
         return "film"
     if filename in {"phase_labels.png", "phase_classes.npz", "phase_area.npz",
-                    "phase_operator_masks.npz", "products.npz", "native_geometry.npz"}:
+                    "phase_operator_masks.npz", "products.npz", "native_geometry.npz",
+                    "phase_probabilities.npz"}:
         return "map"
     return "intermediate"
 

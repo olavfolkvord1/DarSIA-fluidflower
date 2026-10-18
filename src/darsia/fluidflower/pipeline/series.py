@@ -66,6 +66,9 @@ def validate_run(config):
     if config.get("format") != RUN_FORMAT:
         raise ValueError("Explicit native/phase/N1 run configuration required")
     _no_executable_configuration(config)
+    if "gas_probability_storage" in config:
+        from ..phase.probability_storage import parse_request
+        parse_request(config)
     name(config["run"])
     for field in (
         "frames",

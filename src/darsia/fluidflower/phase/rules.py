@@ -603,7 +603,7 @@ def _minimum_additions(base_gas, selected_additions, pixel_area_mm2, *, paramete
     retained = final & keep[components]
     return (retained, dict(minimum_area_mm2=MINIMUM_AREA_MM2, connectivity=parameters['literal_values']['minimum_additions_int_4'], scope='final gas components; every component containing frozen base gas protected', components=int(count - 1), protected_base_components=int(protected[1:].sum()), removed_isolated_addition_pixels=int((final & ~retained).sum()), base_gas_removed_pixels=int((base_gas & ~retained).sum()), variable_pixel_area=not np.isscalar(area)))
 
-def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_area_mm2, *, filled_support=None, top_keep, open_components, barrier_mask, frozen_base_rule_b, p2_allowed=None, source_component_ids=None, parameters: Mapping, heads_parameters: Mapping, regional_parameters: Mapping):
+def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_area_mm2, *, filled_support=None, top_keep, open_components, barrier_mask, frozen_base_rule_b, p2_allowed=None, source_component_ids=None, parameters: Mapping, heads_parameters: Mapping, regional_parameters: Mapping, output_capture=None):
     """Place gas on a frozen CO2 union using explicit prepared optical scores.
 
     The old-light epoch returns before optical or regional evaluation.
@@ -623,6 +623,8 @@ def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_a
     audit = dict(context.metadata, contract=CONTRACT, placement=placement, delta=float(delta), floor_rule_applied=False, frozen_co2_union_reused=True, co2_union_changed_pixels=0)
     if context.light_epoch_id == parameters['placement']['epoch_modes']['bypass']:
         audit.update(rig_light_labels_bit_identical=True, changed_phase_pixels=0, gas_added_pixels=0, gas_removed_pixels=0, optical_evaluation_bypassed=True)
+        if output_capture is not None:
+            output_capture['bypassed'] = True
         return (labels.copy(), audit, {})
     if context.light_epoch_id != parameters['placement']['epoch_modes']['evaluate'] or context.domain.shape != labels.shape:
         raise ValueError('frozen shift context does not match the declared new-lamp frame')
@@ -633,6 +635,9 @@ def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_a
         raise ValueError('frozen source components disagree with the frozen base Rule B decision')
     fraction = _cached_fraction(context, labels, parameters=parameters)
     masks = dict(base_fraction=fraction, frozen_co2=np.isin(labels, (1, 2)))
+    if output_capture is not None:
+        from .probability_storage import require_pair_mode
+        require_pair_mode(placement, parameters)
     if placement == parameters['placement']['placement_modes']['constrained_neighbourhood']:
         allowed = _placement_bool(p2_allowed, labels.shape, 'P2 allowed', parameters=parameters)
         barrier = _placement_bool(barrier_mask, labels.shape, 'P2 barrier facies', parameters=parameters)
@@ -663,9 +668,16 @@ def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_a
         regional_score = regional.probability(prepared['features'], model['heads']['gas_within_co2'], parameters=regional_parameters)
         regional_score = cv2.resize(regional_score, labels.shape[::-1], interpolation=cv2.INTER_LINEAR)
         result, threshold_audit, threshold_masks = replace_gas_from_scores(labels, pixel, regional_score, support, pixel_area_mm2, filled_support=filled_support, parameters=parameters)
+        if output_capture is not None:
+            from .probability_storage import capture_placement, state
+            capture_placement(output_capture, locals())
         clipped = (result == 2) & ~top
         result[clipped] = 1
+        if output_capture is not None:
+            state(output_capture, 'placement-top', result)
         result, applied_b = apply_barrier_rule_b(result, open_components, decision['source_component_ids'] if source_component_ids is None else source_component_ids, pixel_area_mm2=NOMINAL_BARRIER_PIXEL_AREA_MM2, barrier_mask=barrier_mask, parameters=parameters)
+        if output_capture is not None:
+            state(output_capture, 'placement-Rule-B', result)
         audit.update(threshold_audit)
         audit.update(context.metadata, contract=CONTRACT, placement=placement, delta=float(delta), regional_head_used=True, shifted_pixel_probability_used=True, floor_rule_applied=False, top_clip_removed_pixels=int(clipped.sum()), top_clip_applied=True, rule_b_application=applied_b, rule_b_decision_recomputed=True, rule_b_applied=True, rule_b_removed_pixels=applied_b['removed_gas_pixels'], t4b_indicator_applied_once=placement == parameters['placement']['placement_modes']['regional_joint_epoch'])
         masks.update(threshold_masks, frozen_rule_b_forbidden=forbidden)
@@ -709,7 +721,7 @@ def require_categorical_feature_support(labels, optical_valid, gas_feature_valid
     return (result, supported, dict(optical_supported_pixels=int(optical_valid.sum()), gas_feature_invalid_optical_supported_pixels=int(np.count_nonzero(optical_valid & ~gas_feature_valid)), final_modelled_feature_pixels=int(supported.sum()), invalid_feature_policy='unresolved before explicitly flagged nearest-label filling'))
 
 
-def preminimum_gas_selection(decoded_g3, decoded_regional, *, parameters: Mapping):
+def preminimum_gas_selection(decoded_g3, decoded_regional, *, parameters: Mapping, output_capture=None):
     """Threshold decoded gas evidence before intersecting a corrected CO2 union.
 
     Both supplied probability grids must already be float32. The regional
@@ -722,6 +734,9 @@ def preminimum_gas_selection(decoded_g3, decoded_regional, *, parameters: Mappin
     if pixel.ndim != 2 or regional.ndim != 2 or pixel.dtype != np.float32 or (regional.dtype != np.float32):
         raise ValueError('Pre-minimum selection needs decoded float32 probability grids')
     native = cv2.resize(regional, pixel.shape[::-1], interpolation=cv2.INTER_LINEAR)
+    if output_capture is not None:
+        from .probability_storage import capture_centre_selection
+        capture_centre_selection(output_capture, locals())
     return (pixel >= parameters['centre_selection']['pixel_threshold']) & (native >= parameters['centre_selection']['regional_threshold'])
 
 
@@ -806,7 +821,7 @@ def _check_scores(values, name, *, shape=None, allow_nan=False):
         raise ValueError(f'{name} probabilities are outside [0,1]')
     return array
 
-def apply_gas_configuration(frozen_labels, g3_pixel, regional_probability, pixel_area_mm2, settings, *, parameters: Mapping):
+def apply_gas_configuration(frozen_labels, g3_pixel, regional_probability, pixel_area_mm2, settings, *, parameters: Mapping, output_capture=None):
     """Apply thresholds and native four-connected minimum inside frozen CO2.
 
     Regional continuous probabilities are converted to float32 and resized
@@ -849,4 +864,7 @@ def apply_gas_configuration(frozen_labels, g3_pixel, regional_probability, pixel
         raise AssertionError('Approved G3 decision changed frozen water or unresolved pixels')
     gas_count = int(np.count_nonzero(gas))
     audit = dict(format=parameters['gas_configuration']['format'], settings=asdict(settings), configuration_sha256=gas_configuration_identity(settings), co2_union_mask_sha256=_packed_mask_identity(co2), co2_support_exact=True, outside_co2_labels_exact=True, co2_pixels=int(np.count_nonzero(co2)), gas_pixels_before_regional=int(np.count_nonzero(pixel_gas)), gas_pixels_before_minimum=int(np.count_nonzero(regional_gas)), gas_pixels=gas_count, gas_area_mm2=gas_count * area, pixel_area_mm2=area, withdrawn_gas_components=withdrawn_components, withdrawn_gas_pixels=int(np.count_nonzero(regional_gas & ~gas)), invalid_g3_pixels_inside_co2=int(np.count_nonzero(co2 & ~np.isfinite(g3))), regional_source_shape_hw=source_shape, regional_resize='float32 cv2.INTER_LINEAR to native grid before threshold', minimum_policy='4-connected component area strictly smaller than minimum is aqueous', optical_presence_gate_used=False, feature_eligibility_gate_used=False, legacy_gas_fallback_used=False, mass_eligible=False)
+    if output_capture is not None:
+        from .probability_storage import capture_centre
+        capture_centre(output_capture, locals())
     return (result, audit)

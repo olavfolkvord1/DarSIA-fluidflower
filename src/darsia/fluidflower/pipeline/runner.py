@@ -140,6 +140,23 @@ def validate_frame_artifacts(spec, result, final_directory, config):
                 "Phase descriptor differs from committed transitive inventory"
             )
         reader.path(bound)
+    requested = config.get("gas_probability_storage") is not None
+    if ("probabilities" in product) != requested:
+        raise ValueError("Committed optional probability request/product differs")
+    if requested:
+        from ..phase.probability_storage import parse_request, validate_receipt, same_metadata
+        parse_request(config)
+        roles = product["probabilities"]
+        if type(roles) is not dict or set(roles) != {"archive", "receipt"}:
+            raise ValueError("Explicit probability roles required")
+        for bound in roles.values():
+            if inventory.get(Path(bound["path"]).name) != bound:
+                raise ValueError("Probability product differs from exact stage inventory")
+        saved = validate_receipt(reader.json(roles["receipt"]), roles, source=spec["source"],
+                                 case_id=spec["case_id"])
+        if (not same_metadata(saved["phase_configuration"], config["phase"]["configuration"])
+                or not same_metadata(saved["labels"], product["phase"]["labels"])):
+            raise ValueError("Probability original configuration/label roles differ")
     native = product["native"]
     reader.json(native["audit"])
     history = reader.json(product["phase"]["history_input"])
@@ -262,6 +279,10 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     if "storage" in config:
         from .. import storage_outputs
         storage_request = storage_outputs.parse_request(config, precision)
+    probability_request = None
+    if "gas_probability_storage" in config:
+        from ..phase import probability_storage
+        probability_request = probability_storage.parse_request(config)
     if backend not in {"cpu", "cuda"} or precision != task["precision"]:
         raise ValueError("Actual backend/precision differs from queue task")
     from .run_io import for_task
@@ -372,12 +393,14 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             start = time.perf_counter()
             native = inputs.native(spec, output / "preparation" / spec["case_id"])
             frame = inputs.frame(spec, native)
-            if storage_request is None:
+            if storage_request is None and probability_request is None:
                 inferred = infer_labels(
                     frame, inputs.previous, inputs.model_bundle, inputs.parameters
                 )
             else:
                 phase_capture = {}
+                if probability_request is not None:
+                    phase_capture["gas_probability_storage"] = {}
                 inferred = infer_labels(frame, inputs.previous, inputs.model_bundle,
                                         inputs.parameters, output_capture=phase_capture)
             stage = output / "preparation" / spec["case_id"]
@@ -393,6 +416,12 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                 storage_entry = storage_outputs.write_frame(
                     output, task, spec, phase, inferred, phase_capture,
                     mass_capture, evaluated, storage_request)
+            probability_product = None
+            if probability_request is not None:
+                probability_product = probability_storage.write_product(stage, spec,
+                    phase_capture["gas_probability_storage"], model_bindings=inputs.phase["model_bundles"],
+                    phase_configuration=config["phase"]["configuration"], labels=inferred["labels"],
+                    label_descriptor=phase["labels"])
             stage_binding = dict(
                 format="darsia-series-frame-v1",
                 complete=True,
@@ -405,6 +434,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                 numerical_phase_calls=1,
                 opencv_ipp=completed_frame(ipp_before, "run_series:" + spec["case_id"] + ":after"),
             )
+            if probability_product is not None:
+                stage_binding["probabilities"] = probability_product
             if storage_request is not None:
                 stage_binding["storage"] = storage_entry
                 for bound in [storage_entry["receipt"], *storage_entry["files"]]:

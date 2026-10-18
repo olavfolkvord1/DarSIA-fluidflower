@@ -113,7 +113,7 @@ def _save_statistics(stage, extracted):
     return bound
 
 
-def _commit_phase1(stage, spec, *, task, configuration, native, phase, statistics, before, photograph):
+def _commit_phase1(stage, spec, *, task, configuration, native, phase, statistics, before, photograph, probabilities=None):
     """One new immutable stage commit anchors every closed file before progress."""
     from darsia._opencv_runtime import require_ipp_off
     from .runner import _inventory
@@ -126,6 +126,8 @@ def _commit_phase1(stage, spec, *, task, configuration, native, phase, statistic
         source=deepcopy(spec["source"]), configuration=deepcopy(configuration), precision=task["precision"],
         native=native["record"], native_receipt=native["record_asset"], phase=phase,
         statistics=statistics, before_rules=before, photograph=photograph, files=_inventory(stage))
+    if probabilities is not None:
+        record["probabilities"] = probabilities
     # Reuse the already-qualified strict metadata/ownership/role validator.
     from .staged_data import _frame_record
     _frame_record(record, spec, configuration, task["precision"], dict(path=str(commit)))
@@ -162,6 +164,10 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
     from ..phase.infer import infer_labels
     from .runner import _phase_outputs
     config, configuration, native_code_admission = _task_configuration(task, output, backend, precision)
+    probability_request = None
+    if "gas_probability_storage" in config:
+        from ..phase import probability_storage
+        probability_request = probability_storage.parse_request(config)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
@@ -206,10 +212,18 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
             native = inputs.native(spec, stage)
             frame = inputs.frame(spec, native)
             phase_capture = {}
+            if probability_request is not None:
+                phase_capture["gas_probability_storage"] = {}
             inferred = infer_labels(frame, inputs.previous, inputs.model_bundle,
                                     inputs.parameters, output_capture=phase_capture)
             phase = _phase_outputs(stage, spec, frame, inferred)
             before = _save_before(stage, spec, phase_capture, native["record"]["full"]["phase_shape_hw"])
+            probabilities = None
+            if probability_request is not None:
+                probabilities = probability_storage.write_product(stage, spec,
+                    phase_capture["gas_probability_storage"], model_bindings=inputs.phase["model_bundles"],
+                    phase_configuration=config["phase"]["configuration"], labels=inferred["labels"],
+                    label_descriptor=phase["labels"])
             del phase_capture
             photograph = _save_original_photo(stage, task, spec,
                 config.get("photographs", {}).get(spec["case_id"]), inputs.reader)
@@ -220,7 +234,8 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
             statistics = _save_statistics(stage, extracted)
             phase["opencv_ipp"] = completed_frame(ipp_before, "run_phase1:" + spec["case_id"] + ":after")
             committed = _commit_phase1(stage, spec, task=task, configuration=configuration,
-                native=native, phase=phase, statistics=statistics, before=before, photograph=photograph)
+                native=native, phase=phase, statistics=statistics, before=before, photograph=photograph,
+                **({} if probabilities is None else dict(probabilities=probabilities)))
             records.append(committed)
             # Acquisition history and actual progress follow the immutable
             # stage commit. A lost lease/control callback prevents the next frame.

@@ -582,6 +582,7 @@ def merge_native_and_rig(
     parameters: Mapping,
     rule_parameters: Mapping,
     prior_cache=None,
+    output_capture=None,
 ):
     """Compose native and rig decisions, preserving the frozen operator order.
 
@@ -602,6 +603,9 @@ def merge_native_and_rig(
         barrier_mask=barrier_mask,
         parameters=rule_parameters,
     )
+    if output_capture is not None:
+        from .probability_storage import transition
+        transition(output_capture, "edge-Rule-B", fresh, edge_labels)
     x, y, width, height = source_box_xywh
     central = np.asarray(centre.labels).copy()
     central_support = (
@@ -619,6 +623,8 @@ def merge_native_and_rig(
         barrier_mask=crop_native_canvas(barrier_mask, source_box_xywh),
         parameters=rule_parameters,
     )
+    if output_capture is not None:
+        transition(output_capture, "centre-Rule-B", central, central_b)
     merged = edge_labels.copy()
     crop = merged[y : y + height, x : x + width]
     crop[central_support] = central_b[central_support]
@@ -628,6 +634,9 @@ def merge_native_and_rig(
     support[y : y + height, x : x + width] = (
         central_support | fresh_support[y : y + height, x : x + width]
     )
+    if output_capture is not None:
+        from .probability_storage import state
+        state(output_capture, "centre-edge-composition", merged)
     observed = observed | support
     fill_audit = {}
     kwargs = {}
@@ -649,6 +658,8 @@ def merge_native_and_rig(
     filled, classes = fill_rig_labels(
         merged, rig_domain, observed, audit=fill_audit, parameters=parameters, **kwargs
     )
+    if output_capture is not None:
+        state(output_capture, "categorical-fill", filled)
     prior_audit = None
     if prior_cache is not None:
         native, _, prior_audit = preserve_prior_categorical_fill(
@@ -664,6 +675,8 @@ def merge_native_and_rig(
             parameters=parameters,
         )
         filled[y : y + height, x : x + width] = native
+    if output_capture is not None:
+        state(output_capture, "preserved-categorical-fill", filled)
     # Fresh ring fill is a separate evaluation, just as in the saved seam
     # worker. It must not inherit source-bound old fill on the released ring.
     # The saved seam worker filled the fresh numerical decision before B;
@@ -694,6 +707,9 @@ def merge_native_and_rig(
         parameters=parameters,
         rule_parameters=rule_parameters,
     )
+    if output_capture is not None:
+        output_capture["inherited_selection"] = (old_domain & ~release).copy()
+        state(output_capture, "seam-minimum-and-Rule-B", revised)
     return (
         revised,
         classes,

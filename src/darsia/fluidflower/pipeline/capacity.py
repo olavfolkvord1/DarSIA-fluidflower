@@ -419,6 +419,12 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
               "measurement", "completion", "writers", "orchestration", "layout_receipt"}
     if task.get("pipeline") == "native-phase-n1":
         fields.add("measured_native_layout")
+    if "gas_probability_storage" in config:
+        from ..phase.probability_storage import parse_request
+        request = parse_request(config)
+        fields.add("gas_probability_storage")
+        if profile.get("gas_probability_storage") != request:
+            raise ValueError("Probability output requires its own actually measured writer/layout profile")
     if set(profile) != fields:
         raise ValueError("Exact expected-space profile schema required")
     writers = profile["writers"]
@@ -428,6 +434,8 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
         required|={"src/darsia/fluidflower/pipeline/series.py","src/darsia/fluidflower/native/sidecar.py"}
     if task.get("pipeline") == "native-phase-statistics":
         required.add("src/darsia/fluidflower/pipeline/phase_statistics.py")
+    if "gas_probability_storage" in config:
+        required.add("src/darsia/fluidflower/phase/probability_storage.py")
     if config.get("storage") is not None:
         required |= {"src/darsia/fluidflower/storage_resolution.py", "src/darsia/fluidflower/storage_outputs.py"}
         if task.get("pipeline") == "n1":
