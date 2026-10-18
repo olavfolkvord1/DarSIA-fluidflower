@@ -1166,10 +1166,13 @@ def _publish_frame(
     if storage_context is not None:
         from ..storage_n1_outputs import write_n1_frame
         context, capture = storage_context
+        extensive_kwargs = {}
+        if evaluated.get("extensive_inputs") is not None:
+            extensive_kwargs["extensive_inputs"] = evaluated["extensive_inputs"]
         storage_kinds = write_n1_frame(
             temporary, final, manifest=manifest, manifest_asset=manifest_asset,
             spec=spec, config=config, evaluated=evaluated, capture=capture, context=context,
-            extensive_inputs=evaluated.get("extensive_inputs"))
+            **extensive_kwargs)
     files = {
         path.name: {key: value for key, value in asset(path).items() if key != "path"}
         for path in sorted(temporary.iterdir())
