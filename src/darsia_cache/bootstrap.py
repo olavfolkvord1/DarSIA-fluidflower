@@ -63,7 +63,8 @@ def _explicit_document(path, package_file):
     if not 0 < before.st_size <= 1024**2:
         raise CachePolicyError("Explicit stores/policy metadata exceeds one MiB")
     raw = path.read_bytes(); after = path.stat()
-    if before != after or len(raw) != before.st_size:
+    version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+    if version(before) != version(after) or len(raw) != before.st_size:
         raise CachePolicyError("Explicit stores/cache policy changed while reading")
     descriptor = dict(path=str(path),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
     return tomllib.loads(raw.decode("utf-8-sig")), descriptor

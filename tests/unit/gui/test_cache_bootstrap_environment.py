@@ -79,3 +79,52 @@ def test_first_only_redirects_all_inherited_cache_application_paths_inside_owned
         if key!="NUMBA_CACHE_LOCATOR_CLASSES":
             assert PureWindowsPath(actual[key]).is_relative_to(PureWindowsPath(root))
     assert actual["NUMBA_CACHE_LOCATOR_CLASSES"]=="UserProvidedCacheLocator"
+
+
+
+def explicit_stores_path_TESTONLY(monkeypatch,*,changed=None,declared_size=None,raw=None):
+    data=b'[machine]\nid="TESTONLY"\n' if raw is None else raw
+    fields=dict(st_dev=123,st_ino=456,st_size=len(data),st_mtime_ns=789,
+        st_atime=1.0,st_atime_ns=1_000_000_000)
+    if declared_size is not None:fields['st_size']=declared_size
+    before=SimpleNamespace(**fields);after=SimpleNamespace(**dict(fields,**(changed or {})))
+    states=iter([before,after]);reads=[]
+    class Path_TESTONLY:
+        def stat(self):return next(states)
+        def read_bytes(self):reads.append('read');return data
+        def __str__(self):return 'C:/TESTONLY/stores.toml'
+    path=Path_TESTONLY()
+    monkeypatch.setattr(bootstrap,'_outside',lambda selected,package:path)
+    return data,reads
+
+
+def test_explicit_stores_read_ignores_access_time_only_with_exact_raw_descriptor(monkeypatch):
+    import hashlib
+    raw,reads=explicit_stores_path_TESTONLY(monkeypatch,changed=dict(
+        st_atime=9.0,st_atime_ns=9_000_000_000))
+    document,source=bootstrap._explicit_document('C:/TESTONLY/stores.toml','TESTONLY_PACKAGE')
+    assert document=={'machine':{'id':'TESTONLY'}} and reads==['read']
+    assert source==dict(path='C:/TESTONLY/stores.toml',sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+
+
+def test_explicit_stores_read_still_refuses_every_identity_or_content_version_change(monkeypatch):
+    import pytest
+    from darsia_cache.policy import CachePolicyError
+    for field,value in [('st_dev',124),('st_ino',457),('st_size',999),('st_mtime_ns',790)]:
+        explicit_stores_path_TESTONLY(monkeypatch,changed={field:value})
+        with pytest.raises(CachePolicyError,match='changed while reading'):
+            bootstrap._explicit_document('C:/TESTONLY/stores.toml','TESTONLY_PACKAGE')
+    raw,_=explicit_stores_path_TESTONLY(monkeypatch)
+    explicit_stores_path_TESTONLY(monkeypatch,declared_size=len(raw)+1)
+    with pytest.raises(CachePolicyError,match='changed while reading'):
+        bootstrap._explicit_document('C:/TESTONLY/stores.toml','TESTONLY_PACKAGE')
+
+
+def test_explicit_stores_read_preserves_positive_one_mib_before_read_bound(monkeypatch):
+    import pytest
+    from darsia_cache.policy import CachePolicyError
+    for size in [0,1024**2+1]:
+        _,reads=explicit_stores_path_TESTONLY(monkeypatch,declared_size=size)
+        with pytest.raises(CachePolicyError,match='one MiB'):
+            bootstrap._explicit_document('C:/TESTONLY/stores.toml','TESTONLY_PACKAGE')
+        assert reads==[]
