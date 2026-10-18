@@ -225,6 +225,8 @@ def run_series(task, output, backend, precision, on_progress=None):
     reductions and phase call order remain those of the configured methods.
     The caller owns queue claims, retirement, lease fences and watchdogs.
     """
+    from darsia._opencv_runtime import scientific_thread
+    ipp_start = scientific_thread("run_series:start")
     import cv2
     import scipy.linalg
     from threadpoolctl import threadpool_info, threadpool_limits
@@ -240,6 +242,7 @@ def run_series(task, output, backend, precision, on_progress=None):
                 requested_threads=threads,
                 cv2_threads=cv2.getNumThreads(),
                 threadpools=threadpool_info(),
+                opencv_ipp=ipp_start,
             )
             return _run_series(task, output, backend, precision, on_progress, runtime)
     finally:
@@ -247,6 +250,7 @@ def run_series(task, output, backend, precision, on_progress=None):
 
 
 def _run_series(task, output, backend, precision, on_progress, runtime):
+    from darsia._opencv_runtime import scientific_thread, completed_frame, require_ipp_off
     from ..mass.n1_pipeline import N1Pipeline, DataReader, _write_json, _publish_frame
     from ..mass.production_precision import PixelMath
     from ..phase.infer import infer_labels
@@ -355,6 +359,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
         )
         for position in range(len(records), len(config["frames"])):
             spec = config["frames"][position]
+            ipp_before = scientific_thread("run_series:" + spec["case_id"] + ":before")
             if on_progress:
                 on_progress(
                     dict(
@@ -398,6 +403,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                 phase=phase,
                 files=_inventory(stage),
                 numerical_phase_calls=1,
+                opencv_ipp=completed_frame(ipp_before, "run_series:" + spec["case_id"] + ":after"),
             )
             if storage_request is not None:
                 stage_binding["storage"] = storage_entry
@@ -405,6 +411,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                     stage_binding["files"][Path(bound["path"]).name] = bound
                 storage_outputs.validate_publication_binding(stage_binding)
             evaluated["prediction"]["pipeline"] = stage_binding
+            evaluated["opencv_ipp"] = stage_binding["opencv_ipp"]
             elapsed = time.perf_counter() - start
             record = _publish_frame(
                 output,
@@ -463,6 +470,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             reused_case_ids=list(prefix["prefix_case_ids"]),
             frame_producers=producers,
             elapsed_seconds=wall,
+            opencv_ipp=require_ipp_off("run_series:completed"),
         )
         del mass
     finally:

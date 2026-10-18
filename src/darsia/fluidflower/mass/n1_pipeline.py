@@ -357,6 +357,8 @@ class N1Pipeline:
         statistics_only=False
     ):
         """Load only this run's shared data and saved scientific models."""
+        from darsia._opencv_runtime import scientific_thread
+        scientific_thread("N1Pipeline:setup")
         import numpy as np
         import darsia
         from .n1_arithmetic import validate_parameters
@@ -803,11 +805,16 @@ class N1Pipeline:
         A phase-one caller constructs this context with statistics_only=True.
         This method writes no files, commits no frame and advances no history.
         """
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("N1Pipeline.extract_statistics:before")
         prepared = self._prepare_statistics(spec)
-        return dict(statistics=prepared["statistics"], sandmap=prepared["sandmap"])
+        return dict(statistics=prepared["statistics"], sandmap=prepared["sandmap"],
+                    opencv_ipp=completed_frame(ipp_before, "N1Pipeline.extract_statistics:after"))
 
     def evaluate(self, spec, *, output_capture=None):
         """Compute fields and the original paired E/U_rest summary once."""
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("N1Pipeline.evaluate:before")
         if self.statistics_only:
             raise ValueError("A statistics-only context cannot evaluate fitted mass")
         import numpy as np
@@ -852,6 +859,7 @@ class N1Pipeline:
             export=main_products(result, math),
             statistics=row,
             sandmap=report,
+            opencv_ipp=completed_frame(ipp_before, "N1Pipeline.evaluate:after"),
         )
 
 
@@ -956,6 +964,8 @@ def _publish_frame(
     storage_context=None,
 ):
     """Publish one Main-format scientific frame directly on its owned output."""
+    from darsia._opencv_runtime import require_ipp_off
+    require_ipp_off("publish_frame:before")
     import numpy as np
 
     output = Path(output)
@@ -1091,6 +1101,7 @@ def _publish_frame(
         round4_spec_sha256=prediction.get("round4_spec_sha256"),
         amendment_sha256=prediction.get("amendment_sha256"),
         scope="frozen_evaluation",
+        opencv_ipp=evaluated.get("opencv_ipp"),
     )
     for part in (
         "added_to_M",
@@ -1134,7 +1145,9 @@ def _publish_frame(
         products=dict(precision=result["precision"], backend=backend),
         files=files,
         committed_utc=datetime.now(timezone.utc).isoformat(),
+        opencv_ipp=evaluated.get("opencv_ipp"),
     )
+    require_ipp_off("publish_frame:commit")
     commit_asset = _write_json(temporary / "commit.json", commit)
     registration = dict(
         manifest_sha256=manifest_asset["sha256"],
@@ -1191,6 +1204,8 @@ def run_n1(
     numerical libraries before limiting their pools, then cover setup, every
     frame and publication in the same limit context.
     """
+    from darsia._opencv_runtime import scientific_thread
+    ipp_start = scientific_thread("run_n1:start")
     threads = task.get("threads", 1)
     if type(threads) is not int or threads < 1:
         raise ValueError("task.threads must be a positive integer")
@@ -1206,6 +1221,7 @@ def run_n1(
                 "requested_threads": threads,
                 "cv2_threads": cv2.getNumThreads(),
                 "threadpools": threadpool_info(),
+                "opencv_ipp": ipp_start,
             }
             runner = _run_n1 if _runner is None else _runner
             return runner(
@@ -1232,6 +1248,7 @@ def _run_n1(
     directory (UNC in production). An existing frame is never recomputed or
     overwritten. The caller owns queue/TTL/code/environment/process admission.
     """
+    from darsia._opencv_runtime import scientific_thread, completed_frame, require_ipp_off
     from .production_precision import PixelMath
 
     from ..pipeline.run_io import for_task
@@ -1352,6 +1369,7 @@ def _run_n1(
         for position, spec in enumerate(config["frames"]):
             if position < resumed:
                 continue
+            ipp_before = scientific_thread("run_n1:" + spec["case_id"] + ":before")
             if on_progress:
                 on_progress(
                     dict(
@@ -1367,6 +1385,7 @@ def _run_n1(
             evaluated = (pipeline.evaluate(spec) if capture is None
                          else pipeline.evaluate(spec, output_capture=capture))
             compute_seconds = time.perf_counter() - started
+            evaluated["opencv_ipp"] = completed_frame(ipp_before, "run_n1:" + spec["case_id"] + ":after")
             publication = _publish_frame(
                 output,
                 manifest,
@@ -1424,6 +1443,7 @@ def _run_n1(
             physical_correction=config["physical_correction"],
             anchor=config["anchor"],
             elapsed_seconds=wall,
+            opencv_ipp=require_ipp_off("run_n1:completed"),
         )
         del pipeline
     finally:

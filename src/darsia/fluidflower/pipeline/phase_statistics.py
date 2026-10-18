@@ -89,6 +89,8 @@ def _save_original_photo(stage, task, spec, request, reader):
 
 def _save_statistics(stage, extracted):
     """Original N1 gzip/JSON serialization, retaining all summary values."""
+    from darsia._opencv_runtime import require_ipp_off, validate_observation
+    require_ipp_off("phase1-statistics:before-publication")
     from ..mass.n1_pipeline import _jsonable, asset, _write_json
     path = Path(stage) / "native_statistics.json.gz"
     with path.open("xb") as raw:
@@ -101,11 +103,18 @@ def _save_statistics(stage, extracted):
         raw.flush()
         os.fsync(raw.fileno())
     _write_json(Path(stage) / "statistics_geometry_report.json", extracted["sandmap"])
-    return asset(path)
+    bound = asset(path)
+    if "opencv_ipp" in extracted:
+        validate_observation(extracted["opencv_ipp"])
+        _write_json(Path(stage) / "native_statistics_runtime.json", dict(
+            format="darsia-native-statistics-runtime-v1", statistics=bound,
+            opencv_ipp=extracted["opencv_ipp"]))
+    return bound
 
 
 def _commit_phase1(stage, spec, *, task, configuration, native, phase, statistics, before, photograph):
     """One new immutable stage commit anchors every closed file before progress."""
+    from darsia._opencv_runtime import require_ipp_off
     from .runner import _inventory
     stage = Path(stage)
     commit = stage / "phase1_commit.json"
@@ -119,12 +128,15 @@ def _commit_phase1(stage, spec, *, task, configuration, native, phase, statistic
     # Reuse the already-qualified strict metadata/ownership/role validator.
     from .staged_data import _frame_record
     _frame_record(record, spec, configuration, task["precision"], dict(path=str(commit)))
+    record["opencv_ipp"] = phase.get("opencv_ipp", require_ipp_off("phase1:commit"))
     write_immutable(commit, record)
     return descriptor(commit)
 
 
 def run_phase1(task, output, backend, precision, on_progress=None):
     """Existing worker stage entrypoint, not a standalone or generated runner."""
+    from darsia._opencv_runtime import scientific_thread
+    ipp_start = scientific_thread("run_phase1:start")
     import cv2
     import scipy.linalg
     from threadpoolctl import threadpool_info, threadpool_limits
@@ -135,7 +147,7 @@ def run_phase1(task, output, backend, precision, on_progress=None):
     try:
         cv2.setNumThreads(threads)
         with threadpool_limits(limits=threads):
-            runtime = dict(requested_threads=threads, cv2_threads=cv2.getNumThreads(),
+            runtime = dict(opencv_ipp=ipp_start, requested_threads=threads, cv2_threads=cv2.getNumThreads(),
                            threadpools=threadpool_info())
             return _run_phase1(task, output, backend, precision, on_progress, runtime)
     finally:
@@ -143,6 +155,7 @@ def run_phase1(task, output, backend, precision, on_progress=None):
 
 
 def _run_phase1(task, output, backend, precision, on_progress, runtime):
+    from darsia._opencv_runtime import scientific_thread, completed_frame, require_ipp_off
     from ..mass.n1_pipeline import N1Pipeline, _write_json
     from ..mass.production_precision import PixelMath
     from ..phase.infer import infer_labels
@@ -183,6 +196,7 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
         statistics_context = N1Pipeline(statistics_config, precision=precision,
             pixel_math=math_provider, unc_only=True, statistics_only=True)
         for spec in config["frames"]:
+            ipp_before = scientific_thread("run_phase1:" + spec["case_id"] + ":before")
             if on_progress:
                 on_progress(dict(state="frame_started", stage=PIPELINE, run=task["run"],
                     case_id=spec["case_id"], frame_index=spec["frame_index"]))
@@ -202,6 +216,7 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
                                                      baseline=inputs.mass_baseline)
             extracted = statistics_context.extract_statistics(statistics_spec)
             statistics = _save_statistics(stage, extracted)
+            phase["opencv_ipp"] = completed_frame(ipp_before, "run_phase1:" + spec["case_id"] + ":after")
             committed = _commit_phase1(stage, spec, task=task, configuration=configuration,
                 native=native, phase=phase, statistics=statistics, before=before, photograph=photograph)
             records.append(committed)
@@ -222,7 +237,8 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
             close()
     completion = dict(format=COMPLETION_FORMAT, complete=True, run=config["run"],
         configuration=configuration, precision=precision, code_commit=task["commit"],
-        ordered_case_ids=config["ordered_case_ids"], frames=records, history_complete=True)
+        ordered_case_ids=config["ordered_case_ids"], frames=records, history_complete=True,
+        opencv_ipp=require_ipp_off("run_phase1:completed"))
     core = output / "phase1_completed.json"
     write_immutable(core, completion)
     wall = time.perf_counter() - clock
@@ -231,6 +247,7 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
         working_pixel_dtype=precision, case_count=len(records), ordered_case_ids=config["ordered_case_ids"],
         phase1_completion=descriptor(core), phase1_frames=records, manifest=manifest_asset,
         configuration=configuration, physical_correction=config["statistics"]["physical_correction"],
+        opencv_ipp=require_ipp_off("run_phase1:result"),
         worker_references_closed=True, fitted_mass_calibration_read=False,
         mass_evaluation_calls=0, wall_seconds=wall,
         public_dispatch_resume_and_publication_qualified=False)

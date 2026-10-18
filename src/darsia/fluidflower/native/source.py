@@ -382,6 +382,8 @@ class SourceProcessor:
 
     def __init__(self, source_row: dict[str, Any], *, calibration_manifest_path: Path, photo_aggregate_path: Path, enclosed_hole_policy: str=None, display_mode: str=None, isolated_invalid_policy: str=None, parameters: Mapping) -> None:
         """Preserve the source-bound camera processing contract with explicit parameters."""
+        from darsia._opencv_runtime import scientific_thread
+        scientific_thread("SourceProcessor:setup")
         self.parameters = parameters
         enclosed_hole_policy = self.parameters['source']['default_policies']['enclosed_hole_policy'] if enclosed_hole_policy is None else enclosed_hole_policy
         display_mode = self.parameters['source']['default_policies']['display_mode'] if display_mode is None else display_mode
@@ -469,6 +471,8 @@ class SourceProcessor:
 
     def correct(self, *, run: str, frame_id: str, camera_jpeg: Path, camera_arw: Path, review_jpeg: Path, source_manifest_sha256: str, content_shape_hw: tuple[int, int], content_box_xywh: tuple[int, int, int, int]) -> CorrectedFrame:
         """Preserve the source-bound camera processing contract with explicit parameters."""
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("SourceProcessor.correct:before")
         if (
             run != self.run
             or source_manifest_sha256 != self.row['source_manifest_sha256']
@@ -600,6 +604,7 @@ class SourceProcessor:
             certificate.update(isolated_invalid_fill=auxiliary['isolated_invalid_fill'], photo_sand_support_contract=auxiliary['isolated_invalid_fill']['contract'])
         if auxiliary['display_modes_metadata'] is not None:
             certificate['display_modes_metadata'] = auxiliary['display_modes_metadata']
+        certificate["opencv_ipp"] = completed_frame(ipp_before, "SourceProcessor.correct:after")
         return CorrectedFrame(rgb=rgb, log_linear_rgb=scientific, certificate=certificate, required_valid_mask=effective, filled_invalid_mask=auxiliary['filled_invalid_mask'], display_modes=auxiliary['display_modes'], photo_sand_mask=auxiliary['photo_sand_mask'], display_invalid_mask=auxiliary['display_invalid_mask'])
 
 def read_bound(path, expected, *, parameters: Mapping):
@@ -678,6 +683,8 @@ class RigSourceProcessor:
 
     def __init__(self, native_manifest_path, *, parameters: Mapping):
         """Preserve the source-bound camera processing contract with explicit parameters."""
+        from darsia._opencv_runtime import scientific_thread
+        scientific_thread("RigSourceProcessor:setup")
         self.parameters = parameters
         self.native_path = _path(native_manifest_path, parameters=self.parameters)
         self.native = json.loads(self.native_path.read_text(encoding='utf-8-sig'))
@@ -737,6 +744,8 @@ class RigSourceProcessor:
 
     def correct(self, geometry_frame, *, parent_frame_index=None, parent_reference=False):
         """Preserve the source-bound camera processing contract with explicit parameters."""
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("RigSourceProcessor.correct:before")
         row, p = (geometry_frame, self.processor)
         if parent_reference and parent_frame_index is not None:
             raise ValueError('Reference and timeline-frame reuse are distinct source bindings')
@@ -842,7 +851,7 @@ class RigSourceProcessor:
             valid = np.load(_path(reference['v5_log_linear_valid_mask_path'], parameters=self.parameters), mmap_mode='r', allow_pickle=False)
             corrected, cache_audit = retain_parent_scientific_pixels(corrected, parent, valid, parameters=self.parameters)
             cache_audit['reference_source_binding_preserved'] = True
-        return (corrected, dict(contract=self.parameters['source']['rig_contract'], processor=self.identity, sources=sources, renderer=renderer, chart=chart, photometry=info, exact_B=exact_b, **{self.parameters['source']['symbols']['reference_to_frame_h_key']: h_ref.tolist()}, H_v5_B_to_frame_native=h_b.tolist(), full_native_corrected_finite_pixels=int(np.isfinite(corrected).all(0).sum()), source_identity=source_identity, parent_cache=cache_audit, cpu_only=True, training=False))
+        return (corrected, dict(contract=self.parameters['source']['rig_contract'], processor=self.identity, sources=sources, renderer=renderer, chart=chart, photometry=info, exact_B=exact_b, **{self.parameters['source']['symbols']['reference_to_frame_h_key']: h_ref.tolist()}, H_v5_B_to_frame_native=h_b.tolist(), full_native_corrected_finite_pixels=int(np.isfinite(corrected).all(0).sum()), source_identity=source_identity, parent_cache=cache_audit, cpu_only=True, training=False, opencv_ipp=completed_frame(ipp_before, "RigSourceProcessor.correct:after")))
 
 def normalize_homography(value: Any, *, parameters: Mapping) -> np.ndarray:
     """Validate and scale a recorded camera homography. The determinant and homogeneous-coordinate limits come from the receipt policy; no transform is fitted."""

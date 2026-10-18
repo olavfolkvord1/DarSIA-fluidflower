@@ -217,6 +217,8 @@ def _run_tasks(
     worker_generation=None,
     stores=None,
 ):
+    from darsia._opencv_runtime import scientific_thread, require_ipp_off
+    ipp_start = scientific_thread("pipeline-worker:start")
     def queue_error(event):
         messages.put(event)
 
@@ -386,6 +388,7 @@ def _run_tasks(
                     attempt_id=claim.token,
                     task=task,
                 )
+            result["opencv_ipp_worker"] = dict(start=ipp_start, completed=require_ipp_off("pipeline-worker:complete"))
             shared.complete(claim, result)
             if io_runtime is not None:
                 io_runtime.capacity_close(claim)

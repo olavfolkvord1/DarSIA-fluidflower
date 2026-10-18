@@ -401,7 +401,10 @@ def _before_metadata(evidence, target_shape):
 def _frame_record(record, spec, configuration, precision, commit_bound):
     _keys(record, {"format", "complete", "run", "case_id", "frame_index", "elapsed_h", "source",
                    "configuration", "precision", "native", "native_receipt", "phase", "statistics",
-                   "before_rules", "files"}, {"photograph"}, where="phase-one frame receipt")
+                   "before_rules", "files"}, {"photograph", "opencv_ipp"}, where="phase-one frame receipt")
+    from darsia._opencv_runtime import validate_observation
+    if "opencv_ipp" in record:
+        validate_observation(record["opencv_ipp"])
     if (record["format"] != FRAME_FORMAT or record["complete"] is not True
             or record["run"] != spec["source"]["run"] or record["case_id"] != spec["case_id"]
             or not _same_json(record["frame_index"], spec["frame_index"])
@@ -426,9 +429,12 @@ def _frame_record(record, spec, configuration, precision, commit_bound):
             raise ValueError("Repeated or escaping phase-one inventory locator")
         locators.add(key)
         basenames.add(basename.casefold())
-    native = _keys(record["native"], {"complete", "source_sha256", "full", "audit", "processor_kind"}, where="saved native roles")
+    native = _keys(record["native"], {"complete", "source_sha256", "full", "audit", "processor_kind"}, {"opencv_ipp"}, where="saved native roles")
     phase = _keys(record["phase"], {"complete", "source_sha256", "labels", "classes", "area", "qa",
-                                  "operator_masks", "history_input"}, where="saved phase roles")
+                                  "operator_masks", "history_input"}, {"opencv_ipp"}, where="saved phase roles")
+    for saved in (native, phase):
+        if "opencv_ipp" in saved:
+            validate_observation(saved["opencv_ipp"])
     if (native["complete"] is not True or phase["complete"] is not True
             or native["source_sha256"] != spec["source"]["source_sha256"]
             or phase["source_sha256"] != native["source_sha256"]
@@ -483,7 +489,10 @@ def verify_phase1_completion(completion_bound, configuration_bound, *, expected_
     completion = reader.json(completion_bound)
     _data(completion)
     _keys(completion, {"format", "complete", "run", "configuration", "precision", "code_commit",
-                      "ordered_case_ids", "frames", "history_complete"}, where="phase-one completion")
+                      "ordered_case_ids", "frames", "history_complete"}, {"opencv_ipp"}, where="phase-one completion")
+    if "opencv_ipp" in completion:
+        from darsia._opencv_runtime import validate_observation
+        validate_observation(completion["opencv_ipp"])
     if (completion["format"] != COMPLETION_FORMAT or completion["complete"] is not True
             or completion["history_complete"] is not True or completion["run"] != config["run"]
             or completion["configuration"] != configuration_bound or completion["precision"] != config["precision"]

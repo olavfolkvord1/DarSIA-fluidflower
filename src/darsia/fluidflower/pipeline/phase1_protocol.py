@@ -244,7 +244,10 @@ def extract_phase1_products(result, claim, machine_id):
         raise ValueError("Phase-one core completion is outside its actual attempt")
     core = _read_owned(core_bound, claim.output)
     _keys(core, {"format", "complete", "run", "configuration", "precision", "code_commit",
-                 "ordered_case_ids", "frames", "history_complete"}, where="phase-one core completion")
+                 "ordered_case_ids", "frames", "history_complete"}, {"opencv_ipp"}, where="phase-one core completion")
+    if "opencv_ipp" in core:
+        from darsia._opencv_runtime import validate_observation
+        validate_observation(core["opencv_ipp"])
     cases = claim.task["ordered_case_ids"]
     if (core["format"] != COMPLETION_FORMAT or core["complete"] is not True
             or core["history_complete"] is not True or core["run"] != claim.task["run"]

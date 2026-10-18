@@ -70,6 +70,8 @@ class Rig:
         log: Path | None = None,
         show_plot: bool = False,
     ):
+        from darsia._opencv_runtime import scientific_thread, require_ipp_off
+        scientific_thread("Rig.setup_reading:before")
         # Cache experiment for protocol-based datetime lookup
         self.experiment = experiment
 
@@ -107,6 +109,7 @@ class Rig:
             )
         plt.close()
 
+        require_ipp_off("Rig.setup_reading:after")
         logger.info("Reading setup completed.")
 
     def load_corrections(
@@ -1256,6 +1259,8 @@ class Rig:
         darsia.Image
             Image object with applied corrections.
         """
+        from darsia._opencv_runtime import scientific_thread, require_ipp_off
+        scientific_thread("Rig.read_image:before")
         assert hasattr(
             self, "experiment"
         ), "Experiment not defined. Run load_experiment() first."
@@ -1272,6 +1277,7 @@ class Rig:
             dtype=dtype,
         )
 
+        require_ipp_off("Rig.read_image:after")
         return img
 
     # ! ---- EXPERIMENT AND PROTOCOLS ----

@@ -16,6 +16,10 @@ finally:
     del _cache_bootstrap_dont_write, _cache_bootstrap_sys
 del _cache_bootstrap
 
+from darsia._opencv_runtime import scientific_thread as _scientific_thread
+_scientific_thread("darsia-import")
+del _scientific_thread
+
 # Basic imports
 from darsia.image.coordinatesystem import *
 from darsia.image.image import *

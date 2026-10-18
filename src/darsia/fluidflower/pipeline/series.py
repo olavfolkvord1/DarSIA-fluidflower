@@ -306,6 +306,8 @@ class SeriesInputs:
 
     def __init__(self, config, output):
         """Load bound model, baseline and acquisition-history inputs for the ordered series."""
+        from darsia._opencv_runtime import scientific_thread
+        scientific_thread("SeriesInputs:setup")
         from ..mass.n1_pipeline import DataReader
         from ..phase import features
         from . import phase_inputs as loaders
@@ -545,6 +547,8 @@ class SeriesInputs:
 
     def native(self, spec, stage):
         """Execute the explicit frozen RAW processor and camera-ring sampler once."""
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("SeriesInputs.native:before")
         import numpy as np
         from ..native.source import RigSourceProcessor, SourceProcessor
         from ..native import extension, sidecar
@@ -621,6 +625,7 @@ class SeriesInputs:
         log_path, valid_path = stage / "native_log.npy", stage / "native_valid.npy"
         sidecar.write_log_linear(log_path, log)
         sidecar.write_log_linear(valid_path, valid)
+        audit["opencv_ipp"] = completed_frame(ipp_before, "SeriesInputs.native:source")
         audit_asset = _write_json(stage / "native_audit.json", audit)
         context, observed, top = self.geometry(rig_geometry_row, valid, audit)
         full, full_valid, ring_audit = extension.extend_prepared_source(
@@ -660,6 +665,7 @@ class SeriesInputs:
             full=current,
             audit=audit_asset,
             processor_kind=kind,
+            opencv_ipp=completed_frame(ipp_before, "SeriesInputs.native:after-extension"),
         )
         native_record_asset = _write_json(stage / "native.json", native_record)
         return dict(

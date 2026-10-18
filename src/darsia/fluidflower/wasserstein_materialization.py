@@ -383,6 +383,8 @@ def _normalized(cost: float, denominator: float, *, zero_cost: bool) -> float | 
 
 
 def _solve(request: SolveRequest) -> dict[str, Any]:
+    from darsia._opencv_runtime import scientific_thread, completed_frame
+    ipp_before = scientific_thread("wasserstein-solve:before")
     started = time.perf_counter()
     mass_1_g = float(np.sum(request.mass_1, dtype=np.float64))
     mass_2_g = float(np.sum(request.mass_2, dtype=np.float64))
@@ -493,6 +495,7 @@ def _solve(request: SolveRequest) -> dict[str, Any]:
     )
     rows, columns = request.domain.target_shape_rc
     return {
+        "opencv_ipp": completed_frame(ipp_before, "wasserstein-solve:after"),
         "run_1": request.run_1.run_id,
         "run_2": request.run_2.run_id,
         "time_index": request.time_index,

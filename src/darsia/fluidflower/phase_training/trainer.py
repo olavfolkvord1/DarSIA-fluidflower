@@ -757,6 +757,8 @@ def _stage_run(source: RunSource, cache_root: Path, *, native_revision: bool = F
 
 def _initialize_extraction_worker(native_threads: int) -> None:
     """Bound each spawned worker's OpenCV and BLAS/OpenMP thread teams."""
+    from darsia._opencv_runtime import scientific_thread
+    scientific_thread("training-extraction-worker:start")
     from threadpoolctl import threadpool_limits
     cv2.setNumThreads(max(1, int(native_threads)))
     threadpool_limits(limits=max(1, int(native_threads)))
@@ -785,6 +787,8 @@ def _require_v5_float_rgb(value: np.ndarray, *, role: str) -> None:
 
 
 def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> dict[str, Any]:
+    from darsia._opencv_runtime import POLICY, scientific_thread, completed_frame, require_ipp_off
+    ipp_start = scientific_thread("training-extraction:start")
     cv2.setNumThreads(max(1, int(task.opencv_threads)))
     manifest = _read_json(task.staged.asset_manifest_path)
     v5 = (manifest.get("v5_photometry") or {}).get("format") == (
@@ -836,6 +840,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
     if task.output_path.is_file() and task.metadata_path.is_file():
         metadata = _read_json(task.metadata_path)
         if str(metadata.get("cache_key")) == task.cache_key:
+            if metadata.get("opencv_ipp_policy") != POLICY:
+                raise ValueError("Feature cache predates the IPP-off policy; preserve it and select a new cache key")
             if not v5 and any("training_sampling" in region.payload for region in task.regions):
                 from .gas_negative_sampling import sample_region
                 native = _read_json(task.staged.asset_manifest_path)
@@ -850,7 +856,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                 raise ValueError(f"Corrupt feature cache for {task.staged.dataset}/{task.staged.run}")
             if task.radiometry_profile is not None and (metadata.get("radiometry") or {}).get("profile") != task.radiometry_profile:
                 raise ValueError("Feature cache belongs to a different radiometric profile")
-            return {**metadata, "cache_hit": True, "seconds_current": 0.0}
+            return {**metadata, "cache_hit": True, "seconds_current": 0.0,
+                    "current_cache_read_opencv_ipp": require_ipp_off("training-extraction:cache-read")}
 
     started = time.perf_counter()
     canvas_wh = tuple(int(value) for value in manifest["canvas_wh"])
@@ -907,6 +914,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
     frame_rows: list[dict[str, Any]] = []
     sampling_sources = {}
     for frame_index in sorted(by_frame):
+        ipp_before = scientific_thread("training-extraction:frame-before")
         current = (
             staged_rgb(task.staged.frame_paths[frame_index],
                        manifest["frame_sources"][frame_index],
@@ -1173,6 +1181,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                 "frame_index": int(frame_index),
                 "regions": len(by_frame[frame_index]),
                 "pixels": int(all_rows.size),
+                "opencv_ipp": completed_frame(ipp_before, "training-extraction:frame-after"),
                 **({"feature_augmentation": augmentation} if augmentation is not None else {}),
                 **({} if geometry_binding is None else {
                     "v5_frame_geometry_receipt_sha256": geometry_binding["receipt_sha256"],
@@ -1202,6 +1211,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
             feature_names=np.asarray((*task.feature_contract.feature_names,
                 *(feature_augmenter.feature_names if feature_augmenter is not None else ()))),
         )
+    require_ipp_off("training-extraction:before-cache-publication")
     temporary.replace(task.output_path)
     metadata = {
         "schema": 1,
@@ -1218,6 +1228,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         "pixels_per_region": int(task.pixels_per_region),
         "texture_sigma": float(task.texture_sigma),
         "opencv_threads": int(task.opencv_threads),
+        "opencv_ipp_policy": POLICY,
+        "opencv_ipp": dict(start=ipp_start, completed=require_ipp_off("training-extraction:completed")),
         "frames": frame_rows,
         "seconds": float(time.perf_counter() - started),
         "cache_hit": False,
@@ -1237,6 +1249,7 @@ def _feature_cache_key(
     radiometry_profile: dict[str, Any] | None = None,
     feature_contract: OpticalFeatureContract = MAXIMAL_CONTRACT,
 ) -> str:
+    from darsia._opencv_runtime import POLICY
     native = (_read_json(staged.asset_manifest_path)
               if getattr(staged, "asset_manifest_path", None) is not None else {})
     v5 = (native.get("v5_photometry") or {}).get("format") == (
@@ -1315,6 +1328,7 @@ def _feature_cache_key(
             # Model fitting, validation, reporting, and backend changes must
             # not invalidate expensive optical feature extraction.
             "feature_extraction_contract_version": 1,
+            "opencv_ipp_policy": POLICY,
             "radiometry_profile": radiometry_profile,
             "radiometry_runtime": _radiometry_runtime(radiometry_profile),
             "v5_frame_geometry": v5_geometry,
@@ -2314,6 +2328,8 @@ def _radiometry_runtime(profile):
 
 
 def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
+    from darsia._opencv_runtime import scientific_thread, require_ipp_off
+    ipp_start = scientific_thread("train_campaign:start")
     from ..review_storage import resolve_review_path
     started = time.perf_counter()
     regularization_grid = tuple(float(value) for value in args.regularization_grid)
@@ -2622,6 +2638,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         for bundle in bundles
     ]
     summary = {
+        "opencv_ipp": dict(start=ipp_start, completed=require_ipp_off("train_campaign:completed")),
         "radiometry_profile": radiometry_profile,
         "radiometry_runtime": _radiometry_runtime(radiometry_profile),
         "schema": 1,

@@ -84,6 +84,7 @@ def resolve_profile(value):
 
 
 def runtime_identity():
+    from darsia._opencv_runtime import POLICY
     module = core()
     from darsia_extensions import radiometry
     from darsia.fluidflower import image_correction
@@ -101,6 +102,7 @@ def runtime_identity():
         "opencv": cv2.__version__,
         "numpy": np.__version__,
         "sampling_seed": 0,
+        "opencv_ipp_policy": POLICY,
     }
 
 
@@ -175,6 +177,8 @@ class RunRadiometry:
             self.upstream_correction_contract = manifest.get("correction_contract")
 
     def load(self, path, frame_id):
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        ipp_before = scientific_thread("RunRadiometry.load:before")
         module = core()
         path = resolve_review_path(path)
         rgb = load_review_rgb(path, self.content_box)
@@ -245,6 +249,7 @@ class RunRadiometry:
                 source=source,
                 sampling={"roi_rc": self.roi, "runtime": self.identity},
             )
+            completed_frame(ipp_before, "RunRadiometry.load:before-cache-publication")
             cache.parent.mkdir(parents=True, exist_ok=True)
             from darsia_extensions.storage import write_new
 
@@ -256,6 +261,10 @@ class RunRadiometry:
             except FileExistsError:
                 if json.loads(cache.read_text(encoding="utf-8")) != receipt:
                     raise ValueError("Concurrent correction cache mismatch")
+        # The correction receipt retains its producer identity, also on a hit.
+        # Current load observations are separate from those original bytes.
+        self.current_opencv_ipp = getattr(self, "current_opencv_ipp", {})
+        self.current_opencv_ipp[frame_id] = completed_frame(ipp_before, "RunRadiometry.load:after")
         self.receipts[frame_id] = receipt
         return output
 
@@ -265,4 +274,5 @@ class RunRadiometry:
             "profile": self.profile,
             "inventory": core().correction_inventory(receipts),
             "receipts": receipts,
+            "current_load_opencv_ipp": dict(getattr(self, "current_opencv_ipp", {})),
         }

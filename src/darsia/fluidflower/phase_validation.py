@@ -249,7 +249,8 @@ def predict_image_tiled(
     radiometry_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     """Apply one optical model in bounded-memory horizontal tiles."""
-
+    from darsia._opencv_runtime import scientific_thread, require_ipp_off
+    scientific_thread("predict_image_tiled:before")
     current = np.asarray(image_rgb)
     baseline = np.asarray(baseline_rgb)
     if current.shape != baseline.shape or current.ndim != 3:
@@ -282,6 +283,7 @@ def predict_image_tiled(
         for name, values in predicted.items():
             output = outputs.setdefault(name, np.empty((height, width), dtype=np.float32))
             output[start:stop] = np.asarray(values[local], dtype=np.float32)
+    require_ipp_off("predict_image_tiled:after")
     return outputs
 
 

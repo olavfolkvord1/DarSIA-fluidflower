@@ -114,6 +114,8 @@ class ImageCorrectionAdapter:
         task: Mapping[str, Any],
         context: TaskExecutionContext,
     ) -> Mapping[str, Any]:
+        from darsia._opencv_runtime import scientific_thread, completed_frame
+        scientific_thread("image-correction:setup")
         if task.get("module") != "image_correction":
             raise ValueError(
                 "The correction adapter only accepts image-correction tasks"
@@ -188,6 +190,7 @@ class ImageCorrectionAdapter:
                 missing.append(frame)
 
         def correct_frame(frame: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+            ipp_before = scientific_thread("image-correction:frame-before")
             frame_id = str(frame["frame_id"])
             run_id = str(frame.get("run_id") or "run")
             source = verify_file_reference(
@@ -279,6 +282,7 @@ class ImageCorrectionAdapter:
                     or ""
                 ),
                 "analysis_error": "",
+                "opencv_ipp": completed_frame(ipp_before, "image-correction:frame-after"),
             }
             context.commit_chunk(
                 chunk_id,

@@ -1820,6 +1820,8 @@ def execute_task_lease(
     inventory: Mapping[str, Any],
     heartbeat_seconds: float = 30.0,
 ) -> dict[str, Any]:
+    from darsia._opencv_runtime import scientific_thread, completed_frame
+    ipp_before = scientific_thread("execute_task_lease:before")
     task = lease.task
     validate_task_document(task)
     task_id = str(task["task_id"])
@@ -1875,6 +1877,7 @@ def execute_task_lease(
         adapter_result = dict(adapter.execute(task, context))
         if context.cancellation_requested():
             raise RuntimeError("Task cancellation was requested")
+        ipp_runtime = completed_frame(ipp_before, "execute_task_lease:before-publication")
         destination = Path(str((task.get("output") or {})["destination"]))
         publish_manifest = publish_directory_atomic(
             context.staging,
@@ -1905,6 +1908,8 @@ def execute_task_lease(
             "destination": str(destination),
             "publish_manifest": publish_manifest,
             "adapter_result": adapter_result,
+            "opencv_ipp": ipp_runtime,
+            "opencv_ipp_scope": "current thread and new computations; restored chunks retain original provenance",
         }
         result["content_sha256"] = _json_digest(result)
         lease.complete(result)
@@ -1930,6 +1935,8 @@ def run_worker(
     idle_exit_seconds: float | None = None,
     maximum_tasks: int | None = None,
 ) -> int:
+    from darsia._opencv_runtime import scientific_thread
+    scientific_thread("legacy-worker:start")
     from darsia_cache.adapters import bind_legacy_worker_identity
     bind_legacy_worker_identity(worker_id)
     registry = registry or default_adapter_registry()

@@ -500,6 +500,8 @@ def _materialize_run(
     run_id = str(row["run_id"])
     run_root = staging / "runs" / _safe_identifier(run_id)
     run_root.mkdir(parents=True, exist_ok=True)
+    from darsia._opencv_runtime import scientific_thread, completed_frame, require_ipp_off
+    ipp_start = scientific_thread("mass-materialization:setup")
     fields, preview = load_mass_input_products(manifest_path, row)
     dynamic = (
         fields["optical_acidification"],
@@ -674,6 +676,7 @@ def _materialize_run(
     )
     try:
         for output_index, source_index in enumerate(selected_indices):
+            ipp_before = scientific_thread("mass-materialization:frame-before")
             time_hours = source_times[source_index]
             if cancelled():
                 raise RuntimeError("Mass analysis was cancelled")
@@ -784,6 +787,7 @@ def _materialize_run(
                 "concentration_aqueous": frame_result.concentration_aqueous,
                 "saturation_free_gas": frame_result.saturation_free_gas,
             }
+            ipp_frame = completed_frame(ipp_before, "mass-materialization:frame-after")
             frame_id = frame_ids[source_index][0]
             for product, frames in output_frames.items():
                 product_root = run_root / product
@@ -824,6 +828,7 @@ def _materialize_run(
                     "diffusion_dilution_factor": float(diffusion[source_index]),
                     "source_time_index": source_index,
                     "selected_time_index": output_index,
+                    "opencv_ipp": ipp_frame,
                     **({"pixel_area": area_binding} if area_binding is not None else {}),
                     **({"active_pore_volume_m3": float(np.sum(voxel_volume_m3, dtype=np.float64))}
                        if variable_area else {}),
@@ -969,6 +974,7 @@ def _materialize_run(
         "chemistry_model": model,
         "parameters": deepcopy(dict(parameters)),
         "backend_execution": backend_execution,
+        "opencv_ipp": dict(start=ipp_start, completed=require_ipp_off("mass-materialization:completed")),
         "cpu_float64_parity": {
             "required": nonreference,
             "passed": all(row["passed"] for row in parity_rows),

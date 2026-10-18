@@ -107,6 +107,8 @@ def infer_native_centre(
     storage round trips. All model documents, support tolerances and physical
     decision thresholds are supplied explicitly; this function performs no fit.
     """
+    from darsia._opencv_runtime import scientific_thread, completed_frame
+    ipp_before = scientific_thread("infer_native_centre:before")
     fp, hp, rp = (parameters[name] for name in ("features", "heads", "regional"))
     runtime = parameters["native"]
     threads, block_rows = runtime["threads"], runtime["block_rows"]
@@ -328,6 +330,7 @@ def infer_native_centre(
         domain_pixels=int(domain.sum()),
         flat_valid_pixels=int(flat_valid.sum()),
         threads=threads,
+        opencv_ipp=completed_frame(ipp_before, "infer_native_centre:after"),
     )
     if fixed_cache is not None:
         provenance["fixed_baseline_decode_cache"] = fixed_cache.receipt()
@@ -366,6 +369,8 @@ def infer_rig_edge(
     model is distinct from the native-centre original regional model. No labels
     or newly filled categorical pixels enter an optical feature calculation.
     """
+    from darsia._opencv_runtime import scientific_thread, completed_frame
+    ipp_before = scientific_thread("infer_rig_edge:before")
     fp, hp, rp = (parameters[name] for name in ("features", "heads", "regional"))
     runtime = parameters["edge"]
     if pixel_area_mm2 is None:
@@ -475,6 +480,7 @@ def infer_rig_edge(
         co2_islands=island_audit,
         gas_minimum=minimum_audit,
         categorical_feature_support=support_audit,
+        opencv_ipp=completed_frame(ipp_before, "infer_rig_edge:after"),
     )
     return labels, final_support, audit, dict(co2=co2, pre_minimum_gas=preminimum_gas)
 
@@ -600,6 +606,8 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
     cannot supply classifier features. No filesystem or campaign lookup,
     model fitting, temporal interpolation or canvas resampling occurs here.
     """
+    from darsia._opencv_runtime import scientific_thread, completed_frame
+    ipp_before = scientific_thread("infer_labels:before")
     runtime, gp, dp = rules["chain"], rules["geometry"], rules["decisions"]
     baseline = model_bundle["baseline"]
     source = frame["source"]
@@ -868,6 +876,7 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
         physical_scale_approved=True,
         mass_computed=False,
     )
+    qa["opencv_ipp"] = completed_frame(ipp_before, "infer_labels:after")
     return dict(
         labels=labels,
         classes=classes,
