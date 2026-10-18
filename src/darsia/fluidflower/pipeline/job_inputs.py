@@ -147,7 +147,7 @@ class InputCatalog:
         self.original_native_row(row, parameters, use)
 
     def mass(self, config, frames, *, standalone=False):
-        self.doc(config["calibration"], "calibration", "mass.calibration")
+        calibration = self.doc(config["calibration"], "calibration", "mass.calibration")
         self.doc(config["physical_correction"], "rig_model", "mass.physical_correction")
         shared = config["shared"]
         for key in ("physical_reference", "floor_curve"):
@@ -177,6 +177,74 @@ class InputCatalog:
                 self.full(frame["baseline"], use + ".baseline")
                 for key in ("labels", "classes", "area"):
                     self.add(frame[key], "model" if key in {"labels", "classes"} else "rig_model", use + "." + key)
+        if standalone and "phase1" in config:
+            self.phase2_evidence(config, frames)
+        if "pixel_domain" in config:
+            self.n16_inputs(config, frames, calibration)
+
+    def phase2_evidence(self, config, frames):
+        """Catalogue only the saved phase-one evidence the ordinary N1 writer reads."""
+        from . import staged_data as staged
+        from .series import bind_mass_frame
+        staged.validate_phase2_run(config)
+        binding = config["phase1"]
+        phase1 = staged.validate_phase1_run(self.doc(binding["configuration"], "configuration", "mass.phase1.configuration"))
+        core = self.doc(binding["completion"], "configuration", "mass.phase1.completion")
+        order = [spec["case_id"] for spec in frames]
+        if (core.get("format") != staged.COMPLETION_FORMAT or core.get("complete") is not True
+                or core.get("history_complete") is not True or core.get("run") != config["run"]
+                or core.get("configuration") != binding["configuration"] or core.get("precision") != config["precision"]
+                or core.get("code_commit") != binding["code_commit"] or core.get("ordered_case_ids") != order
+                or phase1["ordered_case_ids"] != order or phase1["run"] != config["run"]
+                or phase1["precision"] != config["precision"]
+                or not isinstance(core.get("frames"), list) or len(core["frames"]) != len(order)):
+            raise ValueError("Phase-two catalogue requires its actual complete phase-one source/order")
+        for key, value in phase1["statistics"].items():
+            if key != "format" and not staged._same_json(config.get(key), value):
+                raise ValueError("Phase-two scientific DATA differs from its phase-one template: " + key)
+        for spec, original, committed in zip(frames, phase1["frames"], core["frames"]):
+            refs = binding["frames"][spec["case_id"]]
+            use = "frame." + spec["case_id"] + ".mass.phase1"
+            if not staged._same_json(committed, refs["commit"]):
+                raise ValueError("Phase-two case commit differs from its actual phase-one completion")
+            record = staged._frame_record(self.doc(refs["commit"], "configuration", use + ".commit"),
+                original, binding["configuration"], config["precision"], refs["commit"])
+            expected = bind_mass_frame(original, record["native"], record["phase"], baseline=phase1["phase"]["reference"]["full"])
+            compared = {k: v for k, v in spec.items() if k not in {"pixel_domain_geometry", "frozen_response_basis"}}
+            if not staged._same_json(expected, compared):
+                raise ValueError("Phase-two original N1 frame differs from its sealed phase-one source")
+            for field in ("statistics", "before_rules", "photograph"):
+                if not staged._same_json(refs.get(field), record.get(field)):
+                    raise ValueError("Phase-two saved evidence differs from its original commit: " + field)
+            before = record["before_rules"]
+            self.doc(before["receipt"], "configuration", use + ".before_receipt")
+            if before["state"] == "complete":
+                self.add(before["png"], "model", use + ".before_png")
+            if "photograph" in record:
+                photo = record["photograph"]
+                self.doc(photo["receipt"], "configuration", use + ".photo_receipt")
+                if photo["state"] == "complete":
+                    self.add(photo["png"], "image", use + ".photo_png")
+
+    def n16_inputs(self, config, frames, calibration):
+        """Positive named N16 consumers; passive historical paths stay unvisited."""
+        from .staged_data import validate_phase2_run, validate_n16_frame_binding
+        validate_phase2_run(config)
+        policy = config["pixel_domain"]
+        self.doc(policy["authorized_decisions"], "configuration", "mass.pixel_domain.authorized_decisions")
+        authority = self.doc(policy["n16"]["authority"], "configuration", "mass.pixel_domain.n16.authority")
+        for spec in frames:
+            use = "frame." + spec["case_id"] + ".mass.n16"
+            declared, basis = spec["pixel_domain_geometry"], spec["frozen_response_basis"]
+            source = self.doc(declared["source_receipt"], "rig_model", use + ".source_geometry")
+            original = self.doc(basis["result"], "configuration", use + ".frozen_response_result")
+            validate_n16_frame_binding(config, spec, authority=authority, source=source,
+                original=original, calibration=calibration)
+            self.add(declared["target_depth"], "rig_model", use + ".target_depth")
+            self.add(basis["geometry"], "rig_model", use + ".frozen_response_geometry")
+            for key, bound in declared["n16_masks"].items():
+                if bound is not None:
+                    self.add(bound, "rig_model", use + "." + key)
 
     def statistics(self, config, frames, *, standalone=False):
         """Original summary-source consumers, omitting only fitted mass calibration."""

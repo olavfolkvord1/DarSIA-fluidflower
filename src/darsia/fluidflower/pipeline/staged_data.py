@@ -560,9 +560,140 @@ def verify_phase1_completion(completion_bound, configuration_bound, *, expected_
                 queue_ownership_or_retirement_verified=False)
 
 
+def validate_phase2_run(config):
+    """Admit an explicit sealed N1 stage; never infer a stage or domain policy."""
+    from ..mass.n1_pipeline import CONFIG_FORMAT, CONFIG_REQUIRED, FRAME_REQUIRED
+    _keys(config, {"format", *CONFIG_REQUIRED, "precision", "phase1", "geometry_fields"},
+          {"atmosphere_series", "dose", "contracts", "provenance", "data_aliases", "storage", "pixel_domain"},
+          where="phase-two configuration")
+    if config["format"] != CONFIG_FORMAT or config["precision"] not in {"float32", "float64"}:
+        raise ValueError("Explicit precision-bound ordinary N1 stage required")
+    _bound(config["calibration"], where="phase-two fitted calibration")
+    if not isinstance(config["frames"], list) or not config["frames"]:
+        raise ValueError("Explicit nonempty phase-two case order required")
+    ids, previous = [], None
+    for spec in config["frames"]:
+        if not isinstance(spec, dict) or not set(FRAME_REQUIRED).issubset(spec):
+            raise ValueError("Phase-two frame omits the original N1 ABI")
+        case = spec["case_id"]
+        name(case)
+        if case in ids:
+            raise ValueError("Distinct explicit phase-two case IDs required")
+        if type(spec["frame_index"]) is not int or spec["frame_index"] < 0:
+            raise ValueError("Actual phase-two acquisition index required")
+        _finite(spec["elapsed_h"], where="phase-two frame time")
+        position = (float(spec["elapsed_h"]), spec["frame_index"])
+        if previous is not None and not (position[0] > previous[0] and position[1] > previous[1]):
+            raise ValueError("Phase-two acquisition chronology differs")
+        previous = position
+        ids.append(case)
+    binding = config["phase1"]
+    _keys(binding, {"configuration", "completion", "code_commit", "frames"}, where="phase-two evidence")
+    for field in ("configuration", "completion"):
+        _bound(binding[field], where="phase-two " + field)
+    if not isinstance(binding["code_commit"], str) or re.fullmatch(r"[0-9a-f]{40}", binding["code_commit"]) is None:
+        raise ValueError("Actual phase-one code commit required")
+    if not isinstance(binding["frames"], dict) or set(binding["frames"]) != set(ids):
+        raise ValueError("Phase-two evidence omits or adds a selected case")
+    for refs in binding["frames"].values():
+        _keys(refs, {"commit", "statistics", "before_rules"}, {"photograph"}, where="phase-two case evidence")
+        for field in ("commit", "statistics"):
+            _bound(refs[field], where="phase-two " + field)
+    if "pixel_domain" in config:
+        policy = config["pixel_domain"]
+        if not isinstance(policy, dict) or "n16" not in policy:
+            raise ValueError("The sealed domain extension requires explicit genuine N16 inputs")
+        _keys(policy, {"contract", "adopted_for_execution", "fixture_scope_complete", "fixture_names",
+                       "injector_hardware_excluded", "authorized_decisions", "max_column_distance_m",
+                       "raster_scale", "raster_shift", "geometry_chunk_pixels", "below_floor_phase_unknown_policy",
+                       "include_estimated_mass", "table_fields", "baseline_coverage_tolerance", "heldout_fit_run", "n16"},
+              where="explicit N15/N16 policy")
+        _keys(policy["n16"], {"contract", "authority", "capacity_selector"}, where="N16 policy")
+        from ..mass.pixel_pipeline import validate_policy
+        validate_policy(policy)
+        if (policy["n16"]["contract"] != "darsia-n16-q85-a-v1"
+                or policy["n16"]["capacity_selector"] != "literal-R3-hidden255-solubility"
+                or policy.get("contract") != "darsia-pixel-domain-v1"
+                or policy.get("adopted_for_execution") is not True
+                or policy.get("fixture_scope_complete") is not True
+                or policy.get("max_column_distance_m") != .020
+                or policy.get("include_estimated_mass") is not False):
+            raise ValueError("The existing explicit N15/N16 Q85-A policy is required")
+        _bound(policy["authorized_decisions"], where="N15 domain authority")
+        _bound(policy["n16"]["authority"], where="N16 Q85 authority")
+        for spec in config["frames"]:
+            _keys(spec["pixel_domain_geometry"],
+                  {"source_receipt", "json_pointer", "source_frame_index", "inner_polygon_native",
+                   "fixture_polygons_native", "native_origin_xy", "phase_shape_hw", "target_depth", "n16_masks"},
+                  where="N16 source geometry")
+            declared = spec["pixel_domain_geometry"]
+            _bound(declared["source_receipt"], where="N16 source geometry receipt")
+            _bound(declared["target_depth"], where="N16 measured depth", array=True)
+            _keys(declared["n16_masks"], {"below_photo_strip", "not_sand"}, where="N16 source masks")
+            for bound in declared["n16_masks"].values():
+                if bound is not None:
+                    _bound(bound, where="N16 explicit mask")
+            basis = spec["frozen_response_basis"]
+            _keys(basis, {"result", "geometry", "arrays", "per_frame_geometry", "source_sha256",
+                          "phase_sha256", "calibration_sha256"}, where="N16 original response basis")
+            for field in ("result", "geometry"):
+                _bound(basis[field], where="N16 original response " + field)
+    _data(config)
+    return config
+
+
+def validate_n16_frame_binding(config, spec, *, authority, source, original, calibration):
+    """Check actual existing producer metadata, without constructing mass or geometry."""
+    policy = config["pixel_domain"]
+    if (authority.get("id") != "Q85-OLAV-A-hidden-255-uses-solubility-no-gas-behind-checker"
+            or authority.get("utc") != "2026-10-17T22:35:06Z" or authority.get("decided_by") != "olav"):
+        raise ValueError("N16 requires the actual resolved Q85 A record")
+    declared = spec["pixel_domain_geometry"]
+    pointer = declared["json_pointer"]
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        raise ValueError("Explicit N16 source geometry JSON pointer required")
+    for key in pointer[1:].split("/"):
+        source = source[key.replace("~1", "/").replace("~0", "~")]
+    if (source.get("run") != config["run"] or source.get("frame_index") != spec["frame_index"]
+            or declared["source_frame_index"] != spec["frame_index"]
+            or source.get("source_sha256") != spec["source_binding"]["source_sha256"]):
+        raise ValueError("N16 geometry belongs to another actual source frame")
+    for field, source_field in (("inner_polygon_native", "frame_inner_polygon_native"),
+                                ("fixture_polygons_native", "frame_fixture_polygons_native"),
+                                ("native_origin_xy", "native_origin_xy"), ("phase_shape_hw", "phase_shape_hw"),
+                                ("n16_masks", "n16_masks")):
+        if not _same_json(declared[field], source[source_field]):
+            raise ValueError("N16 declared geometry differs from its actual receipt: " + field)
+    if (declared["inner_polygon_native"] != spec["inner_polygon_native"]
+            or declared["native_origin_xy"] != spec["current"]["native_origin_xy"]
+            or declared["phase_shape_hw"] != spec["current"]["phase_shape_hw"]
+            or set(declared["fixture_polygons_native"]) != set(policy["fixture_names"])
+            or len(declared["fixture_polygons_native"]) != 3):
+        raise ValueError("N16 source polygons/grid differ from the original N1 frame")
+    run = str(config["run"]).lower().removeprefix("ac")
+    if run.isdigit() and 17 <= int(run) <= 38 and declared["n16_masks"]["below_photo_strip"] is None:
+        raise ValueError("AC17-38 requires its actual source-bound below-photo strip")
+    basis = spec["frozen_response_basis"]
+    expected = dict(source_sha256=spec["source_binding"]["source_sha256"],
+                    phase_sha256=spec["labels"]["sha256"], calibration_sha256=config["calibration"]["sha256"])
+    if (original.get("complete") is not True or original.get("run") != config["run"]
+            or original.get("frame_index") != spec["frame_index"] or original.get("elapsed_h") != spec["elapsed_h"]
+            or any(original["bindings"].get(k) != v or basis.get(k) != v for k, v in expected.items())
+            or original["scalar_result"]["parameters"] != calibration["parameters"]
+            or original["scalar_result"]["precision"] != config["precision"]
+            or original["anchor"] != config["anchor"]):
+        raise ValueError("N16 actual response basis differs from this calibration, anchor or frame")
+    static = original["static"]
+    if (any(basis["geometry"][key] != static["asset"][key] for key in ("sha256", "size_bytes"))
+            or basis["arrays"] != static["arrays"] or basis["per_frame_geometry"] != static["per_frame_geometry"]
+            or declared["target_depth"].get("array_key") != "depth_m"
+            or any(declared["target_depth"][key] != basis["geometry"][key] for key in ("sha256", "size_bytes"))):
+        raise ValueError("N16 measured depth/basis differs from its actual producer")
+
+
 def seal_phase2_configuration(destination, completion_bound, configuration_bound, *,
                               expected_phase1_commit, fitted_calibration, fitted_anchor,
-                              storage_data=None, reader):
+                              storage_data=None, pixel_domain_data=None, reader):
     """Seal ordinary N1 DATA from actual phase-one products and explicit new fit.
 
     No native/inference or mass evaluation occurs. The returned DATA still needs
@@ -602,8 +733,28 @@ def seal_phase2_configuration(destination, completion_bound, configuration_bound
         candidate["storage"] = deepcopy(storage_data)
         from ..storage_outputs import parse_request
         parse_request(candidate, candidate["precision"])
-    _keys(candidate, {"format", *CONFIG_REQUIRED, "precision", "phase1", "geometry_fields"},
-          {"atmosphere_series", "dose", "contracts", "provenance", "data_aliases", "storage"}, where="phase-two configuration")
+    if pixel_domain_data is not None:
+        _keys(pixel_domain_data, {"pixel_domain", "frames"}, where="explicit N16 phase-two inputs")
+        additions = pixel_domain_data["frames"]
+        if not isinstance(additions, dict) or set(additions) != {f["case_id"] for f in candidate["frames"]}:
+            raise ValueError("N16 supplied inputs must match the complete original case order")
+        candidate["pixel_domain"] = deepcopy(pixel_domain_data["pixel_domain"])
+        for spec in candidate["frames"]:
+            extra = additions[spec["case_id"]]
+            _keys(extra, {"pixel_domain_geometry", "frozen_response_basis"}, where="explicit N16 case inputs")
+            spec.update(deepcopy(extra))
+        validate_phase2_run(candidate)
+        reader.json(candidate["pixel_domain"]["authorized_decisions"])
+        authority = reader.json(candidate["pixel_domain"]["n16"]["authority"])
+        for spec in candidate["frames"]:
+            declared, basis = spec["pixel_domain_geometry"], spec["frozen_response_basis"]
+            validate_n16_frame_binding(candidate, spec, authority=authority,
+                source=reader.json(declared["source_receipt"]), original=reader.json(basis["result"]),
+                calibration=calibration)
+            for bound in (declared["target_depth"], basis["geometry"], *declared["n16_masks"].values()):
+                if bound is not None:
+                    reader.path(bound)
+    validate_phase2_run(candidate)
     for frame in candidate["frames"]:
         if not set(FRAME_REQUIRED).issubset(frame):
             raise ValueError("Actual phase-one products do not complete the unchanged N1 frame ABI")

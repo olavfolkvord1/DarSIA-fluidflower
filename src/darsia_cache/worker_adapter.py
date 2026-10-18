@@ -160,9 +160,9 @@ class WorkerCacheAdapter:
         must additionally bind this adapter's service-only writer qualification;
         no profile is synthesized from39 products or absence of a search hit.
         """
-        if (self.runtime.backend != "cpu" or task.get("pipeline") != "native-phase-n1"
+        if (self.runtime.backend != "cpu" or task.get("pipeline") not in {"native-phase-n1", "n1"}
                 or task.get("precision") != "float32"):
-            raise CachePolicyError("This adapter qualifies only the audited CPU float32 native-phase-n1 writer route")
+            raise CachePolicyError("This adapter requires a separately observed CPU float32 native-phase-n1 or N1 writer route")
         coverage = measured.get("worker_cache_service_coverage")
         if not isinstance(coverage, dict):
             raise CachePolicyError("No observed worker/service writer qualification")
@@ -204,6 +204,13 @@ class WorkerCacheAdapter:
         required = [Path(__file__), root / "worker_io.py", root / "capacity.py",
                     root / "runner.py", root / "series.py", root.parent / "native" / "sidecar.py",
                     root.parent / "mass" / "n1_pipeline.py"]
+        if task["pipeline"] == "n1":
+            required += [root / "staged_data.py", root / "job_inputs.py",
+                         root.parent / "mass" / "pixel_pipeline.py", root.parent / "mass" / "pixels.py",
+                         root.parent / "geometry" / "pixels.py", root.parent / "storage_extensive.py",
+                         root.parent / "storage_extensive_io.py", root.parent / "storage_n1_outputs.py",
+                         root.parent / "storage_n1_saved_products.py", root.parent / "storage_outputs.py",
+                         root.parent / "storage_resolution.py"]
         if not {_key(p) for p in required}.issubset(producers):
             raise CachePolicyError("Observed producer closure omits an actual worker/output boundary")
         combined = coverage["producer_source_closure"] + coverage["runtime_source_closure"]

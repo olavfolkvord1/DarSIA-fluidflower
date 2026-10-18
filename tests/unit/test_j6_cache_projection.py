@@ -332,6 +332,51 @@ def test_original_claim_validation_still_records_its_binding(projection_fixture)
     assert f.adapter.profiles[f.task["attempt_id"]]["binding"] == binding
 
 
+def _observed_N1_unit_profile(f):
+    """A separate in-memory TESTONLY stage proof, never a production measurement."""
+    f.task["pipeline"] = f.profile["pipeline"] = f.coverage["pipeline"] = "n1"
+    root = f.runtime.repository / "src" / "darsia" / "fluidflower" / "pipeline"
+    paths = [root / "staged_data.py", root / "job_inputs.py", root.parent / "mass" / "pixel_pipeline.py",
+        root.parent / "mass" / "pixels.py", root.parent / "geometry" / "pixels.py",
+        root.parent / "storage_extensive.py", root.parent / "storage_extensive_io.py",
+        root.parent / "storage_n1_outputs.py", root.parent / "storage_n1_saved_products.py",
+        root.parent / "storage_outputs.py", root.parent / "storage_resolution.py"]
+    f.coverage["producer_source_closure"].extend(pin(path) for path in paths)
+    f.lease.profile["module_closure"] = f.coverage["producer_source_closure"] + f.coverage["runtime_source_closure"]
+    f.completion["worker_cache_service_coverage_sha256"] = adapter_module._coverage_hash(f.coverage)
+
+
+def test_N1_profile_requires_its_own_observed_stage_and_complete_source_closure(projection_fixture):
+    f = projection_fixture
+    _observed_N1_unit_profile(f)
+    result = project(f)
+    assert result["observed_service_peak_bytes"] == 170
+    assert result["additional_cache_reservation_bytes"] == 0
+    assert f.adapter.profiles == {}, "Projection must never bind or create a claim"
+
+
+@pytest.mark.parametrize("fault", ["old_stage_measurement", "unobserved_IO", "omitted_writer", "different_count", "positive_claim_cache"])
+def test_N1_cache_profile_is_not_an_alias_for_old_native_measurements(projection_fixture, fault):
+    f = projection_fixture
+    _observed_N1_unit_profile(f)
+    if fault == "old_stage_measurement":
+        f.coverage["pipeline"] = "native-phase-n1"
+    elif fault == "unobserved_IO":
+        f.coverage["actual_writer_IO_observed"] = False
+    elif fault == "omitted_writer":
+        f.coverage["producer_source_closure"] = [row for row in f.coverage["producer_source_closure"]
+            if not row["path"].endswith("storage_extensive_io.py")]
+    elif fault == "different_count":
+        f.coverage["case_count"] -= 1
+    else:
+        f.profile["maximum_cache_bytes"] = 1
+    f.completion["worker_cache_service_coverage_sha256"] = adapter_module._coverage_hash(f.coverage)
+    with pytest.raises(CachePolicyError):
+        project(f)
+    assert "result-read-enter" not in f.trace
+    assert f.adapter.profiles == {}
+
+
 def test_other_active_service_is_counted_without_rereserving_own_service(projection_fixture):
     f = projection_fixture
     f.ledger.other_scope_bytes = {"c" * 32: 25}

@@ -170,13 +170,21 @@ def read_series(path, *, expected_sha256, reader_factory=None):
     ):
         raise ValueError("Complete fixed selection required")
     declared = value["runs"]
+    kind = value.get("pipeline", PIPELINE)
+    if kind not in {PIPELINE, "n1"}:
+        raise ValueError("Unsupported explicit execution-series stage")
     if [row["run"] for row in declared] != [row["run"] for row in selected["runs"]]:
         raise ValueError("Series/selection run order differs")
     if len({name(row["run"]) for row in declared}) != len(declared):
         raise ValueError("Duplicate case-insensitive run")
     configurations = []
     for row, selection in zip(declared, selected["runs"]):
-        config = validate_run(reader.json(row["configuration"]))
+        original = reader.json(row["configuration"])
+        if kind == "n1":
+            from .staged_data import validate_phase2_run
+            config = validate_phase2_run(original)
+        else:
+            config = validate_run(original)
         if (
             config["run"] != row["run"]
             or [spec["case_id"] for spec in config["frames"]]
@@ -184,7 +192,7 @@ def read_series(path, *, expected_sha256, reader_factory=None):
         ):
             raise ValueError("Run configuration differs from fixed selected case order")
         if (
-            config["mass"]["calibration"]["sha256"]
+            (config["calibration"] if kind == "n1" else config["mass"]["calibration"])["sha256"]
             != value["job"]["calibration_sha256"]
         ):
             raise ValueError("Series cannot mix frozen calibrations")
@@ -218,6 +226,9 @@ def series_tasks(series, configurations, *, job_root, series_asset, shared_admis
     if relative.drive or relative.is_absolute() or ".." in relative.parts:
         raise ValueError("Environment lock must remain repository-relative")
     tasks = []
+    kind = series.get("pipeline", PIPELINE)
+    if kind not in {PIPELINE, "n1"}:
+        raise ValueError("Unsupported explicit whole-run execution stage")
     for row, config in zip(series["runs"], configurations):
         resources = deepcopy(row["resources"])
         if resources.get("backend") not in {"cpu", "cuda", "any"}:
@@ -226,7 +237,7 @@ def series_tasks(series, configurations, *, job_root, series_asset, shared_admis
             raise ValueError("Positive internal thread count required")
         task = dict(
             resources,
-            pipeline=PIPELINE,
+            pipeline=kind,
             run=config["run"],
             configuration=row["configuration"],
             commit=job["commit"],
