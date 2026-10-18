@@ -785,7 +785,7 @@ class JobQueue:
             prepared = claim.publication_factory(claim, dict(original), success)
             self.assert_owner(claim)  # Copies never acquire publication rights.
             required = {"candidate", "products_index"} if success else {"candidate"}
-            optional = {"payload_publication"} if success else set()
+            optional = ({"payload_publication"} if success else set()) | {"n43_reference_guard"}
             if (not isinstance(prepared, dict) or not required <= set(prepared)
                     or not set(prepared) <= required | optional):
                 raise ValueError("Explicit shared candidate/index publication descriptors required")
@@ -798,6 +798,8 @@ class JobQueue:
                 self._validate_alias_index(index_path, prepared["candidate"], claim.task["run"], claim.token)
                 self._validate_alias_payload(claim.lease, prepared.get("payload_publication"),
                     prepared["products_index"], claim.task["run"], claim.token)
+        if alias:
+            self._check_n43_reference_publication(prepared,claim.task,success)
         try:
             publication = dict(attempt_id=claim.token, success=success,
                                candidate=descriptor(candidate))
@@ -808,6 +810,8 @@ class JobQueue:
         except FileNotFoundError as exc:
             raise LeaseLost("Reclaim closed the publication lease") from exc
         self.assert_owner(claim)
+        if alias:
+            self._check_n43_reference_publication(publication,claim.task,success)
         try:
             rename(claim.lease, destination)
         except FileNotFoundError as exc:
@@ -879,6 +883,7 @@ class JobQueue:
         target = (self.root / "results" / run / "completed.json"
                   if publication["success"] else self.root / "failed" / (run + ".json"))
         self._shared_target(target)
+        self._check_n43_reference_publication(publication,task,publication["success"])
         if target.exists():
             if target.read_bytes() != raw:
                 raise ValueError("A different terminal result already exists")
@@ -897,11 +902,23 @@ class JobQueue:
                 done["payload_publication"] = _own_reference(self.root, payload)
             done_path = self.root / "done" / (run + ".json")
             self._shared_target(done_path)
+            self._check_n43_reference_publication(publication,task,True)
             try:
                 write_immutable(done_path, done)
             except FileExistsError:
                 if read_json(done_path) != done:
                     raise ValueError("Done identity changed")
+
+    def _check_n43_reference_publication(self, publication, task, success):
+        # The durable optional record also governs original recovery. Ordinary
+        # records with no finite-first environment retain their exact route.
+        guard=publication.get("n43_reference_guard")
+        if "n43_reference_guard" in publication and not isinstance(guard,dict):
+            raise ValueError("N43 publication guard must be its exact typed record")
+        if guard is None and "DARSIA_CACHE_FIRST_QUALIFICATION" not in os.environ:
+            return
+        from darsia_cache.first_qualification import check_reference_publication_guard
+        check_reference_publication_guard(guard,self.root,task,success=success)
 
     def _validate_alias_payload(self, directory, reference, index_reference, run, token):
         """Validate default-product receipt identity; never read large payloads here."""

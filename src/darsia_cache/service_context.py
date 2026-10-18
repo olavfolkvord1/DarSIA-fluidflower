@@ -135,7 +135,7 @@ class OriginalServiceObserverContext:
     resolver_is_not_retirement_proof: bool = True
 
 
-def resolve_original_service_context(receipt_binding, *, package_file):
+def resolve_original_service_context(receipt_binding, *, package_file, first_request=None):
     """Reopen exact metadata once; no ImportLease constructor or live handles.
 
     Requires CacheBudgetLedger.locked(create_binding=False). The original
@@ -164,16 +164,39 @@ def resolve_original_service_context(receipt_binding, *, package_file):
             or receipt["namespace"] != document["cache_bootstrap"]["namespace_admission"]):
         raise CachePolicyError("Original service role/profile/namespace metadata differs")
     profile = reads.read(role["profile"])
-    if (profile.get("format") != "darsia-cache-import-profile-v1"
+    first=None
+    if first_request is not None:
+        from .first_qualification import FirstQualification, PROVIDER
+        if profile.get("format")!=PROVIDER:
+            raise CachePolicyError("Explicit first observer requires the original immutable provider")
+        first=FirstQualification(first_request,provider_binding=role["profile"],
+            stores_source=policy_binding,namespace=receipt["namespace"],read=reads.read)
+        admin=receipt.get("first_qualification",{})
+        entitlement=admin.get("administrative_entitlement",{})
+        if (admin.get("request")!=first.binding or admin.get("provider")!=role["profile"]
+                or entitlement.get("measured_profile") is not False
+                or entitlement.get("maximum_bytes")!=receipt["manifest"]["maximum_bytes"]):
+            raise CachePolicyError("Original first service administrative receipt differs")
+        maximum=nonnegative(entitlement["maximum_bytes"],"Original first service entitlement")
+        if not maximum:raise CachePolicyError("Positive original first entitlement required")
+        profile=dict(format="darsia-cache-first-entry-contract-v1",
+            python_executable=first.provider["python_executable"],
+            module_closure=first.provider["module_closure"],
+            native_supervision=dict(startup=first.provider["startup"]))
+    elif profile.get("format")=="darsia-cache-qualified-profile-provider-v1":
+        from .first_qualification import resolve_profile
+        profile=resolve_profile(role["profile"],"import",reads.read,stores_source=policy_binding)
+    if first is None and (profile.get("format") != "darsia-cache-import-profile-v1"
             or profile.get("purpose") != role["purpose"]
             or profile.get("role_identifier") != role["role_identifier"]
             or profile.get("entry_kind") != role["entry_kind"]
             or profile.get("writer_contract") != "cooperative-start-admission-v1"):
         raise CachePolicyError("Original import/service profile is not applicable")
-    maximum = nonnegative(profile["maximum_cache_bytes"], "Original service maximum")
-    completed = reads.read(profile["completion"])
-    if not maximum or completed.get("complete") is not True or completed.get("passed") is not True:
-        raise CachePolicyError("Original completed import/service profile is required")
+    if first is None:
+        maximum = nonnegative(profile["maximum_cache_bytes"], "Original service maximum")
+        completed = reads.read(profile["completion"])
+        if not maximum or completed.get("complete") is not True or completed.get("passed") is not True:
+            raise CachePolicyError("Original completed import/service profile is required")
     admission = reads.read(receipt["namespace"])
     observer, actual = _owner()
     if not _host_binding(admission, actual):

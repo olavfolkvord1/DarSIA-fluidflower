@@ -264,6 +264,17 @@ class NativeAPI:
             active_processes=int(row.active_processes),
             terminated_by_limit_processes=int(row.terminated_processes))
 
+    def lifetime_memory(self, handle):
+        """Kernel-maintained Job commit peaks; not RSS or sampled cache bytes."""
+        row = _EXTENDED_LIMIT()
+        self.check(self.k.QueryInformationJobObject(handle, 9, C.byref(row), C.sizeof(row), None),
+                   "Native lifetime Job memory unavailable")
+        if row.basic.flags != 0:
+            raise CachePolicyError("Native Job flags changed during lifetime observation")
+        return dict(peak_job_committed_bytes=int(row.peak_job),
+            peak_single_process_committed_bytes=int(row.peak_process),
+            semantics="kernel PeakJobMemoryUsed/PeakProcessMemoryUsed; not RSS or filesystem allocation")
+
     def pipe(self):
         read, write = W.HANDLE(), W.HANDLE()
         security = _SECURITY(C.sizeof(_SECURITY), None, True)
@@ -430,6 +441,9 @@ class NativeAPI:
 
 
 def _checked_contract(lease):
+    if getattr(lease, "first_qualification", None) is not None:
+        from .first_qualification import validate_startup
+        return validate_startup(lease)
     block = lease.profile.get("native_supervision")
     keys = {"format", "completion", "startup", "maximum_family_processes", "publication_contract"}
     if (not isinstance(block, dict) or set(block) != keys
@@ -776,11 +790,13 @@ class OwnedWorker:
                 self.api.terminate_before_resume(self.info["process"])
             raise
 
-    def await_family(self):
+    def await_family(self, *, observer=None):
         while True:
             try:
                 accounting = self.api.accounting(self.job)
                 flags = self.api.require_job_flags(self.job)
+                if observer is not None:
+                    observer(self, accounting)
                 if (accounting["active_processes"] == 0
                         and self.api.signaled(self.info["process"])
                         and (self.owner_handle is None or self.api.signaled(self.owner_handle))):
@@ -883,6 +899,9 @@ def _budget_state(result, error, attempted):
 
 def supervise_original_worker(lease, *, api=None):
     """External controller; never calls lease.start/attach/reserve/register/seal."""
+    if getattr(lease, "first_qualification", None) is not None:
+        from .first_qualification import supervise_first_worker
+        return supervise_first_worker(lease, api=api)
     contract = _checked_contract(lease)
     command = _public_command(lease)
     owned = OwnedWorker(lease, api=api)

@@ -61,3 +61,21 @@ def test_bootstrap_applies_all_child_writer_keys_and_preserves_parent(monkeypatc
     assert tempfile.tempdir is None
     assert calls == ["start", lease.exit_intent]
     assert bootstrap.current_import_lease() is lease
+
+
+def test_first_only_redirects_all_inherited_cache_application_paths_inside_owned_scope():
+    from pathlib import PureWindowsPath
+    from darsia_cache.environment import first_qualification_environment, FIRST_WRITER_ENVIRONMENT_KEYS
+    token="b"*32;root="Q:/TESTONLY_CACHE/jobs/"+token
+    document={"cache":dict(root="Q:/TESTONLY_CACHE",quota_bytes=1,profiles={"jobs":{}})}
+    parent=dict(HOME="C:/old-home",LOCALAPPDATA="C:/old-local",XDG_CACHE_HOME="C:/old-xdg",
+                USERPROFILE="C:/old-user",APPDATA="C:/old-app",UNRELATED="preserved")
+    original=dict(parent)
+    ordinary=derive_cache_environment(document,purpose="jobs",token=token,scope_root=root,parent_environment=parent)
+    assert ordinary["HOME"]==parent["HOME"] and ordinary["LOCALAPPDATA"]==parent["LOCALAPPDATA"]
+    actual=first_qualification_environment(ordinary,scope_root=root)
+    assert parent==original and actual["UNRELATED"]=="preserved"
+    for key in FIRST_WRITER_ENVIRONMENT_KEYS:
+        if key!="NUMBA_CACHE_LOCATOR_CLASSES":
+            assert PureWindowsPath(actual[key]).is_relative_to(PureWindowsPath(root))
+    assert actual["NUMBA_CACHE_LOCATOR_CLASSES"]=="UserProvidedCacheLocator"

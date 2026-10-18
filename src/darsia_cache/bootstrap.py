@@ -26,7 +26,8 @@ from .policy import CachePolicyError, cache_settings, nonnegative, _descriptor
 from .windows import WindowsNamespace, _parts
 from .control import CacheBudgetLedger, _encoded
 from .capacity import _capacity_host_context, read_bound, volume_info
-from .environment import derive_cache_environment, WRITER_SUBDIRECTORIES, WRITER_ENVIRONMENT_KEYS
+from .environment import (derive_cache_environment, WRITER_SUBDIRECTORIES, WRITER_ENVIRONMENT_KEYS,
+    FIRST_WRITER_SUBDIRECTORIES, FIRST_WRITER_ENVIRONMENT_KEYS, first_qualification_environment)
 
 _LEASE = None
 POLICY_ENV = "DARSIA_CACHE_POLICY"
@@ -230,7 +231,7 @@ class ImportLease:
     def __init__(self,document,source,package_file,*,entry_kind,role_identifier=None):
         self.package_file=package_file;self.document=document;self.source=source
         self.policy=cache_settings(document,required=True)
-        if self.policy.volume_cap is None:
+        if self.policy.volume_cap is None and "DARSIA_CACHE_FIRST_QUALIFICATION" not in os.environ:
             raise CachePolicyError("Managed startup requires an accepted actual fixed-volume write-cap binding")
         role=select_entry_role(document,entry_kind=entry_kind,role_identifier=role_identifier)
         boot=document["cache_bootstrap"]
@@ -238,16 +239,37 @@ class ImportLease:
         self.purpose,self.profile_binding=role["purpose"],role["profile"]
         self.entry_limit=nonnegative(boot["accounting_entry_limit"],"Accounting entry limit")
         if not self.entry_limit:raise CachePolicyError("Positive explicit accounting limit required")
-        self.profile=_exact(self.profile_binding,package_file)
-        if (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
+        from .first_qualification import REQUEST_ENV, FirstQualification, resolve_profile
+        self.first_qualification=None
+        if REQUEST_ENV in os.environ:
+            if entry_kind!="worker" or self.purpose!="jobs":
+                raise CachePolicyError("Finite first qualification requires the original worker/jobs entry")
+            self.first_qualification=FirstQualification(json.loads(os.environ[REQUEST_ENV]),
+                provider_binding=self.profile_binding,stores_source=self.source,
+                namespace=boot["namespace_admission"],read=lambda pin:_exact(pin,package_file))
+            first=self.first_qualification.provider
+            # Operational predeclared closure, explicitly NOT a measured profile.
+            self.profile=dict(format="darsia-cache-first-entry-contract-v1",
+                python_executable=first["python_executable"],module_closure=first["module_closure"],
+                native_supervision=dict(startup=first["startup"]))
+            self.maximum=0  # Not an entitlement: derived under the host lock in start().
+        else:
+            self.profile=resolve_profile(self.profile_binding,"import",lambda pin:_exact(pin,package_file),
+                stores_source=self.source)
+        if self.policy.volume_cap is None and not (self.first_qualification is not None
+                and self.first_qualification.reference_build
+                and self.first_qualification.reference_administration["host_policy"]=="olav-n43-one-run-uncapped-d"):
+            raise CachePolicyError("Managed startup requires an accepted actual fixed-volume write-cap binding")
+        if self.first_qualification is None and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
                 or self.profile.get("role_identifier")!=self.role_identifier
                 or self.profile.get("entry_kind")!=self.entry_kind
                 or self.profile.get("writer_contract")!="cooperative-start-admission-v1"):
             raise CachePolicyError("An applicable explicit import/service cache profile is required")
-        self.maximum=nonnegative(self.profile["maximum_cache_bytes"],"Import maximum cache bytes")
-        complete=_exact(self.profile["completion"],package_file)
-        if not self.maximum or complete.get("complete") is not True or complete.get("passed") is not True:
-            raise CachePolicyError("Accepted completed source-bound import cache profile required")
+        if self.first_qualification is None:
+            self.maximum=nonnegative(self.profile["maximum_cache_bytes"],"Import maximum cache bytes")
+            complete=_exact(self.profile["completion"],package_file)
+            if not self.maximum or complete.get("complete") is not True or complete.get("passed") is not True:
+                raise CachePolicyError("Accepted completed source-bound import cache profile required")
         # No optional numerical/runtime identity or guessed extension of a profile.
         executable=Path(sys.executable).resolve()
         bound=self.profile["python_executable"]
@@ -324,6 +346,8 @@ class ImportLease:
         if Path(bound["path"])!=container:raise CachePolicyError("Admitted purpose differs from explicit policy")
         parent=tree=None
         with self.ledger.locked():
+            if getattr(self,"first_qualification",None) is not None:
+                self.maximum=self.first_qualification.service_entitlement(self)
             self.reservation=self.ledger.reserve(token,self.owner,self.maximum)
             self._record(token+".import-intent.json",dict(owner=self.owner,reservation=self.reservation,
                 policy=self.source,profile=self.profile_binding,maximum_bytes=self.maximum))
@@ -335,15 +359,18 @@ class ImportLease:
                 initial_names=tree.api.names(tree.handles[""])
                 if initial_names:
                     raise CachePolicyError("New exclusive UUID scope was not observed empty")
+                first_writers = getattr(self, "first_qualification", None) is not None
+                writer_directories = FIRST_WRITER_SUBDIRECTORIES if first_writers else WRITER_SUBDIRECTORIES
+                writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
                 fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
                     token=token, owner=dict(self.owner), purpose=self.purpose,
                     root_identity=dict(tree.directories[""]),
                     creation_disposition="NtCreateFile.FILE_CREATE", exclusive_root_handle=True,
                     initial_names=[], initial_empty_observed_utc=_utc(),
                     observation_precedes_writer_subdirectories_and_imports=True,
-                    writer_subdirectories=list(WRITER_SUBDIRECTORIES),
-                    writer_environment_keys=list(WRITER_ENVIRONMENT_KEYS))
-                for name in WRITER_SUBDIRECTORIES:
+                    writer_subdirectories=list(writer_directories),
+                    writer_environment_keys=list(writer_keys))
+                for name in writer_directories:
                     tree._parent(tuple(_parts(name)))  # Validated directory components; no phantom file.
                 self.directories=dict(tree.directories);self.root=container/token
                 manifest=dict(format="darsia-cache-external-import-scope-v1",token=token,owner=self.owner,
@@ -365,6 +392,10 @@ class ImportLease:
             role_identifier=self.role_identifier,entry_kind=self.entry_kind,
             namespace=self.document["cache_bootstrap"]["namespace_admission"],
             profile=self.profile_binding,manifest=manifest,directories=self.directories)
+        if getattr(self,"first_qualification",None) is not None:
+            receipt["first_qualification"]=dict(request=self.first_qualification.binding,
+                provider=self.first_qualification.provider_binding,
+                administrative_entitlement=self.first_qualification.administrative)
         self.receipt=self._record(token+".import-service.json",receipt)
         self.attach_owner()
 
@@ -377,6 +408,16 @@ class ImportLease:
                 or receipt.get("entry_kind")!=self.entry_kind):
             raise CachePolicyError("Inherited namespace/profile/role differs")
         manifest=receipt["manifest"];self.root=Path(manifest["root"]);self.reservation=manifest["reservation"]
+        if getattr(self,"first_qualification",None) is not None:
+            first=receipt.get("first_qualification",{})
+            admin=first.get("administrative_entitlement",{})
+            if (first.get("request")!=self.first_qualification.binding
+                    or first.get("provider")!=self.first_qualification.provider_binding
+                    or admin.get("measured_profile") is not False
+                    or admin.get("maximum_bytes")!=manifest["maximum_bytes"]):
+                raise CachePolicyError("Inherited first-mode administrative binding differs")
+            self.maximum=nonnegative(manifest["maximum_bytes"],"Original first service entitlement")
+            if not self.maximum:raise CachePolicyError("No first service entitlement")
         self.manifest=manifest
         self.directories=receipt["directories"]
         expected=self.policy.purpose(self.purpose)/("current" if self.purpose=="tests" else "")/self.reservation["token"]
@@ -416,8 +457,12 @@ class ImportLease:
 
     def exit_intent(self):
         try:
+            document=dict(utc=_utc(),owner=self.owner,reservation=self.reservation,
+                actual_OS_retirement_not_proven=True)
+            if getattr(self,"first_qualification",None) is not None:
+                document["first_qualification_modules"]=self.first_qualification.loaded_modules()
             self._record(self.reservation["token"]+".exit-intent-"+str(self.owner["pid"])+"-"+self.owner["creation_filetime_100ns"]+".json",
-                dict(utc=_utc(),owner=self.owner,reservation=self.reservation,actual_OS_retirement_not_proven=True))
+                document)
         finally:self.close_pins()
         # No reservation close, adoption of arbitrary generated files or cleanup.
 
@@ -479,8 +524,12 @@ def before_darsia_import(*,package_file):
         else:lease.start()
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
+        first_writers = getattr(lease, "first_qualification", None) is not None
+        if first_writers:
+            environment = first_qualification_environment(environment, scope_root=lease.root)
         environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))
-        for key in (*WRITER_ENVIRONMENT_KEYS, RECEIPT_ENV):
+        writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
+        for key in (*writer_keys, RECEIPT_ENV):
             os.environ[key]=environment[key]
         # CPython uses this live attribute, not a later environment assignment.
         # Startup and the imports needed to reach this line are not covered.

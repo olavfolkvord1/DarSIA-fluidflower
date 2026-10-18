@@ -480,7 +480,9 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
     binding = policy.profiles.get("jobs")
     if binding is None:
         raise CachePolicyError("No measured applicable job-cache profile")
-    profile, _ = read_bound(binding)
+    from .first_qualification import resolve_profile
+    profile = resolve_profile(binding, "jobs", lambda pin:read_bound(pin)[0],
+        stores_source=getattr(getattr(adapter,"lease",None),"source",None))
     fields = {"format", "purpose", "pipeline", "precision", "case_count", "commit",
               "maximum_cache_bytes", "measurement", "completion",
               "result_estimate_excludes_cache", "writer_contract"}
@@ -534,6 +536,12 @@ class ClaimCacheBudget:
         self.profiles, self.lock = {}, None
 
     def prepare(self, task, estimate):
+        if getattr(getattr(self.adapter,"lease",None), "first_qualification", None) is not None:
+            binding=self.adapter.prepare_first_claim(task, estimate)
+            # Enforced no additional claim scope/allocation; this is NOT a
+            # measured zero-byte profile or a second service reservation.
+            self.profiles[task["attempt_id"]]=(0,binding)
+            return
         maximum, binding, _, _, _ = applicable_job_cache_profile(self.policy, self.adapter, task, estimate)
         self.profiles[task["attempt_id"]] = (maximum, binding)
 
@@ -542,6 +550,16 @@ class ClaimCacheBudget:
         self.lock.__enter__()
 
     def check(self, task, estimate, other_noncache_bytes):
+        first=getattr(getattr(self.adapter,"lease",None),"first_qualification",None)
+        if first is not None and first.reference_build:
+            from .first_qualification import _same_path, reference_root_for_path
+            if not _same_path(self.capacity.directory,self.adapter.lease.document["capacity"]["state_directory"]):
+                raise CachePolicyError("N43 actual result-capacity state differs from its declared path")
+            reference_root_for_path(first,self.capacity.directory)
+            first.require_task(self.adapter.lease,task)
+            self.ledger.require_reservation(self.adapter.lease.reservation,
+                self.adapter.lease.manifest["owner"], self.adapter.lease.maximum)
+            return first.reference_admission(self.adapter.lease,other_remaining=other_noncache_bytes)
         from .capacity import volume_info
         cache_volume, result_volume = volume_info(self.policy.root), self.capacity.fresh_volume()
         same = self.capacity.remote_scope is None and cache_volume["volume_id"] == result_volume["volume_id"]

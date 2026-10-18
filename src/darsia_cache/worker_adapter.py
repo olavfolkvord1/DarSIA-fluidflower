@@ -47,6 +47,14 @@ class WorkerCacheAdapter:
         self.lease = require_same_startup_stores(runtime.stores)
         self.namespace_admission = self.lease.admission
         self.profiles, self.claims = {}, {}
+        first=getattr(self.lease,"first_qualification",None)
+        if first is not None and first.reference_build:
+            from .first_qualification import ReferencePublicationFence
+            original_factory=runtime.factory
+            def reference_factory(claim):
+                first.require_task(self.lease,claim.task)
+                return ReferencePublicationFence(original_factory(claim),first,self.lease)
+            runtime.factory=reference_factory
 
     def verify_preimport(self, stores, policy, *, create_binding=True):
         lease = require_same_startup_stores(stores)
@@ -147,6 +155,16 @@ class WorkerCacheAdapter:
     def measure(self, root):
         return self.lease.measure(root)
 
+    def prepare_first_claim(self, task, estimate):
+        """Explicit finite administration, never a qualified profile projection."""
+        first=self.lease.first_qualification
+        if self.runtime.backend!="cpu" or self.runtime.commit!=first.provider["scope"]["commit"]:
+            raise CachePolicyError("First worker runtime/source differs from released scope")
+        first.require_task(self.lease,task,remember=True)
+        self.profiles[task["attempt_id"]]=dict(task=deepcopy(task),binding=first.binding,
+            first_administration=True,coverage_sha256=None)
+        return first.binding
+
     def verify_profile(self, task, estimate, binding, profile, measured, complete):
         return self._verify_profile(task, estimate, binding, profile, measured, complete, remember=True)
 
@@ -231,6 +249,11 @@ class WorkerCacheAdapter:
     def register_claim_allocation(self, claim, ledger, reservation, owner, maximum, profile):
         """Bind a qualified zero entitlement; never allocate artificial scratch."""
         proof = self.profiles[claim.token]
+        first=getattr(self.lease,"first_qualification",None)
+        if first is not None:
+            first.require_task(self.lease,claim.task)
+            if proof.get("first_administration") is not True or profile!=first.binding:
+                raise CachePolicyError("First claim is not the exact released administrative binding")
         actual, _ = _owner()
         if (ledger is not self.lease.ledger or maximum != 0
                 or claim.token != claim.task["attempt_id"]
@@ -241,7 +264,8 @@ class WorkerCacheAdapter:
         ledger.require_reservation(reservation, owner, 0)
         ledger.require_unbound_scope(claim.token)
         receipt = self.lease._record(self.lease.reservation["token"] + ".claim-" + claim.token + ".json",
-            dict(format="darsia-worker-cache-claim-service-binding-v1", claim_token=claim.token,
+            dict(format=("darsia-worker-cache-first-claim-service-binding-v1" if first is not None
+                         else "darsia-worker-cache-claim-service-binding-v1"), claim_token=claim.token,
                  task=claim.task, owner=owner, profile=profile,
                  writer_coverage_sha256=proof["coverage_sha256"], claim_reservation=reservation,
                  claim_disposable_entitlement_bytes=0, claim_scope_created=False,

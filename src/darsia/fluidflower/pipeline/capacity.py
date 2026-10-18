@@ -301,6 +301,56 @@ class SpaceEstimate:
                 + _integer(reserve_bytes, "Reserve bytes"))
 
 
+
+@dataclass(frozen=True)
+class PredeclaredN43ProducerEntitlement:
+    run: str
+    case_count: int
+    maximum_aggregate_bytes: int
+    request: dict
+    administration: dict
+    shared_service_reservation: dict
+    model: str = "PREDECLARED all-stage aggregate; shared cache/output entitlement counted once; NOT measured profile"
+
+
+def n43_entitlement(runtime, task, config, rows):
+    """Explicit released producer route; ordinary load_estimate is unchanged."""
+    first=runtime.cache_adapter.lease.first_qualification
+    from darsia_cache.first_qualification import REFERENCE_ENTITLEMENT_BYTES, _same_path
+    if not first.reference_build:
+        raise ValueError("No explicit N43 reference-build administration")
+    first.require_task(runtime.cache_adapter.lease,task)
+    if (config.get("storage") is not None or config.get("pixel_domain") is not None
+            or config.get("probability_storage") is not None
+            or "gas_probability_storage" in config
+            or [frame["case_id"] for frame in config["frames"]]!=task["ordered_case_ids"]):
+        raise ValueError("N43 binds the exact classic native-phase39 route without new output options")
+    _state,_reserve,binding=settings(runtime.stores,runtime.job["series_id"])
+    if binding!=first.request["reference_administration"]:
+        raise ValueError("Result-space administration differs from the exact Root-released N43 request")
+    actual=_native_layout_for_task(runtime.stores,runtime.job["series_id"],task,config,rows)
+    admin=first.reference_administration
+    if actual!=admin["requested_native_layout"]:
+        raise ValueError("N43 actual native layout differs from the predeclared producer")
+    writers=admin["output_writers"]
+    required={"src/darsia/fluidflower/mass/n1_pipeline.py",
+        "src/darsia/fluidflower/mass/n1_statistics.py", "src/darsia/fluidflower/pipeline/series.py",
+        "src/darsia/fluidflower/native/sidecar.py", "src/darsia/fluidflower/pipeline/runner.py"}
+    if (not isinstance(writers,list) or len(writers)>32
+            or len({row.get("relative_path") for row in writers})!=len(writers)
+            or not required<={row.get("relative_path") for row in writers}):
+        raise ValueError("N43 predeclared actual output-writer closure incomplete")
+    for writer in writers:
+        _writer_identity(runtime.repository,task["commit"],writer)
+    roots={row["role"]:row for row in admin["owned_roots"]}
+    if (not _same_path(roots["job"]["path"],runtime.root)
+            or not _same_path(roots["results"]["path"],runtime.stores.roots(runtime.job["series_id"])["results"])):
+        raise ValueError("N43 actual job/results roots escape the predeclared all-stage scope")
+    return PredeclaredN43ProducerEntitlement(task["run"],len(task["ordered_case_ids"]),
+        REFERENCE_ENTITLEMENT_BYTES,first.binding,first.request["reference_administration"],
+        runtime.cache_adapter.lease.reservation)
+
+
 def estimate_run(task, config, profile, *, measurement, completion, layout=None,
                  layout_bytes=0, profile_identity=None, requested_native_layout=None):
     """Pure metadata estimate; missing applicability is refusal, not a default."""
@@ -856,15 +906,29 @@ class CapacityLedger:
                     or (self.remote_scope is None and row.get("volume_id")!=self.volume["volume_id"])
                     or (self.remote_scope is not None and row.get("remote_scope")!=self.remote_scope)):
                 raise ValueError("Reservation belongs to another actual host/account/capacity scope")
-            if (row.get("format") != "darsia-local-capacity-reservation-v1"
+            if (row.get("format") not in {"darsia-local-capacity-reservation-v1",
+                    "darsia-n43-predeclared-capacity-mirror-v1"}
                     or path.parent.name != "r-" + _reservation_id(row["job_root"], row)
                     or type(row.get("case_count")) is not int or row["case_count"] < 1
                     or len(row.get("ordered_case_ids", [])) != row["case_count"]
                     or len(set(row["ordered_case_ids"])) != row["case_count"]):
                 raise ValueError("Original reservation identity/case coverage differs")
             _owner(row["owner"])
-            _integer(row["products_per_frame_estimated_bytes"], "Reserved products")
-            _integer(row["transient_estimated_bytes"], "Reserved transient")
+            if row.get("reservation_model")=="N43-shared-aggregate-service-mirror":
+                _integer(row["maximum_aggregate_bytes"],"Predeclared N43 aggregate",positive=True)
+                if (row["format"]!="darsia-n43-predeclared-capacity-mirror-v1"
+                        or row["maximum_aggregate_bytes"]!=65728995330
+                        or row["case_count"]!=39 or row["run"]!="ac52"
+                        or not isinstance(row.get("shared_service_reservation"),dict)):
+                    raise ValueError("N43 mirror differs from the actual one service entitlement")
+                _bound(row["request"]);_bound(row["administration"])
+                if row["shared_service_reservation"]!=row["estimate"]["shared_service_reservation"]:
+                    raise ValueError("N43 mirror differs from the actual one service entitlement")
+            else:
+                if row["format"]!="darsia-local-capacity-reservation-v1":
+                    raise ValueError("Unknown typed capacity reservation model")
+                _integer(row["products_per_frame_estimated_bytes"], "Reserved products")
+                _integer(row["transient_estimated_bytes"], "Reserved transient")
             if exclude_job is not None and Path(row["job_root"]).resolve() == Path(exclude_job).resolve():
                 continue
             release = path.parent / "released.json"
@@ -888,8 +952,11 @@ class CapacityLedger:
                 committed = max(committed, _integer(update.get("committed_prefix_count"), "Committed prefix"))
             if committed > row["case_count"]:
                 raise ValueError("Capacity progress exceeds original case count")
-            total += ((row["case_count"] - committed) * row["products_per_frame_estimated_bytes"]
-                      + row["transient_estimated_bytes"])
+            if row.get("reservation_model")=="N43-shared-aggregate-service-mirror":
+                total += row["maximum_aggregate_bytes"]
+            else:
+                total += ((row["case_count"] - committed) * row["products_per_frame_estimated_bytes"]
+                          + row["transient_estimated_bytes"])
         return total
 
     def bind(self, job_root, claim, owner, estimate):
@@ -902,13 +969,21 @@ class CapacityLedger:
         if path.exists():
             raise RunUnavailable("An original capacity reservation already exists for this claim token")
         path.mkdir()
-        value = dict(format="darsia-local-capacity-reservation-v1", machine_id=self.machine_id,
-            physical_host=self.host,service_account_sid=self.account,
+        common = dict(machine_id=self.machine_id, physical_host=self.host,service_account_sid=self.account,
             volume_id=self.volume["volume_id"], owner=dict(owner), job_root=str(Path(job_root).resolve()),
             run=claim.task["run"], attempt_id=claim.token, case_count=estimate.case_count,
-            ordered_case_ids=list(claim.task["ordered_case_ids"]),
-            products_per_frame_estimated_bytes=estimate.products_per_frame_estimated_bytes,
-            transient_estimated_bytes=estimate.transient_estimated_bytes, estimate=asdict(estimate))
+            ordered_case_ids=list(claim.task["ordered_case_ids"]))
+        if isinstance(estimate,PredeclaredN43ProducerEntitlement):
+            value = dict(common,format="darsia-n43-predeclared-capacity-mirror-v1",
+                reservation_model="N43-shared-aggregate-service-mirror",
+                maximum_aggregate_bytes=estimate.maximum_aggregate_bytes,
+                shared_service_reservation=estimate.shared_service_reservation,
+                request=estimate.request,administration=estimate.administration,
+                not_a_measured_profile=True, estimate=asdict(estimate))
+        else:
+            value = dict(common,format="darsia-local-capacity-reservation-v1",
+                products_per_frame_estimated_bytes=estimate.products_per_frame_estimated_bytes,
+                transient_estimated_bytes=estimate.transient_estimated_bytes, estimate=asdict(estimate))
         if self.remote_scope is not None:
             value.update(remote_scope=self.remote_scope, results_root=str(self.results_root),
                 observed_client_volume=dict(self.volume),
@@ -1036,8 +1111,12 @@ class ClaimCapacity:
         rows = self.runtime.availability(task)
         try:
             config = configuration_for_task(self.runtime.stores, self.runtime.job["series_id"], task, rows)
-            estimate = load_estimate(self.runtime.stores, self.runtime.job["series_id"], task, config,
-                                     repository=Path(__file__).resolve().parents[4], metadata_rows=rows)
+            first=getattr(getattr(getattr(self.runtime,"cache_adapter",None),"lease",None),"first_qualification",None)
+            if first is not None and first.reference_build:
+                estimate=n43_entitlement(self.runtime,task,config,rows)
+            else:
+                estimate = load_estimate(self.runtime.stores, self.runtime.job["series_id"], task, config,
+                                         repository=Path(__file__).resolve().parents[4], metadata_rows=rows)
             # Slow original input admission/profile reads run outside this local
             # transaction. Only fresh space -> claim -> reservation is serialized.
             self.cache.prepare(task, estimate)
@@ -1046,8 +1125,13 @@ class ClaimCapacity:
             self.cache.acquire()  # Fixed result-volume -> cache lock order.
             other=self.ledger.remaining()
             cache_report = self.cache.check(task, estimate, other)
-            current = report(estimate,self.ledger.fresh_volume(),other,self.ledger.reserve)
-            current["cache"] = cache_report
+            if isinstance(estimate,PredeclaredN43ProducerEntitlement):
+                # cache_report already checks the one WHOLE aggregate against
+                # each affected volume. Never add another 65GB output budget.
+                current=dict(cache_report,model=estimate.model,cache=cache_report)
+            else:
+                current = report(estimate,self.ledger.fresh_volume(),other,self.ledger.reserve)
+                current["cache"] = cache_report
             if not current["sufficient"]:
                 raise RunUnavailable(current["message"] + "; leave this whole run pending")
             self.estimates[task["attempt_id"]] = estimate

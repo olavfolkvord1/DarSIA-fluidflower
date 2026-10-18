@@ -45,3 +45,41 @@ def derive_cache_environment(stores_document, *, purpose, token, scope_root, par
                   DARSIA_PHASE_DISPLAY_CACHE=str(expected / "display"))
     # Do not change HOME/LOCALAPPDATA, JIT, numerical threads or scientific args.
     return result
+
+
+# Q102: only the explicitly released finite first provider redirects these
+# inherited application locations. Ordinary direct-profile behavior above is
+# unchanged. These paths are not an allocation cap or a reserve guarantee.
+FIRST_WRITER_SUBDIRECTORIES = WRITER_SUBDIRECTORIES + (
+    "xdg-cache", "xdg-config", "xdg-data", "joblib",
+    "userprofile", "appdata", "localappdata", "home",
+)
+FIRST_WRITER_ENVIRONMENT_KEYS = WRITER_ENVIRONMENT_KEYS + (
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "JOBLIB_TEMP_FOLDER", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME",
+)
+
+
+def first_qualification_environment(environment, *, scope_root):
+    """Extend the original exact scope mapping; no mkdir/global environment I/O."""
+    root = PureWindowsPath(scope_root)
+    if not root.is_absolute() or root.drive.startswith("\\\\") or ".." in root.parts:
+        raise ValueError("First writers require the actual owned local namespace")
+    if str(PureWindowsPath(environment["DARSIA_FLUIDFLOWER_CACHE"])).casefold() != str(root).casefold():
+        raise ValueError("First writer environment differs from the original service scope")
+    result = dict(environment)
+    result.update(XDG_CACHE_HOME=str(root / "xdg-cache"),
+                  XDG_CONFIG_HOME=str(root / "xdg-config"),
+                  XDG_DATA_HOME=str(root / "xdg-data"),
+                  JOBLIB_TEMP_FOLDER=str(root / "joblib"),
+                  USERPROFILE=str(root / "userprofile"),
+                  APPDATA=str(root / "appdata"),
+                  LOCALAPPDATA=str(root / "localappdata"),
+                  HOME=str(root / "home"))
+    for key in FIRST_WRITER_ENVIRONMENT_KEYS:
+        if key == "NUMBA_CACHE_LOCATOR_CLASSES":
+            continue
+        path = PureWindowsPath(result[key])
+        if not path.is_relative_to(root):
+            raise ValueError("A first cache/temp writer escapes its owned service namespace: " + key)
+    return result
