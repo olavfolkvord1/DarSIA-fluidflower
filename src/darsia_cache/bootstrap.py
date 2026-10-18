@@ -562,7 +562,7 @@ def before_darsia_import(*,package_file):
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
         first_writers = (getattr(lease, "first_qualification", None) is not None
-            or lease.profile.get("format") == "darsia-cache-volume-bound-import-profile-v1")
+            or getattr(lease, "profile", {}).get("format") == "darsia-cache-volume-bound-import-profile-v1")
         if first_writers:
             environment = first_qualification_environment(environment, scope_root=lease.root)
         environment[RECEIPT_ENV]=json.dumps(lease.receipt,sort_keys=True,separators=(",",":"))
