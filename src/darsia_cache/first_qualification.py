@@ -21,7 +21,7 @@ import sys
 import time
 import uuid
 
-from .policy import CachePolicyError, PHYSICAL_RESERVE_BYTES, _descriptor, nonnegative
+from .policy import CachePolicyError, PHYSICAL_RESERVE_BYTES, _descriptor, _module_source_descriptor, nonnegative
 from .control import _encoded
 
 REQUEST_ENV = "DARSIA_CACHE_FIRST_QUALIFICATION"
@@ -57,7 +57,7 @@ def _exact_keys(value, keys, message):
 def _pins(rows):
     if not isinstance(rows, list) or not rows:
         raise CachePolicyError("Nonempty predeclared exact source/runtime closure required")
-    pins = [_descriptor(row) for row in rows]
+    pins = [_module_source_descriptor(row) for row in rows]
     if len({str(PureWindowsPath(pin["path"])).casefold() for pin in pins}) != len(pins):
         raise CachePolicyError("Duplicate first-qualification source identity")
     return pins

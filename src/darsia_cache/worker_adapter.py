@@ -13,7 +13,7 @@ from pathlib import Path, PureWindowsPath
 
 from .adapters import require_same_startup_stores
 from .bootstrap import _exact, _owner
-from .policy import CachePolicyError, _descriptor
+from .policy import CachePolicyError, _descriptor, _module_source_descriptor
 
 
 def _key(path):
@@ -30,7 +30,7 @@ def _source_pins(rows):
         raise CachePolicyError("Observed exact producer/runtime source pins required")
     paths = set()
     for value in rows:
-        pin = _descriptor(value)
+        pin = _module_source_descriptor(value)
         if _key(pin["path"]) in paths:
             raise CachePolicyError("Duplicate source identity in writer qualification")
         paths.add(_key(pin["path"]))

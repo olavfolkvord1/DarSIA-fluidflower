@@ -26,7 +26,7 @@ import sys
 import time
 import uuid
 
-from .policy import CachePolicyError, _descriptor, nonnegative
+from .policy import CachePolicyError, _descriptor, _module_source_descriptor, nonnegative
 from .control import _encoded
 
 
@@ -479,7 +479,7 @@ def _checked_contract(lease):
 
 
 def _exact_source(binding):
-    pin = _descriptor(binding)
+    pin = _module_source_descriptor(binding)
     path = Path(pin["path"])
     before = path.stat()
     raw = path.read_bytes()
@@ -533,7 +533,7 @@ def _public_command(lease):
         from .bootstrap import _exact
         startup = _exact(lease.profile["native_supervision"]["startup"], lease.package_file)
         bindings = [pin for pin in startup["source_files"]
-                    if Path(_descriptor(pin)["path"]).resolve() == observed]
+                    if Path(_module_source_descriptor(pin)["path"]).resolve() == observed]
         if len(bindings) != 1:
             raise CachePolicyError("Actual backing executable has no unique qualified runtime source binding")
         _exact_source(bindings[0])

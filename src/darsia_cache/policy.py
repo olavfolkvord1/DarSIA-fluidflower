@@ -46,6 +46,17 @@ def _descriptor(value):
     return dict(value)
 
 
+def _module_source_descriptor(value):
+    """Allow canonical empty Python modules only in exact source closures."""
+    if (isinstance(value, dict) and set(value) == {"path", "sha256", "size_bytes"}
+            and isinstance(value["path"], str) and value["path"]
+            and PureWindowsPath(value["path"]).suffix.casefold() == ".py"
+            and type(value["size_bytes"]) is int and value["size_bytes"] == 0
+            and value["sha256"] == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"):
+        return dict(value)
+    return _descriptor(value)
+
+
 
 def _kernel_object(value, *, directory):
     keys = {"volume_serial", "file_id_128", "directory", "creation_100ns"}

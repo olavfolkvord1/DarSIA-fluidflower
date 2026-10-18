@@ -445,3 +445,52 @@ def test_Q106_foreign_master_or_failed_stop_records_STOP_without_retry_or_fallba
     assert actual["requested"] is False and actual["error_type"]=="ValueError"
     assert actual["state"]=="STOP_COMMAND_NOT_PUBLISHED"
     assert calls==[dict(machine="TESTONLY-Olav",expected_previous=None)]
+
+
+def test_empty_python_module_is_exact_source_not_empty_metadata():
+    from darsia_cache.policy import _descriptor
+    from darsia_cache.worker_adapter import _source_pins
+    empty = dict(path="C:/TESTONLY/__init__.py", size_bytes=0,
+        sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    value = provider()
+    value["producer_source_closure"].append(empty)
+    value["module_closure"].append(empty)
+    assert first.checked_provider(value) == value
+    assert _source_pins([empty]) == {'c:\\testonly\\__init__.py'}
+    with pytest.raises(CachePolicyError):
+        _descriptor(empty)
+    for role in ("namespace_admission", "python_executable", "startup"):
+        invalid = deepcopy(value)
+        invalid[role] = empty
+        with pytest.raises(CachePolicyError):
+            first.checked_provider(invalid)
+
+
+@pytest.mark.parametrize("changes", [
+    dict(sha256="a"*64), dict(size_bytes=-1), dict(size_bytes=False),
+    dict(size_bytes=16*1024**2+1), dict(path="C:/TESTONLY/empty.json"),
+    dict(path="C:/TESTONLY/empty.pyd"), dict(path="C:/TESTONLY/python.exe"),
+    dict(path=""), dict(size_bytes=0.0), dict(extra="not source identity"),
+])
+def test_empty_source_exception_keeps_exact_sha_type_suffix_size_and_fields(changes):
+    from darsia_cache.worker_adapter import _source_pins
+    value = dict(path="C:/TESTONLY/__init__.py", size_bytes=0,
+        sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    value.update(changes)
+    with pytest.raises(CachePolicyError):
+        first._pins([value])
+    with pytest.raises(CachePolicyError):
+        _source_pins([value])
+
+
+def test_module_source_descriptor_keeps_positive_executable_and_16MiB_boundary():
+    from darsia_cache.policy import _descriptor, _module_source_descriptor
+    for size in (1, 16*1024**2):
+        value = dict(path="C:/TESTONLY/python.exe", size_bytes=size, sha256="a"*64)
+        assert _module_source_descriptor(value) == _descriptor(value)
+    for missing in ("path", "sha256", "size_bytes"):
+        value = dict(path="C:/TESTONLY/__init__.py", size_bytes=0,
+            sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        del value[missing]
+        with pytest.raises(CachePolicyError):
+            first._pins([value])

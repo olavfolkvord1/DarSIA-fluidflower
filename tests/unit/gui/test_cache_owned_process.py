@@ -637,3 +637,39 @@ while not Path(os.environ["TESTONLY_ACK"]).exists():
         for handle in (owner_handle, read, write, job):
             if handle is not None:
                 api.close(handle)
+
+
+def test_actual_empty_python_source_keeps_byte_hash_and_missing_file_refusals(tmp_path):
+    source = tmp_path / "__init__.py"
+    source.write_bytes(b"")
+    binding = dict(path=str(source), size_bytes=0, sha256=hashlib.sha256(b"").hexdigest())
+    assert owned._exact_source(binding) is None
+    source.write_bytes(b"changed")
+    with pytest.raises(CachePolicyError, match="source changed"):
+        owned._exact_source(binding)
+    source.write_bytes(b"")
+    with pytest.raises(CachePolicyError):
+        owned._exact_source(dict(binding, sha256="a"*64))
+    source.unlink()
+    with pytest.raises(FileNotFoundError):
+        owned._exact_source(binding)
+
+
+def test_public_backing_executable_lookup_accepts_empty_python_source_in_closure(tmp_path, monkeypatch):
+    selected, base, source = [tmp_path / name for name in ("python.exe", "base.exe", "__init__.py")]
+    selected.write_bytes(b"TESTONLY selected"); base.write_bytes(b"TESTONLY base"); source.write_bytes(b"")
+    def bound(path):
+        raw = path.read_bytes()
+        return dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
+    selected_pin, base_pin, empty_pin = [bound(path) for path in (selected, base, source)]
+    startup = dict(source_files=[empty_pin, base_pin])
+    argv = [str(base), "-B", "-m", "darsia.fluidflower.worker", "--once"]
+    monkeypatch.setattr(bootstrap, "_exact", lambda pin, package: startup)
+    monkeypatch.setattr(bootstrap, "_python_module_invocation", lambda: ("darsia.fluidflower.worker", ["--once"]))
+    monkeypatch.setattr(owned, "sys", SimpleNamespace(orig_argv=argv, executable=str(selected),
+        _base_executable=str(base), flags=SimpleNamespace(dont_write_bytecode=True)))
+    lease = SimpleNamespace(profile=dict(python_executable=selected_pin,
+        native_supervision=dict(startup=SERVICE)), package_file="TESTONLY_PACKAGE")
+    owned._exact_source(empty_pin)
+    assert owned._public_command(lease) == [str(selected), *argv[1:]]
+    assert argv[0] == str(base)
