@@ -347,3 +347,56 @@ def test_advanced_imported_view_is_readonly_with_explicit_draft_action(imported)
     assert data.geometry_quality_basis.text() == "ordinary basis"
     assert data.import_rig.isEnabled() and not data.place_injector.isEnabled()
     assert app is not None
+
+
+# N54: opaque registered-source fields survive real Qt table round trips.
+# These tiny synthetic rows do not qualify or copy the actual FF_AC geometry.
+def registered_table_page_TESTONLY():
+    from PySide6.QtWidgets import QApplication, QTableWidget, QComboBox, QCheckBox, QDoubleSpinBox
+    from darsia.fluidflower.pages.geometry_facies.page import GeometryFaciesPage
+    app=QApplication.instance() or QApplication([])
+    policy=QComboBox();policy.addItem("Reviewed", "allow_reviewed_run_overrides")
+    detect=QCheckBox();detect.setChecked(True)
+    displacement=QDoubleSpinBox();displacement.setValue(.5)
+    affected=QDoubleSpinBox();affected.setValue(10.)
+    page=SimpleNamespace(run_geometry_table=QTableWidget(0,9),run_geometry_policy=policy,
+        run_geometry_change_detection=detect,run_geometry_displacement_threshold=displacement,
+        run_geometry_affected_threshold=affected,_mark_dirty=lambda *args:None)
+    return app,page,GeometryFaciesPage
+
+
+def test_N54_all43_registered_row_provenance_survives_GUI_collect_without_source_rebinding():
+    app,page,cls=registered_table_page_TESTONLY()
+    original=[]
+    for i in range(43):
+        row=dict(enabled=True,run_id="ac"+str(17+i),acquisition_state="unknown",geometry_choice="run_override",
+            source_image_path="TESTONLY/photo"+str(i)+".npz",labels_path="TESTONLY/labels"+str(i)+".npz",
+            facies_path="",property_change_proposals=[],registration=dict(parent_revision_id="a"*32,
+                labels=dict(path="TESTONLY/labels"+str(i)+".npz",sha256="b"*64,size_bytes=10),
+                status="registered",authority={"TESTONLY":"unchanged"}),
+            additional_provenance={"TESTONLY":[i,{"immutable":"kept"}]})
+        original.append(deepcopy(row));cls._append_run_geometry_row(page,row)
+    actual=cls._collect_run_geometry(page)["runs"]
+    assert actual==original
+    actual[0]["registration"]["authority"]["TESTONLY"]="changed only returned copy"
+    assert cls._collect_run_geometry(page)["runs"]==original
+
+
+def test_N54_renamed_GUI_row_cannot_inherit_another_runs_registration():
+    app,page,cls=registered_table_page_TESTONLY()
+    cls._append_run_geometry_row(page,dict(run_id="ac18",registration={"TESTONLY":"ac18-only proof"}))
+    page.run_geometry_table.item(0,1).setText("ac47")
+    actual=cls._collect_run_geometry(page)["runs"][0]
+    assert actual["run_id"]=="ac47" and "registration" not in actual
+
+
+def test_N54_changed_label_path_does_not_relabel_original_registration_descriptor():
+    app,page,cls=registered_table_page_TESTONLY()
+    original=dict(run_id="ac18",geometry_choice="run_override",labels_path="TESTONLY/original.npz",
+        registration=dict(labels={"path":"TESTONLY/original.npz","sha256":"a"*64,"size_bytes":10}))
+    cls._append_run_geometry_row(page,original)
+    page.run_geometry_table.item(0,5).setText("TESTONLY/different.npz")
+    actual=cls._collect_run_geometry(page)["runs"][0]
+    assert actual["labels_path"]=="TESTONLY/different.npz"
+    assert actual["registration"]==original["registration"]
+    # Existing _verify(record.labels, row.labels_path) refuses this mismatch.

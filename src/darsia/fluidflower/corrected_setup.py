@@ -288,6 +288,105 @@ def _dual_configuration_binding_v2(value, run, configuration, selected, *, serie
     return deepcopy(value)
 
 
+PRIVATE_MANUAL_CONFIGURATION_FORMAT = "darsia-private-Q121-corrected-setup-configuration-binding-v1"
+
+
+def _private_manual_output_bytes(before, changes):
+    """Only two physical output-pointer lines; every other byte is retained."""
+    if set(changes)!={"rig.path","data.results"}:
+        raise ValueError("Private Q121 requires exactly rig.path and data.results.")
+    expected=tomllib.loads(before.decode("utf-8-sig"))
+    bom=b"\xef\xbb\xbf" if before.startswith(b"\xef\xbb\xbf") else b""
+    lines=before[len(bom):].decode("utf-8").splitlines(keepends=True)
+    for leaf in ("rig.path","data.results"):
+        section,key=leaf.split(".");change=changes[leaf]
+        if (not isinstance(change,dict) or set(change)!={"field","before","after"}
+                or change["field"]!=leaf or expected[section][key]!=change["before"]):
+            raise ValueError("Private Q121 output source pointer differs.")
+        headers=[(i,re.match(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$",line.rstrip("\r\n"))) for i,line in enumerate(lines)]
+        starts=[i for i,m in headers if m and m.group(1).strip()==section]
+        if len(starts)!=1:raise ValueError("Private Q121 needs one original output table.")
+        start=starts[0];end=next((i for i in range(start+1,len(lines)) if lines[i].lstrip().startswith("[")),len(lines))
+        found=[i for i in range(start+1,end) if re.match(rf"^\s*{re.escape(key)}\s*=",lines[i])]
+        if len(found)!=1:raise ValueError("Private Q121 needs one original output pointer line.")
+        index=found[0];line=lines[index]
+        prefix=re.match(rf"^(\s*{re.escape(key)}\s*=\s*)",line).group(1)
+        newline="\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        lines[index]=prefix+json.dumps(change["after"],ensure_ascii=False)+newline
+        expected[section][key]=change["after"]
+    after=bom+"".join(lines).encode("utf-8")
+    if not _typed_equal(tomllib.loads(after.decode("utf-8-sig")),expected):
+        raise ValueError("Private Q121 pointer patch changed another TOML value/type.")
+    return after
+
+
+def _private_manual_configuration_binding(value,run,configuration,selected,*,series,
+        project_root,revision,destination,receipt):
+    """Explicit private-only Q121 I/O, never an extension of ordinary dual V2."""
+    keys={"format","run_id","source_configuration","current_configuration","apply_configurations",
+        "pre_pointer_configurations","output_pointer_changes","manual_revision","comparison_sha256"}
+    if (not isinstance(value,dict) or set(value)!=keys or value["format"]!=PRIVATE_MANUAL_CONFIGURATION_FORMAT
+            or value["run_id"]!=run or re.fullmatch(r"[0-9a-f]{64}",str(value["comparison_sha256"])) is None
+            or project_root is None or str(project_root).startswith(("\\\\","//"))
+            or not _same(project_root,Path(series)/"geometry_facies")
+            or re.fullmatch(r"[0-9a-f]{32}",str(revision)) is None):
+        raise ValueError("Private Q121 output binding needs its exact local project/run/revision.")
+    original=_configuration_identity(value["source_configuration"])
+    targets=value["apply_configurations"];previous=value["pre_pointer_configurations"]
+    if (not _typed_equal(original,configuration) or not isinstance(targets,list) or len(targets)!=2
+            or len(selected)!=2 or not isinstance(previous,list) or len(previous)!=2):
+        raise ValueError("Private Q121 requires original source and two pre-pointer/current targets.")
+    root=Path(project_root).resolve();series=Path(series).resolve()
+    for target,path in zip(targets,selected):
+        _configuration_identity(target)
+        if (not _same(target["path"],path) or _same(target["path"],original["path"])
+                or not Path(target["path"]).resolve().is_relative_to(series)):
+            raise ValueError("Private Q121 Apply target is foreign or is the preserved source.")
+    if not _typed_equal(_configuration_identity(value["current_configuration"]),targets[-1]):
+        raise ValueError("Private Q121 current must be its actual merged target.")
+    source=_configuration_bytes_v2(original)
+    for old,role in zip(previous,("runs","merged")):
+        _configuration_identity(old);path=Path(old["path"])
+        if (not path.resolve().is_relative_to(series) or path.parent.name!=role or path.name!=run+".toml"
+                or any(_same(path,target["path"]) for target in targets)
+                or _configuration_bytes_v2(old)!=source):
+            raise ValueError("Private Q121 pre-pointer copies must retain ALL original bytes.")
+    if _same(previous[0]["path"],previous[1]["path"]):
+        raise ValueError("Private Q121 requires two distinct original pre-pointer copies.")
+    expected={"rig.path":root/"results/rig_models"/revision/run,
+              "data.results":root/"results/native_data"/revision/run}
+    changes=value["output_pointer_changes"]
+    if not isinstance(changes,dict) or set(changes)!=set(expected):
+        raise ValueError("Private Q121 permits only its two explicit output pointer leaves.")
+    for leaf,target in expected.items():
+        change=changes[leaf]
+        if (not isinstance(change,dict) or set(change)!={"field","before","after"}
+                or change["field"]!=leaf or change["after"]!=str(target)
+                or not isinstance(change["before"],str) or not Path(change["before"]).is_absolute()
+                or target.resolve()!=target or Path(change["before"]).resolve().is_relative_to(root)):
+            raise ValueError("Private Q121 output pointer is not its fixed local UUID/run path.")
+    expected_raw=_private_manual_output_bytes(source,changes)
+    for target in targets:
+        if _original_configuration_bytes(target,destination,receipt)!=expected_raw:
+            raise ValueError("Private Q121 changed bytes beyond the two output pointer lines.")
+    record=_configuration_identity(value["manual_revision"])
+    if not _same(record["path"],root/"results/geometry"/revision/"revision.json"):
+        raise ValueError("Private Q121 manual provenance is not this new Store UUID.")
+    current=json.loads(_configuration_bytes_v2(record))
+    from .geometry_raster_sources import private_manual_label_edit_sources,MANUAL_LABEL_EDIT
+    manual=private_manual_label_edit_sources(root,current,run)
+    if manual.get("format")!=MANUAL_LABEL_EDIT or manual.get("revision_id")!=revision or manual.get("run_id")!=run:
+        raise ValueError("Private Q121 output binding lacks actual manual parent/session/Store provenance.")
+    return deepcopy(value)
+
+
+def _require_fresh_private_manual_build(paths,dual):
+    # Same effective-config/fresh-rig/cache checks. This is a field projection
+    # of an already checked private record, not relabelling it as dual V2.
+    return _require_fresh_v2_build(paths,dict(current_configuration=dual["current_configuration"],
+        output_pointer_change=dual["output_pointer_changes"]["rig.path"]))
+
+
 def _require_fresh_v2_build(paths, dual):
     """Check original dispatch's output/cache boundary without creating anything."""
     from darsia.presets.workflows.config.utils import _deep_merge
@@ -393,7 +492,11 @@ def _configuration_bundle(series, run, configuration, *, destination=None, recei
     result = dict(series_root=str(series), series_manifest=_descriptor(manifest_path),
                   configuration_bundles=bundles, common_configuration=common_binding)
     if dual is not None:
-        if isinstance(dual, dict) and dual.get("format") == CONFIGURATION_BINDING_V2_FORMAT:
+        if isinstance(dual,dict) and dual.get("format")==PRIVATE_MANUAL_CONFIGURATION_FORMAT:
+            result["dual_configuration_binding"]=_private_manual_configuration_binding(
+                dual,run,configuration,selected,series=series,project_root=project_root,
+                revision=revision,destination=destination,receipt=receipt)
+        elif isinstance(dual, dict) and dual.get("format") == CONFIGURATION_BINDING_V2_FORMAT:
             result["dual_configuration_binding"] = _dual_configuration_binding_v2(
                 dual, run, configuration, selected, series=series, project_root=project_root,
                 revision=revision, destination=destination, receipt=receipt)
@@ -491,7 +594,7 @@ def _verify_immutable_export_inputs(receipt):
     if data.get("dual_configuration_binding") is not None:
         _verified(data["configuration"])
         dual = data["dual_configuration_binding"]
-        if dual["format"] == CONFIGURATION_BINDING_V2_FORMAT:
+        if dual["format"] in (CONFIGURATION_BINDING_V2_FORMAT,PRIVATE_MANUAL_CONFIGURATION_FORMAT):
             for before in dual["pre_pointer_configurations"]:
                 _verified(before)
     if data.get("registered_geometry") is not None:
@@ -606,11 +709,16 @@ def require_corrected_export_for_build(paths):
     dual = binding.get("dual_configuration_binding")
     if dual is not None and dual["format"] == CONFIGURATION_BINDING_V2_FORMAT:
         _require_fresh_v2_build(paths, dual)
+    elif dual is not None and dual["format"]==PRIVATE_MANUAL_CONFIGURATION_FORMAT:
+        _require_fresh_private_manual_build(paths,dual)
     return receipt
 
 
 
 def _registered_binding(project_root, current, config, run):
+    if "manual_label_edit" in config:
+        from .geometry_raster_sources import private_manual_label_edit_sources
+        return private_manual_label_edit_sources(project_root, current, run)
     if config.get("source_mode") != "canonical-from-import":
         return None
     from .geometry_raster_sources import registered_run_sources

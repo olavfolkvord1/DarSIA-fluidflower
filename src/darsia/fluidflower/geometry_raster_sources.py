@@ -207,6 +207,8 @@ def validate_source_mode(config, report):
     try:
         payload = (imported_payload(config) if config["source_mode"] == IMPORTED
                    else canonical_parent_payload(config))
+        if "manual_label_edit" in config:
+            manual_label_edit_payload(config)
         if config["source_mode"] == IMPORTED:
             detail = difference_to_canonical(config, payload["facies"])
             value["summary"].update(source_mode=IMPORTED, source_mode_notice=detail["notice"],
@@ -938,3 +940,180 @@ def materialize_source_mode(config, staging, destination):
     return dict(source_mode=mode, labels_path=copied["labels"]["path"],
                 source_mode_files=copied, source_mode_difference=detail,
                 source_mode_diagnosis=payload["diagnosis"]), payload["rows"]
+
+
+MANUAL_LABEL_EDIT = "darsia-private-manual-label-edit-provenance-v1"
+
+
+def _private_manual_context(project_root, manifest):
+    root=Path(project_root).resolve()
+    value=((manifest.get("tools") or {}).get("native_darsia") or {}).get("manual_label_edit_validation")
+    keys={"format","authority_id","selected_run","parent_revision","private_series_root"}
+    if (not isinstance(value,dict) or set(value)!=keys or value["format"]!=MANUAL_LABEL_EDIT
+            or value["authority_id"]!="Q121" or not str(value["selected_run"])
+            or str(value["private_series_root"]).startswith(("\\\\","//"))
+            or Path(value["private_series_root"]).resolve()!=root.parent
+            or Path(((manifest.get("tools") or {}).get("native_series") or {}).get("series_root", "")).resolve()!=root.parent
+            or root.name!="geometry_facies"):
+        raise ValueError("Manual validation needs its exact local private series/project binding.")
+    _verify(value["parent_revision"])
+    return deepcopy(value)
+
+
+def bind_private_manual_label_edit(project, config, session, materialization):
+    """Bind actual original editor outputs only in the explicit private probe.
+
+    No source map, event, correction, registration or pixel value is changed.
+    The ordinary editor and all old source modes retain their existing route.
+    """
+    context=((project.manifest.get("tools") or {}).get("native_darsia") or {}).get("manual_label_edit_validation")
+    if context is None:
+        return config
+    context=_private_manual_context(project.root,project.manifest)
+    value=deepcopy(config)
+    value["manual_label_edit"]=dict(format=MANUAL_LABEL_EDIT,context=context,
+        source_labels=descriptor(session.base_labels_path),session=descriptor(session.manifest_path),
+        events=descriptor(session.events_path),materialization=descriptor(materialization["manifest_path"]),
+        materialized_labels=descriptor(materialization["labels_path"]))
+    manual_label_edit_payload(value)
+    return value
+
+
+def manual_label_edit_payload(config):
+    """Verify parent/grid and replay the UNCHANGED original editor events.
+
+    The replay view holds no writer paths or constructor side effects. It calls
+    the original _state/_rebuild/_event_mask methods with the original inputs.
+    """
+    from .geometry_facies import (GeometryLabelEditSession,LABEL_EDIT_FORMAT,
+        GEOMETRY_REVISION_FORMAT,_load_array,_darsia_metadata,_file_reference,normalize_run_geometry_config)
+    value=config.get("manual_label_edit")
+    if (not isinstance(value,dict) or set(value)!={"format","context","source_labels","session",
+            "events","materialization","materialized_labels"} or value["format"]!=MANUAL_LABEL_EDIT):
+        raise ValueError("Exact typed manual-label-edit provenance required.")
+    context=value["context"]
+    _private_manual_context(Path(context["private_series_root"])/"geometry_facies",
+        {"tools":{"native_darsia":{"manual_label_edit_validation":context},
+            "native_series":{"series_root":context["private_series_root"]}}})
+    parent_pin=_verify(context["parent_revision"])
+    parent=json.loads(Path(parent_pin["path"]).read_bytes())
+    old=parent.get("configuration") or {}
+    if (parent.get("format")!=GEOMETRY_REVISION_FORMAT or not re.fullmatch(r"[0-9a-f]{32}",str(parent.get("revision_id")))
+            or context.get("selected_run")!=(old.get("frame_binding") or {}).get("display_reference_run")
+            or config.get("source_mode")!=CANONICAL_EDIT or config.get("facies_source_path")!=""):
+        raise ValueError("Private manual edit is only its actual parent display/reference grid.")
+    for key in ("frame","width_m","height_m","baseline_path","frame_binding",
+            "facies_properties_source_path","grouping_mode","regions","canonical_import_parent"):
+        if config.get(key)!=old.get(key):
+            raise ValueError("Manual edit changed parent geometry/source/calibration field: "+key)
+    if normalize_run_geometry_config(config.get("run_geometry"))!=normalize_run_geometry_config(old.get("run_geometry")):
+        raise ValueError("Manual reference edit cannot silently change saved per-run registrations.")
+    if config.get("depth_path")!=old.get("depth_path"):
+        # The unchanged Store copies depth into its genuine new UUID before
+        # its second validation. Accept that byte identity only, not new depth.
+        path=Path(config["depth_path"])
+        depth_root=Path(context["private_series_root"])/"geometry_facies"/"results/geometry"
+        old_depth=descriptor(old["depth_path"]);new_depth=descriptor(path)
+        if (path.parent.parent!=depth_root or not re.fullmatch(r"[0-9a-f]{32}",path.parent.name)
+                or path.name!="depth"+Path(old["depth_path"]).suffix.casefold()
+                or any(new_depth[key]!=old_depth[key] for key in ("sha256","size_bytes"))):
+            raise ValueError("Manual Store depth must remain its original exact byte copy.")
+    actual={key:_verify(value[key]) for key in ("source_labels","session","events","materialization","materialized_labels")}
+    parent_labels=descriptor(old["labels_path"])
+    if any(actual["source_labels"][key]!=parent_labels[key] for key in ("sha256","size_bytes")):
+        raise ValueError("Manual source labels are not the actual parent label bytes.")
+    root=Path(context["private_series_root"]).resolve()/"geometry_facies"
+    for row in actual.values():
+        if not Path(row["path"]).resolve().is_relative_to(root):
+            raise ValueError("Manual session/materialization must stay in the private project.")
+    session=json.loads(Path(actual["session"]["path"]).read_bytes())
+    materialization=json.loads(Path(actual["materialization"]["path"]).read_bytes())
+    reference=config.get("label_edit_session") or {}
+    events=[json.loads(line) for line in Path(actual["events"]["path"]).read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    session_root=Path(actual["session"]["path"]).parent
+    materialization_root=Path(actual["materialization"]["path"]).parent
+    if (session.get("format")!=LABEL_EDIT_FORMAT
+            or not re.fullmatch(r"[0-9a-f]{32}",str(session.get("session_id")))
+            or session["session_id"]!=reference.get("session_id")
+            or Path(actual["session"]["path"]).name!="session.json"
+            or Path(actual["events"]["path"])!=session_root/"events.jsonl"
+            or reference.get("base_labels_path")!=actual["source_labels"]["path"]
+            or reference.get("events_path")!=actual["events"]["path"]
+            or materialization.get("format")!="darsia-fluidflower-label-materialization-v1"
+            or materialization.get("session_id")!=session["session_id"]
+            or materialization.get("materialization_id")!=reference.get("materialization_id")
+            or not re.fullmatch(r"[0-9a-f]{32}",str(materialization.get("materialization_id")))
+            or materialization_root!=session_root/"materializations"/materialization["materialization_id"]
+            or Path(actual["materialized_labels"]["path"])!=materialization_root/"labels.npz"
+            or materialization.get("base_labels_path")!=actual["source_labels"]["path"]
+            or materialization.get("events_path")!=actual["events"]["path"]
+            or reference.get("materialization_manifest_path")!=actual["materialization"]["path"]
+            or Path(config["labels_path"])!=Path(actual["materialized_labels"]["path"])):
+        raise ValueError("Manual parent/session/events/materialization identity differs.")
+    base=np.squeeze(_load_array(Path(actual["source_labels"]["path"])))
+    labels=np.squeeze(_load_array(Path(actual["materialized_labels"]["path"])))
+    if (base.ndim!=2 or not np.issubdtype(base.dtype,np.integer) or labels.dtype!=np.int32
+            or labels.shape!=base.shape or materialization.get("shape")!=list(base.shape)
+            or not _same_grid_metadata(_darsia_metadata(Path(actual["source_labels"]["path"])),
+                _darsia_metadata(Path(actual["materialized_labels"]["path"])))):
+        raise ValueError("Manual labels changed their exact parent spatial grid.")
+    if (session.get("width_m")!=config["width_m"] or session.get("height_m")!=config["height_m"]
+            or session.get("base_labels")!=_file_reference(Path(actual["source_labels"]["path"]))
+            or len({event.get("event_id") for event in events})!=len(events)
+            or not events or any(event.get("format")!=LABEL_EDIT_FORMAT
+                or event.get("kind") not in {"brush","polygon","undo","redo"}
+                or not re.fullmatch(r"[0-9a-f]{32}",str(event.get("event_id"))) for event in events)):
+        raise ValueError("Real original manual session/event history required.")
+    replay=object.__new__(GeometryLabelEditSession)
+    replay.width_m,replay.height_m=config["width_m"],config["height_m"]
+    replay.base_labels=np.asarray(base,dtype=np.int32);replay.events=events
+    replay._rebuild()
+    count=replay.active_operation_count()
+    if (not count or count!=reference.get("active_operation_count")
+            or count!=reference.get("materialized_active_operation_count")
+            or count!=materialization.get("active_operation_count") or not np.array_equal(replay.labels,labels)):
+        raise ValueError("Manual materialization is not the exact original active-event replay.")
+    for row in actual.values():
+        _verify(row)
+    return dict(parent=parent,parent_binding=parent_pin,files=actual)
+
+
+def private_manual_label_edit_sources(project_root,current,run):
+    """A distinct private source variant; never an old registered-map claim."""
+    from .geometry_facies import GEOMETRY_REVISION_FORMAT,_canonical_facies,_load_array
+    root=Path(project_root).resolve()
+    manifest=json.loads((root/"series.json").read_bytes())
+    context=_private_manual_context(root,manifest)
+    config=current.get("configuration") or {}
+    payload=manual_label_edit_payload(config)
+    # Keep the original imported-parent/full-CSV/selected-registration checks.
+    # This validates provenance; exported pixels below are the actual new
+    # manual materialization, never the old run_override as a fallback.
+    canonical_parent_payload(config,run_id=run)
+    revision=current.get("revision_id")
+    if (current.get("format")!=GEOMETRY_REVISION_FORMAT
+            or not re.fullmatch(r"[0-9a-f]{32}",str(revision))
+            or revision==payload["parent"]["revision_id"]
+            or config["manual_label_edit"]["context"]!=context or run!=context["selected_run"]):
+        raise ValueError("Manual export requires its new genuine private Store UUID/reference run.")
+    current_path=root/"overrides/geometry_facies/current.json"
+    revision_path=root/"results/geometry"/revision/"revision.json"
+    if json.loads(current_path.read_bytes())!=current or json.loads(revision_path.read_bytes())!=current:
+        raise ValueError("Manual current and immutable Store revision disagree.")
+    labels=descriptor(current["artifacts"]["labels_path"])
+    facies=descriptor(current["artifacts"]["facies_path"])
+    for row in (labels,facies):
+        if not Path(row["path"]).resolve().is_relative_to(revision_path.parent):
+            raise ValueError("Manual Store artifacts escaped the new UUID.")
+    if any(labels[key]!=payload["files"]["materialized_labels"][key] for key in ("sha256","size_bytes")):
+        raise ValueError("Manual Store labels are not its actual materialized editor bytes.")
+    expected,_properties=_canonical_facies(config)
+    if not np.array_equal(_load_array(Path(facies["path"])),expected):
+        raise ValueError("Manual Store facies differ from the unchanged original derivation.")
+    guarded=[descriptor(current_path),descriptor(revision_path),payload["parent_binding"],*payload["files"].values()]
+    return dict(format=MANUAL_LABEL_EDIT,run_id=run,revision_id=revision,
+        files=dict(labels=labels,facies=facies),guarded_sources=guarded,
+        registration=dict(kind=MANUAL_LABEL_EDIT,not_a_registration_or_H=True,
+            parent_revision_id=payload["parent"]["revision_id"],provenance=config["manual_label_edit"]),
+        label_serialization="Original editor int32 materialization; exact event replay and source grid",
+        provenance="Private Q121 reference-map edit only; not adopted-v1 or carried run registration")

@@ -300,3 +300,110 @@ def test_child_rechecks_reference_registered_evidence_without_new_writes(registe
         _export(data,"two")
     assert snapshot(data.project.root)==before
     assert not (reference.destination/"runs/two").exists()
+
+
+@pytest.fixture
+def private_manual_reference(registered_setup):
+    """Genuine tiny editor/session/materialization and new Store, no GUI or NAS."""
+    import shutil
+    from tests.unit.test_geometry_imported_rasters import Project
+    data=registered_setup
+    parent=data.revision
+    root=data.project.root.parent/"private-series"/"geometry_facies"
+    project=Project(root)
+    parent_file=Path(parent["artifacts"]["labels_path"]).parent/"revision.json"
+    context=dict(format=sources.MANUAL_LABEL_EDIT,authority_id="Q121",selected_run="one",
+        parent_revision=sources.descriptor(parent_file),private_series_root=str(root.parent))
+    project.manifest["tools"]={"native_darsia":{"manual_label_edit_validation":context},
+        "native_series":{"series_root":str(root.parent)}}
+    root.mkdir(parents=True)
+    (root/"series.json").write_text(json.dumps(project.manifest))
+    current=root/"overrides/geometry_facies/current.json";current.parent.mkdir(parents=True)
+    current.write_text(json.dumps(parent))
+    config=deepcopy(parent["configuration"])
+    base=root/"annotations/source_labels.npz";base.parent.mkdir()
+    shutil.copyfile(config["labels_path"],base);config["labels_path"]=str(base)
+    session=geometry.GeometryLabelEditSession.create(config,root/"overrides/geometry_facies/edit_sessions")
+    session.apply(kind="brush",points_m=[[.1,.1]],target_label=2,actor="TESTONLY manual owner",brush_radius_m=.01)
+    session.undo(actor="TESTONLY");session.redo(actor="TESTONLY")
+    materialization=session.materialize()
+    config["labels_path"]=materialization["labels_path"];config["facies_source_path"]=""
+    config["label_edit_session"]={**session.config_reference(),
+        "materialization_id":materialization["materialization_id"],
+        "materialization_manifest_path":materialization["manifest_path"],
+        "materialized_active_operation_count":session.active_operation_count()}
+    config=sources.bind_private_manual_label_edit(project,config,session,materialization)
+    return SimpleNamespace(project=project,parent=parent,config=config,session=session,materialization=materialization)
+
+
+def test_Q121_private_manual_edit_has_real_parent_event_replay_and_new_Store_UUID(private_manual_reference):
+    data=private_manual_reference
+    payload=sources.manual_label_edit_payload(data.config)
+    assert payload["parent"]["revision_id"]==data.parent["revision_id"]
+    saved=geometry.GeometryRevisionStore(data.project).save_revision(data.config,
+        actor="TESTONLY",reason="Actual tiny event replay")
+    assert saved["revision_id"]!=data.parent["revision_id"]
+    actual=sources.private_manual_label_edit_sources(data.project.root,saved,"one")
+    assert actual["format"]==sources.MANUAL_LABEL_EDIT
+    assert actual["registration"]["not_a_registration_or_H"] is True
+    assert np.array_equal(geometry._load_array(Path(actual["files"]["labels"]["path"])),data.session.labels)
+    assert saved["configuration"]["run_geometry"]==data.config["run_geometry"]
+
+
+@pytest.mark.parametrize("field",["parent_revision","selected_run","private_series_root"])
+def test_Q121_manual_context_mismatch_refuses_without_old_adoption_fallback(private_manual_reference,field):
+    data=private_manual_reference;config=deepcopy(data.config)
+    if field=="parent_revision":config["manual_label_edit"]["context"][field]["sha256"]="0"*64
+    elif field=="selected_run":config["manual_label_edit"]["context"][field]="two"
+    else:config["manual_label_edit"]["context"][field]="//TESTONLY/share/not-private"
+    with pytest.raises((ValueError,OSError)):sources.manual_label_edit_payload(config)
+
+
+@pytest.mark.parametrize("role",["source_labels","session","events","materialization","materialized_labels"])
+def test_Q121_every_actual_manual_provenance_role_is_SHA_bound(private_manual_reference,role):
+    data=private_manual_reference;config=deepcopy(data.config)
+    config["manual_label_edit"][role]["sha256"]="0"*64
+    with pytest.raises(ValueError):sources.manual_label_edit_payload(config)
+
+
+def test_Q121_altered_materialized_labels_cannot_be_accepted_by_repinning_only(private_manual_reference):
+    data=private_manual_reference;config=deepcopy(data.config)
+    path=Path(config["labels_path"])
+    changed=data.session.labels.copy();changed[0,0]=99
+    np.savez_compressed(path,array=changed,metadata=geometry._darsia_metadata(data.session.base_labels_path))
+    config["manual_label_edit"]["materialized_labels"]=sources.descriptor(path)
+    with pytest.raises(ValueError,match="exact original active-event replay"):
+        sources.manual_label_edit_payload(config)
+
+
+def test_Q121_manual_record_cannot_export_another_run_or_reuse_parent_Store_UUID(private_manual_reference):
+    data=private_manual_reference
+    saved=geometry.GeometryRevisionStore(data.project).save_revision(data.config,actor="TESTONLY",reason="tiny event")
+    with pytest.raises(ValueError,match="new genuine private Store UUID/reference run"):
+        sources.private_manual_label_edit_sources(data.project.root,saved,"two")
+    old=deepcopy(saved);old["revision_id"]=data.parent["revision_id"]
+    with pytest.raises(ValueError,match="new genuine private Store UUID/reference run"):
+        sources.private_manual_label_edit_sources(data.project.root,old,"one")
+
+
+def test_Q121_absent_private_context_leaves_original_materialization_config_unchanged():
+    config={"TESTONLY":"ordinary raw/painted config"}
+    project=SimpleNamespace(manifest={})
+    assert sources.bind_private_manual_label_edit(project,config,object(),{}) is config
+
+
+def test_Q121_private_project_cannot_keep_a_NAS_series_link(private_manual_reference):
+    data=private_manual_reference
+    manifest=json.loads((data.project.root/"series.json").read_bytes())
+    manifest["tools"]["native_series"]["series_root"]="//TESTONLY/NAS/original-series"
+    (data.project.root/"series.json").write_text(json.dumps(manifest))
+    saved={"configuration":data.config}
+    with pytest.raises(ValueError,match="exact local private series/project"):
+        sources.private_manual_label_edit_sources(data.project.root,saved,"one")
+
+
+def test_Q121_manual_facies_cannot_fall_back_to_original_unedited_raster(private_manual_reference):
+    data=private_manual_reference;config=deepcopy(data.config)
+    config["facies_source_path"]=data.parent["configuration"]["facies_source_path"]
+    with pytest.raises(ValueError,match="actual parent display/reference grid"):
+        sources.manual_label_edit_payload(config)

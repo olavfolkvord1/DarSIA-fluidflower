@@ -491,3 +491,112 @@ def test_v2_parses_only_the_bytes_whose_SHA_and_length_it_verifies(pointer, monk
     assert changed == [str(path)]
     assert tomllib.loads(path.read_text()) == tomllib.loads(original.decode())
     assert not (data["project"].root / "exports").exists()
+
+
+@pytest.fixture
+def Q121_private_output_binding_TESTONLY(tmp_path,monkeypatch):
+    """TOML/dispatch seam only. Real editor provenance is tested separately.
+
+    The manual-source reader is an explicit unit double here; this fixture
+    cannot qualify a real Store, GUI, corrected map or Build.
+    """
+    from darsia.fluidflower import geometry_raster_sources as sources
+    series=tmp_path/"Q121-private-series";root=series/"geometry_facies"
+    run="ac17";revision="b"*32
+    source=tmp_path/"original-config/ac17.toml";source.parent.mkdir()
+    raw=("# original bytes remain except TWO declared pointer lines\r\n"+toml.dumps(dict(
+        rig=dict(path=str(tmp_path/"original-rig")),
+        data=dict(results=str(tmp_path/"original-results"),use_cache=False),
+        labeling=dict(labels="unchanged-original-labels"),
+        calibration=dict(exact_original_float=.123))).replace("\n","\r\n")).encode()
+    source.write_bytes(raw)
+    changes={"rig.path":dict(field="rig.path",before=str(tmp_path/"original-rig"),
+        after=str(root/"results/rig_models"/revision/run)),
+        "data.results":dict(field="data.results",before=str(tmp_path/"original-results"),
+        after=str(root/"results/native_data"/revision/run))}
+    previous=[];targets=[]
+    for role in ("runs","merged"):
+        old=series/"config/pre-pointer"/role/(run+".toml");old.parent.mkdir(parents=True)
+        old.write_bytes(raw);previous.append(descriptor(old))
+        target=series/"config"/role/(run+".toml");target.parent.mkdir(parents=True)
+        target.write_bytes(subject._private_manual_output_bytes(raw,changes));targets.append(descriptor(target))
+    record=root/"results/geometry"/revision/"revision.json";record.parent.mkdir(parents=True)
+    current=dict(TESTONLY_seam=True,revision_id=revision);record.write_text(json.dumps(current))
+    calls=[]
+    def actual_manual_source_reader(project_root,document,requested):
+        assert project_root==root and document==current and requested==run
+        calls.append((project_root,document,requested))
+        return dict(format=sources.MANUAL_LABEL_EDIT,run_id=run,revision_id=revision)
+    monkeypatch.setattr(sources,"private_manual_label_edit_sources",actual_manual_source_reader)
+    value=dict(format=subject.PRIVATE_MANUAL_CONFIGURATION_FORMAT,run_id=run,
+        source_configuration=descriptor(source),current_configuration=targets[-1],
+        apply_configurations=targets,pre_pointer_configurations=previous,
+        output_pointer_changes=changes,manual_revision=descriptor(record),comparison_sha256="c"*64)
+    manifest=dict(runs=dict(ids=[run],geometry_configuration_bindings={run:value}))
+    (series/"series.toml").write_text(toml.dumps(manifest))
+    return dict(series=series,root=root,run=run,revision=revision,value=value,raw=raw,calls=calls)
+
+
+def _Q121_checked_TESTONLY(data,value=None):
+    return subject._private_manual_configuration_binding(value or data["value"],data["run"],
+        data["value"]["source_configuration"],[row["path"] for row in data["value"]["apply_configurations"]],
+        series=data["series"],project_root=data["root"],revision=data["revision"],destination=None,receipt=None)
+
+
+def test_Q121_private_output_binding_routes_to_actual_manual_reader_and_keeps_original_bytes(Q121_private_output_binding_TESTONLY):
+    data=Q121_private_output_binding_TESTONLY
+    assert _Q121_checked_TESTONLY(data)==data["value"] and len(data["calls"])==1
+    bundle=subject._configuration_bundle(data["series"],data["run"],data["value"]["source_configuration"],
+        project_root=data["root"],revision=data["revision"])
+    assert bundle["dual_configuration_binding"]==data["value"] and len(data["calls"])==2
+    for row in data["value"]["pre_pointer_configurations"]:
+        assert Path(row["path"]).read_bytes()==data["raw"]
+
+
+@pytest.mark.parametrize("mutation",["foreign_output","extra_value","missing_manual","foreign_manual","changed_pre_pointer"])
+def test_Q121_private_output_binding_refuses_foreign_or_unproven_changes(Q121_private_output_binding_TESTONLY,mutation):
+    data=Q121_private_output_binding_TESTONLY;value=deepcopy(data["value"])
+    if mutation=="foreign_output":value["output_pointer_changes"]["data.results"]["after"]=str(data["series"].parent/"foreign-results")
+    elif mutation=="missing_manual":del value["manual_revision"]
+    elif mutation=="foreign_manual":value["manual_revision"]["path"]=str(data["series"].parent/"foreign-revision.json")
+    elif mutation=="changed_pre_pointer":
+        path=Path(value["pre_pointer_configurations"][0]["path"])
+        path.write_bytes(path.read_bytes()+b"# not original bytes\n")
+        value["pre_pointer_configurations"][0]=descriptor(path)
+    else:
+        for index,row in enumerate(value["apply_configurations"]):
+            path=Path(row["path"]);path.write_bytes(path.read_bytes().replace(b"0.123",b"0.124"))
+            value["apply_configurations"][index]=descriptor(path)
+        value["current_configuration"]=value["apply_configurations"][-1]
+    with pytest.raises(ValueError):_Q121_checked_TESTONLY(data,value)
+
+
+def test_Q121_private_binding_cannot_skip_failed_manual_provenance(Q121_private_output_binding_TESTONLY,monkeypatch):
+    from darsia.fluidflower import geometry_raster_sources as sources
+    data=Q121_private_output_binding_TESTONLY
+    def reject(*_args):raise ValueError("TESTONLY actual manual source not proven")
+    monkeypatch.setattr(sources,"private_manual_label_edit_sources",reject)
+    with pytest.raises(ValueError,match="manual source not proven"):_Q121_checked_TESTONLY(data)
+
+
+def test_Q121_two_output_leaves_still_fail_UNCHANGED_ordinary_dual_V2(Q121_private_output_binding_TESTONLY):
+    data=Q121_private_output_binding_TESTONLY;private=data["value"]
+    old={key:deepcopy(private[key]) for key in ("run_id","source_configuration","current_configuration",
+        "apply_configurations","pre_pointer_configurations","comparison_sha256")}
+    old.update(format=subject.CONFIGURATION_BINDING_V2_FORMAT,protocol_change_mode="unchanged-zero-leaves",
+        protocol_changes={},output_pointer_change=private["output_pointer_changes"]["rig.path"])
+    with pytest.raises(ValueError,match="beyond its own preserved rig.path"):
+        subject._dual_configuration_binding_v2(old,data["run"],private["source_configuration"],
+            [row["path"] for row in private["apply_configurations"]],series=data["series"],
+            project_root=data["root"],revision=data["revision"],destination=None,receipt=None)
+
+
+def test_Q121_private_build_reuses_original_fresh_effective_config_checks(Q121_private_output_binding_TESTONLY):
+    data=Q121_private_output_binding_TESTONLY
+    checked=_Q121_checked_TESTONLY(data)
+    Path(checked["output_pointer_changes"]["data.results"]["after"]).mkdir(parents=True)
+    subject._require_fresh_private_manual_build(Path(checked["current_configuration"]["path"]),checked)
+    rig=Path(checked["output_pointer_changes"]["rig.path"]["after"]);rig.mkdir(parents=True)
+    (rig/"partial-must-be-preserved").write_bytes(b"not an empty output")
+    with pytest.raises(ValueError,match="not empty"):
+        subject._require_fresh_private_manual_build(Path(checked["current_configuration"]["path"]),checked)

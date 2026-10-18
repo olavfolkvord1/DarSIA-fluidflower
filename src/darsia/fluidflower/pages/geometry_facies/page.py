@@ -1048,9 +1048,11 @@ class GeometryFaciesPage(ModulePage):
             else Qt.CheckState.Unchecked
         )
         self.run_geometry_table.setItem(index, 0, enabled)
-        self.run_geometry_table.setItem(
-            index, 1, QTableWidgetItem(str(row.get("run_id") or ""))
-        )
+        run_item = QTableWidgetItem(str(row.get("run_id") or ""))
+        # Keep the original immutable registration/provenance with this row.
+        # Reading visible controls must not silently discard its source proof.
+        run_item.setData(Qt.ItemDataRole.UserRole, deepcopy_settings(dict(row)))
+        self.run_geometry_table.setItem(index, 1, run_item)
         acquisition = QComboBox()
         for value in RUN_GEOMETRY_ACQUISITION_STATES:
             acquisition.addItem(value.title(), value)
@@ -1142,14 +1144,18 @@ class GeometryFaciesPage(ModulePage):
         for index in range(self.run_geometry_table.rowCount()):
             acquisition = self.run_geometry_table.cellWidget(index, 2)
             geometry_choice = self.run_geometry_table.cellWidget(index, 3)
-            rows.append(
+            run_item = self.run_geometry_table.item(index, 1)
+            run_id = run_item.text().strip().casefold()
+            original = run_item.data(Qt.ItemDataRole.UserRole)
+            # Renaming a row cannot transfer another run's registration. The
+            # unchanged strict source validator then requires genuine new proof.
+            row = (deepcopy_settings(original) if isinstance(original, Mapping)
+                   and str(original.get("run_id") or "").strip().casefold() == run_id else {})
+            row.update(
                 {
                     "enabled": self.run_geometry_table.item(index, 0).checkState()
                     == Qt.CheckState.Checked,
-                    "run_id": self.run_geometry_table.item(index, 1)
-                    .text()
-                    .strip()
-                    .casefold(),
+                    "run_id": run_id,
                     "acquisition_state": str(
                         acquisition.currentData()
                         if isinstance(acquisition, QComboBox)
@@ -1172,6 +1178,7 @@ class GeometryFaciesPage(ModulePage):
                     "property_change_proposals": [],
                 }
             )
+            rows.append(row)
         contract["runs"] = rows
         return contract
 
@@ -2090,6 +2097,8 @@ class GeometryFaciesPage(ModulePage):
             config["labels_path"] = materialization["labels_path"]
             config["facies_source_path"] = ""
             config["label_edit_session"] = reference
+            from darsia.fluidflower.geometry_raster_sources import bind_private_manual_label_edit
+            config = bind_private_manual_label_edit(self.project, config, session, materialization)
             preview = load_geometry_preview(config)
         except Exception as exc:  # noqa: BLE001
             self.busy.setRange(0, 1)
@@ -3240,6 +3249,8 @@ class GeometryFaciesPage(ModulePage):
         self.save_button.setEnabled(False)
         self.busy.setRange(0, 0)
         self.geometry_summary.setText("Reading and validating geometry...")
+        self.last_geometry_preview_error = None
+        self.last_geometry_worker_error = None
         self._thread = QThread(self)
         self._worker = worker
         worker.moveToThread(self._thread)
@@ -3254,6 +3265,8 @@ class GeometryFaciesPage(ModulePage):
     @Slot(object)
     def _worker_finished(self, raw_result: object) -> None:
         result = dict(raw_result)
+        self.last_geometry_preview_error = str(result.get("preview_error") or "")
+        self.last_geometry_worker_error = ""
         if bool(result.get("preview_only")):
             self.preview_data = result.get("preview")
             if self.preview_data is not None:
@@ -3301,6 +3314,7 @@ class GeometryFaciesPage(ModulePage):
 
     @Slot(str)
     def _worker_failed(self, message: str) -> None:
+        self.last_geometry_worker_error = str(message)
         self._finish_worker()
         self.geometry_summary.setText("Geometry operation failed.")
         QMessageBox.critical(self, "Geometry operation failed", message)
