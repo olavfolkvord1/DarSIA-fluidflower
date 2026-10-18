@@ -311,12 +311,22 @@ def test_new_pipeline_has_no_old_execution_or_external_code_imports():
     """The science closure cannot accidentally reconnect old control code."""
     root=Path(pipeline.__file__).parent
     forbidden=("production_round4","production_native","production_job","production_inputs","production_retained","phase_ffac","tools.","validation","operations","runtime")
-    for name in ("n1_pipeline.py","n1_models.py","n1_geometry.py","n1_arithmetic.py","n1_statistics.py"):
-        tree=ast.parse((root/name).read_bytes())
+    policy = Path(darsia.__file__).with_name("_opencv_runtime.py")
+    paths = [root/name for name in ("n1_pipeline.py","n1_models.py","n1_geometry.py","n1_arithmetic.py","n1_statistics.py")] + [policy]
+    for path in paths:
+        tree=ast.parse(path.read_bytes())
         for node in ast.walk(tree):
             if isinstance(node,(ast.Import,ast.ImportFrom)):
                 text=ast.unparse(node)
-                assert not any(token in text for token in forbidden),text
+                if isinstance(node,ast.ImportFrom) and node.module == "darsia._opencv_runtime":
+                    assert node.level == 0 and {item.name for item in node.names} <= {"scientific_thread", "completed_frame", "require_ipp_off"}
+                else:
+                    assert not any(token in text for token in forbidden),text
+                if path == policy:
+                    if isinstance(node,ast.Import):
+                        assert {item.name for item in node.names} <= {"os", "threading", "cv2"}
+                    else:
+                        assert node.level == 0 and node.module == "contextlib" and {item.name for item in node.names} == {"contextmanager"}
             assert not (isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in {"eval","exec","__import__"})
 
 

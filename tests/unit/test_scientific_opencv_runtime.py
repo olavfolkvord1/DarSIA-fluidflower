@@ -301,3 +301,33 @@ def test_statistics_runtime_sidecar_binds_unchanged_statistics_product(
     import gzip
     with gzip.open(product["path"], "rt", encoding="utf-8") as stream:
         assert json.load(stream) == extracted["statistics"]
+
+
+@pytest.mark.parametrize("method", ["evaluate", "extract_statistics"])
+@pytest.mark.parametrize("failure", ["entry-guard", "calculation"])
+def test_pipeline_observation_is_cleared_before_failed_new_call(
+        fresh_thread_policy, monkeypatch, method, failure):
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+    context = object.__new__(N1Pipeline)
+    context.last_opencv_ipp = {"old": "must not be published for this call"}
+    context.statistics_only = False
+    runtime.scientific_thread("test-start")
+
+    class OriginalScientificFailure(Exception):
+        pass
+
+    original = OriginalScientificFailure("original calculation failure")
+
+    def fail(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(context, "_prepare_statistics", fail)
+    if failure == "entry-guard":
+        monkeypatch.setattr(cv2.ipp, "useIPP", lambda: True)
+        with pytest.raises(RuntimeError, match="IPP policy violated"):
+            getattr(context, method)({})
+    else:
+        with pytest.raises(OriginalScientificFailure) as caught:
+            getattr(context, method)({})
+        assert caught.value is original
+    assert context.last_opencv_ipp is None

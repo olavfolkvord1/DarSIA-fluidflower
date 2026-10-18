@@ -411,6 +411,7 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                     stage_binding["files"][Path(bound["path"]).name] = bound
                 storage_outputs.validate_publication_binding(stage_binding)
             evaluated["prediction"]["pipeline"] = stage_binding
+            stage_binding["opencv_ipp"]["mass_evaluation"] = mass.last_opencv_ipp
             evaluated["opencv_ipp"] = stage_binding["opencv_ipp"]
             elapsed = time.perf_counter() - start
             record = _publish_frame(

@@ -91,6 +91,8 @@ def _save_statistics(stage, extracted):
     """Original N1 gzip/JSON serialization, retaining all summary values."""
     from darsia._opencv_runtime import require_ipp_off, validate_observation
     require_ipp_off("phase1-statistics:before-publication")
+    if "opencv_ipp" in extracted:
+        validate_observation(extracted["opencv_ipp"])
     from ..mass.n1_pipeline import _jsonable, asset, _write_json
     path = Path(stage) / "native_statistics.json.gz"
     with path.open("xb") as raw:
@@ -105,7 +107,6 @@ def _save_statistics(stage, extracted):
     _write_json(Path(stage) / "statistics_geometry_report.json", extracted["sandmap"])
     bound = asset(path)
     if "opencv_ipp" in extracted:
-        validate_observation(extracted["opencv_ipp"])
         _write_json(Path(stage) / "native_statistics_runtime.json", dict(
             format="darsia-native-statistics-runtime-v1", statistics=bound,
             opencv_ipp=extracted["opencv_ipp"]))
@@ -215,6 +216,7 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
             statistics_spec = series.bind_mass_frame(spec, native["record"], phase,
                                                      baseline=inputs.mass_baseline)
             extracted = statistics_context.extract_statistics(statistics_spec)
+            extracted["opencv_ipp"] = statistics_context.last_opencv_ipp
             statistics = _save_statistics(stage, extracted)
             phase["opencv_ipp"] = completed_frame(ipp_before, "run_phase1:" + spec["case_id"] + ":after")
             committed = _commit_phase1(stage, spec, task=task, configuration=configuration,

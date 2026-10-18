@@ -805,14 +805,16 @@ class N1Pipeline:
         A phase-one caller constructs this context with statistics_only=True.
         This method writes no files, commits no frame and advances no history.
         """
+        self.last_opencv_ipp = None
         from darsia._opencv_runtime import scientific_thread, completed_frame
         ipp_before = scientific_thread("N1Pipeline.extract_statistics:before")
         prepared = self._prepare_statistics(spec)
-        return dict(statistics=prepared["statistics"], sandmap=prepared["sandmap"],
-                    opencv_ipp=completed_frame(ipp_before, "N1Pipeline.extract_statistics:after"))
+        self.last_opencv_ipp = completed_frame(ipp_before, "N1Pipeline.extract_statistics:after")
+        return dict(statistics=prepared["statistics"], sandmap=prepared["sandmap"])
 
     def evaluate(self, spec, *, output_capture=None):
         """Compute fields and the original paired E/U_rest summary once."""
+        self.last_opencv_ipp = None
         from darsia._opencv_runtime import scientific_thread, completed_frame
         ipp_before = scientific_thread("N1Pipeline.evaluate:before")
         if self.statistics_only:
@@ -852,15 +854,16 @@ class N1Pipeline:
             output_capture.update(frame=frame, x_m=x, y_m=y,
                                   volume_m3=response["analysis"].geometry.cached_voxel_volume)
         prediction = exact_prediction(row, result, self.parameters, config["anchor"])
-        return dict(
+        evaluated = dict(
             response=response,
             result=result,
             prediction=prediction,
             export=main_products(result, math),
             statistics=row,
             sandmap=report,
-            opencv_ipp=completed_frame(ipp_before, "N1Pipeline.evaluate:after"),
         )
+        self.last_opencv_ipp = completed_frame(ipp_before, "N1Pipeline.evaluate:after")
+        return evaluated
 
 
 def _jsonable(value):
@@ -1386,6 +1389,7 @@ def _run_n1(
                          else pipeline.evaluate(spec, output_capture=capture))
             compute_seconds = time.perf_counter() - started
             evaluated["opencv_ipp"] = completed_frame(ipp_before, "run_n1:" + spec["case_id"] + ":after")
+            evaluated["opencv_ipp"]["mass_evaluation"] = pipeline.last_opencv_ipp
             publication = _publish_frame(
                 output,
                 manifest,
