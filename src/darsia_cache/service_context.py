@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -320,6 +320,91 @@ class _RetainedCloseMetadataOnly:
         return self.namespace.write_once(name,raw,maximum=maximum)
 
 
+class _RetainedRegistryControl:
+    """Read the old registry only while its current canonical lock is held."""
+    def __init__(self, ledger):
+        self.ledger = ledger
+
+    def names(self):
+        self.ledger._require_lock()
+        prefix = "cache-l-" + self.ledger.original.reservation["token"] + "-"
+        return [name for name in self.ledger.current.control.names()
+                if name.casefold().startswith(prefix.casefold())]
+
+    def read_once(self, name, maximum=1024**2):
+        self.ledger._require_lock()
+        prefix = "cache-l-" + self.ledger.original.reservation["token"] + "-"
+        if not name.casefold().startswith(prefix.casefold()):
+            raise CachePolicyError("Retained registry view only reads the original service registry")
+        return self.ledger.current.control.read_once(name, maximum=maximum)
+
+    def write_once(self, *args, **kwargs):
+        raise CachePolicyError("Retained registry view cannot write or allocate")
+
+
+class _RetainedRegistryLedger:
+    """Post-close reads; never reopen the original reservation or its ledger."""
+    def __init__(self, original, current, close_record):
+        self.original, self.current = original, current
+        self.close_record = _descriptor(close_record)
+        self.bound, self.key = deepcopy(original.ledger.bound), original.ledger.key
+        self.control = _RetainedRegistryControl(self)
+        self._require_lock()
+
+    def _require_lock(self):
+        old, ledger = self.original, self.current
+        if not isinstance(ledger, CacheBudgetLedger):
+            raise CachePolicyError("Actual current canonical cache ledger required")
+        ledger._require_lock()
+        if (ledger.control is None or ledger is old.ledger
+                or ledger.bound != self.bound or ledger.key != self.key
+                or not _same_path(ledger.policy.root, old.policy.root)
+                or ledger.capacity.host != old.context["host"]
+                or ledger.admission.get("host") != old.context["host"]
+                or ledger.admission.get("host_ledger") != old.ledger.admission.get("host_ledger")
+                or ledger.admission.get("cache_identity") != old.ledger.admission.get("cache_identity")):
+            raise CachePolicyError("Post-close registry requires the same locked canonical host/cache identity")
+        token = old.reservation["token"]
+        name = "cache-c-" + token + ".json"
+        if not _same_path(self.close_record["path"], Path(self.bound["path"]) / name):
+            raise CachePolicyError("Pinned old close is outside the current canonical ledger")
+        close, raw = _json(ledger.control, name)
+        if (self.close_record["sha256"] != hashlib.sha256(raw).hexdigest()
+                or self.close_record["size_bytes"] != len(raw)
+                or set(close) != {"owner", "token", "utc", "no_further_writes", "reservation_sha256"}
+                or close["owner"] != old.manifest["owner"] or close["token"] != token
+                or close["reservation_sha256"] != old.reservation["sha256"]
+                or close["no_further_writes"] is not True):
+            raise CachePolicyError("Pinned original close owner/token/reservation SHA differs")
+        from .control import _time
+        _time(close["utc"])
+
+    def require_reservation(self, reservation, owner, needed):
+        self._require_lock()
+        old = self.original
+        if (reservation != old.reservation or checked_owner(owner) != old.manifest["owner"]
+                or needed != old.maximum):
+            raise CachePolicyError("Post-close view can only read the exact original service reservation")
+        row, raw = _json(self.current.control, "cache-r-" + reservation["token"] + ".json")
+        if (set(row) != {"format", "pool", "utc", "owner", "token", "maximum_bytes"}
+                or row["format"] != "darsia-cache-budget-reservation-v2"
+                or row["owner"] != old.manifest["owner"] or row["token"] != reservation["token"]
+                or row["pool"] != self.key or row["maximum_bytes"] != old.maximum
+                or reservation != dict(token=row["token"], pool=self.key, sha256=hashlib.sha256(raw).hexdigest())):
+            raise CachePolicyError("Closed original reservation bytes/schema differ")
+        from .control import _time
+        _time(row["utc"])
+        scope, _ = _json(self.current.control, "cache-s-" + row["token"] + ".json")
+        if scope != old.manifest:
+            raise CachePolicyError("Closed original service manifest differs")
+        return row, raw
+
+    def _mutator_refused(self, *args, **kwargs):
+        raise CachePolicyError("Retained registry view cannot write or allocate")
+
+    locked = reserve = admit = bind_scope = close = project = _mutator_refused
+
+
 class RetainedServiceCloseContext:
     """Explicit Q123 append-only use of the existing close API, no ImportLease.
 
@@ -354,11 +439,21 @@ class RetainedServiceCloseContext:
             raise CachePolicyError("Retained close is only the original worker/jobs service")
         self._seal=_digest(self.request)
 
-    def _retired_locked(self, reservation):
+    def retired_after_close_locked(self, ledger, close_record):
+        """Revalidate retirement through the current held lock, without writes."""
+        view = _RetainedRegistryLedger(self.original, ledger, close_record)
+        reservation, _ = view.require_reservation(self.original.reservation,
+            self.original.manifest["owner"], self.original.maximum)
+        return self._retired_locked(reservation, registry_ledger=view)
+
+    def _retired_locked(self, reservation, *, registry_ledger=None):
         from .service_lifecycle import ServiceLifecycle, _digest as lifecycle_digest
         from .first_qualification import _digest
         import psutil
         context=self.original
+        if registry_ledger is not None and (not isinstance(registry_ledger, _RetainedRegistryLedger)
+                or registry_ledger.original is not context):
+            raise CachePolicyError("Only the exact read-only retained registry view may observe a closed service")
         if _digest(self.request)!=self._seal:
             raise CachePolicyError("Retained-close request changed in memory")
         if (reservation["owner"]!=context.manifest["owner"]
@@ -391,7 +486,8 @@ class RetainedServiceCloseContext:
                 if str(psutil.Process(row["pid"]).create_time())==str(epoch):
                     raise CachePolicyError("An original retained-service owner is still live")
             except psutil.NoSuchProcess:pass
-        lifecycle=ServiceLifecycle(context);records=lifecycle._records()
+        registry_context = context if registry_ledger is None else replace(context, ledger=registry_ledger)
+        lifecycle=ServiceLifecycle(registry_context);records=lifecycle._records()
         sealed=records.get(("seal","service"))
         owners=sorted((row for (kind,_),row in records.items() if kind=="owner"),key=lambda row:row["binding"]["path"])
         intents={key for kind,key in records if kind=="intent"}

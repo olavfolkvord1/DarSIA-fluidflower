@@ -1298,7 +1298,8 @@ def q123_admission_TESTONLY(monkeypatch):
     value.value=dict(retained_cache_inventory=pin("retained.json"));value._seal=first._digest(value.value)
     value.close_record=dict(path="C:/TESTONLY/ledger/cache-c-"+token+".json",
         sha256=hashlib.sha256(close).hexdigest(),size_bytes=len(close))
-    value.closed=SimpleNamespace(original=old,_retired_locked=lambda actual:calls.append(actual) or True)
+    value.closed=SimpleNamespace(original=old,
+        retired_after_close_locked=lambda ledger,pin:calls.append((ledger,pin)) or True)
     value.read=lambda binding:dict(logical_bytes=117590)
     monkeypatch.setattr(service_context,"verify_retained_cache_inventory",lambda document,root:document)
     monkeypatch.setattr(value,"matplotlib_root",lambda *args,**kwargs:"C:/TESTONLY/output/diagnostic/mpl")

@@ -93,8 +93,7 @@ class RetainedColdScope:
                 or closed.get("no_further_writes") is not True):
             raise CachePolicyError("Actual close does not bind the original owner/token/reservation SHA")
         # Recheck original kernel/registered owner retirement, with exact epochs.
-        reservation, _ = _json(lease.ledger.control, "cache-r-" + old.reservation["token"] + ".json")
-        self.closed._retired_locked(reservation)
+        self.closed.retired_after_close_locked(lease.ledger, self.close_record)
         inventory = verify_retained_cache_inventory(self.read(self.value["retained_cache_inventory"]), lease.policy.root)
         if (report["current_cache_logical_bytes"] != inventory["logical_bytes"]
                 or report["active_cache_remaining_bytes"] != 0

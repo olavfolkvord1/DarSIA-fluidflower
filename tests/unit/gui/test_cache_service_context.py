@@ -645,3 +645,136 @@ def test_Q123_closed_original_requires_exact_pinned_close(world,monkeypatch):
     with pytest.raises(CachePolicyError,match="reservation/close"):
         resolver.resolve_original_service_context(world.receipt_pin,package_file=PACKAGE,retained_close=wrong)
     assert world.records==before
+
+
+def closed_registry_distinct_ledger_TESTONLY(world, monkeypatch):
+    """Real ledger/lifecycle/close methods; only native and metadata I/O are synthetic."""
+    from dataclasses import replace
+    import psutil
+    from darsia_cache.first_qualification import _digest
+
+    original = resolve(world)
+    current = control.CacheBudgetLedger(world.policy, SimpleNamespace(**world.actual),
+        measurement_provider=lambda root: None, namespace_admission=world.admission,
+        verify_host_admission=resolver._host_binding)
+    assert current is not original.ledger
+    producer = replace(original, owner=deepcopy(PRIMARY), ledger=current)
+    lifecycle = ServiceLifecycle(producer)
+    lifecycle.register_owner()
+    generation = "b" * 32
+    child = dict(machine=PRIMARY["machine"], pid=303, process_create_time="TESTONLY_CHILD_EPOCH")
+    lifecycle.record_launch("worker_spawn_intent", dict(slot=0, generation=generation))
+    lifecycle.record_launch("worker_spawn_observed", dict(slot=0, generation=generation,
+        original_native_identity=child))
+    lifecycle.record_launch("worker_children_retired", dict(slot=0, generation=generation,
+        original_child_identities=[child], owned_launch_handle_retired=True))
+    lifecycle.seal(logical_gate="TESTONLY_RETAINED_GATE", outcome="failed",
+        utc="2026-01-01T00:00:00Z", traceback_text="TESTONLY original retained failure")
+
+    context = object.__new__(resolver.RetainedServiceCloseContext)
+    context.original = original
+    context.binding = descriptor("TESTONLY-real-method-close-request.json")
+    context.request = {role: descriptor("TESTONLY-" + role + ".json") for role in (
+        "original_native_retirement", "recorded_owner_retirement", "retained_cache_inventory")}
+    context.request["original_service_receipt"] = world.receipt_pin
+    native = dict(format="darsia-native-owned-worker-retirement-v1", service_receipt=world.receipt_pin,
+        primary=PRIMARY, whole_family_kernel_observation=True, no_process_kill_after_resume=True,
+        terminal=dict(accounting=dict(active_processes=0, terminated_by_limit_processes=0), job_flags=0))
+    monkeypatch.setattr(bootstrap, "_owner", world.observe)
+
+    def synthetic_external_retirement(snapshot, pin):
+        assert pin == context.request["original_native_retirement"]
+        assert len(snapshot["owners"]) == 1 and len(snapshot["launches"]) == 1
+        return True  # Synthetic external evidence; never a production provider.
+
+    eligibility = lifecycle.retention_eligibility(now_utc="2026-01-03T00:00:00Z",
+        retirement=context.request["original_native_retirement"], verify_retirement=synthetic_external_retirement)
+    pin = eligibility["receipt"]
+    context.request["original_lifecycle_eligibility"] = pin
+    eligibility_doc = capacity._json_bytes(world.records[PureWindowsPath(pin["path"]).name])
+    observed = dict(actual=dict(recorded_owned_epochs=[dict(pid=row["pid"],
+        create_time=row["process_create_time"], recorded_epoch_absent=True) for row in (PRIMARY, child)],
+        original_whole_native_family_retirement=dict(context.request["original_native_retirement"], document=native)))
+    inventory = dict(format="darsia-cache-retained-file-inventory-v1", root=world.policy.root,
+        no_cleanup=True, files=[], logical_bytes=0)
+    for key, document in (("original_native_retirement", native), ("recorded_owner_retirement", observed),
+                          ("original_lifecycle_eligibility", eligibility_doc), ("retained_cache_inventory", inventory)):
+        bound = context.request[key]
+        world.metadata[path_key(bound["path"])] = (bound, document)
+    context.reads = resolver._MetadataOnce(PACKAGE)
+    context._seal = _digest(context.request)
+
+    def absent(pid):
+        raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "Process", absent)
+    # This genuinely runs the original open-reservation close/retirement path.
+    result = context.close_retained()
+    assert "cache-c-" + TOKEN + ".json" in world.records
+    assert not original.ledger.lock_active and original.ledger.control is None
+    return context, current, result["close_record"], observed
+
+
+def test_Q123_postclose_real_registry_uses_distinct_current_ledger_without_reopening(world, monkeypatch):
+    from dataclasses import replace
+    context, current, pin, _ = closed_registry_distinct_ledger_TESTONLY(world, monkeypatch)
+    before = deepcopy(world.records)
+    writes = list(world.writes)
+    with current.locked(create_binding=False):
+        # The ordinary producer/lifecycle guard still refuses the closed token.
+        with pytest.raises(CachePolicyError, match="Closed, foreign"):
+            current.require_reservation(world.reservation, PRIMARY, 0)
+        with pytest.raises(CachePolicyError, match="Closed, foreign"):
+            ServiceLifecycle(replace(context.original, ledger=current))._records()
+        assert context.retired_after_close_locked(current, pin) is True
+        assert context.original.ledger.control is None and not context.original.ledger.lock_active
+        view = resolver._RetainedRegistryLedger(context.original, current, pin)
+        for operation in (view.reserve, view.admit, view.bind_scope, view.close, view.project,
+                          view.locked, view.control.write_once):
+            with pytest.raises(CachePolicyError, match="cannot write or allocate"):
+                operation()
+        with pytest.raises(CachePolicyError, match="only reads the original service registry"):
+            view.control.read_once("cache-r-" + TOKEN + ".json")
+    assert world.records == before and world.writes == writes
+    world.assert_closed()
+
+
+@pytest.mark.parametrize("change", ["pin", "unlocked", "canonical", "cache-root", "registry",
+                                   "registry-digest", "live-epoch", "close-owner"])
+def test_Q123_postclose_refuses_changed_pin_lock_identity_registry_or_owner(world, monkeypatch, change):
+    import psutil
+    context, current, pin, _ = closed_registry_distinct_ledger_TESTONLY(world, monkeypatch)
+    if change == "unlocked":
+        with pytest.raises(CachePolicyError, match="transaction"):
+            context.retired_after_close_locked(current, pin)
+        return
+    with current.locked(create_binding=False):
+        if change == "pin":
+            pin = dict(pin, sha256="f" * 64)
+        elif change == "canonical":
+            current.bound = dict(current.bound, identity={"TESTONLY": "another canonical ledger"})
+        elif change == "cache-root":
+            current.policy = SimpleNamespace(root="C:/TESTONLY_NOT_CREATED/different-cache")
+        elif change in {"registry", "registry-digest"}:
+            name = next(n for n in world.records if n.startswith("cache-l-" + TOKEN + "-owner-"))
+            row = capacity._json_bytes(world.records[name])
+            if change == "registry":
+                row["value"]["owner"]["pid"] += 1
+            else:
+                row["utc"] = "2026-01-01T01:00:00Z"
+            world.records[name] = _encoded(row)
+        elif change == "close-owner":
+            name = "cache-c-" + TOKEN + ".json"
+            row = capacity._json_bytes(world.records[name])
+            row["owner"] = OBSERVER
+            world.records[name] = _encoded(row)
+            pin = dict(pin, sha256=hashlib.sha256(world.records[name]).hexdigest(),
+                size_bytes=len(world.records[name]))
+        elif change == "live-epoch":
+            monkeypatch.setattr(psutil, "Process", lambda pid:
+                SimpleNamespace(create_time=lambda: "TESTONLY_PRIMARY_EPOCH"))
+        before, writes = deepcopy(world.records), list(world.writes)
+        with pytest.raises(CachePolicyError):
+            context.retired_after_close_locked(current, pin)
+        assert world.records == before and world.writes == writes
+    world.assert_closed()
