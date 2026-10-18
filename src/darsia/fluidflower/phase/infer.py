@@ -478,8 +478,9 @@ def infer_rig_edge(
         connectivity=runtime["gas_connectivity"],
     )
     if output_capture is not None:
-        from .probability_storage import transition
+        from .probability_storage import transition, changed_rule
         transition(output_capture, "edge-minimum", preminimum_gas, gas_selected)
+        changed_rule(output_capture, "edge_minimum", preminimum_gas, gas_selected)
     labels[co2] = np.where(gas_selected[co2], 2, 1)
     labels, final_support, support_audit = (
         decisions.require_categorical_feature_support(
@@ -550,7 +551,7 @@ def apply_locked_postprocessing(
         parameters=dp,
     )
     if output_capture is not None:
-        state(output_capture["postprocessing"], "top", top.labels)
+        state(output_capture["postprocessing"], "top", top.labels, eligible_rule="post_top")
     ordinal = envelope_ordinal(
         inputs["elapsed_h"], envelopes["u1_elapsed_h"], envelopes["u2_elapsed_h"]
     )
@@ -575,7 +576,7 @@ def apply_locked_postprocessing(
         parameters=dp,
     )
     if output_capture is not None:
-        state(output_capture["postprocessing"], "ordered-floor", floor.labels)
+        state(output_capture["postprocessing"], "ordered-floor", floor.labels, eligible_rule="post_floor")
     if not floor.qa["all_pass"]:
         raise ValueError("Phase frame failed the unchanged ordered floor QA")
     labels = decisions.remove_contact_fill_b(
@@ -586,7 +587,7 @@ def apply_locked_postprocessing(
         parameters=dp,
     )
     if output_capture is not None:
-        state(output_capture["postprocessing"], "contact-fill-removal", labels)
+        state(output_capture["postprocessing"], "contact-fill-removal", labels, eligible_rule="post_contact")
     if floor.fill_reason_b.any():
         raise AssertionError("An absent carryover mask cannot create contact reason b")
     audit = dict(
@@ -708,7 +709,7 @@ def infer_labels(frame, previous, model_bundle: Mapping, rules: Mapping, *, outp
         if probability_capture is not None:
             from .probability_storage import state
             state(probability_capture["composition"], "edge-before-Rule-B", fresh)
-            state(probability_capture["composition"], "edge-Rule-B", base)
+            state(probability_capture["composition"], "edge-Rule-B", base, eligible_rule="edge_B")
         base, classes = domain.fill_rig_labels(
             base,
             context.rig_domain,

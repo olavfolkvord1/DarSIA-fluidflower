@@ -674,10 +674,10 @@ def evaluate_placement(context, placement, delta, base_labels, modelled, pixel_a
         clipped = (result == 2) & ~top
         result[clipped] = 1
         if output_capture is not None:
-            state(output_capture, 'placement-top', result)
+            state(output_capture, 'placement-top', result, eligible_rule='placement_top')
         result, applied_b = apply_barrier_rule_b(result, open_components, decision['source_component_ids'] if source_component_ids is None else source_component_ids, pixel_area_mm2=NOMINAL_BARRIER_PIXEL_AREA_MM2, barrier_mask=barrier_mask, parameters=parameters)
         if output_capture is not None:
-            state(output_capture, 'placement-Rule-B', result)
+            state(output_capture, 'placement-Rule-B', result, eligible_rule='placement_B')
         audit.update(threshold_audit)
         audit.update(context.metadata, contract=CONTRACT, placement=placement, delta=float(delta), regional_head_used=True, shifted_pixel_probability_used=True, floor_rule_applied=False, top_clip_removed_pixels=int(clipped.sum()), top_clip_applied=True, rule_b_application=applied_b, rule_b_decision_recomputed=True, rule_b_applied=True, rule_b_removed_pixels=applied_b['removed_gas_pixels'], t4b_indicator_applied_once=placement == parameters['placement']['placement_modes']['regional_joint_epoch'])
         masks.update(threshold_masks, frozen_rule_b_forbidden=forbidden)

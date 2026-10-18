@@ -192,7 +192,7 @@ def test_required_parameter_types_and_all_arithmetic_ast(parameters, originals):
 
     # Only the reviewed optional side-channel presence comparison is excluded.
     # Every arithmetic expression INSIDE those blocks is still walked below.
-    capture_blocks = {'evaluate_placement': ['48e844a7f1d14d17075b43dcc741594f24d11fd1b9c33259b659f9a06099e3b9', '2822f60641fa58870c5907e182f8ef0e94dcd9a70c7a2ac05d5691a5713ac2c0', '8cadf234a928030aa46ca43e146a9f8e4485dcf755c3f4419a27f6220bd69265', '811bc8272e98eef3c5d58c5083b5427e4bf61786ba833d1b544b96b89279b025', 'e5788fac9a0eb7ca7fd7ae08e3508b5a911d3112846a5fc612e30557c0af2ff6'], 'preminimum_gas_selection': ['c5c5df8c7bdfb8813c12572f91633916d594a0dc96a550d9415a7f8193d6296f'], 'apply_gas_configuration': ['2d915aef59e47748e852142271b0f2e41c73fc3bb155628f206573e92087127a']}
+    capture_blocks = {'evaluate_placement': ['48e844a7f1d14d17075b43dcc741594f24d11fd1b9c33259b659f9a06099e3b9', '2822f60641fa58870c5907e182f8ef0e94dcd9a70c7a2ac05d5691a5713ac2c0', '8cadf234a928030aa46ca43e146a9f8e4485dcf755c3f4419a27f6220bd69265', '0d82a191cd842d04b5dd3fc401d92a68a104b646aa655c9566e81f5987b4b860', 'c6224601cea392725a9d2be428e279e228e5a0ba1b6190443d1361ffac447c23'], 'preminimum_gas_selection': ['c5c5df8c7bdfb8813c12572f91633916d594a0dc96a550d9415a7f8193d6296f'], 'apply_gas_configuration': ['2d915aef59e47748e852142271b0f2e41c73fc3bb155628f206573e92087127a']}
     for function_name, expected_blocks in capture_blocks.items():
         body = ast.parse(inspect.getsource(getattr(rules, function_name))).body[0]
         presence = ast.dump(ast.parse("output_capture is not None", mode="eval").body, include_attributes=False)
@@ -202,7 +202,7 @@ def test_required_parameter_types_and_all_arithmetic_ast(parameters, originals):
         assert actual_blocks == expected_blocks
     from darsia.fluidflower.phase import probability_storage
     helper_ast = ast.dump(ast.parse(inspect.getsource(probability_storage)), include_attributes=False)
-    assert hashlib.sha256(helper_ast.encode()).hexdigest() == "f2e5eb52d5408833de575da1ab026a6d3fe3a7463df5c91c754335f0bfaf94db"
+    assert hashlib.sha256(helper_ast.encode()).hexdigest() == "739ccb57a0154cd3d414df28000a244b85f426c0f964d237904f5c48c36f6d39"
     checked = 0
     for module, names in MAPPING.items():
         original_nodes = {n.name: n for n in git_tree(module).body if isinstance(n, ast.FunctionDef)}

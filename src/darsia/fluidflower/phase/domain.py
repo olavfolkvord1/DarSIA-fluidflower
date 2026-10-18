@@ -396,6 +396,7 @@ def revise_seam_labels(
     barrier_mask,
     parameters: Mapping,
     rule_parameters: Mapping,
+    output_capture=None,
 ):
     """Recompute incident gas components while preserving all other categories.
 
@@ -460,7 +461,13 @@ def revise_seam_labels(
         minimum_area_mm2=parameters["gas_minimum_area_mm2"],
         connectivity=parameters["gas_connectivity"],
     )
+    if output_capture is not None:
+        from .probability_storage import changed_rule
+        changed_rule(output_capture, "seam_minimum", scoped_candidates, kept)
     commit = supported & new_co2 & (affected | ring)
+    if output_capture is not None:
+        from .probability_storage import capture_seam_population
+        capture_seam_population(output_capture, locals())
     result[commit] = 1
     result[kept] = 2
 
@@ -484,6 +491,8 @@ def revise_seam_labels(
         barrier_mask=barrier_mask,
         parameters=rule_parameters,
     )
+    if output_capture is not None:
+        changed_rule(output_capture, "seam_B", result, revised)
     changed_reachability = sorted(
         set(old_rule_b["allowed_component_ids"]) ^ set(rule_b["allowed_component_ids"])
     )
@@ -604,8 +613,9 @@ def merge_native_and_rig(
         parameters=rule_parameters,
     )
     if output_capture is not None:
-        from .probability_storage import transition
+        from .probability_storage import transition, changed_rule
         transition(output_capture, "edge-Rule-B", fresh, edge_labels)
+        changed_rule(output_capture, "edge_B", fresh, edge_labels)
     x, y, width, height = source_box_xywh
     central = np.asarray(centre.labels).copy()
     central_support = (
@@ -625,6 +635,7 @@ def merge_native_and_rig(
     )
     if output_capture is not None:
         transition(output_capture, "centre-Rule-B", central, central_b)
+        changed_rule(output_capture, "centre_B", central, central_b)
     merged = edge_labels.copy()
     crop = merged[y : y + height, x : x + width]
     crop[central_support] = central_b[central_support]
@@ -706,9 +717,11 @@ def merge_native_and_rig(
         barrier_mask=barrier_mask,
         parameters=parameters,
         rule_parameters=rule_parameters,
+        **({} if output_capture is None else dict(output_capture=output_capture)),
     )
     if output_capture is not None:
-        output_capture["inherited_selection"] = (old_domain & ~release).copy()
+        output_capture["central_support"] = central_support.copy()
+        output_capture["release"] = release.copy()
         state(output_capture, "seam-minimum-and-Rule-B", revised)
     return (
         revised,

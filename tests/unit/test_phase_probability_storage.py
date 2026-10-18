@@ -63,7 +63,7 @@ def test_lossless_archive_reader_preserves_exact_float32_and_unscored_nan(tmp_pa
         assert actual["arrays"][name].tobytes() == expected.tobytes()
     receipt = actual["receipt"]
     assert receipt["labels"] == asset(tmp_path / "case-one" / "phase_labels.png")
-    assert receipt["logical_bytes"] == labels.size * 9
+    assert receipt["logical_bytes"] == labels.size * 11
     assert receipt["compressed_bytes"] == Path(roles["archive"]["path"]).stat().st_size
     assert receipt["projected_3090_compressed_bytes"] == receipt["compressed_bytes"] * 3090
     assert "not an admitted job budget" in receipt["projection_basis"]
@@ -72,7 +72,7 @@ def test_lossless_archive_reader_preserves_exact_float32_and_unscored_nan(tmp_pa
 
 
 @pytest.mark.parametrize("bad", ["pixel_half", "regional_half", "wrong_shape", "float_codes", "unknown_code",
-                                 "invented_unscored", "missing_scored", "outside_nonzero"])
+                                 "invented_unscored", "missing_scored", "outside_nonzero", "unknown_rule_bit", "unscored_rule_bit", "float_rule_bits"])
 def test_saved_array_contract_refuses_lossy_or_fabricated_scores(bad):
     capture, labels = _capture()
     arrays = deepcopy(capture["product"]["arrays"])
@@ -83,7 +83,10 @@ def test_saved_array_contract_refuses_lossy_or_fabricated_scores(bad):
     elif bad == "unknown_code": arrays["branch_support"][0, 0] = 4
     elif bad == "invented_unscored": arrays["pixel_probability"][1, 1] = 0
     elif bad == "missing_scored": arrays["regional_probability"][0, 0] = np.nan
-    else: arrays["pixel_probability"][1, 0] = .8
+    elif bad == "outside_nonzero": arrays["pixel_probability"][1, 0] = .8
+    elif bad == "unknown_rule_bit": arrays["later_rule_changes"][0, 0] = 4096
+    elif bad == "unscored_rule_bit": arrays["later_rule_changes"][1, 1] = 1
+    else: arrays["later_rule_changes"] = arrays["later_rule_changes"].astype(np.float32)
     with pytest.raises(ValueError): storage.validate_arrays(arrays, labels=labels)
 
 
@@ -207,3 +210,41 @@ def test_optin_capacity_refuses_old_or_uncovered_writer_profile(monkeypatch, tmp
     with pytest.raises(ValueError, match=expected):
         capacity.load_estimate(None, "Synthetic", dict(pipeline="native-phase-statistics"),
             dict(gas_probability_storage=request), repository=tmp_path)
+
+
+@pytest.mark.parametrize("bad", ["wrong_spatial_mask", "wrong_branch_bit", "different_membership_receipt"])
+def test_saved_reader_independently_replays_spatial_rule_membership(tmp_path, bad):
+    roles, source, labels, capture = _product(tmp_path / "case-one")
+    receipt = json.loads(Path(roles["receipt"]["path"]).read_bytes())
+    arrays = deepcopy(capture["product"]["arrays"])
+    if bad == "different_membership_receipt":
+        receipt["evidence"]["spatial_proof"]["rules"]["post_top"]["applicable_pixels"] = 1
+    else:
+        # Deliberately rebind payload hashes to exercise semantic spatial validation,
+        # rather than only the outer exact-byte DataReader guard.
+        arrays["pixel_probability"][0, 1] = np.float32(.8)
+        if bad == "wrong_spatial_mask":
+            arrays["later_rule_changes"][0, 0] = storage.RULE_BITS["placement_minimum"]
+        else:
+            arrays["later_rule_changes"][0, 1] = storage.RULE_BITS["centre_minimum"]
+        from darsia.fluidflower.mass.n1_pipeline import _write_npz
+        archive_path = tmp_path / "rebound.npz"
+        roles["archive"] = _write_npz(archive_path, arrays)
+        receipt["archive"] = roles["archive"]
+        receipt["arrays"] = {name: storage.identity(value) for name, value in arrays.items()}
+        receipt["compressed_bytes"] = roles["archive"]["size_bytes"]
+        receipt["projected_3090_compressed_bytes"] = roles["archive"]["size_bytes"] * 3090
+    roles["receipt"] = _write_json(tmp_path / "rebound_receipt.json", receipt)
+    with pytest.raises(ValueError):
+        storage.read_product(roles, reader=DataReader(), source=source, case_id="case-one", labels=labels)
+
+
+def test_write_refuses_post_finish_pair_mutation_before_any_archive(tmp_path):
+    capture, labels = _capture()
+    capture["product"]["arrays"]["pixel_probability"][0, 1] = np.float32(.8)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    with pytest.raises(ValueError, match="unexplained spatial disagreement"):
+        storage.write_product(stage, dict(source={}, case_id="x"), capture,
+                              model_bindings={}, phase_configuration={}, labels=labels, label_descriptor={})
+    assert list(stage.iterdir()) == []
