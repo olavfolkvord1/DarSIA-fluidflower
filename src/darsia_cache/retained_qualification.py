@@ -11,6 +11,21 @@ import re
 from .policy import CachePolicyError, _descriptor
 
 
+def require_prior_reservations_closed(names):
+    """Refuse unless every cache-r reservation in these ledger names has its cache-c.
+
+    A fully written live reservation has zero remaining bytes. It still forbids
+    an exclusive start, so each one must be genuinely closed.
+    """
+    for name in names:
+        if name.startswith("cache-r-"):
+            if re.fullmatch(r"cache-r-[0-9a-f]{32}\.json", name) is None:
+                raise CachePolicyError("Unknown prior reservation prevents exclusivity")
+            token = name[8:-5]
+            if "cache-c-" + token + ".json" not in names:
+                raise CachePolicyError("Every prior reservation must be genuinely closed")
+
+
 class RetainedColdScope:
     def __init__(self, first, binding, *, read, read_authorities, historical_authorities=None):
         from .first_qualification import _digest, _exact_keys
@@ -73,16 +88,7 @@ class RetainedColdScope:
                 or lease.admission["cache_identity"] != old.ledger.admission["cache_identity"]
                 or lease.admission["host_ledger"] != old.ledger.admission["host_ledger"]):
             raise CachePolicyError("Q123 retains the same Main canonical root, identity and Q87 cap")
-        names = lease.ledger.control.names()
-        # A fully written live reservation has zero remaining bytes. It still
-        # forbids exclusive qualification, so require real closure for each one.
-        for name in names:
-            if name.startswith("cache-r-"):
-                if re.fullmatch(r"cache-r-[0-9a-f]{32}\.json", name) is None:
-                    raise CachePolicyError("Unknown prior reservation prevents exclusivity")
-                token = name[8:-5]
-                if "cache-c-" + token + ".json" not in names:
-                    raise CachePolicyError("Every prior reservation must be genuinely closed")
+        require_prior_reservations_closed(lease.ledger.control.names())
         # Original project/remaining has already validated each close's owner,
         # token and raw reservation SHA, including fully allocated reservations.
         raw, _ = lease.ledger.control.read_once(Path(self.close_record["path"]).name)

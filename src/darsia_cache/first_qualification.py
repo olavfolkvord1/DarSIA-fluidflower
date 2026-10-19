@@ -46,15 +46,23 @@ REFERENCE_RELEASES = {
         plan_sha256="9dc0979d5cd48ce18df6391253ed3f178f181c0c321626cef179c25a2e59e988",
     ),
     # R3, the RAW39 reference: N134 is Olav's release, N136 names the plan and
-    # entitlement, and N135 is his choice of this exact entry.
-    ("N134", "N136"): dict(
+    # entitlement, and N135 is his choice of this exact entry. N139 lets R3
+    # start with the retained Q123 font file counted instead of an empty cache:
+    # exactly that inventory, verified on disk, and nothing else in the cache.
+    ("N134", "N136", "N139"): dict(
         records={
             "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
             "N136-CLAUDE-r3-plan-3ea1caa8-entitlement-65728995330B-pinned-for-the-exact-code-entry": "claude",
+            "N139-OLAV-r3-starts-with-the-verified-117590-byte-retained-font-file-counted-file-and-old-approval-untouched": "olav",
         },
         plan_sha256="3ea1caa8ff432f5c17d2904f7f43080e23aeac039a447d8667a1586749e0426e",
+        retained_cache=dict(
+            inventory_sha256="be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2",
+            logical_bytes=117590,
+        ),
     ),
 }
+RETAINED_INVENTORY = "darsia-cache-retained-file-inventory-v1"
 
 
 def released_reference(authority_ids):
@@ -320,12 +328,18 @@ class FirstQualification:
         self.reference_administration = None
         self.reference_roots_validated = False
         self.reference_transport_observation = None
+        self.reference_retained_inventory = None
         if self.reference_build:
             self.reference_administration = checked_reference_administration(
                 read(_descriptor(self.request["reference_administration"])), self, read=read,
                 read_authorities=read_authorities)
             if self.request["authority_ids"] != self.reference_administration["authority_ids"]:
                 raise CachePolicyError("Finite release/stores/provider/authority binding differs")
+            if "retained_cache_inventory" in self.reference_administration:
+                # Already checked against its release pin; kept for admission.
+                self.reference_retained_inventory = read(
+                    _descriptor(self.reference_administration["retained_cache_inventory"]))
+                self._reference_retained_seal = _digest(self.reference_retained_inventory)
         self.q123_cold_scope = None
         if "q123_cold_scope" in self.request:
             from .retained_qualification import RetainedColdScope
@@ -350,7 +364,7 @@ class FirstQualification:
             report=lease.ledger.project(0)
             if getattr(self, "q123_cold_scope", None) is not None:
                 self.q123_cold_scope.admit(self, lease, report)
-            elif (report["current_cache_logical_bytes"]!=0
+            elif (report["current_cache_logical_bytes"]!=self.initial_cache_bytes(lease)
                     or report["active_cache_remaining_bytes"]!=0
                     or (not self.reference_build
                         and report.get("hard_filesystem_quota_verified") is not True)):
@@ -382,6 +396,23 @@ class FirstQualification:
                 provider=self.provider_binding, stores_source=self.stores_source,
                 owner=lease.owner, scope=self.provider["scope"], no_retry=True)))
         self.started = True
+
+    def initial_cache_bytes(self, lease):
+        """Cache bytes a cold start may find: 0, or its release's retained files.
+
+        Only a REFERENCE_RELEASES entry with retained_cache admits files, and
+        then exactly its inventory, verified on disk, with every earlier
+        reservation closed. Call it with the host ledger lock held.
+        """
+        inventory = getattr(self, "reference_retained_inventory", None)
+        if inventory is None:
+            return 0
+        from .retained_qualification import require_prior_reservations_closed
+        from .service_context import verify_retained_cache_inventory
+        if _digest(inventory) != self._reference_retained_seal:
+            raise CachePolicyError("Released retained inventory changed in memory")
+        require_prior_reservations_closed(lease.ledger.control.names())
+        return verify_retained_cache_inventory(inventory, lease.policy.root)["logical_bytes"]
 
     def _launch_marker_name(self):
         return "cache-first-launch-" + _digest(dict(
@@ -493,7 +524,7 @@ class FirstQualification:
         hard=report.get("hard_filesystem_quota_verified") is True
         if hard != (self.reference_administration["host_policy"]=="main-q87-fixed500"):
             raise CachePolicyError("N43 actual hard-cap observation differs from the declared host exception")
-        if initial and (report["current_cache_logical_bytes"] != 0
+        if initial and (report["current_cache_logical_bytes"] != self.initial_cache_bytes(lease)
                 or report["active_cache_remaining_bytes"] != 0):
             raise CachePolicyError("N43 requires its fresh exclusive cache and no prior service allocation")
         snapshot = reference_scope_snapshot(self, lease)
@@ -2145,12 +2176,14 @@ def checked_reference_administration(value, first, *, read, read_authorities=Non
     entry's answer records and plan SHA-256 must match (N43/Q109 is the first).
     """
     release = released_reference(value.get("authority_ids")) if isinstance(value, dict) else None
+    retained = (release or {}).get("retained_cache")
     _exact_keys(value, {"format", "authority_ids", "answers_source", "accepted_plan",
         "scope", "task", "host", "host_policy", "owned_roots", "entry_limit",
         "aggregate_entitlement_bytes", "counting_semantics", "watchdog_period_seconds",
         "operational_reserve_bytes", "minimum_family_memory_limit_bytes",
         "memory_reserve_bytes", "all_external_writers_redirected", "exclusive_producer",
-        "output_configuration", "requested_native_layout", "output_writers", "producer_state"}, "Exact N43 reference administration required")
+        "output_configuration", "requested_native_layout", "output_writers", "producer_state"}
+        | ({"retained_cache_inventory"} if retained else set()), "Exact N43 reference administration required")
     if (value["format"] != REFERENCE_ADMINISTRATION
             or release is None
             or value["scope"] != first.provider["scope"]
@@ -2225,6 +2258,18 @@ def checked_reference_administration(value, first, *, read, read_authorities=Non
             left,right=PureWindowsPath(row["path"]),PureWindowsPath(other["path"])
             if left==right or left in right.parents or right in left.parents:
                 raise CachePolicyError("N43 roots overlap; all-stage files must count exactly once")
+    if retained:
+        # The release pins the exact retained file set; admission verifies it on disk.
+        pin=_descriptor(value["retained_cache_inventory"])
+        if pin["sha256"]!=retained["inventory_sha256"]:
+            raise CachePolicyError("The released retained cache is exactly inventory "+retained["inventory_sha256"][:8])
+        inventory=read(pin)
+        if (not isinstance(inventory,dict) or inventory.get("format")!=RETAINED_INVENTORY
+                or inventory.get("no_cleanup") is not True
+                or type(inventory.get("logical_bytes")) is not int
+                or inventory["logical_bytes"]!=retained["logical_bytes"]
+                or not _same_path(inventory.get("root",""),by_role["cache"]["path"])):
+            raise CachePolicyError("Released retained inventory must count exactly its files in this cache root")
     return deepcopy(value)
 
 

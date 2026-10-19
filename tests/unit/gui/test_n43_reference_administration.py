@@ -234,7 +234,7 @@ def entitlement_runtime_TESTONLY(monkeypatch):
         job={"series_id":"TESTONLY"},root="//TESTONLY/share/job",repository="C:/TESTONLY/source")
     config=dict(frames=[{"case_id":case} for case in task["ordered_case_ids"]])
     monkeypatch.setattr(capacity,"settings",lambda *args:(None,PHYSICAL_RESERVE_BYTES,pin_TESTONLY("admin.json")))
-    monkeypatch.setattr(capacity,"_native_layout_for_task",lambda *args:value["requested_native_layout"])
+    monkeypatch.setattr(capacity,"_native_layout_for_task",lambda *args,**kwargs:value["requested_native_layout"])
     calls=[]
     monkeypatch.setattr(capacity,"_writer_identity",lambda *args:calls.append(args))
     return runtime,task,config,value,calls

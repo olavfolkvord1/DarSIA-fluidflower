@@ -79,8 +79,13 @@ def _native_layout_shape(value, count, where):
     return list(value)
 
 
-def _native_layout_for_task(stores, series_id, task, config, rows=None):
-    """Only already-declared JSON metadata; never array/image reads or a claim."""
+def _native_layout_for_task(stores, series_id, task, config, rows=None, *, raw_reference=False):
+    """Only already-declared JSON metadata; never array/image reads or a claim.
+
+    Measured profiles exist for rig frames only. RAW-only frames (raw_rig) are
+    read only with raw_reference=True, the released reference-build route: their
+    native grid is their RAW source binding's, and the layout names that binding.
+    """
     from .store_runtime import resolve_catalog
     if (task.get("pipeline") != "native-phase-n1"
             or config.get("format") != "darsia-native-phase-n1-run-v1"):
@@ -125,13 +130,27 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None):
     frames = config["frames"]
     if not isinstance(frames, list) or not frames:
         raise ValueError("Actual nonempty frame layout required")
+    kinds = {frame["native_task"]["kind"] for frame in frames}
+    raw = raw_reference and kinds == {"raw_rig"}
+    if kinds != {"rig"} and not raw:
+        raise ValueError("Unmeasured native processor route requires its own profile")
+    raw_bindings = set()
     for frame in frames:
         case = name(frame["case_id"])
-        if frame["native_task"]["kind"] != "rig":
-            raise ValueError("Unmeasured native processor route requires its own profile")
         n = document("frame." + case + ".native_geometry", frame["native_task"]["geometry"])
+        if raw:
+            descriptor = frame["native_task"]["processor"]["raw_binding"]
+            binding = document("frame." + case + ".native.raw_binding", descriptor)
+            if (binding.get("contract") != "darsia-raw-rig-source-v1"
+                    or n.get("contract") != "darsia-raw-native-frame-v1"
+                    or n.get("run") != binding.get("run") or binding.get("run") != task.get("run")):
+                raise ValueError("RAW-only frame requires its exact source binding and frame contract: " + case)
+            raw_bindings.add(descriptor["sha256"])
+            native_frame_hw = binding["native_shape_hw"]
+        else:
+            native_frame_hw = n["native_shape_hw"]
         g = document("frame." + case + ".rig_geometry", frame["geometry"])
-        shapes = [n["native_shape_hw"], g["source_native_shape_hw"],
+        shapes = [native_frame_hw, g["source_native_shape_hw"],
                   frame["mass_spec"]["original_domain"]["native_shape_hw"]]
         if any(_native_layout_shape(v, 2, case) != native_hw for v in shapes):
             raise ValueError("Requested frame native shape differs: " + case)
@@ -145,13 +164,19 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None):
     dtype = params["features"]["alignment"]["rgb_dtype"]
     if not isinstance(dtype, str) or dtype != task["precision"]:
         raise ValueError("Original task precision and explicit feature RGB dtype differ")
-    return dict(format="darsia-native-phase-n1-measured-layout-v1",
-                pipeline="native-phase-n1", precision=task["precision"],
-                native_shape_hw=native_hw, phase_shape_hw=phase_hw,
-                native_shape_chw=chw, feature_rgb_dtype=dtype,
-                source_box_xywh=list(source_box),
-                native_configuration_sha256=config["native"]["configuration"]["sha256"],
-                phase_configuration_sha256=config["phase"]["configuration"]["sha256"])
+    layout = dict(format="darsia-native-phase-n1-measured-layout-v1",
+                  pipeline="native-phase-n1", precision=task["precision"],
+                  native_shape_hw=native_hw, phase_shape_hw=phase_hw,
+                  native_shape_chw=chw, feature_rgb_dtype=dtype,
+                  source_box_xywh=list(source_box),
+                  native_configuration_sha256=config["native"]["configuration"]["sha256"],
+                  phase_configuration_sha256=config["phase"]["configuration"]["sha256"])
+    if raw:
+        if len(raw_bindings) != 1:
+            raise ValueError("A RAW-only reference layout requires one RAW source binding")
+        # Never equal to a rig layout, so no rig profile or reference can match it.
+        layout.update(native_task_kind="raw_rig", raw_source_binding_sha256=raw_bindings.pop())
+    return layout
 
 
 def _check_measured_native_layout(profile, requested):
@@ -493,7 +518,7 @@ def n43_entitlement(runtime, task, config, rows):
     _state,_reserve,binding=settings(runtime.stores,runtime.job["series_id"])
     if binding!=first.request["reference_administration"]:
         raise ValueError("Result-space administration differs from the exact Root-released N43 request")
-    actual=_native_layout_for_task(runtime.stores,runtime.job["series_id"],task,config,rows)
+    actual=_native_layout_for_task(runtime.stores,runtime.job["series_id"],task,config,rows,raw_reference=True)
     admin=first.reference_administration
     if actual!=admin["requested_native_layout"]:
         raise ValueError("N43 actual native layout differs from the predeclared producer")
