@@ -8,11 +8,24 @@ import json
 
 import pytest
 
-from darsia.fluidflower.tools import calibration_pairwise_review as pairwise
 from .test_raw_photographic_review import _write, inputs  # noqa: F401
 
 
-def test_raw_root_photographs_and_rows(tmp_path, inputs):
+@pytest.fixture
+def pairwise(tmp_path, monkeypatch):
+    # The historical tool resolves its configured series during import. Keep
+    # this unit test independent of the user's registry and network projects.
+    series = tmp_path / "configured_series"
+    series.mkdir()
+    (series / "series.toml").write_text(
+        'schema_version = 1\nseries_id = "ffac"\n[paths]\n', encoding="utf8",
+    )
+    monkeypatch.setenv("DARSIA_FFAC_PROJECT_ROOT", str(series))
+    from darsia.fluidflower.tools import calibration_pairwise_review
+    return calibration_pairwise_review
+
+
+def test_raw_root_photographs_and_rows(tmp_path, inputs, pairwise):
     manifest = json.loads(_write(tmp_path, inputs).read_text(encoding="utf-8"))
     root = tmp_path / "review"
     folder = (root / "native_frames/ac52").resolve()
@@ -29,7 +42,7 @@ def test_raw_root_photographs_and_rows(tmp_path, inputs):
     assert rows[1]["case_id"] == "ac52_f2" and "source_name" not in manifest["frames"][1]
 
 
-def test_historical_roots_keep_their_photograph_paths(tmp_path):
+def test_historical_roots_keep_their_photograph_paths(tmp_path, pairwise):
     assert pairwise._raw_review_photograph(tmp_path, "ac52") is None
     folder = tmp_path / "native_frames/ac52"
     assert pairwise._native_frame_path(tmp_path, "ac52", 3) == folder.resolve() / "frame_003.jpg"
@@ -37,7 +50,7 @@ def test_historical_roots_keep_their_photograph_paths(tmp_path):
         tmp_path.resolve() / "native_references/ac52/pre_injection.jpg")
 
 
-def test_every_new_raw_consumer_function_has_a_docstring():
+def test_every_new_raw_consumer_function_has_a_docstring(pairwise):
     from darsia.fluidflower import phase_photographic_assets, phase_saved_presentation, storage_original_photo
     from darsia.fluidflower.phase_training import raw_frame_context
     from darsia.fluidflower.tools import phase_studio_photometry_preview_cache
