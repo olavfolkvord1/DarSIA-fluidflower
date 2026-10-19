@@ -328,7 +328,7 @@ class SeriesInputs:
     until the caller has committed the full native/phase/mass frame.
     """
 
-    def __init__(self, config, output):
+    def __init__(self, config, output, *, unc_only=True):
         """Load bound model, baseline and acquisition-history inputs for the ordered series."""
         from darsia._opencv_runtime import scientific_thread
         scientific_thread("SeriesInputs:setup")
@@ -337,7 +337,7 @@ class SeriesInputs:
         from . import phase_inputs as loaders
 
         self.config, self.output = config, Path(output)
-        self.reader = DataReader(config.get("data_aliases", ()), unc_only=True)
+        self.reader = DataReader(config.get("data_aliases", ()), unc_only=unc_only)
         self.aliases = {
             row["logical"]["path"]: row["physical"]["path"]
             for row in config.get("data_aliases", ())
