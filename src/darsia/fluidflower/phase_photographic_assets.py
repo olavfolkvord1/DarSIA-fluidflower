@@ -22,6 +22,31 @@ def _selected_rows(manifest, reference=False):
     rows = [manifest.get("reference") or {}] if reference else manifest.get("frame_sources") or []
     return rows if SELECTED_SOURCE_KEY in manifest or (rows and all(row.get("source_label_identity") and row.get("photographs") for row in rows)) else []
 
+def _raw_review(review_root, run):
+    """The run's RAW photographic review manifest, or None for a historical root."""
+    if not review_root or not run:
+        return None
+    from .raw_photographic_review import read_raw_review_manifest
+    return read_raw_review_manifest(review_root, run)
+
+
+def _raw_rows(manifest, reference=False):
+    """The rows of a RAW review manifest (or of RAW rows passed alone), else None."""
+    from .raw_photographic_review import RAW_REVIEW_FORMAT
+    if manifest.get("format") == RAW_REVIEW_FORMAT:
+        return [manifest.get("reference") or {}] if reference else list(manifest.get("frames") or [])
+    rows = [manifest.get("reference") or {}] if reference else (manifest.get("frame_sources") or [])
+    if rows and all(isinstance(row, Mapping) and isinstance(row.get("assets"), Mapping)
+                    and isinstance(row.get("acquisition"), Mapping) for row in rows):
+        return list(rows)
+    return None
+
+
+def _raw_modes(rows, modes):
+    """Whether every RAW row declares each of ``modes``; no file I/O."""
+    return bool(rows) and all(all(mode in row["assets"] for mode in modes) for row in rows)
+
+
 def _selected_manifest(review_root, run):
     from .phase_selected_policy_review import _native_document, _READER
     path = Path(review_root)/"native_frames"/str(run).casefold()/"manifest.json"
@@ -45,6 +70,8 @@ def _sha256(path: Path) -> str:
 
 def raw_detail_available(manifest: Mapping, *, reference: bool = False) -> bool:
     """Whether a V5 manifest advertises the optional display asset."""
+    if (raw := _raw_rows(manifest, reference)) is not None:
+        return _raw_modes(raw, ("raw_detail",))
     if rows := _selected_rows(manifest,reference):
         return all(row.get("photographs",{}).get("raw_detail") for row in rows)
     if (manifest.get("v5_photometry") or {}).get("format") != V5_SOURCE_FORMAT:
@@ -58,6 +85,8 @@ def raw_detail_available(manifest: Mapping, *, reference: bool = False) -> bool:
 
 def display_modes_available(manifest: Mapping, *, reference: bool = False) -> bool:
     """Inspect mode declarations without filesystem work on the GUI thread."""
+    if (raw := _raw_rows(manifest, reference)) is not None:
+        return _raw_modes(raw, BASE_DISPLAY_MODES)
     rows = [manifest.get("reference") or {}] if reference else (manifest.get("frame_sources") or [])
     return bool(rows) and all(
         isinstance(row.get("v5_display_modes"), Mapping)
@@ -70,7 +99,12 @@ def display_modes_available(manifest: Mapping, *, reference: bool = False) -> bo
 
 
 def original_display_available(manifest: Mapping, *, reference: bool = False) -> bool:
-    """Inspect source-bound camera JPEG declarations without filesystem I/O."""
+    """Inspect source-bound camera JPEG declarations without filesystem I/O.
+
+    A RAW review root declares its camera-RAW original as an asset instead.
+    """
+    if (raw := _raw_rows(manifest, reference)) is not None:
+        return _raw_modes(raw, ("original",))
     if rows := _selected_rows(manifest,reference):
         return all(row.get("photographs",{}).get("original") for row in rows)
     if (manifest.get("v5_photometry") or {}).get("format") != V5_SOURCE_FORMAT:
@@ -119,6 +153,13 @@ def change_display_available(review_root, run, *, frame_count: int | None = None
     """
     if not review_root or not run:
         return False
+    try:
+        raw = _raw_review(review_root, run)
+    except (OSError, ValueError):
+        return False
+    if raw is not None:
+        return (_raw_modes(raw["frames"], ("change",)) and _raw_modes([raw["reference"]], ("change",))
+                and (frame_count is None or len(raw["frames"]) == frame_count))
     native_path=Path(review_root)/"native_frames"/str(run).casefold()/"manifest.json"
     try:
         native=json.loads(native_path.read_text(encoding="utf-8-sig"))
@@ -157,6 +198,9 @@ def change_display_available(review_root, run, *, frame_count: int | None = None
 
 def resolve_change_display(review_root, run, frame_index, *, reference=False) -> Path:
     """Verify a separately recorded change photograph against the sealed run."""
+    if _raw_review(review_root, run) is not None:
+        from .raw_photographic_review import resolve_raw_photograph
+        return resolve_raw_photograph(review_root, run, frame_index, mode="change", reference=reference)
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photograph
         return resolve_photograph(review_root,run,frame_index,reference=reference,mode="change")
@@ -243,6 +287,9 @@ def resolve_display_mode(review_root, run, frame_index, mode="natural", *, refer
         raise ValueError(f"Unknown photographic display mode: {mode}")
     if mode == "change":
         return resolve_change_display(review_root, run, frame_index, reference=reference)
+    if _raw_review(review_root, run) is not None:
+        from .raw_photographic_review import resolve_raw_photograph
+        return resolve_raw_photograph(review_root, run, frame_index, mode=mode, reference=reference)
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photograph
         return resolve_photograph(review_root,run,frame_index,reference=reference,mode=mode)
@@ -269,6 +316,15 @@ def load_display_image(review_root, run, frame_index=None, *, mode="natural", re
     from .phase_rig_raw_display import rig_raw_display_available, load_rig_raw_display_image
     from .phase_rig_display_canvas import pad_rig_photograph
 
+    if _raw_review(review_root, run) is not None:
+        # RAW review assets are lossless PNGs already on the phase canvas.
+        if mode not in (*DISPLAY_MODES, "raw_detail", "original"):
+            raise ValueError(f"Unknown photographic display mode: {mode}")
+        from .raw_photographic_review import resolve_raw_photograph
+        image = QImage(str(resolve_raw_photograph(review_root, run, frame_index, mode=mode, reference=reference)))
+        if image.isNull():
+            raise ValueError("RAW review photograph could not be decoded")
+        return image
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photograph
         image=QImage(str(resolve_photograph(review_root,run,frame_index,mode=mode,reference=reference)))
@@ -317,6 +373,12 @@ def load_original_display_rgb(review_root, run, frame_index, *, reference=False)
     import cv2
     from PIL import Image
 
+    if _raw_review(review_root, run) is not None:
+        # The camera RAW, already pulled onto the canvas by the review writer.
+        from .raw_photographic_review import resolve_raw_photograph
+        with Image.open(resolve_raw_photograph(review_root, run, frame_index, mode="original",
+                                               reference=reference)) as image:
+            return np.asarray(image.convert("RGB"))
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photograph
         with Image.open(resolve_photograph(review_root,run,frame_index,mode="original",reference=reference)) as image:
@@ -394,6 +456,9 @@ def load_original_display_rgb(review_root, run, frame_index, *, reference=False)
 
 def resolve_photo_sand_domain(review_root, run, frame_index, *, reference=False, canvas=True) -> np.ndarray:
     """Load the immutable photo-sand mask, independent of model feature support."""
+    if _raw_review(review_root, run) is not None:
+        from .raw_photographic_review import load_raw_photo_support
+        return load_raw_photo_support(review_root, run, frame_index, reference=reference, canvas=canvas)
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photo_sand_domain as selected_domain
         return selected_domain(review_root,run,frame_index,reference=reference,canvas=canvas)
@@ -439,6 +504,9 @@ def resolve_raw_detail(
     and file digest are checked on every resolution.  No JPEG fallback occurs
     after the user selects RAW detail.
     """
+    if _raw_review(review_root, run) is not None:
+        from .raw_photographic_review import resolve_raw_photograph
+        return resolve_raw_photograph(review_root, run, frame_index, mode="raw_detail", reference=reference)
     if _selected_manifest(review_root,run) is not None:
         from .phase_selected_policy_review import resolve_photograph
         return resolve_photograph(review_root,run,frame_index,reference=reference,mode="raw_detail")
