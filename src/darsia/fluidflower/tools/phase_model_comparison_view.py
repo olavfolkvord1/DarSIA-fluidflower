@@ -32,6 +32,7 @@ from darsia.fluidflower.model_display import (
 from darsia.fluidflower.tools.phase_review_area_sort import (
     peak_phase_area_percent, sorted_phase_area_runs,
 )
+from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT
 from darsia.fluidflower.phase_photographic_assets import V5_SOURCE_FORMAT, raw_detail_available, resolve_raw_detail, BASE_DISPLAY_MODES, DISPLAY_MODES, change_display_available, display_modes_available, resolve_display_mode, resolve_photo_sand_domain, original_display_available, load_original_display_rgb
 from darsia.fluidflower.phase_rig_raw_display import (
     rig_raw_display_available, load_rig_raw_display_image,
@@ -228,6 +229,23 @@ def _warp_display_image(image, matrix, *, overlay):
     return result
 
 
+def _frame_rows(manifest):
+    """Saved timeline rows: a RAW review's Studio rows, or the historical frame sources (none when absent)."""
+    from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT, studio_rows
+    if manifest.get("format") == RAW_REVIEW_FORMAT:
+        return studio_rows(manifest)
+    rows = manifest.get("frame_sources")
+    return rows or []
+
+
+def _content_shape(manifest):
+    """The native grid (height, width) of a saved source, or None when it records none."""
+    from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT, review_content_shape
+    if manifest.get("format") == RAW_REVIEW_FORMAT:
+        return list(review_content_shape(manifest))
+    return manifest.get("analysis_image_shape_hw")
+
+
 def run_manifest(job):
     path = Path(job["review_root"]) / "native_frames" / job["run"] / "manifest.json"
     raw = path.read_bytes()
@@ -236,8 +254,8 @@ def run_manifest(job):
 
 def match_frames(left, right, *, left_digest, right_digest):
     """Match by raw photograph identity and time, never merely by frame number."""
-    shape = left.get("analysis_image_shape_hw")
-    if not shape or list(shape) != list(right.get("analysis_image_shape_hw") or []):
+    shape = _content_shape(left)
+    if not shape or list(shape) != list(_content_shape(right) or []):
         raise ValueError("The saved analysis grids differ. Automatic resizing is not supported.")
     if left.get("dataset") != right.get("dataset") or left.get("run") != right.get("run"):
         raise ValueError("Choose the same experiment and series on both sides.")
@@ -245,7 +263,7 @@ def match_frames(left, right, *, left_digest, right_digest):
 
     def index(manifest):
         result = {}
-        for position, row in enumerate(manifest.get("frame_sources") or []):
+        for position, row in enumerate(_frame_rows(manifest)):
             frame = int(row.get("frame_index", position))
             digest = row.get("source_sha256")
             if not digest and not same_manifest:
@@ -278,14 +296,14 @@ def align_cross_run_frames(left, right):
     """Use each left frame and the nearest recorded elapsed time on the right."""
     if left.get("dataset") != right.get("dataset") or left.get("run") == right.get("run"):
         raise ValueError("Cross-experiment alignment requires two runs in one series.")
-    shape = left.get("analysis_image_shape_hw")
-    if not shape or list(shape) != list(right.get("analysis_image_shape_hw") or []):
+    shape = _content_shape(left)
+    if not shape or list(shape) != list(_content_shape(right) or []):
         raise ValueError("The saved analysis grids differ. Automatic resizing is not supported.")
 
     def timeline(manifest):
         rows = []
         seen = set()
-        for position, source in enumerate(manifest.get("frame_sources") or []):
+        for position, source in enumerate(_frame_rows(manifest)):
             frame = int(source.get("frame_index", position))
             elapsed = float(source["elapsed_h"])
             if frame in seen or not math.isfinite(elapsed):
@@ -334,7 +352,7 @@ def available_brightness_modes(pair) -> tuple[str, ...]:
     if not pair or not all(display_modes_available(m) for m in pair["manifests"]):
         return BASE_DISPLAY_MODES
     if all(change_display_available(job["review_root"], job["run"],
-                                    frame_count=len(manifest.get("frame_sources") or []))
+                                    frame_count=len(_frame_rows(manifest)))
            for job, manifest in zip(pair["jobs"], pair["manifests"])):
         return DISPLAY_MODES
     return BASE_DISPLAY_MODES
@@ -352,7 +370,7 @@ def available_panel_photo_modes(pair, side) -> tuple[str, ...]:
     if display_modes_available(manifest):
         available.update(BASE_DISPLAY_MODES)
         if change_display_available(job["review_root"], job["run"],
-                                    frame_count=len(manifest.get("frame_sources") or [])):
+                                    frame_count=len(_frame_rows(manifest))):
             available.add("change")
     if raw_detail_available(manifest):
         available.add("raw_detail")
@@ -362,13 +380,13 @@ def available_panel_photo_modes(pair, side) -> tuple[str, ...]:
 def _crop(image, manifest, *, overlay=False, frame_index=None, common_rig_revision=None):
     if image.isNull():
         raise ValueError("The saved image could not be decoded.")
-    h, w = map(int, manifest["analysis_image_shape_hw"])
+    h, w = map(int, _content_shape(manifest))
     canvas = manifest.get("canvas_wh")
     box = manifest.get("content_box_xywh")
-    revision = (manifest["frame_sources"][frame_index].get("rig_domain_revision")
+    revision = (_frame_rows(manifest)[frame_index].get("rig_domain_revision")
                 if frame_index is not None else None)
     if revision is None and frame_index is None:
-        revision = next((row["rig_domain_revision"] for row in manifest.get("frame_sources", ())
+        revision = next((row["rig_domain_revision"] for row in _frame_rows(manifest)
                          if "phase_shape_hw" in (row.get("rig_domain_revision") or {})), None)
     from darsia.fluidflower.phase_rig_display_canvas import (
         on_common_rig_canvas, pad_rig_photograph, validate_rig_display_overlay)
@@ -377,7 +395,7 @@ def _crop(image, manifest, *, overlay=False, frame_index=None, common_rig_revisi
                 else pad_rig_photograph(image, revision))
     if common_rig_revision is not None:
         return on_common_rig_canvas(image, manifest, common_rig_revision, overlay=overlay)
-    if any(row.get("rig_domain_revision") for row in manifest.get("frame_sources", ())):
+    if any(row.get("rig_domain_revision") for row in _frame_rows(manifest)):
         if not canvas or [image.width(), image.height()] != list(canvas):
             raise ValueError("Rig-domain photographs and maps require their full recorded review canvas.")
         return image
@@ -400,7 +418,7 @@ def load_images(pair, frame_position, phase="all", *, raw_detail=False, display_
     from darsia.fluidflower.tools import calibration_pairwise_review as review
     frame = pair["frames"][frame_position]
     payload = []
-    revisions = [manifest["frame_sources"][frame[side]].get("rig_domain_revision")
+    revisions = [_frame_rows(manifest)[frame[side]].get("rig_domain_revision")
                  for side, manifest in zip(("left", "right"), pair["manifests"])]
     padded = [revision for revision in revisions if revision and "phase_shape_hw" in revision]
     common_rig_revision = padded[0] if padded else None
@@ -429,7 +447,8 @@ def load_images(pair, frame_position, phase="all", *, raw_detail=False, display_
               and rig_raw_display_available(manifest, frame_index=frame[side])):
             original_image = load_rig_raw_display_image(
                 root, job["run"], frame[side], mode="raw_detail" if raw else mode)
-        elif (raw or mode == "raw_detail") and (manifest.get("v5_photometry") or {}).get("format") == V5_SOURCE_FORMAT:
+        elif (raw or mode == "raw_detail") and ((manifest.get("v5_photometry") or {}).get("format") == V5_SOURCE_FORMAT
+                                                or manifest.get("format") == RAW_REVIEW_FORMAT):
             photograph = resolve_raw_detail(root, job["run"], frame[side])
         elif display_modes_available(manifest):
             photograph = resolve_display_mode(root, job["run"], frame[side], mode)
@@ -437,7 +456,7 @@ def load_images(pair, frame_position, phase="all", *, raw_detail=False, display_
         overlay = review._native_phase_map_variant_path(overlay, overlay_asset_layer(phase), fallback=False)
         if (original_image is None and not photograph.is_file()) or (not withheld and not overlay.is_file()):
             raise FileNotFoundError(f"Saved {phase} map or photograph is unavailable: {overlay}")
-        rig_canvas = bool(manifest["frame_sources"][frame[side]].get("rig_domain_revision"))
+        rig_canvas = bool(_frame_rows(manifest)[frame[side]].get("rig_domain_revision"))
         domain = (resolve_photo_sand_domain(root, job["run"], frame[side], canvas=rig_canvas or common_rig_revision is not None)
                   if display_modes_available(manifest) else None)
         from darsia.fluidflower.phase_rig_display_canvas import pad_rig_display_mask
@@ -454,12 +473,12 @@ def load_images(pair, frame_position, phase="all", *, raw_detail=False, display_
         rendered._filled_phase_mask = pad_rig_display_mask(filled, common_rig_revision, manifest=manifest)
         from darsia.fluidflower.phase_floor_contact_display import resolve_floor_contact_display_mask
         contact = (resolve_floor_contact_display_mask(root, job["run"], frame[side])
-                   if rig_canvas and not withheld and manifest["frame_sources"][frame[side]].get("floor_contact_fill") else None)
+                   if rig_canvas and not withheld and _frame_rows(manifest)[frame[side]].get("floor_contact_fill") else None)
         rendered._floor_contact_fill_mask = pad_rig_display_mask(contact, common_rig_revision, manifest=manifest)
         payload.append((_crop(original_image if original_image is not None else QImage(str(photograph)), manifest,
             frame_index=frame[side], common_rig_revision=common_rig_revision), rendered))
     if pair.get("physical_alignment") and len(payload) == 2:
-        rows = [manifest["frame_sources"][frame[side]]
+        rows = [_frame_rows(manifest)[frame[side]]
                 for side, manifest in zip(("left", "right"), pair["manifests"])]
         matrix = metric_rig_alignment(*rows)
         if matrix is not None:

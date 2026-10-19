@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from darsia.fluidflower import raw_photographic_review as review
+
 from .test_raw_photographic_review import _write, inputs  # noqa: F401
 
 
@@ -37,7 +39,7 @@ def test_raw_root_photographs_and_rows(tmp_path, inputs, pairwise):
         pairwise._native_photograph_availability(root, "ac52", manifest, 3)
     (folder / "frames/ac52_f1/natural.png").unlink()
     assert not pairwise._native_photograph_availability(root, "ac52", manifest, 2)[1]
-    rows = pairwise._raw_review_rows(manifest)
+    rows = review.studio_rows(manifest)
     assert [row["source_name"] for row in rows] == ["ac52_f1.ARW", "ac52_f2.ARW"]
     assert rows[1]["case_id"] == "ac52_f2" and "source_name" not in manifest["frames"][1]
 
@@ -61,7 +63,7 @@ def test_every_new_raw_consumer_function_has_a_docstring(pairwise):
         phase_photographic_assets._raw_modes, storage_original_photo.publish_raw_original_png,
         storage_original_photo._publish, pairwise._deferred_presentation_validator,
         phase_saved_presentation._presentation_photo, phase_studio_photometry_preview_cache.raw_review_key_info,
-        pairwise._raw_review_photograph, pairwise._raw_review_rows, cohort,
+        pairwise._raw_review_photograph, review.studio_rows, cohort,
         *[getattr(cohort, name) for name in ("frame", "context", "H_v5_B_to_frame", "H_previous_to_frame",
                                              "feature_support", "_valid", "native_centre", "from_manifest",
                                              "_bind")]]

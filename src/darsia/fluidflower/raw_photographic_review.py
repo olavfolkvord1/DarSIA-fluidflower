@@ -8,7 +8,10 @@ each frame. They are rendered only from the run's bound records:
 - the already computed native log-linear camera RGB, through the configured
   display helpers, for the photographic modes;
 - the record's extended RAW (native centre and ring windows), through the
-  unchanged rig RAW composer and transfer, for ``raw_detail``.
+  unchanged rig RAW composer and transfer, for ``raw_detail``;
+- the same RAW against baseline B on the record's bound rig classes, through
+  the unchanged rig RAW Change renderer, for ``change`` (when every record
+  binds its rig classes).
 
 No JPEG is read or written, nothing scientific is recomputed, and an existing
 root is never changed: every file is created exclusively and the manifest is
@@ -38,6 +41,7 @@ RAW_REVIEW_FORMAT = "darsia-raw-photographic-review-v1"
 RAW_SOURCE_CONTRACT = "darsia-raw-rig-source-v1"
 ORIGINAL_MODE = "original"
 RAW_DETAIL_MODE = "raw_detail"
+CHANGE_MODE = "change"
 PHOTO_SUPPORT_ASSET = "photo_support"
 
 _READER = VerifiedAssetReader()
@@ -94,6 +98,7 @@ def raw_sources(full: Mapping, audit_descriptor: Mapping, *, reader=None) -> dic
         valid_mask=_descriptor(centre.get("valid_mask"), "Native valid mask"),
         audit=_descriptor(audit_descriptor, "RAW producer audit"),
         full=dict(full),
+        H_v5_B_to_frame_native=audit.get("H_v5_B_to_frame_native"),
     )
 
 
@@ -186,6 +191,39 @@ def render_raw_detail_asset(sources: Mapping, *, tile_rows: int) -> np.ndarray:
     return render_raw_detail(signal, support, tile_rows=int(tile_rows))
 
 
+def render_change_asset(sources: Mapping, rig_classes: Mapping, *, baseline: Mapping, run: str,
+                        frame_index: int | None, parameters: Mapping) -> np.ndarray:
+    """The existing Change view of a RAW record against baseline B, on the phase canvas.
+
+    The unchanged rig RAW renderer registers B's flatfield reference to the
+    record through the record's H from B (identity for B itself), renders
+    Change on the record's rig domain from its bound rig classes and marks
+    unsupported rig pixels. It reads the bound ``change_display`` and
+    ``display_modes`` parameters and the configured rig-class contract; the
+    bound display modes must be this review's own.
+    """
+    from .native.config import require_parameters
+    from .phase_rig_raw_display import _asset_identity, _raw_identity, _render_rig_raw_display_rgb, _token
+    from .phase_saved_review_metadata import configured_parameters
+
+    if require_parameters("display_modes") != parameters:
+        raise ValueError("Change needs this review's own bound display parameters")
+    record, manifest = pinned_raw_record(sources)
+    classes = _descriptor(rig_classes, "Rig classes")
+    record["rig_domain_revision"].update(contract=configured_parameters("display_views")["rig_contract"],
+                                         classes=classes)
+    manifest["reference"] = pinned_raw_record(baseline)[0]
+    reference = frame_index is None
+    binding = {} if reference else dict(H_v5_B_to_frame_native=sources["H_v5_B_to_frame_native"])
+    rgb, _masks, _audit = _render_rig_raw_display_rgb(
+        dict(native=manifest, native_path=Path(classes["path"])), record, binding, run, frame_index,
+        mode=CHANGE_MODE, reference=reference,
+        reference_key=_raw_identity(manifest["reference"], manifest),
+        classes_key=_token(dict(revision=record["rig_domain_revision"], classes=_asset_identity(classes)[1])),
+        backend="cpu")
+    return rgb
+
+
 def render_display_assets(sources: Mapping, photo_support: np.ndarray, *, parameters: Mapping,
                           modes: Sequence[str], reader=None) -> dict[str, np.ndarray]:
     """The configured photographic modes on the phase canvas, as HWC uint8 RGB.
@@ -244,9 +282,14 @@ def _relative_asset(run_folder: Path, path: Path) -> dict:
 
 
 def _render_entry(run_folder: Path, folder: Path, sources: Mapping, photo_support, *,
-                  profile, parameters, modes, reader) -> dict:
+                  profile, parameters, modes, reader, change=None) -> dict:
     assets = {}
     fill = parameters["unfilled_rgb8"]
+    if CHANGE_MODE in modes:
+        image = render_change_asset(sources, change["rig_classes"], baseline=change["baseline"],
+                                    run=change["run"], frame_index=change["frame_index"], parameters=parameters)
+        _write_png(folder / f"{CHANGE_MODE}.png", image)
+        assets[CHANGE_MODE] = _relative_asset(run_folder, folder / f"{CHANGE_MODE}.png")
     for mode in modes:
         if mode == ORIGINAL_MODE:
             image = render_original(sources, profile=profile, fill_rgb8=fill, reader=reader)
@@ -256,7 +299,7 @@ def _render_entry(run_folder: Path, folder: Path, sources: Mapping, photo_suppor
             image = render_raw_detail_asset(sources, tile_rows=parameters["tile_rows"])
             _write_png(folder / f"{mode}.png", image)
             assets[mode] = _relative_asset(run_folder, folder / f"{mode}.png")
-    display = [mode for mode in modes if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE)]
+    display = [mode for mode in modes if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE, CHANGE_MODE)]
     if display:
         for mode, image in render_display_assets(sources, photo_support, parameters=parameters,
                                                  modes=display, reader=reader).items():
@@ -280,7 +323,8 @@ def write_raw_review_root(review_root: str | Path, *, run: str, native_configura
     holds ``case_id``, ``frame_index``, ``elapsed_h``, the bound
     ``native_record``, ``native_geometry`` and ``rig_geometry`` descriptors
     and its ``photo_support``. ``modes`` defaults to the original, every
-    configured display mode and the RAW detail. ``training_context`` optionally
+    configured display mode and the RAW detail, plus ``change`` when B and every
+    frame bind their ``rig_classes`` descriptor. ``training_context`` optionally
     records the run's reference-context and photo-sand bindings for training
     (``phase_training.raw_frame_context``). The run folder must not exist yet.
     """
@@ -289,12 +333,16 @@ def write_raw_review_root(review_root: str | Path, *, run: str, native_configura
     configuration = _descriptor(native_configuration, "Native configuration")
     binding = _descriptor(raw_binding, "RAW source binding")
     parameters = reader.json(configuration)["display_modes"]
+    classified = [entry.get("rig_classes") for entry in (reference, *frames)]
     modes = (tuple(modes) if modes is not None
-             else (ORIGINAL_MODE, *parameters["modes"], RAW_DETAIL_MODE))
-    unknown = [mode for mode in modes
-               if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE) and mode not in parameters["modes"]]
+             else (ORIGINAL_MODE, *parameters["modes"], RAW_DETAIL_MODE,
+                   *((CHANGE_MODE,) if all(classified) else ())))
+    unknown = [mode for mode in modes if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE, CHANGE_MODE)
+               and mode not in parameters["modes"]]
     if unknown or not modes:
         raise ValueError(f"Unknown RAW review modes: {unknown}")
+    if CHANGE_MODE in modes and not all(classified):
+        raise ValueError("Change needs the rig classes of baseline B and of every frame")
     if training_context is not None:
         from .phase_training.raw_frame_context import CONTEXT_BINDING_KEYS
         if not isinstance(training_context, Mapping) or set(training_context) - CONTEXT_BINDING_KEYS:
@@ -309,13 +357,19 @@ def write_raw_review_root(review_root: str | Path, *, run: str, native_configura
     reference_sources = raw_sources(record["full"], native_row["raw_producer_audit"], reader=reader)
     if str(record["source"].get("run") or "").casefold() != run:
         raise ValueError("Reference acquisition belongs to another run")
+    def change(rig_classes, frame_index):
+        return dict(rig_classes=rig_classes, baseline=reference_sources, run=run, frame_index=frame_index)
+
     reference_entry = dict(
         acquisition_manifest=acquisition_manifest, record_index=record_index,
         acquisition=reference_sources["acquisition"], audit=reference_sources["audit"],
         profile_id=reference_sources["profile_id"],
+        **({} if not reference.get("rig_classes") else
+           {"rig_classes": _descriptor(reference["rig_classes"], "Rig classes")}),
         **_render_entry(run_folder, run_folder / "reference", reference_sources,
                         reference["photo_support"], profile=configuration,
-                        parameters=parameters, modes=modes, reader=reader))
+                        parameters=parameters, modes=modes, reader=reader,
+                        change=change(reference.get("rig_classes"), None)))
     geometry = {key: reference_sources[key] for key in
                 ("phase_shape_hw", "native_origin_xy", "native_shape_hw", "content_box_xywh")}
 
@@ -343,9 +397,12 @@ def write_raw_review_root(review_root: str | Path, *, run: str, native_configura
             native_geometry=_descriptor(frame["native_geometry"], "Native geometry"),
             rig_geometry=_descriptor(frame["rig_geometry"], "Rig geometry"),
             acquisition=sources["acquisition"], audit=sources["audit"], profile_id=sources["profile_id"],
+            **({} if not frame.get("rig_classes") else
+               {"rig_classes": _descriptor(frame["rig_classes"], "Rig classes")}),
             **_render_entry(run_folder, run_folder / "frames" / case_id, sources,
                             frame["photo_support"], profile=configuration,
-                            parameters=parameters, modes=modes, reader=reader)))
+                            parameters=parameters, modes=modes, reader=reader,
+                            change=change(frame.get("rig_classes"), index))))
 
     canvas_height, canvas_width = geometry["phase_shape_hw"]
     manifest = dict(
@@ -435,6 +492,16 @@ def review_content_shape(manifest: Mapping) -> tuple[int, int]:
     return tuple(int(value) for value in manifest[key])
 
 
+def studio_rows(manifest: Mapping, run: str | None = None) -> list[dict]:
+    """A RAW review's frames as Studio rows, named and identified by their camera RAW.
+
+    ``source_name`` is the RAW file name and ``source_sha256`` its acquisition
+    SHA-256, the keys historical rows give their camera photograph.
+    """
+    return [dict(row, source_name=PureWindowsPath(row["acquisition"]["path"]).name,
+                 source_sha256=row["acquisition"]["sha256"]) for row in timeline_rows(manifest, run)]
+
+
 def raw_review_row(row) -> bool:
     """Whether a Studio row is a RAW review frame or reference (it names assets and an acquisition)."""
     return (isinstance(row, Mapping) and isinstance(row.get("assets"), Mapping)
@@ -498,10 +565,13 @@ def load_raw_photo_support(review_root, run, frame_index: int | None = None, *, 
 
 
 __all__ = [
-    "ORIGINAL_MODE", "PHOTO_SUPPORT_ASSET", "RAW_DETAIL_MODE", "RAW_REVIEW_FORMAT", "RAW_SOURCE_CONTRACT",
+    "CHANGE_MODE", "ORIGINAL_MODE", "PHOTO_SUPPORT_ASSET", "RAW_DETAIL_MODE", "RAW_REVIEW_FORMAT",
+    "RAW_SOURCE_CONTRACT",
     "canvas_content_box", "load_raw_photo_support", "pinned_raw_record", "place_on_canvas",
     "raw_asset_descriptor", "raw_modes_available", "raw_review_record", "raw_review_row", "raw_sources",
-    "read_raw_review_manifest", "render_display_assets", "render_original", "render_raw_detail_asset",
-    "resolve_raw_photograph", "review_content_shape", "timeline_rows", "validate_raw_review_manifest",
+    "read_raw_review_manifest", "render_change_asset", "render_display_assets", "render_original",
+    "render_raw_detail_asset",
+    "resolve_raw_photograph", "review_content_shape", "studio_rows", "timeline_rows",
+    "validate_raw_review_manifest",
     "write_raw_review_root",
 ]

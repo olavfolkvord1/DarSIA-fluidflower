@@ -1883,14 +1883,6 @@ def _deferred_presentation_validator(review_output_dir: Path, run: str):
     return validate_deferred_presentation
 
 
-def _raw_review_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Studio frame rows of a RAW review: its frames, named by their camera RAW file."""
-    from pathlib import PureWindowsPath
-
-    return [dict(row, source_name=PureWindowsPath(row["acquisition"]["path"]).name)
-            for row in manifest["frames"]]
-
-
 def _native_frame_path(output_dir: Path, run: str, frame_index: int) -> Path:
     raw = _raw_review_photograph(output_dir, run, frame_index)
     if raw is not None:
@@ -6085,7 +6077,8 @@ class ReviewApp:
         ]
         if raw_review:
             analysis_shape = list(native_manifest["native_shape_hw"])
-            frame_sources = _raw_review_rows(native_manifest)
+            from darsia.fluidflower.raw_photographic_review import studio_rows
+            frame_sources = studio_rows(native_manifest)
         phase_quiz_payload_a = _load_phase_quiz_payload(
             self.store.output_dir,
             pair.candidate_a,

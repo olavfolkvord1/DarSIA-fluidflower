@@ -178,8 +178,29 @@ def read_saved_training_photometry(entry, series_id):
     )
 
 
+def _raw_review_inputs(manifest_path):
+    """Declared training inputs of a RAW photographic review: SHA form and presence, never pixels.
+
+    Baseline B and every frame name their native log-linear RGB and exact valid
+    mask through the SHA-bound records the review binds; the trainer verifies
+    their bytes before use.
+    """
+    from darsia.fluidflower.phase_training.raw_frame_context import RawFrameGeometryCohort
+
+    cohort = RawFrameGeometryCohort.from_manifest(manifest_path)
+    paths = set()
+    for index in (None, *range(len(cohort.rows))):
+        for descriptor in cohort.native_centre(index).values():
+            if not _digest(descriptor.get("sha256")):
+                raise ValueError("Missing RAW training input SHA in " + str(manifest_path))
+            if not Path(descriptor["path"]).is_file():
+                raise FileNotFoundError("RAW training input is missing: " + descriptor["path"])
+            paths.add(descriptor["path"])
+    return paths
+
+
 def require_saved_sidecars(bundles, binding):
-    """Check exactly the selected bundles' declared V5 files, never their pixels."""
+    """Check exactly the selected bundles' declared V5 files or RAW review inputs, never their pixels."""
     if not bundles:
         raise ValueError("Choose saved reviewed evidence before training")
     checked, payloads = set(), set()
@@ -216,6 +237,12 @@ def require_saved_sidecars(bundles, binding):
             if not _digest(expected):
                 raise ValueError("The reviewed V5 source lacks its native-manifest SHA")
             _raw, native = _read(path, expected)
+            from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT
+            if native.get("format") == RAW_REVIEW_FORMAT:
+                # A RAW photographic review names SHA-bound native records, not V5 sidecars.
+                payloads.update(_raw_review_inputs(path))
+                checked.add(path)
+                continue
             if (native.get("v5_photometry") or {}).get("format") != SOURCE_FORMAT:
                 raise ValueError(
                     "Selected evidence uses historical JPEG input instead of saved V5 sidecars"
