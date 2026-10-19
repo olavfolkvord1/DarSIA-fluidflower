@@ -46,10 +46,14 @@ reference conditions (Claude, 19 Oct 2026).
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
 from os import PathLike
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -84,6 +88,12 @@ __all__ = [
     "StoredFrameMapping",
     "load_npz_fields",
     "read_stage1_frame",
+    "COLOUR_COORDINATE_FORMAT",
+    "COLOUR_COORDINATE_ARCHIVE",
+    "COLOUR_COORDINATE_ARRAY",
+    "COLOUR_COORDINATE_RECORD",
+    "read_colour_coordinate",
+    "blue_fraction_from_stored_coordinate",
 ]
 
 PORE_VOLUME_UNITS_TO_M3 = {"m3": 1.0, "L": 1.0e-3}
@@ -769,6 +779,8 @@ def load_npz_fields(
     """
     if not names:
         raise ValueError("no stored field names were given")
+    if not Path(path).is_file():
+        raise ValueError(f"{path} does not exist; the stored fields are absent")
     loaded = np.load(path, allow_pickle=False)
     if not isinstance(loaded, np.lib.npyio.NpzFile):
         raise ValueError(f"{path} is not an .npz archive")
@@ -852,3 +864,77 @@ def read_stage1_frame(
         outside_mask=masks["outside"],
         pixel_area_m2=arrays.get("pixel_area_m2"),
     )
+
+
+# -- stored colour-path coordinate of stage 1 ---------------------------------------
+# Stage 1 writes it only with the storage option store_colour_coordinate (default
+# off): <frame>/colour_path_coordinate.npz, one float32 array on the native grid,
+# NaN outside the colour-quantifiable support, recorded in the frame's result.json.
+# These names equal the constants of darsia.fluidflower.storage_profile.
+COLOUR_COORDINATE_FORMAT = "darsia-colour-path-coordinate-v1"
+COLOUR_COORDINATE_ARCHIVE = "colour_path_coordinate.npz"
+COLOUR_COORDINATE_ARRAY = "colour_path_coordinate"
+COLOUR_COORDINATE_RECORD = "colour_coordinate"
+
+
+def read_colour_coordinate(frame_directory: str | PathLike) -> np.ndarray:
+    """Load a stage-1 frame's stored colour-path coordinate, verified.
+
+    The frame's result.json must record it; the archive must match the recorded
+    SHA-256 and size, and only the recorded array is read, from the verified
+    bytes. A frame without the coordinate, a missing or changed archive and an
+    array other than float32 on a 2D grid raise ValueError.
+    """
+    directory = Path(frame_directory)
+    try:
+        result = json.loads((directory / "result.json").read_bytes())
+    except FileNotFoundError:
+        raise ValueError(f"{directory} holds no stage-1 result.json") from None
+    record = result.get(COLOUR_COORDINATE_RECORD) if isinstance(result, dict) else None
+    if record is None:
+        raise ValueError(
+            f"{directory}: the frame stores no colour-path coordinate; stage 1 must run "
+            "with the storage option store_colour_coordinate"
+        )
+    if (
+        not isinstance(record, dict)
+        or record.get("format") != COLOUR_COORDINATE_FORMAT
+        or record.get("path") != COLOUR_COORDINATE_ARCHIVE
+        or record.get("array") != COLOUR_COORDINATE_ARRAY
+    ):
+        raise ValueError(f"{directory}: unknown colour-path coordinate record")
+    path = directory / COLOUR_COORDINATE_ARCHIVE
+    if not path.is_file():
+        raise ValueError(f"{path} is missing although result.json records it")
+    data = path.read_bytes()
+    if len(data) != record.get("size_bytes") or (
+        hashlib.sha256(data).hexdigest() != record.get("sha256")
+    ):
+        raise ValueError(f"{path} differs from its recorded SHA-256 or size")
+    with np.load(io.BytesIO(data), allow_pickle=False) as archive:
+        if COLOUR_COORDINATE_ARRAY not in archive.files:
+            raise ValueError(f"{path} holds no {COLOUR_COORDINATE_ARRAY} array")
+        value = archive[COLOUR_COORDINATE_ARRAY]
+    identity = record.get("identity") or {}
+    if (
+        value.dtype != np.float32
+        or value.ndim != 2
+        or identity.get("dtype") != value.dtype.str
+        or identity.get("shape") != list(value.shape)
+    ):
+        raise ValueError(
+            f"{path}: the coordinate must be the recorded float32 2D array"
+        )
+    return value
+
+
+def blue_fraction_from_stored_coordinate(
+    frame_directory: str | PathLike, adapter: BlueFractionAdapter
+) -> np.ndarray:
+    """Blue fraction of a stage-1 frame from its stored colour-path coordinate.
+
+    The coordinate is read with ``read_colour_coordinate`` and passed through
+    the per-series ``adapter`` (the calibration, supplied by the caller), whose
+    output contract is enforced by ``blue_fraction_from_colour``.
+    """
+    return blue_fraction_from_colour(read_colour_coordinate(frame_directory), adapter)
