@@ -777,6 +777,32 @@ class JobQueue:
         write_immutable(candidate, document)
         self.assert_owner(claim)
         destination = self.root / "publishing" / name(claim.task["run"])
+        existing_path = claim.lease / "publication.json"
+        if not success and existing_path.exists():
+            existing = read_json(existing_path)
+            if existing.get("success") is True:
+                # A failed ownership move must retain the original success
+                # bundle for explicit recovery, never rewrite publication.json
+                # with a second failure publication or attempt another move.
+                if existing.get("attempt_id") != claim.token:
+                    raise ValueError("Existing success publication belongs to another attempt")
+                if alias:
+                    if (existing.get("format") != "darsia-alias-publication-v1"
+                            or existing.get("run") != claim.task["run"]):
+                        raise ValueError("Existing success publication belongs to another run")
+                    _own_asset(claim.lease, existing["candidate"])
+                    index = _own_asset(claim.lease, existing["products_index"])
+                    self._validate_alias_index(index, existing["candidate"], claim.task["run"], claim.token)
+                    self._validate_alias_payload(claim.lease, existing.get("payload_publication"),
+                        existing["products_index"], claim.task["run"], claim.token)
+                else:
+                    original = claim.output / "candidate_completed.json"
+                    if existing.get("candidate") != descriptor(original):
+                        raise ValueError("Existing success candidate identity differs")
+                self._publication_diagnostic(claim, 0, "failure_after_prepared_success", dict(
+                    original_failure=descriptor(candidate), preserved_success=descriptor(existing_path),
+                    no_publication_rewrite=True, no_ownership_move=True))
+                return document
         # Prepare recovery metadata before the ownership transition. A crash
         # after rename can then finish publication without scientific replay.
         prepared = None
@@ -813,11 +839,29 @@ class JobQueue:
         if alias:
             self._check_n43_reference_publication(publication,claim.task,success)
         try:
-            rename(claim.lease, destination)
+            from .publication_handles import ordinary_publication_move
+
+            def owner():
+                self.assert_owner(claim)
+                self._shared_target(destination)
+
+            ordinary_publication_move(claim.lease, destination,
+                move=_windows_rename if os.name == "nt" else os.rename,
+                assert_owner=owner,
+                record=lambda attempt, phase, value: self._publication_diagnostic(
+                    claim, attempt, phase, value))
         except FileNotFoundError as exc:
             raise LeaseLost("Reclaim won before publication") from exc
         self._finish_publication(destination)
         return document
+
+    def _publication_diagnostic(self, claim, attempt, phase, value):
+        """Immutable owned-job metadata; never a stream left open on the lease."""
+        run, token = name(claim.task["run"]), name(claim.token)
+        path = self.root / "logs" / f"publication_{run}_{token}_{attempt:02}_{phase}.json"
+        self._shared_target(path)
+        write_immutable(path, dict(utc=utc(), run=claim.task["run"], attempt_id=claim.token,
+            physical_attempt=attempt, phase=phase, **value))
 
     def _finish_publication(self, directory: Path) -> None:
         publication = read_json(directory / "publication.json")

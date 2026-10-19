@@ -249,6 +249,28 @@ def test_failure_traceback_is_preserved_and_worker_takes_next(
     assert any(e.get("traceback") == failed["traceback"] for e in all_events)
 
 
+def test_original_worker_failure_remains_primary_when_failure_diagnostics_fail(
+    tmp_path, monkeypatch, native_cache_owner_binding
+):
+    shared = JobQueue(tmp_path)
+    shared.enqueue(task())
+    original = RuntimeError("Original worker failure")
+    def science(*args, **kwargs): raise original
+    def failure(*args, **kwargs): raise OSError("Failure diagnostic storage unavailable")
+    monkeypatch.setitem(sys.modules, "darsia.fluidflower.n1_pipeline", types.SimpleNamespace(run_n1=science))
+    monkeypatch.setattr(worker, "_identity", lambda machine: OWNER)
+    monkeypatch.setattr(JobQueue, "fail", failure)
+    events = queue.Queue()
+    with pytest.raises(RuntimeError, match="Original worker failure") as caught:
+        worker._work(str(tmp_path), dict(commit="1"*40,calibration_sha256="2"*64,precision="float32"),
+            "1"*40,"machine","cpu",events,threading.Event(),True,True)
+    assert caught.value is original
+    assert "Failure diagnostic storage unavailable" in " ".join(original.__notes__)
+    recorded = []
+    while not events.empty(): recorded.append(events.get())
+    assert any("Original worker failure" in event.get("traceback", "") for event in recorded)
+
+
 @pytest.mark.parametrize("dirty,head", [(" M tracked.py\n", "1"*40), ("", "4"*40)])
 def test_startup_git_rejection_is_console_and_log_and_never_claims(tmp_path, monkeypatch, capsys, dirty, head):
     # This isolated Git-rejection fixture already supplies synthetic UNC/Git

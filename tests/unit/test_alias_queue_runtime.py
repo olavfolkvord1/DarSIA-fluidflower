@@ -109,6 +109,46 @@ def completion():
                 precision="float32", scalar=23.859055832362177)
 
 
+def test_alias_failed_move_keeps_success_bundle_and_original_failure_without_rewrite(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline import publication_handles
+    queue, clock, callbacks, events = fixture(tmp_path, monkeypatch)
+    claim = claim_fixture(queue, clock, callbacks)
+    moves = []
+    def blocked(*args, **kwargs):
+        moves.append(1)
+        raise PermissionError("Original lease move refused")
+    monkeypatch.setattr(publication_handles, "ordinary_publication_move", blocked)
+    with pytest.raises(PermissionError, match="Original lease move refused"):
+        queue.complete(claim, completion())
+    publication = claim.lease / "publication.json"
+    before = {p.relative_to(claim.lease): (p.read_bytes(), p.stat().st_mtime_ns)
+              for p in claim.lease.rglob("*") if p.is_file()}
+    factory_calls = events.count("shared_copy_before_fence")
+    queue.fail(claim, "Original lease move refused; do not replace success publication", {})
+    assert moves == [1] and events.count("shared_copy_before_fence") == factory_calls
+    assert {p: ((claim.lease / p).read_bytes(), (claim.lease / p).stat().st_mtime_ns)
+            for p in before} == before
+    assert jobs.read_json(publication)["success"] is True
+    assert "Original lease move refused" in jobs.read_json(claim.output / "failed.json")["traceback"]
+    assert not (queue.root / "done/ac52.json").exists() and not (queue.root / "failed/ac52.json").exists()
+
+
+def test_existing_foreign_success_publication_is_not_a_failure_bypass(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline import publication_handles
+    queue, clock, callbacks, _events = fixture(tmp_path, monkeypatch)
+    claim = claim_fixture(queue, clock, callbacks)
+    monkeypatch.setattr(publication_handles, "ordinary_publication_move",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("move refused")))
+    with pytest.raises(PermissionError): queue.complete(claim, completion())
+    path = claim.lease / "publication.json"
+    document = jobs.read_json(path); document["attempt_id"] = "different-attempt"
+    path.write_text(json.dumps(document))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="another attempt"):
+        queue.fail(claim, "original failure", {})
+    assert path.read_bytes() == before and not (queue.root / "failed/ac52.json").exists()
+
+
 def test_pending_j2_and_missing_runtime_callbacks_never_claim(tmp_path, monkeypatch):
     queue, clock, callbacks, _events = fixture(tmp_path, monkeypatch, ready=False)
     with pytest.raises(RuntimeError, match="not explicitly ready"):

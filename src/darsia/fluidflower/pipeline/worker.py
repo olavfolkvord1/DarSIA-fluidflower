@@ -415,12 +415,16 @@ def _run_tasks(
                     traceback=text,
                 )
             )
-        except Exception:
+        except Exception as original_error:
             text = traceback.format_exc()
+            publication_error = None
             try:
                 shared.fail(claim, text, owner)
             except LeaseLost:
                 pass  # Its own attempt failure stays; only the current lease publishes.
+            except Exception as error:
+                publication_error = error
+                original_error.add_note("Failure publication/diagnostic also failed: " + repr(error))
             if io_runtime is not None:
                 io_runtime.capacity_close(claim)
             messages.put(
@@ -431,6 +435,8 @@ def _run_tasks(
                     traceback=text,
                 )
             )
+            if publication_error is not None:
+                raise original_error from publication_error
             if once:
                 raise SystemExit(1)
         finally:
