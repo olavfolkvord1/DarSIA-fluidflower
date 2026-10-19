@@ -38,7 +38,7 @@ def fixture(tmp_path, monkeypatch):
     acquisition.write_bytes(b"bound-RAW-acquisition")
     raw_bound = descriptor(acquisition)
     models = {}
-    for name, model in (("fit", fit), ("reference", replace(fit, run="virtual_reference"))):
+    for name, model in (("fit", fit), ("reference", replace(fit, run="donor_consensus"))):
         path = tmp_path / (name + ".npz")
         photometry.save_baseline(path, model, grid, dict(source_arw_sha256=raw_bound["sha256"],
             source_review_sha256="1" * 64, source_manifest_sha256="2" * 64,

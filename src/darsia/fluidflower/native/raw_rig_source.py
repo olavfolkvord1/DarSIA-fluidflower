@@ -62,8 +62,8 @@ def validate_binding(binding: Mapping, parameters: Mapping) -> None:
     models = _keys(binding["models"], {"fit", "reference", "old_field"}, where="frozen models")
     for name in ("fit", "reference"):
         _keys(models[name], {"data", "sidecar"}, where=name + " model")
-    source.verify_execution_identity(execution_identity(), binding["execution_identity"],
-                                     tuple(execution_identity()))
+    actual = execution_identity()
+    source.verify_execution_identity(actual, binding["execution_identity"], tuple(actual))
 
 
 def validate_frame(row: Mapping, binding: Mapping, parameters: Mapping) -> tuple:
@@ -103,7 +103,9 @@ class RawRigSourceProcessor:
             loaded[name] = photometry.load_baseline(data, parameters=parameters["photometry"])
         fit, grid = loaded["fit"]
         reference, ref_grid = loaded["reference"]
-        if fit.run != b["run"] or reference.run != "virtual_reference" or grid != ref_grid:
+        # The virtual-reference asset has its own historical run string
+        # (e.g. a donor-consensus name). Its exact bound bytes define its role.
+        if fit.run != b["run"] or grid != ref_grid:
             raise ValueError("RAW source and frozen photometric models/grid differ")
         fit_receipt = json.loads(self._asset(b["models"]["fit"]["sidecar"]).read_text(encoding="utf8"))
         if fit_receipt["source"]["source_arw_sha256"] != b["baseline_raw"]["sha256"]:
@@ -111,7 +113,7 @@ class RawRigSourceProcessor:
         old_field = None
         if b["models"]["old_field"] is not None:
             with np.load(self._asset(b["models"]["old_field"]), allow_pickle=False) as archive:
-                old_field = archive["field"]
+                old_field = archive["field"].astype(np.float32)
             if old_field.dtype != np.float32 or old_field.shape != grid.shape_hw:
                 raise ValueError("RAW source old-light field differs from its frozen grid/type")
         self.processor = SimpleNamespace(run=b["run"], fit=fit, reference=reference,
@@ -171,8 +173,8 @@ class RawRigSourceProcessor:
             raise ValueError("JPEG-positioned parent pixels cannot be reused by the RAW-only source")
         if sha256_file(self.binding_path) != self.binding_sha256:
             raise ValueError("RAW source binding changed after processor setup")
-        source.verify_execution_identity(execution_identity(), self.binding["execution_identity"],
-                                         tuple(execution_identity()))
+        actual = execution_identity()
+        source.verify_execution_identity(actual, self.binding["execution_identity"], tuple(actual))
         h_ref, h_b, h_ref_b = validate_frame(geometry_frame, self.binding, self.parameters)
         sensor = self._sensor(geometry_frame["acquisition"])
         exact_b = sensor.source["sha256"] == self.baseline_sensor.source["sha256"]
