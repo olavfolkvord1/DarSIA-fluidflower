@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .utils import _get_key, _get_section_from_toml
+from .utils import _config_path, _get_key, _get_section_from_toml
 
 
 @dataclass
@@ -47,9 +47,8 @@ class RigConfig:
         self.height = _get_key(sec, "height", required=True, type_=float)
         self.dim = _get_key(sec, "dim", required=True, type_=int)
         default_path = results / "setup" / "rig" if results else None
-        self.path = _get_key(
-            sec, "path", default=default_path, required=False, type_=Path
-        )
+        rig_path = _get_key(sec, "path", required=False)
+        self.path = default_path if rig_path is None else _config_path(rig_path, path)
         assert self.path is not None, "results is required if path is not set"
         return self
 

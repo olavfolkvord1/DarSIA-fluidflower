@@ -7,7 +7,7 @@ from pathlib import Path
 
 from natsort import natsorted, ns
 
-from .utils import _get_key, _get_section_from_toml
+from .utils import _config_path, _get_key, _get_section_from_toml
 
 logger = logging.getLogger(__name__)
 
@@ -122,15 +122,17 @@ class DataConfig:
         if folder_value is None and folders_value is None:
             raise KeyError("Missing key 'folder' or 'folders' in [data].")
 
+        # Relative folders/results of a series project are read against its
+        # series root (see _config_path); the baseline stays folder-relative.
         self.folders = []
         if folder_value is not None:
-            self.folders.append(Path(folder_value))
+            self.folders.append(_config_path(folder_value, path))
         if folders_value is not None:
             if not isinstance(folders_value, list):
                 raise ValueError("[data].folders must be a list of paths.")
             if not folders_value:
                 raise ValueError("[data].folders must not be empty.")
-            parsed_folders = [Path(folder) for folder in folders_value]
+            parsed_folders = [_config_path(folder, path) for folder in folders_value]
             for folder in parsed_folders:
                 if folder not in self.folders:
                     self.folders.append(folder)
@@ -180,7 +182,7 @@ class DataConfig:
             self.data = None
 
         # Get results
-        self.results = _get_key(sec, "results", required=True, type_=Path)
+        self.results = _config_path(_get_key(sec, "results", required=True), path)
         if require_results:
             if not self.results.is_dir():
                 raise FileNotFoundError(f"Results folder {self.results} not found.")

@@ -69,11 +69,11 @@ def _is_absolute(value: str) -> bool:
     return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
 
-def resolve_storage_path(path) -> Path:
-    """Apply explicitly configured prefix aliases without accessing old storage.
+def _alias_rows() -> list[tuple[str, str]]:
+    """Return the registry's normalized (source, destination) prefix aliases.
 
-    Missing destinations do not fall back to an obsolete source. This changes
-    only the path used by a reader, never the bytes of its frozen document.
+    Sources are case-folded and sorted longest first; relative destinations are
+    read against the registry folder. An empty list means no alias is set.
     """
     registry, settings = _settings()
     aliases = settings.get("storage", {}).get("path_aliases", {})
@@ -87,6 +87,42 @@ def resolve_storage_path(path) -> Path:
             destination = _normalized(registry.parent / destination)
         rows.append((source.rstrip("/").casefold(), destination.rstrip("/")))
     rows.sort(key=lambda row: len(row[0]), reverse=True)
+    return rows
+
+
+def storage_path_remapper():
+    """Return a function that reads path strings through the storage aliases.
+
+    The registry is read once, for callers that map many paths at a time. The
+    function returns a string that an alias source prefixes as
+    :func:`resolve_storage_path` would; any other string is returned
+    unchanged, character for character, so a machine without aliases reads
+    exactly the authored text.
+    """
+    rows = _alias_rows()
+
+    def remap(value) -> str:
+        text = os.fspath(value)
+        if rows:
+            key = _normalized(text).casefold()
+            if any(key == source or key.startswith(source + "/") for source, _ in rows):
+                return str(_resolve_with(text, rows))
+        return text
+
+    return remap
+
+
+def resolve_storage_path(path) -> Path:
+    """Apply explicitly configured prefix aliases without accessing old storage.
+
+    Missing destinations do not fall back to an obsolete source. This changes
+    only the path used by a reader, never the bytes of its frozen document.
+    """
+    return _resolve_with(path, _alias_rows())
+
+
+def _resolve_with(path, rows) -> Path:
+    """Resolve ``path`` through already read alias rows (see _alias_rows)."""
     if not rows:
         return Path(path).expanduser()
     result = _normalized(path)

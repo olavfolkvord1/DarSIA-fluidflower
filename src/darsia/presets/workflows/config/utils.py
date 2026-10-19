@@ -1,8 +1,10 @@
 """Utility functions for TOML parsing"""
 
+import os
+import sys
 import tomllib
 from datetime import timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -48,6 +50,111 @@ def _deep_merge(base: dict, update: dict) -> dict:
     return base
 
 
+def _in_alias_job_worker() -> bool:
+    """Return True while an alias-job worker executes a task.
+
+    Such a worker maps every input through its machine's ``stores.toml`` (the
+    active per-run I/O binding of ``darsia.fluidflower.pipeline.run_io``), so
+    the per-user path conventions of this module must not apply there.
+    """
+    run_io = sys.modules.get("darsia.fluidflower.pipeline.run_io")
+    return run_io is not None and run_io.current_binding() is not None
+
+
+def _map_strings(value: Any, remap) -> Any:
+    """Return ``value`` with ``remap`` applied to every string and table key.
+
+    Lists and tables are rebuilt only when an entry changed; otherwise the
+    original object is returned, so an identity ``remap`` changes nothing.
+    """
+    if isinstance(value, str):
+        result = remap(value)
+        return value if result == value else result
+    if isinstance(value, list):
+        items = [_map_strings(item, remap) for item in value]
+        changed = any(new is not old for new, old in zip(items, value))
+        return items if changed else value
+    if isinstance(value, dict):
+        table: dict = {}
+        changed = False
+        for key, item in value.items():
+            new_key = _map_strings(key, remap)
+            new_item = _map_strings(item, remap)
+            if new_key in table:
+                raise ValueError(
+                    f"Storage path aliases map two keys to the same path: {new_key}"
+                )
+            table[new_key] = new_item
+            changed = changed or new_key is not key or new_item is not item
+        return table if changed else value
+    return value
+
+
+def _with_storage_aliases(section: dict) -> dict:
+    """Read alias-prefixed absolute paths of a section at this machine's location.
+
+    Every string value and table key that starts with a source prefix of the
+    per-user registry's ``[storage.path_aliases]`` is passed through
+    ``darsia.fluidflower.storage_paths.resolve_storage_path``. Without an alias
+    the section is returned unchanged. Only the values read change, never the
+    file bytes, so content (SHA) bindings of configuration files stay valid.
+    Alias-job workers already map their inputs and are left untouched.
+    """
+    if _in_alias_job_worker():
+        return section
+    from darsia.fluidflower.storage_paths import storage_path_remapper
+
+    return _map_strings(section, storage_path_remapper())
+
+
+def _series_root(config: Path | list[Path]) -> Path | None:
+    """Return the series project root holding configuration file(s), or None.
+
+    The root is the nearest folder above a file that contains ``series.toml``.
+    Files without such a folder are ignored; files of two different series
+    give None, as do files outside any series.
+    """
+    paths = [config] if isinstance(config, (str, os.PathLike)) else list(config)
+    roots = set()
+    for path in paths:
+        folder = Path(path).absolute().parent
+        for candidate in (folder, *folder.parents):
+            try:
+                found = (candidate / "series.toml").is_file()
+            except OSError:  # An unreadable parent holds no usable series.
+                found = False
+            if found:
+                roots.add(candidate)
+                break
+    return roots.pop() if len(roots) == 1 else None
+
+
+def _is_relative_path(value: Any) -> bool:
+    """Return True for a non-empty path without a drive or root in any spelling."""
+    text = str(value)
+    return (
+        bool(text.strip())
+        and not PurePosixPath(text).anchor
+        and not PureWindowsPath(text).anchor
+    )
+
+
+def _config_path(value: Any, config: Path | list[Path] | None) -> Path:
+    """Return one path value of a native configuration as a Path.
+
+    A relative value of a configuration inside a series project folder (one
+    holding ``series.toml``) is read against that series root, so a cloned
+    project finds its own files wherever it is checked out. Outside a series,
+    without ``config``, and in alias-job workers a relative value keeps
+    DarSIA's working-directory meaning. Other values are returned as Paths.
+    """
+    path = Path(value)
+    if config is None or not _is_relative_path(value) or _in_alias_job_worker():
+        return path
+    root = _series_root(config)
+    return path if root is None else root / path
+
+
 def _get_section_from_toml(path: Path | list[Path], section: str) -> dict:
     if isinstance(path, Path):
         data = tomllib.loads(path.read_text())
@@ -59,7 +166,7 @@ def _get_section_from_toml(path: Path | list[Path], section: str) -> dict:
     else:
         raise TypeError(f"Path must be a Path or list of Paths. It is {type(path)}.")
     sec = _get_section(data, section)
-    return sec
+    return _with_storage_aliases(sec)
 
 
 def _get_key(section: dict, key: str, default=None, required=True, type_=None) -> Any:
