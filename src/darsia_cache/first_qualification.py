@@ -64,8 +64,9 @@ REFERENCE_RELEASES = {
             logical_bytes=117590,
         ),
     ),
-    # N142 adds the font file of that stopped attempt: R3 starts again counting
-    # exactly this two-file inventory, verified on disk, and nothing else.
+    # N142 adds the font file of that stopped attempt. R3's second attempt
+    # (service 52294fac) stopped at its first frame under this entry, which
+    # stays for that attempt's close; with three files on disk it cannot start.
     ("N134", "N136", "N139", "N142"): dict(
         records={
             "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
@@ -77,6 +78,22 @@ REFERENCE_RELEASES = {
         retained_cache=dict(
             inventory_sha256="668f556a8d20c7d82484a9449521e46522b4d22b1bf2a0290e9f77d323c90a35",
             logical_bytes=235180,
+        ),
+    ),
+    # N145 adds the font file of the second attempt: R3 starts again counting
+    # exactly this three-file inventory, verified on disk, and nothing else.
+    ("N134", "N136", "N139", "N142", "N145"): dict(
+        records={
+            "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
+            "N136-CLAUDE-r3-plan-3ea1caa8-entitlement-65728995330B-pinned-for-the-exact-code-entry": "claude",
+            "N139-OLAV-r3-starts-with-the-verified-117590-byte-retained-font-file-counted-file-and-old-approval-untouched": "olav",
+            "N142-OLAV-r3-close-failed-service-95c-count-both-font-files-235180-bytes-one-new-start": "olav",
+            "N145-OLAV-yes-q157-paired-model-staging-close-5229-count-three-font-files-one-new-start": "olav",
+        },
+        plan_sha256="3ea1caa8ff432f5c17d2904f7f43080e23aeac039a447d8667a1586749e0426e",
+        retained_cache=dict(
+            inventory_sha256="96986702430169ac39fe43ea62195db66d36229cd287ddac6fe57f5e46890fce",
+            logical_bytes=352770,
         ),
     ),
 }
