@@ -2535,7 +2535,8 @@ class LayerPainterView(QWidget):
             if not lp.session_path(self.project, reference.run_id).is_file():
                 return False
             saved = lp.load_painting_session(self.project, reference)
-            raw_size = photo_size(Path(reference.baseline_image))
+            raw_size = photo_size(Path(reference.baseline_image),
+                                  camera_u=lp.reference_camera_u(self.project, reference))
         except (OSError, ValueError, KeyError, TypeError):
             return False
         return (
@@ -2701,7 +2702,9 @@ class LayerPainterView(QWidget):
                 self._saved_corrected_boundaries = workspace_frame.saved_boundaries(
                     self._workspace_frame_config, reference.run_id, image.display.shape[:2], project=self.project)
             else:
-                image = lp.load_painting_image(Path(reference.baseline_image))
+                image = lp.load_painting_image(
+                    Path(reference.baseline_image),
+                    camera_u=lp.reference_camera_u(self.project, reference))
         except (OSError, ValueError) as error:
             self.image = None
             self.canvas.clear_photo()
@@ -2730,7 +2733,7 @@ class LayerPainterView(QWidget):
         self._detail_plain = (
             None
             if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
-            else self._full_resolution(image.path)
+            else self._full_resolution(image.path, camera_u=image.camera_u)
         )
         self._update_enhanced()
         self._show_reference(reset_view=True)
@@ -2754,7 +2757,7 @@ class LayerPainterView(QWidget):
         mask[rows : shape[0] - rows, cols : shape[1] - cols] = True
         return mask
 
-    def _full_resolution(self, path: Path | str) -> np.ndarray | None:
+    def _full_resolution(self, path: Path | str, *, camera_u: Any = None) -> np.ndarray | None:
         """The photograph at up to ``DETAIL_LIMIT_PX`` as uint8 RGB.
 
         It is shown when zoomed in. None when it would be no larger than the
@@ -2767,9 +2770,9 @@ class LayerPainterView(QWidget):
         from darsia.fluidflower.photograph_io import load_reduced_rgb8
 
         try:
-            width, height = photo_size(Path(path))
+            width, height = photo_size(Path(path), camera_u=camera_u)
             factor = max(1, int(math.ceil(max(width, height) / lp.DETAIL_LIMIT_PX)))
-            detail = load_reduced_rgb8(Path(path), factor)
+            detail = load_reduced_rgb8(Path(path), factor, camera_u=camera_u)
         except (OSError, ValueError):
             return None
         rows, cols = self.image.display.shape[:2]
@@ -2843,10 +2846,12 @@ class LayerPainterView(QWidget):
             return True
         from darsia.fluidflower.photograph_io import load_reduced
 
+        # A RAW of a run with a camera profile is shown on U, the grid of the marks.
+        camera_u = self._camera_u_profile() if image_family(path) == "raw" else None
         try:
-            width, height = photo_size(Path(path))
+            width, height = photo_size(Path(path), camera_u=camera_u)
             factor = max(1, int(math.ceil(max(width, height) / lp.DISPLAY_LIMIT_PX)))
-            rgb = load_reduced(Path(path), factor)
+            rgb = load_reduced(Path(path), factor, camera_u=camera_u)
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Could not show the photograph", str(error))
             return False
@@ -2916,13 +2921,13 @@ class LayerPainterView(QWidget):
         assert self.image is not None
         path = Path(path)
         expected = (int(self.image.image_size[0]), int(self.image.image_size[1]))
-        camera_u = None
+        # A camera RAW of a run with a configured camera profile is shown on the
+        # camera grid U (N106). U is also the grid of the camera's JPEG and of a
+        # RAW reference shown on U; otherwise both must be the same kind.
+        camera_u = self._camera_u_profile() if image_family(path) == "raw" else None
+        reference_on_u = getattr(self.image, "camera_u", None) is not None
         if image_family(path) != image_family(self.image.path):
-            # A camera RAW is shown under a JPEG reference only on the camera
-            # grid U of the run's configured profile (N106), never on its own grid.
-            if image_family(path) == "raw":
-                camera_u = self._camera_u_profile()
-            if camera_u is None or tuple(camera_u.camera_wh) != expected:
+            if camera_u is None and not reference_on_u:
                 if not quiet:
                     QMessageBox.warning(
                         self,
@@ -2934,10 +2939,8 @@ class LayerPainterView(QWidget):
                         "photograph of the same kind.",
                     )
                 return False
-        if camera_u is not None:
-            return self._set_camera_u_background(path, camera_u, expected, show=show, quiet=quiet)
         try:
-            width, height = photo_size(path)
+            width, height = photo_size(path, camera_u=camera_u)
         except (OSError, ValueError) as error:
             if not quiet:
                 QMessageBox.warning(self, "Could not read the photograph", str(error))
@@ -2957,7 +2960,7 @@ class LayerPainterView(QWidget):
         shape = self.image.display.shape[:2]
         try:
             factor = max(1, int(math.ceil(max(width, height) / lp.DISPLAY_LIMIT_PX)))
-            rgb = np.asarray(load_reduced(path, factor), dtype=np.float32)
+            rgb = np.asarray(load_reduced(path, factor, camera_u=camera_u), dtype=np.float32)
         except (OSError, ValueError) as error:
             if not quiet:
                 QMessageBox.warning(self, "Could not read the photograph", str(error))
@@ -2967,7 +2970,8 @@ class LayerPainterView(QWidget):
 
             rgb = cv2.resize(rgb, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
         rgb = np.clip(rgb, 0.0, 1.0)
-        return self._install_background(path, rgb, self._full_resolution(path), expected, show)
+        return self._install_background(
+            path, rgb, self._full_resolution(path, camera_u=camera_u), expected, show)
 
     def _camera_u_profile(self):
         """The reference run's configured camera-U profile, or None (cached per run)."""
@@ -2986,36 +2990,6 @@ class LayerPainterView(QWidget):
                 self._camera_u = None
             self._camera_u_key = key
         return self._camera_u
-
-    def _set_camera_u_background(self, path, camera_u, expected, *, show, quiet) -> bool:
-        """Show a camera RAW on the run's camera grid U under a JPEG reference.
-
-        The shared renderer places the RAW on exactly the grid of the camera's
-        JPEG, so marks drawn on the JPEG fit it unchanged (N106/N108).
-        """
-
-        from darsia.fluidflower.native.raw_photograph import load_camera_u_rgb8
-
-        try:
-            full = load_camera_u_rgb8(path, profile_path=camera_u.path,
-                                      profile_sha256=camera_u.sha256,
-                                      profile_id=camera_u.profile_id)
-        except (OSError, ValueError, KeyError, ImportError) as error:
-            if not quiet:
-                QMessageBox.warning(self, "Could not read the photograph", str(error))
-            return False
-        if (full.shape[1], full.shape[0]) != expected:
-            if not quiet:
-                QMessageBox.warning(self, "Background photo",
-                                    f"{path.name} renders at {full.shape[1]} x {full.shape[0]} pixels, "
-                                    f"the reference photo is {expected[0]} x {expected[1]}.")
-            return False
-        import cv2
-
-        rows, cols = self.image.display.shape[:2]
-        rgb = cv2.resize(full, (cols, rows), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        detail = full if full.shape[0] > rows and full.shape[1] > cols else None
-        return self._install_background(path, np.clip(rgb, 0.0, 1.0), detail, expected, show)
 
     def _install_background(self, path, rgb, detail, expected, show) -> bool:
         """Install a loaded background photo (display copy and detail) and show it."""

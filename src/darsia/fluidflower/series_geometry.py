@@ -952,9 +952,19 @@ def _image_size(path: Path) -> tuple[int, int, int | None]:
         return int(image.width), int(image.height), orientation
 
 
-def photo_size(path: Path) -> tuple[int, int]:
-    """Width and height of a photograph, from its header (RAW: upright sensor area)."""
+def photo_size(path: Path, *, camera_u=None) -> tuple[int, int]:
+    """Width and height of a photograph, from its header (RAW: upright sensor area).
 
+    With a run's camera-U profile (``camera_u``) a camera RAW is shown on the
+    camera grid U, so its size is the profile's U size (N106).
+    """
+
+    if camera_u is not None:
+        from darsia.fluidflower.image_formats import image_family
+
+        if image_family(path) == "raw":
+            width, height = camera_u.camera_wh
+            return int(width), int(height)
     width, height, _orientation = _image_size(Path(path))
     return width, height
 

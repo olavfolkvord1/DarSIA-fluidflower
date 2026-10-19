@@ -342,7 +342,10 @@ class RigFramePanel(QWidget):
             and reference.baseline_image
         ):
             try:
-                width, height = photo_size(reference.baseline_image)
+                from darsia.fluidflower.layer_painting import reference_camera_u
+
+                width, height = photo_size(reference.baseline_image,
+                                           camera_u=reference_camera_u(self.project, reference))
                 self._photo_size = (width, height)
             except (OSError, ValueError):
                 self._photo_size = None
@@ -752,10 +755,16 @@ class RigFramePanel(QWidget):
 
         host_show = getattr(self.page, "show_frame_photo", None)
         try:
-            width, height = photo_size(path)
+            # A RAW of a run with a camera profile is shown on U, the grid of the frame.
+            from darsia.fluidflower.layer_painting import photo_camera_u
+
+            reference = self.reference()
+            camera_u = (photo_camera_u(self.project, reference.run_id, path)
+                        if reference is not None else None)
+            width, height = photo_size(path, camera_u=camera_u)
             if not callable(host_show):
                 factor = max(1, int(math.ceil(max(width, height) / _DISPLAY_LIMIT_PX)))
-                rgb = load_reduced(path, factor)
+                rgb = load_reduced(path, factor, camera_u=camera_u)
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Could not show the photograph", str(error))
             return False

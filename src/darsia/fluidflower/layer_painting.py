@@ -727,7 +727,8 @@ def load_painting_session(
     size = None
     if reference.baseline_image is not None:
         try:
-            size = photo_size(reference.baseline_image)
+            size = photo_size(reference.baseline_image,
+                              camera_u=reference_camera_u(project, reference))
         except (OSError, ValueError):
             size = None
     session = PaintingSession.default(
@@ -840,6 +841,8 @@ class PaintingImage:
     display: np.ndarray
     analysis: np.ndarray
     _features: np.ndarray | None = None
+    # The run's camera-U profile when a RAW is shown on the camera grid U.
+    camera_u: Any = None
 
     @property
     def analysis_shape(self) -> tuple[int, int]:
@@ -859,22 +862,53 @@ class PaintingImage:
         return self._features
 
 
+def photo_camera_u(project: FluidFlowerProject, run_id: str, path: Path | str | None):
+    """The camera-U profile one photograph of a run is shown on, or None.
+
+    Only a camera RAW of a run with a configured profile (series.toml [native],
+    N106) is shown on the camera grid U; a JPEG or an unprofiled RAW keeps its
+    own grid. A present but malformed profile raises.
+    """
+
+    from darsia.fluidflower.image_formats import image_family
+
+    root = getattr(project, "root", None)
+    if path is None or root is None or image_family(path) != "raw":
+        return None
+    from darsia.fluidflower.series_native_context import camera_u_profile
+
+    return camera_u_profile(root, run_id)
+
+
+def reference_camera_u(project: FluidFlowerProject, reference: SeriesRunInputs | None):
+    """The camera-U profile of a run's reference photograph, or None."""
+
+    if reference is None:
+        return None
+    return photo_camera_u(project, reference.run_id, reference.baseline_image)
+
+
 def load_painting_image(
     path: Path,
     *,
+    camera_u: Any = None,
     analysis_width: int = ANALYSIS_WIDTH,
     display_limit: int = DISPLAY_LIMIT_PX,
 ) -> PaintingImage:
-    """Read a photograph reduced for display and for the pixel classifier."""
+    """Read a photograph reduced for display and for the pixel classifier.
+
+    With the run's camera-U profile a RAW is read on the camera grid U.
+    """
 
     import cv2
 
+    from darsia.fluidflower.image_formats import image_family
     from darsia.fluidflower.photograph_io import load_reduced
 
     selected = Path(path)
-    width, height = photo_size(selected)
+    width, height = photo_size(selected, camera_u=camera_u)
     factor = max(1, int(math.ceil(max(width, height) / float(display_limit))))
-    display = load_reduced(selected, factor)
+    display = load_reduced(selected, factor, camera_u=camera_u)
     target_width = min(int(analysis_width), display.shape[1])
     if target_width < display.shape[1]:
         target_height = max(8, int(round(height * target_width / width)))
@@ -888,6 +922,7 @@ def load_painting_image(
         (int(width), int(height)),
         np.ascontiguousarray(display, dtype=np.float32),
         np.ascontiguousarray(analysis, dtype=np.float32),
+        camera_u=camera_u if camera_u is not None and image_family(selected) == "raw" else None,
     )
 
 
@@ -1964,7 +1999,8 @@ def save_painted_revision(
     if problems:
         raise ValueError(" ".join(problems))
     assert reference.baseline_image is not None
-    width_px, height_px = photo_size(reference.baseline_image)
+    width_px, height_px = photo_size(reference.baseline_image,
+                                     camera_u=reference_camera_u(project, reference))
     if (width_px, height_px) != tuple(proposal.image_size):
         raise ValueError(
             f"The baseline photograph of {reference.run_id} has {width_px} x "
@@ -2103,6 +2139,8 @@ __all__ = [
     "frame_pixels_per_metre",
     "load_painting_image",
     "load_painting_session",
+    "photo_camera_u",
+    "reference_camera_u",
     "load_proposal",
     "merge_small_regions",
     "minimum_region_pixels",
