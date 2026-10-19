@@ -411,6 +411,7 @@ def register_chart(
     frame_review_to_camera_h: np.ndarray,
     frame_native_linear_rgb: np.ndarray,
     parameters: Mapping,
+    _gray_reader=None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     'Register frozen chart swatches from source photographs and reject invalid support.'
     policy = parameters["chart"]
@@ -443,8 +444,9 @@ def register_chart(
                   min(sensor["camera_wh"][0], right+policy["search_margin"]), min(sensor["camera_wh"][1], bottom+policy["search_margin"]))
     cv2.setRNGSeed(policy["rng_seed"])
     sift = cv2.SIFT_create(nfeatures=policy["sift_features"])
-    template_kp, template_desc = sift.detectAndCompute(gray_roi(baseline, template_box, parameters=sensor), None)
-    frame_kp, frame_desc = sift.detectAndCompute(gray_roi(frame, search_box, parameters=sensor), None)
+    read_gray = gray_roi if _gray_reader is None else _gray_reader
+    template_kp, template_desc = sift.detectAndCompute(read_gray(baseline, template_box, parameters=sensor), None)
+    frame_kp, frame_desc = sift.detectAndCompute(read_gray(frame, search_box, parameters=sensor), None)
     if template_desc is None or frame_desc is None:
         raise ValueError("Checker registration has no source-only descriptors")
     matches = cv2.BFMatcher().knnMatch(template_desc, frame_desc, k=2)

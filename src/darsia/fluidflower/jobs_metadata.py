@@ -147,6 +147,14 @@ def validate_current_selection(
             task = frame.get("native_task") or {}
             if task.get("kind") == "source":
                 raw = relocated(task["arguments"]["camera_jpeg"])
+            elif task.get("kind") == "raw_rig":
+                bound = relocated(task["geometry"])
+                geometry = reader.read(Path(bound["path"]), bound)
+                raw = relocated(geometry["acquisition"])
+                from .image_formats import image_family
+                if (image_family(raw["path"]) != "raw"
+                        or frame["source"]["source_sha256"] != raw["sha256"]):
+                    raise ValueError("RAW selected source differs from its exact acquisition")
             elif task.get("kind") == "rig":
                 bound = relocated(task["geometry"])
                 geometry = reader.read(Path(bound["path"]), bound)

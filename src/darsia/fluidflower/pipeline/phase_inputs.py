@@ -20,6 +20,33 @@ from ..phase import inputs as native_inputs, heads
 from ..phase.domain import RetainedSourceInferenceCache, _mask_digest
 from ..phase.metrics import validate_pixel_area
 
+RAW_ACQUISITION_CONTRACT = 'darsia-raw-phase-acquisition-v1'
+
+
+def verify_raw_acquisition(record, row, audit, *, parameters):
+    """Bind new baseline/history arrays to a RAW-produced acquisition.
+
+    The masked-array and temporal readers below retain their existing numeric
+    contracts. This additional source check prevents an old JPEG-positioned
+    row being relabelled as the new RAW baseline or initial history.
+    """
+    from ..image_formats import image_family
+    acquisition = row.get('raw_acquisition') or {}
+    raw_sha = acquisition.get('sha256')
+    expected = record.get('source_sha256', (record.get('source') or {}).get('source_sha256'))
+    if (row.get('contract') != RAW_ACQUISITION_CONTRACT or row.get('source_kind') != 'raw'
+            or image_family(acquisition.get('path', '')) != 'raw'
+            or not isinstance(raw_sha, str) or re.fullmatch('[0-9a-f]{64}', raw_sha) is None
+            or raw_sha != row.get(parameters['source_sha_field']) or raw_sha != expected
+            or record['full'].get('source_sha256') != raw_sha
+            or record['full'].get('binding', {}).get('producer_audit') != row.get('raw_producer_audit')
+            or audit.get('contract') != 'darsia-raw-rig-source-v1'
+            or audit.get('jpeg_inputs') is not False or audit.get('cpu_only') is not True
+            or audit.get('training') is not False
+            or audit.get('processor', {}).get('contract') != 'darsia-raw-rig-source-v1'
+            or audit.get('sources', {}).get('camera_arw', {}).get('sha256') != raw_sha):
+        raise ValueError('New RAW baseline/history differs from its actual RAW producer/source')
+
 def _descriptor(item, kind, aliases):
     if not isinstance(item, dict) or not isinstance(item.get('path'), str):
         raise ValueError('Missing SHA-bound ' + kind)

@@ -85,6 +85,9 @@ def validate_run(config):
     if not isinstance(frames, list) or not frames:
         raise ValueError("A nonempty fixed frame selection is required")
     ids, digests, last = set(), set(), None
+    raw_mode = any(frame.get("native_task", {}).get("kind") == "raw_rig" for frame in frames)
+    if raw_mode and any(frame.get("native_task", {}).get("kind") != "raw_rig" for frame in frames):
+        raise ValueError("A RAW-only run cannot mix JPEG-positioned native processors")
     predecessor = config["phase"]["initial_previous"]["source"]["source_sha256"]
     for spec in frames:
         identifier = name(spec["case_id"])
@@ -121,8 +124,15 @@ def validate_run(config):
         for key in ("native_task", "geometry", "phase_roles", "mass_spec"):
             if key not in spec:
                 raise ValueError("Missing frame-stage DATA: " + key)
-        if spec["native_task"]["kind"] not in {"rig", "source"}:
+        if spec["native_task"]["kind"] not in {"rig", "source", "raw_rig"}:
             raise ValueError("A fixed native processor kind is required")
+        if spec["native_task"]["kind"] == "raw_rig":
+            task = spec["native_task"]
+            if (set(task) != {"kind", "geometry", "processor"}
+                    or set(task["processor"]) != {"raw_binding"}
+                    or spec["phase_roles"].get("retained_source_cache") is not None
+                    or spec["phase_roles"].get("native_row") is not None):
+                raise ValueError("RAW-only task requires explicit binding and fresh inference roles")
         forbidden = {"current", "labels", "classes", "area"} & spec["mass_spec"].keys()
         if forbidden:
             raise ValueError("Mass current/phase/area must be fresh stage outputs")
@@ -344,6 +354,9 @@ class SeriesInputs:
         self.model_bundle = self._models()
         reference = config["phase"]["reference"]
         row = self.reader.json(reference["native_row"])
+        self.raw_mode = all(frame["native_task"]["kind"] == "raw_rig" for frame in config["frames"])
+        if self.raw_mode:
+            self._verify_raw_acquisition(reference, row)
         full, valid = loaders.compose_extended_scientific(
             reference["full"],
             parameters=self.parameters["scientific"],
@@ -489,13 +502,22 @@ class SeriesInputs:
             zones=self.reader.array(chain["zones"]),
         )
 
+    def _verify_raw_acquisition(self, record, row):
+        from . import phase_inputs as loaders
+        audit = self.reader.json(row["raw_producer_audit"])
+        loaders.verify_raw_acquisition(record, row, audit, parameters=self.parameters["inputs"])
+        self.reader.path(row["raw_acquisition"])
+
     def _saved_acquisition(self, record):
         """Load separately bound reference/current history arrays without inference."""
         import numpy as np
         from . import phase_inputs as loaders
 
+        row = self.reader.json(record["native_row"])
+        if self.raw_mode:
+            self._verify_raw_acquisition(record, row)
         native = loaders.original_native_input(
-            self.reader.json(record["native_row"]),
+            row,
             scientific_native_log=self.reader.array(
                 record["full"]["native_centre"]["log_linear_rgb"]
             ),
@@ -504,7 +526,7 @@ class SeriesInputs:
         )
         temporal = loaders.original_temporal_input(
             native,
-            self.reader.json(record["native_row"]),
+            row,
             parameters=self.parameters["inputs"],
             ring_parameters=self.native_parameters["extended_ring"],
             aliases=self.aliases,
@@ -565,6 +587,7 @@ class SeriesInputs:
         ipp_before = scientific_thread("SeriesInputs.native:before")
         import numpy as np
         from ..native.source import RigSourceProcessor, SourceProcessor
+        from ..native.raw_rig_source import RawRigSourceProcessor
         from ..native import extension, sidecar
         from ..mass.n1_pipeline import asset, _write_json
 
@@ -575,7 +598,10 @@ class SeriesInputs:
         key = json.dumps(task["processor"], sort_keys=True)
         if key not in self.processors:
             value = task["processor"]
-            if kind == "rig":
+            if kind == "raw_rig":
+                self.processors[key] = RawRigSourceProcessor(
+                    self.reader.path(value["raw_binding"]), parameters=self.native_parameters)
+            elif kind == "rig":
                 self.processors[key] = RigSourceProcessor(
                     self.reader.path(value["native_manifest"]),
                     parameters=self.native_parameters,
@@ -593,7 +619,15 @@ class SeriesInputs:
                     parameters=self.native_parameters,
                 )
         processor = self.processors[key]
-        if kind == "rig":
+        if kind == "raw_rig":
+            if (geometry_row["acquisition"]["sha256"] != spec["source"]["source_sha256"]
+                    or geometry_row["run"] != self.config["run"]):
+                raise ValueError("RAW native acquisition differs from the selected source identity")
+            if (spec["phase_roles"].get("retained_source_cache") is not None
+                    or spec["phase_roles"].get("native_row") is not None):
+                raise ValueError("RAW-only positioning cannot reuse JPEG-positioned inference")
+            log, audit = processor.correct(geometry_row)
+        elif kind == "rig":
             log, audit = processor.correct(
                 geometry_row,
                 parent_frame_index=task["parent_frame_index"],
@@ -645,7 +679,7 @@ class SeriesInputs:
         full, full_valid, ring_audit = extension.extend_prepared_source(
             log,
             audit,
-            processor if kind == "rig" else processor_for_ring,
+            processor if kind in {"rig", "raw_rig"} else processor_for_ring,
             context.rig_domain & observed,
             parameters=self.native_parameters,
         )

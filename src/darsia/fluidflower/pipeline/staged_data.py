@@ -214,9 +214,13 @@ def validate_phase1_run(config):
             raise ValueError("Selection must retain strict chronological order")
         task = _keys(spec["native_task"], {"kind", "geometry", "processor"},
                      {"parent_frame_index", "parent_reference", "arguments", "reference_to_frame_h"}, where="native task roles")
-        if task["kind"] not in {"rig", "source"}:
+        if task["kind"] not in {"rig", "source", "raw_rig"}:
             raise ValueError("Only the original fixed native processors are admitted")
-        if task["kind"] == "rig":
+        if task["kind"] == "raw_rig":
+            _keys(task, {"kind", "geometry", "processor"}, where="RAW-only native task roles")
+            _keys(task["processor"], {"raw_binding"}, where="RAW-only native processor roles")
+            _bound(task["processor"]["raw_binding"], where="RAW-only source binding")
+        elif task["kind"] == "rig":
             _keys(task, {"kind", "geometry", "processor", "parent_frame_index", "parent_reference"}, where="rig native task roles")
             _keys(task["processor"], {"native_manifest"}, where="rig native processor roles")
             _bound(task["processor"]["native_manifest"], where="rig native manifest")
@@ -262,6 +266,9 @@ def validate_phase1_run(config):
                       "probability_spacing_m", "placement_metadata"},
                       {"native_row", "probability_receipt", "photo_sand_reference", "photo_proof", "retained_frame_index"},
                       where="frame phase roles")
+        if task["kind"] == "raw_rig" and (roles.get("retained_source_cache") is not None
+                                          or roles.get("native_row") is not None):
+            raise ValueError("RAW-only positioning requires fresh inference without JPEG-positioned parent roles")
         if roles["retained_source_cache"] is not None and (
                 type(roles.get("retained_frame_index")) is not int or roles["retained_frame_index"] < 0):
             raise ValueError("Original retained cache frame index must be explicit; no selection-index inference")

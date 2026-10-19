@@ -284,6 +284,13 @@ class InputCatalog:
         native = self.doc(config["native"]["configuration"], "configuration", "native.configuration")
         for key in ("reference", "initial_previous"):
             self.original_acquisition(config["phase"][key], p["inputs"], "phase." + key)
+            if any(frame["native_task"]["kind"] == "raw_rig" for frame in config["frames"]):
+                from .phase_inputs import verify_raw_acquisition
+                record = config["phase"][key]
+                row = self.doc(record["native_row"], "configuration", "phase." + key + ".native_row")
+                audit = self.doc(row["raw_producer_audit"], "configuration", "phase." + key + ".raw_audit")
+                verify_raw_acquisition(record, row, audit, parameters=p["inputs"])
+                self.add(row["raw_acquisition"], "image", "phase." + key + ".raw_acquisition")
         bundles = phase["model_bundles"]
         for role in ("native", "edge"):
             item = bundles[role]
@@ -359,7 +366,26 @@ class InputCatalog:
 
     def native_task(self, task, geometry, parameters, use):
         processor = task["processor"]
-        if task["kind"] == "rig":
+        if task["kind"] == "raw_rig":
+            from ..native.raw_rig_source import validate_binding, validate_frame
+            from ..image_formats import image_family
+            binding = self.doc(processor["raw_binding"], "configuration", use + ".raw_binding")
+            validate_binding(binding, parameters)
+            validate_frame(geometry, binding, parameters)
+            for name, descriptor in (("baseline_raw", binding["baseline_raw"]),
+                                     ("acquisition", geometry["acquisition"])):
+                if image_family(descriptor["path"]) != "raw":
+                    raise ValueError("RAW-only native task has a non-RAW acquisition")
+                self.add(descriptor, "image", use + "." + name)
+            for name in ("fit", "reference"):
+                model = binding["models"][name]
+                self.add(model["data"], "calibration", use + "." + name + ".data")
+                self.doc(model["sidecar"], "calibration", use + "." + name + ".sidecar")
+            if binding["models"]["old_field"] is not None:
+                self.add(binding["models"]["old_field"], "calibration", use + ".old_field")
+            for index, descriptor in enumerate(binding["shape_assets"]):
+                self.add(descriptor, "rig_model", use + ".shape." + str(index))
+        elif task["kind"] == "rig":
             manifest = self.doc(processor["native_manifest"], "configuration", use + ".native_manifest")
             binding = manifest["v5_photometry"]
             self.pair_doc(binding, "source_manifest", "source_manifest_sha256", "configuration", use + ".source_manifest")
