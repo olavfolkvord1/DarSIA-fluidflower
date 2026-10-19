@@ -164,12 +164,19 @@ def test_the_proposal_and_the_saved_session_still_use_the_reference(view, paths,
     saved = lp.session_path(view.project, "ac52")
     before = json.loads(saved.read_text(encoding="utf-8"))
     assert view.set_background_photo(paths["before"])
+    view.save_session()
+    assert json.loads(saved.read_text(encoding="utf-8")) == before
     view.add_polygon(lp.Polygon(3, [(35.0, 5.0), (35.0, 30.0), (55.0, 30.0), (55.0, 5.0)]))
     view.save_session()
     after = json.loads(saved.read_text(encoding="utf-8"))
     # The background is not written to the session; the image is the reference.
     assert after["image"] == before["image"]
-    assert "background" not in json.dumps(after)
+    # The reference path itself may legitimately contain "background". Check
+    # the document fields rather than searching arbitrary serialized values.
+    assert after.keys() == before.keys()
+    assert {key: value for key, value in after.items() if key != "polygons"} == {
+        key: value for key, value in before.items() if key != "polygons"
+    }
     assert str(view.image.path) == str(paths["baseline"])
 
 
