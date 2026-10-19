@@ -296,7 +296,12 @@ def test_whole_job_explicit_qualified_provider_uses_real_budget(projection_fixtu
     result = capacity.whole_job_report(f.stores, "FF_AC", [f.task], [{}],
         repository=f.runtime.repository, job_root=f.runtime.root, cache_provider=f.adapter)
     assert result["sufficient"] and result["complete_admission_sufficient"]
-    assert result["needed_bytes"] == PHYSICAL_RESERVE_BYTES + 500
+    # N51: this job's result estimate excludes other result reservations, which
+    # remain visible. The independently qualified cache budget stays strict.
+    assert result["needed_bytes"] == PHYSICAL_RESERVE_BYTES + 400
+    assert result["other_active_remaining_bytes"] == 100
+    assert result["other_active_remaining_included_in_results_estimate"] is False
+    assert result["results_space_policy"] == "estimate, not coordinated across hosts"
     assert result["required_cache_bytes"] == 200
     assert result["quota_headroom_bytes"] == 800
     assert result["cache"]["reservation_created"] is False
