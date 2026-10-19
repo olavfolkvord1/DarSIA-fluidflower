@@ -33,6 +33,36 @@ REFERENCE_REQUEST = "darsia-n43-reference-build-request-v1"
 REFERENCE_ADMINISTRATION = "darsia-n43-reference-build-administration-v1"
 REFERENCE_ENTITLEMENT_BYTES = 65728995330
 REFERENCE_CASE_IDS = ["ac52_f" + str(i) for i in range(1, 44) if i not in {8, 15, 22, 24}]
+# Reference builds Olav released, each pinned exactly here and reviewed as code:
+# authority ids -> the answer records with their deciders, and the accepted plan.
+# Every one keeps the aggregate entitlement REFERENCE_ENTITLEMENT_BYTES.
+REFERENCE_RELEASES = {
+    ("N43", "Q109", "Q106"): dict(
+        records={
+            "N43-OLAV-GO-execute-plan-9dc0979d-tonight-Main-reference-and-Olav-qualification": "olav",
+            "Q109-answer-option-A-whole-output-entitlement-65728995330B-all-stages-count": "claude",
+            "Q106-answer-sampled-operational-reserve-hard-bound-is-Q87-volume-no-new-seam": "claude",
+        },
+        plan_sha256="9dc0979d5cd48ce18df6391253ed3f178f181c0c321626cef179c25a2e59e988",
+    ),
+    # R3, the RAW39 reference: N134 is Olav's release, N136 names the plan and
+    # entitlement, and N135 is his choice of this exact entry.
+    ("N134", "N136"): dict(
+        records={
+            "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
+            "N136-CLAUDE-r3-plan-3ea1caa8-entitlement-65728995330B-pinned-for-the-exact-code-entry": "claude",
+        },
+        plan_sha256="3ea1caa8ff432f5c17d2904f7f43080e23aeac039a447d8667a1586749e0426e",
+    ),
+}
+
+
+def released_reference(authority_ids):
+    """The REFERENCE_RELEASES entry these authority ids name exactly, or None."""
+
+    if not isinstance(authority_ids, list) or not all(isinstance(item, str) for item in authority_ids):
+        return None
+    return REFERENCE_RELEASES.get(tuple(authority_ids))
 CAPACITY_BOUND = "darsia-cache-required-capacity-bound-v1"
 BOUNDED_EVIDENCE = "darsia-cache-physical-bound-sampled-evidence-v1"
 Q104_OUTPUT_ENTITLEMENT_BYTES = 27374032352  # Historical metadata parser only; Q119 governs the active bound route.
@@ -225,10 +255,12 @@ class FirstQualification:
         _exact_keys(self.request, fields, "Exact Root-released finite first request required")
         expected_format = (REFERENCE_REQUEST if self.reference_build else
             BOUND_REQUEST if self.bound_mode else REQUEST)
-        authorities = (["N43", "Q109", "Q106"] if self.reference_build else
+        # A reference build names one exactly released authority set (REFERENCE_RELEASES).
+        authorities = (None if self.reference_build else
             ["Q97", "Q99", "Q102", "Q104", "Q106", "Q109", "Q117", "Q119"] if self.bound_mode else ["Q97", "Q99"])
+        released = released_reference(self.request.get("authority_ids")) is not None
         if (self.request["format"] != expected_format or self.request["execution_authorized"] is not True
-                or self.request["authority_ids"] != authorities
+                or (not released if authorities is None else self.request["authority_ids"] != authorities)
                 or self.request["provider"] != provider_binding
                 or self.request["stores_source"] != stores_source
                 or self.request["namespace_admission"] != namespace):
@@ -292,6 +324,8 @@ class FirstQualification:
             self.reference_administration = checked_reference_administration(
                 read(_descriptor(self.request["reference_administration"])), self, read=read,
                 read_authorities=read_authorities)
+            if self.request["authority_ids"] != self.reference_administration["authority_ids"]:
+                raise CachePolicyError("Finite release/stores/provider/authority binding differs")
         self.q123_cold_scope = None
         if "q123_cold_scope" in self.request:
             from .retained_qualification import RetainedColdScope
@@ -2105,7 +2139,12 @@ def checked_all_stage_reference(task, value, *, read, maximum_output_bytes=Q104_
 
 
 def checked_reference_administration(value, first, *, read, read_authorities=None):
-    """N43/Q109 is an explicit producer entitlement, never a measured profile."""
+    """A released reference build is an explicit producer entitlement, never a measured profile.
+
+    Its authority ids must name one entry of REFERENCE_RELEASES exactly; that
+    entry's answer records and plan SHA-256 must match (N43/Q109 is the first).
+    """
+    release = released_reference(value.get("authority_ids")) if isinstance(value, dict) else None
     _exact_keys(value, {"format", "authority_ids", "answers_source", "accepted_plan",
         "scope", "task", "host", "host_policy", "owned_roots", "entry_limit",
         "aggregate_entitlement_bytes", "counting_semantics", "watchdog_period_seconds",
@@ -2113,7 +2152,7 @@ def checked_reference_administration(value, first, *, read, read_authorities=Non
         "memory_reserve_bytes", "all_external_writers_redirected", "exclusive_producer",
         "output_configuration", "requested_native_layout", "output_writers", "producer_state"}, "Exact N43 reference administration required")
     if (value["format"] != REFERENCE_ADMINISTRATION
-            or value["authority_ids"] != ["N43", "Q109", "Q106"]
+            or release is None
             or value["scope"] != first.provider["scope"]
             or value["scope"]["ordered_case_ids"] != REFERENCE_CASE_IDS
             or value["task"] != first.request["task"]
@@ -2133,11 +2172,8 @@ def checked_reference_administration(value, first, *, read, read_authorities=Non
     authorities=(read if read_authorities is None else read_authorities)(
         _descriptor(value["answers_source"]))
     ids={row.get("id"):row for row in authorities} if isinstance(authorities,list) else {}
-    required={"N43-OLAV-GO-execute-plan-9dc0979d-tonight-Main-reference-and-Olav-qualification":"olav",
-        "Q109-answer-option-A-whole-output-entitlement-65728995330B-all-stages-count":"claude",
-        "Q106-answer-sampled-operational-reserve-hard-bound-is-Q87-volume-no-new-seam":"claude"}
-    if any(ids.get(key,{}).get("decided_by")!=by for key,by in required.items()):
-        raise CachePolicyError("Actual N43 humanGO/Q109/Q106 source records required")
+    if any(ids.get(key,{}).get("decided_by")!=by for key,by in release["records"].items()):
+        raise CachePolicyError("Actual released humanGO and authority source records required")
     argv=first.request["public_command"]
     def option(name, expected):
         positions=[i for i,arg in enumerate(argv) if arg==name]
@@ -2146,8 +2182,8 @@ def checked_reference_administration(value, first, *, read, read_authorities=Non
             or argv.count("--once")!=1 or "--watchdog" in argv):
         raise CachePolicyError("N43 preserves one original whole-run CPU worker/once and forbids automatic retry")
     _descriptor(value["accepted_plan"])
-    if value["accepted_plan"]["sha256"]!="9dc0979d5cd48ce18df6391253ed3f178f181c0c321626cef179c25a2e59e988":
-        raise CachePolicyError("N43 humanGO names the exact retained plan9dc0979d")
+    if value["accepted_plan"]["sha256"]!=release["plan_sha256"]:
+        raise CachePolicyError("The released humanGO names the exact retained plan "+release["plan_sha256"][:8])
     read(value["accepted_plan"])
     if not isinstance(value["requested_native_layout"],dict) or not value["output_writers"]:
         raise CachePolicyError("Predeclared actual native layout and closed output-writer pins required")
