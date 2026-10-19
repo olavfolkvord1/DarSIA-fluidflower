@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import stat
 import sys
@@ -100,6 +100,112 @@ def _exact_authority_list(binding, package_file):
     if not isinstance(document, list) or any(not isinstance(row, dict) for row in document):
         raise CachePolicyError("Authority metadata must be a list of record objects")
     return document
+
+
+class _HistoricalAuthorityReader:
+    """Root-bound Q134 history for named preserved requests, never a fallback.
+
+    New authority reads use the full immutable current snapshot. Only an exact
+    preserved request may resolve the one declared old answers descriptor.
+    Original requests, descriptors, and live authority files are never changed.
+    """
+    def __init__(self, binding, package_file):
+        self.package_file = package_file
+        self.binding = _descriptor(binding)
+        value = _exact(self.binding, package_file)
+        if (set(value) != {"format", "authority_ids", "current_authorities",
+                "preserved_requests", "historical_authorities"}
+                or value["format"] != "darsia-cache-historical-authority-resolution-v1"
+                or value["authority_ids"] != ["Q134"]):
+            raise CachePolicyError("Exact Root-bound Q134 historical authority map required")
+        current = value["current_authorities"]
+        if not isinstance(current, dict) or set(current) != {"claude_answers", "claude_status"}:
+            raise CachePolicyError("Both immutable current authority snapshots are required")
+        self.current = {}
+        for role, row in current.items():
+            if not isinstance(row, dict) or set(row) != {"source", "snapshot"}:
+                raise CachePolicyError("Exact current authority source/snapshot pair required")
+            source, snapshot = _descriptor(row["source"]), _descriptor(row["snapshot"])
+            if (PureWindowsPath(source["path"]).name.casefold() != role + ".json"
+                    or self._path(source) == self._path(snapshot)
+                    or (source["sha256"], source["size_bytes"]) != (snapshot["sha256"], snapshot["size_bytes"])):
+                raise CachePolicyError("Immutable snapshot must preserve exact current authority bytes outside its live path")
+            _outside(source["path"], package_file)
+            document = (_exact_authority_list(snapshot, package_file) if role == "claude_answers"
+                else _exact(snapshot, package_file))
+            self.current[role] = (source, snapshot, document)
+        answers = self.current["claude_answers"][2]
+        if not any(row.get("id") == "Q134-answer-option1-historical-authority-resolver-and-immutable-authority-snapshots"
+                and row.get("decided_by") == "claude" for row in answers):
+            raise CachePolicyError("Actual current Q134 authority required")
+        requests = value["preserved_requests"]
+        if not isinstance(requests, list) or not requests:
+            raise CachePolicyError("Explicit preserved original request pins required")
+        self.requests = [_descriptor(row) for row in requests]
+        if len({self._path(row) for row in self.requests}) != len(self.requests):
+            raise CachePolicyError("Preserved original request paths must be unique")
+        history = value["historical_authorities"]
+        if not isinstance(history, list) or len(history) != 1:
+            raise CachePolicyError("Exactly one declared historical answers version required")
+        row = history[0]
+        if not isinstance(row, dict) or set(row) != {"original", "snapshot", "entry_count"}:
+            raise CachePolicyError("Exact historical original/snapshot/count required")
+        original, snapshot = _descriptor(row["original"]), _descriptor(row["snapshot"])
+        historical = _exact_authority_list(snapshot, package_file)
+        if (self._path(original) != self._path(self.current["claude_answers"][0])
+                or self._path(original) == self._path(snapshot)
+                or (original["sha256"], original["size_bytes"]) != (snapshot["sha256"], snapshot["size_bytes"])
+                or type(row["entry_count"]) is not int or not 0 < row["entry_count"] < len(answers)
+                or len(historical) != row["entry_count"] or answers[:len(historical)] != historical):
+            raise CachePolicyError("Historical raw pin/path/entry-prefix provenance differs")
+        self.original, self.snapshot = original, snapshot
+        self._verify_actual_prefix(answers)
+
+    @staticmethod
+    def _path(pin):
+        return str(PureWindowsPath(pin["path"])).casefold()
+
+    def _verify_actual_prefix(self, snapshot):
+        # This live read proves prefix provenance only; appended records never
+        # replace the immutable request-time authority document used by the job.
+        source = self.current["claude_answers"][0]
+        path = _outside(source["path"], self.package_file)
+        before = path.stat()
+        if not 0 < before.st_size <= 16 * 1024**2:
+            raise CachePolicyError("Bounded current authority prefix source required")
+        raw = path.read_bytes()
+        after = path.stat()
+        version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+        if version(before) != version(after) or len(raw) != before.st_size:
+            raise CachePolicyError("Current authority prefix source changed while reading")
+        actual = _exact_authority_list(dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(),
+            size_bytes=len(raw)), self.package_file)
+        if actual[:len(snapshot)] != snapshot:
+            raise CachePolicyError("Current authority entry-prefix provenance differs")
+
+    def current_authorities(self, binding):
+        pin = _descriptor(binding)
+        if pin != self.current["claude_answers"][1]:
+            raise CachePolicyError("Every new request must bind its immutable full-current answers snapshot")
+        return _exact_authority_list(pin, self.package_file)
+
+    def for_original(self, request):
+        from copy import deepcopy
+        if _descriptor(request) not in self.requests:
+            raise CachePolicyError("Historical authority map is only for its preserved original requests")
+        def read(binding):
+            pin = _descriptor(binding)
+            if self._path(pin) == self._path(self.original):
+                if pin != self.original:
+                    raise CachePolicyError("Historical original authority descriptor differs")
+                # Recheck immutable bytes on every fresh reconstruction.
+                return _exact_authority_list(self.snapshot, self.package_file)
+            if pin == self.current["claude_answers"][1]:
+                return self.current_authorities(pin)
+            # Other already immutable historical snapshots keep their original
+            # exact reader. No failed ordinary read is ever redirected.
+            return deepcopy(_exact_authority_list(pin, self.package_file))
+        return read
 
 
 def _python_module_invocation():

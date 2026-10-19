@@ -36,8 +36,9 @@ def _verify_original_directory(path, identity):
 
 
 class _MetadataOnce:
-    def __init__(self, package_file):
+    def __init__(self, package_file, *, authority_reader=None):
         self.package_file, self.seen = package_file, {}
+        self.authority_reader = authority_reader
 
     def remember(self, pin, document):
         key = str(PureWindowsPath(pin["path"])).casefold()
@@ -69,7 +70,8 @@ class _MetadataOnce:
             if not isinstance(document, list) or any(not isinstance(row, dict) for row in document):
                 raise CachePolicyError("Authority metadata must be a list of record objects")
             return deepcopy(document)
-        document = _exact_authority_list(pin, self.package_file)
+        document = (_exact_authority_list(pin, self.package_file) if self.authority_reader is None
+            else self.authority_reader(pin))
         self.remember(pin, document)
         return deepcopy(document)
 
@@ -150,7 +152,8 @@ class OriginalServiceObserverContext:
     resolver_is_not_retirement_proof: bool = True
 
 
-def resolve_original_service_context(receipt_binding, *, package_file, first_request=None, retained_close=None):
+def resolve_original_service_context(receipt_binding, *, package_file, first_request=None, retained_close=None,
+                                     historical_authorities=None):
     """Reopen exact metadata once; no ImportLease constructor or live handles.
 
     Requires CacheBudgetLedger.locked(create_binding=False). The original
@@ -159,7 +162,12 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
     primary owner. Full registered-owner/launch/reader retirement is still a
     separate mandatory provider; this function does not inspect/kill processes.
     """
-    reads = _MetadataOnce(package_file)
+    if historical_authorities is not None:
+        from .bootstrap import _HistoricalAuthorityReader
+        if not isinstance(historical_authorities, _HistoricalAuthorityReader):
+            raise CachePolicyError("Exact Root-bound historical authority reader required")
+    reader = None if historical_authorities is None else historical_authorities.for_original(first_request)
+    reads = _MetadataOnce(package_file, authority_reader=reader)
     receipt_binding = _descriptor(receipt_binding)
     receipt = reads.read(receipt_binding)
     if receipt.get("format") != "darsia-cache-import-service-receipt-v1":
@@ -186,7 +194,7 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
             raise CachePolicyError("Explicit first observer requires the original immutable provider")
         first=FirstQualification(first_request,provider_binding=role["profile"],
             stores_source=policy_binding,namespace=receipt["namespace"],read=reads.read,
-            read_authorities=reads.read_authorities)
+            read_authorities=reads.read_authorities, historical_authorities=historical_authorities)
         admin=receipt.get("first_qualification",{})
         entitlement=admin.get("administrative_entitlement",{})
         if (admin.get("request")!=first.binding or admin.get("provider")!=role["profile"]
@@ -411,7 +419,7 @@ class RetainedServiceCloseContext:
     Every original cache file is retained. This is not cleanup eligibility,
     scientific success, rearm authority or an assertion of zero retained bytes.
     """
-    def __init__(self, binding, *, package_file, retained_close=None):
+    def __init__(self, binding, *, package_file, retained_close=None, historical_authorities=None):
         from .first_qualification import _digest, _exact_keys
         self.reads=_MetadataOnce(package_file)
         self.binding=_descriptor(binding)
@@ -429,12 +437,27 @@ class RetainedServiceCloseContext:
                 or release.get("execution_authorized") is not True
                 or release.get("request_payload_sha256")!=_digest({key:value for key,value in self.request.items() if key!="root_release"})):
             raise CachePolicyError("Actual Root release for this retained close required")
+        if "historical_authority_resolution" in release:
+            from .bootstrap import _HistoricalAuthorityReader
+            if historical_authorities is not None:
+                if not isinstance(historical_authorities, _HistoricalAuthorityReader):
+                    raise CachePolicyError("Exact Root-bound historical authority reader required")
+                historical_authorities.for_original(self.binding)
+            historical_authorities = _HistoricalAuthorityReader(
+                release["historical_authority_resolution"], package_file)
+            self.reads.authority_reader = historical_authorities.current_authorities
+        elif historical_authorities is not None:
+            from .bootstrap import _HistoricalAuthorityReader
+            if not isinstance(historical_authorities, _HistoricalAuthorityReader):
+                raise CachePolicyError("Exact Root-bound historical authority reader required")
+            self.reads.authority_reader = historical_authorities.for_original(self.binding)
         answers=self.reads.read_authorities(self.request["answers_source"])
         required={"Q123-answer-option1-append-only-closeout-and-new-empty-exclusive-scope-retained-bytes-counted"}
         if not required.issubset({row.get("id") for row in answers}):
             raise CachePolicyError("Actual Q123 authority required")
         self.original=resolve_original_service_context(self.request["original_service_receipt"],
-            package_file=package_file,first_request=self.request["original_request"],retained_close=retained_close)
+            package_file=package_file,first_request=self.request["original_request"],retained_close=retained_close,
+            historical_authorities=historical_authorities)
         if self.original.entry_kind!="worker" or self.original.purpose!="jobs":
             raise CachePolicyError("Retained close is only the original worker/jobs service")
         self._seal=_digest(self.request)

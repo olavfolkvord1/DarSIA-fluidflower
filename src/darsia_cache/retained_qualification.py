@@ -12,7 +12,7 @@ from .policy import CachePolicyError, _descriptor
 
 
 class RetainedColdScope:
-    def __init__(self, first, binding, *, read, read_authorities):
+    def __init__(self, first, binding, *, read, read_authorities, historical_authorities=None):
         from .first_qualification import _digest, _exact_keys
         from .service_context import RetainedServiceCloseContext
         self.binding = _descriptor(binding)
@@ -37,7 +37,8 @@ class RetainedColdScope:
             "retained_cache_inventory", "all_files_retained", "retained_bytes_are_still_used",
             "cleanup_authorized", "rearm_authorized"}, "Actual original retained close result required")
         self.closed = RetainedServiceCloseContext(result["request"], package_file=__file__,
-            retained_close=_descriptor(result["close_record"]))
+            retained_close=_descriptor(result["close_record"]),
+            historical_authorities=historical_authorities)
         original = self.closed.original
         if (result["format"] != "darsia-cache-retained-service-close-result-v1"
                 or result["reservation"] != original.reservation

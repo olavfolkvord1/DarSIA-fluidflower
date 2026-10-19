@@ -206,7 +206,7 @@ def administrative_entitlement(report):
 class FirstQualification:
     """Read exact metadata on init; no cache/output writes or environment changes."""
     def __init__(self, binding, *, provider_binding, stores_source, namespace, read,
-                 read_authorities=None):
+                 read_authorities=None, historical_authorities=None):
         self.binding = _descriptor(binding)
         self.request = read(self.binding)
         self.reference_build = self.request.get("format") == REFERENCE_REQUEST
@@ -245,6 +245,23 @@ class FirstQualification:
                 or release.get("scope") != self.request["scope"]
                 or release.get("request_payload_sha256") != _digest(payload)):
             raise CachePolicyError("Actual Root-released first scope required")
+        if "historical_authority_resolution" in release:
+            if not self.bound_mode or "q123_cold_scope" not in self.request:
+                raise CachePolicyError("Q134 map belongs only to a new bound retained-scope request")
+            from .bootstrap import _HistoricalAuthorityReader
+            if historical_authorities is not None:
+                if not isinstance(historical_authorities, _HistoricalAuthorityReader):
+                    raise CachePolicyError("Exact Root-bound historical authority reader required")
+                historical_authorities.for_original(self.binding)
+            historical_authorities = _HistoricalAuthorityReader(
+                release["historical_authority_resolution"], __file__)
+            read_authorities = historical_authorities.current_authorities
+        elif historical_authorities is not None:
+            from .bootstrap import _HistoricalAuthorityReader
+            if not isinstance(historical_authorities, _HistoricalAuthorityReader):
+                raise CachePolicyError("Exact Root-bound historical authority reader required")
+            historical_authorities.for_original(self.binding)
+        self.historical_authorities = historical_authorities
         self.provider_binding = _descriptor(provider_binding)
         self.provider = checked_provider(read(self.provider_binding))
         if (self.request["scope"] != self.provider["scope"]
@@ -279,7 +296,8 @@ class FirstQualification:
         if "q123_cold_scope" in self.request:
             from .retained_qualification import RetainedColdScope
             self.q123_cold_scope = RetainedColdScope(self, self.request["q123_cold_scope"],
-                read=read, read_authorities=read_authorities)
+                read=read, read_authorities=read_authorities,
+                historical_authorities=historical_authorities)
         self.started = False
         self.claim = None
 
@@ -2269,34 +2287,39 @@ def reference_scope_snapshot(first, lease):
             nonlocal entries,total,subtotal
             try:
                 start=_reference_stat_identity(_reference_directory_stat(directory))
+                pending=[]
                 with os.scandir(directory) as stream:
                     for entry in stream:
                         entries+=1
                         if entries>value["entry_limit"]:
                             raise CachePolicyError("N43 finite aggregate accounting entry limit exceeded")
-                        try:
-                            info=Path(entry.path).lstat()
-                        except FileNotFoundError:
-                            anomalies.append(dict(path=entry.path,state="VANISHED_DURING_SAMPLE"));continue
-                        if getattr(info,"st_reparse_tag",0) or getattr(info,"st_file_attributes",0)&0x400:
-                            raise CachePolicyError("N43 aggregate reparse entry refused")
-                        if stat.S_ISDIR(info.st_mode):
-                            walk(Path(entry.path))
-                        else:
-                            if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
-                                raise CachePolicyError("N43 aggregate file type/hardlink refused")
-                            identity=(info.st_dev,info.st_ino)
-                            if identity in identities:
-                                # A live directory rename can expose the same
-                                # one-link file twice. Count once and mark the
-                                # non-atomic sample, never call this a peak.
-                                anomalies.append(dict(path=entry.path,state="IDENTITY_SEEN_TWICE_DURING_SAMPLE"));continue
-                            identities.add(identity);total+=info.st_size;subtotal+=info.st_size
-                            relative=Path(entry.path).relative_to(root)
-                            if entry.name in {"candidate_completed.json","completed.json"} or (
-                                    row["role"]=="job" and relative==Path("done")/"ac52.json"):
-                                terminal_metadata.append(dict(path=entry.path,size_bytes=info.st_size,
-                                    role="original terminal/candidate metadata; not Root reference acceptance"))
+                        pending.append((entry.name,entry.path))
+                # Close this directory's iterator before inspecting children or
+                # descending; an ancestor monitor handle must not span recursion.
+                for name,path in pending:
+                    try:
+                        info=Path(path).lstat()
+                    except FileNotFoundError:
+                        anomalies.append(dict(path=path,state="VANISHED_DURING_SAMPLE"));continue
+                    if getattr(info,"st_reparse_tag",0) or getattr(info,"st_file_attributes",0)&0x400:
+                        raise CachePolicyError("N43 aggregate reparse entry refused")
+                    if stat.S_ISDIR(info.st_mode):
+                        walk(Path(path))
+                    else:
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
+                            raise CachePolicyError("N43 aggregate file type/hardlink refused")
+                        identity=(info.st_dev,info.st_ino)
+                        if identity in identities:
+                            # A live directory rename can expose the same
+                            # one-link file twice. Count once and mark the
+                            # non-atomic sample, never call this a peak.
+                            anomalies.append(dict(path=path,state="IDENTITY_SEEN_TWICE_DURING_SAMPLE"));continue
+                        identities.add(identity);total+=info.st_size;subtotal+=info.st_size
+                        relative=Path(path).relative_to(root)
+                        if name in {"candidate_completed.json","completed.json"} or (
+                                row["role"]=="job" and relative==Path("done")/"ac52.json"):
+                            terminal_metadata.append(dict(path=path,size_bytes=info.st_size,
+                                role="original terminal/candidate metadata; not Root reference acceptance"))
                 if _reference_stat_identity(_reference_directory_stat(directory))!=start:
                     anomalies.append(dict(path=str(directory),state="DIRECTORY_IDENTITY_CHANGED_DURING_SAMPLE"))
             except FileNotFoundError:

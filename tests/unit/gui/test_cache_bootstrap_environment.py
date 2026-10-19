@@ -1,10 +1,15 @@
 """Memory-only pre-import application, never a host cache admission/profile."""
 from types import SimpleNamespace
+from copy import deepcopy
+import hashlib
 import json
 import tempfile
 
+import pytest
+
 import darsia_cache.bootstrap as bootstrap
 from darsia_cache.environment import derive_cache_environment, WRITER_ENVIRONMENT_KEYS
+from darsia_cache.policy import CachePolicyError
 
 
 def test_bootstrap_applies_all_child_writer_keys_and_preserves_parent(monkeypatch):
@@ -128,3 +133,127 @@ def test_explicit_stores_read_preserves_positive_one_mib_before_read_bound(monke
         with pytest.raises(CachePolicyError,match='one MiB'):
             bootstrap._explicit_document('C:/TESTONLY/stores.toml','TESTONLY_PACKAGE')
         assert reads==[]
+
+
+def _historical_authority_case(tmp_path):
+    """Real temporary metadata; no patched SHA/parser/path/version boundary."""
+    def write(name, value, *, raw=None):
+        path = tmp_path / name
+        raw = json.dumps(value, indent=1).encode() if raw is None else raw
+        path.write_bytes(raw)
+        return dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
+    old = [{"id": "N43", "decided_by": "olav"}, {"id": "Q123", "decided_by": "claude"}]
+    old_raw = json.dumps(old, indent=1).encode()
+    live_answers = write("claude_answers.json", old, raw=old_raw)
+    historical_snapshot = write("historical_answers.json", old, raw=old_raw)
+    current = old + [{"id": "Q134-answer-option1-historical-authority-resolver-and-immutable-authority-snapshots",
+        "decided_by": "claude"}]
+    live_answers_now = write("claude_answers.json", current)
+    current_answers = write("current_answers_snapshot.json", current)
+    live_status = write("claude_status.json", {"seq": 263, "state": "current"})
+    current_status = write("current_status_snapshot.json", {"seq": 263, "state": "current"})
+    request = write("preserved_original_request.json", {"answers_source": live_answers})
+    value = dict(format="darsia-cache-historical-authority-resolution-v1", authority_ids=["Q134"],
+        current_authorities=dict(claude_answers=dict(source=live_answers_now, snapshot=current_answers),
+            claude_status=dict(source=live_status, snapshot=current_status)),
+        preserved_requests=[request], historical_authorities=[dict(original=live_answers,
+            snapshot=historical_snapshot, entry_count=len(old))])
+    binding = write("root_bound_history_map.json", value)
+    return SimpleNamespace(write=write, old=old, current=current, old_pin=live_answers,
+        current_pin=current_answers, request=request, value=value, binding=binding,
+        package=str(tmp_path/"not_created_package"/"darsia"/"__init__.py"))
+
+
+def test_q134_exact_history_does_not_change_default_reader_or_old_or_live_bytes(tmp_path):
+    case = _historical_authority_case(tmp_path)
+    before = {path: path.read_bytes() for path in tmp_path.iterdir()}
+    with pytest.raises(CachePolicyError, match="changed before read"):
+        bootstrap._exact_authority_list(case.old_pin, case.package)
+    reader = bootstrap._HistoricalAuthorityReader(case.binding, case.package)
+    original = reader.for_original(case.request)
+    assert original(case.old_pin) == case.old
+    assert reader.current_authorities(case.current_pin) == case.current
+    with pytest.raises(CachePolicyError, match="immutable full-current"):
+        reader.current_authorities(case.old_pin)
+    with pytest.raises(CachePolicyError, match="changed before read"):
+        bootstrap._exact_authority_list(case.old_pin, case.package)
+    assert before == {path: path.read_bytes() for path in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("change", ["missing_status", "status_snapshot_size", "answers_live_alias",
+    "original_sha", "original_size", "original_path", "snapshot_prefix", "entry_count",
+    "duplicate_request", "missing_history", "no_q134", "live_prefix"])
+def test_q134_wrong_map_raw_pin_path_prefix_or_current_pair_fails_closed(tmp_path, change):
+    case = _historical_authority_case(tmp_path)
+    value = deepcopy(case.value)
+    history = value["historical_authorities"][0]
+    if change == "missing_status":
+        del value["current_authorities"]["claude_status"]
+    elif change == "status_snapshot_size":
+        value["current_authorities"]["claude_status"]["snapshot"]["size_bytes"] += 1
+    elif change == "answers_live_alias":
+        value["current_authorities"]["claude_answers"]["snapshot"] = value["current_authorities"]["claude_answers"]["source"]
+    elif change == "original_sha":
+        history["original"]["sha256"] = "f" * 64
+    elif change == "original_size":
+        history["original"]["size_bytes"] += 1
+    elif change == "original_path":
+        history["original"]["path"] = str(tmp_path/"other_live_answers.json")
+    elif change == "snapshot_prefix":
+        history["snapshot"] = case.write("wrong_historical_snapshot.json", [{"id": "changed"}] + case.old[1:])
+        history["original"].update({key:history["snapshot"][key] for key in ("sha256", "size_bytes")})
+    elif change == "entry_count":
+        history["entry_count"] = True
+    elif change == "duplicate_request":
+        value["preserved_requests"].append(deepcopy(case.request))
+    elif change == "missing_history":
+        value["historical_authorities"] = []
+    elif change == "no_q134":
+        snapshot = case.write("wrong_current_answers.json", case.old + [{"id": "other"}])
+        value["current_authorities"]["claude_answers"]["snapshot"] = snapshot
+        value["current_authorities"]["claude_answers"]["source"].update(
+            {key:snapshot[key] for key in ("sha256", "size_bytes")})
+    elif change == "live_prefix":
+        case.write("claude_answers.json", [{"id": "removed_original"}] + case.current[1:])
+    binding = case.write("wrong_map.json", value)
+    with pytest.raises(CachePolicyError):
+        bootstrap._HistoricalAuthorityReader(binding, case.package)
+
+
+def test_q134_only_named_original_exact_descriptor_can_read_history(tmp_path):
+    case = _historical_authority_case(tmp_path)
+    reader = bootstrap._HistoricalAuthorityReader(case.binding, case.package)
+    for unknown in (None, {**case.request, "sha256": "e" * 64},
+                    {**case.request, "path": str(tmp_path/"new_request.json")}):
+        with pytest.raises(CachePolicyError):
+            reader.for_original(unknown)
+    original = reader.for_original(case.request)
+    with pytest.raises(CachePolicyError, match="descriptor differs"):
+        original({**case.old_pin, "sha256": "d" * 64})
+    historical_path = tmp_path/"historical_answers.json"
+    historical_path.write_bytes(historical_path.read_bytes() + b" ")
+    with pytest.raises(CachePolicyError):
+        original(case.old_pin)
+
+
+def test_q134_current_snapshot_survives_live_appends_and_status_updates_without_adopting_them(tmp_path):
+    case = _historical_authority_case(tmp_path)
+    case.write("claude_answers.json", case.current + [{"id": "later_answer", "decided_by": "claude"}])
+    case.write("claude_status.json", {"seq": 264, "state": "updated later"})
+    reader = bootstrap._HistoricalAuthorityReader(case.binding, case.package)
+    assert reader.current_authorities(case.current_pin) == case.current
+    assert reader.for_original(case.request)(case.old_pin) == case.old
+    assert reader.current["claude_status"][2] == {"seq": 263, "state": "current"}
+    assert all(row.get("id") != "later_answer" for row in reader.current_authorities(case.current_pin))
+
+
+def test_q134_metadata_once_uses_explicit_original_reader_and_preserves_copy_guards(tmp_path):
+    from darsia_cache.service_context import _MetadataOnce
+    case = _historical_authority_case(tmp_path)
+    reader = bootstrap._HistoricalAuthorityReader(case.binding, case.package)
+    once = _MetadataOnce(case.package, authority_reader=reader.for_original(case.request))
+    value = once.read_authorities(case.old_pin)
+    value[0]["id"] = "changed copy"
+    assert once.read_authorities(case.old_pin) == case.old
+    with pytest.raises(CachePolicyError, match="descriptor changed"):
+        once.read_authorities({**case.old_pin, "sha256": "a" * 64})

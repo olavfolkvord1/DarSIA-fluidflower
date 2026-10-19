@@ -381,6 +381,39 @@ def test_live_snapshot_holds_no_immutable_directory_handles(monkeypatch,tmp_path
     assert actual["non_atomic"] and not actual["complete_lifetime_peak"]
 
 
+@pytest.mark.parametrize("entry_limit", [100, 1])
+def test_live_snapshot_closes_parent_iterator_before_child_and_on_limit(monkeypatch,tmp_path,entry_limit):
+    from darsia_cache import capacity as cache_capacity
+    path=tmp_path/"TESTONLY-owned";path.mkdir()
+    child=path/"nested";child.mkdir();(child/"one").write_bytes(b"abc")
+    info=path.lstat();active=set();opened=[];closed=[];original=first.os.scandir
+    class TrackedScan:
+        def __init__(self,directory):
+            # A child scan must begin after every ancestor scan has closed.
+            assert not active
+            self.directory=str(directory);self.stream=original(directory)
+        def __enter__(self):
+            active.add(self.directory);opened.append(self.directory)
+            return self.stream
+        def __exit__(self,*args):
+            self.stream.close();active.remove(self.directory);closed.append(self.directory)
+    monkeypatch.setattr(first.os,"scandir",TrackedScan)
+    monkeypatch.setattr(cache_capacity,"volume_info",lambda root:dict(volume_id=str(info.st_dev),free_bytes=10**12))
+    monkeypatch.setattr(first,"reference_writer_coverage",lambda *args:[])
+    state=SimpleNamespace(reference_administration=dict(entry_limit=entry_limit,host_policy="main-q87-fixed500",
+        owned_roots=[dict(role="cache",path=str(path),identity={"TESTONLY":"preaccepted separately"},
+            stat_identity=first._reference_stat_identity(info),volume_id=str(info.st_dev))]),
+        reference_transport_observation=None)
+    if entry_limit==1:
+        with pytest.raises(CachePolicyError,match="entry limit"):
+            first.reference_scope_snapshot(state,object())
+    else:
+        actual=first.reference_scope_snapshot(state,object())
+        assert actual["logical_bytes"]==3 and actual["entries"]==2
+        assert actual["observed_scan_anomalies"]==[]
+    assert not active and opened==closed==[str(path),str(child)]
+
+
 def test_live_directory_move_is_reported_incomplete_not_a_false_lifetime_peak(monkeypatch,tmp_path):
     from darsia_cache import capacity as cache_capacity
     path=tmp_path/"TESTONLY-owned";path.mkdir();moving=path/"moving";moving.mkdir()
