@@ -38,13 +38,17 @@ def train(request_path: Path, *, heads=("co2_presence", "gas_within_co2")):
     bundles = [t.ReviewBundle(Path(b["decisions"]["snapshot_path"]),
                              Path(b["combined_manifest"]["snapshot_path"])) for b in request["bundles"]]
     from .. import phase_review_retractions as withdrawals
+    from .scope import partition_review_events, requested_reviewers
+    reviewers = requested_reviewers(settings)
     withdrawal_snapshot = withdrawals.model_retractions(output)
     if withdrawal_snapshot is None:
         withdrawal_snapshot = withdrawals.snapshot_for_bundles(
             [(b.decisions_path, b.combined_manifest_path) for b in bundles], settings)
+    withdrawal_snapshot = partition_review_events(withdrawal_snapshot, reviewers)
     withdrawals.require_fresh_fit(withdrawal_snapshot, settings)
     withdrawal_record = withdrawals.write_model_snapshot(output, withdrawal_snapshot)
-    sources, regions, conflicts = t._load_sources_and_regions(bundles, withdrawal_snapshot=withdrawal_snapshot)
+    sources, regions, conflicts = t._load_sources_and_regions(bundles, withdrawal_snapshot=withdrawal_snapshot,
+                                                              reviewers=reviewers)
     from .scope import requested_series, validate_training_series
     selected_series = requested_series(settings)
     validate_training_series(sources, regions, selected_series)
@@ -75,11 +79,12 @@ def train(request_path: Path, *, heads=("co2_presence", "gas_within_co2")):
         "series_scope": selected_series,
         "phase_classes": dict(Counter(r.phase_class for r in ordered)),
         "reviewers": dict(Counter(r.reviewer for r in ordered)),
+        **t._reviewer_inventory(ordered, reviewers),
         "deduplication_conflicts": conflicts,
     }
     from .gas_negative_sampling import sampling_inventory
     inventory.update(sampling_inventory(ordered))
-    t._write_region_inventory(staging / "region_inventory.csv", ordered)
+    t._write_region_inventory(staging / "region_inventory.csv", ordered, reviewer_ids=reviewers is not None)
     t._write_json(staging / "training_inventory.json", inventory)
     np.savez_compressed(staging / "training_samples.npz", features=features,
                         region_indices=owners, feature_names=np.asarray(maximal_contract.feature_names))
@@ -124,7 +129,8 @@ def train(request_path: Path, *, heads=("co2_presence", "gas_within_co2")):
                 "production_precision": fit.precision, "authoritative_reference": "cpu-float64",
                 "validated_backends": ["cpu"] if settings["backend"] == "cpu" else ["cpu", "cuda"],
                 "parity": t._json_safe(parity)},
-            "reviewers": sorted(inventory["reviewers"]), "radiometry_profile": radiometry_profile,
+            "reviewers": sorted(inventory["reviewers"]), **t._reviewer_provenance(ordered, reviewers),
+            "radiometry_profile": radiometry_profile,
             "radiometry_runtime": radiometry_runtime,
             "source_sha256": {"trainer": t._sha256(Path(__file__)),
                               "training_primitives": t._sha256(t.PACKAGE_ROOT / "logistic.py")},

@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -65,7 +67,7 @@ from darsia.fluidflower.phase_workflow import (
     prepare_phase_training_request,
 )
 from darsia.fluidflower.project import default_project_root, sha256_file
-from darsia.fluidflower.reviewer_preferences import load_reviewer_name, save_reviewer_name
+from darsia.fluidflower.reviewer_preferences import load_reviewer_name, reviewer_identifier, save_reviewer_name
 from darsia.fluidflower.ui.common import FILE_DIALOG_OPTIONS, PathField
 
 
@@ -1446,6 +1448,19 @@ class SharedPhaseModelTrainingPage(QWidget):
         bundle_widget.setLayout(bundle_actions)
         evidence_layout.addRow("Reviewed evidence packages", self.bundles)
         evidence_layout.addRow("", bundle_widget)
+        self.annotator_selection = QWidget()
+        annotator_layout = QVBoxLayout(self.annotator_selection)
+        annotator_layout.setContentsMargins(0, 0, 0, 0)
+        annotator_layout.addWidget(QLabel("Annotators"))
+        self.annotators = QListWidget()
+        self.annotators.setMaximumHeight(96)
+        self.annotators.setToolTip("People whose saved reviews were found. Unticked people's sessions are hidden.")
+        self.annotators.itemChanged.connect(self._annotators_changed)
+        annotator_layout.addWidget(self.annotators)
+        annotator_layout.addWidget(_secondary(
+            "Only the ticked people's boxes, blind answers and evidence changes enter the new model. "
+            "All are ticked by default."))
+        evidence_layout.addRow(self.annotator_selection)
         self.output_parent = PathField(directory=True)
         self.output_parent.setText(
             str(os.environ.get("DARSIA_FLUIDFLOWER_PHASE_MODEL_LIBRARY") or
@@ -3161,9 +3176,57 @@ class SharedPhaseModelTrainingPage(QWidget):
             self._discover_review_session_entries(tuple(self._transfer_review_roots))
         )
 
+    @staticmethod
+    def _session_reviewer_id(session: Mapping[str, object]) -> str:
+        """The reviewer_id of a saved session (the slug of its name when absent)."""
+        return reviewer_identifier(str(session.get("reviewer_id") or "").strip()
+                                   or str(session.get("reviewer") or ""))
+
+    def _refresh_annotators(self) -> None:
+        """List the people of the discovered sessions; newly found people start ticked."""
+        annotators = getattr(self, "annotators", None)
+        if annotators is None:
+            return
+        unticked = {annotators.item(row).data(Qt.ItemDataRole.UserRole) for row in range(annotators.count())
+                    if annotators.item(row).checkState() != Qt.CheckState.Checked}
+        names: dict[str, str] = {}
+        for session in self.review_sessions:
+            names.setdefault(self._session_reviewer_id(session), str(session.get("reviewer") or "").strip())
+        annotators.blockSignals(True)
+        annotators.clear()
+        for reviewer_id in sorted(names, key=lambda key: ((names[key] or key).casefold(), key)):
+            name = names[reviewer_id]
+            item = QListWidgetItem(f"{name} ({reviewer_id})" if name and name != reviewer_id else reviewer_id)
+            item.setData(Qt.ItemDataRole.UserRole, reviewer_id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked if reviewer_id in unticked else Qt.CheckState.Checked)
+            annotators.addItem(item)
+        annotators.blockSignals(False)
+
+    def _selected_annotators(self) -> list[str] | None:
+        """Ticked reviewer IDs, or None while every listed person is ticked."""
+        annotators = getattr(self, "annotators", None)
+        if annotators is None:
+            return None
+        items = [annotators.item(row) for row in range(annotators.count())]
+        ticked = [item.data(Qt.ItemDataRole.UserRole) for item in items
+                  if item.checkState() == Qt.CheckState.Checked]
+        return None if len(ticked) == len(items) else sorted(ticked)
+
+    def _session_matches_annotators(self, session: Mapping[str, object]) -> bool:
+        """Whether a saved session belongs to a ticked person."""
+        selected = self._selected_annotators()
+        return selected is None or self._session_reviewer_id(session) in selected
+
+    def _annotators_changed(self, _item: object = None) -> None:
+        """Show only the ticked people's sessions."""
+        if hasattr(self, "saved_sessions"):
+            self._rebuild_session_combo()
+
     def _install_review_sessions(self, sessions: list[dict[str, object]]) -> None:
         selected_path = str((self._selected_session() or {}).get("session_path") or "")
         self.review_sessions = sessions
+        self._refresh_annotators()
         model = self._selected_validation_model()
         if (model and self._transfer_sources_for == str(model["root"])
                 and any(row.get("parent_review_binding") for row in self._transfer_source_rows)):
@@ -3194,6 +3257,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             session
             for session in self.review_sessions
             if self._session_matches_selected_model(session)
+            and self._session_matches_annotators(session)
             and any(int(session.get(key) or 0) for key in
                     ("manual_regions", "blind_region_labels", "frame_verdicts"))
         ]
@@ -4807,6 +4871,12 @@ class SharedPhaseModelTrainingPage(QWidget):
                 "mil_max_iters": self.mil_iterations.value(),
                 "change_evidence_ablation": self.change_ablation.isChecked(),
             }
+            selected_annotators = getattr(self, "_selected_annotators", None)
+            annotators = selected_annotators() if callable(selected_annotators) else None
+            if annotators is not None:
+                if not annotators:
+                    raise ValueError("Tick at least one annotator before training")
+                settings["reviewers"] = annotators
             native_photometry = getattr(self, "_native_training_photometry", None)
             if native_photometry is not None:
                 settings = native_photometry.prepare_settings(settings, bundles)

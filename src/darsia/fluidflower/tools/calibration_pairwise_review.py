@@ -1072,8 +1072,8 @@ def _latest_jsonl_object(path: Path) -> dict[str, Any] | None:
 
 
 def _reviewer_identifier(name: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", "-", str(name).strip().casefold()).strip("-")
-    return value or "anonymous"
+    from darsia.fluidflower.reviewer_preferences import reviewer_identifier
+    return reviewer_identifier(name)
 
 
 @contextmanager

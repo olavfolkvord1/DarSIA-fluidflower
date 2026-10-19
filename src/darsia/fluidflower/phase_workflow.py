@@ -593,28 +593,43 @@ def prepare_phase_training_request(
     bundles = [(resolve_review_path(decisions), resolve_review_path(manifest))
                for decisions, manifest in bundles]
     from . import phase_review_retractions as withdrawals
-    from darsia.fluidflower.phase_training.scope import requested_series, partition_bundle
+    from darsia.fluidflower.phase_training.scope import (
+        partition_bundle, partition_review_events, partition_reviewers, requested_reviewers,
+        requested_series, require_reviewer_scope_allowed,
+    )
     selected_series = requested_series(settings)
+    selected_reviewers = requested_reviewers(settings)
+    if selected_reviewers is not None:
+        require_reviewer_scope_allowed(settings)
+        settings["reviewers"] = list(selected_reviewers)
+    # Either scope writes derived input views; the original review files stay as they are.
+    derived = selected_series is not None or selected_reviewers is not None
     withdrawal_snapshot = (withdrawals.snapshot_for_bundles(bundles, settings) if withdrawal_snapshot is None
                            else withdrawals.validate_snapshot(withdrawal_snapshot))
     if selected_series is not None:
         withdrawal_snapshot = withdrawals.snapshot_from_events(selected_series,
             [event for event in withdrawal_snapshot["events"] if event["target"]["series"] == selected_series])
+    withdrawal_snapshot = partition_review_events(withdrawal_snapshot, selected_reviewers)
     withdrawals.require_fresh_fit(withdrawal_snapshot, settings)
     settings[withdrawals.DOCUMENT_KEY] = withdrawal_snapshot
     selected_bundles = []
-    if selected_series is not None:
+    if derived:
         for decisions_source, manifest_source in bundles:
             decision_bytes = Path(decisions_source).read_bytes()
             manifest_bytes = Path(manifest_source).read_bytes()
             decisions = json.loads(decision_bytes.decode("utf-8-sig"))
             manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
-            decisions, manifest = partition_bundle(decisions, manifest, selected_series)
+            if selected_series is not None:
+                decisions, manifest = partition_bundle(decisions, manifest, selected_series)
+            decisions = partition_reviewers(decisions, selected_reviewers)
             if decisions["decisions"]:
                 selected_bundles.append((decisions_source, manifest_source, decisions, manifest,
                     hashlib.sha256(decision_bytes).hexdigest(), hashlib.sha256(manifest_bytes).hexdigest()))
         if not selected_bundles and not withdrawals.active_replacements(withdrawal_snapshot):
-            raise ValueError(f"No reviewed evidence for {selected_series}")
+            scope = [selected_series] if selected_series is not None else []
+            if selected_reviewers is not None:
+                scope.append("reviewers " + ", ".join(selected_reviewers))
+            raise ValueError("No reviewed evidence for " + " and ".join(scope))
         bundles = [(row[0], row[1]) for row in selected_bundles]
     from darsia.fluidflower.phase_training.radiometry import resolve_profile
     radiometry_value = str(settings.get("radiometry_profile") or "legacy")
@@ -637,7 +652,7 @@ def prepare_phase_training_request(
         if selected_series is not None and event["target"]["series"] != selected_series:
             continue
         bundles.append((decisions_source, manifest_source))
-        if selected_series is not None:
+        if derived:
             selected_bundles.append((decisions_source, manifest_source,
                 json.loads(decisions_source.read_text(encoding="utf-8")),
                 json.loads(manifest_source.read_text(encoding="utf-8")),
@@ -669,7 +684,7 @@ def prepare_phase_training_request(
             destination = snapshot_root / f"{index:02d}_{role}{suffix}"
             source_sha = sha256_file(source)
             sampling_changed = False
-            if selected_series is None:
+            if not derived:
                 shutil.copy2(source, destination)
             else:
                 payload = selected_bundles[index - 1][2 if role == "decisions" else 3]
@@ -688,7 +703,7 @@ def prepare_phase_training_request(
                     raise OSError(f"Source evidence changed during withdrawal capture: {source}")
                 original_copy.write_bytes(original_bytes)
                 original_payload = json.loads(destination.read_text(encoding="utf-8-sig"))
-                source_manifest = (selected_bundles[index - 1][3] if selected_series is not None
+                source_manifest = (selected_bundles[index - 1][3] if derived
                                    else json.loads(Path(manifest_source).read_text(encoding="utf-8-sig")))
                 filtered_payload, removed = withdrawals.filter_document(
                     original_payload, source_manifest, withdrawal_snapshot)
@@ -702,7 +717,7 @@ def prepare_phase_training_request(
                     destination.write_text(json.dumps(frozen_payload, indent=2) + "\n", encoding="utf-8")
                     sampling_changed = True
             destination_sha = sha256_file(destination)
-            if selected_series is None and role != "decisions" and not sampling_changed and source_sha != destination_sha:
+            if not derived and role != "decisions" and not sampling_changed and source_sha != destination_sha:
                 raise OSError(f"Snapshot hash mismatch for {source}")
             records[role] = {
                 "source_path": str(source),
@@ -712,6 +727,8 @@ def prepare_phase_training_request(
             }
             if selected_series is not None:
                 records[role].update(source_sha256=source_sha, derived_series_subset=selected_series)
+            if selected_reviewers is not None:
+                records[role].update(source_sha256=source_sha, derived_reviewer_subset=list(selected_reviewers))
             if sampling_changed:
                 records[role].update(source_sha256=source_sha, frozen_sampling_dependencies=True)
             if role == "decisions":
@@ -802,6 +819,10 @@ def build_phase_training_command(
         command.extend(("--radiometry-profile", str(settings["radiometry_profile"])))
     if settings.get("series"):
         command.extend(("--series", *settings["series"]))
+    from .phase_training.scope import requested_reviewers, require_reviewer_scope_allowed
+    require_reviewer_scope_allowed(settings)
+    for reviewer in requested_reviewers(settings) or ():
+        command.extend(("--reviewer", reviewer))
     if settings.get("model_scope"):
         command.extend(("--model-scope", str(settings["model_scope"])))
     if settings.get("feature_cache_root"):

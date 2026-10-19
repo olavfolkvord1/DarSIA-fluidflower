@@ -404,6 +404,9 @@ class NativePhaseSteps(QWidget):
 
     def _build_training(self):
         studio = self.studio
+        annotators = getattr(studio, "annotator_selection", None)
+        if isinstance(annotators, QWidget):
+            _move(annotators, self.layouts[4])
         _move(studio.saved_sessions, self.layouts[4])
         _move(studio.session_summary, self.layouts[4])
         _move(studio.resume_session_button, self.layouts[4])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -12,6 +13,12 @@ from darsia.fluidflower.series_paths import darsia_source_checkout
 
 _FORMAT = "darsia-phase-model-studio-reviewer-v1"
 _RELATIVE_PATH = Path("config") / "phase_model_studio_reviewer.json"
+
+
+def reviewer_identifier(name: str) -> str:
+    """The reviewer_id saved with a reviewer's evidence: a slug of the name."""
+    value = re.sub(r"[^a-z0-9]+", "-", str(name).strip().casefold()).strip("-")
+    return value or "anonymous"
 
 
 def _preference_path(project_root: Path | str) -> Path:

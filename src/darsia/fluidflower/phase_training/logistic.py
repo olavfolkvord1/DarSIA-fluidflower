@@ -140,6 +140,7 @@ class ReviewedRegion:
     source: str
     reviewer: str
     payload: Mapping[str, Any]
+    reviewer_id: str = ""
 
     @property
     def supervision_weight(self) -> float:

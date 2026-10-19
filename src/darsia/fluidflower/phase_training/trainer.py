@@ -276,7 +276,10 @@ def _load_sources_and_regions(
     preserve_native_revisions: bool = False,
     label_policy_audit: dict[str, Any] | None = None,
     region_sources: dict[str, RunSource] | None = None,
+    reviewers: Sequence[str] | None = None,
 ) -> tuple[list[RunSource], list[ReviewedRegion], list[dict[str, Any]]]:
+    """Reviewed regions and their run sources; ``reviewers`` keeps only their evidence."""
+    from .scope import evidence_reviewer
     sources: dict[str, RunSource] = {}
     selected_by_geometry: dict[str, ReviewedRegion] = {}
     selected_source_by_geometry: dict[str, RunSource] = {}
@@ -287,6 +290,12 @@ def _load_sources_and_regions(
 
     from .. import phase_review_retractions as withdrawals
     inputs = [(bundle, _read_json(bundle.decisions_path), _read_json(bundle.combined_manifest_path)) for bundle in bundles]
+    if reviewers is not None:
+        from .scope import partition_review_events, partition_reviewers
+        if withdrawal_snapshot is None:
+            raise ValueError("A reviewer scope needs the frozen evidence-action policy")
+        withdrawal_snapshot = partition_review_events(withdrawal_snapshot, reviewers)
+        inputs = [(bundle, partition_reviewers(doc, reviewers), manifest) for bundle, doc, manifest in inputs]
     policy = withdrawal_snapshot
     if policy is None:
         embedded = [doc[withdrawals.DOCUMENT_KEY] for _, doc, _ in inputs if doc.get(withdrawals.DOCUMENT_KEY)]
@@ -401,6 +410,7 @@ def _load_sources_and_regions(
                         source=review_source,
                         reviewer=str(item.get("reviewer") or reviewer),
                         payload=dict(item),
+                        reviewer_id=evidence_reviewer(item, decision),
                     )
                     pending.append((source, region))
 
@@ -2031,7 +2041,9 @@ def _cross_validate_head(
     return report, final_fit, final_threshold, parity
 
 
-def _write_region_inventory(path: Path, regions: Sequence[ReviewedRegion]) -> None:
+def _write_region_inventory(path: Path, regions: Sequence[ReviewedRegion], *,
+                            reviewer_ids: bool = False) -> None:
+    """Write region_inventory.csv; ``reviewer_ids`` adds a reviewer_id column."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(
@@ -2047,6 +2059,7 @@ def _write_region_inventory(path: Path, regions: Sequence[ReviewedRegion]) -> No
                 "confidence",
                 "source",
                 "reviewer",
+                *(("reviewer_id",) if reviewer_ids else ()),
                 "supervision_weight",
             ),
         )
@@ -2064,9 +2077,26 @@ def _write_region_inventory(path: Path, regions: Sequence[ReviewedRegion]) -> No
                     "confidence": region.confidence,
                     "source": region.source,
                     "reviewer": region.reviewer,
+                    **({"reviewer_id": region.reviewer_id} if reviewer_ids else {}),
                     "supervision_weight": region.supervision_weight,
                 }
             )
+
+
+def _reviewer_inventory(regions: Sequence[ReviewedRegion], reviewers: Sequence[str] | None) -> dict[str, Any]:
+    """Reviewer-scope fields of the training inventory; none without a scope."""
+    if reviewers is None:
+        return {}
+    return {"reviewer_scope": list(reviewers),
+            "reviewer_ids": dict(Counter(region.reviewer_id for region in regions))}
+
+
+def _reviewer_provenance(regions: Sequence[ReviewedRegion], reviewers: Sequence[str] | None) -> dict[str, Any]:
+    """Reviewer-scope fields of a model head's provenance; none without a scope."""
+    if reviewers is None:
+        return {}
+    return {"reviewer_scope": list(reviewers),
+            "reviewer_ids": sorted({region.reviewer_id for region in regions})}
 
 
 def _sync_result(local_result: Path, output_root: Path) -> None:
@@ -2350,10 +2380,18 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         for decisions, manifest in args.bundle
     ]
     from .. import phase_review_retractions as withdrawals
+    from .scope import (FROZEN_ANNOTATION_SET_REFUSAL, partition_review_events, requested_reviewers,
+                        require_reviewer_scope_allowed)
+    reviewers = requested_reviewers({"reviewers": getattr(args, "reviewers", None)})
+    frozen_request = Path(args.output_root) / "training_request.json"
+    if reviewers is not None and frozen_request.is_file():
+        require_reviewer_scope_allowed({**(_read_json(frozen_request).get("settings") or {}),
+                                        "reviewers": list(reviewers)})
     withdrawal_snapshot = withdrawals.model_retractions(Path(args.output_root))
     if withdrawal_snapshot is None:
         withdrawal_snapshot = withdrawals.snapshot_for_bundles(
             [(b.decisions_path, b.combined_manifest_path) for b in bundles])
+    withdrawal_snapshot = partition_review_events(withdrawal_snapshot, reviewers)
     withdrawals.require_fresh_fit(withdrawal_snapshot, vars(args))
     if withdrawal_snapshot["targets"] and (Path(args.output_root) / "summary.json").exists():
         raise FileExistsError("Withdrawn evidence requires a new model version; completed models are immutable")
@@ -2364,7 +2402,8 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
     sources, regions, conflicts = _load_sources_and_regions(
         bundles, withdrawal_snapshot=withdrawal_snapshot,
         preserve_native_revisions=preserve_revisions,
-        label_policy_audit=label_policy_audit, region_sources=origin_sources)
+        label_policy_audit=label_policy_audit, region_sources=origin_sources,
+        reviewers=reviewers)
     series_filter = {str(value).casefold().replace("_", "") for value in getattr(args, "series", []) or []}
     if series_filter:
         sources = [s for s in sources if s.dataset.casefold().replace("_", "") in series_filter]
@@ -2394,6 +2433,9 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
     ]
     if any(v5_source_flags) and not all(v5_source_flags):
         raise ValueError("Cannot combine V5 RAW and historical JPEG review inputs")
+    if reviewers is not None and v5_source_flags and all(v5_source_flags):
+        # Its fit scope pins exact annotation counts and IDs (see chemistry_fit_scope).
+        raise ValueError(FROZEN_ANNOTATION_SET_REFUSAL)
     fit_excluded_runs = tuple(getattr(args, "fit_excluded_runs", ()) or ())
     chemistry_scope = None
     fit_allowed_review_ids = None
@@ -2455,7 +2497,8 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         f"Combined feature matrix: {maximal_features.shape[0]} x "
         f"{maximal_features.shape[1]}"
     )
-    _write_region_inventory(local_result / "region_inventory.csv", ordered_regions)
+    _write_region_inventory(local_result / "region_inventory.csv", ordered_regions,
+                            reviewer_ids=reviewers is not None)
     with (local_result / "training_samples.npz").open("wb") as stream:
         np.savez_compressed(
             stream,
@@ -2486,6 +2529,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "confidence": dict(Counter(region.confidence for region in ordered_regions)),
         "sources": dict(Counter(region.source for region in ordered_regions)),
         "reviewers": dict(Counter(region.reviewer for region in ordered_regions)),
+        **_reviewer_inventory(ordered_regions, reviewers),
         "deduplication_conflicts": conflicts,
     }
     if v5_source_flags and all(v5_source_flags):
@@ -2585,6 +2629,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
                 "datasets": sorted({source.dataset for source in sources}),
                 "series_scope": selected_series,
                 "reviewers": sorted({region.reviewer for region in ordered_regions}),
+                **_reviewer_provenance(ordered_regions, reviewers),
                 "training_inventory": inventory,
                 "fit_checkpoint_contract": fit_checkpoint_contract,
                 "cross_validation": _json_safe(report),
@@ -2690,6 +2735,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--radiometry-profile", default="legacy",
                         help="image:PATH, uniform24-after2014, a frozen profile JSON, or explicit legacy input")
     parser.add_argument("--series", nargs="+", help="Optional series subset, e.g. FF_AC FF_UM")
+    parser.add_argument("--reviewer", action="append", dest="reviewers", metavar="REVIEWER_ID",
+                        help="Train only on this reviewer's annotations, answers and evidence actions; "
+                             "repeat for several people (default: everyone)")
     parser.add_argument("--model-scope", choices=("shared", "single-series"), default="shared")
     parser.add_argument("--feature-cache-root", type=Path,
                         help="Reusable image-feature cache, separate from this model's fit checkpoints")
