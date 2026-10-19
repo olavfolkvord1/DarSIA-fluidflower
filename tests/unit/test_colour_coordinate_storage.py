@@ -116,16 +116,25 @@ from pathlib import Path
 
 import threadpoolctl
 
-# Process facts differ between any two interpreters, whatever the code: fix them
-# like the clocks (pid and thread ids; the load order of thread pools).
-os.getpid = lambda: 4242
-threading.get_ident = lambda: 4243
-threading.get_native_id = lambda: 4244
+# Normalize process facts only in the saved IPP observations. Windows library
+# discovery still needs the real process ID, and Python keeps its real threads.
 _pools = threadpoolctl.threadpool_info
 threadpoolctl.threadpool_info = lambda: sorted(
     _pools(), key=lambda row: json.dumps(row, sort_keys=True, default=str))
 
 import darsia.fluidflower.mass.n1_pipeline as n1
+import darsia._opencv_runtime as opencv_runtime
+
+_observe_ipp = opencv_runtime.require_ipp_off
+
+
+def fixed_process_observation(stage):
+    record = _observe_ipp(stage)  # Keep the actual IPP check.
+    record.update(pid=4242, thread_id=4243, native_thread_id=4244)
+    return record
+
+
+opencv_runtime.require_ipp_off = fixed_process_observation
 
 spec = json.loads(Path(sys.argv[1]).read_text())
 state = {}
