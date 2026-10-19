@@ -15,6 +15,7 @@ import tomllib
 from darsia.fluidflower.image_selection_plan import _eligible_frames
 from darsia.fluidflower.series_method import ManifestChangedError
 from darsia.fluidflower.series_paths import series_key
+from darsia.fluidflower.storage_paths import storage_path_remapper
 
 RULE = "Default 20 (1 + 8 + 11)"
 QUALITY_RULE = "28sep-frozen-raw-chart-pillar-v1"
@@ -290,7 +291,7 @@ def legacy_stored_plan_status(root):
             label="Stored plan (Studio 20)",
             note="No Studio project pointer is stored. Import its source-bound native manifest explicitly.",
         )
-    path = Path(pointer)
+    path = Path(storage_path_remapper()(str(pointer)))
     path = path if path.is_absolute() else root / path
     project, bound = _metadata_file(path.resolve())
     from darsia.fluidflower.project import PROJECT_FORMAT
@@ -324,8 +325,11 @@ def load_stored_native_plan(path, metadata, *, series_id, expected=None):
         raise ValueError("Choose an existing native manifest with frame_sources.")
     available = {_key(row["source_path"]): row for row in eligible_frames(metadata)}
     selected, seen, identities = [], set(), []
+    # A receipt keeps its historical paths; the storage aliases (if any) name
+    # where this machine finds the same images.
+    remap = storage_path_remapper()
     for row in native:
-        key = _key(row.get("source_path", ""))
+        key = _key(remap(str(row.get("source_path", ""))))
         digest = row.get("source_sha256")
         if not isinstance(digest, str) or re.fullmatch("[0-9a-f]{64}", digest) is None:
             raise ValueError(
@@ -390,8 +394,9 @@ def load_saved_quality(path, metadata, *, expected=None):
         for field in ("replacement", "rejected_image"):
             if isinstance(match.get(field), dict):
                 rows.append(match[field])
+    remap = storage_path_remapper()  # Historical receipt paths, as read here.
     for row in rows:
-        key = _key(row.get("source_path", ""))
+        key = _key(remap(str(row.get("source_path", ""))))
         quality = row.get("quality") or {}
         if (
             quality.get("class_measurement", doc.get("class_measurement"))

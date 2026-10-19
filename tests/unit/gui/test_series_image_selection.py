@@ -1270,14 +1270,18 @@ def test_later_manual_save_preserves_proposal_background_and_marks_added_frame(
     )
     saved = table["runs"]["ac17"]
     manifest = json.loads(Path(saved["selection_manifest"]["path"]).read_bytes())
+    # The manifest and series.toml store the same portable (series-relative) text.
+    stored = tomllib.loads((root / "series.toml").read_bytes().decode())
+    assert saved["default20_proposal"] == first["runs"]["ac17"]["default20_proposal"]
     assert (
-        saved["default20_proposal"]
-        == first["runs"]["ac17"]["default20_proposal"]
+        stored["image_selection"]["runs"]["ac17"]["default20_proposal"]
         == manifest["proposal"]
     )
     assert saved["manual_edits_after_apply"] is True
     manual = next(
-        row for row in manifest["frames"] if row["chosen_image"]["source_path"] == added
+        row
+        for row in manifest["frames"]
+        if root / row["chosen_image"]["source_path"] == Path(added)
     )
     assert manual["selection_origin"] == "manual" and manual["offset_seconds"] == 0
     assert (
@@ -1320,7 +1324,7 @@ def test_resolver_binds_applied_provenance_even_if_manifest_hash_is_redeclared(
     path = root / "series.toml"
     document = tomllib.loads(path.read_bytes().decode())
     saved = document["image_selection"]["runs"]["ac17"]
-    manifest_path = Path(saved["selection_manifest"]["path"])
+    manifest_path = root / saved["selection_manifest"]["path"]  # series-relative
     manifest = json.loads(manifest_path.read_bytes())
     repaired = next(row for row in manifest["frames"] if "rejected_image" in row)
     repaired[field] = value
@@ -1378,7 +1382,12 @@ def test_historical_clock_is_displayed_and_saved_separately_from_protocol(
         == metadata.frames[1]["elapsed_h"]
     )
     assert identity["source_sha256"] == native["frame_sources"][1]["source_sha256"]
-    assert manifest["stored_plan"] == saved["stored_plan_provenance"]
+    # Both files store the same portable (series-relative) provenance text.
+    stored = tomllib.loads((root / "series.toml").read_bytes().decode())
+    assert (
+        manifest["stored_plan"]
+        == stored["image_selection"]["runs"]["ac17"]["stored_plan_provenance"]
+    )
     assert manifest["frames"][1]["data_time_h"] == metadata.frames[1]["elapsed_h"]
     assert (
         model.resolve_saved_selection(root, "ac17", metadata)["selected"][1][
@@ -1413,7 +1422,7 @@ def test_resolver_binds_both_stored_clock_identities_even_with_redeclared_sha(
     series = root / "series.toml"
     document = tomllib.loads(series.read_bytes().decode())
     saved = document["image_selection"]["runs"]["ac17"]
-    manifest_path = Path(saved["selection_manifest"]["path"])
+    manifest_path = root / saved["selection_manifest"]["path"]  # series-relative
     manifest = json.loads(manifest_path.read_bytes())
     wrong = "f" * 64 if field == "source_sha256" else 99.0
     manifest["stored_plan"]["native_source_identities"][1][field] = wrong

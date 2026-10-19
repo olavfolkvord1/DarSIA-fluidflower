@@ -23,12 +23,14 @@ import toml
 from darsia.fluidflower.image_selection_plan import _eligible_frames, resolve_selection
 from darsia.fluidflower.series_method import ManifestChangedError, _same_values
 from darsia.fluidflower.series_paths import series_key
+from darsia.fluidflower.storage_paths import storage_path_remapper
 from darsia.fluidflower.image_selection_proposal import (
     default20_proposal,
     first_usable_rule,
     load_saved_quality,
     load_stored_native_plan,
 )
+from darsia.presets.workflows.config.utils import _is_relative_path
 
 
 FORMAT = "fluidflower-series-image-selection-v1"
@@ -55,6 +57,66 @@ def _count(value, label):
 
 def _key(path):
     return str(path).replace("\\", "/").casefold()
+
+
+# Saved fields that name files: descriptors, frame identities and provenance.
+_PATH_FIELDS = frozenset({"path", "source_path", "protocol_source_path"})
+
+
+def _located(value, root, remap):
+    """Return a saved or configured path as this machine reads it.
+
+    A path stored relative to the series root (new saves) is joined to
+    ``root``. An absolute path passes through ``remap`` (a
+    ``storage_path_remapper()``); without a matching alias its text is
+    unchanged, so an old absolute selection reads exactly as before.
+    """
+    text = str(value)
+    if _is_relative_path(text):
+        return str(Path(root) / text)
+    return remap(text)
+
+
+def _stored(value, root):
+    """Return the portable text a new save writes for a path.
+
+    A path inside the series root is stored relative to it with ``/``
+    separators, so a moved or cloned project still validates; any other path
+    is stored absolute, as given.
+    """
+    text = str(value)
+    if _is_relative_path(text):
+        return text
+    try:
+        relative = Path(text).relative_to(Path(root))
+    except ValueError:
+        return text
+    return relative.as_posix() if relative.parts else text
+
+
+def _map_paths(value, convert):
+    """Return a copy of a saved structure with ``convert`` applied to path fields."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                convert(item)
+                if key in _PATH_FIELDS and isinstance(item, str)
+                else _map_paths(item, convert)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_map_paths(item, convert) for item in value]
+    return value
+
+
+def _comparable(value, root, remap):
+    """Return a saved structure with path fields reduced to location keys.
+
+    Saved and freshly read metadata then compare equal whether a path was
+    stored relative, absolute or under another aliased spelling.
+    """
+    return _map_paths(value, lambda path: _key(_located(path, root, remap)))
 
 
 def _descriptor(path):
@@ -84,15 +146,16 @@ def _deep_merge(base, update):
     return original_merge(base, update)
 
 
-def _path(value, root):
-    path = Path(value)
+def _path(value, root, remap):
+    # Absolute values follow the per-user storage aliases (unchanged without).
+    path = Path(remap(str(value)))
     return path if path.is_absolute() else Path(root) / path
 
 
-def _protocol_path(value, root):
+def _protocol_path(value, root, remap):
     if isinstance(value, tuple):
-        return (_path(value[0], root), value[1])
-    return _path(value, root)
+        return (_path(value[0], root, remap), value[1])
+    return _path(value, root, remap)
 
 
 def _source_file(value):
@@ -163,7 +226,8 @@ def load_run_protocol_metadata(series_root, run_id, *, config_paths=None):
         raise ValueError(
             "Choose the saved injection protocol before suggesting image times."
         )
-    injection_source = _protocol_path(protocols.injection, root)
+    remap = storage_path_remapper()  # The registry is read once per load.
+    injection_source = _protocol_path(protocols.injection, root, remap)
     sources.append(_descriptor(_source_file(injection_source)))
     injection = InjectionProtocol(injection_source)
     active = injection.df[injection.df["rate_kg_s"] > 0]
@@ -183,17 +247,19 @@ def load_run_protocol_metadata(series_root, run_id, *, config_paths=None):
         covered_end = max(covered_end, right)
     frames = []
     for folder_value in folders:
-        folder = _path(folder_value, root)
+        folder = _path(folder_value, root, remap)
         configured_folder = next(
             p for p in protocols.imaging if _key(p) == _key(folder_value)
         )
-        source = _protocol_path(protocols.imaging[configured_folder], root)
+        source = _protocol_path(protocols.imaging[configured_folder], root, remap)
         blacklist = protocols.blacklist
         if isinstance(blacklist, dict):
             blacklist = next(
                 (v for p, v in blacklist.items() if _key(p) == _key(folder_value)), None
             )
-        blacklist = _protocol_path(blacklist, root) if blacklist is not None else None
+        blacklist = (
+            _protocol_path(blacklist, root, remap) if blacklist is not None else None
+        )
         sources.append(_descriptor(_source_file(source)))
         if blacklist is not None:
             sources.append(_descriptor(_source_file(blacklist)))
@@ -210,7 +276,7 @@ def load_run_protocol_metadata(series_root, run_id, *, config_paths=None):
             path = (
                 folder / row_key[len(folder_key) + 1 :]
                 if row_key.casefold().startswith(folder_key.casefold() + "/")
-                else _path(row.path, folder)
+                else _path(row.path, folder, remap)
             )
             # Datetime conversion/blacklist parsing stay with original readers.
             elapsed_h = (row.datetime - start).total_seconds() / 3600.0
@@ -370,6 +436,11 @@ def _validate_saved_table(table, allowed_runs):
 
 
 def read_series_image_selection(root):
+    """Return the saved choices with every path as this machine reads it.
+
+    Paths stored relative to the series root are joined to it and absolute
+    ones follow the storage aliases; ``raw`` stays the exact file bytes.
+    """
     path = Path(root) / "series.toml"
     raw = path.read_bytes()
     document = tomllib.loads(raw.decode("utf-8-sig"))
@@ -391,6 +462,9 @@ def read_series_image_selection(root):
     table = document.get("image_selection")
     if table is None:
         table = {"format": FORMAT, "schema_version": 1, "runs": {}}
+    base = Path(root).resolve()
+    remap = storage_path_remapper()
+    table = _map_paths(table, lambda value: _located(value, base, remap))
     return deepcopy(_validate_saved_table(table, allowed)), raw
 
 
@@ -399,11 +473,15 @@ def _proposal_background(metadata, quality, value):
     if value is None:
         return None
     keys = ("rule", "parameters", "target_matches", "no_preinjection_image")
+    root, remap = metadata.series_root, storage_path_remapper()
     try:
         fresh = default20_proposal(
             metadata, d1_h=value["parameters"]["d1_h"], quality=quality
         )
-        if any(value[key] != fresh[key] for key in keys):
+        if any(
+            _comparable(value[key], root, remap) != _comparable(fresh[key], root, remap)
+            for key in keys
+        ):
             raise ManifestChangedError(
                 "The applied Default20 proposal no longer matches current source metadata."
             )
@@ -507,6 +585,7 @@ def resolve_saved_selection(root, run, protocols, *, check_files=False):
     run = str(run).strip().casefold()
     if protocols.run_id != run:
         raise ValueError("Loaded protocol metadata belongs to another run.")
+    remap = storage_path_remapper()
     table, raw = read_series_image_selection(root)
     saved = table["runs"].get(run)
     if not saved or not saved.get("selected"):
@@ -528,7 +607,11 @@ def resolve_saved_selection(root, run, protocols, *, check_files=False):
         )
         or len({_key(source["path"]) for source in sources}) != len(sources)
         or len(sources) != len(current)
-        or any(current.get(_key(source["path"])) != source for source in sources)
+        or any(
+            _comparable(current.get(_key(source["path"])), root, remap)
+            != _comparable(source, root, remap)
+            for source in sources
+        )
     ):
         raise ManifestChangedError(
             "Saved choices were made from different protocol/config metadata; edit and save them again."
@@ -604,14 +687,20 @@ def resolve_saved_selection(root, run, protocols, *, check_files=False):
     background = _proposal_background(
         protocols, quality, saved.get("default20_proposal")
     )
-    if choice_manifest.get("proposal") != background:
+    # The manifest keeps the path text of its save (relative inside the series
+    # root, absolute outside); compare locations, not spellings.
+    if _comparable(choice_manifest.get("proposal"), root, remap) != _comparable(
+        background, root, remap
+    ):
         raise ManifestChangedError(
             "The per-run proposal provenance differs from the saved applied proposal."
         )
-    stored_background = _stored_plan_background(stored_plan)
+    stored_background = _comparable(_stored_plan_background(stored_plan), root, remap)
     if (
-        choice_manifest.get("stored_plan") != stored_background
-        or saved.get("stored_plan_provenance") != stored_background
+        _comparable(choice_manifest.get("stored_plan"), root, remap)
+        != stored_background
+        or _comparable(saved.get("stored_plan_provenance"), root, remap)
+        != stored_background
     ):
         raise ManifestChangedError(
             "The stored native/protocol clock provenance differs from its bound source identities."
@@ -651,11 +740,19 @@ def resolve_saved_selection(root, run, protocols, *, check_files=False):
         choice_manifest.get("series_id")
         != tomllib.loads(raw.decode("utf-8-sig"))["series_id"]
         or choice_manifest.get("run_id") != run
-        or choice_manifest.get("source_metadata") != sources
-        or choice_manifest.get("supplemental_source_metadata", []) != supplemental
+        or _comparable(choice_manifest.get("source_metadata"), root, remap)
+        != _comparable(sources, root, remap)
+        or _comparable(
+            choice_manifest.get("supplemental_source_metadata", []), root, remap
+        )
+        != _comparable(supplemental, root, remap)
         or bool(choice_manifest.get("no_preinjection_image", False)) != no_pre
-        or choice_manifest.get("frames")
-        != _selection_frame_records(protocols, selected, quality, background)
+        or _comparable(choice_manifest.get("frames"), root, remap)
+        != _comparable(
+            _selection_frame_records(protocols, selected, quality, background),
+            root,
+            remap,
+        )
     ):
         raise ManifestChangedError(
             "The per-run selection manifest belongs to different choices."
@@ -758,8 +855,11 @@ def save_run_image_selection(
         "image_selection", {"format": FORMAT, "schema_version": 1, "runs": {}}
     )
     _validate_saved_table(table, allowed)
-    previous = table["runs"].get(metadata.run_id, {})
-    run = deepcopy(previous)
+    base = Path(root).resolve()
+    run = deepcopy(table["runs"].get(metadata.run_id, {}))
+    # Earlier choices are read where this machine finds their files.
+    remap = storage_path_remapper()
+    previous = _map_paths(run, lambda value: _located(value, base, remap))
     if stored_plan is None and previous.get("stored_plan_source"):
         stored_plan = load_stored_native_plan(
             previous["stored_plan_source"]["path"],
@@ -826,7 +926,7 @@ def save_run_image_selection(
         "scientific_computation": False,
         "execution_plan_created": False,
     }
-    manifest_dir = Path(root) / "image_selection" / "manifests" / metadata.run_id
+    manifest_dir = base / "image_selection" / "manifests" / metadata.run_id
     selection_manifest["rule"] = str(rule)
     if proposal is not None:
         selection_manifest["proposal"] = {
@@ -835,6 +935,10 @@ def save_run_image_selection(
         }
     if stored_plan is not None:
         selection_manifest["stored_plan"] = _stored_plan_background(stored_plan)
+    # New saves keep paths inside the series root relative to it (portable).
+    selection_manifest = _map_paths(
+        selection_manifest, lambda value: _stored(value, base)
+    )
     manifest_path = manifest_dir / (revision + ".json")
     manifest_raw = (
         json.dumps(selection_manifest, ensure_ascii=False, allow_nan=False, indent=2)
@@ -886,11 +990,11 @@ def save_run_image_selection(
             manual_edits_after_apply
             or {_key(row["source_path"]) for row in selected} != proposed_paths
         )
-    elif previous.get("default20_proposal") and run["selected"] != previous.get(
-        "selected"
-    ):
+    elif previous.get("default20_proposal") and _comparable(
+        run["selected"], base, remap
+    ) != _comparable(previous.get("selected"), base, remap):
         run["manual_edits_after_apply"] = True
-    table["runs"][metadata.run_id] = run
+    table["runs"][metadata.run_id] = _map_paths(run, lambda value: _stored(value, base))
     _validate_saved_table(table, allowed)
     text = toml.dumps(updated)
     if b"\r\n" in original:
@@ -919,4 +1023,4 @@ def save_run_image_selection(
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-    return deepcopy(table), encoded
+    return _map_paths(table, lambda value: _located(value, base, remap)), encoded
