@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from . import geometry_workspace_frame as workspace_frame
 from typing import Any
@@ -99,6 +100,23 @@ STROKE_OPACITY = 0.75
 _VERTEX_HIT_PX = 8.0
 # A right press that moves less than this (screen pixels) is a click.
 _CLICK_SLOP_PX = 4.0
+# Point handles of the Edit tool (screen pixels); selected points are larger.
+_HANDLE_PX = 7.0
+_SELECTED_HANDLE_PX = 11.0
+# Screen pixels that an arrow key moves the selected points (with Shift).
+_NUDGE_PX = 1.0
+_NUDGE_SHIFT_PX = 10.0
+# Arrow keys of the Edit tool: (rows, columns) per step.
+_NUDGE_KEYS = {
+    Qt.Key.Key_Left: (0, -1),
+    Qt.Key.Key_Right: (0, 1),
+    Qt.Key.Key_Up: (-1, 0),
+    Qt.Key.Key_Down: (1, 0),
+}
+_TOO_FEW_POINTS = (
+    "A polygon needs at least three points; use Delete polygon in its "
+    "right-click menu."
+)
 _BRUSH_STEPS = 100
 _BRUSH_MIN_FRACTION = 0.0005
 _BRUSH_MAX_FRACTION = 0.05
@@ -111,8 +129,8 @@ _SHOW_TIP = "Show or hide this layer in the photograph (display only)"
 _ROLE_SHORT = {"porous_medium": "Porous", "free_water": "Free water"}
 _CANVAS_HINT = (
     "Wheel: zoom · right or middle drag: pan · Ctrl+Z / Ctrl+Y: undo / redo. "
-    "On the photo: L polygon · B paint · E erase · H pan · [ ] brush size · "
-    "1-9 layer · P propose · F fit"
+    "On the photo: L draw · V edit · B paint · E erase · H pan · [ ] brush "
+    "size · 1-9 layer · P propose · F fit"
 )
 _DRAFT_HINT = (
     "Polygon with {count} point{plural}: left click adds a point · right click, "
@@ -235,6 +253,37 @@ def insert_point_on_nearest_edge(
     return vertices, edge + 1
 
 
+def _segment_distance(point: QPointF, start: QPointF, end: QPointF) -> float:
+    """Distance from a point to the segment between two points."""
+
+    delta_x, delta_y = end.x() - start.x(), end.y() - start.y()
+    length2 = delta_x * delta_x + delta_y * delta_y
+    fraction = 0.0
+    if length2 > 0.0:
+        fraction = (
+            (point.x() - start.x()) * delta_x + (point.y() - start.y()) * delta_y
+        ) / length2
+        fraction = min(max(fraction, 0.0), 1.0)
+    return math.hypot(
+        point.x() - (start.x() + fraction * delta_x),
+        point.y() - (start.y() + fraction * delta_y),
+    )
+
+
+@dataclass
+class _PointDrag:
+    """Selected points being dragged with the Edit tool."""
+
+    # Viewport position and raw (row, col) of the press.
+    press: QPointF
+    start: tuple[float, float]
+    # Points of every polygon with selected points, before and while dragging.
+    before: dict[int, list[tuple[float, float]]]
+    after: dict[int, list[tuple[float, float]]]
+    # The mouse has moved further than a click.
+    moving: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Canvas
 
@@ -242,22 +291,47 @@ def insert_point_on_nearest_edge(
 class LayerCanvas(QGraphicsView):
     """Photograph with polygons, painted strokes and the proposed layers on top.
 
-    Polygon tool: a left click adds a point, a right click (without dragging),
-    Enter or a double click closes the polygon, Backspace removes the last
-    point and Esc cancels it. Points of finished polygons can be dragged with
-    the left button. A right click on a polygon asks for its menu
-    (``polygon_context``: the polygon, the point under the click or -1, and
-    the screen position); just before that, ``last_context_raw`` is set to the
-    raw (row, col) of the click, so that the menu can add a point to the
-    polygon on its nearest edge. The right or middle button drags the view in
-    every tool.
+    The tools are ``pan``, ``polygon`` (the Draw button), ``edit``, ``paint``
+    and ``erase``. The right or middle button drags the view in every tool.
+
+    Draw (``polygon``) only draws new polygons: a left click adds a point, a
+    right click (without dragging), Enter or a double click closes the
+    polygon, Backspace removes the last point and Esc cancels it. Existing
+    polygons show no point handles here, and a click on one of their points
+    adds a point to the new polygon; it never moves the existing point.
+
+    Edit (``edit``) changes existing polygons and never starts a polygon, a
+    stroke or a draft. Every shown polygon has point handles, and selected
+    points (``selected_points``) are drawn larger, white with a dark outline.
+    A left press on a point selects only that point, or keeps the whole
+    selection when the point is already selected; Ctrl+click adds the point
+    to the selection or takes it out. Dragging moves all selected points by
+    the same raw-pixel offset; they stop together at the edge of the
+    photograph. A drag on empty space selects the points inside its rectangle
+    (Ctrl adds them to the selection); a click there clears the selection.
+    Delete or Backspace removes the selected points, but a polygon that would
+    keep fewer than three points is left unchanged and ``notice`` says so.
+    The arrow keys move the selected points by one screen pixel (Shift: ten)
+    and Esc clears the selection. A double click on an edge adds a point there
+    and selects it. Each of these changes is reported once, so that it is
+    undone in one step: ``polygon_edited`` (index and new points) when one
+    polygon changed, ``polygons_edited`` ({index: new points}) when several
+    did.
+
+    A right click on a polygon asks for its menu (``polygon_context``: the
+    polygon, the point under the click or -1, and the screen position); with
+    the Edit tool, a click near an edge counts too, also just outside the
+    polygon. Just before that, ``last_context_raw`` is set to the raw
+    (row, col) of the click, so that the menu can add a point to the polygon
+    on its nearest edge.
 
     ``set_hidden_layers`` hides the polygons and strokes of some layers; this
     changes only what is shown. Polygons of hidden layers are not drawn, get
-    no point handles and cannot be dragged or right-clicked. Strokes of hidden
-    layers are left out of the stroke image; eraser strokes still apply to the
-    strokes that are shown. ``set_overlays_visible`` (all marks, the proposal)
-    works on top of this.
+    no point handles and cannot be selected, dragged or right-clicked; hiding
+    a layer drops its points from the selection. Strokes of hidden layers are
+    left out of the stroke image; eraser strokes still apply to the strokes
+    that are shown. ``set_overlays_visible`` (all marks, the proposal) works
+    on top of this.
 
     The canvas also serves the rig frame panel: ``image_point_selected`` gives
     clicks in place mode as fractions of the photograph, ``preview`` identifies
@@ -269,13 +343,15 @@ class LayerCanvas(QGraphicsView):
     polygon_finished = Signal(object)
     # Index of an edited polygon and its new points (raw pixels).
     polygon_edited = Signal(int, object)
+    # Several polygons changed in one step: {index: new points (raw pixels)}.
+    polygons_edited = Signal(object)
     # Polygon index, point index (-1: not on a point) and global position.
     polygon_context = Signal(int, int, QPoint)
     # Points of the polygon being drawn (0: none).
     draft_changed = Signal(int)
     notice = Signal(str)
 
-    TOOLS = ("pan", "polygon", "paint", "erase")
+    TOOLS = ("pan", "polygon", "edit", "paint", "erase")
 
     def __init__(self) -> None:
         super().__init__()
@@ -296,6 +372,14 @@ class LayerCanvas(QGraphicsView):
         self.draft_item.setZValue(14.0)
         self.rubber_item = QGraphicsPathItem()
         self.rubber_item.setZValue(14.0)
+        # The rectangle dragged on empty space to select points (Edit tool).
+        self.band_item = QGraphicsRectItem()
+        self.band_item.setZValue(25.0)
+        band_pen = QPen(QColor(255, 255, 255, 230), 1.0, Qt.PenStyle.DashLine)
+        band_pen.setCosmetic(True)
+        self.band_item.setPen(band_pen)
+        self.band_item.setBrush(QColor(255, 255, 255, 40))
+        self.band_item.hide()
         self.cursor_item = QGraphicsEllipseItem()
         self.cursor_item.setZValue(30.0)
         cursor_pen = QPen(QColor(255, 255, 255, 230), 1.5)
@@ -309,6 +393,7 @@ class LayerCanvas(QGraphicsView):
             self.active_item,
             self.draft_item,
             self.rubber_item,
+            self.band_item,
             self.cursor_item,
         ):
             self.scene().addItem(item)
@@ -341,12 +426,15 @@ class LayerCanvas(QGraphicsView):
         self._polygons: list[lp.Polygon] = []
         self._polygon_colors: dict[int, QColor] = {}
         self._polygon_items: list[QGraphicsPathItem] = []
-        # Point handles of each polygon (polygon tool only).
+        # Point handles of each polygon (Edit tool only).
         self._handle_items: list[list[QGraphicsRectItem]] = []
         self._draft: list[tuple[float, float]] = []
         self._draft_handles: list[QGraphicsRectItem] = []
-        self._drag: tuple[int, int] | None = None
-        self._drag_points: list[tuple[float, float]] | None = None
+        # Edit tool: the selected points as (polygon index, point index), a
+        # drag of them in progress and where a rubber band started (viewport).
+        self._selection: set[tuple[int, int]] = set()
+        self._drag: _PointDrag | None = None
+        self._band_origin: QPointF | None = None
         # Layers whose polygons and strokes are not shown (display only).
         self._hidden_layers: frozenset[int] = frozenset()
         # The strokes last rendered, to draw them again when layers are hidden.
@@ -448,6 +536,8 @@ class LayerCanvas(QGraphicsView):
         self._cancel_stroke()
         self.cancel_polygon()
         self._end_drag()
+        self._cancel_band()
+        self._selection = set()
         self.render_polygons([], {})
         self._strokes = []
         self._stroke_colors = {}
@@ -473,6 +563,7 @@ class LayerCanvas(QGraphicsView):
         if not marks:
             self.cancel_polygon()
             self._end_drag()
+            self._cancel_band()
         self.stroke_item.setVisible(marks)
         self.active_item.setVisible(marks)
         for item, polygon in zip(self._polygon_items, self._polygons):
@@ -494,12 +585,15 @@ class LayerCanvas(QGraphicsView):
         if hidden == self._hidden_layers:
             return
         self._hidden_layers = hidden
-        if (
-            self._drag is not None
-            and self._drag[0] < len(self._polygons)
-            and self._polygons[self._drag[0]].layer_id in hidden
+        if self._drag is not None and any(
+            index < len(self._polygons) and self._polygons[index].layer_id in hidden
+            for index in self._drag.before
         ):
             self._end_drag()
+        # Points of hidden layers cannot stay selected.
+        self._selection = {
+            point for point in self._selection if self._selectable(*point)
+        }
         for item, polygon in zip(self._polygon_items, self._polygons):
             item.setVisible(self._marks_visible and polygon.layer_id not in hidden)
         self._update_handles()
@@ -641,10 +735,26 @@ class LayerCanvas(QGraphicsView):
         self._polygon_items = []
         self._polygons = list(polygons)
         self._polygon_colors = dict(colors)
+        drag = self._drag
+        if drag is not None and any(
+            index >= len(self._polygons) or list(self._polygons[index].points) != points
+            for index, points in drag.before.items()
+        ):
+            # The polygons changed under the drag: it no longer applies.
+            self._drag = drag = None
+        # Selected points must still exist and be shown.
+        self._selection = {
+            point for point in self._selection if self._selectable(*point)
+        }
         if self._display_shape is not None:
             areas = [polygon.area() for polygon in self._polygons]
             for index, polygon in enumerate(self._polygons):
-                item = QGraphicsPathItem(self._polygon_path(polygon.points))
+                points = (
+                    drag.after[index]
+                    if drag is not None and index in drag.after
+                    else polygon.points
+                )
+                item = QGraphicsPathItem(self._polygon_path(points))
                 self._style_polygon(
                     item, QColor(colors.get(polygon.layer_id, QColor("#ffffff")))
                 )
@@ -674,34 +784,71 @@ class LayerCanvas(QGraphicsView):
         self.scene().addItem(item)
         return item
 
+    def _style_handle(
+        self, item: QGraphicsRectItem, color: QColor, selected: bool
+    ) -> None:
+        """A point handle in its layer's colour; larger and white when selected."""
+
+        size = _SELECTED_HANDLE_PX if selected else _HANDLE_PX
+        item.setRect(-size / 2.0, -size / 2.0, size, size)
+        pen = QPen(
+            QColor(20, 20, 20, 255 if selected else 230), 2.0 if selected else 1.0
+        )
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QColor(255, 255, 255) if selected else QColor(color))
+        item.setZValue(21.0 if selected else 20.0)
+
     def _update_handles(self) -> None:
+        """Point handles for every shown polygon, with the Edit tool only."""
+
         for handles in self._handle_items:
             for item in handles:
                 self.scene().removeItem(item)
         self._handle_items = []
         if (
-            self.tool != "polygon"
+            self.tool != "edit"
             or not self._marks_visible
             or not self.paint_enabled
             or self._display_shape is None
         ):
             return
+        drag = self._drag
         for index, polygon in enumerate(self._polygons):
             if polygon.layer_id in self._hidden_layers:
                 # No handles, but keep one list per polygon (indexed by polygon).
                 self._handle_items.append([])
                 continue
             points = (
-                self._drag_points
-                if self._drag is not None and self._drag[0] == index
+                drag.after[index]
+                if drag is not None and index in drag.after
                 else polygon.points
             )
             color = QColor(self._polygon_colors.get(polygon.layer_id, "#ffffff"))
-            self._handle_items.append(
-                [
-                    self._handle(self.raw_to_scene(row, col), color)
-                    for row, col in points
-                ]
+            handles = []
+            for vertex, (row, col) in enumerate(points):
+                item = self._handle(self.raw_to_scene(row, col), color)
+                self._style_handle(item, color, (index, vertex) in self._selection)
+                handles.append(item)
+            self._handle_items.append(handles)
+
+    def _restyle_handles(self, points: Iterable[tuple[int, int]]) -> None:
+        """Show whether these points are selected, without making the handles
+        again."""
+
+        for index, vertex in points:
+            if not (
+                0 <= index < min(len(self._handle_items), len(self._polygons))
+                and 0 <= vertex < len(self._handle_items[index])
+            ):
+                continue
+            color = QColor(
+                self._polygon_colors.get(self._polygons[index].layer_id, "#ffffff")
+            )
+            self._style_handle(
+                self._handle_items[index][vertex],
+                color,
+                (index, vertex) in self._selection,
             )
 
     def _hit_vertex(self, position: QPointF) -> tuple[int, int] | None:
@@ -732,14 +879,355 @@ class LayerCanvas(QGraphicsView):
             return None
         return min(hits, key=lambda index: self._polygons[index].area())
 
+    def _hit_edge(self, position: QPointF) -> int | None:
+        """The shown polygon with an edge within the point-hit distance of a
+        viewport position: the nearest edge, and the smaller polygon where
+        two edges are as near (a shared boundary)."""
+
+        transform = self.viewportTransform()
+        best: tuple[float, float, int] | None = None
+        for index, polygon in enumerate(self._polygons):
+            if polygon.layer_id in self._hidden_layers or len(polygon.points) < 2:
+                continue
+            spots = [
+                transform.map(self.raw_to_scene(row, col))
+                for row, col in polygon.points
+            ]
+            distance = min(
+                _segment_distance(position, start, spots[(number + 1) % len(spots)])
+                for number, start in enumerate(spots)
+            )
+            if distance <= _VERTEX_HIT_PX:
+                key = (distance, polygon.area(), index)
+                if best is None or key < best:
+                    best = key
+        return None if best is None else best[2]
+
     def polygon_at(self, position: QPointF) -> tuple[int, int] | None:
-        """Polygon (and point, or -1) under a viewport position."""
+        """Polygon (and point, or -1) under a viewport position.
+
+        With the Edit tool, a position near an edge counts too, also just
+        outside the polygon.
+        """
 
         vertex = self._hit_vertex(position)
         if vertex is not None:
             return vertex
         index = self._hit_polygon(position)
+        if index is None and self.tool == "edit":
+            index = self._hit_edge(position)
         return None if index is None else (index, -1)
+
+    # ---------------------------------------------------- selecting points
+
+    @property
+    def selected_points(self) -> list[tuple[int, int]]:
+        """Points selected with the Edit tool: sorted (polygon, point) indices."""
+
+        return sorted(self._selection)
+
+    def _selectable(self, index: int, vertex: int) -> bool:
+        return (
+            0 <= index < len(self._polygons)
+            and 0 <= vertex < len(self._polygons[index].points)
+            and self._polygons[index].layer_id not in self._hidden_layers
+        )
+
+    def set_selection(self, points: Iterable[tuple[int, int]]) -> None:
+        """Select these (polygon, point) indices instead of the current ones.
+
+        Only the Edit tool has a selection; points of hidden layers and points
+        that do not exist are left out.
+        """
+
+        chosen = {(int(index), int(vertex)) for index, vertex in points}
+        if self.tool != "edit":
+            chosen = set()
+        before = self._selection
+        self._selection = {point for point in chosen if self._selectable(*point)}
+        self._restyle_handles(before ^ self._selection)
+
+    def clear_selection(self) -> None:
+        """Select no point; a drag or a rubber band in progress is cancelled."""
+
+        self._cancel_drag()
+        self._cancel_band()
+        if self._selection:
+            before, self._selection = self._selection, set()
+            self._restyle_handles(before)
+
+    def selection_without(
+        self, index: int, vertices: Iterable[int]
+    ) -> list[tuple[int, int]]:
+        """The selection as it will be once these points of polygon ``index``
+        are removed: they leave it, and later points of that polygon move up."""
+
+        removed = {int(vertex) for vertex in vertices}
+        kept = []
+        for polygon, vertex in self._selection:
+            if polygon != index:
+                kept.append((polygon, vertex))
+            elif vertex not in removed:
+                earlier = sum(1 for number in removed if number < vertex)
+                kept.append((polygon, vertex - earlier))
+        return sorted(kept)
+
+    def _selected_by_polygon(self) -> dict[int, set[int]]:
+        grouped: dict[int, set[int]] = {}
+        for index, vertex in self._selection:
+            if self._selectable(index, vertex):
+                grouped.setdefault(index, set()).add(vertex)
+        return grouped
+
+    def _emit_edits(self, changes: Mapping[int, list[tuple[float, float]]]) -> None:
+        """Report changed polygons as one change: ``polygon_edited`` for one
+        polygon, ``polygons_edited`` for several."""
+
+        if len(changes) == 1:
+            ((index, points),) = changes.items()
+            self.polygon_edited.emit(int(index), list(points))
+        elif changes:
+            self.polygons_edited.emit(
+                {int(index): list(points) for index, points in changes.items()}
+            )
+
+    def _raw_limits(self) -> tuple[float, float, float, float]:
+        """First and last raw row and column that points are kept within (as
+        for the points of a polygon being drawn)."""
+
+        bounds = self.pixmap_item.boundingRect()
+        top, left = self.scene_to_raw(QPointF(0.0, 0.0))
+        bottom, right = self.scene_to_raw(
+            QPointF(max(0.0, bounds.width() - 1.0), max(0.0, bounds.height() - 1.0))
+        )
+        return top, bottom, left, right
+
+    def _clamp_offset(
+        self, points: Sequence[tuple[float, float]], rows: float, cols: float
+    ) -> tuple[float, float]:
+        """Limit an offset so that it moves none of these points out of the
+        photograph; points already outside it are not pulled in."""
+
+        if not points:
+            return 0.0, 0.0
+        top, bottom, left, right = self._raw_limits()
+        row_values = [point[0] for point in points]
+        col_values = [point[1] for point in points]
+        rows = min(
+            max(rows, min(0.0, top - min(row_values))),
+            max(0.0, bottom - max(row_values)),
+        )
+        cols = min(
+            max(cols, min(0.0, left - min(col_values))),
+            max(0.0, right - max(col_values)),
+        )
+        return rows, cols
+
+    def _moved_points(
+        self,
+        polygons: Mapping[int, Sequence[tuple[float, float]]],
+        rows: float,
+        cols: float,
+    ) -> dict[int, list[tuple[float, float]]]:
+        """The points of these polygons with the selected ones moved by an
+        offset (raw pixels), limited to the photograph."""
+
+        selected = self._selected_by_polygon()
+        moving = [
+            polygons[index][vertex]
+            for index, vertices in selected.items()
+            if index in polygons
+            for vertex in vertices
+            if vertex < len(polygons[index])
+        ]
+        rows, cols = self._clamp_offset(moving, rows, cols)
+        moved = {}
+        for index, points in polygons.items():
+            new_points = list(points)
+            for vertex in selected.get(index, ()):
+                if vertex < len(new_points):
+                    row, col = new_points[vertex]
+                    new_points[vertex] = (row + rows, col + cols)
+            moved[index] = new_points
+        return moved
+
+    def nudge_selected_points(self, screen_rows: float, screen_cols: float) -> bool:
+        """Move the selected points by screen pixels as one change (limited to
+        the photograph); False when nothing moved."""
+
+        selected = self._selected_by_polygon()
+        if not selected:
+            return False
+        transform = self.transform()
+        scale_rows, scale_cols = self._scale()
+        zoom_rows = abs(transform.m22()) * scale_rows
+        zoom_cols = abs(transform.m11()) * scale_cols
+        if zoom_rows <= 0.0 or zoom_cols <= 0.0:
+            return False
+        before = {index: list(self._polygons[index].points) for index in selected}
+        after = self._moved_points(
+            before, screen_rows / zoom_rows, screen_cols / zoom_cols
+        )
+        changes = {
+            index: points for index, points in after.items() if points != before[index]
+        }
+        self._emit_edits(changes)
+        return bool(changes)
+
+    def delete_selected_points(self) -> int:
+        """Remove the selected points as one change; returns how many went.
+
+        A polygon that would keep fewer than three points is left unchanged,
+        its points stay selected and ``notice`` says so; other polygons still
+        lose their selected points.
+        """
+
+        selection = set(self._selection)
+        changes: dict[int, list[tuple[float, float]]] = {}
+        refused = False
+        for index, vertices in sorted(self._selected_by_polygon().items()):
+            kept = [
+                point
+                for vertex, point in enumerate(self._polygons[index].points)
+                if vertex not in vertices
+            ]
+            if len(kept) < 3:
+                refused = True
+            else:
+                changes[index] = kept
+        removed = 0
+        if changes:
+            self._emit_edits(changes)
+            applied = {
+                index
+                for index, points in changes.items()
+                if index < len(self._polygons)
+                and list(self._polygons[index].points) == points
+            }
+            removed = sum(1 for index, _vertex in selection if index in applied)
+            self.set_selection(point for point in selection if point[0] not in applied)
+        if refused:
+            self.notice.emit(_TOO_FEW_POINTS)
+        return removed
+
+    def _insert_point_at(self, position: QPointF) -> bool:
+        """Add a point on the polygon edge under a viewport position (not on a
+        point) and select it."""
+
+        if self._hit_vertex(position) is not None:
+            return False
+        index = self._hit_edge(position)
+        if index is None:
+            return False
+        row, col = self.scene_to_raw(self.mapToScene(position.toPoint()))
+        points, inserted = insert_point_on_nearest_edge(
+            self._polygons[index].points, row, col
+        )
+        if inserted < 0:
+            return False
+        self._emit_edits({index: points})
+        if index < len(self._polygons) and list(self._polygons[index].points) == points:
+            self.set_selection([(index, inserted)])
+            return True
+        return False
+
+    def _edit_press(self, event: Any) -> None:
+        """A left press with the Edit tool: select points, then drag them or
+        a rubber band."""
+
+        # A drag or band whose release never came (a dialog took the mouse).
+        self._cancel_drag()
+        self._cancel_band()
+        position = event.position()
+        extend = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        hit = self._hit_vertex(position)
+        if hit is None:
+            if not extend:
+                self.set_selection(())
+            self._band_origin = QPointF(position)
+            return
+        selection = set(self._selection)
+        if extend:
+            selection ^= {hit}
+        elif hit not in selection:
+            selection = {hit}
+        self.set_selection(selection)
+        if hit in self._selection:
+            self._start_drag(position)
+
+    def _band_rect(self, position: QPointF) -> QRectF:
+        """Scene rectangle from where the rubber band started to a position."""
+
+        assert self._band_origin is not None
+        return QRectF(
+            QPointF(self.mapToScene(self._band_origin.toPoint())),
+            QPointF(self.mapToScene(position.toPoint())),
+        ).normalized()
+
+    def _move_band(self, position: QPointF) -> None:
+        if self._band_origin is None:
+            return
+        if (
+            not self.band_item.isVisible()
+            and (position - self._band_origin).manhattanLength() <= _CLICK_SLOP_PX
+        ):
+            return
+        self.band_item.setRect(self._band_rect(position))
+        self.band_item.show()
+
+    def _finish_band(self, position: QPointF) -> None:
+        """Add the shown points inside the rubber band to the selection."""
+
+        if self._band_origin is None:
+            return
+        dragged = (
+            self.band_item.isVisible()
+            or (position - self._band_origin).manhattanLength() > _CLICK_SLOP_PX
+        )
+        rect = self._band_rect(position)
+        self._cancel_band()
+        if not dragged:
+            return
+        chosen = set(self._selection)
+        for index, polygon in enumerate(self._polygons):
+            if polygon.layer_id in self._hidden_layers:
+                continue
+            for vertex, (row, col) in enumerate(polygon.points):
+                if rect.contains(self.raw_to_scene(row, col)):
+                    chosen.add((index, vertex))
+        self.set_selection(chosen)
+
+    def _cancel_band(self) -> None:
+        self._band_origin = None
+        self.band_item.hide()
+        self.band_item.setRect(QRectF())
+
+    def _edit_key(self, event: Any) -> bool:
+        """Keys of the Edit tool; False when the key is not one of them."""
+
+        key = event.key()
+        busy = self._drag is not None or self._band_origin is not None
+        if key == Qt.Key.Key_Escape:
+            if not (self._selection or busy):
+                return False
+            self.clear_selection()
+            return True
+        if not self._selection or busy:
+            return False
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected_points()
+            return True
+        step = _NUDGE_KEYS.get(key)
+        modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        if step is None or modifiers & ~Qt.KeyboardModifier.ShiftModifier:
+            return False
+        pixels = (
+            _NUDGE_SHIFT_PX
+            if modifiers & Qt.KeyboardModifier.ShiftModifier
+            else _NUDGE_PX
+        )
+        self.nudge_selected_points(step[0] * pixels, step[1] * pixels)
+        return True
 
     # ------------------------------------------------------ drawing polygons
 
@@ -848,31 +1336,79 @@ class LayerCanvas(QGraphicsView):
             _VERTEX_HIT_PX
         )
 
-    def _start_drag(self, index: int, vertex: int) -> None:
-        self._drag = (index, vertex)
-        self._drag_points = list(self._polygons[index].points)
+    def _editing(self) -> bool:
+        return (
+            self.paint_enabled
+            and not self.place_mode
+            and self.tool == "edit"
+            and self._raw_size is not None
+            and self._marks_visible
+        )
 
-    def _move_drag(self, scene_point: QPointF) -> None:
-        if self._drag is None or self._drag_points is None:
+    def _start_drag(self, position: QPointF) -> None:
+        """Start dragging the selected points from a viewport position."""
+
+        before = {
+            index: list(self._polygons[index].points)
+            for index in sorted(self._selected_by_polygon())
+        }
+        if not before:
             return
-        index, vertex = self._drag
-        clamped = self._clamped_scene(scene_point)
-        self._drag_points[vertex] = self.scene_to_raw(clamped)
-        if index < len(self._polygon_items):
-            self._polygon_items[index].setPath(self._polygon_path(self._drag_points))
-        if index < len(self._handle_items) and vertex < len(self._handle_items[index]):
-            self._handle_items[index][vertex].setPos(clamped)
+        self._drag = _PointDrag(
+            QPointF(position),
+            self.scene_to_raw(self.mapToScene(position.toPoint())),
+            before,
+            {index: list(points) for index, points in before.items()},
+        )
+
+    def _move_drag(self, position: QPointF) -> None:
+        """Move the dragged points with the mouse, all by the same offset."""
+
+        drag = self._drag
+        if drag is None:
+            return
+        if not drag.moving:
+            if (position - drag.press).manhattanLength() <= _CLICK_SLOP_PX:
+                return
+            drag.moving = True
+        row, col = self.scene_to_raw(self.mapToScene(position.toPoint()))
+        drag.after = self._moved_points(
+            drag.before, row - drag.start[0], col - drag.start[1]
+        )
+        for index, points in drag.after.items():
+            if index < len(self._polygon_items):
+                self._polygon_items[index].setPath(self._polygon_path(points))
+            handles = (
+                self._handle_items[index] if index < len(self._handle_items) else []
+            )
+            for vertex, item in enumerate(handles):
+                if vertex < len(points):
+                    item.setPos(self.raw_to_scene(*points[vertex]))
 
     def _end_drag(self) -> None:
-        drag, points = self._drag, self._drag_points
-        self._drag = None
-        self._drag_points = None
-        if drag is None or points is None:
+        """Finish a drag: one change for every polygon whose points moved."""
+
+        drag, self._drag = self._drag, None
+        if drag is None:
             return
-        if points != list(self._polygons[drag[0]].points):
-            self.polygon_edited.emit(drag[0], points)
-        else:
-            self._update_handles()
+        changes = {
+            index: points
+            for index, points in drag.after.items()
+            if points != drag.before[index]
+        }
+        # Without a change the outlines and handles are where they were.
+        self._emit_edits(changes)
+
+    def _cancel_drag(self) -> None:
+        """Stop a drag and put the points back where they were."""
+
+        drag, self._drag = self._drag, None
+        if drag is None:
+            return
+        for index, points in drag.before.items():
+            if index < len(self._polygon_items):
+                self._polygon_items[index].setPath(self._polygon_path(points))
+        self._update_handles()
 
     # ------------------------------------------------------------ tools
 
@@ -881,6 +1417,8 @@ class LayerCanvas(QGraphicsView):
             raise ValueError(f"Unknown tool {tool!r}")
         if tool != self.tool:
             self.cancel_polygon()
+            # Only the Edit tool has selected points.
+            self.clear_selection()
         self.tool = tool
         self._cancel_stroke()
         self.setDragMode(
@@ -889,9 +1427,10 @@ class LayerCanvas(QGraphicsView):
             else QGraphicsView.DragMode.NoDrag
         )
         self.viewport().setCursor(
-            Qt.CursorShape.OpenHandCursor
-            if tool == "pan"
-            else Qt.CursorShape.CrossCursor
+            {
+                "pan": Qt.CursorShape.OpenHandCursor,
+                "edit": Qt.CursorShape.ArrowCursor,
+            }.get(tool, Qt.CursorShape.CrossCursor)
         )
         self._update_handles()
         self._update_cursor()
@@ -1017,14 +1556,14 @@ class LayerCanvas(QGraphicsView):
                 )
                 event.accept()
                 return
+        if button == Qt.MouseButton.LeftButton and self._editing():
+            self._edit_press(event)
+            event.accept()
+            return
         if button == Qt.MouseButton.LeftButton and self._drawing():
+            # Draw only adds points: a click on a point of an existing polygon
+            # adds a point to the new polygon there.
             point = self.mapToScene(event.position().toPoint())
-            if not self._draft:
-                vertex = self._hit_vertex(event.position())
-                if vertex is not None:
-                    self._start_drag(*vertex)
-                    event.accept()
-                    return
             if self._near_first_point(event.position()):
                 self.close_polygon()
                 event.accept()
@@ -1048,6 +1587,11 @@ class LayerCanvas(QGraphicsView):
                 self.close_polygon()
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self._editing():
+            self._cancel_band()
+            self._insert_point_at(event.position())
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: Any) -> None:
@@ -1067,7 +1611,11 @@ class LayerCanvas(QGraphicsView):
             return
         point = self.mapToScene(event.position().toPoint())
         if self._drag is not None:
-            self._move_drag(point)
+            self._move_drag(event.position())
+            event.accept()
+            return
+        if self._band_origin is not None:
+            self._move_band(event.position())
             event.accept()
             return
         if self._draft and self._drawing():
@@ -1100,6 +1648,10 @@ class LayerCanvas(QGraphicsView):
             return
         if button == Qt.MouseButton.LeftButton and self._drag is not None:
             self._end_drag()
+            event.accept()
+            return
+        if button == Qt.MouseButton.LeftButton and self._band_origin is not None:
+            self._finish_band(event.position())
             event.accept()
             return
         if button == Qt.MouseButton.LeftButton and self._points:
@@ -1142,6 +1694,9 @@ class LayerCanvas(QGraphicsView):
                 self.close_polygon()
                 event.accept()
                 return
+        if self._editing() and self._edit_key(event):
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def leaveEvent(self, event: Any) -> None:
@@ -1355,6 +1910,7 @@ class LayerPainterView(QWidget):
         self.canvas.stroke_finished.connect(self._stroke_finished)
         self.canvas.polygon_finished.connect(self._polygon_finished)
         self.canvas.polygon_edited.connect(self._polygon_edited)
+        self.canvas.polygons_edited.connect(self._polygons_edited)
         self.canvas.polygon_context.connect(self._polygon_menu)
         self.canvas.draft_changed.connect(self._draft_changed)
         self.canvas.notice.connect(self._canvas_notice)
@@ -1426,16 +1982,23 @@ class LayerPainterView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(
             _note(
-                "Choose a layer and outline it with a polygon: left click adds a "
-                "point, right click or Enter closes it. Rough outlines are enough; "
-                "the boundaries are placed within the snap distance (step 3). Drag "
-                "a point to move it. Right-click a point to remove it, or right-"
-                "click inside a polygon to add a point on its nearest edge, delete "
-                "the polygon or give it to another layer. The brush (B) paints "
-                "strokes, for example as corrections. Mark the ColorChecker, tape "
-                "and fittings as Excluded. Untick Show to hide a layer in the "
-                "photograph; this changes only what is shown. Right-click the list "
-                "to show only one layer, or all layers again."
+                "Choose a layer and draw it with Draw (L): left click adds a "
+                "point, right click or Enter closes the polygon. Rough outlines "
+                "are enough; the boundaries are placed within the snap distance "
+                "(step 3). Draw only adds new polygons and never moves a point "
+                "that is already there. To change existing polygons, use Edit "
+                "(V): click a point to select it and drag to move it, Ctrl+click "
+                "to select more points, or drag on empty space to select the "
+                "points in a rectangle. Delete removes the selected points, the "
+                "arrow keys move them a little (Shift: more) and Esc clears the "
+                "selection. Double-click an edge to add a point there. Right-"
+                "click a polygon to add or remove a point, delete the polygon or "
+                "give it to another layer. The brush (B) paints strokes, for "
+                "example as corrections. Mark the ColorChecker, tape and fittings "
+                "as Excluded. Untick Show to hide a layer in the photograph; this "
+                "changes only what is shown, and its points cannot be edited "
+                "while it is hidden. Right-click the list to show only one layer, "
+                "or all layers again."
             )
         )
         self.layer_table = QTableWidget(0, 5)
@@ -1501,8 +2064,8 @@ class LayerPainterView(QWidget):
                 "photograph inside the rig frame. Inside a polygon its layer is "
                 "kept; near polygon edges the model places the boundary within the "
                 "snap distance, choosing only between layers marked nearby. Where "
-                "it is wrong, move or add a polygon point or paint a short stroke "
-                "of the right layer, and propose again."
+                "it is wrong, move or add a polygon point with Edit (V) or paint "
+                "a short stroke of the right layer, and propose again."
             )
         )
         row = QHBoxLayout()
@@ -1670,11 +2233,21 @@ class LayerPainterView(QWidget):
             ("pan", "Pan", "Drag to move the photograph (H)"),
             (
                 "polygon",
-                "Polygon",
+                "Draw",
                 (
-                    "Outline the selected layer (L): left click adds a point, right "
-                    "click or Enter closes the polygon. Drag a point to move it; "
-                    "right-click a polygon to add or remove a point"
+                    "Draw a new polygon for the selected layer (L): left click adds "
+                    "a point, right click or Enter closes it"
+                ),
+            ),
+            (
+                "edit",
+                "Edit",
+                (
+                    "Edit existing polygons (V): click a point to select it and "
+                    "drag to move; Ctrl+click selects more points; drag on empty "
+                    "space selects points in a rectangle; Delete removes the "
+                    "selected points; double-click or right-click an edge to add a "
+                    "point"
                 ),
             ),
             ("paint", "Paint", "Paint strokes of the selected layer (B)"),
@@ -1788,6 +2361,7 @@ class LayerPainterView(QWidget):
         canvas_only = Qt.ShortcutContext.WidgetShortcut
         for key, slot in (
             ("L", lambda: self.set_tool("polygon")),
+            ("V", lambda: self.set_tool("edit")),
             ("B", lambda: self.set_tool("paint")),
             ("E", lambda: self.set_tool("erase")),
             ("H", lambda: self.set_tool("pan")),
@@ -1891,6 +2465,7 @@ class LayerPainterView(QWidget):
             self._undo_stack = []
             self._redo_stack = []
             self.canvas.cancel_polygon()
+            self.canvas.clear_selection()
             self._other_photo = None
             self._reference_token = None
             try:
@@ -2121,7 +2696,10 @@ class LayerPainterView(QWidget):
     # ------------------------------------------------------------- tools
 
     def set_tool(self, tool: str) -> None:
-        if tool in {"polygon", "paint", "erase"} and self._other_photo is not None:
+        if (
+            tool in {"polygon", "edit", "paint", "erase"}
+            and self._other_photo is not None
+        ):
             self.show_reference_photo()
         self.canvas.set_tool(tool)
         button = self.tool_buttons.get(tool)
@@ -2359,6 +2937,7 @@ class LayerPainterView(QWidget):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self.canvas.cancel_polygon()
+        self.canvas.clear_selection()
         self.session.remove_layer(layer_id)
         if layer_id in self._hidden_layers:
             # A later layer may get the same ID; it starts shown.
@@ -2387,6 +2966,8 @@ class LayerPainterView(QWidget):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        # Removing polygons renumbers the others.
+        self.canvas.clear_selection()
         self._push_undo()
         self.session.clear_layer_marks(layer_id)
         self._after_mark_change()
@@ -2446,12 +3027,14 @@ class LayerPainterView(QWidget):
 
     def _prune_hidden_layers(self) -> None:
         """Hidden layers belong to the session shown: another session (another
-        run or an imported map) shows every layer; removed layers are dropped."""
+        run or an imported map) shows every layer; removed layers are dropped.
+        Another session also starts with no point selected."""
 
         session = self.session
         if session is not self._hidden_session:
             self._hidden_session = session
             hidden: set[int] = set()
+            self.canvas.clear_selection()
         elif session is None:
             hidden = set()
         else:
@@ -2590,24 +3173,52 @@ class LayerPainterView(QWidget):
     def _polygon_edited(
         self, index: int, points: Sequence[tuple[float, float]]
     ) -> None:
-        if self.session is None or not 0 <= index < len(self.session.polygons):
-            return
+        self._polygons_edited({index: points})
+
+    def _polygons_edited(
+        self, changes: Mapping[int, Sequence[tuple[float, float]]]
+    ) -> list[int]:
+        """Give one or more polygons new points, as one change to undo.
+
+        A polygon whose new points are not valid (fewer than three, or no
+        area) keeps its points and the hint line says why; the others still
+        change. Returns the indices of the polygons that changed.
+        """
+
+        if self.session is None:
+            return []
         snapshot = self._snapshot()
-        layer_id = self.session.polygons[index].layer_id
-        try:
-            self.session.replace_polygon(index, lp.Polygon(layer_id, list(points)))
-        except ValueError as error:
-            self._canvas_notice(str(error))
-            self._render_marks()
-            return
+        applied: list[int] = []
+        problems: list[str] = []
+        for index, points in sorted(dict(changes).items()):
+            index = int(index)
+            if not 0 <= index < len(self.session.polygons):
+                continue
+            layer_id = self.session.polygons[index].layer_id
+            try:
+                self.session.replace_polygon(index, lp.Polygon(layer_id, list(points)))
+            except ValueError as error:
+                problems.append(str(error))
+                continue
+            applied.append(index)
+        if not applied:
+            if problems:
+                self._canvas_notice(problems[0])
+                self._render_marks()
+            return []
         self._undo_stack.append(snapshot)
         del self._undo_stack[:-_UNDO_LIMIT]
         self._redo_stack = []
         self._after_mark_change()
+        if problems:
+            self._canvas_notice(problems[0])
+        return applied
 
     def delete_polygon(self, index: int) -> None:
         if self.session is None or not 0 <= index < len(self.session.polygons):
             return
+        # Deleting a polygon renumbers the polygons after it.
+        self.canvas.clear_selection()
         self._push_undo()
         self.session.remove_polygon(index)
         self._after_mark_change()
@@ -2617,6 +3228,7 @@ class LayerPainterView(QWidget):
             return
         if self.session.polygons[index].layer_id == layer_id:
             return
+        self.canvas.clear_selection()
         self._push_undo()
         self.session.move_polygon(index, layer_id)
         self._reveal_layer(layer_id)
@@ -2631,15 +3243,28 @@ class LayerPainterView(QWidget):
         points = [
             point for number, point in enumerate(polygon.points) if number != vertex
         ]
+        # The other selected points keep their selection.
+        selection = self.canvas.selection_without(index, (vertex,))
         self._polygon_edited(index, points)
+        if self.session.polygons[index].points == points:
+            self.canvas.set_selection(selection)
+
+    def remove_selected_points(self) -> int:
+        """Remove the points selected with the Edit tool, as one change to undo.
+
+        A polygon that would keep fewer than three points is left unchanged
+        and the hint line says so. Returns how many points were removed.
+        """
+
+        return self.canvas.delete_selected_points()
 
     def add_polygon_point(self, index: int, row: float, col: float) -> int:
         """Add a point to a polygon on its edge nearest to (row, col).
 
         (row, col) is in raw pixels, for example where the polygon was
         right-clicked; the point goes where it projects onto that edge. Like a
-        moved point, the change can be undone. Returns the index of the new
-        point, or -1.
+        moved point, the change can be undone. With the Edit tool the new
+        point is selected. Returns the index of the new point, or -1.
         """
 
         if self.session is None or not 0 <= index < len(self.session.polygons):
@@ -2652,6 +3277,7 @@ class LayerPainterView(QWidget):
         self._polygon_edited(index, points)
         if self.session.polygons[index].points != points:
             return -1  # refused; the notice says why
+        self.canvas.set_selection([(index, inserted)])
         return inserted
 
     def _polygon_menu(self, index: int, vertex: int, position: QPoint) -> None:
@@ -2668,6 +3294,14 @@ class LayerPainterView(QWidget):
             remove_point.triggered.connect(
                 lambda _checked=False: self.remove_polygon_point(index, vertex)
             )
+            selected = self.canvas.selected_points
+            if len(selected) > 1 and (index, vertex) in selected:
+                remove_selected = menu.addAction(
+                    f"Remove {len(selected)} selected points"
+                )
+                remove_selected.triggered.connect(
+                    lambda _checked=False: self.remove_selected_points()
+                )
         elif self.canvas.last_context_raw is not None:
             # Where the polygon was right-clicked, in raw pixels.
             clicked = self.canvas.last_context_raw
@@ -2723,15 +3357,21 @@ class LayerPainterView(QWidget):
             return
         if not self._undo_stack:
             return
-        self._redo_stack.append(self._snapshot())
-        self._restore(self._undo_stack.pop())
+        current, snapshot = self._snapshot(), self._undo_stack.pop()
+        if snapshot[0] != current[0]:
+            self.canvas.clear_selection()  # the polygons change
+        self._redo_stack.append(current)
+        self._restore(snapshot)
         self._after_mark_change()
 
     def redo(self) -> None:
         if self.session is None or not self._redo_stack:
             return
-        self._undo_stack.append(self._snapshot())
-        self._restore(self._redo_stack.pop())
+        current, snapshot = self._snapshot(), self._redo_stack.pop()
+        if snapshot[0] != current[0]:
+            self.canvas.clear_selection()  # the polygons change
+        self._undo_stack.append(current)
+        self._restore(snapshot)
         self._after_mark_change()
 
     def _after_mark_change(self, *, render: bool = True) -> None:

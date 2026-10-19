@@ -103,6 +103,7 @@ def _alpha(canvas, row, col):
 
 
 def test_canvas_hidden_layers_polygons_are_not_drawn_handled_or_hit(canvas):
+    canvas.set_tool("edit")  # point handles are shown by the Edit tool (0002)
     polygons = [lp.Polygon(1, list(POLYGON_A)), lp.Polygon(2, list(POLYGON_B))]
     canvas.render_polygons(polygons, COLORS)
     corner_b, inside_b = _spot(canvas, 10.0, 45.0), _spot(canvas, 30.0, 60.0)
@@ -228,6 +229,7 @@ def _check_box_center(table, item):
 
 
 def test_show_column_hides_a_layer_on_the_canvas_only(view):
+    view.set_tool("edit")  # point handles are shown by the Edit tool (0002)
     table = view.layer_table
     assert table.columnCount() == 5
     assert [table.horizontalHeaderItem(column).text() for column in range(5)] == [
@@ -436,6 +438,7 @@ def test_proposal_overlay_is_transparent_for_hidden_layers(view, monkeypatch):
 
 
 def test_add_point_here_inserts_one_point_and_undo_restores_the_polygon(view):
+    view.set_tool("edit")  # point handles are shown by the Edit tool (0002)
     view.add_polygon(lp.Polygon(2, list(POLYGON_B)))
     original = list(view.session.polygons[0].points)
     canvas = view.canvas
