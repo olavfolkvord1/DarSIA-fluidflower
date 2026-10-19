@@ -19,17 +19,22 @@ from . import series
 from .job_queue import JobQueue, descriptor, read_json, require_unc, write_immutable
 
 
-def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None, capacity_stores=()):
+def prepare_job(series_path, job_root, *, expected_sha256, series_manifest=None, capacity_stores=(),
+                storage_profile=None):
     """Prepare new versioned alias metadata; legacy jobs remain readable/runnable.
 
     The registered schema-1 manifest is explicit because an execution-series
     plan is a different document. No missing-manifest fallback creates a new
     absolute-path job. J3 runtime remains unavailable for these new jobs.
+    ``storage_profile`` is the job's explicit choice, 'full' or 'lean' (None:
+    storage_profile.DEFAULT_STORAGE_PROFILE); the result reports the shared
+    estimate for that profile under ``storage_estimate``.
     """
     from .alias_job import prepare_alias_job
 
     return prepare_alias_job(series_path, job_root, expected_sha256=expected_sha256,
-                             series_manifest=series_manifest, capacity_stores=capacity_stores)
+                             series_manifest=series_manifest, capacity_stores=capacity_stores,
+                             storage_profile=storage_profile)
 
 
 def _phase_outputs(stage, spec, frame, inferred):
@@ -292,8 +297,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
 
     config = series.load_run(task)
     config["_configuration_sha256"] = task["configuration"]["sha256"]
-    from ..storage_profile import resolve as storage_setting
-    setting = storage_setting(config)
+    from ..storage_profile import resolve as storage_setting, run_setting
+    setting = run_setting(task, config)  # The job's choice; legacy tasks write full.
     if ("storage_profile" in config["mass"]["template"]
             and storage_setting(config["mass"]["template"]) != setting):
         raise ValueError("The series storage_profile differs from its mass template")
@@ -563,12 +568,15 @@ def main(argv=None):
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--stores", type=Path, action="append", default=[],
                         help="Optional local machine map(s) for whole-job expected needed/free reports")
+    parser.add_argument("--storage-profile", choices=("full", "lean"), default=None,
+                        help="The job's storage profile (default: DEFAULT_STORAGE_PROFILE)")
     args = parser.parse_args(argv)
     from ..store_map import read_store_map
     maps = [read_store_map(path, forbidden_roots=(Path(__file__).resolve().parents[4],
                                                 args.series_manifest.parent)) for path in args.stores]
     result = prepare_job(args.series, args.job, expected_sha256=args.series_sha256,
-                         series_manifest=descriptor(args.series_manifest), capacity_stores=maps)
+                         series_manifest=descriptor(args.series_manifest), capacity_stores=maps,
+                         storage_profile=args.storage_profile)
     print(json.dumps(result, sort_keys=True), flush=True)
 
 

@@ -301,6 +301,104 @@ class SpaceEstimate:
                 + _integer(reserve_bytes, "Reserve bytes"))
 
 
+LEAN_ESTIMATE_MODEL = ("ESTIMATE, not a measurement: the chosen storage profile's documented "
+                       "per-file sizes (storage_profile.estimate_job_bytes); no measured lean "
+                       "profile exists yet and the full measured profile is never reused")
+
+
+@dataclass(frozen=True)
+class StorageProfileEstimate:
+    """A lean task's own admission estimate (N55).
+
+    The shared per-profile estimator, bound to the task's explicit storage
+    profile and to the actual writer sources of its commit. It is never a
+    reuse of the full measured profile, and never a measurement.
+    """
+    run: str
+    case_count: int
+    storage_profile: str
+    colour_intermediates: str
+    pipeline: str
+    products_per_frame_estimated_bytes: int
+    run_constant_estimated_bytes: int
+    inflight_estimated_bytes: int
+    estimate: dict
+    writer_identity: list
+    commit: str
+    model: str = LEAN_ESTIMATE_MODEL
+
+    @property
+    def products_estimated_bytes(self):
+        return self.products_per_frame_estimated_bytes * self.case_count
+
+    @property
+    def transient_estimated_bytes(self):
+        # The run's one-off constant-input store stays reserved with the run.
+        return self.inflight_estimated_bytes + self.run_constant_estimated_bytes
+
+    def needed(self, *, other_remaining_bytes=0, reserve_bytes=DEFAULT_RESERVE_BYTES):
+        return (self.products_estimated_bytes + self.transient_estimated_bytes
+                + _integer(other_remaining_bytes, "Other active remaining bytes")
+                + _integer(reserve_bytes, "Reserve bytes"))
+
+
+def _require_full_profile(task, route):
+    from ..storage_profile import declared_storage_profile
+    if declared_storage_profile(task) != "full":
+        raise ValueError(route + " binds the full storage profile of references and "
+                         "qualification; a lean task is refused here")
+
+
+def _lean_writers(pipeline, config):
+    """The writer sources one lean estimate binds, by route and optional output."""
+    rows = ["src/darsia/fluidflower/storage_profile.py", "src/darsia/fluidflower/mass/n1_pipeline.py",
+            "src/darsia/fluidflower/mass/n1_statistics.py"]
+    if pipeline == "native-phase-n1":
+        rows += ["src/darsia/fluidflower/pipeline/series.py", "src/darsia/fluidflower/native/sidecar.py",
+                 "src/darsia/fluidflower/pipeline/runner.py"]
+    if config.get("pixel_domain") is not None:
+        rows.append("src/darsia/fluidflower/mass/pixel_pipeline.py")
+    if config.get("storage") is not None:
+        rows += ["src/darsia/fluidflower/storage_resolution.py", "src/darsia/fluidflower/storage_outputs.py"]
+        if pipeline == "n1":
+            rows.append("src/darsia/fluidflower/storage_n1_outputs.py")
+    return rows
+
+
+def _lean_writer_identity(repository, commit, pipeline, config):
+    """The lean writer's own identity: its sources at the task commit, verified on disk.
+
+    No measured lean profile pins them yet, so they are recorded with the
+    estimate and its reservation, never compared with a full measurement.
+    """
+    identity = []
+    for relative in _lean_writers(pipeline, config):
+        original = subprocess.check_output(["git", "-C", str(repository), "show", commit + ":" + relative])
+        row = dict(relative_path=relative, sha256=hashlib.sha256(original).hexdigest())
+        _writer_identity(repository, commit, row)
+        identity.append(row)
+    return identity
+
+
+def lean_estimate(task, config, *, repository):
+    """Admission estimate of a lean task: its own profile, never the full profile's."""
+    from ..storage_profile import declared_storage_profile, run_estimate
+    if declared_storage_profile(task) != "lean":
+        raise ValueError("The lean estimate needs a task that chose storage_profile 'lean'")
+    pipeline, cases = task.get("pipeline"), task.get("ordered_case_ids")
+    if (pipeline not in {"native-phase-n1", "n1"} or not isinstance(cases, list) or not cases
+            or len(set(cases)) != len(cases) or not isinstance(config.get("frames"), list)
+            or [frame.get("case_id") for frame in config["frames"]] != cases
+            or config.get("run") != task.get("run")
+            or ("precision" in config and config["precision"] != task.get("precision"))
+            or re.fullmatch(r"[0-9a-f]{40}", str(task.get("commit", ""))) is None):
+        raise ValueError("Lean capacity estimate: task pipeline, precision, commit or exact case order differs")
+    value = run_estimate("lean", config, pipeline=pipeline)
+    writers = _lean_writer_identity(repository, task["commit"], pipeline, config)
+    return StorageProfileEstimate(name(task["run"]), len(cases), "lean", value["colour_intermediates"],
+        pipeline, value["per_frame_bytes"], value["per_run_bytes"], value["inflight_bytes"], value,
+        writers, task["commit"])
+
 
 @dataclass(frozen=True)
 class PredeclaredN43ProducerEntitlement:
@@ -341,6 +439,7 @@ class PredeclaredFirstOutputEntitlement:
 
 def first_output_entitlement(runtime, task, config, rows):
     """First-only Q104 administration; ordinary measured estimates stay intact."""
+    _require_full_profile(task, "The first Q104 qualification")
     first = runtime.cache_adapter.lease.first_qualification
     from darsia_cache.first_qualification import BOUND_OUTPUT_ADMINISTRATION, FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES, checked_all_stage_reference, _same_path
     if not first.bound_mode:
@@ -380,6 +479,7 @@ def first_output_entitlement(runtime, task, config, rows):
 
 def n43_entitlement(runtime, task, config, rows):
     """Explicit released producer route; ordinary load_estimate is unchanged."""
+    _require_full_profile(task, "The N43 reference build")
     first=runtime.cache_adapter.lease.first_qualification
     from darsia_cache.first_qualification import REFERENCE_ENTITLEMENT_BYTES, _same_path
     if not first.reference_build:
@@ -528,6 +628,11 @@ def estimate_run(task, config, profile, *, measurement, completion, layout=None,
 
 
 def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=None):
+    from ..storage_profile import declared_storage_profile
+    if declared_storage_profile(task) == "lean":
+        # The task's explicit choice binds its own estimate and writer identity;
+        # the full measured profile below is never reused for a lean writer.
+        return lean_estimate(task, config, repository=repository)
     _state, _reserve, binding = settings(stores, series_id)
     profile, _raw = read_bound(binding)
     from darsia_cache.first_qualification import PROVIDER, BOUND_JOB_PROFILE, resolve_profile
@@ -1183,12 +1288,14 @@ def report(estimate, volume, other_remaining, reserve):
     other = _integer(other_remaining, "Other active remaining bytes")
     needed = estimate.needed(reserve_bytes=reserve)
     free = _integer(volume["free_bytes"], "Actual free bytes")
+    message = f"{estimate.run}: estimated needed {needed} bytes / free {free} bytes (this job, estimated transient space and reserve; estimate, not coordinated across hosts)"
+    if isinstance(estimate, StorageProfileEstimate):
+        message += "; storage profile " + estimate.storage_profile + ": " + LEAN_ESTIMATE_MODEL
     return dict(**asdict(estimate), needed_bytes=needed, free_bytes=free,
                 other_active_remaining_bytes=other, reserve_bytes=reserve,
                 other_active_remaining_included_in_results_estimate=False,
                 results_space_policy="estimate, not coordinated across hosts",
-                sufficient=free >= needed, volume=volume,
-                message=f"{estimate.run}: estimated needed {needed} bytes / free {free} bytes (this job, estimated transient space and reserve; estimate, not coordinated across hosts)")
+                sufficient=free >= needed, volume=volume, message=message)
 
 
 def configuration_for_task(stores, series_id, task, rows=None):
@@ -1355,6 +1462,8 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
     combined = volume["free_bytes"] >= needed and cache["complete"] and cache["sufficient"]
     cache_message = cache["state"] + (": " + cache["reason"] if "reason" in cache else
         f"; required total {cache['required_cache_bytes']} bytes, quota headroom {cache['quota_headroom_bytes']} bytes")
+    profile_note = ("; lean runs: " + LEAN_ESTIMATE_MODEL
+                    if any(isinstance(row, StorageProfileEstimate) for row in estimates) else "")
     return dict(format="darsia-whole-job-expected-space-v1", machine_id=stores.machine_id,
         results_root=str(root), results_protocol=admission.protocol, results_local=admission.local,
         runs=[asdict(row) for row in estimates], products_expected_bytes=products,
@@ -1370,7 +1479,7 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
         cache_policy_state=cache["state"], complete_admission_sufficient=combined,
         scope="read-only result/cache projection for explicitly admitted service; no reservation or claim; preserved products not subtracted; fresh checks repeat before actual claim",
         remote_scope=getattr(ledger,"remote_scope",None),
-        message=f"Expected results needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}; estimate, not coordinated across hosts; cache: {cache_message}")
+        message=f"Expected results needed {needed} bytes / free {volume['free_bytes']} bytes for this whole job on {stores.machine_id}; estimate, not coordinated across hosts; cache: {cache_message}" + profile_note)
 
 
 def report_job_root(job_root, stores, *, cache_provider=None):

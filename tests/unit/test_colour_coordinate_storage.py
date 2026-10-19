@@ -165,7 +165,7 @@ outcomes = {}
 for case in spec["cases"]:
     state["counter"], state["ids"] = iter(range(1, 10 ** 6)), iter(range(1, 10 ** 6))
     task = dict(run=case["run"], configuration=case["configuration"], commit=spec["commit"],
-                job_id="job")
+                job_id="job", **case.get("task", {}))
     outcomes[case["name"]] = n1.run_n1(task, Path(case["output"]), "cpu", "float32")
 Path(spec["outcomes"]).write_text(json.dumps(outcomes, sort_keys=True, default=str))
 """
@@ -228,6 +228,8 @@ def test_option_off_is_byte_identical_to_the_writer_before_this_change(
                 run=config["run"],
                 configuration=bound,
                 output=str(tmp_path / "run" / name),
+                # N55: the job's choice, carried by its task; ignored before N55.
+                task={} if setting is None else dict(storage_profile=setting["profile"]),
             )
         )
     expected = _drive(tmp_path, head, cases, "head")

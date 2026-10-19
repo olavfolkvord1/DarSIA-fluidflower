@@ -421,9 +421,12 @@ class JobSnapshotReader:
                 "job"
             ) != descriptor(root / "job.json"):
                 raise ValueError("UI master metadata belongs to another job")
+        from .storage_profile import (declared_storage_profile, expected_format_version,
+                                      job_storage_profile)
         if job.get("format") == "darsia-alias-job-v1":
             from .pipeline.alias_job import prepared_snapshot
-            if job.get("format_version") != 1:
+            # Lean jobs are version 2 (N55); full and legacy jobs version 1.
+            if job.get("format_version") != expected_format_version(job):
                 raise ValueError("Unsupported alias-job metadata version")
             if job.get("execution_ready") is False:
                 return prepared_snapshot(registration, job, ui, reader=self.read)
@@ -432,6 +435,7 @@ class JobSnapshotReader:
                 raise ValueError("Unsupported alias-job runtime version")
             from .published_jobs_snapshot import published_snapshot
             return published_snapshot(registration, job, ui, reader=self.read)
+        job_storage_profile(job)  # A legacy job without the field is full.
         created = ui.get("created_utc") or job.get("created_utc")
         created_epoch = _epoch(created)
         snapshots, machines, errors = [], {}, []
@@ -461,6 +465,8 @@ class JobSnapshotReader:
                     or task.get("precision") != job.get("precision")
                 ):
                     raise ValueError("Task code/calibration/precision differs from job")
+                if declared_storage_profile(task) != declared_storage_profile(job):
+                    raise ValueError("Task storage_profile differs from job")
                 config = self.read(
                     Path(task["configuration"]["path"]), task["configuration"]
                 )
@@ -925,12 +931,18 @@ def create_job_from_plan(
     machine=None,
     preparer=None,
     admitter=None,
+    storage_profile=None,
 ):
     """Only an explicit Create click calls this original metadata producer.
 
     A saved adopted execution plan is required. No selected image count, model,
-    calibration or descriptor is manufactured from GUI strings.
+    calibration or descriptor is manufactured from GUI strings. An explicit
+    ``storage_profile`` ('full' or 'lean') is the job's choice; None leaves the
+    producer's default for new jobs.
     """
+    if storage_profile is not None:
+        from .storage_profile import new_job_profile
+        new_job_profile(storage_profile)  # Refuse an unknown choice before any work.
     _bound(plan)
     if not Path(plan["path"]).is_absolute():
         raise ValueError("An explicit absolute source plan path is required")
@@ -985,8 +997,9 @@ def create_job_from_plan(
         raise ValueError("Series roots/manifest changed during plan admission")
     portable_binding = portable_selection_binding(
         selection_binding, series_manifest=series_manifest)
+    choice = {} if storage_profile is None else {"storage_profile": storage_profile}
     result = preparer(Path(plan["path"]), root, expected_sha256=plan["sha256"],
-                      series_manifest=series_manifest)
+                      series_manifest=series_manifest, **choice)
     if (
         result.get("complete") is not True
         or result.get("numerical_calls_started") is not False

@@ -75,14 +75,27 @@ def read_alias_series(path, *, expected_sha256, series_manifest, catalog_factory
                               reader_factory=reader_factory)
 
 
+def _same_choice(existing, prepared):
+    """An existing job/task written without the storage field is legacy full."""
+    from ..storage_profile import JOB_FIELD, LEGACY_STORAGE_PROFILE
+    if existing == prepared:
+        return True
+    return (JOB_FIELD not in existing and prepared.get(JOB_FIELD) == LEGACY_STORAGE_PROFILE
+            and existing == {key: value for key, value in prepared.items() if key != JOB_FIELD})
+
+
 def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest,
-                      catalog_factory=None, capacity_stores=()):
+                      catalog_factory=None, capacity_stores=(), storage_profile=None):
     """Resolve all metadata input roles before creating the new shared job.
 
     No payload arrays, scientific method or executor is invoked. Original
     configuration bytes and source SHA remain external input identities.
+    ``storage_profile`` ('full' or 'lean'; None: the default for new jobs) is
+    written to job.json and every task.json; lean declares format_version 2.
     """
     from . import series
+    from .. import storage_profile as storage
+    profile = storage.new_job_profile(storage_profile)
     transport = shared_output_admission(job_root)
     catalog_factory = catalog_factory or InputCatalog
     source_manifest, manifest, roots = _manifest(series_manifest)
@@ -97,18 +110,22 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
         value,configs,job_root=job_root,series_asset=original_series,
         shared_admission=transport)
     name(value["job_id"])
+    version=storage.FORMAT_VERSIONS[profile]
     tasks=[]
     for task, config in zip(original_tasks,configs):
+        # A run configuration's own entry must agree with the job's choice.
+        storage.require_run_choice(profile,config,pipeline=task["pipeline"])
         catalog=catalog_factory(roots,[*value.get("data_aliases",()),*config.get("data_aliases",())])
         catalog.add(original_series,"configuration","run.execution_series")
         catalog.add(series_manifest,"configuration","run.series_manifest")
         inputs=validate_catalog(catalog.collect(task["configuration"],config))
         inputs["runtime_support"]="darsia-role-io-runtime-v1"
-        portable=dict(deepcopy(task),format=TASK_FORMAT,format_version=1,
+        portable=dict(deepcopy(task),format=TASK_FORMAT,format_version=version,
             legacy_paths=False,execution_ready=True,execution_blocker="",
             configuration=inputs["configuration"],series=series_reference,
             series_manifest=manifest_reference,input_catalog=inputs,
-            ordered_case_ids=[frame["case_id"] for frame in config["frames"]])
+            ordered_case_ids=[frame["case_id"] for frame in config["frames"]],
+            storage_profile=profile)
         # No producer/consumer may smuggle an unknown resource path into tasks.
         allowed={"backend","threads","device_id","pool_limit_bytes"}
         if set(value["runs"][len(tasks)]["resources"])-allowed:
@@ -118,10 +135,11 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
                  "created_utc","publish","expected_runs","series"}
     if set(job)-allowed_job:
         raise ValueError("Unsupported alias-job fields: "+repr(sorted(set(job)-allowed_job)))
-    job=dict(job,format=JOB_FORMAT,format_version=1,legacy_paths=False,
+    job=dict(job,format=JOB_FORMAT,format_version=version,legacy_paths=False,
         execution_ready=True,execution_blocker="",runtime_support="darsia-role-io-runtime-v1",
         series=series_reference,series_manifest=manifest_reference,
-        series_id=manifest["series_id"],input_reference_format="root-alias-relative-v1")
+        series_id=manifest["series_id"],input_reference_format="root-alias-relative-v1",
+        storage_profile=profile)
     publish = job.get("publish", ["film", "lossless_export"])
     if (not isinstance(publish,list) or any(
             not isinstance(item,str) or not item or "\\" in item
@@ -131,10 +149,11 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     job["publish"] = deepcopy(publish)
     from .capacity import prepared_reports
     capacity_reports=prepared_reports(capacity_stores,manifest["series_id"],tasks,configs,job_root)
+    storage_estimate=storage.estimate_prepared_job(profile,tasks,configs)
     root=Path(job_root)
     # Every role, root, size and metadata SHA has now been admitted.
     target=root/"job.json"
-    if target.exists() and read_json(target)!=job:
+    if target.exists() and not _same_choice(read_json(target),job):
         raise ValueError("Existing alias job DATA differs from immutable metadata")
     prior_tasks={}
     for task in tasks:
@@ -142,7 +161,7 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
         if location.exists():
             prior=read_json(location)
             projected={key:item for key,item in prior.items() if key not in {"attempt_id","output_directory"}}
-            if projected!=task:
+            if not _same_choice(projected,task):
                 raise ValueError("Existing alias run task differs")
             prior_tasks[task["run"]]=location
     root.mkdir(parents=True,exist_ok=True)
@@ -161,7 +180,8 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     return {"complete":True,"job":descriptor(root/"job.json"),"series":series_reference,
             "series_manifest":manifest_reference,"tasks":prepared,
             "legacy_paths":False,"execution_ready":True,"execution_blocker":"",
-            "numerical_calls_started":False,"capacity_reports":capacity_reports}
+            "numerical_calls_started":False,"capacity_reports":capacity_reports,
+            "storage_profile":profile,"storage_estimate":storage_estimate}
 
 
 

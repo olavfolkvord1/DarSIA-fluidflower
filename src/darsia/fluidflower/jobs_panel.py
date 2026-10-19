@@ -47,6 +47,14 @@ from PySide6.QtWidgets import (
 
 from .job_control import publish_control, read_control
 from .jobs_metadata import JobSnapshotReader, create_job_from_plan
+from .storage_profile import (
+    DEFAULT_STORAGE_PROFILE,
+    ESTIMATE_LABEL,
+    PHASE_TWO_ROUTE,
+    SERIES_ROUTE,
+    estimate_job_bytes,
+    job_storage_profile,
+)
 from .pipeline.job_queue import descriptor, name, require_unc, write_immutable
 from .remote_worker_launch import (
     RemoteWorkerTarget,
@@ -105,6 +113,45 @@ def _eta(value):
     return f"{value / 60:.1f} min" if isinstance(value, (int, float)) else "Unknown"
 
 
+def _size(value):
+    """Decimal units, as the documented per-file sizes (1 GB = 10^9 bytes)."""
+    for unit, scale in (("TB", 10**12), ("GB", 10**9), ("MB", 10**6)):
+        if value >= scale:
+            return f"{value / scale:.1f} {unit}"
+    return f"{value} bytes"
+
+
+def choice_estimate_text(profile, free_space=None):
+    """The chosen profile's shared estimate and known free space, before Create."""
+    series = estimate_job_bytes(profile, 1, pipeline=SERIES_ROUTE)
+    phase_two = estimate_job_bytes(profile, 1, pipeline=PHASE_TWO_ROUTE)
+    text = (
+        f"Storage estimate for {profile} (AC52 frame canvas; a larger canvas scales up): "
+        f"{_size(series['per_frame_bytes'])} per frame in the native-phase-N1 series route, "
+        f"{_size(phase_two['per_frame_bytes'])} per frame in phase two (N1)"
+    )
+    if profile == "lean":
+        dropped = estimate_job_bytes(
+            "lean", 1, pipeline=SERIES_ROUTE, colour_intermediates="drop"
+        )
+        text += (
+            f", plus {_size(series['per_run_bytes'])} per run for its constant inputs "
+            f"({_size(dropped['per_frame_bytes'])} per frame in the series route if the run "
+            "configuration drops the colour intermediates)"
+        )
+    text += (
+        f". {ESTIMATE_LABEL}. Create reports the whole-job estimate; no worker starts."
+    )
+    if free_space:
+        text += (
+            "\nFree space on this machine's results volume (last check): "
+            + _size(free_space["free_bytes"])
+        )
+    else:
+        text += "\nFree space: not checked on this machine yet; the worker checks fresh free space before every claim."
+    return text
+
+
 class _CallWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -124,10 +171,11 @@ class _CallWorker(QObject):
 class StartAnalysisDialog(QDialog):
     """Choose an already adopted saved execution plan and a fresh UNC job root."""
 
-    def __init__(self, plans, parent=None):
+    def __init__(self, plans, parent=None, *, free_space=None):
         super().__init__(parent)
         self.setWindowTitle("Start analysis — create job metadata")
         self.plans = deepcopy(list(plans))
+        self.free_space = deepcopy(free_space)
         layout = QVBoxLayout(self)
         layout.addWidget(
             _label(
@@ -143,12 +191,26 @@ class StartAnalysisDialog(QDialog):
         form.addRow("Saved execution plan", self.plan_combo)
         form.addRow("Job name", self.name_edit)
         form.addRow("Fresh UNC job folder", self.job_edit)
+        # The job's storage profile is chosen here, once, before any worker.
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItem(
+            "Full — today's layout (references, qualification, exact gates)", "full"
+        )
+        self.profile_combo.addItem(
+            "Lean — production layout: same computation, fewer stored files", "lean"
+        )
+        self.profile_combo.setCurrentIndex(
+            self.profile_combo.findData(DEFAULT_STORAGE_PROFILE)
+        )
+        form.addRow("Storage profile", self.profile_combo)
         layout.addLayout(form)
         browse = QPushButton("Import saved execution plan…")
         browse.clicked.connect(self._import_plan)
         layout.addWidget(browse)
         self.binding_label = _label()
         layout.addWidget(self.binding_label)
+        self.estimate_label = _label()
+        layout.addWidget(self.estimate_label)
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
         )
@@ -160,7 +222,14 @@ class StartAnalysisDialog(QDialog):
         layout.addWidget(self.buttons)
         self.plan_combo.currentIndexChanged.connect(self._update_binding)
         self.job_edit.textChanged.connect(self._update_binding)
+        self.profile_combo.currentIndexChanged.connect(self._update_estimate)
         self._update_binding()
+        self._update_estimate()
+
+    def _update_estimate(self, *_):
+        self.estimate_label.setText(
+            choice_estimate_text(self.profile_combo.currentData(), self.free_space)
+        )
 
     def _update_binding(self, *_):
         plan = self.plan_combo.currentData() or {}
@@ -192,6 +261,7 @@ class StartAnalysisDialog(QDialog):
             "plan": deepcopy(self.plan_combo.currentData()),
             "job_root": self.job_edit.text().strip(),
             "display_name": self.name_edit.text().strip(),
+            "storage_profile": self.profile_combo.currentData(),
         }
 
 
@@ -513,6 +583,8 @@ class JobsPanel(QWidget):
         self._control_thread = self._control_worker = None
         self._control_pending = False
         self._capacity_thread = self._capacity_worker = None
+        self._known_free_space = None
+        self._creation_estimates = {}
         self._resume_after_control = None
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
@@ -541,6 +613,9 @@ class JobsPanel(QWidget):
         self.capacity_label = _label("Expected space not checked. The worker checks fresh free space before claiming a run.")
         layout.addWidget(self.capacity_button)
         layout.addWidget(self.capacity_label)
+        # Read-only: an existing job keeps the profile stored in its job.json.
+        self.profile_label = _label("Storage profile: no job selected.")
+        layout.addWidget(self.profile_label)
         controls = QHBoxLayout()
         self.backend_combo, self.workers_spin = QComboBox(), QSpinBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -813,6 +888,11 @@ class JobsPanel(QWidget):
         else:
             text = result["message"] + (" — enough by this estimate." if result["sufficient"] else " — insufficient by this estimate.")
             text += " Includes preserved native outputs, optional storage additions, estimated temporary space and reserve. Results: estimate, not coordinated across hosts. Fresh check repeats before claim; cache admission is separate."
+            if type(result.get("free_bytes")) is int:
+                # Free space this panel knows, shown when choosing a new job's profile.
+                self._known_free_space = dict(free_bytes=result["free_bytes"],
+                                              series_id=self.series_id,
+                                              results_root=result.get("results_root"))
         self.capacity_label.setText(text)
 
     @Slot()
@@ -828,6 +908,7 @@ class JobsPanel(QWidget):
         self.current = data
         if (data or {}).get("root") != old_root:
             self.capacity_label.setText("Expected space not checked. The worker checks fresh free space before claiming a run.")
+        self.profile_label.setText(self._profile_text(data))
         self.capacity_button.setEnabled(bool(data and self.local_stores_path_provider
             and (data.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"
             and self._capacity_thread is None))
@@ -919,6 +1000,36 @@ class JobsPanel(QWidget):
                 machines_provider=self.machines_provider,
             )
 
+    def _profile_text(self, data):
+        """The selected job's stored storage profile; never editable here."""
+        if not data:
+            return "Storage profile: no job selected."
+        facts = data.get("job_facts")
+        if not facts:
+            return "Storage profile: not shown, the job metadata could not be read."
+        if facts.get("pipeline") == "native-phase-statistics" and "storage_profile" not in facts:
+            return "Storage profile: not applicable; phase one writes no N1 frame products."
+        try:
+            profile = job_storage_profile(facts)
+        except ValueError as error:
+            return "Storage profile: invalid job metadata: " + str(error)
+        source = (
+            "stored in job.json"
+            if "storage_profile" in facts
+            else "legacy job.json without the field; old jobs stay full"
+        )
+        text = f"Storage profile: {profile} — {source}. Fixed for an existing job (read-only)."
+        estimate = self._creation_estimates.get(str(data.get("root")))
+        if estimate and estimate.get("complete"):
+            text += (
+                f"\nEstimate at creation: {_size(estimate['job_bytes'])} for "
+                f"{estimate['frames']} frames, plus {_size(estimate['inflight_bytes'])} in flight. "
+                f"{ESTIMATE_LABEL}."
+            )
+        else:
+            text += "\nCheck expected space on this machine for this job's estimate against fresh free space."
+        return text
+
     def set_resource_panel(self, panel):
         if self.resource_panel is not None:
             raise ValueError("Resource panel already connected")
@@ -959,11 +1070,16 @@ class JobsPanel(QWidget):
         except Exception:
             self._error(traceback.format_exc())
             return
-        dialog = StartAnalysisDialog(plans, self)
+        known = self._known_free_space
+        dialog = StartAnalysisDialog(
+            plans,
+            self,
+            free_space=known if known and known["series_id"] == self.series_id else None,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.create_job(**dialog.choices())
 
-    def create_job(self, plan, job_root, display_name):
+    def create_job(self, plan, job_root, display_name, storage_profile=None):
         if self._create_thread is not None:
             return
         self.create_button.setEnabled(False)
@@ -974,6 +1090,8 @@ class JobsPanel(QWidget):
             "series_id": self.series_id,
             "selection_provider": self.selection_provider,
         }
+        if storage_profile is not None:
+            kwargs["storage_profile"] = storage_profile
         generation = self._generation
         self._create_thread, self._create_worker = self._start_call(
             lambda: {
@@ -987,6 +1105,11 @@ class JobsPanel(QWidget):
     @Slot(object)
     def _created(self, result):
         registration = result["registration"]
+        receipt = (registration or {}).get("producer_receipt")
+        if isinstance(receipt, dict) and isinstance(receipt.get("storage_estimate"), dict):
+            self._creation_estimates[str(registration.get("root"))] = deepcopy(
+                receipt["storage_estimate"]
+            )
         self.job_created.emit(deepcopy(registration))
         if result["generation"] != self._generation:
             return

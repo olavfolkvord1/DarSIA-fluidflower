@@ -1340,8 +1340,8 @@ def _run_n1(
     )
     if config["run"] != task["run"] or backend not in {"cpu", "cuda"}:
         raise ValueError("Task run and explicit numerical backend are required")
-    from ..storage_profile import resolve as storage_setting
-    setting = storage_setting(config)  # Explicit or default; validated before any output.
+    from ..storage_profile import run_setting
+    setting = run_setting(task, config)  # The job's choice; validated before any output.
     if on_progress is not None and not callable(on_progress):
         raise TypeError("Progress callback must be callable")
     output = Path(output)

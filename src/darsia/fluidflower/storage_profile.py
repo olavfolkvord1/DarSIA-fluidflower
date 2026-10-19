@@ -24,11 +24,21 @@ is unchanged and still runs in memory. The profile drops three per-frame writes:
   ``temporal_log.npy`` of the native/phase series stage (switch ``keep`` or
   ``drop``, default ``keep``).
 
-The setting is an optional run-configuration entry::
+The profile is chosen per job (N55). ``prepare_job`` records the explicit job
+field ``"storage_profile": "full" | "lean"`` in job.json and in every task.json
+(:func:`job_storage_profile`); a lean job and its tasks declare
+``format_version`` 2, so a reader that predates the field refuses them instead
+of writing the full layout. A job or task without the field is a legacy job and
+stays ``full`` (:data:`LEGACY_STORAGE_PROFILE`), whatever the default for new
+jobs is. A run writes with :func:`run_setting`: the job's profile, plus the
+optional run-configuration entry for the lean sub-options::
 
     "storage_profile": {"profile": "lean", "colour_intermediates": "keep"}
 
-Without the entry :data:`DEFAULT_STORAGE_PROFILE` applies.
+A profile named by that entry must equal the job's choice; otherwise the run
+is refused before any output. Both profiles compute identically.
+:func:`estimate_job_bytes` is the one per-profile size estimate that
+prepare_job, the Jobs panel and lean capacity admission share.
 
 The same entry takes the optional ``"store_colour_coordinate": true`` (default
 :data:`DEFAULT_STORE_COLOUR_COORDINATE` = off). In either profile each frame
@@ -43,10 +53,13 @@ from copy import deepcopy
 import json
 from pathlib import Path
 
-#: The one default storage profile. References, qualification and the exact
-#: gates use "full". Production selects "lean" after its exact gate, either
-#: per run configuration or by changing this single constant.
+#: The profile prepare_job and the Jobs panel choose for a NEW job when the
+#: caller does not choose one. References, qualification and the exact gates
+#: use "full". After the exact gate, production switches this constant to
+#: "lean". Existing jobs never follow it (LEGACY_STORAGE_PROFILE).
 DEFAULT_STORAGE_PROFILE = "full"
+#: The profile of an existing job or task without the explicit field.
+LEGACY_STORAGE_PROFILE = "full"
 
 #: Optional per-pixel colour-path coordinate (``"store_colour_coordinate"`` in
 #: the storage_profile entry). Off by default: without the explicit setting no
@@ -83,10 +96,14 @@ _N16_FIELDS = ("n16_solubility_g_per_l", "full_physical_depth_m", "full_physical
 
 
 def resolve(config):
-    """Return the explicit or default storage setting of one run configuration."""
+    """Return the storage setting one run configuration's entry requests.
+
+    Without the entry a configuration requests nothing: legacy full. Which
+    profile a run writes is the job's choice (:func:`run_setting`).
+    """
     value = config.get(SETTING) if isinstance(config, dict) else None
     if value is None:
-        return dict(profile=DEFAULT_STORAGE_PROFILE,
+        return dict(profile=LEGACY_STORAGE_PROFILE,
                     colour_intermediates=DEFAULT_COLOUR_INTERMEDIATES)
     if (not isinstance(value, dict) or "profile" not in value
             or set(value) - {"profile", "colour_intermediates", COLOUR_COORDINATE_SETTING}):
@@ -118,6 +135,307 @@ def require_template_colour_coordinate(series_config, template):
     """A series' mass stage reads the option from its template: they must agree."""
     if stores_colour_coordinate(series_config) != stores_colour_coordinate(template):
         raise ValueError("The series colour-coordinate storage differs from its mass template")
+
+
+# --------------------------------------------------- per-job choice (N55)
+
+#: The explicit field of job.json and task.json.
+JOB_FIELD = "storage_profile"
+#: The alias job/task format_version each profile declares. Lean is version 2:
+#: a reader that predates the field refuses a lean job instead of writing the
+#: full layout. Full and legacy stay version 1.
+FORMAT_VERSIONS = {"full": 1, "lean": 2}
+_ALIAS_FORMATS = ("darsia-alias-job-v1", "darsia-alias-task-v1")
+_PHASE_ONE = "native-phase-statistics"
+SERIES_ROUTE = "native-phase-n1"
+PHASE_TWO_ROUTE = "n1"
+
+
+def new_job_profile(choice=None):
+    """The profile a new job records: the explicit choice, else the default."""
+    value = DEFAULT_STORAGE_PROFILE if choice is None else choice
+    if not isinstance(value, str) or value not in PROFILES:
+        raise ValueError("A job's storage_profile must be 'full' or 'lean', not " + repr(value))
+    return value
+
+
+def expected_format_version(document):
+    """The alias format_version a job/task with this storage field declares."""
+    if not isinstance(document, dict):
+        raise ValueError("A job or task document is required")
+    if JOB_FIELD not in document:
+        return FORMAT_VERSIONS[LEGACY_STORAGE_PROFILE]
+    value = document[JOB_FIELD]
+    if not isinstance(value, str) or value not in PROFILES:
+        raise ValueError("Unknown job storage_profile: " + repr(value))
+    if document.get("pipeline") == _PHASE_ONE:
+        raise ValueError("Phase one writes no N1 frame products; its jobs carry no storage_profile")
+    return FORMAT_VERSIONS[value]
+
+
+def declared_storage_profile(document):
+    """The profile a job/task document declares (value validated); absent = legacy full."""
+    expected_format_version(document)
+    return document.get(JOB_FIELD, LEGACY_STORAGE_PROFILE)
+
+
+def job_storage_profile(document):
+    """The explicit storage profile of a job.json or task.json; absent = legacy full.
+
+    The reader validation: the value and, for an alias job or task, the
+    format_version it declares (1 for full and legacy, 2 for lean).
+    """
+    profile = declared_storage_profile(document)
+    if (document.get("format") in _ALIAS_FORMATS
+            and document.get("format_version") != FORMAT_VERSIONS[profile]):
+        raise ValueError("An alias job/task with storage_profile " + repr(profile)
+                         + " must declare format_version " + str(FORMAT_VERSIONS[profile]))
+    return profile
+
+
+def require_task_matches_job(task, job):
+    """A claimed task writes with its own job's storage profile."""
+    if declared_storage_profile(task) != declared_storage_profile(job):
+        raise ValueError("Claimed task storage_profile differs from job.json")
+
+
+def run_setting(task, config):
+    """The storage setting one run writes with: its job's choice.
+
+    The task carries its job's explicit profile; a task without the field is a
+    legacy task and writes full. The run configuration's optional entry may add
+    the lean sub-options. A profile that entry names must equal the job's
+    choice, so neither an old task nor a configuration is reinterpreted.
+    """
+    chosen = declared_storage_profile(task)
+    if not isinstance(config, dict) or config.get(SETTING) is None:
+        return dict(profile=chosen, colour_intermediates=DEFAULT_COLOUR_INTERMEDIATES)
+    requested = resolve(config)
+    if requested["profile"] != chosen:
+        raise ValueError(
+            "The run configuration's storage_profile entry names '" + requested["profile"]
+            + "' but its job chose '" + chosen + "'"
+            + (" (a task without the field is a legacy full task)" if JOB_FIELD not in task else "")
+            + "; prepare a job with the matching storage_profile")
+    return requested
+
+
+def require_run_choice(profile, config, *, pipeline):
+    """prepare_job's check of one run's configuration against the job's choice."""
+    setting = run_setting({JOB_FIELD: new_job_profile(profile)}, config)
+    template = (config.get("mass") or {}).get("template") or {} if pipeline == SERIES_ROUTE else {}
+    if SETTING in template and resolve(template) != setting:
+        raise ValueError("The series storage_profile differs from its mass template")
+    return setting
+
+
+# ------------------------------------------------- size estimate (N55)
+
+ESTIMATE_FORMAT = "darsia-storage-profile-estimate-v1"
+ESTIMATE_LABEL = ("ESTIMATE, not a measurement: documented per-file sizes; "
+                  "no measured lean profile exists yet")
+#: Per-frame file sizes measured on AC52 (J4 current1d, native-phase-N1 series
+#: route: 32.9 GB for 39 frames, about 843 MB per frame; decimal bytes).
+AC52_FRAME_BYTES = {
+    "native_log.npy": 196_000_000,       # float32 colour intermediate, 3 x 2979 x 5472
+    "temporal_log.npy": 196_000_000,     # float32 colour intermediate
+    "native_geometry.npz": 307_000_000,  # static fields, re-warped and written per frame
+    "phase_area.npz": 65_600_000,        # per-frame pixel_area_mm2
+    "products.npz": 40_000_000,          # average (93.8 MB at f43)
+    "valid masks": 33_000_000,           # valid masks of the intermediates (1.3 GB / 39)
+    "JSON and receipts": 5_000_000,      # 0.2 GB / 39
+}
+#: The mass_total part of products.npz, which lean omits: the f43 share
+#: (30.8 of 93.8 MB) of the 40 MB average.
+AC52_MASS_TOTAL_BYTES = 13_100_000
+#: A lean run's constant-input store, once per run (AC52's per-run static.npz).
+AC52_RUN_STORE_BYTES = 218_000_000
+#: Optional in-run coarse layer at 1 mm (AC52 f43, the largest measured frame),
+#: per frame and per run; scaled by (1 mm / resolution)^2.
+AC52_COARSE_1MM_FRAME_BYTES = 1_850_000
+AC52_COARSE_1MM_RUN_BYTES = 4_700_000
+#: Optional colour-path coordinate: raw float32 on the AC52 canvas (written
+#: compressed, so this is an upper estimate).
+AC52_COLOUR_COORDINATE_BYTES = 4 * 3572 * 6304
+#: The frame canvas of the AC52 measurement. A run whose declared canvas is
+#: larger has the default sizes scaled up by the pixel ratio (never down).
+AC52_CANVAS_HW = (3572, 6304)
+#: The files a phase-two (N1) frame writes. phase_area, the colour
+#: intermediates and their valid masks are phase one's outputs.
+PHASE_TWO_FILES = ("native_geometry.npz", "products.npz", "JSON and receipts")
+AC52_SOURCE = ("AC52 J4 current1d, native-phase-N1 series route, 39 frames: 32.9 GB, about "
+               "843 MB per frame (native_log and temporal_log 196 MB each, native_geometry "
+               "307 MB, phase_area 65.6 MB, products 40 MB average, valid masks 33 MB, JSON "
+               "5 MB); mass_total 30.8 of 93.8 MB at f43; per-run static store 218 MB")
+
+
+def _bytes(value, where):
+    if type(value) is not int or value < 0:
+        raise ValueError(where + " must be a nonnegative integer byte count")
+    return value
+
+
+def estimate_job_bytes(profile, frames, *, runs=1, pipeline=SERIES_ROUTE,
+                       colour_intermediates=DEFAULT_COLOUR_INTERMEDIATES, frame_bytes=None,
+                       mass_total_bytes=None, run_store_bytes=None, extra_frame_bytes=0,
+                       extra_run_bytes=0, source=None):
+    """Bytes one storage profile is expected to retain, per frame and for a job.
+
+    The one estimator of prepare_job, the Jobs panel and lean capacity
+    admission. Every number comes from explicit per-file sizes (default: the
+    measured AC52 sizes), so the result is labelled an ESTIMATE.
+
+    * full keeps every file of the route (the series route writes all of
+      AC52_FRAME_BYTES; phase two writes PHASE_TWO_FILES).
+    * lean omits native_geometry.npz (its static fields regenerate) and the
+      mass_total part of products.npz, and writes one constant-input store per
+      run. With colour_intermediates='drop' (lean series route only) the two
+      colour intermediates are not retained.
+
+    ``inflight_bytes`` is the allowance for the frame being written, as in the
+    measured capacity model, plus with 'drop' the previous frame's colour
+    intermediates, which are removed only after the next commit.
+    ``needed_bytes`` = ``job_bytes`` + ``inflight_bytes``, before other active
+    reservations and the reserve.
+    """
+    if not isinstance(profile, str) or profile not in PROFILES:
+        raise ValueError("Unknown storage profile: " + repr(profile))
+    if pipeline not in (SERIES_ROUTE, PHASE_TWO_ROUTE):
+        raise ValueError("Storage profiles apply to the N1 frame routes native-phase-n1 and n1 only")
+    if type(frames) is not int or frames < 1 or type(runs) is not int or runs < 1:
+        raise ValueError("Positive integer frame and run counts are required")
+    if colour_intermediates not in COLOUR_RETENTION:
+        raise ValueError("Colour-intermediate retention must be 'keep' or 'drop'")
+    if colour_intermediates == "drop" and (profile != "lean" or pipeline != SERIES_ROUTE):
+        raise ValueError("Only a lean native-phase-N1 series run drops its colour intermediates")
+    sizes = dict(AC52_FRAME_BYTES if frame_bytes is None else frame_bytes)
+    if set(sizes) != set(AC52_FRAME_BYTES):
+        raise ValueError("Per-file sizes must name exactly: " + ", ".join(AC52_FRAME_BYTES))
+    for key, value in sizes.items():
+        _bytes(value, key)
+    mass_total = _bytes(AC52_MASS_TOTAL_BYTES if mass_total_bytes is None else mass_total_bytes,
+                        "mass_total")
+    if mass_total > sizes["products.npz"]:
+        raise ValueError("mass_total cannot exceed products.npz")
+    store = _bytes(AC52_RUN_STORE_BYTES if run_store_bytes is None else run_store_bytes, "Run store")
+    extra_frame = _bytes(extra_frame_bytes, "Optional per-frame outputs")
+    extra_run = _bytes(extra_run_bytes, "Optional per-run outputs")
+    names = AC52_FRAME_BYTES if pipeline == SERIES_ROUTE else PHASE_TWO_FILES
+    files = {name: sizes[name] for name in names}
+    not_retained, per_run = {}, extra_run
+    if profile == "lean":
+        not_retained["native_geometry.npz"] = files.pop("native_geometry.npz")
+        files["products.npz"] -= mass_total
+        not_retained["mass_total in products.npz"] = mass_total
+        per_run += store
+    colour = 0
+    if colour_intermediates == "drop":
+        for name in COLOUR_INTERMEDIATES:
+            not_retained[name] = files.pop(name)
+            colour += not_retained[name]
+    if extra_frame:
+        files["optional outputs"] = extra_frame
+    per_frame = sum(files.values())
+    inflight = per_frame + 2 * colour
+    job = per_frame * frames + per_run * runs
+    return dict(format=ESTIMATE_FORMAT, estimate=True, label=ESTIMATE_LABEL, profile=profile,
+                pipeline=pipeline, colour_intermediates=colour_intermediates, frames=frames,
+                runs=runs, per_frame_bytes=per_frame, per_run_bytes=per_run,
+                inflight_bytes=inflight, job_bytes=job, needed_bytes=job + inflight,
+                files=files, not_retained=not_retained,
+                parameters=dict(frame_bytes=sizes, mass_total_bytes=mass_total,
+                                run_store_bytes=store, extra_frame_bytes=extra_frame,
+                                extra_run_bytes=extra_run),
+                source=AC52_SOURCE if source is None else str(source))
+
+
+def declared_canvas_pixels(config, *, pipeline):
+    """The largest frame canvas a run configuration declares (metadata), or None.
+
+    Phase two: each frame's ``current.phase_shape_hw`` (the N1 frame ABI).
+    Series route: each frame's ``mass_spec.photo_top.shape_hw``.
+    """
+    largest = None
+    for frame in config.get("frames") or ():
+        if not isinstance(frame, dict):
+            return None
+        if pipeline == PHASE_TWO_ROUTE:
+            shape = (frame.get("current") or {}).get("phase_shape_hw")
+        else:
+            shape = ((frame.get("mass_spec") or {}).get("photo_top") or {}).get("shape_hw")
+        if (not isinstance(shape, (list, tuple)) or len(shape) != 2
+                or any(type(size) is not int or size < 1 for size in shape)):
+            return None
+        largest = max(largest or 0, shape[0] * shape[1])
+    return largest
+
+
+def run_estimate(profile, config, *, pipeline, **sizes):
+    """The shared estimate of one run, from its own configuration DATA only.
+
+    It reads the frame count, the lean colour switch, the optional outputs and
+    the declared frame canvas. Without explicit sizes, the AC52 defaults are
+    scaled up by the canvas pixel ratio when the run's canvas is larger than
+    AC52's (never down). A run without a declared canvas, and an optional
+    output without a documented size, are refused, never counted as zero.
+    """
+    import math
+    frames = config.get("frames") if isinstance(config, dict) else None
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("A run configuration with a nonempty frame list is required")
+    setting = require_run_choice(profile, config, pipeline=pipeline)
+    if "gas_probability_storage" in config:
+        raise ValueError("The gas-probability output has no documented size; it needs a measured profile")
+    pixels = declared_canvas_pixels(config, pipeline=pipeline)
+    if pixels is None:
+        raise ValueError("The run configuration declares no frame canvas shape; "
+                         "the documented sizes cannot be applied to it")
+    explicit = bool(sizes)  # Explicit caller sizes belong to their own layout: never scaled.
+    scale = 1.0 if explicit else max(1.0, pixels / (AC52_CANVAS_HW[0] * AC52_CANVAS_HW[1]))
+    if scale > 1.0:
+        sizes = dict(frame_bytes={name: math.ceil(value * scale)
+                                  for name, value in AC52_FRAME_BYTES.items()},
+                     mass_total_bytes=math.ceil(AC52_MASS_TOTAL_BYTES * scale),
+                     run_store_bytes=math.ceil(AC52_RUN_STORE_BYTES * scale),
+                     source=AC52_SOURCE + "; scaled by %.4f to a declared canvas of %d pixels"
+                            % (scale, pixels))
+    extra_frame = extra_run = 0
+    request = config.get("storage")
+    if request is not None:
+        if pipeline == SERIES_ROUTE:
+            raise ValueError("The series route's storage outputs have no documented size; "
+                             "they need a measured profile")
+        from .storage_resolution import resolution_mm
+        step = resolution_mm(request.get("resolution_mm") if isinstance(request, dict) else None)
+        if step is not None:  # Native publication is phase two's original path.
+            extra_frame = math.ceil(AC52_COARSE_1MM_FRAME_BYTES / step ** 2)
+            extra_run = math.ceil(AC52_COARSE_1MM_RUN_BYTES / step ** 2)
+    if stores_colour_coordinate(config):
+        extra_frame += max(AC52_COLOUR_COORDINATE_BYTES, 4 * pixels)
+    value = estimate_job_bytes(profile, len(frames), pipeline=pipeline,
+                               colour_intermediates=setting["colour_intermediates"],
+                               extra_frame_bytes=extra_frame, extra_run_bytes=extra_run, **sizes)
+    return dict(value, declared_canvas_pixels=pixels, ac52_size_scale=None if explicit else scale)
+
+
+def estimate_prepared_job(profile, tasks, configs):
+    """prepare_job's whole-job estimate for the chosen profile, one row per run."""
+    rows = []
+    for task, config in zip(tasks, configs, strict=True):
+        try:
+            value = run_estimate(profile, config, pipeline=task.get("pipeline", PHASE_TWO_ROUTE))
+        except (KeyError, TypeError, ValueError) as error:
+            rows.append(dict(run=task["run"], available=False, reason=str(error)))
+            continue
+        rows.append(dict(value, run=task["run"], available=True))
+    complete = bool(rows) and all(row["available"] for row in rows)
+    total = lambda key: sum(row[key] for row in rows) if complete else None
+    # In-flight allowances add up like capacity's whole-job report: one per run.
+    return dict(format=ESTIMATE_FORMAT, estimate=True, label=ESTIMATE_LABEL, profile=profile,
+                complete=complete, runs=rows, frames=total("frames"), job_bytes=total("job_bytes"),
+                inflight_bytes=total("inflight_bytes"), needed_bytes=total("needed_bytes"),
+                scope="whole job, before other active reservations and the reserve; "
+                      "capacity admission repeats its check against fresh free space")
 
 
 # ---------------------------------------------------- colour-path coordinate

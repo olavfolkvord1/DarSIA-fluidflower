@@ -12,6 +12,7 @@ import re
 import traceback
 
 from .pipeline.job_queue import descriptor, name, _own_asset, publication_directory, validate_task
+from .storage_profile import declared_storage_profile
 from .pipeline.products_publication import (
     _read_index, read_published_metadata, published_metadata_descriptor, _bound, _json,
 )
@@ -474,7 +475,8 @@ def published_snapshot(registration,job,ui,*,reader):
             elif (task.get("format")!="darsia-alias-task-v1" or task.get("execution_ready") is not True
                     or task["run"]!=run or task["commit"]!=job["commit"]
                     or task["calibration_sha256"]!=job["calibration_sha256"]
-                    or task["precision"]!=job["precision"]):
+                    or task["precision"]!=job["precision"]
+                    or declared_storage_profile(task)!=declared_storage_profile(job)):
                 raise ValueError("Alias task identity differs from its immutable job")
             cases=task["ordered_case_ids"];row["total"]=len(cases);counted={};times=[]
             done_path=root/"done"/(run+".json");failure_path=root/"failed"/(run+".json")

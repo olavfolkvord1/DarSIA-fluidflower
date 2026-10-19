@@ -194,11 +194,14 @@ def validate_task(task: dict) -> None:
             if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
                 raise ValueError(f"Task {key} must be a full lowercase SHA")
     config = task["configuration"]
+    from ..storage_profile import expected_format_version, job_storage_profile
     if task.get("format") == "darsia-alias-task-v1":
         from ..store_map import validate_input_reference
         from .job_inputs import validate_catalog
 
-        if task.get("format_version") != 1 or task.get("legacy_paths") is not False:
+        # Lean tasks are version 2 (N55); full and legacy tasks stay version 1.
+        if (task.get("format_version") != expected_format_version(task)
+                or task.get("legacy_paths") is not False):
             raise ValueError("Explicit alias-task version/legacy flag required")
         validate_input_reference(config)
         validate_input_reference(task["series"])
@@ -219,6 +222,7 @@ def validate_task(task: dict) -> None:
         raise ValueError("Task backend must be any, cpu or cuda")
     if task.get("precision", "float32") not in {"float32", "float64"}:
         raise ValueError("Task precision must be float32 or float64")
+    job_storage_profile(task)  # Explicit 'full'/'lean'; absent is a legacy full task.
 
 
 @dataclass(frozen=True)

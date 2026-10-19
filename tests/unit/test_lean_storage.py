@@ -154,6 +154,9 @@ def _run(tmp_path, name, config, profile=None, *, module=n1, **task):
     config = deepcopy(config)
     if profile is not None:
         config["storage_profile"] = profile
+        if isinstance(profile, dict) and isinstance(profile.get("profile"), str):
+            # N55: the job's choice, carried by its task, selects the profile.
+            task.setdefault("storage_profile", profile["profile"])
     bound = _bind(tmp_path / (name + "_config.json"), config)
     return module.run_n1(dict(run=config["run"], configuration=bound, commit=CODE, **task),
                          tmp_path / name, "cpu", "float32")
@@ -193,11 +196,17 @@ def test_default_constant_is_full_and_setting_is_strict():
             lean.resolve({"storage_profile": bad})
 
 
-def test_default_constant_applies_without_setting(synthetic, tmp_path, monkeypatch):
+def test_default_constant_selects_new_jobs_only(synthetic, tmp_path, monkeypatch):
+    # N55: the constant is the default of NEW jobs (prepare_job, Jobs panel).
+    # A task without the explicit field is a legacy task and stays full.
     monkeypatch.setattr(lean, "DEFAULT_STORAGE_PROFILE", "lean")
-    outcome = _run(tmp_path, "defaulted", synthetic)
-    assert outcome["lean_storage"]["profile"] == "lean"
-    assert all("native_geometry.npz" not in record["files"] for record in outcome["records"])
+    assert lean.new_job_profile() == "lean"
+    legacy = _run(tmp_path, "defaulted", synthetic)
+    assert "lean_storage" not in legacy
+    assert all("native_geometry.npz" in record["files"] for record in legacy["records"])
+    chosen = _run(tmp_path, "chosen", synthetic, storage_profile="lean")
+    assert chosen["lean_storage"]["profile"] == "lean"
+    assert all("native_geometry.npz" not in record["files"] for record in chosen["records"])
 
 
 # ------------------------------------------------- full profile = base writer
@@ -545,7 +554,8 @@ def _retired_prefix(tmp_path, config, profile):
     config["storage_profile"] = profile
     bound = _bind(tmp_path / "resume_config.json", config)
     task = dict(run=config["run"], configuration=bound, commit=CODE,
-                calibration_sha256=config["calibration"]["sha256"], threads=1)
+                calibration_sha256=config["calibration"]["sha256"], threads=1,
+                storage_profile=profile["profile"])
     old = tmp_path / "attempts" / ("a" * 32)
 
     def progress(event):

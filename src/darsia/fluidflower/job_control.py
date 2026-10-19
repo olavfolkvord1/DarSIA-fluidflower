@@ -96,7 +96,9 @@ def _bindings(root):
     """Only own-job immutable references change syntax; control rules do not."""
     job = read_json(root / "job.json")
     if job.get("format") == "darsia-alias-job-v1":
-        if job.get("format_version") != 1:
+        from .storage_profile import expected_format_version
+        # Lean jobs are version 2 (N55); full and legacy jobs version 1.
+        if job.get("format_version") != expected_format_version(job):
             raise ValueError("Unknown alias job version")
         from .pipeline.alias_job import job_metadata_reference
         return (lambda path: job_metadata_reference(root, path)), "darsia-job-ui-master-v2", ALIAS_FORMAT

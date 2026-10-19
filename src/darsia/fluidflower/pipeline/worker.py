@@ -39,9 +39,10 @@ def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
         raise ValueError("Shared queue transport refused: " + transport.reason + ": " + transport.evidence)
     job = read_json(job_root / "job.json")
     alias = job.get("format") == "darsia-alias-job-v1"
+    from ..storage_profile import expected_format_version, job_storage_profile
     if not alias:
         require_unc(str(job_root))
-    elif (job.get("format_version")!=1 or job.get("legacy_paths") is not False
+    elif (job.get("format_version")!=expected_format_version(job) or job.get("legacy_paths") is not False
             or job.get("execution_ready") is not True
             or job.get("runtime_support")!="darsia-role-io-runtime-v1"):
         raise RuntimeError("Alias job is not explicitly ready for J3 runtime")
@@ -91,6 +92,7 @@ def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
             working_tree_size_bytes=len(raw), EOL_only_representation=(raw != original))
     if job.get("precision") not in {"float32", "float64"}:
         raise ValueError("One explicit job precision is required")
+    job_storage_profile(job)  # Explicit 'full'/'lean'; absent is a legacy full job.
     import re
 
     if job.get("pipeline") == "native-phase-statistics":
@@ -297,6 +299,8 @@ def _run_tasks(
             precision = task.get("precision", job["precision"])
             if precision != job["precision"]:
                 raise ValueError("A job cannot mix working precisions")
+            from ..storage_profile import require_task_matches_job
+            require_task_matches_job(task, job)
 
             io_binding=None
             if io_runtime is not None:
