@@ -50,6 +50,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QShortcut,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -359,7 +360,17 @@ class LayerCanvas(QGraphicsView):
     The canvas also serves the rig frame panel: ``image_point_selected`` gives
     clicks in place mode as fractions of the photograph, ``preview`` identifies
     the photograph shown and ``set_model`` shows another one.
+
+    ``set_photo`` may also get the photograph at a higher resolution
+    (``detail``, normally its raw pixels). It is shown over the display copy
+    whenever one of its pixels covers at least half a screen pixel, so that
+    zooming in shows the photograph's own pixels; the display copy, which sets
+    the scene grid for the marks, strokes and the proposal, is shown when
+    zoomed out. Display only.
     """
+
+    # The detail is shown from this many screen pixels per detail pixel.
+    DETAIL_FROM = 0.5
 
     image_point_selected = Signal(float, float)
     stroke_finished = Signal(object)
@@ -383,6 +394,13 @@ class LayerCanvas(QGraphicsView):
         self.pixmap_item.setTransformationMode(
             Qt.TransformationMode.SmoothTransformation
         )
+        # The photograph at a higher resolution, over the display copy.
+        self.detail_item = QGraphicsPixmapItem()
+        self.detail_item.setTransformationMode(
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self.detail_item.setZValue(1.0)
+        self.detail_item.hide()
         self.proposal_item = QGraphicsPixmapItem()
         self.proposal_item.setZValue(5.0)
         self.stroke_item = QGraphicsPixmapItem()
@@ -411,6 +429,7 @@ class LayerCanvas(QGraphicsView):
         self.cursor_item.hide()
         for item in (
             self.pixmap_item,
+            self.detail_item,
             self.proposal_item,
             self.stroke_item,
             self.active_item,
@@ -514,8 +533,13 @@ class LayerCanvas(QGraphicsView):
         *,
         token: dict[str, Any],
         reset_view: bool,
+        detail: np.ndarray | None = None,
     ) -> None:
-        """Show an RGB uint8 image that represents a raw photograph."""
+        """Show an RGB uint8 image that represents a raw photograph.
+
+        ``detail`` is the same photograph at a higher resolution, shown when
+        zoomed in (see the class notes); ``None`` shows the display copy only.
+        """
 
         image = np.ascontiguousarray(display, dtype=np.uint8)
         height, width = image.shape[:2]
@@ -531,6 +555,7 @@ class LayerCanvas(QGraphicsView):
         self._display_shape = (height, width)
         self._raw_size = (int(raw_size[0]), int(raw_size[1]))
         self.preview = token
+        self._set_detail(detail)
         if resized or self._stroke_image is None:
             self._stroke_image = QImage(
                 width, height, QImage.Format.Format_ARGB32_Premultiplied
@@ -541,6 +566,45 @@ class LayerCanvas(QGraphicsView):
         self.scene().setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
         if reset_view:
             self.fit_image()
+        self.refresh_detail()
+
+    def _set_detail(self, detail: np.ndarray | None) -> None:
+        """Place ``detail`` on the scene grid of the display copy."""
+
+        if detail is None or self._display_shape is None:
+            self.detail_item.setPixmap(QPixmap())
+            self.detail_item.hide()
+            return
+        image = np.ascontiguousarray(detail, dtype=np.uint8)
+        rows, cols = image.shape[:2]
+        qimage = QImage(
+            image.data, cols, rows, int(image.strides[0]), QImage.Format.Format_RGB888
+        ).copy()
+        self.detail_item.setPixmap(QPixmap.fromImage(qimage))
+        # Each detail pixel centre lands where raw_to_scene puts that point of
+        # the photograph, so the marks sit on the pixels they were drawn on.
+        height, width = self._display_shape
+        self.detail_item.setTransform(QTransform.fromScale(width / cols, height / rows))
+        self.detail_item.setPos(-0.5, -0.5)
+
+    @property
+    def detail_shown(self) -> bool:
+        """Whether the higher-resolution photograph is shown now."""
+
+        return self.detail_item.isVisible()
+
+    def refresh_detail(self) -> None:
+        """Show the detail when zoomed in far enough, else the display copy."""
+
+        pixmap = self.detail_item.pixmap()
+        if pixmap.isNull() or self._display_shape is None:
+            self.detail_item.hide()
+            return
+        scene_per_detail = self._display_shape[1] / pixmap.width()
+        screen_per_scene = abs(self.transform().m11())
+        self.detail_item.setVisible(
+            screen_per_scene * scene_per_detail >= self.DETAIL_FROM
+        )
 
     def set_model(self, preview: Mapping[str, Any], _config: Mapping[str, Any]) -> None:
         """Show ``preview["baseline"]`` (float RGB in [0, 1] or uint8)."""
@@ -554,8 +618,9 @@ class LayerCanvas(QGraphicsView):
     def clear_photo(self) -> None:
         """Show nothing (a run without a readable baseline photograph)."""
 
-        for item in (self.pixmap_item, self.proposal_item, self.stroke_item):
+        for item in (self.pixmap_item, self.detail_item, self.proposal_item, self.stroke_item):
             item.setPixmap(QPixmap())
+        self.detail_item.hide()
         self._cancel_stroke()
         self.cancel_polygon()
         self._end_drag()
@@ -577,6 +642,7 @@ class LayerCanvas(QGraphicsView):
         self.resetTransform()
         self.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
         self._user_zoomed = False
+        self.refresh_detail()
         self._update_cursor()
 
     def set_overlays_visible(self, marks: bool, proposal: bool) -> None:
@@ -1551,6 +1617,7 @@ class LayerCanvas(QGraphicsView):
         factor = 1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2
         self.scale(factor, factor)
         self._user_zoomed = True
+        self.refresh_detail()
         self._update_cursor(self.mapToScene(event.position().toPoint()))
 
     def resizeEvent(self, event: Any) -> None:
@@ -1931,6 +1998,12 @@ class LayerPainterView(QWidget):
         self._background_enhanced: np.ndarray | None = None
         self._background_token: dict[str, Any] | None = None
         self._background_shown = False
+        # The reference and background photos at full resolution (uint8),
+        # plain and with enhanced contrast, shown when zoomed in.
+        self._detail_plain: np.ndarray | None = None
+        self._detail_enhanced: np.ndarray | None = None
+        self._background_detail_plain: np.ndarray | None = None
+        self._background_detail_enhanced: np.ndarray | None = None
         self._proposal_thread: QThread | None = None
         self._proposal_worker: _ProposalWorker | None = None
         self._save_thread: QThread | None = None
@@ -2551,6 +2624,8 @@ class LayerPainterView(QWidget):
             self.canvas.clear_selection()
             self._other_photo = None
             self._reference_token = None
+            self._detail_plain = None
+            self._detail_enhanced = None
             try:
                 reference = self.reference()
             except (OSError, ValueError) as error:
@@ -2646,6 +2721,13 @@ class LayerPainterView(QWidget):
             "raw_size": image.image_size,
             "reference": True,
         }
+        # The full-resolution photo for zooming in; the saved corrected maps
+        # are shown at their display size only.
+        self._detail_plain = (
+            None
+            if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
+            else self._full_resolution(image.path)
+        )
         self._update_enhanced()
         self._show_reference(reset_view=True)
 
@@ -2668,24 +2750,63 @@ class LayerPainterView(QWidget):
         mask[rows : shape[0] - rows, cols : shape[1] - cols] = True
         return mask
 
+    def _full_resolution(self, path: Path | str) -> np.ndarray | None:
+        """The photograph at up to ``DETAIL_LIMIT_PX`` as uint8 RGB.
+
+        It is shown when zoomed in. None when it would be no larger than the
+        display copy, or when it cannot be read. Display only: the marks, the
+        proposal and saving never use it.
+        """
+
+        if self.image is None:
+            return None
+        from darsia.fluidflower.photograph_io import load_reduced_rgb8
+
+        try:
+            width, height = photo_size(Path(path))
+            factor = max(1, int(math.ceil(max(width, height) / lp.DETAIL_LIMIT_PX)))
+            detail = load_reduced_rgb8(Path(path), factor)
+        except (OSError, ValueError):
+            return None
+        rows, cols = self.image.display.shape[:2]
+        if detail.shape[0] <= rows or detail.shape[1] <= cols:
+            return None
+        return detail
+
+    def _stretched_detail(
+        self, detail: np.ndarray | None, display: np.ndarray
+    ) -> np.ndarray | None:
+        """``detail`` with the same contrast stretch as its display copy."""
+
+        if detail is None:
+            return None
+        lower, upper = lp.contrast_limits(display, self._display_mask())
+        return lp.stretch_contrast_rgb8(detail, lower, upper)
+
     def _update_enhanced(self) -> None:
         if self.image is None:
             self._enhanced = None
+            self._detail_enhanced = None
             return
         self._enhanced = lp.enhance_contrast(self.image.display, self._display_mask())
+        self._detail_enhanced = self._stretched_detail(self._detail_plain, self.image.display)
         self._update_background_enhanced()
 
     def _show_reference(self, *, reset_view: bool) -> None:
         if self.image is None or self._reference_token is None:
             return
+        enhanced = self.enhance.isChecked()
         token = self._reference_token
-        display = self._enhanced if self.enhance.isChecked() else self._plain
+        display = self._enhanced if enhanced else self._plain
+        detail = self._detail_enhanced if enhanced else self._detail_plain
         if self._background_shown and self._background_token is not None:
             token = self._background_token
-            display = (
-                self._background_enhanced
-                if self.enhance.isChecked() and self._background_enhanced is not None
-                else self._background_plain
+            stretched = enhanced and self._background_enhanced is not None
+            display = self._background_enhanced if stretched else self._background_plain
+            detail = (
+                self._background_detail_enhanced
+                if stretched
+                else self._background_detail_plain
             )
         assert display is not None
         self.canvas.set_photo(
@@ -2693,6 +2814,7 @@ class LayerPainterView(QWidget):
             self.image.image_size,
             token=token,
             reset_view=reset_view,
+            detail=detail,
         )
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             self.canvas.paint_enabled = False
@@ -2824,6 +2946,7 @@ class LayerPainterView(QWidget):
         self._background_path = path
         self._background_rgb = rgb
         self._background_plain = np.rint(255.0 * rgb).astype(np.uint8)
+        self._background_detail_plain = self._full_resolution(path)
         self._update_background_enhanced()
         self._background_token = {
             "baseline": self._background_plain,
@@ -2876,9 +2999,13 @@ class LayerPainterView(QWidget):
     def _update_background_enhanced(self) -> None:
         if self._background_rgb is None or self.image is None:
             self._background_enhanced = None
+            self._background_detail_enhanced = None
             return
         self._background_enhanced = lp.enhance_contrast(
             self._background_rgb, self._display_mask()
+        )
+        self._background_detail_enhanced = self._stretched_detail(
+            self._background_detail_plain, self._background_rgb
         )
 
     def _clear_background(self) -> None:
@@ -2886,6 +3013,8 @@ class LayerPainterView(QWidget):
         self._background_rgb = None
         self._background_plain = None
         self._background_enhanced = None
+        self._background_detail_plain = None
+        self._background_detail_enhanced = None
         self._background_token = None
         self._background_shown = False
         self._refresh_background_choice()

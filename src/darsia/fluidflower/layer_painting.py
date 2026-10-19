@@ -60,6 +60,9 @@ ERASER = 0
 OUTSIDE = 0
 ANALYSIS_WIDTH = 1200
 DISPLAY_LIMIT_PX = 2400
+# Up to this many pixels on its longest side, the painting tab also keeps the
+# photograph at full resolution and shows it when zoomed in (display only).
+DETAIL_LIMIT_PX = 6000
 LAYER_ROLES: dict[str, str] = {
     "porous_medium": "Porous medium",
     "free_water": "Free water",
@@ -770,6 +773,25 @@ def save_painting_session(
 # Photograph
 
 
+def contrast_limits(
+    rgb: np.ndarray,
+    mask: np.ndarray | None = None,
+    *,
+    low: float = 0.5,
+    high: float = 99.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The two channel percentiles that ``enhance_contrast`` stretches between."""
+
+    image = np.asarray(rgb, dtype=np.float32)
+    if image.max(initial=0.0) > 1.5:
+        image = image / 255.0
+    sample = image[mask] if mask is not None and np.any(mask) else image.reshape(-1, 3)
+    if sample.shape[0] > 400_000:
+        step = int(math.ceil(sample.shape[0] / 400_000))
+        sample = sample[::step]
+    return np.percentile(sample, low, axis=0), np.percentile(sample, high, axis=0)
+
+
 def enhance_contrast(
     rgb: np.ndarray,
     mask: np.ndarray | None = None,
@@ -782,15 +804,30 @@ def enhance_contrast(
     image = np.asarray(rgb, dtype=np.float32)
     if image.max(initial=0.0) > 1.5:
         image = image / 255.0
-    sample = image[mask] if mask is not None and np.any(mask) else image.reshape(-1, 3)
-    if sample.shape[0] > 400_000:
-        step = int(math.ceil(sample.shape[0] / 400_000))
-        sample = sample[::step]
-    lower = np.percentile(sample, low, axis=0)
-    upper = np.percentile(sample, high, axis=0)
+    lower, upper = contrast_limits(image, mask, low=low, high=high)
     span = np.maximum(upper - lower, 1.0e-3)
     stretched = np.clip((image - lower) / span, 0.0, 1.0)
     return np.rint(255.0 * stretched).astype(np.uint8)
+
+
+def stretch_contrast_rgb8(
+    rgb: np.ndarray, lower: np.ndarray, upper: np.ndarray
+) -> np.ndarray:
+    """``enhance_contrast``'s stretch between given limits, for uint8 RGB.
+
+    Gives the same values as ``enhance_contrast`` with these limits, through
+    one lookup table per channel instead of a floating-point copy, so that a
+    full-resolution photograph can be stretched with little memory.
+    """
+
+    values = np.arange(256, dtype=np.float32)[:, None] / 255.0
+    span = np.maximum(upper - lower, 1.0e-3)
+    table = np.rint(255.0 * np.clip((values - lower) / span, 0.0, 1.0)).astype(np.uint8)
+    image = np.asarray(rgb, dtype=np.uint8)
+    stretched = np.empty_like(image)
+    for channel in range(3):
+        stretched[..., channel] = table[image[..., channel], channel]
+    return stretched
 
 
 @dataclass
@@ -2058,6 +2095,7 @@ __all__ = [
     "PolygonGuide",
     "Stroke",
     "check_ready_for_revision",
+    "contrast_limits",
     "enhance_contrast",
     "facies_ids",
     "frame_mask",
@@ -2079,5 +2117,6 @@ __all__ = [
     "save_painting_session",
     "session_path",
     "snap_pixels",
+    "stretch_contrast_rgb8",
     "upsample_classes",
 ]
