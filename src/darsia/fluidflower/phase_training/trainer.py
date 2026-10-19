@@ -1435,7 +1435,7 @@ def _feature_cache_key(
             "texture_sigma": float(texture_sigma),
             "feature_contract": feature_contract.to_dict(),
             "v5_review_sampling_code_sha256": (
-                _sha256(PACKAGE_ROOT / "v5_review_sampling.py") if v5 else None),
+                _sha256(PACKAGE_ROOT / "review_sampling.py") if v5 else None),
             "optical_phase_features_sha256": _sha256(
                 FLUIDFLOWER_ROOT / "phase_features.py"
             ),
