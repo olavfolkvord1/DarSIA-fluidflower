@@ -178,7 +178,10 @@ class WorkerCacheAdapter:
         first=self.lease.first_qualification
         if self.runtime.backend!="cpu" or self.runtime.commit!=first.provider["scope"]["commit"]:
             raise CachePolicyError("First worker runtime/source differs from released scope")
-        first.require_task(self.lease,task,remember=True)
+        first.require_task(self.lease,task)
+        if first.reference_build:
+            from .first_qualification import reference_writer_coverage
+            reference_writer_coverage(first, self.lease, writer_environment=True)
         self.profiles[task["attempt_id"]]=dict(task=deepcopy(task),binding=first.binding,
             first_administration=True,coverage_sha256=None)
         return first.binding

@@ -302,7 +302,7 @@ class FirstQualification:
         self.claim = None
 
     def consume(self, lease):
-        """Native controller consumes once before CreateProcess; no recovery retry."""
+        """Admit one native launch; only a successful claim consumes the scope."""
         if self.bound_mode:
             if (not isinstance(self.output_entitlement, dict)
                     or self.output_entitlement.get("format") != BOUND_OUTPUT_ADMINISTRATION
@@ -336,13 +336,22 @@ class FirstQualification:
                         or report.get("reserve_bytes") != PHYSICAL_RESERVE_BYTES
                         or report.get("free_physical_bytes", 0) <= PHYSICAL_RESERVE_BYTES):
                     raise CachePolicyError("Fresh original Q87 hard cap, same namespace and operational reserve required")
-            # This lock/flat immutable marker shares the actual host reservation
-            # authority. A new UUID/provider cannot repeat the same qualification.
-            lease.ledger.control.write_once("cache-first-" + key + ".json", _encoded(dict(
-                format="darsia-cache-first-qualification-consumed-v1", request=self.binding,
+            # A prior actual claim, including legacy consumed markers, remains
+            # final. A failed preclaim launch retains separate immutable proof;
+            # only a new Root-bound request may have another launch marker.
+            names = lease.ledger.control.names()
+            if ("cache-first-" + key + ".json" in names
+                    or "cache-first-" + key + "-claim.json" in names):
+                raise CachePolicyError("An actual first claim already consumed this qualification")
+            lease.ledger.control.write_once(self._launch_marker_name(), _encoded(dict(
+                format="darsia-cache-first-qualification-launch-admitted-v1", request=self.binding,
                 provider=self.provider_binding, stores_source=self.stores_source,
                 owner=lease.owner, scope=self.provider["scope"], no_retry=True)))
         self.started = True
+
+    def _launch_marker_name(self):
+        return "cache-first-launch-" + _digest(dict(
+            qualification=self._once_key(), request=self.binding)) + ".json"
 
     def _once_key(self):
         return _digest(dict(scope=self.provider["scope"], python=self.provider["python_executable"],
@@ -359,19 +368,7 @@ class FirstQualification:
             raise CachePolicyError("First output/cache namespace is not the actual accepted one-host cap")
 
     def service_entitlement(self, lease):
-        self._namespace(lease)
-        # Called inside the original service reservation transaction. A direct
-        # worker cannot bypass the consumed native-controller launch marker.
-        if getattr(lease,"native_launch_context",None) is None:
-            raise CachePolicyError("First service must be inside the original controlled native Job")
-        raw,_=lease.ledger.control.read_once("cache-first-"+self._once_key()+".json")
-        from .capacity import _json_bytes
-        marker=_json_bytes(raw)
-        if (marker.get("format")!="darsia-cache-first-qualification-consumed-v1"
-                or marker.get("request")!=self.binding or marker.get("provider")!=self.provider_binding
-                or marker.get("stores_source")!=self.stores_source
-                or marker.get("scope")!=self.provider["scope"] or marker.get("no_retry") is not True):
-            raise CachePolicyError("Original one-shot first launch marker differs")
+        self._require_launch_admission(lease)
         report = lease.ledger.project(0)
         if getattr(self, "q123_cold_scope", None) is not None:
             self.q123_cold_scope.admit(self, lease, report)
@@ -388,7 +385,22 @@ class FirstQualification:
             admission=report)
         return maximum
 
-    def require_task(self, lease, task, *, remember=False):
+    def _require_launch_admission(self, lease):
+        self._namespace(lease)
+        # Called inside the original service reservation transaction. A direct
+        # worker cannot bypass the exact native-controller launch admission.
+        if getattr(lease,"native_launch_context",None) is None:
+            raise CachePolicyError("First service must be inside the original controlled native Job")
+        raw,_=lease.ledger.control.read_once(self._launch_marker_name())
+        from .capacity import _json_bytes
+        marker=_json_bytes(raw)
+        if (marker.get("format")!="darsia-cache-first-qualification-launch-admitted-v1"
+                or marker.get("request")!=self.binding or marker.get("provider")!=self.provider_binding
+                or marker.get("stores_source")!=self.stores_source
+                or marker.get("scope")!=self.provider["scope"] or marker.get("no_retry") is not True):
+            raise CachePolicyError("Original one-shot first launch marker differs")
+
+    def require_task(self, lease, task):
         scope = self.provider["scope"]
         if (getattr(lease, "first_qualification", None) is not self
                 or {key: task.get(key) for key in ("commit", "pipeline", "precision", "run", "ordered_case_ids")}
@@ -397,25 +409,43 @@ class FirstQualification:
             raise CachePolicyError("First claim differs from exact released source/stage/cases/stores")
         if self.claim is not None and self.claim != task:
             raise CachePolicyError("Only one actual exact39 claim may use this first service")
-        if self.reference_build and remember:
-            # The actual worker slot has the service scope/environment. The
-            # external native observer never starts a cache lease of its own.
-            reference_writer_coverage(self,lease,writer_environment=True)
-        if remember:
-            # One original queued attempt/owner across all spawned service
-            # actors, not merely one in-memory counter per Python process.
-            with lease.ledger.locked():
-                name="cache-first-"+self._once_key()+"-claim.json"
-                value=dict(format="darsia-cache-first-single-claim-v1",request=self.binding,
-                    provider=self.provider_binding,task=task,owner=lease.owner)
-                if name in lease.ledger.control.names():
-                    raw,_=lease.ledger.control.read_once(name)
-                    from .capacity import _json_bytes
-                    if _json_bytes(raw)!=value:
-                        raise CachePolicyError("A different first claim/owner already consumed this entitlement")
-                else:lease.ledger.control.write_once(name,_encoded(value))
-            self.claim = deepcopy(task)
         return True
+
+    def remember_claim_locked(self, lease, claim):
+        """The original atomic queue claim succeeded; retain consumption first."""
+        lease.ledger._require_lock()
+        if claim.token != claim.task.get("attempt_id"):
+            raise CachePolicyError("Actual first claim token differs from its released task")
+        self.require_task(lease, claim.task)
+        self._require_launch_admission(lease)
+        if self.reference_build:
+            reference_writer_coverage(self, lease, writer_environment=True)
+        self._remember_claim_locked(lease, claim.task)
+
+    def _remember_claim_locked(self, lease, task):
+        # The caller holds the original result-volume -> cache transaction.
+        # Consume before any later result/cache reservation or receipt can fail.
+        lease.ledger._require_lock()
+        name = "cache-first-" + self._once_key() + "-claim.json"
+        once = "cache-first-" + self._once_key() + ".json"
+        value = dict(format="darsia-cache-first-single-claim-v1", request=self.binding,
+            provider=self.provider_binding, task=task, owner=lease.owner)
+        consumed = dict(format="darsia-cache-first-qualification-consumed-v1",
+            request=self.binding, provider=self.provider_binding, stores_source=self.stores_source,
+            owner=lease.owner, scope=self.provider["scope"], no_retry=True)
+        names = lease.ledger.control.names()
+        if name in names:
+            from .capacity import _json_bytes
+            raw, _ = lease.ledger.control.read_once(name)
+            if _json_bytes(raw) != value or once not in names:
+                raise CachePolicyError("A different first claim/owner already consumed this entitlement")
+            raw, _ = lease.ledger.control.read_once(once)
+            if _json_bytes(raw) != consumed:
+                raise CachePolicyError("Actual consumed first-claim marker differs")
+        else:
+            lease.ledger.control.write_once(once, _encoded(consumed))
+            lease.ledger.control.write_once(name, _encoded(value))
+        self.claim = deepcopy(task)
 
     def reference_admission(self, lease, *, report=None, initial=False, other_remaining=0):
         """One explicit aggregate, independently admitted on each affected volume."""

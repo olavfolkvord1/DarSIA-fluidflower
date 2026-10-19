@@ -1278,6 +1278,10 @@ class ClaimCapacity:
 
     def bind(self, claim):
         if claim is not None:
+            lease = getattr(getattr(self.runtime, "cache_adapter", None), "lease", None)
+            first = getattr(lease, "first_qualification", None)
+            if first is not None:
+                first.remember_claim_locked(lease, claim)
             reservation = self.ledger.bind(self.runtime.root, claim, self.owner,
                                            self.estimates[claim.token])
             self.runtime.capacities[claim.token] = (self.ledger, reservation, self.owner)

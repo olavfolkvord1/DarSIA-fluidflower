@@ -28,24 +28,24 @@ def provider():
         module_closure=producers+runtime)
 
 
-def protocol():
+def protocol(request_name="request.json", request_digit="a", task_digit="a", job_id="TESTONLY-job"):
     value=provider(); binding=pin("provider.json"); stores=pin("stores.toml")
     request=dict(format=first.REQUEST, execution_authorized=True, authority_ids=["Q97","Q99"],
         root_release=pin("release.json"), provider=binding, stores_source=stores,
         namespace_admission=value["namespace_admission"], scope=value["scope"],
-        task=pin("task.json"),
+        task=pin("task.json", task_digit),
         cache_stat_period_seconds=30,
         public_command=["C:/TESTONLY/python.exe","-B","-m","darsia.fluidflower.worker"])
     release=dict(format="darsia-cache-first-qualification-root-release-v1",
         execution_authorized=True,provider=binding,stores_source=stores,scope=value["scope"],
         request_payload_sha256=first._digest({k:v for k,v in request.items() if k!="root_release"}))
     task=deepcopy(value["scope"]);task.pop("backend")
-    task.update(attempt_id="2"*32,job_id="TESTONLY-job")
+    task.update(attempt_id="2"*32,job_id=job_id)
     objects={binding["path"]:value,request["root_release"]["path"]:release,
         "C:/TESTONLY/task.json":task,
-        "C:/TESTONLY/request.json":request}
+        "C:/TESTONLY/"+request_name:request}
     read=lambda descriptor:deepcopy(objects[descriptor["path"]])
-    state=first.FirstQualification(pin("request.json"),provider_binding=binding,
+    state=first.FirstQualification(pin(request_name, request_digit),provider_binding=binding,
         stores_source=stores,namespace=value["namespace_admission"],read=read)
     return state,objects
 
@@ -152,9 +152,15 @@ def test_modified_request_after_root_payload_release_refuses():
 
 class Ledger_TESTONLY:
     def __init__(self):
-        self.documents={};self.control=self;self.maximums=[]
+        self.documents={};self.control=self;self.maximums=[];self.lock_active=False
     @contextmanager
-    def locked(self,**kwargs):yield self
+    def locked(self,**kwargs):
+        if self.lock_active:raise CachePolicyError("Nested cache transaction refused")
+        self.lock_active=True
+        try:yield self
+        finally:self.lock_active=False
+    def _require_lock(self):
+        if not self.lock_active:raise CachePolicyError("Same host transaction required")
     def project(self,maximum):
         assert maximum==0
         return report(active_cache_remaining_bytes=0)
@@ -207,12 +213,15 @@ def test_service_entitlement_requires_original_native_context_and_once_marker(mo
     assert len(lease.ledger.documents)==1  # No service reservation is duplicated here.
 
 
-def test_different_spawned_owner_cannot_reuse_first_claim():
+def test_different_spawned_owner_cannot_reuse_first_claim(monkeypatch):
     state,_=protocol();lease=lease_for(state);task=task_for(state)
-    state.require_task(lease,task,remember=True)
+    launch_for_claim_TESTONLY(state, lease, monkeypatch)
+    with lease.ledger.locked():
+        state.remember_claim_locked(lease,SimpleNamespace(token=task["attempt_id"],task=task))
     other,_=protocol();lease.first_qualification=other;lease.owner=dict(pid=99,process_create_time="999.0")
     with pytest.raises(CachePolicyError,match="different first claim/owner"):
-        other.require_task(lease,task,remember=True)
+        with lease.ledger.locked():
+            other.remember_claim_locked(lease,SimpleNamespace(token=task["attempt_id"],task=task))
 
 
 def test_exact_task_contract_binds_calibration_and_all_original_input_metadata():
@@ -231,9 +240,19 @@ def task_for(state):
     return task
 
 
-def test_one_real_claim_can_bind_but_second_attempt_or_changed_cases_cannot():
+def launch_for_claim_TESTONLY(state, lease, monkeypatch):
+    monkeypatch.setattr(first,"_outputs_absent",lambda value:None)
+    state.consume(lease)
+    lease.native_launch_context=pin("actual-native-launch.json")
+
+
+def test_one_real_claim_can_bind_but_second_attempt_or_changed_cases_cannot(monkeypatch):
     state,_=protocol();lease=lease_for(state);task=task_for(state)
-    assert state.require_task(lease,task,remember=True) is True
+    assert state.require_task(lease,task) is True
+    assert state.claim is None
+    launch_for_claim_TESTONLY(state, lease, monkeypatch)
+    with lease.ledger.locked():
+        state.remember_claim_locked(lease,SimpleNamespace(token=task["attempt_id"],task=task))
     changed=deepcopy(task);changed["attempt_id"]="3"*32
     with pytest.raises(CachePolicyError):state.require_task(lease,changed)
     changed=deepcopy(task);changed["ordered_case_ids"].reverse()
@@ -246,7 +265,9 @@ def test_first_claim_uses_existing_service_without_inventing_measured_zero_or_ne
     adapter.lease=lease;adapter.runtime=SimpleNamespace(backend="cpu",commit="c"*40)
     adapter.profiles={};adapter.claims={}
     task=task_for(state)
+    launch_for_claim_TESTONLY(state, lease, monkeypatch)
     assert adapter.prepare_first_claim(task,None)==state.binding
+    assert state.claim is None and len(lease.ledger.documents)==1
     proof=adapter.profiles[task["attempt_id"]]
     assert proof["first_administration"] is True and proof["coverage_sha256"] is None
     assert "maximum_observed_cache_bytes" not in proof
@@ -255,12 +276,167 @@ def test_first_claim_uses_existing_service_without_inventing_measured_zero_or_ne
     lease._record=lambda name,value:(records.append(deepcopy(value)) or pin(name))
     monkeypatch.setattr("darsia_cache.worker_adapter._owner",lambda:(lease.owner,{}))
     claim=SimpleNamespace(token=task["attempt_id"],task=task)
+    with lease.ledger.locked():state.remember_claim_locked(lease,claim)
     adapter.register_claim_allocation(claim,lease.ledger,{"token":claim.token},lease.owner,0,state.binding)
     assert records[0]["format"]=="darsia-worker-cache-first-claim-service-binding-v1"
     assert records[0]["claim_scope_created"] is False
     assert records[0]["service_reservation"]==lease.reservation
     assert records[0]["writer_coverage_sha256"] is None
-    assert len(lease.ledger.documents)==1  # Only the first-claim authority record.
+    assert len(lease.ledger.documents)==3  # Launch proof, actual consumption and exact claim authority.
+
+
+def test_q138_preclaim_failure_allows_only_a_new_released_request(monkeypatch):
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    original=dict(lease.ledger.documents)
+    assert "cache-first-"+state._once_key()+".json" not in original
+    replacement,_=protocol("fresh-request.json","d","e","TESTONLY-fresh-namespace")
+    lease.first_qualification=replacement
+    replacement.consume(lease)
+    assert state._once_key()==replacement._once_key()
+    assert state._launch_marker_name()!=replacement._launch_marker_name()
+    assert len(lease.ledger.documents)==2
+    assert all(lease.ledger.documents[name]==raw for name,raw in original.items())
+    with pytest.raises(CachePolicyError,match="already exists"):
+        replacement.consume(lease)
+
+
+def test_q138_preclaim_preparation_and_lost_queue_race_consume_nothing(monkeypatch):
+    from darsia.fluidflower.pipeline.capacity import ClaimCapacity
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    original=dict(lease.ledger.documents)
+    adapter=WorkerCacheAdapter.__new__(WorkerCacheAdapter)
+    adapter.lease=lease;adapter.runtime=SimpleNamespace(backend="cpu",commit="c"*40)
+    adapter.profiles={};adapter.claims={}
+    assert adapter.prepare_first_claim(deepcopy(state.task),None)==state.binding
+    context=ClaimCapacity.__new__(ClaimCapacity)
+    context.bind(None)  # The atomic queue claim was lost; no claim-side state exists.
+    assert state.claim is None and lease.ledger.documents==original
+
+
+def test_q138_actual_claim_consumes_before_result_reservation_can_fail(monkeypatch):
+    from darsia.fluidflower.pipeline.capacity import ClaimCapacity
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    context=ClaimCapacity.__new__(ClaimCapacity)
+    context.runtime=SimpleNamespace(cache_adapter=SimpleNamespace(lease=lease),root="TESTONLY-root")
+    context.owner=lease.owner;context.estimates={claim.token:object()}
+    def result_reservation_failed(*args):raise OSError("TESTONLY after-claim reservation failure")
+    context.ledger=SimpleNamespace(bind=result_reservation_failed)
+    with pytest.raises(OSError,match="after-claim reservation"):
+        with lease.ledger.locked():context.bind(claim)
+    once="cache-first-"+state._once_key()+".json"
+    assert once in lease.ledger.documents and once[:-5]+"-claim.json" in lease.ledger.documents
+    assert state.claim==claim.task
+    replacement,_=protocol("fresh-request.json","d","e","TESTONLY-fresh-namespace")
+    lease.first_qualification=replacement
+    with pytest.raises(CachePolicyError,match="actual first claim already consumed"):
+        replacement.consume(lease)
+
+
+def test_q138_actual_claim_success_preserves_result_then_cache_binding_order(monkeypatch):
+    from darsia.fluidflower.pipeline.capacity import ClaimCapacity
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    context=ClaimCapacity.__new__(ClaimCapacity)
+    context.runtime=SimpleNamespace(cache_adapter=SimpleNamespace(lease=lease),
+        root="TESTONLY-root",capacities={})
+    context.owner=lease.owner;estimate=object();context.estimates={claim.token:estimate}
+    events=[];reservation={"TESTONLY":"original result reservation"}
+    def bind_result(root,actual,owner,bound_estimate):
+        assert root==context.runtime.root and actual is claim and owner==lease.owner
+        assert bound_estimate is estimate
+        assert "cache-first-"+state._once_key()+".json" in lease.ledger.documents
+        assert state.claim==claim.task
+        events.append("result");return reservation
+    context.ledger=SimpleNamespace(bind=bind_result)
+    context.cache=SimpleNamespace(bind=lambda actual:events.append("cache") if actual is claim else pytest.fail())
+    with lease.ledger.locked():context.bind(claim)
+    assert events==["result","cache"]
+    assert context.runtime.capacities[claim.token]==(context.ledger,reservation,lease.owner)
+
+
+def test_q138_actual_claim_requires_original_lock_and_exact_task_token(monkeypatch):
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    original=dict(lease.ledger.documents)
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    with pytest.raises(CachePolicyError,match="Same host transaction"):
+        state.remember_claim_locked(lease,claim)
+    with pytest.raises(CachePolicyError,match="claim token"):
+        with lease.ledger.locked():
+            state.remember_claim_locked(lease,SimpleNamespace(token="f"*32,task=claim.task))
+    assert lease.ledger.documents==original
+
+
+def test_q138_legacy_consumed_marker_is_never_rearmed_or_overwritten(monkeypatch):
+    state,_=protocol();lease=lease_for(state)
+    old_name="cache-first-"+state._once_key()+".json"
+    old_bytes=b'{"TESTONLY":"retained old preclaim marker; no deletion or repair"}\n'
+    lease.ledger.documents[old_name]=old_bytes
+    monkeypatch.setattr(first,"_outputs_absent",lambda value:None)
+    with pytest.raises(CachePolicyError,match="actual first claim already consumed"):
+        state.consume(lease)
+    assert lease.ledger.documents=={old_name:old_bytes}
+
+
+def test_q138_claim_marker_write_failure_still_consumes_actual_claim(monkeypatch):
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    original_write=lease.ledger.write_once
+    def fail_claim_record(name,raw):
+        if name.endswith("-claim.json"):raise OSError("TESTONLY immutable claim record failure")
+        return original_write(name,raw)
+    monkeypatch.setattr(lease.ledger,"write_once",fail_claim_record)
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    with pytest.raises(OSError,match="claim record failure"):
+        with lease.ledger.locked():state.remember_claim_locked(lease,claim)
+    once="cache-first-"+state._once_key()+".json"
+    assert once in lease.ledger.documents and once[:-5]+"-claim.json" not in lease.ledger.documents
+    with pytest.raises(CachePolicyError,match="actual first claim already consumed"):
+        state.consume(lease)
+
+
+@pytest.mark.parametrize("mutation",[
+    lambda marker:marker.update(format="darsia-cache-first-qualification-consumed-v1"),
+    lambda marker:marker.update(request=pin("foreign-request.json")),
+    lambda marker:marker.update(provider=pin("foreign-provider.json")),
+    lambda marker:marker.update(stores_source=pin("foreign-stores.toml")),
+    lambda marker:marker.update(scope=dict(TESTONLY="foreign scope")),
+    lambda marker:marker.update(no_retry=False),
+])
+def test_q138_actual_claim_keeps_original_native_launch_binding_guards(monkeypatch,mutation):
+    from darsia_cache.capacity import _json_bytes
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    name=state._launch_marker_name();marker=_json_bytes(lease.ledger.documents[name]);mutation(marker)
+    lease.ledger.documents[name]=first._encoded(marker)
+    before=dict(lease.ledger.documents)
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    with pytest.raises(CachePolicyError,match="one-shot first launch marker"):
+        with lease.ledger.locked():state.remember_claim_locked(lease,claim)
+    assert lease.ledger.documents==before
+
+
+def test_q138_exact_claim_is_idempotent_but_another_released_request_cannot_claim(monkeypatch):
+    state,_=protocol();lease=lease_for(state)
+    launch_for_claim_TESTONLY(state,lease,monkeypatch)
+    other,_=protocol("fresh-request.json","d","e","TESTONLY-fresh-namespace")
+    lease.first_qualification=other;other.consume(lease)
+    lease.first_qualification=state
+    claim=SimpleNamespace(token=state.task["attempt_id"],task=deepcopy(state.task))
+    with lease.ledger.locked():state.remember_claim_locked(lease,claim)
+    original=dict(lease.ledger.documents)
+    with lease.ledger.locked():state.remember_claim_locked(lease,claim)
+    assert lease.ledger.documents==original
+    lease.first_qualification=other
+    with pytest.raises(CachePolicyError,match="different first claim/owner"):
+        with lease.ledger.locked():
+            other.remember_claim_locked(lease,SimpleNamespace(token=other.task["attempt_id"],task=deepcopy(other.task)))
+    assert lease.ledger.documents==original
 
 
 def test_sampled_peak_is_not_lifetime_peak_and_kernel_total_is_not_concurrency():
