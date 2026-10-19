@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMenu,
     QMessageBox,
@@ -1966,6 +1967,8 @@ class LayerPainterView(QWidget):
         # True while a session painted on the raw reference photo is shown in
         # a project whose geometry is in the saved corrected rig frame.
         self._raw_session_frame = False
+        # The reference photograph on the fine proposal grid: (source, fine image).
+        self._fine_image: tuple[lp.PaintingImage, lp.PaintingImage] | None = None
         self._saved_corrected_boundaries: np.ndarray | None = None
         self.session: lp.PaintingSession | None = None
         self.image: lp.PaintingImage | None = None
@@ -2234,6 +2237,19 @@ class LayerPainterView(QWidget):
         )
         self.snap.editingFinished.connect(self._settings_changed)
         snap_row.addWidget(self.snap)
+        snap_row.addSpacing(10)
+        snap_row.addWidget(QLabel("Detail"))
+        self.detail = QComboBox()
+        for key, label in (("normal", "Normal"), ("fine", "Fine")):
+            self.detail.addItem(label, key)
+        self.detail.setToolTip(
+            "The grid the model labels. Fine uses the photograph as shown on screen, "
+            "with about twice the pixels per mm of Normal, so thin layers keep their "
+            "width; a proposal then takes about twice as long. A layer can also get "
+            "its own snap distance: right-click it in the layer list."
+        )
+        self.detail.currentIndexChanged.connect(self._settings_changed)
+        snap_row.addWidget(self.detail)
         snap_row.addStretch(1)
         layout.addLayout(snap_row)
         self.proposal_summary = QLabel()
@@ -3127,7 +3143,7 @@ class LayerPainterView(QWidget):
 
     def _sync_settings(self) -> None:
         session = self.session
-        widgets = (self.smoothing, self.min_region, self.snap, self.unit)
+        widgets = (self.smoothing, self.min_region, self.snap, self.detail, self.unit)
         for widget in widgets:
             widget.blockSignals(True)
         try:
@@ -3137,6 +3153,7 @@ class LayerPainterView(QWidget):
                 )
                 self.min_region.setValue(float(session.min_region_cm2))
                 self.snap.setValue(float(session.snap_mm))
+                self.detail.setCurrentIndex(max(0, self.detail.findData(session.detail)))
                 self.unit.setCurrentIndex(
                     max(0, self.unit.findData(session.permeability_unit))
                 )
@@ -3152,6 +3169,7 @@ class LayerPainterView(QWidget):
             self.smoothing,
             self.min_region,
             self.snap,
+            self.detail,
             self.unit,
             self.add_facies_button,
             self.remove_facies_button,
@@ -3272,11 +3290,20 @@ class LayerPainterView(QWidget):
                 )
                 table.setItem(row, 1, name)
                 for column, counts in ((2, polygons), (3, strokes)):
-                    count = QTableWidgetItem(str(counts.get(layer.layer_id, 0)))
+                    text = str(counts.get(layer.layer_id, 0))
+                    if column == 2 and layer.snap_mm is not None:
+                        # The layer's own snap distance, shown with its polygons.
+                        text += f" · {layer.snap_mm:g} mm"
+                    count = QTableWidgetItem(text)
                     count.setFlags(
                         Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                     )
                     count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if column == 2 and layer.snap_mm is not None:
+                        count.setToolTip(
+                            f"This layer's own snap distance: {layer.snap_mm:g} mm. "
+                            "Right-click to change it."
+                        )
                     table.setItem(row, column, count)
                 shown = QTableWidgetItem()
                 shown.setFlags(
@@ -3583,8 +3610,60 @@ class LayerPainterView(QWidget):
         every = menu.addAction("Show all layers")
         every.setEnabled(bool(self._hidden_layers))
         every.triggered.connect(lambda _checked=False: self.show_all_layers())
+        menu.addSeparator()
+        own = menu.addAction("Snap distance of this layer…")
+        own.setEnabled(layer is not None)
+        common = menu.addAction("Use the common snap distance")
+        common.setEnabled(layer is not None and layer.snap_mm is not None)
+        if layer is not None:
+            own.triggered.connect(
+                lambda _checked=False, layer_id=layer.layer_id: self._ask_layer_snap(layer_id)
+            )
+            common.triggered.connect(
+                lambda _checked=False, layer_id=layer.layer_id: self.set_layer_snap(
+                    layer_id, None
+                )
+            )
         self._layer_table_menu_widget = menu
         menu.popup(self.layer_table.viewport().mapToGlobal(position))
+
+    def _ask_layer_snap(self, layer_id: int) -> None:
+        """Ask for one layer's own snap distance and set it."""
+
+        if self.session is None:
+            return
+        layer = self.session.layer(layer_id)
+        if layer is None:
+            return
+        value, accepted = QInputDialog.getDouble(
+            self,
+            "Snap distance of this layer",
+            f"Snap distance for {layer.name} (mm). 0 keeps its polygons exactly, "
+            "for thin layers; the common distance is "
+            f"{self.session.snap_mm:g} mm.",
+            self.session.layer_snap_mm(layer_id),
+            0.0,
+            lp.MAX_SNAP_MM,
+            1,
+        )
+        if accepted:
+            self.set_layer_snap(layer_id, float(value))
+
+    def set_layer_snap(self, layer_id: int, snap_mm: float | None) -> None:
+        """Give one layer its own snap distance, or the common one with None."""
+
+        if self.session is None:
+            return
+        layer = self.session.layer(layer_id)
+        if layer is None:
+            return
+        value = None if snap_mm is None else float(min(max(snap_mm, 0.0), lp.MAX_SNAP_MM))
+        if layer.snap_mm == value:
+            return
+        layer.snap_mm = value
+        self._mark_dirty()
+        self._refresh_layers()
+        self._refresh_status()
 
     # ------------------------------------------------------------- marks
 
@@ -3898,6 +3977,7 @@ class LayerPainterView(QWidget):
         self.session.smoothing = str(self.smoothing.currentData() or "medium")
         self.session.min_region_cm2 = float(self.min_region.value())
         self.session.snap_mm = float(self.snap.value())
+        self.session.detail = str(self.detail.currentData() or "normal")
         self._mark_dirty()
         self._refresh_status()
 
@@ -3924,7 +4004,7 @@ class LayerPainterView(QWidget):
         snapshot = lp.PaintingSession.from_dict(self.session.to_dict())
         thread = QThread(self)
         worker = _ProposalWorker(
-            self.image,
+            self._proposal_image(),
             snapshot,
             self.current_frame(),
             lp.proposal_path(self.project, reference.run_id),
@@ -3948,6 +4028,21 @@ class LayerPainterView(QWidget):
         self.step_propose.set_status("Working…", "warn")
         thread.start()
         self.busy_changed.emit(True)
+
+    def _proposal_image(self) -> lp.PaintingImage:
+        """The reference photograph on the grid the session's detail asks for.
+
+        Fine uses the displayed photograph as the analysis grid. That image is
+        kept while the photograph stays, so its features are computed once.
+        """
+
+        assert self.image is not None and self.session is not None
+        if self.session.detail != "fine":
+            return self.image
+        if self._fine_image is None or self._fine_image[0] is not self.image:
+            fine = lp.with_analysis_width(self.image, int(self.image.display.shape[1]))
+            self._fine_image = (self.image, fine)
+        return self._fine_image[1]
 
     @Slot(object)
     def _proposal_worker_finished(self, proposal: lp.LayerProposal) -> None:

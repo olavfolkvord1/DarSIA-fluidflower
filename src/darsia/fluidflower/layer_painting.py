@@ -107,6 +107,12 @@ UNCERTAIN_BELOW = 0.6
 # How far polygon edges may lie from the true boundary, by default.
 DEFAULT_SNAP_MM = 10.0
 MAX_SNAP_MM = 100.0
+# Uncovered strips this close to the rig-frame edge take the nearest polygon's
+# layer (polygons drawn to the edge seldom reach it exactly).
+DEFAULT_EDGE_FILL_MM = 5.0
+# The grid a proposal is computed on: "normal" (ANALYSIS_WIDTH columns) or
+# "fine" (the photograph as displayed), which keeps thin layers.
+PROPOSAL_DETAILS = ("normal", "fine")
 # Without a rig size, the photograph is taken to be this wide.
 NOMINAL_IMAGE_WIDTH_M = 1.0
 
@@ -129,12 +135,17 @@ def _number(value: Any) -> float | None:
 
 @dataclass
 class PaintedLayer:
-    """A layer the user paints; ``facies`` names the facies it belongs to."""
+    """A layer the user paints; ``facies`` names the facies it belongs to.
+
+    ``snap_mm`` is this layer's own snap distance for its polygons; None uses
+    the session's.
+    """
 
     layer_id: int
     name: str
     color: str
     facies: str
+    snap_mm: float | None = None
 
 
 @dataclass
@@ -232,6 +243,8 @@ class PaintingSession:
     smoothing: str = "medium"
     min_region_cm2: float = 2.0
     snap_mm: float = DEFAULT_SNAP_MM
+    edge_fill_mm: float = DEFAULT_EDGE_FILL_MM
+    detail: str = "normal"
     updated_utc: str = ""
     updated_by: str = ""
     # Set when the run's baseline photograph differs from the one painted on.
@@ -257,6 +270,14 @@ class PaintingSession:
 
     def layer(self, layer_id: int) -> PaintedLayer | None:
         return next((row for row in self.layers if row.layer_id == layer_id), None)
+
+    def layer_snap_mm(self, layer_id: int) -> float:
+        """The snap distance of one layer's polygons: its own, else the session's."""
+
+        layer = self.layer(layer_id)
+        if layer is None or layer.snap_mm is None:
+            return float(self.snap_mm)
+        return float(layer.snap_mm)
 
     def _unique_name(self, wanted: str, *, ignore: int | None = None) -> str:
         used = {row.name.casefold() for row in self.layers if row.layer_id != ignore}
@@ -593,6 +614,7 @@ class PaintingSession:
                     "name": row.name,
                     "color": row.color,
                     "facies": row.facies,
+                    **({} if row.snap_mm is None else {"snap_mm": row.snap_mm}),
                 }
                 for row in self.layers
             ],
@@ -609,6 +631,8 @@ class PaintingSession:
                 "smoothing": self.smoothing,
                 "min_region_cm2": self.min_region_cm2,
                 "snap_mm": self.snap_mm,
+                "edge_fill_mm": self.edge_fill_mm,
+                "detail": self.detail,
             },
             "updated_utc": self.updated_utc,
             "updated_by": self.updated_by,
@@ -626,6 +650,8 @@ class PaintingSession:
         size = image.get("size")
         settings = dict(payload.get("proposal_settings") or {})
         snap = _number(settings.get("snap_mm"))
+        edge = _number(settings.get("edge_fill_mm"))
+        detail = str(settings.get("detail") or "normal")
         session = cls(
             run_id=str(payload.get("run_id") or ""),
             image_path=str(image.get("path") or ""),
@@ -639,18 +665,28 @@ class PaintingSession:
                 if snap is None
                 else float(min(max(snap, 0.0), MAX_SNAP_MM))
             ),
+            edge_fill_mm=(
+                DEFAULT_EDGE_FILL_MM
+                if edge is None
+                else float(min(max(edge, 0.0), MAX_SNAP_MM))
+            ),
+            detail=detail if detail in PROPOSAL_DETAILS else "normal",
             updated_utc=str(payload.get("updated_utc") or ""),
             updated_by=str(payload.get("updated_by") or ""),
         )
         if session.smoothing not in SMOOTHING_SIGMA:
             session.smoothing = "medium"
         for row in payload.get("layers") or []:
+            layer_snap = _number(row.get("snap_mm"))
             session.layers.append(
                 PaintedLayer(
                     int(row["layer_id"]),
                     str(row.get("name") or f"Layer {row['layer_id']}"),
                     str(row.get("color") or LAYER_COLORS[0]),
                     str(row.get("facies") or row.get("name") or ""),
+                    None
+                    if layer_snap is None
+                    else float(min(max(layer_snap, 0.0), MAX_SNAP_MM)),
                 )
             )
         for name, row in dict(payload.get("facies") or {}).items():
@@ -863,6 +899,33 @@ class PaintingImage:
         return self._features
 
 
+def with_analysis_width(image: PaintingImage, width: int) -> PaintingImage:
+    """The same photograph with its analysis grid ``width`` columns wide.
+
+    The analysis grid is reduced from the display image, so it is at most as
+    wide as that. The display image is shared; features are computed anew.
+    """
+
+    import cv2
+
+    display = image.display
+    target = max(8, min(int(width), int(display.shape[1])))
+    if target == image.analysis.shape[1]:
+        return image
+    if target == display.shape[1]:
+        analysis = display
+    else:
+        height = max(8, int(round(display.shape[0] * target / display.shape[1])))
+        analysis = cv2.resize(display, (target, height), interpolation=cv2.INTER_AREA)
+    return PaintingImage(
+        image.path,
+        tuple(image.image_size),
+        display,
+        np.ascontiguousarray(analysis, dtype=np.float32),
+        camera_u=image.camera_u,
+    )
+
+
 def photo_camera_u(project: FluidFlowerProject, run_id: str, path: Path | str | None):
     """The camera-U profile one photograph of a run is shown on, or None.
 
@@ -1065,12 +1128,19 @@ class PolygonGuide:
     # Layer of each pixel that can serve as a training sample (0: none).
     training: np.ndarray
     snap_px: float
+    # Layers with their own snap distance (grid pixels).
+    layer_snap_px: dict[int, float] = field(default_factory=dict)
+
+    def layer_snap(self, layer_id: int) -> float:
+        """A layer's snap distance in grid pixels: its own, else the common one."""
+
+        return self.layer_snap_px.get(int(layer_id), self.snap_px)
 
     def near(self, layer_id: int) -> np.ndarray | None:
-        """Pixels within the snap distance of a layer's polygons."""
+        """Pixels within the layer's snap distance of its polygons."""
 
         distance = self.distance.get(int(layer_id))
-        return None if distance is None else distance <= self.snap_px
+        return None if distance is None else distance <= self.layer_snap(layer_id)
 
 
 def polygon_guide(
@@ -1081,6 +1151,7 @@ def polygon_guide(
     snap_px: float,
     *,
     min_training_pixels: int = 50,
+    layer_snap_px: Mapping[int, float] | None = None,
 ) -> PolygonGuide:
     """Fixed interiors and allowed layers of a set of polygons on a grid.
 
@@ -1093,6 +1164,11 @@ def polygon_guide(
     whose polygons (or strokes, see :func:`propose_layers`) lie within
     ``snap_px`` compete. Areas that no polygon covers may hold any layer, so
     pixels within twice the snap distance of such an area are not restricted.
+
+    ``layer_snap_px`` gives single layers their own snap distance in place of
+    ``snap_px``, both for fixing their polygon pixels and for how far from
+    their polygons they compete. With 0 a layer keeps its polygons exactly and
+    does not spread beyond them where the area is covered by polygons.
     """
 
     import cv2
@@ -1117,19 +1193,27 @@ def polygon_guide(
     distance_edge = _distance_to(edges)
 
     snap = max(0.0, float(snap_px))
-    fixed = covered & (distance_edge > snap) if snap > 0.0 else covered.copy()
-    if snap > 0.0 and distance:
+    own_snap = {int(key): max(0.0, float(value)) for key, value in (layer_snap_px or {}).items()}
+    if own_snap:
+        snap_map = np.full(shape, snap, dtype=np.float32)
+        for layer_id, value in own_snap.items():
+            snap_map[owner == layer_id] = value
+        fixed = covered & ((distance_edge > snap_map) | (snap_map <= 0.0))
+    else:
+        fixed = covered & (distance_edge > snap) if snap > 0.0 else covered.copy()
+    reach = max([snap, *own_snap.values()])
+    if reach > 0.0 and distance:
         nearest = np.minimum.reduce(list(distance.values()))
         # Far from every polygon, any layer may occur.
-        free = inside & (nearest > snap)
-        restricted = inside & ~fixed & (_distance_to(free) > 2.0 * snap)
+        free = inside & (nearest > reach)
+        restricted = inside & ~fixed & (_distance_to(free) > 2.0 * reach)
     else:
         restricted = np.zeros(shape, dtype=bool)
 
     training = np.zeros(shape, dtype=np.uint8)
-    margin = max(snap, 2.0)
     for layer_id in masks:
         own = owner == layer_id
+        margin = max(own_snap.get(int(layer_id), snap), 2.0)
         for limit in (margin, min(margin, 2.0), -1.0):
             chosen = own & (distance_edge > limit)
             if np.count_nonzero(chosen) >= min_training_pixels:
@@ -1142,7 +1226,32 @@ def polygon_guide(
         distance=distance,
         training=training,
         snap_px=snap,
+        layer_snap_px=own_snap,
     )
+
+
+def frame_edge_fill(guide: PolygonGuide, inside: np.ndarray, edge_px: float) -> np.ndarray:
+    """Layer of each uncovered pixel in a strip along the rig-frame edge (0: none).
+
+    Polygons drawn up to the frame edge seldom reach it exactly. A pixel no
+    polygon covers that lies within ``edge_px`` of the edge of ``inside`` (the
+    photograph's border counts where the frame reaches beyond it) and within
+    ``edge_px`` of a polygon takes the layer of the nearest polygon, so the
+    classifier does not label the strip as some other layer.
+    """
+
+    fill = np.zeros(inside.shape, dtype=np.uint8)
+    if edge_px <= 0.0 or not guide.distance:
+        return fill
+    padded = np.pad(inside, 1, constant_values=False)
+    to_edge = _distance_to(~padded)[1:-1, 1:-1]
+    layers = sorted(guide.distance)
+    stack = np.stack([guide.distance[layer] for layer in layers])
+    nearest = np.argmin(stack, axis=0)
+    near = np.take_along_axis(stack, nearest[None], axis=0)[0]
+    strip = inside & (guide.owner == 0) & (to_edge <= edge_px) & (near <= edge_px)
+    fill[strip] = np.asarray(layers, dtype=np.uint8)[nearest[strip]]
+    return fill
 
 
 def snap_pixels(
@@ -1346,6 +1455,16 @@ def proposal_digest(session: PaintingSession, frame: RigFrame | None) -> str:
         # Only with polygons, so that proposals from strokes alone stay current.
         payload["polygons"] = [row.to_list() for row in session.polygons]
         payload["snap_mm"] = round(float(session.snap_mm), 3)
+        payload["edge_fill_mm"] = round(float(session.edge_fill_mm), 3)
+        layer_snaps = {
+            str(row.layer_id): round(float(row.snap_mm), 3)
+            for row in session.layers
+            if row.snap_mm is not None
+        }
+        if layer_snaps:
+            payload["layer_snap_mm"] = layer_snaps
+    if session.detail != "normal":
+        payload["detail"] = session.detail
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -1492,17 +1611,30 @@ def propose_layers(
     painted = rasterize_strokes(session.strokes, shape, scale)
     painted[~inside] = 0
     snap_px = snap_pixels(session.snap_mm, frame, scale, image.image_size)
+    layer_snap_px = {
+        row.layer_id: snap_pixels(row.snap_mm, frame, scale, image.image_size)
+        for row in session.layers
+        if row.snap_mm is not None
+    }
     guide: PolygonGuide | None = None
     if session.polygons:
         _progress(progress, "Reading the polygons…")
-        guide = polygon_guide(session.polygons, shape, scale, inside, snap_px)
+        guide = polygon_guide(
+            session.polygons, shape, scale, inside, snap_px, layer_snap_px=layer_snap_px
+        )
         # A stroke corrects the polygons under it.
         guide.training[painted > 0] = 0
 
-    # Pixels whose layer is given: polygon interiors, then strokes on top.
+    # Pixels whose layer is given: polygon interiors and the strips they leave
+    # along the frame edge, then strokes on top.
     hard = np.zeros(shape, dtype=np.uint8)
     if guide is not None:
         hard[guide.fixed] = guide.owner[guide.fixed]
+        # snap_pixels converts any length in mm to grid pixels.
+        edge = frame_edge_fill(
+            guide, inside, snap_pixels(session.edge_fill_mm, frame, scale, image.image_size)
+        )
+        hard[edge > 0] = edge[edge > 0]
     hard[painted > 0] = painted[painted > 0]
     todo = inside & (hard == 0)
 
@@ -1644,7 +1776,7 @@ def _classify(
             allowed = near.copy() if near is not None else np.zeros(shape, bool)
             strokes = painted == layer_id
             if np.any(strokes):
-                allowed |= _distance_to(strokes) <= snap_px
+                allowed |= _distance_to(strokes) <= guide.layer_snap(layer_id)
             blocked = guide.restricted & ~allowed
             if np.any(blocked):
                 disallowed[position] = blocked
@@ -1849,13 +1981,16 @@ def painted_label_map(
     scale = (1.0, 1.0)
     inside = frame_mask(frame, (height, width), scale)
     classes[~inside] = OUTSIDE
-    if session.polygons and session.snap_mm <= 0.0:
-        # Polygons used exactly keep their outline at full resolution; strokes
-        # inside them still correct them.
+    exact = sorted(
+        {row.layer_id for row in session.polygons if session.layer_snap_mm(row.layer_id) <= 0.0}
+    )
+    if exact:
+        # Polygons used exactly (snap 0, common or the layer's own) keep their
+        # outline at full resolution; strokes inside them still correct them.
         _progress(progress, "Drawing the polygons at full resolution…")
         owner = rasterize_polygons(session.polygons, (height, width), scale)
         owner[~inside] = 0
-        covered = owner > 0
+        covered = np.isin(owner, exact)
         classes[covered] = owner[covered]
         del owner
         painted = rasterize_strokes(session.strokes, (height, width), scale)
@@ -2129,6 +2264,7 @@ def save_painted_revision(
 
 
 __all__ = [
+    "DEFAULT_EDGE_FILL_MM",
     "DEFAULT_LAYERS",
     "DEFAULT_SNAP_MM",
     "ERASER",
@@ -2138,6 +2274,7 @@ __all__ = [
     "OUTSIDE_FACIES",
     "OUTSIDE_POROSITY",
     "PERMEABILITY_UNITS",
+    "PROPOSAL_DETAILS",
     "ROLE_POROSITY",
     "SMOOTHING_SIGMA",
     "FaciesEntry",
@@ -2152,6 +2289,7 @@ __all__ = [
     "contrast_limits",
     "enhance_contrast",
     "facies_ids",
+    "frame_edge_fill",
     "frame_mask",
     "frame_pixels_per_metre",
     "load_painting_image",
@@ -2176,4 +2314,5 @@ __all__ = [
     "snap_pixels",
     "stretch_contrast_rgb8",
     "upsample_classes",
+    "with_analysis_width",
 ]

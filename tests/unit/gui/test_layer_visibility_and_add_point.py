@@ -343,8 +343,15 @@ def test_layer_table_menu_shows_only_one_layer_or_all_layers(view):
     actions = {
         action.text(): action for action in view._layer_table_menu_widget.actions()
     }
-    assert list(actions) == ["Show only this layer", "Show all layers"]
+    assert list(actions) == [
+        "Show only this layer",
+        "Show all layers",
+        "",  # separator
+        "Snap distance of this layer…",
+        "Use the common snap distance",
+    ]
     assert not actions["Show all layers"].isEnabled()
+    assert not actions["Use the common snap distance"].isEnabled()
     actions["Show only this layer"].trigger()
     assert view.hidden_layers == {1, 2, 4}
     assert _shows(view) == [UNCHECKED, UNCHECKED, CHECKED, UNCHECKED]
