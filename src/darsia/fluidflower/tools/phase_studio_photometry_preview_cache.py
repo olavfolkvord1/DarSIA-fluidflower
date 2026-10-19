@@ -20,6 +20,17 @@ a cached image and must byte-verify the inputs when generating a cache miss.
         "contract_sha256": "<optional SHA-256 of frozen correction contract>",
     }
 
+A RAW run (``"source_kind": "raw"``) names its RAW photographic review
+manifest as the native manifest and its camera RAW file(s) as ``raw_sources``.
+Instead of a serialized rig it is keyed on its exact RAW identities::
+
+        "source_kind": "raw",
+        "native_records": [{"path": Path(...), "sha256": "<native record>"},
+                           {"path": Path(...), "sha256": "<RAW producer audit>"}],
+        "profile": {"profile_id": "late", "sha256": "<native configuration>"},
+
+``raw_review_key_info`` builds these fields from a RAW review root.
+
 ``rig_artifacts``, ``config_files``, and ``contract_sha256`` are optional. The
 ordered raw-source list matters for averaged clear-water references. Current
 source/configuration file stats and the complete serialized-rig fingerprint
@@ -115,12 +126,18 @@ def _identity(key_info: Mapping) -> tuple[dict, str]:
         raise ValueError("Reference previews must use frame_index=None")
     shape = _shape(key_info["display_shape_hw"])
     manifest = _path(key_info["native_manifest_path"])
-    rig = _path(key_info["rig_path"])
-    if not rig.is_dir():
-        raise FileNotFoundError(rig)
-    fingerprint = serialized_rig_fingerprint(rig)
-    if not fingerprint:
-        raise ValueError(f"Serialized geometry rig is empty: {rig}")
+    raw = key_info.get("source_kind") == "raw"
+    if key_info.get("source_kind") not in (None, "raw"):
+        raise ValueError("source_kind must be absent or 'raw'")
+    rig_identity = None
+    if not raw:
+        rig = _path(key_info["rig_path"])
+        if not rig.is_dir():
+            raise FileNotFoundError(rig)
+        fingerprint = serialized_rig_fingerprint(rig)
+        if not fingerprint:
+            raise ValueError(f"Serialized geometry rig is empty: {rig}")
+        rig_identity = {"path": str(rig), "fingerprint": fingerprint}
     config_paths = key_info.get("config_files") or []
     if not isinstance(config_paths, (list, tuple)):
         raise ValueError("config_files must be a list of paths")
@@ -138,15 +155,52 @@ def _identity(key_info: Mapping) -> tuple[dict, str]:
         },
         "raw_sources": _file_records(key_info["raw_sources"], required=True,
                                      label="raw_sources"),
-        "rig": {"path": str(rig), "fingerprint": fingerprint},
+        "rig": rig_identity,
         "rig_artifacts": _file_records(key_info.get("rig_artifacts"), required=False,
                                        label="rig_artifacts"),
         "config_files": [_stat(_path(path)) for path in config_paths],
         "contract_sha256": _sha(contract, "contract_sha256") if contract else None,
     }
+    if raw:
+        profile = key_info["profile"]
+        if not isinstance(profile, Mapping) or not str(profile.get("profile_id") or "").strip():
+            raise ValueError("A RAW preview needs its camera profile id and document SHA-256")
+        payload.update(source_kind="raw", profile={
+            "profile_id": str(profile["profile_id"]), "sha256": _sha(profile.get("sha256"), "profile.sha256")},
+            native_records=_file_records(key_info["native_records"], required=True, label="native_records"))
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                            ensure_ascii=True).encode("utf-8")
     return payload, sha256(canonical).hexdigest()
+
+
+def raw_review_key_info(review_root, run: str, *, dataset: str, native_manifest_sha256: str,
+                        display_shape_hw, frame_index: int | None = None, config_files=()) -> dict:
+    """Cache key fields of a RAW run's frame (or of its baseline when ``frame_index`` is None).
+
+    The fields come from the run's RAW photographic review manifest: its camera
+    RAW, native record and RAW audit, and camera profile identity. The caller
+    passes the frozen manifest SHA-256 it has verified.
+    """
+    from darsia.fluidflower.raw_photographic_review import raw_review_record, read_raw_review_manifest
+
+    manifest = read_raw_review_manifest(review_root, run)
+    if manifest is None:
+        raise ValueError("The review root holds no RAW photographic review for this run")
+    reference = frame_index is None
+    record = raw_review_record(manifest, frame_index, reference=reference)
+    native = record["acquisition_manifest"] if reference else record["native_record"]
+    return {
+        "dataset": dataset, "run": run, "category": "baseline" if reference else "frame",
+        "frame_index": frame_index, "display_shape_hw": tuple(display_shape_hw),
+        "native_manifest_path": str(Path(review_root) / "native_frames" / str(run).casefold() / "manifest.json"),
+        "native_manifest_sha256": native_manifest_sha256,
+        "raw_sources": [{"path": record["acquisition"]["path"], "sha256": record["acquisition"]["sha256"]}],
+        "source_kind": "raw",
+        "native_records": [{"path": native["path"], "sha256": native["sha256"]},
+                           {"path": record["audit"]["path"], "sha256": record["audit"]["sha256"]}],
+        "profile": {"profile_id": record["profile_id"], "sha256": manifest["native_configuration"]["sha256"]},
+        "config_files": [str(path) for path in config_files],
+    }
 
 
 def _cache_path(payload: dict, digest: str) -> Path:

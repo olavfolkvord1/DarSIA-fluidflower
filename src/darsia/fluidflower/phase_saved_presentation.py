@@ -1,4 +1,9 @@
-"""Render saved phase PNG/CSV diagnostics without phase inference or fitting."""
+"""Render saved phase PNG/CSV diagnostics without phase inference or fitting.
+
+The native manifest is a historical review manifest or a RAW photographic
+review (``raw_photographic_review``); a RAW run takes its timeline from the
+review's frames and its video photographs from the review's natural PNGs.
+"""
 from __future__ import annotations
 import csv
 import json
@@ -128,7 +133,7 @@ def validate_deferred_presentation(summary, *, run, candidate_id, params_sha256,
     count = int(descriptor["frame_count"])
     with Path(per_frame_csv).open(encoding="utf-8-sig", newline="") as stream:
         times = [float(row["elapsed_h"]) for row in csv.DictReader(stream)]
-    expected = [float(row["elapsed_h"]) for row in native["frame_sources"]]
+    expected = [float(row["elapsed_h"]) for row in _timeline_rows(native, run)]
     if count < 1 or len(expected) != count or int(native["frame_count"]) != count or times != expected:
         raise ValueError("Deferred presentation has another or incomplete timeline")
     if not np.isfinite(times).all():
@@ -195,9 +200,7 @@ def ensure_candidate_presentation(candidate, kind="plot", progress=None):
                     for index in range(len(times)):
                         if progress:
                             progress(f"Encoding video {index+1}/{len(times)}")
-                        photo_path = Path(candidate.review_output_dir) / "native_frames" / candidate.run / f"frame_{index:03d}.png"
-                        if not photo_path.is_file():
-                            photo_path = photo_path.with_suffix(".jpg")
+                        photo_path = _presentation_photo(candidate, native, index)
                         with Image.open(_presentation_layer(candidate, index)) as layer, Image.open(photo_path) as photo:
                             if layer.size != tuple(native["canvas_wh"]) or photo.size != layer.size:
                                 raise ValueError("Prediction layer and photo have different native geometry")
@@ -219,6 +222,24 @@ def ensure_candidate_presentation(candidate, kind="plot", progress=None):
         finally:
             temporary.unlink(missing_ok=True)
     return target
+
+def _timeline_rows(native, run):
+    """Frame rows of a historical native manifest or of a checked RAW photographic review."""
+    from .raw_photographic_review import RAW_REVIEW_FORMAT, validate_raw_review_manifest
+    if native.get("format") == RAW_REVIEW_FORMAT:
+        return validate_raw_review_manifest(native, run)["frames"]
+    return native["frame_sources"]
+
+
+def _presentation_photo(candidate, native, index):
+    """The photograph under one phase layer: the RAW review's natural PNG or the historical frame."""
+    from .raw_photographic_review import RAW_REVIEW_FORMAT, resolve_raw_photograph
+    if native.get("format") == RAW_REVIEW_FORMAT:
+        return resolve_raw_photograph(candidate.review_output_dir, candidate.run, index, mode="natural")
+    photo_path = Path(candidate.review_output_dir) / "native_frames" / candidate.run / f"frame_{index:03d}.png"
+    if not photo_path.is_file():
+        photo_path = photo_path.with_suffix(".jpg")
+    return photo_path
 
 def _presentation_layer(candidate, index):
     return Path(candidate.phase_map_output_dir) / "native_phase_maps" / candidate.run / (

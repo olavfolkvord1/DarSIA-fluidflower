@@ -80,9 +80,11 @@ def _save_original_photo(stage, task, spec, request, reader):
         return dict(state="pending", receipt=receipt)
     # This separately qualified optional product must be present in the final
     # source closure before its explicit request can execute. It does not decode
-    # camera RAW or run registration; only the bound saved geometry-only JPEG.
-    from ..storage_original_photo import publish_registered_original_png
-    result = publish_registered_original_png(Path(stage) / "registered_original.png",
+    # camera RAW or run registration; only the bound saved geometry-only JPEG,
+    # or the bound lossless original of a RAW photographic review.
+    from ..storage_original_photo import publish_raw_original_png, publish_registered_original_png
+    publish = publish_raw_original_png if "raw_review" in request else publish_registered_original_png
+    result = publish(Path(stage) / "registered_original.png",
         task=task, frame_spec=spec, resolve_asset=reader.path, **request)
     return dict(state="complete", receipt=result["receipt"], png=result["photograph"])
 

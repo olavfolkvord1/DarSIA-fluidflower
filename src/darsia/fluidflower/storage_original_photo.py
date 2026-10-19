@@ -1,6 +1,9 @@
 """Publish a stored shape-only photograph ROI as an immutable RGBA display.
 
-Only explicit saved metadata and its already-produced review JPEG are read.
+Only explicit saved metadata and its already-produced review photograph are
+read: the saved review JPEG of a historical run, or the lossless original PNG
+of a RAW photographic review (``raw_photographic_review``), which was rendered
+from the camera RAW when that review was written.
 No camera/RAW decode, correction chain, phase/flatfield mask or model is run.
 Alpha describes stored photograph ROI coverage, never camera or domain validity.
 """
@@ -127,28 +130,87 @@ def publish_registered_original_png(destination, *, task, frame_spec, native_geo
         raise ValueError("Saved photograph canvas differs from its current bound metadata")
     rgba = _place_known_roi(rgb, box=native["content_box_xywh"],
         target_shape=current["phase_shape_hw"], native_origin=current["native_origin_xy"])
-    x, y, width, height = native["content_box_xywh"]
-    source_roi = rgb[y:y + height, x:x + width]
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("xb") as stream:
-        Image.fromarray(rgba).save(stream, format="PNG")
-    document = dict(format="darsia-stored-registered-original-photo-v1", complete=True,
+    return _publish(destination, receipt, rgb, rgba, native["content_box_xywh"], dict(
         run=task["run"], case_id=frame_spec["case_id"], precision=task["precision"],
         source=deepcopy(frame_spec["source"]), camera_source=camera,
         geometry_producer_sha256=geometry_producer_sha256, loaded_assets=loaded,
         current_selected_frame_index=current["frame_index"],
         camera_timeline_index=native.get("frame_index"),
-        source_review_canvas_hw=list(rgb.shape[:2]), target_canvas_hw=list(rgba.shape[:2]),
-        stored_photograph_ROI_xywh=list(native["content_box_xywh"]),
         current_native_origin_xy=list(current["native_origin_xy"]),
         H_ac28_to_frame_native=deepcopy(current["H_ac28_to_frame_native"]),
+        original_shape_configs=deepcopy(native["binding"]["original_shape_configs"]),
+        original_shape_corrections=deepcopy(native["binding"]["original_shape_corrections"]),
+        JPEG_decode="PIL RGB; no EXIF transpose; producer only"))
+
+
+def publish_raw_original_png(destination, *, task, frame_spec, raw_review,
+                             geometry_producer_sha256, resolve_asset):
+    """Producer-only copy of a RAW review's original into the same PNG contract.
+
+    ``raw_review`` is the closed descriptor of a RAW photographic review run
+    manifest. Its frame named by ``frame_spec["case_id"]`` must hold the same
+    camera RAW acquisition as ``frame_spec["source"]``. That frame's lossless
+    ``original`` PNG (the camera RAW on the phase canvas) is copied inside the
+    native content box only, with the receipt fields of saved JPEG originals,
+    so existing readers take it unchanged. Its native record, RAW audit,
+    profile, configuration and binding descriptors are recorded as well.
+    """
+    from .raw_photographic_review import ORIGINAL_MODE, raw_asset_descriptor, validate_raw_review_manifest
+
+    destination = Path(destination)
+    receipt = destination.with_name(destination.name + ".receipt.json")
+    if destination.suffix.lower() != ".png":
+        raise ValueError("Choose a new original photograph PNG")
+    if destination.exists() or receipt.exists():
+        raise FileExistsError("Original photograph products and receipts are immutable")
+    if re.fullmatch(r"[0-9a-f]{64}", str(geometry_producer_sha256)) is None:
+        raise ValueError("Explicit original geometry producer SHA required")
+    loaded = []
+    manifest = validate_raw_review_manifest(_json(_read_bytes(raw_review, resolve_asset, loaded)), task["run"])
+    rows = [row for row in manifest["frames"] if row.get("case_id") == frame_spec["case_id"]]
+    if (task["precision"] not in {"float32", "float64"}
+            or not isinstance(frame_spec["case_id"], str) or len(rows) != 1
+            or rows[0]["acquisition"]["sha256"] != frame_spec["source"]["source_sha256"]
+            or ORIGINAL_MODE not in rows[0]["assets"]):
+        raise ValueError("RAW review frame differs from the saved frame's camera RAW")
+    row = rows[0]
+    original = raw_asset_descriptor(Path(raw_review["path"]).parent, row["assets"][ORIGINAL_MODE])
+    with Image.open(io.BytesIO(_read_bytes(original, resolve_asset, loaded))) as image:
+        if image.format != "PNG" or image.mode != "RGB":
+            raise ValueError("RAW review original must remain a lossless RGB PNG")
+        rgb = np.asarray(image).copy()
+    if list(rgb.shape[:2]) != list(manifest["phase_shape_hw"]):
+        raise ValueError("RAW review original differs from its phase canvas")
+    rgba = _place_known_roi(rgb, box=list(manifest["content_box_xywh"]),
+        target_shape=list(manifest["phase_shape_hw"]), native_origin=list(manifest["native_origin_xy"]))
+    return _publish(destination, receipt, rgb, rgba, manifest["content_box_xywh"], dict(
+        run=task["run"], case_id=frame_spec["case_id"], precision=task["precision"],
+        source=deepcopy(frame_spec["source"]), source_kind="raw",
+        camera_source=dict(path=row["acquisition"]["path"], sha256=row["acquisition"]["sha256"]),
+        geometry_producer_sha256=geometry_producer_sha256, loaded_assets=loaded,
+        current_selected_frame_index=frame_spec.get("frame_index"),
+        raw_review=deepcopy(raw_review), raw_review_frame_index=row["frame_index"],
+        native_record=deepcopy(row["native_record"]), raw_audit=deepcopy(row["audit"]),
+        profile_id=row["profile_id"], native_configuration=deepcopy(manifest["native_configuration"]),
+        raw_binding=deepcopy(manifest["raw_binding"]),
+        current_native_origin_xy=list(manifest["native_origin_xy"]),
+        RAW_render="camera RAW through native.raw_photograph.load_camera_u_rgb8 when the RAW review was written; producer only copies its PNG"))
+
+
+def _publish(destination, receipt, rgb, rgba, box, fields):
+    """Write the RGBA PNG and its sealed receipt; shared by both original producers."""
+    x, y, width, height = box
+    source_roi = rgb[y:y + height, x:x + width]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as stream:
+        Image.fromarray(rgba).save(stream, format="PNG")
+    document = dict(fields, format="darsia-stored-registered-original-photo-v1", complete=True,
+        source_review_canvas_hw=list(rgb.shape[:2]), target_canvas_hw=list(rgba.shape[:2]),
+        stored_photograph_ROI_xywh=list(box),
         alpha_meaning=_ALPHA, alpha_inside_ROI=255, alpha_outside_ROI=0,
         full_canvas_photograph_coverage=(width * height == rgba.shape[0] * rgba.shape[1]),
         known_ROI_pixel_identity=_pixels(source_roi), copied_ROI_pixel_identity=_pixels(rgba[y:y + height, x:x + width, :3]),
-        RGBA_pixel_identity=_pixels(rgba), display_dtype="uint8",
-        original_shape_configs=deepcopy(native["binding"]["original_shape_configs"]),
-        original_shape_corrections=deepcopy(native["binding"]["original_shape_corrections"]),
-        JPEG_decode="PIL RGB; no EXIF transpose; producer only", colour_light_or_v5_changes=False,
+        RGBA_pixel_identity=_pixels(rgba), display_dtype="uint8", colour_light_or_v5_changes=False,
         camera_RAW_or_correction_chain_executed=False, current_phase_products_changed=False,
         photograph=_asset(destination))
     with receipt.open("xb") as stream:

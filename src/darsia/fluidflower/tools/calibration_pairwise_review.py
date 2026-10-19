@@ -1856,7 +1856,29 @@ def _native_frame_folder(output_dir: Path, run: str) -> Path:
     return resolve_review_path(output_dir) / "native_frames" / run.casefold()
 
 
+def _raw_review_photograph(output_dir: Path, run: str, frame_index: int | None = None, *,
+                           reference: bool = False) -> Path | None:
+    """The SHA-verified natural PNG of a RAW photographic review; None for a historical root."""
+    from darsia.fluidflower.raw_photographic_review import read_raw_review_manifest, resolve_raw_photograph
+
+    root = resolve_review_path(output_dir)
+    if read_raw_review_manifest(root, run) is None:
+        return None
+    return resolve_raw_photograph(root, run, frame_index, mode="natural", reference=reference)
+
+
+def _raw_review_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Studio frame rows of a RAW review: its frames, named by their camera RAW file."""
+    from pathlib import PureWindowsPath
+
+    return [dict(row, source_name=PureWindowsPath(row["acquisition"]["path"]).name)
+            for row in manifest["frames"]]
+
+
 def _native_frame_path(output_dir: Path, run: str, frame_index: int) -> Path:
+    raw = _raw_review_photograph(output_dir, run, frame_index)
+    if raw is not None:
+        return raw
     manifest = _native_frame_folder(output_dir, run) / "manifest.json"
     if manifest.is_file() and "ffac_selected_policy_a_sources" in _read_json(manifest):
         from darsia.fluidflower.phase_selected_policy_review import resolve_photograph
@@ -1881,6 +1903,19 @@ def _native_photograph_availability(
     checks, but perform that reconstruction only once for this availability request.
     Selected image reads still verify their own asset content in the image worker.
     """
+    from darsia.fluidflower.raw_photographic_review import (
+        RAW_REVIEW_FORMAT, raw_asset_descriptor, validate_raw_review_manifest)
+    if manifest.get("format") == RAW_REVIEW_FORMAT:
+        # Existence only: every served photograph verifies its own SHA-256.
+        manifest = validate_raw_review_manifest(manifest, run)
+        if len(manifest["frames"]) != frame_count:
+            raise ValueError("RAW review timeline differs from the candidate frame count")
+        folder = _native_frame_folder(output_dir, run)
+        paths = [Path(raw_asset_descriptor(folder, row["assets"]["natural"])["path"])
+                 if "natural" in (row.get("assets") or {}) else None
+                 for row in (manifest["reference"], *manifest["frames"])]
+        return (paths[0] or folder / "reference" / "natural.png",
+                all(path is not None and path.is_file() for path in paths))
     if "ffac_selected_policy_a_sources" in manifest:
         from darsia.fluidflower.phase_selected_policy_review import load_native_source
         state=load_native_source(output_dir,run,manifest,verify_geometry=False)
@@ -2826,6 +2861,9 @@ def _select_phase_quiz_proposals(
 
 
 def _native_reference_path(output_dir: Path, run: str) -> Path:
+    raw = _raw_review_photograph(output_dir, run, reference=True)
+    if raw is not None:
+        return raw
     output_dir = resolve_review_path(output_dir)
     manifest = output_dir / "native_frames" / run.casefold() / "manifest.json"
     if manifest.is_file() and "ffac_selected_policy_a_sources" in _read_json(manifest):
@@ -5957,7 +5995,12 @@ class ReviewApp:
             and len(reference_offsets) == pair.candidate_a.frame_count
         )
         from darsia.fluidflower.tools.phase_injection_references import rig_reference_frame_index
-        rig_baseline_index = rig_reference_frame_index(native_manifest)
+        from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT
+        raw_review = native_manifest.get("format") == RAW_REVIEW_FORMAT
+        rig_baseline_index = None if raw_review else rig_reference_frame_index(native_manifest)
+        if raw_review:
+            # The RAW baseline is shown as its own photograph; no translation is measured.
+            reference_ready = native_frames_ready
         if rig_baseline_index is not None:
             # Reference mode shows this exact source and its own existing map.
             # It is not translated onto the currently selected frame.
@@ -6024,6 +6067,9 @@ class ReviewApp:
             for row in (native_manifest.get("frame_sources") or [])
             if isinstance(row, Mapping)
         ]
+        if raw_review:
+            analysis_shape = list(native_manifest["native_shape_hw"])
+            frame_sources = _raw_review_rows(native_manifest)
         phase_quiz_payload_a = _load_phase_quiz_payload(
             self.store.output_dir,
             pair.candidate_a,
