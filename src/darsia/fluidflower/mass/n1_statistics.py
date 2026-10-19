@@ -245,6 +245,9 @@ def summarize_round3_response(response, geometry, *, own_colour, photo_support,
     frame, physics = response["frame"], response["physics"]
     run=frame.run_id
     partition=physical_partition(response,max_depth_m=summary_settings["max_depth_m"],max_porosity=summary_settings["max_porosity"])
+    # These full-grid partition intermediates have no later summary consumer.
+    # Keep the measured volume and main masks; release only this call's copies.
+    del partition["bound_volume"], partition["aq_known"], partition["gas_known"]
     parameters=dict(candidate="N1",gain=float(summary_settings["baseline_gain"]),beta=0.)
     anchor=dict(elapsed_h=float(summary_settings.get("anchor_target_h",2.25)),affected_pore_volume_m3=max(partition["affected_pore_volume_m3"],1e-20))
     main=baseline_main(response,parameters,anchor,pixel_math)
@@ -259,25 +262,35 @@ def summarize_round3_response(response, geometry, *, own_colour, photo_support,
     fixed_gas = volume*density*(1-geometry.swi)*1000
     fixed_water = volume*sol*geometry.swi*1000
     gas_constant = np.where(gas_available, fixed_gas+fixed_water, 0.)
+    gas_constant_g = float(gas_constant[gas_available].sum())
+    del gas_constant
     own_fraction = np.asarray(own_colour["aqueous_relative"],np.float64)
     own_available = missing & ~is_gas & own_colour["available"] & np.asarray(photo_support, bool) & geometry.valid
     main_positive = partition["main_aq"] | partition["main_gas"]
     donor, column_available, column_distance = nearest_main_above(main_positive, geometry.y_m, max_distance_m=summary_settings["max_column_distance_m"])
+    del main_positive
     cols = np.arange(shape[1])[None, :]
     donor = np.maximum(donor, 0)
     source_gas = partition["main_gas"][donor, cols]
     source_relative = response["prepared"].aqueous_relative[donor,cols].astype(np.float64)
     source_sol = sol[donor,cols]
     solubility_ratio = np.divide(source_sol,sol,out=np.zeros(shape),where=sol>0)
+    del source_sol, donor, cols
     column_fraction = source_relative
     column_available &= missing & ~is_gas & geometry.valid & np.isfinite(source_relative) & np.isfinite(solubility_ratio)
     source_gas &= column_available
     pair_mask = missing & ~is_gas & (own_available | column_available)
     own_fraction = np.where(own_available, own_fraction, 0.)
     column_fraction = np.where(column_available, column_fraction, 0.)
+    del source_relative
     neither = missing & ~(gas_available | own_available | column_available)
     undefined = neither & ~geometry.valid
-    urest = volume* np.where(is_gas, np.maximum(sol, density), sol)*1000
+    # The where result owns its buffer. Reuse it for the same two float64
+    # multiplies, with the original operand order and no input-array mutation.
+    urest = np.where(is_gas, np.maximum(sol, density), sol)
+    np.multiply(volume, urest, out=urest)
+    np.multiply(urest, 1000, out=urest)
+    del volume
     parts = _parts(frame, missing)
     part_records = {}
     distance_arrays = {name: np.broadcast_to(np.asarray(value, np.float64), shape)
@@ -315,7 +328,7 @@ def summarize_round3_response(response, geometry, *, own_colour, photo_support,
         main_gas_water_mass_g=main["gas_water_mass_g"], affected_pore_volume_m3=partition["affected_pore_volume_m3"],
         estimate_fixed_gas_mass_g=float(fixed_gas[gas_available].sum()),
         estimate_fixed_gas_water_mass_g=float(fixed_water[gas_available].sum()),
-        estimate_gas_constant_g=float(gas_constant[gas_available].sum()),
+        estimate_gas_constant_g=gas_constant_g,
         urest_g=None if undefined.any() else float(urest[neither].sum()),
         estimate_geometry_undefined_co2_pixels=int(undefined.sum()),
         estimate_geometry_extended_area_cm2=float(area[missing & geometry.valid & ~frame.known_physical_domain].sum()*10000),
