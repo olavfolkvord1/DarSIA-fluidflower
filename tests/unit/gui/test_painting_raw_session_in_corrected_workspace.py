@@ -11,6 +11,7 @@ rig model or NAS input is used.
 
 import hashlib
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -231,6 +232,36 @@ def test_a_session_without_marks_keeps_the_corrected_view(make_view, project):
     assert view.image is not None
     assert view.image.image_size == (CORRECTED_SHAPE[1], CORRECTED_SHAPE[0])
     assert not view.canvas.paint_enabled
+
+
+def test_a_wrapped_proposal_ready_still_runs_in_the_gui_thread(make_view, project, qtbot):
+    # The coloured-map import replaces view._proposal_ready with a plain
+    # function, and Qt calls a plain function in the emitting thread. The
+    # proposal worker must therefore reach the view through a real slot.
+    # (19 Oct: DarSIA closed after Propose; the facies table was refreshed
+    # from the worker thread and Qt6Core raised an access violation.)
+    session = lp.PaintingSession.default("ac52", _corrected_path(project), RAW_SIZE)
+    session.polygons = [
+        lp.Polygon(2, list(RAW_POLYGON)),
+        lp.Polygon(3, [(35.0, 45.0), (35.0, 75.0), (55.0, 75.0), (55.0, 45.0)]),
+    ]
+    lp.save_painting_session(project, session, actor="test")
+    view = make_view()
+    assert view.propose_button.isEnabled()
+    gui = threading.get_ident()
+    seen = []
+    original = view._proposal_ready
+
+    def wrapped(proposal):
+        seen.append(threading.get_ident())
+        if seen[-1] == gui:  # Never touch widgets from another thread.
+            original(proposal)
+
+    view._proposal_ready = wrapped
+    view.propose()
+    qtbot.waitUntil(lambda: not view.busy(), timeout=60000)
+    assert seen == [gui]
+    assert view.proposal is not None
 
 
 def test_a_raw_session_on_a_camera_raw_opens_on_u_from_the_linked_series(

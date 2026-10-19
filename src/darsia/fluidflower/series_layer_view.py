@@ -3932,8 +3932,8 @@ class LayerPainterView(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.propose_status.setText)
-        worker.finished.connect(self._proposal_ready)
-        worker.failed.connect(self._proposal_failed)
+        worker.finished.connect(self._proposal_worker_finished)
+        worker.failed.connect(self._proposal_worker_failed)
         # Direct: quit from the worker thread, so that wait() in the GUI
         # thread cannot block a queued quit.
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
@@ -3948,6 +3948,24 @@ class LayerPainterView(QWidget):
         self.step_propose.set_status("Working…", "warn")
         thread.start()
         self.busy_changed.emit(True)
+
+    @Slot(object)
+    def _proposal_worker_finished(self, proposal: lp.LayerProposal) -> None:
+        """Hand a finished proposal to _proposal_ready in this view's thread.
+
+        The worker's signal reaches a slot of the view, so Qt queues it into
+        the GUI thread. _proposal_ready may be replaced by an extension's
+        plain function, which Qt would call in the worker's thread, so the
+        worker never connects to it directly.
+        """
+
+        self._proposal_ready(proposal)
+
+    @Slot(str)
+    def _proposal_worker_failed(self, message: str) -> None:
+        """Hand a failed proposal's message to _proposal_failed in this view's thread."""
+
+        self._proposal_failed(message)
 
     @Slot(object)
     def _proposal_ready(self, proposal: lp.LayerProposal) -> None:
