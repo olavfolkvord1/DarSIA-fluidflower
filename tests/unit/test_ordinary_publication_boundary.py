@@ -165,7 +165,13 @@ def test_prepared_success_is_not_rewritten_or_moved_by_failure(tmp_path, monkeyp
 @pytest.fixture
 def native_directory_reader(tmp_path):
     if os.name != "nt": pytest.skip("Actual Windows directory handles require Windows")
+    import ctypes
+    from ctypes import wintypes
     path = tmp_path / "lease"; path.mkdir()
+    # The venv executable is a redirector on this runtime. This stdlib-only
+    # child uses the same actual base interpreter, so Popen owns the real PID.
+    executable = Path(sys._base_executable).resolve(strict=True)
+    assert executable.parent == Path(sys.base_prefix).resolve(strict=True)
     script = r'''
 import ctypes,json,os,sys
 from ctypes import wintypes
@@ -173,15 +179,22 @@ k=ctypes.WinDLL('kernel32',use_last_error=True)
 k.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
 k.CreateFileW.restype=wintypes.HANDLE
 k.CloseHandle.argtypes=[wintypes.HANDLE];k.CloseHandle.restype=wintypes.BOOL
+k.GetCurrentProcess.restype=wintypes.HANDLE
+k.GetProcessTimes.argtypes=[wintypes.HANDLE,*([ctypes.POINTER(wintypes.FILETIME)]*4)]
+k.GetProcessTimes.restype=wintypes.BOOL
+times=[wintypes.FILETIME() for _ in range(4)]
+if not k.GetProcessTimes(k.GetCurrentProcess(),*[ctypes.byref(value) for value in times]):raise ctypes.WinError(ctypes.get_last_error())
+created=(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
 h=k.CreateFileW(sys.argv[1],0x80,0x3,None,3,0x02000000,None)
 if h==ctypes.c_void_p(-1).value:raise ctypes.WinError(ctypes.get_last_error())
 try:
- print(json.dumps(dict(pid=os.getpid(),path=sys.argv[1])),flush=True)
+ print(json.dumps(dict(pid=os.getpid(),path=sys.argv[1],executable=sys.executable,
+  creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]))),flush=True)
  sys.stdin.readline()
 finally:
  if not k.CloseHandle(h):raise ctypes.WinError(ctypes.get_last_error())
 '''
-    proc = subprocess.Popen([sys.executable, "-X", "utf8", "-B", "-c", script, str(path)],
+    proc = subprocess.Popen([str(executable), "-X", "utf8", "-B", "-c", script, str(path)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     ready = queue.Queue()
     threading.Thread(target=lambda: ready.put(proc.stdout.readline()), daemon=True).start()
@@ -189,14 +202,25 @@ finally:
         if proc.poll() is None:
             _out, error = proc.communicate("release\n", timeout=10)
             assert proc.returncode == 0, error
+        assert proc.poll() == 0  # Exact Popen-owned process retired successfully.
     try:
         owner = json.loads(ready.get(timeout=15))
-        assert owner == dict(pid=proc.pid, path=str(path))
-        yield SimpleNamespace(path=path, pid=proc.pid, close=close)
+        kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+        kernel.GetProcessTimes.argtypes=[wintypes.HANDLE,*([ctypes.POINTER(wintypes.FILETIME)]*4)]
+        kernel.GetProcessTimes.restype=wintypes.BOOL
+        observed=[wintypes.FILETIME() for _ in range(4)]
+        assert kernel.GetProcessTimes(proc._handle,*[ctypes.byref(value) for value in observed])
+        created=(observed[0].dwHighDateTime<<32)|observed[0].dwLowDateTime
+        assert Path(owner.pop("executable")).resolve(strict=True) == executable
+        assert owner == dict(pid=proc.pid,path=str(path),
+            creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]))
+        yield SimpleNamespace(path=path,pid=proc.pid,creation_filetime_100ns=str(created),close=close)
     finally:
         try: close()
         finally:
             if proc.poll() is None: proc.kill(); proc.communicate(timeout=10)
+            for stream in (proc.stdin,proc.stdout,proc.stderr):
+                if not stream.closed: stream.close()
 
 
 def test_native_query_reports_actual_directory_reader_pid_or_literal_unavailable(native_directory_reader):

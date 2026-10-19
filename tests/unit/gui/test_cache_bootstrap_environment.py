@@ -285,5 +285,5 @@ def test_q134_live_append_after_stable_capture_is_not_reopened_or_adopted(monkey
 
 @pytest.mark.parametrize("raw", [b'[{"id":"a","id":"b"}]', b'[{"x":NaN}]', b'[null]', b'{}'])
 def test_q134_captured_prefix_decoder_keeps_duplicate_nonfinite_and_list_guards(raw):
-    with pytest.raises(CachePolicyError):
+    with pytest.raises(ValueError):
         bootstrap._authority_records(raw)
