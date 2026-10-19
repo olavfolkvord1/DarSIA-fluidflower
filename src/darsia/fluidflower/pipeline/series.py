@@ -622,6 +622,7 @@ class SeriesInputs:
         processor = self.processors[key]
         if kind == "raw_rig":
             if (geometry_row["acquisition"]["sha256"] != spec["source"]["source_sha256"]
+                    or spec["source"]["source_binding"]["source_sha256"] != spec["source"]["source_sha256"]
                     or geometry_row["run"] != self.config["run"]):
                 raise ValueError("RAW native acquisition differs from the selected source identity")
             if (spec["phase_roles"].get("retained_source_cache") is not None
