@@ -117,6 +117,27 @@ def test_ordinary_publication_attempts_no_directory_rename(tmp_path, no_director
     assert (tmp_path / "done/sample.json").is_file() and claim.lease.is_dir()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows reader sharing policy")
+def test_publication_finishes_while_a_lease_reader_denies_directory_rename(tmp_path):
+    """A real open Windows handle must not prevent in-place publication."""
+    shared = JobQueue(tmp_path)
+    shared.enqueue(task())
+    claim = shared.claim("machine", "cpu", OWNER)
+    owner = claim.lease / "owner.json"
+    original = owner.read_bytes()
+    value = result(claim)
+    with owner.open("rb") as reader:
+        assert shared.complete(claim, value) is value
+        shared.recover_publications()
+        assert reader.read() == original
+        assert owner.read_bytes() == original
+        assert jobs.publication_directory(tmp_path, "sample") == claim.lease
+        assert read_json(tmp_path / "results/sample/completed.json") == value
+        assert read_json(tmp_path / "done/sample.json")["attempt_id"] == claim.token
+    assert claim.lease.is_dir()
+    assert jobs.read_decision(tmp_path, "sample", claim.token)["outcome"] == "publish"
+
+
 def test_alias_payload_publication_attempts_no_directory_rename(tmp_path, monkeypatch, no_directory_rename):
     queue_, clock, callbacks, _events = alias_fixture(tmp_path, monkeypatch)
     callback = payload_callback(callbacks["publication_factory"])
