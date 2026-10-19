@@ -28,7 +28,26 @@ class NotPhaseModelSource(ValueError):
 
 
 def library_root(series_root: Path | str) -> Path:
-    return Path(series_root).expanduser() / "models" / "phase"
+    from .series_paths import series_folder_path
+    return series_folder_path(series_root, "phase_model_library")
+
+
+def _library_owner(location: Path) -> Path | None:
+    """The phase-model series folder whose library or model folder is ``location``.
+
+    Only series that set [paths] phase_model are recognised here; the fixed
+    historical folder names are matched by ``records_for_location``.
+    """
+    from .series_paths import phase_model_root, series_folder_path
+    key = os.path.normcase(os.path.abspath(location))
+    for candidate in Path(location).parents:
+        if not (candidate / "series.toml").is_file():
+            continue
+        if phase_model_root(candidate) is None:
+            return None
+        folders = (library_root(candidate), series_folder_path(candidate, "phase_models"))
+        return candidate if key in {os.path.normcase(os.path.abspath(folder)) for folder in folders} else None
+    return None
 
 
 def configured_library_records() -> list[dict]:
@@ -45,7 +64,8 @@ def records_for_location(location: Path | str) -> list[dict]:
         return library_records(location.parent)
     if (location / "series.toml").is_file() or library_root(location).is_dir():
         return library_records(location)
-    return []
+    owner = _library_owner(location)
+    return library_records(owner) if owner is not None else []
 
 
 def _read(path: Path) -> dict:
@@ -154,7 +174,9 @@ def _target(entry: dict, series_root: Path) -> Path:
 def resolve_reference(path: Path | str, *, series_root: Path | str | None = None) -> Path:
     """Resolve only the exact indexed source, failing closed on missing/stale data."""
     path = Path(path)
-    series_root = Path(series_root) if series_root is not None else path.parent.parent.parent
+    if series_root is None:
+        series_root = _library_owner(path.parent) or path.parent.parent.parent
+    series_root = Path(series_root)
     entry = _read(path)
     if entry.get("format") != FORMAT or entry.get("kind") != "phase":
         raise ValueError(f"Not a phase-model library reference: {path}")
@@ -321,6 +343,7 @@ def discover_series_sources(series_root: Path | str) -> list[Path]:
             if value:
                 path = Path(value)
                 locations.append(path if path.is_absolute() else series_root / path)
+    locations.extend(_phase_model_locations(series_root, locations))
     for location in locations:
         roots.extend(_model_directories(location, max_depth=4))
     # A stale indexed target cannot bypass its identity refusal via legacy scan.
@@ -329,6 +352,16 @@ def discover_series_sources(series_root: Path | str) -> list[Path]:
                if not record["available"] and record.get("target_root")} - valid_targets
     return deduplicate_versions(root for root in roots
                                 if os.path.normcase(os.path.normpath(str(root))) not in blocked)
+
+
+def _phase_model_locations(series_root: Path, scanned: Iterable[Path]) -> list[Path]:
+    """The [paths] phase_models folder of a series, unless already scanned."""
+    from .series_paths import phase_model_root, series_folder_path
+    if phase_model_root(series_root) is None:
+        return []
+    folder = series_folder_path(series_root, "phase_models")
+    known = {os.path.normcase(os.path.abspath(path)) for path in scanned}
+    return [] if os.path.normcase(os.path.abspath(folder)) in known else [folder]
 
 
 def registration_sources(results: Path) -> list[Path]:
@@ -351,7 +384,8 @@ def index_series(series_root: Path | str) -> dict:
     from .phase_model_history import _model_directories
     roots = registration_sources(series_root / "results")
     roots.extend(discover_series_sources(series_root))
-    for location in (series_root / "models", series_root / "phase_models", series_root / "results"):
+    locations = [series_root / "models", series_root / "phase_models", series_root / "results"]
+    for location in (*locations, *_phase_model_locations(series_root, locations)):
         roots.extend(_model_directories(location, max_depth=4))
     indexed, errors, ignored = [], [], []
     for root in deduplicate_versions(roots):
@@ -411,9 +445,13 @@ def index_series(series_root: Path | str) -> dict:
     if legacy.is_dir():
         marker = legacy / "phase_library_location.json"
         if not marker.exists():
+            try:
+                target, relative_to = os.path.relpath(library_root(series_root), legacy).replace("\\", "/"), "this_file"
+            except ValueError:  # A configured library on another drive.
+                target, relative_to = str(library_root(series_root)), "absolute"
             with marker.open("x", encoding="utf-8") as stream:
                 json.dump({"format": "phase-model-library-location-v1",
-                           "target": "../models/phase", "relative_to": "this_file",
+                           "target": target, "relative_to": relative_to,
                            "legacy_sources_preserved": True}, stream, indent=2)
                 stream.write("\n")
         legacy_marker = str(marker)

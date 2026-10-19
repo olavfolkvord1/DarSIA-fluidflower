@@ -121,9 +121,24 @@ def validate_snapshot(snapshot):
     return expected
 
 
+def ledger_folder(root, *, before_phase_model=False):
+    """The withdraw/reclassify event folder of a series folder.
+
+    It is ``events`` inside [paths] evidence_actions. ``before_phase_model``
+    gives the folder the series used before it set [paths] phase_model.
+    """
+    from .series_paths import series_folder_path
+    return series_folder_path(root, "evidence_actions", before_phase_model=before_phase_model) / "events"
+
+
 def load_retractions(project_root=None, *, series):
     root = resolve_project_root(series, project_root)
-    folder = root / "reviews" / "evidence_actions" / "events"
+    folder = ledger_folder(root)
+    earlier = ledger_folder(root, before_phase_model=True)
+    if earlier != folder and earlier.is_dir() and any(earlier.glob("*.json")):
+        # Moving the ledger by configuration must not drop applied withdrawals.
+        raise ValueError(f"Review-evidence events remain in {earlier}, but [paths] place the "
+                         f"ledger in {folder}; move the events or set [paths] evidence_actions")
     # No recursive discovery and no local fallback: an unavailable registered
     # project cannot silently look like an empty training-withdrawal policy.
     events = []
@@ -257,7 +272,7 @@ def _verified_entry(entry, *, series, run, root):
             continue
         document = json.loads(data.decode("utf-8-sig"))
         if origin.get("kind") == "evidence_action":
-            expected_path = root / "reviews/evidence_actions/events" / (str(origin.get("event_id")) + ".json")
+            expected_path = ledger_folder(root) / (str(origin.get("event_id")) + ".json")
             if path.resolve() != expected_path.resolve() or document.get("event_id") != origin.get("event_id"):
                 continue
             replacement = document.get("replacement") or {}
@@ -300,7 +315,7 @@ def _new_event(entry, *, series, run, actor, root, reason, action):
 
 @contextmanager
 def _ledger_write(root):
-    folder = root / "reviews/evidence_actions/events"
+    folder = ledger_folder(root)
     folder.mkdir(parents=True, exist_ok=True)
     lock = folder / ".write.lock"
     try:
@@ -316,7 +331,7 @@ def _ledger_write(root):
 
 
 def _append_event(root, event):
-    folder = root / "reviews" / "evidence_actions" / "events"
+    folder = ledger_folder(root)
     folder.mkdir(parents=True, exist_ok=True)
     target_path = folder / (event["event_id"] + ".json")
     temporary = folder / (event["event_id"] + ".pending")

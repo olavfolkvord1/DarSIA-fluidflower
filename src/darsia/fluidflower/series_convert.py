@@ -191,7 +191,10 @@ def inspect_models(root, model_roots, series_id):
 
 def inspect_review_registration(root):
     """Existing collection registrations stay literal; do not repair by name."""
-    path = Path(root) / "phase_review_collections" / "index.json"
+    from .series_paths import phase_model_root, series_folder_path
+    folder = (series_folder_path(root, "review_collections") if phase_model_root(root) is not None
+              else Path(root) / "phase_review_collections")
+    path = folder / "index.json"
     if not path.is_file():
         return dict(state="not_registered", entries=[], pending=[])
     raw = _bytes(path, MAX_MANIFEST)

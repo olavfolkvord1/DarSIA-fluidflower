@@ -10360,7 +10360,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         if getattr(self,"_selected_annotation_binding",None) is not None:
             from darsia.fluidflower.phase_annotation_binding import stamp_camera_identity
             row=self.current_pair["frame_sources"][self.frame_index]
-            annotation=stamp_camera_identity(annotation,row,self.current_run)
+            annotation=stamp_camera_identity(annotation,row,self.current_run,
+                dataset=self.current_pair.get("dataset"),selected_camera=True)
         side = str(annotation.get("candidate") or "A").upper()
         shared = self._is_shared_image_annotation(annotation)
         self.annotations.append(annotation)
@@ -11298,7 +11299,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
                 if target is None or saved_frame_choices.get(target)==item.get("choice"):
                     kept.append(deepcopy(item))
             unchanged={ReviewImageAssets._annotation_display_frame(self,item) for item in kept}
-            frame_choices=kept+[stamp_camera_identity(item,current_pair["frame_sources"][item["frame_index"]],self.current_run)
+            frame_choices=kept+[stamp_camera_identity(item,current_pair["frame_sources"][item["frame_index"]],self.current_run,
+                dataset=current_pair.get("dataset"),selected_camera=True)
                 for item in frame_choices if item["frame_index"] not in unchanged]
         aggregate_choice = (
             review.aggregate_frame_choice(

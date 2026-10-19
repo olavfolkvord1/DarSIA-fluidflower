@@ -3,14 +3,18 @@
 The ``series.toml`` file lives inside each series' DarSIA directory. Relative
 manifest paths are resolved there, independently of the process working directory.
 Native workflow TOMLs themselves retain DarSIA's own configuration schema.
+An optional [paths] ``phase_model`` folder collects everything used to train a
+phase model; series without it keep every historical location.
 """
 
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 import re
 import json
+import stat
 import tempfile
 import tomllib
 
@@ -22,7 +26,94 @@ _PATHS = {
     "results": "results", "reviews": "reviews", "training": "training",
     "review_collections": "phase_review_collections",
     "geometry_facies": "geometry_facies",
+    # Fixed phase-model folders of series without [paths] phase_model.
+    "evidence_actions": "reviews/evidence_actions",
+    "evidence_audits": "reviews/evidence_audits",
+    "phase_model_library": "models/phase",
 }
+# Without [paths] phase_model, these keys name another key's folder.
+_SAME_FOLDER = {"phase_annotations": "reviews", "phase_models": "models"}
+# With [paths] phase_model, each folder used to train a phase model defaults to
+# one of its two parts: Annotations (what was reviewed and on which images; it
+# is also the review-session folder) and Model (the trained versions and their
+# library index). Explicit keys win.
+_PHASE_MODEL_FOLDERS = {
+    "phase_annotations": ("phase_model", "Annotations"),
+    "phase_models": ("phase_model", "Model"),
+    "reviews": ("phase_annotations", ""),
+    "review_collections": ("phase_annotations", "review_collections"),
+    "evidence_actions": ("phase_annotations", "evidence_actions"),
+    "evidence_audits": ("phase_annotations", "evidence_audits"),
+    "training_enrollments": ("phase_annotations", "training_enrollments"),
+    "phase_model_library": ("phase_models", "library"),
+}
+
+
+def _configured_path(paths, key: str, *, phase_model: bool = True):
+    """The [paths] value of ``key``: explicit, inside phase_model, or historical."""
+    if key in paths:
+        return paths[key]
+    if phase_model and paths.get("phase_model") and key in _PHASE_MODEL_FOLDERS:
+        parent, name = _PHASE_MODEL_FOLDERS[key]
+        folder = _configured_path(paths, parent)
+        return str(Path(str(folder)) / name) if name else folder
+    if key in _SAME_FOLDER:
+        return _configured_path(paths, _SAME_FOLDER[key], phase_model=phase_model)
+    if key in _PATHS:
+        return _PATHS[key]
+    raise KeyError(f"Unknown series path: {key}")
+
+
+@lru_cache(maxsize=64)
+def _cached_manifest_paths(path: str, _modified: int, _size: int) -> dict:
+    """[paths] of one series.toml revision (keyed by its modification stamp)."""
+    with open(path, "rb") as stream:
+        return dict(tomllib.load(stream).get("paths") or {})
+
+
+def _manifest_paths(root: Path) -> dict:
+    """[paths] of the series.toml in ``root``; empty without that file."""
+    manifest = Path(root) / "series.toml"
+    try:
+        info = manifest.stat()
+    except OSError:
+        return {}
+    if not stat.S_ISREG(info.st_mode):
+        return {}
+    return dict(_cached_manifest_paths(str(manifest), info.st_mtime_ns, info.st_size))
+
+
+def series_folder_path(root: str | Path, key: str, *, before_phase_model: bool = False) -> Path:
+    """Resolve one [paths] key for a series folder, registered or not.
+
+    ``root`` holds series.toml; without that file every key keeps its
+    historical default. The result is lexical (no filesystem resolution), as
+    callers holding NAS paths expect. ``before_phase_model`` ignores [paths]
+    phase_model and returns the folder the series used before that layout.
+    """
+    from .storage_paths import resolve_storage_path
+    root = Path(root).expanduser()
+    raw = _configured_path(_manifest_paths(root), key, phase_model=not before_phase_model)
+    path = resolve_storage_path(raw)
+    return path if path.is_absolute() else root / path
+
+
+def phase_model_root(root: str | Path) -> Path | None:
+    """The [paths] phase_model folder of a series folder, or None when unset."""
+    if not _manifest_paths(Path(root).expanduser()).get("phase_model"):
+        return None
+    return series_folder_path(root, "phase_model")
+
+
+def model_versions_folder(root: str | Path) -> Path:
+    """Where a series folder keeps trained phase-model versions.
+
+    [paths] phase_models when the series sets [paths] phase_model; otherwise
+    the fixed ``models`` folder that callers holding only a folder always used.
+    """
+    if phase_model_root(root) is not None:
+        return series_folder_path(root, "phase_models")
+    return Path(root).expanduser() / "models"
 
 
 def series_key(dataset: str) -> str:
@@ -201,9 +292,7 @@ def series_path(dataset: str, key: str) -> Path:
     root = series_root(dataset)
     # Existing projects remain discoverable during the create-only migration.
     manifest = series_manifest(dataset) if (root / "series.toml").is_file() else {}
-    raw = manifest.get("paths", {}).get(key, _PATHS.get(key))
-    if raw is None:
-        raise KeyError(f"Unknown series path: {key}")
+    raw = _configured_path(manifest.get("paths", {}), key)
     path = resolve_storage_path(raw)
     return (path if path.is_absolute() else root / path).resolve()
 

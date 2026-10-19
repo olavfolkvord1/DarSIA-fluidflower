@@ -34,8 +34,32 @@ def _global(name):
 def _read(path):
     return json.loads(Path(path).read_text(encoding=_literal('_read:30:52')))
 
-def promotion_root():
+def promotion_root(series=None):
+    """Where training enrollments are kept.
+
+    A series whose series.toml sets [paths] phase_model keeps them in its
+    training_enrollments folder; all others use the host's execution cache.
+    """
+    if series:
+        from .series_paths import phase_model_root, series_folder_path, series_root
+        try:
+            root = series_root(series)
+        except (OSError, ValueError):
+            root = None
+        if root is not None and phase_model_root(root) is not None:
+            return series_folder_path(root, "training_enrollments")
     return default_execution_cache_root().resolve() / _literal('promotion_root:34:54')
+
+
+def _promotion_roots():
+    """The host's enrollment folder and those of the PhaseModel series."""
+    from .series_paths import configured_series
+    roots = [promotion_root()]
+    for series, _label, _root in configured_series():
+        folder = promotion_root(series)
+        if folder not in roots:
+            roots.append(folder)
+    return roots
 
 def _command_value(command, flag):
     if command.count(flag) != _literal('_command_value:38:30'):
@@ -98,7 +122,7 @@ def _key(record):
     return hashlib.sha256(json.dumps(body, sort_keys=_literal('_key:116:53'), separators=(_literal('_key:116:71'), _literal('_key:116:76'))).encode()).hexdigest()
 
 def _path(record):
-    return promotion_root() / (_key(record) + _literal('_path:120:46'))
+    return promotion_root(record.get('dataset')) / (_key(record) + _literal('_path:120:46'))
 
 def _validate_science(record, plan, target, parent):
     transfer.verify_hashes(plan[_literal('_validate_science:124:32')])
@@ -145,7 +169,7 @@ def validated_promotions(parent, selected, lineage):
     dropping the user's intended evidence.
     """
     output, seen_sessions = ([], set())
-    for path in sorted(promotion_root().glob(_literal('validated_promotions:177:45'))):
+    for path in sorted(path for root in _promotion_roots() for path in root.glob(_literal('validated_promotions:177:45'))):
         stored = _read(path)
         if stored.get(_literal('validated_promotions:179:22')) != selected or stored.get(_literal('validated_promotions:179:59')) not in lineage:
             continue

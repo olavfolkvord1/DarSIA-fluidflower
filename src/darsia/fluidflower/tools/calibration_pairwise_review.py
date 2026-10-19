@@ -1195,7 +1195,8 @@ def _calibration_records(path_text: str) -> tuple[dict[str, str], ...]:
             if (frame.get("frame_index") != index or not math.isfinite(time)
                     or not isinstance(digest, str) or len(digest) != 64):
                 raise ValueError("Invalid native review frame/time/source binding")
-            records.append(dict(frame_index=str(index), elapsed_h=str(time), source_sha256=digest))
+            records.append(dict(frame_index=str(index), elapsed_h=str(time), source_sha256=digest,
+                                **({"source_name": str(frame["source_name"])} if frame.get("source_name") else {})))
         return tuple(records)
     with Path(path_text).open("r", encoding="utf-8-sig", newline="") as stream:
         return tuple(dict(row) for row in csv.DictReader(stream))
@@ -4906,7 +4907,8 @@ class ReviewStore:
             from darsia.fluidflower.phase_annotation_binding import stamp_camera_identity
             for index,frame_choice in enumerate(clean_frame_choices):
                 source=candidate_a_records[frame_choice["frame_index"]]
-                clean_frame_choices[index]=stamp_camera_identity(frame_choice,source,run)
+                clean_frame_choices[index]=stamp_camera_identity(frame_choice,source,run,
+                    dataset=pair.candidate_a.dataset,selected_camera=True)
         for frame_choice in clean_frame_choices:
             frame_choice["reviewer"] = reviewer
             frame_choice["reviewer_id"] = reviewer_id
@@ -5199,12 +5201,12 @@ class ReviewStore:
             }
             if (getattr(candidate,"quality_flags",None) or {}).get("selected_camera_review") and annotation.get("source_binding_contract"):
                 from darsia.fluidflower.phase_annotation_binding import CONTRACT as camera_contract,stamp_camera_identity
-                expected=stamp_camera_identity({},records[frame_index],run)
+                expected=stamp_camera_identity({},records[frame_index],run,dataset=candidate.dataset,selected_camera=True)
                 if annotation.get("source_binding_contract")!=camera_contract or any(
                         annotation.get(key)!=expected[key] for key in ("source_sha256","source_label_identity")):
                     raise ValueError("Selected annotation is not bound to this exact camera acquisition")
                 phase_fields.update({key:expected[key] for key in ("source_sha256","source_label_identity","source_binding_contract")})
-            clean_annotations.append(
+            clean_annotation = (
                 {
                     "id": annotation_id,
                     "candidate": label,
@@ -5268,6 +5270,12 @@ class ReviewStore:
                     "reviewer_id": reviewer_id,
                 }
             )
+            from darsia.fluidflower.phase_annotation_binding import PHOTO_IDENTITY_KEY, stamp_camera_identity
+            # New boxes record their photograph; saved legacy boxes stay as they were.
+            if (stored is None or PHOTO_IDENTITY_KEY in stored) and frame_index < len(records):
+                clean_annotation = stamp_camera_identity(
+                    clean_annotation, records[frame_index], run, dataset=candidate.dataset)
+            clean_annotations.append(clean_annotation)
         winner = None
         if choice == "candidate_a":
             winner = pair.candidate_a.candidate_id

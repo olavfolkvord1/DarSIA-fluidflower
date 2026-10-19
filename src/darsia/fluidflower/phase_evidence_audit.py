@@ -409,20 +409,22 @@ def load_queue(path, *, verify_sources=False):
 def queue_directory(model):
     """Keep study work products alongside the series on NAS."""
     from .phase_review_retractions import resolve_project_root
+    from .series_paths import series_folder_path
     series = read(Path(model) / "summary.json")["inventory"]["datasets"]
     if len(series) != 1:
         raise ValueError("Select one experimental series for disagreements")
-    return resolve_project_root(series[0]) / "reviews" / "evidence_audits"
+    return series_folder_path(resolve_project_root(series[0]), "evidence_audits")
 
 
 def discover_queues():
     from .phase_workflow import default_phase_review_roots
     rows = []
     from .phase_review_retractions import resolve_project_root
+    from .series_paths import configured_series, series_folder_path
     directories = [root / "evidence_audits" for root in default_phase_review_roots()]
-    for series in ("ffac", "ffum"):
+    for series, _label, _root in configured_series():
         try:
-            directories.append(resolve_project_root(series) / "reviews" / "evidence_audits")
+            directories.append(series_folder_path(resolve_project_root(series), "evidence_audits"))
         except (OSError, ValueError):
             continue
     for directory in dict.fromkeys(directories):

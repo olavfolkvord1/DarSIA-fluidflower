@@ -10,6 +10,8 @@ import math
 
 SOURCE_KEY = "ffac_selected_policy_a_sources"
 CONTRACT = "ffac-selected-camera-annotation-binding-v1"
+# Saved with every newly saved annotation: the photograph it was drawn on.
+PHOTO_IDENTITY_KEY = "photo_identity"
 
 
 def is_selected(native):
@@ -172,10 +174,45 @@ def presentation_frame(payload,binding):
     return result["payload"].get("frame_index") if result["displayable"] else None
 
 
-def stamp_camera_identity(payload,row,run):
-    """Only newly drawn evidence gets this identity; legacy payloads stay intact."""
+def _series_id(value):
+    """Canonical series ID of a dataset name, or "" when there is none."""
+    from .series_paths import series_key
+    try:
+        return series_key(value) if value else ""
+    except ValueError:
+        return ""
+
+
+def photo_identity(row,*,dataset,run):
+    """The photograph one frame record shows: {dataset, run, source_name, source_sha256}.
+
+    Returns None when the record names neither the photograph nor its SHA-256.
+    """
+    row=row or {}
+    digest=(row.get("source_label_identity") or {}).get("camera_source_sha256") or row.get("source_sha256")
+    digest=str(digest).lower() if _digest(digest) else None
+    name=str(row.get("source_name") or str(row.get("source_path") or "").replace("\\","/").rsplit("/",1)[-1])
+    if not name and digest is None:
+        return None
+    return dict(dataset=_series_id(dataset),run=str(run).casefold(),source_name=name or None,source_sha256=digest)
+
+
+def stamp_camera_identity(payload,row,run,*,dataset,selected_camera=False):
+    """Return newly saved evidence with the identity of the photograph it is on.
+
+    ``row`` is the frame record of the evidence's frame_index. By default the
+    copy gains ``photo_identity`` (see ``photo_identity``). The selected-camera
+    review contract (``selected_camera=True``) instead writes that contract's
+    original three fields, with unchanged values. Only newly saved evidence is
+    stamped; legacy payloads stay intact and keep loading without it.
+    """
     result=deepcopy(payload)
-    result["source_label_identity"]=dict(dataset="ffac",run=str(run).casefold(),camera_source_sha256=camera_sha(row))
+    if not selected_camera:
+        identity=photo_identity(row,dataset=dataset,run=run)
+        if identity is not None:
+            result[PHOTO_IDENTITY_KEY]=identity
+        return result
+    result["source_label_identity"]=dict(dataset=_series_id(dataset),run=str(run).casefold(),camera_source_sha256=camera_sha(row))
     result["source_sha256"]=camera_sha(row)
     result["source_binding_contract"]=CONTRACT
     return result

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
                                QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from darsia.fluidflower.model_display import friendly_model_name
-from darsia.fluidflower.series_paths import configured_series
+from darsia.fluidflower.series_paths import configured_series, model_versions_folder
 from darsia.fluidflower.phase_model_history import (
     _model_directories, inspect_phase_model_history_entry, metadata_only_catalog,
     ModelHistoryEntries, registration_context_available, REGISTRATION_ROOTS_UNAVAILABLE,
@@ -35,7 +35,7 @@ def _series_models(series: str, project_root: Path,
     # history helper also scans registered defaults and external review roots;
     # those paths repeated NAS work and delayed this selector. Users can add an
     # external model folder explicitly below.
-    paths = [*_model_directories(root / "models", max_depth=4),
+    paths = [*_model_directories(model_versions_folder(root), max_depth=4),
              *(path for path in _model_directories(root / "results", max_depth=3)
                if path.name.startswith("phase-model-"))]
     candidates = []
@@ -245,7 +245,7 @@ class MassAnalysisWorkspace(QWidget):
             self._selected_model_changed()
 
     def _browse_model(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Phase-model folder", str(self.project_root / "models"))
+        path = QFileDialog.getExistingDirectory(self, "Phase-model folder", str(model_versions_folder(self.project_root)))
         if path:
             index = self.model.findData(path)
             if index < 0:

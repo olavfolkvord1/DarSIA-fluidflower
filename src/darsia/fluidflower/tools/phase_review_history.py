@@ -807,7 +807,8 @@ def _include_replacement_history(result: dict[str, Any], run: str,
         native = replacement.get("native_manifest") or {}
         combined = replacement.get("combined_manifest") or {}
         job = replacement.get("job") or {}
-        event_path = (str(Path(context["project_root"]) / "reviews/evidence_actions/events" / (event_id + ".json"))
+        from darsia.fluidflower.phase_review_retractions import ledger_folder
+        event_path = (str(ledger_folder(Path(context["project_root"])) / (event_id + ".json"))
                       if context.get("project_root") else "")
         origin = {"kind": "evidence_action", "event_id": event_id,
                   "event_path": event_path, "decisions_path": event_path,

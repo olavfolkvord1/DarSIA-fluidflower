@@ -44,6 +44,10 @@ INJECTION_WORD = "inj"
 NOT_A_RUN_WORDS = ("test", "blue", "blå", "skyll", "flush", "clean")
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 GENERATOR = "darsia.fluidflower.series_creation"
+# Every folder used to train the series' phase model: review sessions, review
+# collections, the evidence ledger and audits under PhaseModel/Annotations,
+# trained versions and their library index under PhaseModel/Model.
+PHASE_MODEL_FOLDER = "PhaseModel"
 PATHS = (
     ("root", "."),
     ("config", "config"),
@@ -53,9 +57,7 @@ PATHS = (
     ("protocols", "protocols"),
     ("data", "data"),
     ("models", "models"),
-    ("reviews", "reviews"),
-    ("review_collections", "phase_review_collections"),
-    ("training", "training"),
+    ("phase_model", PHASE_MODEL_FOLDER),
     ("results", "results"),
 )
 

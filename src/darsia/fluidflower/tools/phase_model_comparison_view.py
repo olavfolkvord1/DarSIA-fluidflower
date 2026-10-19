@@ -805,7 +805,7 @@ class PhaseModelComparisonDialog(QDialog):
             settings = QSettings("DarSIA", "DarSIA Phase Model Studio")
             saved = json.loads(str(settings.value("modelHistory/completedModelRoots", "{}")))
             entries = SharedPhaseModelTrainingPage._discover_model_entries(
-                str(series_path(dataset, "models")), tuple(saved.values()) if isinstance(saved, dict) else ())
+                str(series_path(dataset, "phase_models")), tuple(saved.values()) if isinstance(saved, dict) else ())
             entries = _models_for_series(entries, dataset)
             selected = next((str(row["root"]) for row in entries
                              if str(row.get("model_id")) == target_model_id), "")

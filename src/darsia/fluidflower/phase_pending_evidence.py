@@ -335,7 +335,7 @@ def _registered_promotions(family, series):
     """Verify saved enrollment metadata; full native-image checks stay in capture."""
     from . import phase_saved_promotions as promotions
     result = []
-    for path in sorted(promotions.promotion_root().glob("*.json")):
+    for path in sorted(promotions.promotion_root(series).glob("*.json")):
         stored = _read(path)
         if withdrawals._series(stored.get("dataset")) != withdrawals._series(series) or stored.get("source_model_id") not in family:
             continue

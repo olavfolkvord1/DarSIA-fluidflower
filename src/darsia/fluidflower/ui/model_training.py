@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from darsia.fluidflower.series_paths import configured_series, tool_path, tool_arguments, local_cache_root, series_path, series_root
+from darsia.fluidflower.series_paths import configured_series, tool_path, tool_arguments, local_cache_root, model_versions_folder, series_path, series_root
 
 import json
 import importlib
@@ -403,7 +403,7 @@ def _read_model_retraction_state(model_root, series):
     """Worker-side storage read; never treat an unavailable ledger as empty."""
     from ..phase_review_retractions import (
         FreshCalibrationRequired, assert_calibration_can_be_inherited,
-        empty_snapshot, load_retractions, model_retractions, resolve_project_root,
+        empty_snapshot, ledger_folder, load_retractions, model_retractions, resolve_project_root,
         snapshot_from_events,
     )
     live = load_retractions(series=series)
@@ -423,7 +423,7 @@ def _read_model_retraction_state(model_root, series):
                     if event["event_id"] not in {row["event_id"] for row in applied.get("events", [])}),
                 current_digest=live["digest"], applied_digest=applied["digest"],
                 withdrawn_count=sum(target not in applied.get("targets", []) for target in live["targets"]),
-                ledger_path=str(resolve_project_root(series) / "reviews" / "evidence_actions" / "events"))
+                ledger_path=str(ledger_folder(resolve_project_root(series))))
 
 
 def _secondary(text: str) -> QLabel:
@@ -773,11 +773,14 @@ class SharedPhaseModelTrainingPage(QWidget):
             root = self._configured_series_roots[selected]
             try:
                 if series_root(selected) == root.resolve():
-                    return series_path(selected, "models")
+                    return series_path(selected, "phase_models")
             except (OSError, ValueError, KeyError):
                 pass
-            return root / "models"
-        return series_path(selected, "models")
+            try:
+                return model_versions_folder(root)
+            except (OSError, ValueError):
+                return root / "models"
+        return series_path(selected, "phase_models")
 
     def _default_model_library(self) -> Path:
         selected = self._active_model_series

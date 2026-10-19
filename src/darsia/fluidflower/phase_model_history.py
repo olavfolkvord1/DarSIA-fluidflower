@@ -126,7 +126,7 @@ def project_phase_model_roots() -> list[Path]:
         roots.extend(Path(record["root"]) for record in library_records(_project_root)
                      if record["available"])
         try:
-            library = series_path(series, "models")
+            library = series_path(series, "phase_models")
             with os.scandir(library) as children:
                 roots.extend(Path(child.path).resolve() for child in children
                              if child.is_dir(follow_symlinks=False)
