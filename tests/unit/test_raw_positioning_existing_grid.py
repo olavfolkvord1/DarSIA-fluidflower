@@ -194,7 +194,7 @@ def test_display_and_science_use_the_shared_u_profile(source):
     linear = photograph.load_camera_u_linear(source.path, **binding)
     np.testing.assert_array_equal(linear, raw.camera_u(read(source), parameters=source.parameters))
     assert photograph.camera_u_size(**{k:v for k,v in binding.items() if k!='expected_sha256'}) == (12, 8)
-    assert calls == [dict(use_camera_wb=True, no_auto_bright=True, output_bps=8,
+    assert calls == [dict(use_camera_wb=True, output_bps=8,
                           half_size=False, user_flip=0)]
 
 

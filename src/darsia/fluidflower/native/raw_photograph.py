@@ -52,8 +52,8 @@ def load_camera_u_rgb8(path, *, profile_path, profile_sha256, profile_id,
         path, expected_sha256=digest, parameters=parameters, profile_id=profile_id)
     before = raw_positioning._version(path)
     with rawpy.imread(str(path)) as source:
-        display = source.postprocess(use_camera_wb=True, no_auto_bright=True,
-                                     output_bps=8, half_size=False, user_flip=0)
+        display = source.postprocess(use_camera_wb=True, output_bps=8,
+                                     half_size=False, user_flip=0)
     if (raw_positioning._version(path) != before
             or sha256_file(path) != digest):
         raise ValueError("RAW photograph changed during its display rendering")
@@ -65,6 +65,6 @@ def load_camera_u_rgb8(path, *, profile_path, profile_sha256, profile_id,
         raise ValueError("The declared camera-U display extends outside its sensor")
     rgb = np.moveaxis(np.clip(np.rint(warped), 0, 255).astype(np.uint8), 0, -1)
     if factor > 1:
-        size = ((width + factor - 1) // factor, (height + factor - 1) // factor)
+        size = (max(1, width // factor), max(1, height // factor))
         rgb = np.asarray(Image.fromarray(rgb).resize(size, Image.Resampling.BOX))
     return rgb
