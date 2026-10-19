@@ -174,8 +174,10 @@ def test_the_proposal_and_the_saved_session_still_use_the_reference(view, paths,
     # The reference path itself may legitimately contain "background". Check
     # the document fields rather than searching arbitrary serialized values.
     assert after.keys() == before.keys()
-    assert {key: value for key, value in after.items() if key != "polygons"} == {
-        key: value for key, value in before.items() if key != "polygons"
+    # The intentional polygon edit also updates its ordinary edit timestamp.
+    edited = {"polygons", "updated_utc"}
+    assert {key: value for key, value in after.items() if key not in edited} == {
+        key: value for key, value in before.items() if key not in edited
     }
     assert str(view.image.path) == str(paths["baseline"])
 
