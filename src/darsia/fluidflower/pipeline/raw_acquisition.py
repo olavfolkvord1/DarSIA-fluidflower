@@ -104,11 +104,11 @@ class RawAcquisitionInputs(SeriesInputs):
                 maximum_center_delta_log=ring_parameters["maximum_center_delta_log"],
                 parameters=ring_parameters)
             path = stage / "temporal_ring.npz"
-            with path.open("xb") as stream:
+            from .io_ops import publish_file
+            def write_ring(stream):
                 np.savez(stream, **strips, pad_px=np.asarray(pad, np.int16),
                          contract=np.asarray(ring_parameters["contract"]))
-                stream.flush()
-                os.fsync(stream.fileno())
+            publish_file(path, write_ring)
             ring = asset(path)
             keys = p["inputs"]["fields"]["temporal"]
             if len(keys) != 4:

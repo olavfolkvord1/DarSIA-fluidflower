@@ -15,6 +15,8 @@ import numpy as np
 from PIL import Image
 
 from .io import sha256_file
+from ..pipeline.io_ops import publish_file, retry_io
+from ..pipeline.job_queue import retry_transient
 
 
 @dataclass(frozen=True)
@@ -108,24 +110,9 @@ def raw_detail_display(log_linear: np.ndarray, *, parameters: Mapping) -> np.nda
 
 def write_log_linear(path: Path, values: np.ndarray) -> str:
     """Retain the exact full-resolution scientific signal separately from JPEG."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.pending")
-    try:
-        with temporary.open("xb") as stream:
-            np.save(stream, np.ascontiguousarray(values), allow_pickle=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = sha256_file(temporary)
-        if path.exists():
-            if sha256_file(path) != digest:
-                raise ValueError(
-                    f"Unreceipted Native linear output differs from recomputation: {path}"
-                )
-        else:
-            os.replace(temporary, path)
-        return digest
-    finally:
-        temporary.unlink(missing_ok=True)
+    def write(stream):
+        np.save(stream, np.ascontiguousarray(values), allow_pickle=False)
+    return publish_file(path, write, reuse_identical=True)
 
 
 def copy_verified(source: Path, destination: Path, expected_sha256: str) -> str:
@@ -134,29 +121,17 @@ def copy_verified(source: Path, destination: Path, expected_sha256: str) -> str:
         raise ValueError(
             f"Frozen timeline output changed before baseline copy: {source}"
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
+    if retry_transient(destination.exists):
         if sha256_file(destination) != expected_sha256:
             raise ValueError(
                 f"Unreceipted baseline copy differs from source: {destination}"
             )
         return expected_sha256
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.pending")
-    try:
-        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+    def copy(outgoing):
+        with source.open("rb") as incoming:
             shutil.copyfileobj(incoming, outgoing, length=1 << 20)
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
-        if sha256_file(temporary) != expected_sha256:
-            raise ValueError("Baseline temporary copy differs from frozen timeline")
-        if destination.exists():
-            if sha256_file(destination) != expected_sha256:
-                raise ValueError(f"Concurrent baseline output differs: {destination}")
-        else:
-            os.replace(temporary, destination)
-        return expected_sha256
-    finally:
-        temporary.unlink(missing_ok=True)
+    return publish_file(destination, copy, reuse_identical=True,
+                        expected_sha256=expected_sha256)
 
 
 def write_display_jpeg(
@@ -359,27 +334,11 @@ def write_extended_ring(
         maximum_center_delta_log=parameters["maximum_center_delta_log"],
         parameters=parameters,
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.pending")
-    try:
-        with temporary.open("xb") as stream:
-            np.savez(
-                stream,
-                **strips,
-                pad_px=np.asarray(pad_px, np.int16),
-                contract=np.asarray(parameters["contract"]),
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = sha256_file(temporary)
-        if path.exists():
-            if sha256_file(path) != digest:
-                raise ValueError("Completed Native source-backed ring changed")
-        else:
-            os.replace(temporary, path)
-        return (digest, difference)
-    finally:
-        temporary.unlink(missing_ok=True)
+    def write(stream):
+        np.savez(stream, **strips, pad_px=np.asarray(pad_px, np.int16),
+                 contract=np.asarray(parameters["contract"]))
+    digest = publish_file(path, write, reuse_identical=True)
+    return digest, difference
 
 
 def assemble_extended_log(

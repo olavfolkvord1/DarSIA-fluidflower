@@ -28,7 +28,7 @@ class FakeServerClock:
         return self.now - self.stamp(path) >= timeout_seconds * 1_000_000_000
 
 
-def fixture(tmp_path, monkeypatch, *, ready=True):
+def fixture(tmp_path, monkeypatch, *, ready=True, local_results_directory=None):
     clock = FakeServerClock()
     monkeypatch.setattr(server_clock, "file_mtime_ns", clock.stamp)
     queue = jobs.JobQueue(tmp_path / "shared", server_clock=clock,
@@ -62,10 +62,11 @@ def fixture(tmp_path, monkeypatch, *, ready=True):
 
     def output_factory(value, token):
         events.append("owned_output_after_rename")
-        root = tmp_path / "local-results"
+        result_base = tmp_path if local_results_directory is None else local_results_directory
+        root = result_base / "local-results"
         output = root / value["job_id"] / value["run"] / ".attempts" / token
         proof = job_filesystem.LocalFileAdmission(True, "synthetic-local", "fixture only",
-                                                   "No actual filesystem qualification claimed", str(tmp_path))
+                                                   "No actual filesystem qualification claimed", str(result_base))
         return jobs.LocalOutputBinding("Main", root, output, proof)
 
     def publication_factory(claim, candidate, success):

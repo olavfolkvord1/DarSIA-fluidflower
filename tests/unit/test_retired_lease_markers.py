@@ -166,7 +166,14 @@ def test_claim_sets_aside_a_second_queue_file_of_a_leased_generation(tmp_path, s
 
 def test_input_rejection_marks_the_lease_and_queues_its_decided_retry(
         tmp_path, monkeypatch, no_directory_rename):
-    queue_, clock, callbacks, _events = alias_fixture(tmp_path, monkeypatch)
+    # NAS validation keeps queue/lease files on SMB. The separately admitted
+    # worker results root must still be local, as in an actual alias job.
+    local_results = None
+    if tmp_path.drive.startswith("\\\\"):
+        import tempfile
+        local_results = Path(tempfile.mkdtemp(prefix="n112-local-results-"))
+    queue_, clock, callbacks, _events = alias_fixture(
+        tmp_path, monkeypatch, local_results_directory=local_results)
     claim = alias_claim(queue_, clock, callbacks)
     record = queue_.reject_before_science(claim, "InputHashMismatch: original SHA differs", {"pid": 123})
     assert no_directory_rename == []

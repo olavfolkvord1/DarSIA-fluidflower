@@ -272,6 +272,11 @@ def validate_phase1_run(config):
         if task["kind"] == "raw_rig" and (roles.get("retained_source_cache") is not None
                                           or roles.get("native_row") is not None):
             raise ValueError("RAW-only positioning requires fresh inference without JPEG-positioned parent roles")
+        if task["kind"] == "raw_rig":
+            if roles["encoding_contract"] is not None:
+                raise ValueError("Fresh RAW inference cannot carry a historical probability encoding receipt")
+            if source.get("studio_anchor") and type((source.get("parent_source") or {}).get("source_changed")) is not bool:
+                raise ValueError("RAW Studio anchor requires its unchanged source-geometry flag")
         if roles["retained_source_cache"] is not None and (
                 type(roles.get("retained_frame_index")) is not int or roles["retained_frame_index"] < 0):
             raise ValueError("Original retained cache frame index must be explicit; no selection-index inference")

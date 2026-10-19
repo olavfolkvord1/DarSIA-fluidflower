@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .job_queue import name, rename, write_immutable
+from .io_ops import retry_io
 
 INDEX_FORMAT = "darsia-products-index-v1"
 BUNDLE_FORMAT = "darsia-product-publication-v1"
@@ -134,6 +135,7 @@ def _products(values):
     return rows
 
 
+@retry_io
 def _no_links(path):
     path = Path(path)
     if not path.is_absolute():
@@ -143,13 +145,17 @@ def _no_links(path):
     for candidate in reversed((path, *path.parents)):
         try:
             info = candidate.lstat()
-        except FileNotFoundError:
+        except FileNotFoundError as error:
+            from .job_queue import transient_os_error
+            if transient_os_error(error):
+                raise
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
             raise ValueError("Symlink/reparse paths are forbidden: " + str(candidate))
     return path
 
 
+@retry_io
 def _file(path):
     path = _no_links(path)
     info = path.stat()
@@ -162,6 +168,7 @@ def _stamp(info):
     return info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino
 
 
+@retry_io
 def _verified_bytes(path, expected, *, limit):
     path = _file(path)
     before = path.stat()
@@ -176,6 +183,7 @@ def _verified_bytes(path, expected, *, limit):
     return raw
 
 
+@retry_io
 def _verify_file(path, expected, *, limit):
     """Verify a requested shared descriptor without buffering its metadata."""
     path = _file(path)
@@ -216,7 +224,8 @@ def _json(raw):
 
 def _fresh_root(path):
     path = _no_links(path)
-    path.mkdir(parents=True, exist_ok=False)
+    from .job_queue import _create_directory
+    _create_directory(path, parents=True)
     return _no_links(path)
 
 
@@ -224,7 +233,8 @@ def _target(root, relative):
     root = _no_links(root)
     destination = root.joinpath(*_relative(relative).split("/"))
     _no_links(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    from .job_queue import retry_transient
+    retry_transient(lambda: destination.parent.mkdir(parents=True, exist_ok=True))
     _no_links(destination.parent)
     if not destination.parent.resolve().is_relative_to(root.resolve()):
         raise ValueError("Publication target escapes its fresh root")
@@ -233,7 +243,8 @@ def _target(root, relative):
     return destination
 
 
-def _copy(source, expected, destination):
+@retry_io
+def _copy_pending(source, expected, destination):
     """Stream/hash, verify the closed temporary bytes, then publish exclusively."""
     source = _file(source)
     before = source.stat()
@@ -260,6 +271,12 @@ def _copy(source, expected, destination):
     if temporary.stat().st_size != expected["bytes"] or check.hexdigest() != expected["sha256"]:
         raise ValueError("Copied bytes differ; partial preserved: " + str(temporary))
     _no_links(destination.parent)
+    return temporary
+
+
+def _copy(source, expected, destination):
+    """Retry copying and committing as separate IO steps, never scientific work."""
+    temporary = _copy_pending(source, expected, destination)
     if os.name == "nt":
         rename(temporary, destination)
     else:
@@ -274,7 +291,8 @@ def _write_index(root, filename, document):
         raise ValueError("Publication index exceeds its independent bounded metadata size")
     destination = _target(root, filename)
     write_immutable(destination, document, create_parents=False)
-    raw = destination.read_bytes()
+    from .job_queue import retry_transient
+    raw = retry_transient(destination.read_bytes)
     return dict(path=str(destination), sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
 
 
@@ -309,7 +327,8 @@ def publish_run_metadata(publication_root, *, job, run, attempt_id, machine_id,
     progress.json, active leases, or not-yet-written retirement.json here.
 
     The index is written LAST. A preserved partial directory without that index
-    is not an admitted publication. Failures are not retried or rolled back.
+    is not an admitted publication. Transient file steps are retried; scientific
+    work is never rerun. Partial files are retained on final failure.
     """
     _closed(file_writers_closed)
     if all_final_products_listed is not True:

@@ -12,12 +12,14 @@ import re
 from pathlib import Path
 
 from .job_queue import read_json, retired_lease_directory
+from .io_ops import retry_io
 
 
 def _key(path):
     return ntpath.normcase(ntpath.normpath(str(path)))
 
 
+@retry_io
 def _verify_file(path, bound):
     """Verify a declared immutable file, including its identity before/after."""
     path = Path(path)

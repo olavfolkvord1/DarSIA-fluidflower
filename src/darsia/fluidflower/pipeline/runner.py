@@ -48,8 +48,10 @@ def _phase_outputs(stage, spec, frame, inferred):
     if labels.dtype != np.uint8 or labels.shape != frame["pixel_area_mm2"].shape:
         raise ValueError("Fresh phase labels/grid differ")
     label_path = stage / "phase_labels.png"
-    with label_path.open("xb") as stream:
+    from .io_ops import publish_file
+    def write_labels(stream):
         Image.fromarray(labels).save(stream, format="PNG")
+    publish_file(label_path, write_labels)
     classes = _write_npz(stage / "phase_classes.npz", inferred["classes"])
     area = dict(
         _write_npz(
@@ -233,27 +235,32 @@ def scalar_table(records, fields, destination):
 
     reader = DataReader()
     destination = Path(destination)
-    with destination.open("x", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        for record in records:
-            bound = dict(
-                record["files"]["result.json"],
-                path=str(Path(record["nas_directory"]) / "result.json"),
-            )
-            result = reader.json(bound)
-            if (
-                result.get("complete") is not True
-                or result["case_id"] != record["frame_id"]
-            ):
-                raise ValueError("Table row is not its genuine committed frame")
-            selected = {}
-            for field in fields:
-                value = result[field]
-                if isinstance(value, (dict, list)):
-                    raise ValueError("Table fields must be scalar values")
-                selected[field] = value
-            writer.writerow(selected)
+    rows = []
+    for record in records:
+        bound = dict(record["files"]["result.json"],
+                     path=str(Path(record["nas_directory"]) / "result.json"))
+        result = reader.json(bound)
+        if result.get("complete") is not True or result["case_id"] != record["frame_id"]:
+            raise ValueError("Table row is not its genuine committed frame")
+        selected = {}
+        for field in fields:
+            value = result[field]
+            if isinstance(value, (dict, list)):
+                raise ValueError("Table fields must be scalar values")
+            selected[field] = value
+        rows.append(selected)
+    from .io_ops import publish_file
+    def write(binary):
+        import io
+        stream = io.TextIOWrapper(binary, encoding="utf-8", newline="")
+        try:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+        finally:
+            stream.detach()
+    publish_file(destination, write)
     return asset(destination)
 
 
@@ -321,8 +328,9 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     else:
         io_binding.require_output(output)
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
+    from .job_queue import retry_transient
+    retry_transient(lambda: output.mkdir(parents=True, exist_ok=True))
+    if retry_transient(lambda: any(output.iterdir())):
         raise FileExistsError("Each attempt must be fresh")
     clock = time.perf_counter()
     prefix = verify_frame_prefix(

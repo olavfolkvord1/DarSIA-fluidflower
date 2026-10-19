@@ -20,6 +20,7 @@ import numpy as np
 from . import extension, photometry, raw_chart, raw_positioning, raw_positioning_port
 from . import registration, source
 from .io import resolve_asset_path, sha256_file
+from ..pipeline.job_queue import read_json
 
 
 CONTRACT = "darsia-raw-rig-source-v1"
@@ -89,7 +90,7 @@ class RawRigSourceProcessor:
         self.parameters = parameters
         self.binding_path = self._path(binding_path)
         self.binding_sha256 = sha256_file(self.binding_path)
-        self.binding = json.loads(self.binding_path.read_text(encoding="utf-8-sig"))
+        self.binding = read_json(self.binding_path)
         validate_binding(self.binding, parameters)
         b = self.binding
         # Both the NPZ and the exact sidecar are inputs. An internally
@@ -107,7 +108,7 @@ class RawRigSourceProcessor:
         # (e.g. a donor-consensus name). Its exact bound bytes define its role.
         if fit.run != b["run"] or grid != ref_grid:
             raise ValueError("RAW source and frozen photometric models/grid differ")
-        fit_receipt = json.loads(self._asset(b["models"]["fit"]["sidecar"]).read_text(encoding="utf8"))
+        fit_receipt = read_json(self._asset(b["models"]["fit"]["sidecar"]))
         if fit_receipt["source"]["source_arw_sha256"] != b["baseline_raw"]["sha256"]:
             raise ValueError("RAW baseline acquisition differs from the unchanged B fit")
         old_field = None

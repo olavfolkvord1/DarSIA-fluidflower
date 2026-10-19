@@ -97,6 +97,20 @@ def test_expected_current_products_are_not_phase_inputs():
         series.validate_run(config)
 
 
+@pytest.mark.parametrize("missing", ["probability_encoding", "anchor_flag"])
+def test_RAW_source_metadata_errors_fail_before_numerical_work(missing):
+    config = _configuration()
+    frame = config["frames"][0]
+    frame["native_task"] = dict(kind="raw_rig", geometry={}, processor=dict(raw_binding={}))
+    frame["phase_roles"]["encoding_contract"] = None
+    if missing == "probability_encoding":
+        frame["phase_roles"]["encoding_contract"] = {"historical": True}
+    else:
+        frame["source"]["studio_anchor"] = True
+    with pytest.raises(ValueError, match="probability encoding|source-geometry flag"):
+        series.validate_run(config)
+
+
 def test_model_entrypoint_cannot_execute_series_python():
     config = _configuration()
     config["phase"]["entrypoint"] = "some_module:function"

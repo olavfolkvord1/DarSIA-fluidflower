@@ -27,6 +27,7 @@ import os
 import socket
 import time
 import uuid
+from ..pipeline.io_ops import retry_io
 
 CONFIG_FORMAT = "darsia-n1-run-v1"
 CONFIG_REQUIRED = (
@@ -102,12 +103,18 @@ def _strict_json(raw):
 
 def _stamp(path):
     """Actual file identity used to retain one consumed-data SHA verification."""
-    value = path.stat()
+    from ..pipeline.job_queue import retry_transient
+    value = retry_transient(path.stat)
     return value.st_size, value.st_mtime_ns, value.st_dev, value.st_ino
 
 
 def asset(path):
     """Return the actual full SHA/size descriptor of a produced file."""
+    from ..pipeline.io_ops import retry_io
+    return retry_io(_asset_once)(path)
+
+
+def _asset_once(path):
     path = Path(path)
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -180,13 +187,15 @@ class DataReader:
     def json(self, descriptor):
         """Read a consumed JSON data document, never a code/control snapshot."""
         path = self.path(descriptor)
-        raw = path.read_bytes()
+        from ..pipeline.job_queue import retry_transient
+        raw = retry_transient(path.read_bytes)
         if hashlib.sha256(raw).hexdigest() != descriptor["sha256"]:
             raise ValueError("Consumed JSON data changed: " + str(path))
         result = _strict_json(raw)
         self.path(descriptor)
         return result
 
+    @retry_io
     def array(self, descriptor):
         """Read exact NPY/explicit NPZ-array storage without dtype conversion."""
         import numpy as np
@@ -205,6 +214,7 @@ class DataReader:
         self.path(descriptor)
         return result
 
+    @retry_io
     def archive(self, descriptor, names):
         """Read declared registered fields from one physical/class archive."""
         import numpy as np
@@ -915,10 +925,8 @@ def _write_json(path, value):
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    with Path(path).open("xb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
+    from ..pipeline.job_queue import _publish_bytes
+    _publish_bytes(Path(path), raw, create_parents=False)
     return asset(path)
 
 
@@ -927,7 +935,9 @@ def _write_npz(path, arrays):
     import numpy as np
     import zipfile
 
-    with Path(path).open("xb") as stream:
+    from ..pipeline.io_ops import publish_file
+
+    def write(stream):
         with zipfile.ZipFile(
             stream, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
         ) as archive:
@@ -936,8 +946,7 @@ def _write_npz(path, arrays):
                     np.lib.format.write_array(
                         member, np.asanyarray(array), allow_pickle=False
                     )
-        stream.flush()
-        os.fsync(stream.fileno())
+    publish_file(path, write)
     return asset(path)
 
 
@@ -1003,13 +1012,14 @@ def _publish_frame(
 
     output = Path(output)
     final = output / "frames" / spec["case_id"]
-    final.parent.mkdir(parents=True, exist_ok=True)
+    from ..pipeline.job_queue import retry_transient, _create_directory
+    retry_transient(lambda: final.parent.mkdir(parents=True, exist_ok=True))
     if final.exists():
         raise FileExistsError(final)
     temporary = final.parent / (
         "." + spec["case_id"] + "." + uuid.uuid4().hex + ".partial"
     )
-    temporary.mkdir()
+    _create_directory(temporary)
     response, result, prediction = (
         evaluated["response"],
         evaluated["result"],
@@ -1176,15 +1186,15 @@ def _publish_frame(
     )):
         for quantity in ("area_cm2", "co2_area_cm2"):
             record[part + "_" + quantity] = evaluated["sandmap"][part][quantity]
-    with gzip.open(
-        temporary / "native_statistics.json.gz", "wt", encoding="utf-8", compresslevel=3
-    ) as stream:
-        json.dump(
-            _jsonable(evaluated["statistics"]),
-            stream,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
+    from ..pipeline.io_ops import publish_file
+    def write_statistics(binary):
+        import io
+        with gzip.GzipFile(filename="native_statistics.json", mode="wb",
+                           fileobj=binary, compresslevel=3) as compressed:
+            with io.TextIOWrapper(compressed, encoding="utf-8") as stream:
+                json.dump(_jsonable(evaluated["statistics"]), stream,
+                          allow_nan=False, separators=(",", ":"))
+    publish_file(temporary / "native_statistics.json.gz", write_statistics)
     if "n16_producer" in evaluated:
         from ..storage_extensive_io import bind_n16_producer
         bind_n16_producer(evaluated, record, manifest=manifest, manifest_asset=manifest_asset,
@@ -1204,7 +1214,7 @@ def _publish_frame(
             **extensive_kwargs)
     files = {
         path.name: {key: value for key, value in asset(path).items() if key != "path"}
-        for path in sorted(temporary.iterdir())
+        for path in sorted(retry_transient(lambda: list(temporary.iterdir())))
     }
     for name, kind in storage_kinds.items():
         files[name]["kind"] = kind
@@ -1230,12 +1240,13 @@ def _publish_frame(
         files=files,
     )
     operations = output / "ops"
-    operations.mkdir(exist_ok=True)
+    retry_transient(lambda: operations.mkdir(exist_ok=True))
     _write_json(operations / ("frame_commit_" + commit_id + ".json"), registration)
     # Windows rename and POSIX rename never replace a nonempty frame directory.
     if final.exists():
         raise FileExistsError(final)
-    temporary.rename(final)
+    from ..pipeline.job_queue import rename
+    rename(temporary, final)
     inventory = {
         **files,
         "commit.json": {

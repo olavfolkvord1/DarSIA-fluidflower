@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import cv2
 import numpy as np
+from ..pipeline.io_ops import retry_io
 
 def _log_rgb(a, shape=None, *, parameters: Mapping):
     """Convert channel-first log RGB to float32 and validate optional geometry."""
@@ -765,6 +766,7 @@ def save_baseline(path: Path, fit: Baseline, grid: ReferenceGrid, provenance: di
     os.replace(temp_json, sidecar)
     return receipt
 
+@retry_io
 def load_baseline(path: Path, *, verify: bool=True, parameters: Mapping) -> tuple[Baseline, ReferenceGrid]:
     """Load a bound observed-sand NPZ and its explicit ReferenceGrid.
 

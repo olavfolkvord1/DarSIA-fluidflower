@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 from ..store_map import input_reference, validate_input_reference
+from .io_ops import retry_io
 
 CATALOG_FORMAT = "darsia-role-input-catalog-v1"
 MAX_METADATA_BYTES = 128 * 1024 * 1024
@@ -58,6 +59,7 @@ class InputCatalog:
         self.source_setups = set()
 
     @staticmethod
+    @retry_io
     def _read_metadata(path):
         with Path(path).open("rb") as stream:
             raw = stream.read(MAX_METADATA_BYTES + 1)
@@ -74,6 +76,7 @@ class InputCatalog:
             raise ValueError("Input locator and source identity differ")
         return result
 
+    @retry_io
     def add(self, descriptor, role, use):
         actual = self.physical(descriptor)
         # Root admission precedes any stat/open. Passive provenance is not visited.
@@ -102,6 +105,7 @@ class InputCatalog:
             row["uses"].append(use)
         return deepcopy(reference)
 
+    @retry_io
     def doc(self, descriptor, role, use):
         reference = self.add(descriptor, role, use)
         actual = self.physical(descriptor)

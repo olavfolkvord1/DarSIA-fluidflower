@@ -133,6 +133,10 @@ def validate_run(config):
                     or spec["phase_roles"].get("retained_source_cache") is not None
                     or spec["phase_roles"].get("native_row") is not None):
                 raise ValueError("RAW-only task requires explicit binding and fresh inference roles")
+            if spec["phase_roles"].get("encoding_contract") is not None:
+                raise ValueError("Fresh RAW inference cannot carry a historical probability encoding receipt")
+            if source.get("studio_anchor") and type((source.get("parent_source") or {}).get("source_changed")) is not bool:
+                raise ValueError("RAW Studio anchor requires its unchanged source-geometry flag")
         forbidden = {"current", "labels", "classes", "area"} & spec["mass_spec"].keys()
         if forbidden:
             raise ValueError("Mass current/phase/area must be fresh stage outputs")
@@ -671,7 +675,8 @@ class SeriesInputs:
                 processor=processor, identity=processor.identity()
             )
         valid = np.isfinite(log).all(0)
-        stage.mkdir(parents=True)
+        from .job_queue import _create_directory
+        _create_directory(stage, parents=True)
         log_path, valid_path = stage / "native_log.npy", stage / "native_valid.npy"
         sidecar.write_log_linear(log_path, log)
         sidecar.write_log_linear(valid_path, valid)

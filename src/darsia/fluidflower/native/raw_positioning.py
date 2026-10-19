@@ -17,6 +17,7 @@ import numpy as np
 
 from . import registration
 from .io import sha256_file
+from ..pipeline.job_queue import retry_transient
 
 
 CONTRACT = "darsia-raw-positioning-existing-grid-v1"
@@ -36,7 +37,7 @@ class Sensor:
 
 
 def _version(path: Path) -> tuple[int, int, int, int, int]:
-    value = path.stat()
+    value = retry_transient(path.stat)
     return (value.st_dev, value.st_ino, value.st_size,
             value.st_mtime_ns, value.st_ctime_ns)
 
@@ -60,16 +61,16 @@ def read_sensor(path: str | Path, *, expected_sha256: str,
     policy = common["sensor"]
     profile = common["profiles"][profile_id]
     registration.check_demosaic_order(parameters=parameters)
-    distortion, red, blue = registration.read_lens_tables(
-        path, parameters=common["lens"])
+    distortion, red, blue = retry_transient(lambda: registration.read_lens_tables(
+        path, parameters=common["lens"]))
     if distortion != tuple(profile["distortion"]):
         raise ValueError("RAW lens table differs from the calibrated profile")
-    identity = read_camera_identity(path)
+    identity = retry_transient(lambda: read_camera_identity(path))
     try:
         import rawpy
     except ImportError as error:
         raise ImportError("RAW positioning requires rawpy (CPU LibRaw)") from error
-    with rawpy.imread(str(path)) as raw:
+    with retry_transient(lambda: rawpy.imread(str(path))) as raw:
         original = raw.raw_image_visible.copy()
         if original.dtype != np.uint16 or original.ndim != 2:
             raise ValueError("RAW visible mosaic must be two-dimensional uint16")
@@ -188,7 +189,7 @@ def load_shape_chain(assets: Sequence[Mapping]) -> list:
         path = Path(asset["path"])
         if path.suffix.lower() != ".npz" or sha256_file(path) != asset["sha256"]:
             raise ValueError("Native shape correction changed: " + str(path))
-        correction = darsia.read_correction(path)
+        correction = retry_transient(lambda: darsia.read_correction(path))
         if not rig._is_shape_correction(correction):
             raise ValueError("Native review permits geometric corrections only")
         chain.append(correction)

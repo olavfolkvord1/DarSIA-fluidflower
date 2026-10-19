@@ -17,6 +17,7 @@ import subprocess
 
 from .job_inputs import InputCatalog, _json_bytes, validate_catalog, MAX_METADATA_BYTES
 from .store_runtime import InputHashMismatch, RunUnavailable
+from .io_ops import retry_io
 
 _active = ContextVar("admitted_run_io", default=None)
 TASK_FORMAT = "darsia-alias-task-v1"
@@ -216,6 +217,7 @@ class RunIOBinding:
         self._replayed = True
         return self
 
+    @retry_io
     def _verified_bytes(self, row):
         self._input_digest(row)
         before = row.path.stat()
@@ -265,6 +267,7 @@ class RunIOBinding:
                 ["git", "-C", str(self.repository), "show", self.commit + ":" + relative])
             self._admit_code(relative, hashlib.sha256(original).hexdigest(), role)
 
+    @retry_io
     def _admit_code(self, relative, digest, role):
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise InputHashMismatch("Explicit original source SHA is required")
@@ -299,6 +302,7 @@ class RunIOBinding:
         self.code_audit.append(dict(role=role, actual_path=str(path),
             **{key: value for key, value in record.items() if key != "path"}))
 
+    @retry_io
     def _checked_code_digest(self, code):
         """Recheck this checkout's raw snapshot; return its canonical Git identity."""
         path = Path(code["path"])
@@ -414,6 +418,7 @@ class RunIOBinding:
             raise RunUnavailable("Resume source is not another own admitted local attempt")
         return actual
 
+    @retry_io
     def _proof_bytes(self, bound, expected_path):
         path = Path(bound["path"])
         if path.resolve() != Path(expected_path).resolve():

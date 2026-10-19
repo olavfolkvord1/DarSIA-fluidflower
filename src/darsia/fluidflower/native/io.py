@@ -7,8 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
+from ..pipeline.io_ops import retry_io
 
 
+@retry_io
 def sha256_file(path: str | Path) -> str:
     """Hash the exact bytes of a file without loading its image into memory."""
     from ..pipeline.run_io import current_binding
@@ -24,6 +26,7 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+@retry_io
 def read_bound_json(path: str | Path, expected_sha256: str) -> dict[str, Any]:
     """Read a JSON object only after its declared content digest matches."""
     source = Path(path)
