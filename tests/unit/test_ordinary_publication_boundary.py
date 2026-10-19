@@ -146,18 +146,20 @@ def test_prepared_success_is_not_rewritten_or_moved_by_failure(tmp_path, monkeyp
         configuration=dict(path=r"\\server\share\config.json", sha256="3" * 64),
         precision="float32", backend="any"))
     claim = shared.claim("machine", "cpu", dict(pid=123, process_create_time="1.0"))
-    moves = []
-    def blocked(*args, **kwargs): moves.append(1); raise sharing_error()
-    monkeypatch.setattr(boundary, "ordinary_publication_move", blocked)
+    decisions = []
+    def blocked(*args, **kwargs): decisions.append(1); raise sharing_error()
+    monkeypatch.setattr(jobs, "decide", blocked)  # The ownership decision fails.
     with pytest.raises(PermissionError):
         shared.complete(claim, dict(complete=True, run="sample", worker_references_closed=True))
     publication = claim.lease / "publication.json"
     original = (publication.read_bytes(), publication.stat().st_mtime_ns)
-    value = shared.fail(claim, "Original PermissionError: five rename attempts failed", {})
-    assert value["complete"] is False and moves == [1]
+    value = shared.fail(claim, "Original PermissionError: publication decision failed", {})
+    assert value["complete"] is False and decisions == [1]
     assert (publication.read_bytes(), publication.stat().st_mtime_ns) == original
     assert jobs.read_json(claim.output / "failed.json")["traceback"].startswith("Original PermissionError")
     assert not (tmp_path / "failed/sample.json").exists() and not (tmp_path / "done/sample.json").exists()
+    assert claim.lease.is_dir() and not (tmp_path / "publishing/sample").exists()
+    assert not list((tmp_path / "decisions").iterdir())
     log = next((tmp_path / "logs").glob("*failure_after_prepared_success.json"))
     assert jobs.read_json(log)["no_publication_rewrite"] is True
 

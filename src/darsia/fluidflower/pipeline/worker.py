@@ -969,11 +969,13 @@ def _parent(args, identity, job, commit, log):
                         / "leases"
                         / (name(claim["run"]) + "." + claim["attempt_id"])
                     )
-                    if lease.exists():
-                        active = True
-                        continue
+                    # A published lease stays in leases/ (publishing/<run> is
+                    # its marker file), so the publication is checked first.
                     if (args.job / "publishing" / name(claim["run"])).exists():
                         slot["finished"] = True
+                        continue
+                    if lease.exists():
+                        active = True
                         continue
                     slot["waiting_reclaim"] = False
                 # Re-verify the same startup admission before a replacement imports

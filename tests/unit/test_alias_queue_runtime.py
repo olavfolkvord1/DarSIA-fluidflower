@@ -109,36 +109,38 @@ def completion():
                 precision="float32", scalar=23.859055832362177)
 
 
-def test_alias_failed_move_keeps_success_bundle_and_original_failure_without_rewrite(tmp_path, monkeypatch):
-    from darsia.fluidflower.pipeline import publication_handles
+def test_alias_failed_publication_decision_keeps_success_bundle_and_original_failure_without_rewrite(tmp_path, monkeypatch):
     queue, clock, callbacks, events = fixture(tmp_path, monkeypatch)
     claim = claim_fixture(queue, clock, callbacks)
-    moves = []
+    decisions = []
     def blocked(*args, **kwargs):
-        moves.append(1)
-        raise PermissionError("Original lease move refused")
-    monkeypatch.setattr(publication_handles, "ordinary_publication_move", blocked)
-    with pytest.raises(PermissionError, match="Original lease move refused"):
+        decisions.append(args[3])
+        raise PermissionError("Original publication decision refused")
+    monkeypatch.setattr(jobs, "decide", blocked)  # The ownership transition fails.
+    with pytest.raises(PermissionError, match="Original publication decision refused"):
         queue.complete(claim, completion())
     publication = claim.lease / "publication.json"
+    assert not jobs.decision_path(queue.root, "ac52", claim.token).exists()
+    assert not (queue.root / "publishing/ac52").exists()
     before = {p.relative_to(claim.lease): (p.read_bytes(), p.stat().st_mtime_ns)
               for p in claim.lease.rglob("*") if p.is_file()}
     factory_calls = events.count("shared_copy_before_fence")
-    queue.fail(claim, "Original lease move refused; do not replace success publication", {})
-    assert moves == [1] and events.count("shared_copy_before_fence") == factory_calls
+    queue.fail(claim, "Original publication decision refused; do not replace success publication", {})
+    assert decisions == ["publish"] and events.count("shared_copy_before_fence") == factory_calls
     assert {p: ((claim.lease / p).read_bytes(), (claim.lease / p).stat().st_mtime_ns)
             for p in before} == before
     assert jobs.read_json(publication)["success"] is True
-    assert "Original lease move refused" in jobs.read_json(claim.output / "failed.json")["traceback"]
+    assert "Original publication decision refused" in jobs.read_json(claim.output / "failed.json")["traceback"]
     assert not (queue.root / "done/ac52.json").exists() and not (queue.root / "failed/ac52.json").exists()
+    assert not jobs.decision_path(queue.root, "ac52", claim.token).exists()
+    assert not (queue.root / "publishing/ac52").exists()
 
 
 def test_existing_foreign_success_publication_is_not_a_failure_bypass(tmp_path, monkeypatch):
-    from darsia.fluidflower.pipeline import publication_handles
     queue, clock, callbacks, _events = fixture(tmp_path, monkeypatch)
     claim = claim_fixture(queue, clock, callbacks)
-    monkeypatch.setattr(publication_handles, "ordinary_publication_move",
-        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("move refused")))
+    monkeypatch.setattr(jobs, "decide",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("decision refused")))
     with pytest.raises(PermissionError): queue.complete(claim, completion())
     path = claim.lease / "publication.json"
     document = jobs.read_json(path); document["attempt_id"] = "different-attempt"
@@ -474,11 +476,21 @@ def test_default_payload_receipt_survives_lease_rename_and_is_job_relative_in_do
     queue.complete(claim, completion())
     done = jobs.read_json(queue.root / "done/ac52.json")
     path = jobs._own_asset(queue.root, done["payload_publication"])
-    assert path == (queue.root / "publishing/ac52/artifacts/default_products/publication.json").resolve()
+    # The published bundle stays in its lease; publishing/ac52 is only its marker.
+    assert jobs.publication_directory(queue.root, "ac52") == claim.lease
+    assert path == (claim.lease / "artifacts/default_products/publication.json").resolve()
+    assert done["payload_publication"]["relative_path"] == (
+        "leases/ac52." + claim.token + "/artifacts/default_products/publication.json")
     receipt = jobs.read_json(path)
     assert receipt["products_index"]["path"].startswith(str(claim.lease))
-    assert not claim.lease.exists()  # Old path is passive provenance, not opened.
     assert receipt["products_index"]["sha256"] == done["products_index"]["sha256"]
+    # The done record stays job-relative when the whole shared root is renamed.
+    moved = tmp_path / "renamed-shared-root"
+    queue.root.rename(moved)
+    assert not claim.lease.exists()  # Old path is passive provenance, not opened.
+    assert jobs._own_asset(moved, done["payload_publication"]) == (
+        moved / done["payload_publication"]["relative_path"]).resolve()
+    assert jobs.read_json(jobs._own_asset(moved, done["payload_publication"])) == receipt
 
 
 @pytest.mark.parametrize("mode", ["index_mismatch", "unrequested_kind"])

@@ -231,7 +231,10 @@ def test_missing_shared_registration_never_falls_back_to_original_local_file(tmp
 
 def test_failure_publication_cannot_relabel_its_actual_worker_owner(tmp_path,monkeypatch):
     data=published_fixture(tmp_path,monkeypatch,failure=True)
-    path=data.root/"publishing/ac52/owner.json"
+    # The published owner stays in its in-place lease; publishing/ac52 is its marker file.
+    assert (data.root/"publishing/ac52").is_file()
+    assert jobs.publication_directory(data.root,"ac52")==data.current.lease
+    path=data.current.lease/"owner.json"
     value=jobs.read_json(path);value["actual_owner"]["pid"]=999;write(path,value)
     result=assert_metadata_error(data)
     assert "Original failure task/run/attempt/worker" in result["runs"][0]["error"]

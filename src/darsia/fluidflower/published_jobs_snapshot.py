@@ -11,7 +11,7 @@ from pathlib import Path, PureWindowsPath, PurePosixPath
 import re
 import traceback
 
-from .pipeline.job_queue import descriptor, name, _own_asset, validate_task
+from .pipeline.job_queue import descriptor, name, _own_asset, publication_directory, validate_task
 from .pipeline.products_publication import (
     _read_index, read_published_metadata, published_metadata_descriptor, _bound, _json,
 )
@@ -416,7 +416,10 @@ def _terminal(root, run_root, base_task, job, done, reader):
 
 def _failed_publication(root, base_task, failure_path, reader):
     """Keep literal failure and actual frame progress from its exact shared bundle."""
-    directory = root / "publishing" / name(base_task["run"])
+    # A legacy moved publishing directory, or the in-place lease its marker names.
+    directory = publication_directory(root, base_task["run"])
+    if directory is None:
+        raise ValueError("Canonical failure has no shared publication")
     owner = reader(directory / "owner.json")
     publication = reader(directory / "publication.json")
     token = owner.get("token")

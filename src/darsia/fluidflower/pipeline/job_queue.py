@@ -3,6 +3,9 @@
 The shared filesystem must provide atomic rename within one share. Progress is
 written only for actual I/O or frame advances, never as a synthetic heartbeat.
 An expired attempt keeps its output, but loses the right to publish a run.
+Each attempt is retired by exactly one exclusive-create decision file
+(publish, reclaimed or rejected). Publication never moves the lease directory:
+a run-level marker file binds the run to its published lease in place.
 """
 from __future__ import annotations
 
@@ -122,13 +125,18 @@ def rename(source: Path, destination: Path) -> None:
             time.sleep(0.01)
 
 
+def _immutable_bytes(document: dict) -> bytes:
+    """Exact bytes write_immutable publishes for a document."""
+    return (json.dumps(document, ensure_ascii=False, allow_nan=False) + "\n").encode()
+
+
 def write_immutable(path: Path, document: dict, *, create_parents=True) -> None:
     """Publish complete UTF-8 bytes without ever replacing an existing file."""
     path = Path(path)
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
-    data = (json.dumps(document, ensure_ascii=False, allow_nan=False) + "\n").encode()
+    data = _immutable_bytes(document)
     with temporary.open("xb") as stream:
         stream.write(data)
         stream.flush()
@@ -292,6 +300,83 @@ def _write_immutable_raw(path, raw):
         temporary.unlink()  # Only the successful extra link is removed.
 
 
+DECISION_FORMAT = "darsia-attempt-decision-v1"
+PUBLICATION_MARKER_FORMAT = "darsia-publication-marker-v1"
+OUTCOMES = frozenset({"publish", "reclaimed", "rejected"})
+
+
+def decision_path(root: Path, run: str, token: str) -> Path:
+    """Return the single decision file that retires one attempt."""
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Attempt decision requires a 32-hex attempt identity")
+    return Path(root) / "decisions" / f"{name(run)}.{token}.json"
+
+
+def read_decision(root: Path, run: str, token: str) -> dict | None:
+    """Read the standing decision of an attempt, or None while it is undecided."""
+    path = decision_path(root, run, token)
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        return None
+    run = name(run)
+    if (not isinstance(value, dict) or value.get("format") != DECISION_FORMAT
+            or value.get("run") != run or value.get("attempt_id") != token
+            or value.get("outcome") not in OUTCOMES
+            or value.get("lease_relative_path") != f"leases/{run}.{token}"):
+        raise ValueError("Attempt decision differs from its run/attempt/outcome")
+    return value
+
+
+def decide(root: Path, run: str, token: str, outcome: str, **extra) -> tuple[bool, dict]:
+    """Exclusively create the one decision of an attempt; a loser reads the winner.
+
+    write_immutable is an exclusive create (POSIX link, Windows no-replace
+    rename of a closed temporary file), so handles that remain open inside a
+    lease directory cannot block this ownership transition.
+    """
+    if outcome not in OUTCOMES:
+        raise ValueError(f"Unknown attempt decision outcome: {outcome!r}")
+    path = decision_path(root, run, token)
+    run = name(run)
+    value = dict(format=DECISION_FORMAT, run=run, attempt_id=token, outcome=outcome,
+                 lease_relative_path=f"leases/{run}.{token}", decided_utc=utc())
+    if set(extra) & set(value):
+        raise ValueError("Decision details cannot replace its identity fields")
+    value.update(extra)
+    try:
+        write_immutable(path, value)
+    except FileExistsError:
+        existing = read_decision(root, run, token)
+        if existing is None:
+            raise RuntimeError("An exclusive attempt decision vanished") from None
+        return False, existing
+    return True, value
+
+
+def publication_directory(root: Path, run: str) -> Path | None:
+    """Return the published bundle of a run: a legacy moved directory or its marked lease."""
+    root, run = Path(root), name(run)
+    path = root / "publishing" / run
+    if path.is_dir():
+        return path  # Legacy layout: the whole lease directory was moved here.
+    try:
+        marker = read_json(path)
+    except FileNotFoundError:
+        return None
+    token = marker.get("attempt_id") if isinstance(marker, dict) else None
+    if (not isinstance(marker, dict)
+            or set(marker) != {"format", "run", "attempt_id", "lease_relative_path"}
+            or marker["format"] != PUBLICATION_MARKER_FORMAT or marker["run"] != run
+            or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or marker["lease_relative_path"] != f"leases/{run}.{token}"):
+        raise ValueError("Publication marker differs from its run/attempt lease")
+    decision = read_decision(root, run, token)
+    if decision is None or decision["outcome"] != "publish":
+        raise ValueError("Publication marker has no standing publish decision")
+    return root / "leases" / f"{run}.{token}"
+
+
 class JobQueue:
     """Filesystem protocol; workers and controllers share this implementation."""
 
@@ -308,7 +393,7 @@ class JobQueue:
         self._machine_id = name(machine_id) if machine_id is not None else None
         self._progress_lock = threading.Lock()
         self.on_error = on_error
-        for directory in ("queue", "claimed", "leases", "publishing", "reclaimed", "results", "done", "failed", "logs"):
+        for directory in ("queue", "claimed", "leases", "decisions", "publishing", "reclaimed", "results", "done", "failed", "logs"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
 
     def _server(self, machine=None):
@@ -543,6 +628,9 @@ class JobQueue:
             raise LeaseLost(f"Attempt {claim.token} no longer owns {claim.task['run']}") from exc
         if owner["token"] != claim.token or task != claim.task:
             raise LeaseLost("Claim identity changed")
+        decision = read_decision(self.root, claim.task["run"], claim.token)
+        if decision is not None and decision["outcome"] != "publish":
+            raise LeaseLost(f"Attempt {claim.token} was {decision['outcome']} for {claim.task['run']}")
 
     def progress(self, claim: Claim, event: dict) -> None:
         """Record an actual I/O or frame-advance event with a nanosecond timestamp under ownership."""
@@ -639,14 +727,22 @@ class JobQueue:
                 continue
             task, token = owner["task"], owner["token"]
             run = name(task["run"])
+            decision = read_decision(self.root, run, token)
+            outcome = None if decision is None else decision["outcome"]
+            if outcome == "rejected" or (outcome == "publish" and (
+                    (self.root / "publishing" / run).exists()
+                    or not (lease / "publication.json").exists())):
+                # Published leases stay in leases/ by design; a rejection
+                # belongs to its rejector.
+                continue
             try:
                 progress = self._old_progress(owner, lease)
                 from .server_clock import file_mtime_ns
                 latest_ns = file_mtime_ns(progress)
-                if not self._server().stale(progress, self.stale_seconds):
+                if outcome != "reclaimed" and not self._server().stale(progress, self.stale_seconds):
                     continue
             except FileNotFoundError:
-                # Publication/reclaim may have atomically moved this lease.
+                # Another reclaimer/rejection may have atomically archived this lease.
                 continue
             claimed_path = (self.root.joinpath(*owner["claimed"]["relative_path"].split("/"))
                             if task.get("format") == "darsia-alias-task-v1"
@@ -655,12 +751,34 @@ class JobQueue:
                 expected = self.root / "claimed" / name(owner["machine"]) / (run + ".json")
                 if claimed_path != expected:
                     raise ValueError("Portable claim reference differs from its canonical shared location")
+            if outcome == "publish":
+                # A stale publisher stopped between its decision and its run marker.
+                self._write_publication_marker(run, token)
+                self._finish_publication(lease)
+                continue
+            if decision is None:
+                if (lease / "publication.json").exists():
+                    # N67: the products of this attempt are saved. Finish it by
+                    # publication; a published run is never re-run.
+                    _won, decision = decide(self.root, run, token, "publish",
+                                            decided_by="reclaim_stale_recovery")
+                    if decision["outcome"] == "publish":
+                        self._write_publication_marker(run, token)
+                        self._finish_publication(lease)
+                    continue
+                won, decision = decide(self.root, run, token, "reclaimed",
+                                       last_actual_progress_unix_ns=latest_ns)
+                if not won:
+                    continue  # A publisher or another reclaimer decided first.
+            # A standing reclaim decision: archive the lease. This also retries
+            # the archive steps when an earlier pass stopped before moving it.
+            latest_ns = decision.get("last_actual_progress_unix_ns", latest_ns)
             archive = self.root / "reclaimed" / run / token
             archive.mkdir(parents=True, exist_ok=True)
             try:
                 rename(lease, archive / "lease")
             except FileNotFoundError:
-                continue  # Publication or another reclaimer won the rename.
+                continue  # Another reclaimer archived this lease.
             except FileExistsError:
                 continue
             for old in (claimed_path, self.root / "queue" / (run + ".json")):
@@ -668,8 +786,9 @@ class JobQueue:
                     rename(old, archive / "task.json")
             if (self.root / "publishing" / run).exists():
                 raise RuntimeError("Reclaimed run already has a publication owner")
-            retry = dict(task, attempt_id=uuid.uuid4().hex)
-            write_immutable(self.root / "queue" / (run + ".json"), retry)
+            if (archive / "reclaimed.json").exists():
+                continue  # An earlier pass already enqueued and recorded this retry.
+            retry = self._reclaim_retry(task, token)
             record = dict(run=task["run"], previous_attempt=token,
                           next_attempt=retry["attempt_id"], reclaimed_utc=utc(),
                           last_actual_progress_unix_ns=latest_ns)
@@ -704,6 +823,16 @@ class JobQueue:
                 if not self._server().stale(marker, self.stale_seconds):
                     continue
                 prior_lineage = self._prior_resume_lineage(run, token)
+                decision = read_decision(self.root, run, token)
+                if decision is None:
+                    won, decision = decide(self.root, run, token, "reclaimed",
+                                           last_actual_progress_unix_ns=last_ns)
+                    if not won:
+                        continue  # A publisher or retirement decided first.
+                if decision["outcome"] != "reclaimed":
+                    continue
+                # A standing reclaim decision whose claim was not archived yet,
+                # also when an earlier reclaim pass stopped after its decision.
                 archive = self.root / "reclaimed" / run / token
                 archive.mkdir(parents=True, exist_ok=True)
                 if lease.exists():
@@ -715,20 +844,37 @@ class JobQueue:
                 continue
             if (self.root / "publishing" / run).exists():
                 continue
-            retry = dict(task, attempt_id=uuid.uuid4().hex)
-            write_immutable(self.root / "queue" / (run + ".json"), retry)
+            if (archive / "reclaimed.json").exists():
+                continue  # An earlier pass already enqueued and recorded this retry.
+            present = archive / "lease" if (archive / "lease").exists() else lease
+            retry = self._reclaim_retry(task, token)
             record = dict(run=task["run"], previous_attempt=token,
                           next_attempt=retry["attempt_id"], reclaimed_utc=utc(),
                           last_actual_progress_unix_ns=last_ns,
                           # An owner may have appeared between the initial
                           # observation and the atomic retirement. Preserve all
                           # ordinary prefix/OS-retirement guards in that case.
-                          interrupted_claim_before_science=not (archive / "lease" / "owner.json").exists(),
+                          interrupted_claim_before_science=not (present / "owner.json").exists(),
                           prior_resume_lineage=prior_lineage,
                           preserve_prior_resume_lineage=True)
             write_immutable(archive / "reclaimed.json", record)
             reclaimed.append(record)
         return reclaimed
+
+    def _reclaim_retry(self, task, token):
+        """Enqueue one fresh generation; reuse the one an interrupted archive pass queued."""
+        pending = self.root / "queue" / (name(task["run"]) + ".json")
+        try:
+            existing = read_json(pending)
+        except FileNotFoundError:
+            existing = None
+        if (isinstance(existing, dict) and existing.get("attempt_id") != token
+                and {key: value for key, value in existing.items() if key != "attempt_id"}
+                    == {key: value for key, value in task.items() if key != "attempt_id"}):
+            return existing
+        retry = dict(task, attempt_id=uuid.uuid4().hex)
+        write_immutable(pending, retry)  # Any other queued file still refuses, as before.
+        return retry
 
     def reject_before_science(self, claim: Claim, reason: str, owner: dict) -> dict:
         """Retire only an empty alias admission, then let another machine try it.
@@ -746,6 +892,9 @@ class JobQueue:
             raise ValueError("Pre-science rejection cannot discard an attempt with output/progress")
         run = name(claim.task["run"])
         prior_lineage = self._prior_resume_lineage(run, claim.token)
+        won, _decision = decide(self.root, run, claim.token, "rejected")
+        if not won:
+            raise LeaseLost("Reclaim/publication already retired this input admission")
         archive = self.root / "reclaimed" / run / claim.token
         archive.mkdir(parents=True, exist_ok=True)
         try:
@@ -774,16 +923,21 @@ class JobQueue:
         if alias and not callable(claim.publication_factory):
             raise RuntimeError("Alias publication requires its original immutable shared-bundle binding")
         candidate = claim.output / ("candidate_completed.json" if success else "failed.json")
-        write_immutable(candidate, document)
+        try:
+            write_immutable(candidate, document)
+        except FileExistsError:
+            # Only a success retry of this attempt reuses its identical original bytes.
+            if not success or candidate.read_bytes() != _immutable_bytes(document):
+                raise
         self.assert_owner(claim)
-        destination = self.root / "publishing" / name(claim.task["run"])
+        run = name(claim.task["run"])
         existing_path = claim.lease / "publication.json"
         if not success and existing_path.exists():
             existing = read_json(existing_path)
             if existing.get("success") is True:
-                # A failed ownership move must retain the original success
-                # bundle for explicit recovery, never rewrite publication.json
-                # with a second failure publication or attempt another move.
+                # A failure after the prepared success must retain the original
+                # success bundle for recovery, never rewrite publication.json
+                # with a second failure publication or make another decision.
                 if existing.get("attempt_id") != claim.token:
                     raise ValueError("Existing success publication belongs to another attempt")
                 if alias:
@@ -804,7 +958,7 @@ class JobQueue:
                     no_publication_rewrite=True, no_ownership_move=True))
                 return document
         # Prepare recovery metadata before the ownership transition. A crash
-        # after rename can then finish publication without scientific replay.
+        # after the decision can then finish publication without scientific replay.
         prepared = None
         if alias:
             original = descriptor(candidate)
@@ -832,28 +986,43 @@ class JobQueue:
             if alias:
                 publication = dict(format="darsia-alias-publication-v1", run=claim.task["run"],
                                    attempt_id=claim.token, success=success, **prepared)
-            write_immutable(claim.lease / "publication.json", publication, create_parents=False)
+            write_immutable(existing_path, publication, create_parents=False)
         except FileNotFoundError as exc:
             raise LeaseLost("Reclaim closed the publication lease") from exc
+        except FileExistsError:
+            # A success retry of this attempt accepts only its identical record.
+            if not success or existing_path.read_bytes() != _immutable_bytes(publication):
+                raise
         self.assert_owner(claim)
         if alias:
             self._check_n43_reference_publication(publication,claim.task,success)
-        try:
-            from .publication_handles import ordinary_publication_move
-
-            def owner():
-                self.assert_owner(claim)
-                self._shared_target(destination)
-
-            ordinary_publication_move(claim.lease, destination,
-                move=_windows_rename if os.name == "nt" else os.rename,
-                assert_owner=owner,
-                record=lambda attempt, phase, value: self._publication_diagnostic(
-                    claim, attempt, phase, value))
-        except FileNotFoundError as exc:
-            raise LeaseLost("Reclaim won before publication") from exc
-        self._finish_publication(destination)
+        # The ownership transition is one exclusive-create decision file. The
+        # lease directory never moves, so handles open inside it cannot block it.
+        self._shared_target(decision_path(self.root, run, claim.token))
+        _won, decision = decide(self.root, run, claim.token, "publish")
+        if decision["outcome"] != "publish":
+            raise LeaseLost("Reclaim won before publication")
+        self._write_publication_marker(run, claim.token)
+        self._finish_publication(claim.lease)
         return document
+
+    def _write_publication_marker(self, run, token):
+        """Bind the run to its in-place published lease; an identical marker is a retry."""
+        run = name(run)
+        path = self.root / "publishing" / run
+        marker = dict(format=PUBLICATION_MARKER_FORMAT, run=run, attempt_id=token,
+                      lease_relative_path=f"leases/{run}.{token}")
+        self._shared_target(path)
+        if not path.exists():
+            try:
+                write_immutable(path, marker)
+                return
+            except FileExistsError:
+                pass
+        if path.is_dir():
+            raise RuntimeError("Run already has a legacy publication directory")
+        if read_json(path) != marker:
+            raise RuntimeError("Run already has a publication marker of another attempt")
 
     def _publication_diagnostic(self, claim, attempt, phase, value):
         """Immutable owned-job metadata; never a stream left open on the lease."""
@@ -900,7 +1069,7 @@ class JobQueue:
                         raise ValueError("Done identity changed")
 
     def _finish_alias_publication(self, directory, publication):
-        """Finish only the immutable moved shared bundle, never producer C: paths."""
+        """Finish only the immutable published shared bundle, never producer C: paths."""
         owner = read_json(directory / "owner.json")
         task, token = owner["task"], owner["token"]
         run = name(task["run"])
@@ -1031,8 +1200,12 @@ class JobQueue:
 
     def recover_publications(self) -> None:
         """Finish pending publications while leaving matching completed/done documents untouched."""
-        for directory in (self.root / "publishing").iterdir():
-            if (directory / "publication.json").exists():
+        for entry in (self.root / "publishing").iterdir():
+            if entry.name.startswith("."):
+                continue  # A write_immutable temporary, never a publication.
+            # A marker file names its in-place lease; a legacy directory is the moved lease.
+            directory = publication_directory(self.root, entry.name)
+            if directory is not None and (directory / "publication.json").exists():
                 self._finish_publication(directory)
 
     def complete(self, claim: Claim, result: dict) -> dict:

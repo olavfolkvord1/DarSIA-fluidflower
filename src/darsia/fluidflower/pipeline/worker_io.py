@@ -124,8 +124,10 @@ def owner_for_attempt(root,task,service_id):
              root/"publishing"/run/"owner.json"]
     matches=[]
     for path in sources:
+        # publishing/<run> is a marker file in the in-place layout (POSIX:
+        # NotADirectoryError, Windows: FileNotFoundError); its lease is above.
         try: owner=read_json(path)
-        except FileNotFoundError: continue
+        except (FileNotFoundError,NotADirectoryError): continue
         if owner.get("token")==token:
             if owner.get("machine")!=service_id or owner.get("task")!=task:
                 raise ValueError("Actual owner and original task/service differ")
@@ -156,10 +158,11 @@ def claimed_task_after_archive(root,service_id,event):
     paths=[(root/"claimed"/service_id/(run+".json"),False),
            (root/"reclaimed"/run/token/"task.json",False),
            (root/"reclaimed"/run/token/"lease"/"owner.json",True),
+           (root/"leases"/(run+"."+token)/"owner.json",True),
            (root/"publishing"/run/"owner.json",True)]
     for path,owner in paths:
         try: value=read_json(path)
-        except FileNotFoundError: continue
+        except (FileNotFoundError,NotADirectoryError): continue
         task=value.get("task") if owner else value
         if isinstance(task,dict) and task.get("attempt_id")==token:
             if owner and value.get("machine")!=service_id:

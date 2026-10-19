@@ -603,7 +603,9 @@ def test_original_initial_promotion_persists_typed_guard_and_checks_all_seams(mo
     result=dict(complete=True,run="ac52",worker_references_closed=True,TESTONLY="original scientific bytes")
     assert queue.complete(claim,result) is result
     assert calls==[True,True,True,True]
-    record=module.read_json(queue.root/"publishing"/"ac52"/"publication.json")
+    # The persisted record stays in the in-place lease that the run marker names.
+    assert module.publication_directory(queue.root,"ac52")==claim.lease and claim.lease.is_dir()
+    record=module.read_json(claim.lease/"publication.json")
     assert record["n43_reference_guard"]=={"TESTONLY":"exact guard checked independently"}
     assert module.read_json(queue.root/"results"/"ac52"/"completed.json")==result
     assert (queue.root/"done"/"ac52.json").is_file()
