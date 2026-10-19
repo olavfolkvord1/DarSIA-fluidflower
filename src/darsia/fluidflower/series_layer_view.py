@@ -16,6 +16,7 @@ The full geometry-and-facies page remains available as the advanced view.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRectF,
+    QSettings,
     Qt,
     QThread,
     QTimer,
@@ -57,6 +59,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -125,6 +128,15 @@ _UNDO_LIMIT = 200
 # Column of the layer table whose box shows or hides a layer (display only).
 _SHOW_COLUMN = 4
 _SHOW_TIP = "Show or hide this layer in the photograph (display only)"
+# Another photograph of the reference run shown under the marks (display only).
+_BACKGROUND_TIP = (
+    "Photograph shown under the marks. Choose another photo of the same run and "
+    "camera position, for example one taken before the indicator was added. "
+    "Display only: the proposal always uses the reference photo. T switches "
+    "between the reference photo and the chosen photo."
+)
+_BACKGROUND_SETTINGS = ("DarSIA", "FluidFlower layer painting")
+_BACKGROUND_CHOOSE = "choose"
 # Short role names for the facies table.
 _ROLE_SHORT = {"porous_medium": "Porous", "free_water": "Free water"}
 _CANVAS_HINT = (
@@ -1897,6 +1909,14 @@ class LayerPainterView(QWidget):
         self._reference_token: dict[str, Any] | None = None
         self._plain: np.ndarray | None = None
         self._enhanced: np.ndarray | None = None
+        # Another photograph of the reference run, shown under the marks
+        # instead of the reference photo when chosen (display only).
+        self._background_path: Path | None = None
+        self._background_rgb: np.ndarray | None = None
+        self._background_plain: np.ndarray | None = None
+        self._background_enhanced: np.ndarray | None = None
+        self._background_token: dict[str, Any] | None = None
+        self._background_shown = False
         self._proposal_thread: QThread | None = None
         self._proposal_worker: _ProposalWorker | None = None
         self._save_thread: QThread | None = None
@@ -1998,7 +2018,9 @@ class LayerPainterView(QWidget):
                 "as Excluded. Untick Show to hide a layer in the photograph; this "
                 "changes only what is shown, and its points cannot be edited "
                 "while it is hidden. Right-click the list to show only one layer, "
-                "or all layers again."
+                "or all layers again. Background (T) shows another photo of the "
+                "same run under the marks, for example one taken before the "
+                "indicator was added; the proposal still uses the reference photo."
             )
         )
         self.layer_table = QTableWidget(0, 5)
@@ -2325,6 +2347,18 @@ class LayerPainterView(QWidget):
         )
         self.enhance.toggled.connect(self._enhance_toggled)
         display.addWidget(self.enhance)
+        display.addSpacing(8)
+        background_label = QLabel("Background")
+        background_label.setToolTip(_BACKGROUND_TIP)
+        display.addWidget(background_label)
+        self.background = QComboBox()
+        self.background.setToolTip(_BACKGROUND_TIP)
+        self.background.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.background.activated.connect(self._background_activated)
+        display.addWidget(self.background)
+        self._refresh_background_choice()
         display.addStretch(1)
 
         self.photo_note_row = QWidget()
@@ -2367,6 +2401,7 @@ class LayerPainterView(QWidget):
             ("H", lambda: self.set_tool("pan")),
             ("F", self.canvas.fit_image),
             ("P", self.propose),
+            ("T", self.toggle_background),
             ("[", lambda: self._step_brush(-6)),
             ("]", lambda: self._step_brush(6)),
         ):
@@ -2441,6 +2476,7 @@ class LayerPainterView(QWidget):
 
         self.save_session()
         # Which layers are hidden is a display choice for the session shown.
+        self._clear_background()
         self._hidden_layers = set()
         self._hidden_session = None
         self.canvas.set_hidden_layers(())
@@ -2495,6 +2531,7 @@ class LayerPainterView(QWidget):
                         reference.run_id, reference.baseline_image
                     )
                 self._load_reference_photo(reference)
+                self._restore_background()
                 proposal = lp.load_proposal(self.project, reference.run_id)
                 if (
                     proposal is not None
@@ -2563,10 +2600,11 @@ class LayerPainterView(QWidget):
         self._update_enhanced()
         self._show_reference(reset_view=True)
 
-    def _update_enhanced(self) -> None:
+    def _display_mask(self) -> np.ndarray | None:
+        """Pixels used to stretch the display contrast (inside the rig frame)."""
+
         if self.image is None:
-            self._enhanced = None
-            return
+            return None
         frame = self.current_frame()
         shape = self.image.display.shape[:2]
         scale = (
@@ -2574,23 +2612,37 @@ class LayerPainterView(QWidget):
             shape[1] / self.image.image_size[0],
         )
         if frame is not None:
-            mask = lp.frame_mask(frame, shape, scale)
-        else:
-            # Without a frame, leave out the border where the rig frame usually is.
-            mask = np.zeros(shape, dtype=bool)
-            rows, cols = int(0.12 * shape[0]), int(0.08 * shape[1])
-            mask[rows : shape[0] - rows, cols : shape[1] - cols] = True
-        self._enhanced = lp.enhance_contrast(self.image.display, mask)
+            return lp.frame_mask(frame, shape, scale)
+        # Without a frame, leave out the border where the rig frame usually is.
+        mask = np.zeros(shape, dtype=bool)
+        rows, cols = int(0.12 * shape[0]), int(0.08 * shape[1])
+        mask[rows : shape[0] - rows, cols : shape[1] - cols] = True
+        return mask
+
+    def _update_enhanced(self) -> None:
+        if self.image is None:
+            self._enhanced = None
+            return
+        self._enhanced = lp.enhance_contrast(self.image.display, self._display_mask())
+        self._update_background_enhanced()
 
     def _show_reference(self, *, reset_view: bool) -> None:
         if self.image is None or self._reference_token is None:
             return
+        token = self._reference_token
         display = self._enhanced if self.enhance.isChecked() else self._plain
+        if self._background_shown and self._background_token is not None:
+            token = self._background_token
+            display = (
+                self._background_enhanced
+                if self.enhance.isChecked() and self._background_enhanced is not None
+                else self._background_plain
+            )
         assert display is not None
         self.canvas.set_photo(
             display,
             self.image.image_size,
-            token=self._reference_token,
+            token=token,
             reset_view=reset_view,
         )
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
@@ -2635,6 +2687,216 @@ class LayerPainterView(QWidget):
         )
         self.photo_note_row.show()
         return True
+
+    # ----------------------------------------------------- background photo
+
+    def background_available(self) -> bool:
+        """A background photo needs the raw reference photograph of the run."""
+
+        if self.image is None:
+            return False
+        try:
+            return workspace_frame.frame_kind(self._workspace_frame_config) == "raw"
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @property
+    def background_path(self) -> Path | None:
+        """The chosen background photo of this run, if any."""
+
+        return self._background_path
+
+    @property
+    def background_shown(self) -> bool:
+        return bool(self._background_shown and self._background_token is not None)
+
+    def set_background_photo(
+        self, path: Path | str | None, *, show: bool = True, quiet: bool = False
+    ) -> bool:
+        """Show another photograph of the reference run under the marks.
+
+        The photograph must have the raw size of the reference photo, for
+        example one taken earlier in the same run before the indicator was
+        added. Only the display changes: marks, strokes and the proposal stay
+        on top, painting works as on the reference photo, and the proposal is
+        always computed from the reference photo. ``None`` forgets the choice.
+        The choice is remembered per user, series folder and run.
+        """
+
+        if path is None:
+            self._clear_background()
+            self._remember_background(None)
+            if self.image is not None and self._other_photo is None:
+                self._show_reference(reset_view=False)
+            return True
+        if not self.background_available():
+            if not quiet:
+                QMessageBox.information(
+                    self,
+                    "Background photo",
+                    "A background photo can be used with the raw reference "
+                    "photograph only.",
+                )
+            return False
+        assert self.image is not None
+        path = Path(path)
+        expected = (int(self.image.image_size[0]), int(self.image.image_size[1]))
+        try:
+            width, height = photo_size(path)
+        except (OSError, ValueError) as error:
+            if not quiet:
+                QMessageBox.warning(self, "Could not read the photograph", str(error))
+            return False
+        if (int(width), int(height)) != expected:
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    "Background photo",
+                    f"{path.name} is {width} x {height} pixels, the reference "
+                    f"photo {expected[0]} x {expected[1]}. Choose a photograph "
+                    "of the same run and camera position.",
+                )
+            return False
+        from darsia.fluidflower.photograph_io import load_reduced
+
+        shape = self.image.display.shape[:2]
+        try:
+            factor = max(1, int(math.ceil(max(width, height) / lp.DISPLAY_LIMIT_PX)))
+            rgb = np.asarray(load_reduced(path, factor), dtype=np.float32)
+        except (OSError, ValueError) as error:
+            if not quiet:
+                QMessageBox.warning(self, "Could not read the photograph", str(error))
+            return False
+        if rgb.shape[:2] != shape:
+            import cv2
+
+            rgb = cv2.resize(rgb, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+        rgb = np.clip(rgb, 0.0, 1.0)
+        self._background_path = path
+        self._background_rgb = rgb
+        self._background_plain = np.rint(255.0 * rgb).astype(np.uint8)
+        self._update_background_enhanced()
+        self._background_token = {
+            "baseline": self._background_plain,
+            "path": str(path),
+            "raw_size": expected,
+            "reference": False,
+            "background": True,
+        }
+        self._background_shown = bool(show)
+        self._remember_background(path)
+        self._refresh_background_choice()
+        if self._other_photo is None:
+            self._show_reference(reset_view=False)
+        return True
+
+    def show_background(self, shown: bool) -> None:
+        """Show the chosen background photo (True) or the reference photo."""
+
+        self._background_shown = bool(shown) and self._background_token is not None
+        self._refresh_background_choice()
+        if self.image is not None:
+            self._show_reference(reset_view=False)
+
+    def toggle_background(self) -> None:
+        """Switch between the reference photo and the chosen background (T)."""
+
+        if self._background_token is None:
+            self.choose_background_photo()
+            return
+        self.show_background(not self._background_shown)
+
+    def choose_background_photo(self) -> bool:
+        if not self.background_available():
+            self._refresh_background_choice()
+            return False
+        assert self.image is not None
+        start = Path(self.image.path).parent
+        start = start.parent if start.parent != start else start
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Background photo of the same run",
+            str(start),
+            "Photographs (*.jpg *.jpeg *.png *.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            self._refresh_background_choice()
+            return False
+        return self.set_background_photo(Path(path))
+
+    def _update_background_enhanced(self) -> None:
+        if self._background_rgb is None or self.image is None:
+            self._background_enhanced = None
+            return
+        self._background_enhanced = lp.enhance_contrast(
+            self._background_rgb, self._display_mask()
+        )
+
+    def _clear_background(self) -> None:
+        self._background_path = None
+        self._background_rgb = None
+        self._background_plain = None
+        self._background_enhanced = None
+        self._background_token = None
+        self._background_shown = False
+        self._refresh_background_choice()
+
+    def _refresh_background_choice(self) -> None:
+        box = getattr(self, "background", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        try:
+            box.clear()
+            box.addItem("Reference photo", None)
+            if self._background_path is not None:
+                box.addItem(self._background_path.name, str(self._background_path))
+            box.addItem("Choose photo...", _BACKGROUND_CHOOSE)
+            box.setCurrentIndex(
+                1 if self._background_shown and self._background_path is not None else 0
+            )
+            box.setEnabled(self.background_available())
+        finally:
+            box.blockSignals(False)
+
+    def _background_activated(self, index: int) -> None:
+        data = self.background.itemData(index)
+        if data == _BACKGROUND_CHOOSE:
+            self.choose_background_photo()
+        else:
+            self.show_background(data is not None)
+
+    def _background_settings_key(self) -> str | None:
+        reference = self.reference()
+        if reference is None:
+            return None
+        root = str(getattr(self.project, "root", "") or "")
+        digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
+        return f"background/{digest}/{reference.run_id}"
+
+    def _remember_background(self, path: Path | None) -> None:
+        key = self._background_settings_key()
+        if key is None:
+            return
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        if path is None:
+            settings.remove(key)
+        else:
+            settings.setValue(key, str(path))
+        settings.sync()
+
+    def _restore_background(self) -> None:
+        """Load the background photo last chosen for this run (not shown)."""
+
+        key = self._background_settings_key()
+        if key is None or not self.background_available():
+            self._refresh_background_choice()
+            return
+        value = QSettings(*_BACKGROUND_SETTINGS).value(key, "")
+        if value and Path(str(value)).is_file():
+            self.set_background_photo(Path(str(value)), show=False, quiet=True)
+        else:
+            self._refresh_background_choice()
 
     def _sync_settings(self) -> None:
         session = self.session
