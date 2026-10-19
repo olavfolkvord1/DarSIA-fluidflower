@@ -390,6 +390,41 @@ def test_N54_renamed_GUI_row_cannot_inherit_another_runs_registration():
     assert actual["run_id"]=="ac47" and "registration" not in actual
 
 
+@pytest.mark.parametrize("optional", [{}, {"facies_path": ""},
+    {"property_change_proposals": [{"TESTONLY": "preserve pending review"}]}])
+def test_N54_legacy_registered_contract_roundtrips_without_optional_field_insertion(optional):
+    from darsia.fluidflower.geometry_facies import normalize_run_geometry_config
+    app, page, cls = registered_table_page_TESTONLY()
+    row = dict(run_id="ac17", enabled=True, acquisition_state="unknown",
+        geometry_choice="run_override", labels_path="TESTONLY/labels.npz",
+        source_image_path="TESTONLY/photo.npz", registration={"TESTONLY": "original"},
+        **optional)
+    contract = normalize_run_geometry_config({"runs": [row],
+        "provenance": {"TESTONLY": "original contract"}})
+    page.config = {"run_geometry": deepcopy(contract)}
+    cls._append_run_geometry_row(page, row)
+    assert cls._collect_run_geometry(page) == contract
+    assert page.config["run_geometry"] == contract
+    assert app is not None
+
+
+def test_N54_user_can_add_then_clear_a_previously_absent_facies_path():
+    app, page, cls = registered_table_page_TESTONLY()
+    row = dict(run_id="ac17", registration={"TESTONLY": "original"})
+    cls._append_run_geometry_row(page, row)
+    assert "facies_path" not in cls._collect_run_geometry(page)["runs"][0]
+    page.run_geometry_table.item(0, 6).setText("TESTONLY/user-selected.npz")
+    changed = cls._collect_run_geometry(page)["runs"][0]
+    assert changed["facies_path"] == "TESTONLY/user-selected.npz"
+    assert changed["registration"] == row["registration"]
+    cls._append_run_geometry_row(page, changed)
+    page.run_geometry_table.item(1, 6).setText("")
+    cleared = cls._collect_run_geometry(page)["runs"][1]
+    assert cleared["facies_path"] == ""
+    assert cleared["registration"] == row["registration"]
+    assert app is not None
+
+
 def test_N54_changed_label_path_does_not_relabel_original_registration_descriptor():
     app,page,cls=registered_table_page_TESTONLY()
     original=dict(run_id="ac18",geometry_choice="run_override",labels_path="TESTONLY/original.npz",

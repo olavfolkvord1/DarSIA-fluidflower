@@ -1127,11 +1127,13 @@ class GeometryFaciesPage(ModulePage):
             self.run_geometry_table.blockSignals(False)
 
     def _collect_run_geometry(self) -> dict[str, Any]:
-        contract = default_run_geometry_config()
+        contract = normalize_run_geometry_config(
+            getattr(self, "config", {}).get("run_geometry")
+        )
         contract["geometry_policy"] = str(
             self.run_geometry_policy.currentData() or "allow_reviewed_run_overrides"
         )
-        contract["change_detection"] = {
+        contract["change_detection"].update({
             "enabled": self.run_geometry_change_detection.isChecked(),
             "warning_displacement_fraction_of_height": (
                 self.run_geometry_displacement_threshold.value() / 100.0
@@ -1139,7 +1141,7 @@ class GeometryFaciesPage(ModulePage):
             "minimum_affected_boundary_fraction": (
                 self.run_geometry_affected_threshold.value() / 100.0
             ),
-        }
+        })
         rows: list[dict[str, Any]] = []
         for index in range(self.run_geometry_table.rowCount()):
             acquisition = self.run_geometry_table.cellWidget(index, 2)
@@ -1151,8 +1153,7 @@ class GeometryFaciesPage(ModulePage):
             # unchanged strict source validator then requires genuine new proof.
             row = (deepcopy_settings(original) if isinstance(original, Mapping)
                    and str(original.get("run_id") or "").strip().casefold() == run_id else {})
-            row.update(
-                {
+            values = {
                     "enabled": self.run_geometry_table.item(index, 0).checkState()
                     == Qt.CheckState.Checked,
                     "run_id": run_id,
@@ -1175,9 +1176,18 @@ class GeometryFaciesPage(ModulePage):
                     "facies_path": self.run_geometry_table.item(index, 6)
                     .text()
                     .strip(),
-                    "property_change_proposals": [],
                 }
-            )
+            if row:
+                # Empty optional fields were absent in older saved revisions.
+                # Opening the editor must not add them or erase opaque proposals.
+                defaults = {"enabled": True, "acquisition_state": "unknown",
+                    "geometry_choice": "series_reference", "source_image_path": "",
+                    "labels_path": "", "facies_path": ""}
+                for key, value in values.items():
+                    if key in row or value != defaults.get(key):
+                        row[key] = value
+            else:
+                row.update(values, property_change_proposals=[])
             rows.append(row)
         contract["runs"] = rows
         return contract
