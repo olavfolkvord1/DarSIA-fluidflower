@@ -1,7 +1,7 @@
 """Optional storage of the per-pixel colour-path coordinate (default off).
 
 Synthetic frames only. With the option off every output must stay
-byte-identical to the writer of the commit before this change (2d8ccda3,
+byte-identical to the writer of the integration commit before this change (563e562f,
 run from its own source tree). With the option on, each frame also writes
 colour_path_coordinate.npz: float32 on the native grid, NaN outside the
 colour-quantifiable support, bit-identical to the parameter the frame's own
@@ -31,7 +31,9 @@ from darsia.fluidflower.mass import n1_pipeline as n1
 from darsia.fluidflower.mass.production_precision import PixelMath
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-HEAD_COMMIT = "2d8ccda332e7e4043801db48ed6506b2539a8268"  # Writer before this change.
+# The exported patch's six old source blobs match this local integration base.
+# Claude's private 2d8ccda3 commit object is not part of a format-patch export.
+HEAD_COMMIT = "563e562f5ca6ae4deefaab9c91a617bfc97270b8"
 ON = {"profile": "full", "store_colour_coordinate": True}
 LEAN_ON = {"profile": "lean", "store_colour_coordinate": True}
 
