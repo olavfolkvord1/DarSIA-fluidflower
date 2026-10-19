@@ -354,7 +354,8 @@ class SeriesInputs:
         self.model_bundle = self._models()
         reference = config["phase"]["reference"]
         row = self.reader.json(reference["native_row"])
-        self.raw_mode = all(frame["native_task"]["kind"] == "raw_rig" for frame in config["frames"])
+        frames = config.get("frames", ())
+        self.raw_mode = bool(frames) and all(frame["native_task"]["kind"] == "raw_rig" for frame in frames)
         if self.raw_mode:
             self._verify_raw_acquisition(reference, row)
         full, valid = loaders.compose_extended_scientific(
