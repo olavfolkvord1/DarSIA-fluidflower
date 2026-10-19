@@ -185,11 +185,14 @@ k.GetProcessTimes.restype=wintypes.BOOL
 times=[wintypes.FILETIME() for _ in range(4)]
 if not k.GetProcessTimes(k.GetCurrentProcess(),*[ctypes.byref(value) for value in times]):raise ctypes.WinError(ctypes.get_last_error())
 created=(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
-h=k.CreateFileW(sys.argv[1],0x80,0x3,None,3,0x02000000,None)
+# Attribute-only access is exempt from sharing; retain real directory read access.
+FILE_LIST_DIRECTORY,FILE_SHARE_READ_WRITE=0x1,0x3
+h=k.CreateFileW(sys.argv[1],FILE_LIST_DIRECTORY,FILE_SHARE_READ_WRITE,None,3,0x02000000,None)
 if h==ctypes.c_void_p(-1).value:raise ctypes.WinError(ctypes.get_last_error())
 try:
  print(json.dumps(dict(pid=os.getpid(),path=sys.argv[1],executable=sys.executable,
-  creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]))),flush=True)
+  creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]),
+  requested_access=FILE_LIST_DIRECTORY,share_mode=FILE_SHARE_READ_WRITE)),flush=True)
  sys.stdin.readline()
 finally:
  if not k.CloseHandle(h):raise ctypes.WinError(ctypes.get_last_error())
@@ -213,7 +216,8 @@ finally:
         created=(observed[0].dwHighDateTime<<32)|observed[0].dwLowDateTime
         assert Path(owner.pop("executable")).resolve(strict=True) == executable
         assert owner == dict(pid=proc.pid,path=str(path),
-            creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]))
+            creation_filetime_100ns=str(created),python_version=list(sys.version_info[:3]),
+            requested_access=0x1,share_mode=0x3)
         yield SimpleNamespace(path=path,pid=proc.pid,creation_filetime_100ns=str(created),close=close)
     finally:
         try: close()
