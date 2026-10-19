@@ -550,9 +550,13 @@ def test_a_full_task_keeps_the_measured_profile_path_and_its_pins(tmp_path, monk
                                  repository=repository)
     assert isinstance(legacy, cap.SpaceEstimate) and explicit == legacy
     assert legacy.native_expected_bytes == 250 and checked == required + required
-    assert cap.report(legacy, {"free_bytes": 10**12}, 0, 40)["message"] == (
-        f"ac52: needed {legacy.needed(reserve_bytes=40)} bytes / free {10**12} bytes (includes other "
-        "active remaining output, estimated transient space and reserve)")
+    report = cap.report(legacy, {"free_bytes": 10**12}, 31, 40)
+    assert report["needed_bytes"] == legacy.needed(reserve_bytes=40)
+    assert report["other_active_remaining_bytes"] == 31
+    assert report["other_active_remaining_included_in_results_estimate"] is False
+    assert report["message"] == (
+        f"ac52: estimated needed {legacy.needed(reserve_bytes=40)} bytes / free {10**12} bytes "
+        "(this job, estimated transient space and reserve; estimate, not coordinated across hosts)")
 
 
 class _Ledger:
@@ -594,7 +598,9 @@ def test_claim_admission_refuses_when_free_minus_reserve_is_below_the_lean_estim
                                                                           sha256="c" * 64)])
     expected = storage.run_estimate("lean", config, pipeline="native-phase-n1")
     other = 31
-    free = expected["needed_bytes"] + other + _Ledger.reserve - shortfall
+    # N51: other retained reservations are informative; this job plus reserve
+    # determines the result-volume admission boundary on this host.
+    free = expected["needed_bytes"] + _Ledger.reserve - shortfall
     refusals = []
     runtime = SimpleNamespace(capacity_refusals={}, availability=lambda actual: rows,
                               stores=SimpleNamespace(), job=dict(series_id="FF_AC"))
@@ -638,7 +644,10 @@ def test_whole_job_report_labels_lean_runs_as_estimates(tmp_path, monkeypatch):
     stores = SimpleNamespace(machine_id="main", roots=lambda _: dict(results=str(tmp_path / "results")))
     report = cap.whole_job_report(stores, "FF_AC", [task], [config], repository=tmp_path)
     expected = storage.run_estimate("lean", config, pipeline="native-phase-n1")
-    assert report["needed_bytes"] == expected["needed_bytes"] + 31 + 40
+    assert report["needed_bytes"] == expected["needed_bytes"] + 40
+    assert report["other_active_remaining_bytes"] == 31
+    assert report["other_active_remaining_included_in_results_estimate"] is False
+    assert report["results_space_policy"] == "estimate, not coordinated across hosts"
     assert report["runs"][0]["storage_profile"] == "lean"
     assert "lean runs: ESTIMATE" in report["message"]
 
