@@ -52,7 +52,7 @@ def test_historical_roots_keep_their_rows_and_frame_images(tmp_path):
     folder = tmp_path / "native_frames/ac52"
     folder.mkdir(parents=True)
     candidate = SimpleNamespace(review_output_dir=tmp_path, run="ac52")
-    assert presentation._timeline_rows({"frame_sources": [{"elapsed_h": 1}]}, "ac52") == [{"elapsed_h": 1}]
+    assert presentation.timeline_rows({"frame_sources": [{"elapsed_h": 1}]}, "ac52") == [{"elapsed_h": 1}]
     assert presentation._presentation_photo(candidate, {}, 3) == folder / "frame_003.jpg"
     (folder / "frame_003.png").write_bytes(b"")
     assert presentation._presentation_photo(candidate, {}, 3) == folder / "frame_003.png"

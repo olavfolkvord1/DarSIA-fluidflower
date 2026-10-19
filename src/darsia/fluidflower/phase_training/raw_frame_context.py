@@ -26,6 +26,9 @@ from darsia.fluidflower.project import sha256_file
 
 CONTRACT = "darsia-raw-frame-geometry-v1"
 SUPPORT_CONTRACT = "darsia-raw-frame-feature-source-support-v1"
+# Training on RAW reviews uses baseline B and the previous frame on the native
+# centre, each with its exact valid mask (no extended ring).
+TEMPORAL_CONTRACT = "darsia-raw-native-centre-source-supported-v1"
 CONTEXT_BINDING_KEYS = frozenset({
     "reference_context_path", "reference_context_sha256",
     "photo_certified_sand_mask_path", "photo_certified_sand_mask_sha256",
@@ -40,6 +43,7 @@ class RawFrameGeometryCohort:
 
     ``context_binding`` holds the run's reference-context and photo-sand
     bindings (the keys V5 receipts carried) and is needed only by ``context``.
+    It defaults to the ``training_context`` the review root was written with.
     Audits, records and masks are SHA-checked on every access.
     """
 
@@ -50,10 +54,29 @@ class RawFrameGeometryCohort:
         manifest = read_raw_review_manifest(review_root, run)
         if manifest is None:
             raise ValueError("The review root holds no RAW photographic review for this run")
-        unknown = sorted(set(context_binding or {}) - CONTEXT_BINDING_KEYS)
+        path = Path(review_root) / "native_frames" / str(run).casefold() / "manifest.json"
+        self._bind(path, manifest, context_binding)
+
+    @classmethod
+    def from_manifest(cls, manifest_path: str | Path, *,
+                      context_binding: Mapping[str, Any] | None = None) -> "RawFrameGeometryCohort":
+        """The cohort of a RAW review manifest file, for example the trainer's staged copy."""
+        from darsia.fluidflower.raw_photographic_review import validate_raw_review_manifest
+
+        path = Path(manifest_path)
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+        manifest = validate_raw_review_manifest(document, str(document.get("run") or ""))
+        cohort = cls.__new__(cls)
+        cohort._bind(path, manifest, context_binding)
+        return cohort
+
+    def _bind(self, path: Path, manifest: Mapping, context_binding: Mapping[str, Any] | None) -> None:
+        """Take the run's frames, reference, grid and identities from one checked manifest."""
+        if context_binding is None:
+            context_binding = manifest.get("training_context") or {}
+        unknown = sorted(set(context_binding) - CONTEXT_BINDING_KEYS)
         if unknown:
             raise ValueError(f"Unknown RAW frame context bindings: {unknown}")
-        path = Path(review_root) / "native_frames" / str(run).casefold() / "manifest.json"
         self.run = manifest["run"]
         self.native_manifest_path = path
         self.native_manifest_sha256 = sha256_file(path)
@@ -111,17 +134,28 @@ class RawFrameGeometryCohort:
 
         return V5FrameGeometryCohort.H_previous_to_frame(self, previous_index, index)
 
-    def _valid(self, full: Mapping) -> tuple[np.ndarray, str]:
-        """The SHA-checked native valid mask of a record's ``full`` section, and its SHA."""
-        descriptor = full["native_centre"]["valid_mask"]
+    def native_centre(self, index: int | None) -> dict[str, dict]:
+        """The ``log_linear_rgb`` and ``valid_mask`` descriptors of a frame, or of baseline B (None).
+
+        Frames read their SHA-bound native record and the baseline its
+        acquisition-manifest record, so a caller can verify staged copies.
+        """
+        if index is None:
+            acquisitions = self._reader.json(self.reference["acquisition_manifest"])
+            centre = acquisitions["records"][self.reference["record_index"]]["full"]["native_centre"]
+        else:
+            if type(index) is not int or not 0 <= index < len(self.rows):
+                raise ValueError("RAW frame index outside its review timeline")
+            centre = self._reader.json(self.rows[index]["native_record"])["full"]["native_centre"]
+        return dict(log_linear_rgb=dict(centre["log_linear_rgb"]), valid_mask=dict(centre["valid_mask"]))
+
+    def _valid(self, index: int | None) -> tuple[np.ndarray, str]:
+        """The SHA-checked native valid mask of a frame or of baseline B (None), and its SHA."""
+        descriptor = self.native_centre(index)["valid_mask"]
         valid = np.asarray(self._reader.array(descriptor))
         if valid.dtype != np.bool_ or valid.shape != self.shape_hw:
             raise ValueError("RAW native valid mask differs from the review's native grid")
         return valid, descriptor["sha256"]
-
-    def _frame_valid(self, index: int) -> tuple[np.ndarray, str]:
-        """The native valid mask of one frame's SHA-bound native record, and its SHA."""
-        return self._valid(self._reader.json(self.rows[index]["native_record"])["full"])
 
     def feature_support(self, index: int, previous_index: int | None,
                         linear_input: Any = None) -> tuple[np.ndarray, dict[str, Any]]:
@@ -136,11 +170,9 @@ class RawFrameGeometryCohort:
             raise ValueError("RAW previous frame index is not earlier than current")
         current = self.frame(index)
         previous = None if previous_index is None else self.frame(previous_index)
-        current_valid, current_sha = self._frame_valid(index)
-        acquisitions = self._reader.json(self.reference["acquisition_manifest"])
-        baseline_valid, baseline_sha = self._valid(
-            acquisitions["records"][self.reference["record_index"]]["full"])
-        previous_valid, previous_sha = (None, None) if previous is None else self._frame_valid(previous_index)
+        current_valid, current_sha = self._valid(index)
+        baseline_valid, baseline_sha = self._valid(None)
+        previous_valid, previous_sha = (None, None) if previous is None else self._valid(previous_index)
         parameters = require_parameters("support")
         safe, raw_support = _support.compute_feature_support(
             current_valid=current_valid, baseline_valid=baseline_valid, previous_valid=previous_valid,
@@ -163,4 +195,4 @@ class RawFrameGeometryCohort:
         return safe, receipt
 
 
-__all__ = ["CONTEXT_BINDING_KEYS", "CONTRACT", "SUPPORT_CONTRACT", "RawFrameGeometryCohort"]
+__all__ = ["CONTEXT_BINDING_KEYS", "CONTRACT", "SUPPORT_CONTRACT", "TEMPORAL_CONTRACT", "RawFrameGeometryCohort"]

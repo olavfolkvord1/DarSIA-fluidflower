@@ -59,10 +59,21 @@ def test_every_new_raw_consumer_function_has_a_docstring(pairwise):
     items = [
         phase_photographic_assets._raw_review, phase_photographic_assets._raw_rows,
         phase_photographic_assets._raw_modes, storage_original_photo.publish_raw_original_png,
-        storage_original_photo._publish, phase_saved_presentation._timeline_rows,
+        storage_original_photo._publish, pairwise._deferred_presentation_validator,
         phase_saved_presentation._presentation_photo, phase_studio_photometry_preview_cache.raw_review_key_info,
         pairwise._raw_review_photograph, pairwise._raw_review_rows, cohort,
         *[getattr(cohort, name) for name in ("frame", "context", "H_v5_B_to_frame", "H_previous_to_frame",
-                                             "feature_support", "_valid", "_frame_valid")]]
+                                             "feature_support", "_valid", "native_centre", "from_manifest",
+                                             "_bind")]]
     for item in items:
         assert item.__doc__ and item.__doc__.strip(), item
+
+
+def test_deferred_presentation_of_a_raw_root_uses_the_current_reader(tmp_path, inputs, pairwise):
+    from darsia.fluidflower import phase_saved_candidate_admission, phase_saved_presentation
+    _write(tmp_path, inputs)
+    assert (pairwise._deferred_presentation_validator(tmp_path / "review", "ac52")
+            is phase_saved_presentation.validate_deferred_presentation)
+    assert (pairwise._deferred_presentation_validator(tmp_path / "historical", "ac52")
+            is phase_saved_candidate_admission.validate_deferred_presentation)
+    assert pairwise._deferred_presentation_validator.__doc__.strip()

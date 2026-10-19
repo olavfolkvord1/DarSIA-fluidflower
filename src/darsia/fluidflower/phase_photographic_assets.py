@@ -36,8 +36,8 @@ def _raw_rows(manifest, reference=False):
     if manifest.get("format") == RAW_REVIEW_FORMAT:
         return [manifest.get("reference") or {}] if reference else list(manifest.get("frames") or [])
     rows = [manifest.get("reference") or {}] if reference else (manifest.get("frame_sources") or [])
-    if rows and all(isinstance(row, Mapping) and isinstance(row.get("assets"), Mapping)
-                    and isinstance(row.get("acquisition"), Mapping) for row in rows):
+    from .raw_photographic_review import raw_review_row
+    if rows and all(raw_review_row(row) for row in rows):
         return list(rows)
     return None
 

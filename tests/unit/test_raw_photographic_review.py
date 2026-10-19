@@ -38,7 +38,8 @@ def _write_npy(path, array):
 
 def _record(tmp_path, name, *, raw_sha, profile_id="late", binding=None, jpeg_inputs=False, shift_x=0):
     folder = tmp_path / "records" / name
-    log = np.full((3, *NATIVE_HW), np.float32(0.25), dtype=np.float32)
+    log = np.empty((3, *NATIVE_HW), dtype=np.float32)
+    log[:] = np.log(np.linspace(2.0, 60000.0, NATIVE_HW[1], dtype=np.float32))[None, None, :]
     log[:, 0, 0] = np.nan
     valid = np.ones(NATIVE_HW, dtype=bool)
     valid[0, 0] = False
@@ -121,14 +122,14 @@ def test_writer_makes_one_lossless_root_with_the_required_manifest(tmp_path, inp
     assert path == tmp_path / "review/native_frames/ac52/manifest.json"
     assert manifest["format"] == review.RAW_REVIEW_FORMAT and manifest["source_kind"] == "raw"
     assert manifest["run"] == "ac52"
-    assert manifest["modes"] == ["original", "natural", "lift1", "lift2"]
+    assert manifest["modes"] == ["original", "natural", "lift1", "lift2", "raw_detail"]
     assert manifest["native_configuration"] == inputs["configuration"]
     assert manifest["raw_binding"] == inputs["binding"]
     assert manifest["content_box_xywh"] == [5, 3, 16, 10] and manifest["canvas_wh"] == [24, 14]
     assert [frame["case_id"] for frame in manifest["frames"]] == ["ac52_f1", "ac52_f2"]
     frame = manifest["frames"][1]
     assert frame["frame_index"] == 1 and frame["elapsed_h"] == 0.5
-    assert set(frame["assets"]) == {"original", "natural", "lift1", "lift2"}
+    assert set(frame["assets"]) == {"original", "natural", "lift1", "lift2", "raw_detail"}
     assert frame["assets"]["natural"]["path"] == "frames/ac52_f2/natural.png"
     reference = manifest["reference"]
     assert reference["record_index"] == 0 and set(reference["assets"]) == set(frame["assets"])
@@ -155,6 +156,39 @@ def test_display_modes_sit_on_the_native_box_with_the_configured_fill(tmp_path, 
     assert natural.shape == (*PHASE_HW, 3)
     assert tuple(natural[3, 5]) == (1, 1, 1) and tuple(lift[12, 20]) == (2, 2, 2)
     assert tuple(natural[2, 5]) == tuple(FILL) and tuple(natural[3, 4]) == tuple(FILL)
+
+
+def test_raw_detail_is_the_pinned_composer_and_transfer_of_the_extended_raw(tmp_path, inputs):
+    from darsia.fluidflower.phase_rig_raw_display import BACKGROUND, render_raw_detail
+    _write(tmp_path, inputs)
+    detail = np.asarray(Image.open(review.resolve_raw_photograph(tmp_path / "review", "ac52", 0, mode="raw_detail")))
+    log = np.load(inputs["frames"][0]["native_record"]["path"].replace("native.json", "native_log.npy"))
+    signal = np.full((3, *PHASE_HW), np.nan, dtype=np.float32)
+    signal[:, 3:13, 5:21] = log
+    support = np.zeros(PHASE_HW, dtype=bool)
+    support[3:13, 5:21] = np.isfinite(log).all(0)
+    signal[:, ~support] = np.nan
+    assert np.array_equal(detail, render_raw_detail(signal, support, tile_rows=4))
+    assert tuple(detail[3, 5]) == BACKGROUND and tuple(detail[0, 0]) == BACKGROUND
+    assert detail[5, 20].sum() > detail[5, 6].sum()  # Brighter RAW to the right.
+
+
+def test_pinned_record_restates_the_raw_record_without_new_values(tmp_path):
+    record = _record(tmp_path, "pinned", raw_sha="")
+    sources = review.raw_sources(record["full"], record["audit"])
+    pinned, manifest = review.pinned_raw_record(sources)
+    centre = pinned["full_extended_scientific"]["native_centre"]
+    assert pinned["source_sha256"] == centre["source_sha256"] == record["full"]["source_sha256"]
+    assert pinned["full_native_scientific"]["log_linear_rgb"] == record["full"]["native_centre"]["log_linear_rgb"]
+    assert pinned["rig_domain_revision"] == dict(canvas_wh=[24, 14], phase_shape_hw=[14, 24], native_origin_xy=[-5, -3])
+    assert manifest == dict(content_box_xywh=[5, 3, 16, 10], analysis_image_shape_hw=[10, 16])
+    assert "source_sha256" not in record["full"]["native_centre"]  # The record itself is not changed.
+
+
+def test_studio_rows_are_recognized_as_raw_review_rows(tmp_path, inputs):
+    manifest = json.loads(_write(tmp_path, inputs).read_text(encoding="utf-8"))
+    assert all(review.raw_review_row(row) for row in (manifest["reference"], *manifest["frames"]))
+    assert not review.raw_review_row({"v5_display_modes": {}}) and not review.raw_review_row(None)
 
 
 def test_photo_support_round_trips_on_canvas_and_native_grid(tmp_path, inputs):

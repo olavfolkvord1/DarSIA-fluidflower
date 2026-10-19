@@ -1092,12 +1092,17 @@ class ReviewImageAssets:
         self._request_frame()
 
     def _photo_sand_loader(self, index=None, *, reference=False):
+        from darsia.fluidflower.raw_photographic_review import raw_review_row
         rows = (self.current_pair or {}).get("frame_sources") or []
         row_index = 0 if reference else index
-        if row_index is None or not 0 <= row_index < len(rows) or not rows[row_index].get("v5_display_modes"):
+        if row_index is None or not 0 <= row_index < len(rows):
+            return None
+        # A RAW review's photo support is a canvas PNG beside its photographs.
+        raw = raw_review_row(rows[row_index])
+        if not (rows[row_index].get("v5_display_modes") or raw):
             return None
         root, run = self.current_review_root, self.current_run
-        full_photo = bool(rows[row_index].get("rig_domain_revision"))
+        full_photo = bool(rows[row_index].get("rig_domain_revision")) or raw
         return lambda: resolve_photo_sand_domain(root, run, index, reference=reference, canvas=full_photo)
 
     def _filled_display_loader(self, index):
@@ -1134,8 +1139,9 @@ class ReviewImageAssets:
                 f"v5-raw-detail:frame:{root}:{run}:{index}",
                 lambda: resolve_raw_detail(root, run, index),
             ), index, "raw_detail")
+        from darsia.fluidflower.raw_photographic_review import raw_review_row
         rows = (self.current_pair or {}).get("frame_sources") or []
-        if 0 <= index < len(rows) and rows[index].get("v5_display_modes"):
+        if 0 <= index < len(rows) and (rows[index].get("v5_display_modes") or raw_review_row(rows[index])):
             mode = getattr(self, "display_mode", "natural")
             if mode == "change" and (asset := ReviewImageAssets._rig_raw_display_asset(self, index, mode)):
                 return asset

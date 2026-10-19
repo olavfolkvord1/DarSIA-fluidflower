@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 from . import trainer as t
+from ..raw_photographic_review import timeline_rows
 
 
 def require_single_run(sources):
@@ -54,7 +55,7 @@ def train(request_path: Path, *, heads=("co2_presence", "gas_within_co2")):
     validate_training_series(sources, regions, selected_series)
     require_single_run(sources)
     for source in sources:
-        frames = t._read_json(source.asset_manifest_path)["frame_sources"]
+        frames = timeline_rows(t._read_json(source.asset_manifest_path))
         for region in regions:
             if not np.isclose(region.elapsed_h, frames[region.frame_index]["elapsed_h"], atol=1e-5, rtol=0):
                 raise ValueError("Annotation timing differs from its registered source image")

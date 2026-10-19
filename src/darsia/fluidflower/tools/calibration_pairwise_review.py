@@ -1510,10 +1510,10 @@ def _candidate_from_job(selection_dir: Path, job: Mapping[str, Any], *, selected
     if job.get("presentation_status") == "deferred":
         if not phase_model_only:
             raise ValueError("Deferred presentation requires a native phase model candidate")
-        from darsia.fluidflower.phase_saved_candidate_admission import validate_deferred_presentation
-        validate_deferred_presentation(summary, run=run, candidate_id=candidate_id,
+        review_output_dir = _manifest_relative_path(selection_dir, job["review_output_dir"])
+        _deferred_presentation_validator(review_output_dir, run)(summary, run=run, candidate_id=candidate_id,
             params_sha256=digest,
-            review_output_dir=_manifest_relative_path(selection_dir, job["review_output_dir"]),
+            review_output_dir=review_output_dir,
             phase_map_output_dir=_manifest_relative_path(selection_dir, job["phase_map_output_dir"]),
             per_frame_csv=per_frame_csv)
     else:
@@ -1865,6 +1865,22 @@ def _raw_review_photograph(output_dir: Path, run: str, frame_index: int | None =
     if read_raw_review_manifest(root, run) is None:
         return None
     return resolve_raw_photograph(root, run, frame_index, mode="natural", reference=reference)
+
+
+def _deferred_presentation_validator(review_output_dir: Path, run: str):
+    """The deferred-presentation check for a run's native review.
+
+    A RAW photographic review is checked by the current presentation reader,
+    which reads its timeline from the review's frames. Every historical root
+    keeps the frozen, configuration-bound admission copy.
+    """
+    from darsia.fluidflower.raw_photographic_review import read_raw_review_manifest
+
+    if read_raw_review_manifest(resolve_review_path(review_output_dir), run) is not None:
+        from darsia.fluidflower.phase_saved_presentation import validate_deferred_presentation
+    else:
+        from darsia.fluidflower.phase_saved_candidate_admission import validate_deferred_presentation
+    return validate_deferred_presentation
 
 
 def _raw_review_rows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:

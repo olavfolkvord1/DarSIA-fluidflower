@@ -72,6 +72,7 @@ from darsia.fluidflower.phase_training.review_regions import (
     _load_rgb,
     _sample_mask,
 )
+from darsia.fluidflower.raw_photographic_review import review_content_shape, timeline_rows
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 FLUIDFLOWER_ROOT = PACKAGE_ROOT.parent
@@ -544,7 +545,76 @@ def _copy_file(source: Path, destination: Path) -> dict[str, Any]:
     }
 
 
+def _raw_review_manifest(manifest: Mapping[str, Any]) -> bool:
+    """Whether a native manifest is a RAW photographic review (``raw_photographic_review``)."""
+    from darsia.fluidflower.raw_photographic_review import RAW_REVIEW_FORMAT
+    return manifest.get("format") == RAW_REVIEW_FORMAT
+
+
+def _stage_raw_review_run(source: RunSource, cache_root: Path, *,
+                          native_revision: bool = False) -> StagedRun:
+    """Stage a RAW review run's float inputs, each checked against its SHA-bound record.
+
+    Baseline B and every frame contribute their native log-linear camera RGB
+    and exact valid mask. Local copies take the trainer's float-input names,
+    so the unchanged decoder reads them. A complete earlier staging is reused
+    while the review manifest is unchanged.
+    """
+    from .raw_frame_context import RawFrameGeometryCohort
+
+    manifest_sha = _sha256(source.asset_manifest_path)
+    suffix = ("_" + _canonical_hash(str(source.review_root.resolve()))[:16]
+              if native_revision else "")
+    local_root = (Path(cache_root) / "assets"
+                  / f"{source.dataset}_{source.run}_{manifest_sha[:16]}{suffix}")
+    cohort = RawFrameGeometryCohort.from_manifest(source.asset_manifest_path)
+    if cohort.run != str(source.run).casefold():
+        raise ValueError(f"RAW review belongs to another run: {source.asset_manifest_path}")
+    names = ["pre_injection", *(f"frame_{index:03d}" for index in range(len(cohort.rows)))]
+    centres = [cohort.native_centre(None), *(cohort.native_centre(index) for index in range(len(cohort.rows)))]
+    originals = [dict(path=str(source.asset_manifest_path), sha256=manifest_sha)]
+    staged = [local_root / "manifest.json"]
+    for name, centre in zip(names, centres, strict=True):
+        originals += [centre["log_linear_rgb"], centre["valid_mask"]]
+        staged += [local_root / f"{name}.log_linear_rgb.npy", local_root / f"{name}.log_linear_valid_mask.npy"]
+
+    def staged_run(asset_sha: str) -> StagedRun:
+        return StagedRun(run=source.run, dataset=source.dataset, root=local_root,
+                         asset_manifest_path=staged[0], baseline_path=staged[1],
+                         frame_paths=tuple(staged[3::2]), asset_sha256=asset_sha,
+                         independent_reference_frames=source.independent_reference_frames,
+                         baseline_valid_mask_path=staged[2], frame_valid_mask_paths=tuple(staged[4::2]))
+
+    complete_path = local_root / "staged_assets.json"
+    if complete_path.is_file():
+        complete = _read_json(complete_path)
+        if str(complete.get("source_manifest_sha256")) == manifest_sha and all(path.is_file() for path in staged):
+            files = complete.get("files") or []
+            if (len(files) != len(originals)
+                    or any(row.get("sha256") != original["sha256"] for row, original in zip(files, originals))
+                    or (native_revision and any(_sha256(path) != row["sha256"]
+                                                for path, row in zip(staged, files)))):
+                raise ValueError(f"Staged RAW review inputs differ from their records: {source.asset_manifest_path}")
+            return staged_run(str(complete["asset_sha256"]))
+    local_root.mkdir(parents=True, exist_ok=True)
+    files = []
+    for original, local in zip(originals, staged, strict=True):
+        row = _copy_file(Path(original["path"]), local)
+        if row["sha256"] != original["sha256"]:
+            raise ValueError(f"RAW review input differs from its record: {original['path']}")
+        files.append(row)
+    asset_sha = _canonical_hash(files)
+    _write_json(complete_path, {
+        "schema": 1, "run": source.run, "dataset": source.dataset, "source_kind": "raw",
+        "source_review_root": str(source.review_root), "source_manifest_sha256": manifest_sha,
+        "asset_sha256": asset_sha, "files": files,
+        "created_utc": datetime.now(UTC).isoformat(timespec="seconds")})
+    return staged_run(asset_sha)
+
+
 def _stage_run(source: RunSource, cache_root: Path, *, native_revision: bool = False) -> StagedRun:
+    if _raw_review_manifest(_read_json(source.asset_manifest_path)):
+        return _stage_raw_review_run(source, cache_root, native_revision=native_revision)
     manifest_sha = _sha256(source.asset_manifest_path)
     source_suffix = (
         "_" + _canonical_hash(str(source.review_root.resolve()))[:16]
@@ -807,6 +877,21 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
     track1_photo = bool(manifest.get("v5_track1_photo_geometry"))
     temporal_reference = None
     masked_temporal = False
+    raw = _raw_review_manifest(manifest)
+    prefix = "raw" if raw else "v5"
+    if raw:
+        # A RAW photographic review: SHA-bound native records and the RAW geometry cohort.
+        if task.radiometry_profile is not None:
+            raise ValueError("RAW camera-linear optical input cannot use legacy radiometry")
+        from darsia.fluidflower.phase_training.raw_frame_context import (
+            TEMPORAL_CONTRACT, RawFrameGeometryCohort)
+        frame_geometry = RawFrameGeometryCohort.from_manifest(task.staged.asset_manifest_path)
+        temporal_reference, masked_temporal, extended_temporal = TEMPORAL_CONTRACT, True, False
+        for index in sorted({i for region in task.regions
+                             for i in _frame_dependencies(
+                                 int(region.frame_index),
+                                 task.staged.independent_reference_frames)}):
+            frame_geometry.frame(index)
     if v5:
         if task.radiometry_profile is not None:
             raise ValueError("V5 camera-linear optical input cannot use legacy radiometry")
@@ -847,12 +932,26 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         )
         _require_v5_float_rgb(rgb, role="decoded")
         return rgb
+
+    def raw_rgb(index: int | None, path: Path, valid_mask_path: Path) -> np.ndarray:
+        # The staged copy must still equal its record's array and exact valid mask.
+        from darsia.fluidflower.phase_training.log_linear_input import EXACT_VALID_MASK_POLICY
+        centre = frame_geometry.native_centre(index)
+        rgb = _load_rgb(
+            path, content_box,
+            expected_sha256=centre["log_linear_rgb"]["sha256"],
+            invalid_policy=EXACT_VALID_MASK_POLICY,
+            valid_mask_path=valid_mask_path,
+            valid_mask_sha256=centre["valid_mask"]["sha256"],
+        )
+        _require_v5_float_rgb(rgb, role="decoded")
+        return rgb
     if task.output_path.is_file() and task.metadata_path.is_file():
         metadata = _read_json(task.metadata_path)
         if str(metadata.get("cache_key")) == task.cache_key:
             if metadata.get("opencv_ipp_policy") != POLICY:
                 raise ValueError("Feature cache predates the IPP-off policy; preserve it and select a new cache key")
-            if not v5 and any("training_sampling" in region.payload for region in task.regions):
+            if not (v5 or raw) and any("training_sampling" in region.payload for region in task.regions):
                 from .gas_negative_sampling import sample_region
                 native = _read_json(task.staged.asset_manifest_path)
                 checked = {}
@@ -882,6 +981,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
             source_manifest=task.staged.asset_manifest_path,
         )
         baseline = radiometry.load(task.staged.baseline_path, "pre_injection")
+    elif raw:
+        baseline = raw_rgb(None, task.staged.baseline_path, task.staged.baseline_valid_mask_path)
     else:
         baseline = (None if v5 and extended_temporal else
                     staged_rgb(task.staged.baseline_path, manifest["reference"],
@@ -903,7 +1004,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
             invalid_policy=invalid_policy,
             valid_mask_path=task.staged.baseline_valid_mask_path,
             valid_mask_sha256=reference.get("v5_log_linear_valid_mask_sha256"))
-    if v5 and masked_temporal:
+    if (v5 or raw) and masked_temporal:
         if not extended_temporal:
             if task.staged.baseline_valid_mask_path is not None:
                 baseline_source_valid = np.load(
@@ -926,6 +1027,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
     for frame_index in sorted(by_frame):
         ipp_before = scientific_thread("training-extraction:frame-before")
         current = (
+            raw_rgb(frame_index, task.staged.frame_paths[frame_index],
+                    task.staged.frame_valid_mask_paths[frame_index]) if raw else
             staged_rgb(task.staged.frame_paths[frame_index],
                        manifest["frame_sources"][frame_index],
                        (task.staged.frame_valid_mask_paths[frame_index]
@@ -940,9 +1043,11 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         previous_source_valid = None
         previous_index = (_prior_frame_index(
             frame_index, task.staged.independent_reference_frames)
-            if v5 else frame_index - 1 if frame_index > 0 else None)
+            if (v5 or raw) else frame_index - 1 if frame_index > 0 else None)
         if previous_index is not None:
-            previous = (None if v5 and extended_temporal else
+            previous = (raw_rgb(previous_index, task.staged.frame_paths[previous_index],
+                                task.staged.frame_valid_mask_paths[previous_index]) if raw else
+                        None if v5 and extended_temporal else
                 staged_rgb(task.staged.frame_paths[previous_index],
                            manifest["frame_sources"][previous_index],
                            (task.staged.frame_valid_mask_paths[previous_index]
@@ -971,7 +1076,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                     valid_mask_sha256=previous_record.get(
                         "v5_log_linear_valid_mask_sha256"))
         current_source_valid = None
-        if v5 and masked_temporal:
+        if (v5 or raw) and masked_temporal:
             if task.staged.frame_valid_mask_paths:
                 current_source_valid = np.load(
                     task.staged.frame_valid_mask_paths[frame_index],
@@ -1061,7 +1166,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
             baseline_for_frame, previous_for_frame = baseline, previous
             alignment = None
             feature_valid = None
-        if v5:
+        if v5 or raw:
             _require_v5_float_rgb(current, role="current")
             _require_v5_float_rgb(baseline_for_frame, role="aligned baseline")
             if previous_for_frame is not None:
@@ -1073,7 +1178,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
         owners: list[np.ndarray] = []
         support_rows: list[dict[str, Any]] = []
         for local_index, region in by_frame[frame_index]:
-            if v5:
+            if v5 or raw:
                 from .review_sampling import sampling_receipt
                 review_sampling = sampling_receipt(region.phase_class, region.payload)
                 if review_sampling["role"] in (
@@ -1110,7 +1215,7 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                         f"retains {retained_pixels}/{sand_pixels} certified sand pixels "
                         f"after 8-pixel texture support guard (<90%); "
                         f"whole annotation={original_pixels}, raw={raw_retained_pixels}")
-            if not v5 and "training_sampling" in region.payload:
+            if not (v5 or raw) and "training_sampling" in region.payload:
                 from .gas_negative_sampling import sample_region
                 rows, columns = sample_region(region, mask, task.staged.asset_manifest_path,
                     limit=max(1, int(task.pixels_per_region)), cache=sampling_sources)
@@ -1181,8 +1286,8 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                 raise ValueError("Feature augmentation removed every pixel of a reviewed region")
         else:
             combined_owners = np.concatenate(owners)
-        if v5 and (not isinstance(extracted, np.ndarray)
-                   or extracted.dtype != np.dtype("float32")):
+        if (v5 or raw) and (not isinstance(extracted, np.ndarray)
+                            or extracted.dtype != np.dtype("float32")):
             raise ValueError("V5 optical model features must be float32")
         feature_chunks.append(np.asarray(extracted, dtype=np.float32))
         owner_chunks.append(combined_owners)
@@ -1194,14 +1299,14 @@ def _extract_run_features(task: ExtractionTask, *, feature_augmenter=None) -> di
                 "opencv_ipp": completed_frame(ipp_before, "training-extraction:frame-after"),
                 **({"feature_augmentation": augmentation} if augmentation is not None else {}),
                 **({} if geometry_binding is None else {
-                    "v5_frame_geometry_receipt_sha256": geometry_binding["receipt_sha256"],
-                    "v5_previous_frame_index": previous_index,
-                    "v5_previous_geometry_receipt_sha256": (
+                    f"{prefix}_frame_geometry_receipt_sha256": geometry_binding["receipt_sha256"],
+                    f"{prefix}_previous_frame_index": previous_index,
+                    f"{prefix}_previous_geometry_receipt_sha256": (
                         None if previous_index is None else
                         frame_geometry.frame(previous_index)["receipt_sha256"]),
-                    "v5_temporal_alignment": alignment,
-                    "v5_temporal_reference_contract": temporal_reference,
-                    "v5_region_source_support": support_rows,
+                    f"{prefix}_temporal_alignment": alignment,
+                    f"{prefix}_temporal_reference_contract": temporal_reference,
+                    f"{prefix}_region_source_support": support_rows,
                 }),
             }
         )
@@ -1264,6 +1369,7 @@ def _feature_cache_key(
               if getattr(staged, "asset_manifest_path", None) is not None else {})
     v5 = (native.get("v5_photometry") or {}).get("format") == (
         "ffac-v5-native-source-materialization-v1")
+    raw = _raw_review_manifest(native)
     v5_geometry = None
     if v5:
         from darsia.fluidflower.phase_training import frame_context as ffac_v5_frame_context, temporal_alignment as ffac_v5_temporal_alignment
@@ -1310,7 +1416,7 @@ def _feature_cache_key(
         for region in regions
     ]
     for item, region in zip(region_contract, regions):
-        if v5:
+        if v5 or raw:
             from .review_sampling import sampling_receipt
             item["sampling"] = sampling_receipt(region.phase_class, region.payload)
         elif "training_sampling" in region.payload:
@@ -1319,7 +1425,7 @@ def _feature_cache_key(
             item["sampling"] = gas_negative_sampling.contract(region.payload["training_sampling"])
             item["sampling_runtime_sha256"] = canonical_implementation(
                 gas_negative_sampling.__name__, _sha256(Path(gas_negative_sampling.__file__)))
-    return _canonical_hash(
+    payload = (
         {
             "asset_sha256": staged.asset_sha256,
             "v5_independent_reference_frames": (
@@ -1344,6 +1450,31 @@ def _feature_cache_key(
             "v5_frame_geometry": v5_geometry,
         }
     )
+    if raw:
+        payload.update(raw_frame_geometry=_raw_geometry_identity(staged, regions),
+                       raw_independent_reference_frames=list(staged.independent_reference_frames),
+                       raw_review_sampling_code_sha256=_sha256(PACKAGE_ROOT / "review_sampling.py"))
+    return _canonical_hash(payload)
+
+
+def _raw_geometry_identity(staged: StagedRun, regions: Sequence[ReviewedRegion]) -> dict[str, Any]:
+    """The RAW frame-geometry identity of a feature cache: receipts, training context and code."""
+    from darsia.fluidflower.phase_training import frame_context, raw_frame_context, temporal_alignment
+
+    cohort = raw_frame_context.RawFrameGeometryCohort.from_manifest(staged.asset_manifest_path)
+    indices = sorted({i for region in regions
+                      for i in _frame_dependencies(int(region.frame_index),
+                                                   staged.independent_reference_frames)})
+    return {
+        "cohort_manifest_sha256": cohort.native_manifest_sha256,
+        "frame_receipts": [{"index": index, "sha256": cohort.frame(index)["receipt_sha256"]}
+                           for index in indices],
+        "training_context": cohort.context_binding,
+        "temporal_reference_contract": raw_frame_context.TEMPORAL_CONTRACT,
+        "raw_frame_context_code_sha256": _sha256(Path(raw_frame_context.__file__)),
+        "frame_context_code_sha256": _sha256(Path(frame_context.__file__)),
+        "temporal_alignment_code_sha256": _sha256(Path(temporal_alignment.__file__)),
+    }
 
 
 def _native_revision_task_groups(
@@ -1371,13 +1502,13 @@ def _native_revision_task_groups(
             x, y, crop_width, crop_height = (int(value) for value in manifest["content_box_xywh"])
             if (width <= 0 or height <= 0 or x < 0 or y < 0 or crop_width <= 0
                     or crop_height <= 0 or x + crop_width > width or y + crop_height > height
-                    or tuple(manifest["analysis_image_shape_hw"]) != (crop_height, crop_width)
-                    or len(manifest["frame_sources"]) != int(manifest["frame_count"])):
+                    or review_content_shape(manifest) != (crop_height, crop_width)
+                    or len(timeline_rows(manifest)) != int(manifest["frame_count"])):
                 raise ValueError(f"Invalid reviewed native geometry or timeline: {manifest_path}")
             manifests[manifest_path] = manifest
         manifest = manifests[manifest_path]
         frame = int(region.frame_index)
-        rows = manifest["frame_sources"]
+        rows = timeline_rows(manifest)
         if not 0 <= frame < len(rows):
             raise ValueError(f"Review frame is outside its original source: {region.region_id}")
         if "elapsed_h" in region.payload and not np.isclose(
@@ -1517,9 +1648,9 @@ def _load_feature_caches(
     for task in tasks:
         with np.load(task.output_path, allow_pickle=False) as archive:
             raw_features = archive["features"]
-            v5_task = (_read_json(task.staged.asset_manifest_path).get(
-                "v5_photometry") or {}).get("format") == (
-                    "ffac-v5-native-source-materialization-v1")
+            task_manifest = _read_json(task.staged.asset_manifest_path)
+            v5_task = ((task_manifest.get("v5_photometry") or {}).get("format") == (
+                "ffac-v5-native-source-materialization-v1") or _raw_review_manifest(task_manifest))
             if v5_task and raw_features.dtype != np.dtype("float32"):
                 raise ValueError("V5 cached optical model features must be float32")
             features = np.asarray(raw_features, dtype=np.float32)
@@ -2433,7 +2564,13 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
     ]
     if any(v5_source_flags) and not all(v5_source_flags):
         raise ValueError("Cannot combine V5 RAW and historical JPEG review inputs")
-    if reviewers is not None and v5_source_flags and all(v5_source_flags):
+    raw_source_flags = [_raw_review_manifest(_read_json(source.asset_manifest_path))
+                        for source in inventory_sources]
+    if any(raw_source_flags) and not all(raw_source_flags):
+        raise ValueError("Cannot combine RAW photographic reviews with other review inputs")
+    # RAW reviews are float camera-linear inputs and follow the V5 fit rules.
+    float_source_flags = [v5 or raw for v5, raw in zip(v5_source_flags, raw_source_flags)]
+    if reviewers is not None and float_source_flags and all(float_source_flags):
         # Its fit scope pins exact annotation counts and IDs (see chemistry_fit_scope).
         raise ValueError(FROZEN_ANNOTATION_SET_REFUSAL)
     fit_excluded_runs = tuple(getattr(args, "fit_excluded_runs", ()) or ())
@@ -2444,7 +2581,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         "v5_track1_photo_geometry")) for source in inventory_sources]
     if any(track1_flags) and not all(track1_flags):
         raise ValueError("Cannot mix Track1 photo-only and physical V5 sources")
-    if v5_source_flags and all(v5_source_flags):
+    if float_source_flags and all(float_source_flags):
         from darsia.fluidflower.phase_training.chemistry_fit_scope import EXCLUDED_RUNS, verify_scope
         request_path = Path(args.output_root) / "training_request.json"
         if not request_path.is_file():
@@ -2532,7 +2669,7 @@ def train_campaign(args: argparse.Namespace) -> dict[str, Any]:
         **_reviewer_inventory(ordered_regions, reviewers),
         "deduplication_conflicts": conflicts,
     }
-    if v5_source_flags and all(v5_source_flags):
+    if float_source_flags and all(float_source_flags):
         verify_scope(chemistry_scope, ordered_regions)
         inventory["v5_chemistry_fit_scope"] = chemistry_scope
         if partition_binding is not None:

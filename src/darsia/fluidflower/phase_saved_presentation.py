@@ -20,6 +20,7 @@ from PIL import Image
 from .project import sha256_file
 from .review_storage import resolve_review_path
 from .phase_saved_review_metadata import configured_parameters
+from .raw_photographic_review import timeline_rows
 
 def _read(path):
     return json.loads(resolve_review_path(path).read_text(encoding="utf-8-sig"))
@@ -133,7 +134,7 @@ def validate_deferred_presentation(summary, *, run, candidate_id, params_sha256,
     count = int(descriptor["frame_count"])
     with Path(per_frame_csv).open(encoding="utf-8-sig", newline="") as stream:
         times = [float(row["elapsed_h"]) for row in csv.DictReader(stream)]
-    expected = [float(row["elapsed_h"]) for row in _timeline_rows(native, run)]
+    expected = [float(row["elapsed_h"]) for row in timeline_rows(native, run)]
     if count < 1 or len(expected) != count or int(native["frame_count"]) != count or times != expected:
         raise ValueError("Deferred presentation has another or incomplete timeline")
     if not np.isfinite(times).all():
@@ -222,14 +223,6 @@ def ensure_candidate_presentation(candidate, kind="plot", progress=None):
         finally:
             temporary.unlink(missing_ok=True)
     return target
-
-def _timeline_rows(native, run):
-    """Frame rows of a historical native manifest or of a checked RAW photographic review."""
-    from .raw_photographic_review import RAW_REVIEW_FORMAT, validate_raw_review_manifest
-    if native.get("format") == RAW_REVIEW_FORMAT:
-        return validate_raw_review_manifest(native, run)["frames"]
-    return native["frame_sources"]
-
 
 def _presentation_photo(candidate, native, index):
     """The photograph under one phase layer: the RAW review's natural PNG or the historical frame."""

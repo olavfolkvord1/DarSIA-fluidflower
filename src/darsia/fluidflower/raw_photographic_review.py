@@ -6,7 +6,9 @@ each frame. They are rendered only from the run's bound records:
 - the camera RAW, through the shared camera-U renderer, for the ``original``
   photograph;
 - the already computed native log-linear camera RGB, through the configured
-  display helpers, for the photographic modes.
+  display helpers, for the photographic modes;
+- the record's extended RAW (native centre and ring windows), through the
+  unchanged rig RAW composer and transfer, for ``raw_detail``.
 
 No JPEG is read or written, nothing scientific is recomputed, and an existing
 root is never changed: every file is created exclusively and the manifest is
@@ -35,6 +37,7 @@ from .phase_saved_assets import VerifiedAssetReader, asset
 RAW_REVIEW_FORMAT = "darsia-raw-photographic-review-v1"
 RAW_SOURCE_CONTRACT = "darsia-raw-rig-source-v1"
 ORIGINAL_MODE = "original"
+RAW_DETAIL_MODE = "raw_detail"
 PHOTO_SUPPORT_ASSET = "photo_support"
 
 _READER = VerifiedAssetReader()
@@ -90,6 +93,7 @@ def raw_sources(full: Mapping, audit_descriptor: Mapping, *, reader=None) -> dic
         log_linear_rgb=_descriptor(centre.get("log_linear_rgb"), "Native log-linear RGB"),
         valid_mask=_descriptor(centre.get("valid_mask"), "Native valid mask"),
         audit=_descriptor(audit_descriptor, "RAW producer audit"),
+        full=dict(full),
     )
 
 
@@ -144,6 +148,42 @@ def _rgb_triplet(value) -> tuple[int, int, int]:
     if len(values) != 3:
         raise ValueError("A fill colour is one grey level or three RGB values")
     return tuple(int(v) for v in values)
+
+
+def pinned_raw_record(sources: Mapping) -> tuple[dict, dict]:
+    """A RAW record restated as the record and manifest the rig RAW composer reads.
+
+    ``phase_rig_raw_display.compose_display_raw`` stays byte-identical, because
+    series configurations bind its exact bytes. Nothing is computed here. The
+    native centre takes the source of the ``full`` descriptor that holds it,
+    and the rig grid is the review's phase canvas and native origin.
+    """
+    full = sources["full"]
+    centre = full["native_centre"]
+    height, width = (int(value) for value in sources["phase_shape_hw"])
+    x, y, content_width, content_height = sources["content_box_xywh"]
+    record = dict(
+        source_sha256=full["source_sha256"],
+        full_extended_scientific=dict(full, native_centre=dict(centre, source_sha256=full["source_sha256"])),
+        full_native_scientific=dict(log_linear_rgb=centre["log_linear_rgb"], valid_mask=centre["valid_mask"]),
+        rig_domain_revision=dict(canvas_wh=[width, height], phase_shape_hw=[height, width],
+                                 native_origin_xy=list(sources["native_origin_xy"])))
+    manifest = dict(content_box_xywh=[x, y, content_width, content_height],
+                    analysis_image_shape_hw=[content_height, content_width])
+    return record, manifest
+
+
+def render_raw_detail_asset(sources: Mapping, *, tile_rows: int) -> np.ndarray:
+    """The existing RAW-detail view of a RAW record's extended RAW, on the phase canvas.
+
+    The unchanged ``compose_display_raw`` assembles the native centre and its
+    ring windows, and ``render_raw_detail`` applies the campaign-wide log
+    transfer. Unsupported pixels keep its background colour.
+    """
+    from .phase_rig_raw_display import compose_display_raw, render_raw_detail
+
+    signal, support = compose_display_raw(*pinned_raw_record(sources))
+    return render_raw_detail(signal, support, tile_rows=int(tile_rows))
 
 
 def render_display_assets(sources: Mapping, photo_support: np.ndarray, *, parameters: Mapping,
@@ -212,7 +252,11 @@ def _render_entry(run_folder: Path, folder: Path, sources: Mapping, photo_suppor
             image = render_original(sources, profile=profile, fill_rgb8=fill, reader=reader)
             _write_png(folder / f"{mode}.png", image)
             assets[mode] = _relative_asset(run_folder, folder / f"{mode}.png")
-    display = [mode for mode in modes if mode != ORIGINAL_MODE]
+        elif mode == RAW_DETAIL_MODE:
+            image = render_raw_detail_asset(sources, tile_rows=parameters["tile_rows"])
+            _write_png(folder / f"{mode}.png", image)
+            assets[mode] = _relative_asset(run_folder, folder / f"{mode}.png")
+    display = [mode for mode in modes if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE)]
     if display:
         for mode, image in render_display_assets(sources, photo_support, parameters=parameters,
                                                  modes=display, reader=reader).items():
@@ -227,25 +271,34 @@ def _render_entry(run_folder: Path, folder: Path, sources: Mapping, photo_suppor
 
 def write_raw_review_root(review_root: str | Path, *, run: str, native_configuration: Mapping,
                           raw_binding: Mapping, reference: Mapping, frames: Sequence[Mapping],
-                          modes: Sequence[str] | None = None, reader=None) -> Path:
+                          modes: Sequence[str] | None = None, training_context: Mapping | None = None,
+                          reader=None) -> Path:
     """Write one fresh RAW photographic review root for a run; return its manifest.
 
     ``reference`` holds the bound ``acquisition_manifest``, its
     ``record_index`` and a native-shape boolean ``photo_support``. Each frame
     holds ``case_id``, ``frame_index``, ``elapsed_h``, the bound
     ``native_record``, ``native_geometry`` and ``rig_geometry`` descriptors
-    and its ``photo_support``. ``modes`` defaults to the original plus every
-    configured display mode. The run folder must not exist yet.
+    and its ``photo_support``. ``modes`` defaults to the original, every
+    configured display mode and the RAW detail. ``training_context`` optionally
+    records the run's reference-context and photo-sand bindings for training
+    (``phase_training.raw_frame_context``). The run folder must not exist yet.
     """
     reader = reader or _READER
     run = str(run).casefold()
     configuration = _descriptor(native_configuration, "Native configuration")
     binding = _descriptor(raw_binding, "RAW source binding")
     parameters = reader.json(configuration)["display_modes"]
-    modes = tuple(modes) if modes is not None else (ORIGINAL_MODE, *parameters["modes"])
-    unknown = [mode for mode in modes if mode != ORIGINAL_MODE and mode not in parameters["modes"]]
+    modes = (tuple(modes) if modes is not None
+             else (ORIGINAL_MODE, *parameters["modes"], RAW_DETAIL_MODE))
+    unknown = [mode for mode in modes
+               if mode not in (ORIGINAL_MODE, RAW_DETAIL_MODE) and mode not in parameters["modes"]]
     if unknown or not modes:
         raise ValueError(f"Unknown RAW review modes: {unknown}")
+    if training_context is not None:
+        from .phase_training.raw_frame_context import CONTEXT_BINDING_KEYS
+        if not isinstance(training_context, Mapping) or set(training_context) - CONTEXT_BINDING_KEYS:
+            raise ValueError("Training context holds only reference-context and photo-sand bindings")
     run_folder = Path(review_root) / "native_frames" / run
     run_folder.mkdir(parents=True, exist_ok=False)  # One fresh root; never mutate one.
 
@@ -302,7 +355,8 @@ def write_raw_review_root(review_root: str | Path, *, run: str, native_configura
         native_origin_xy=list(geometry["native_origin_xy"]),
         native_shape_hw=list(geometry["native_shape_hw"]),
         content_box_xywh=list(geometry["content_box_xywh"]), canvas_wh=[canvas_width, canvas_height],
-        reference=reference_entry, frames=entries, frame_count=len(entries))
+        reference=reference_entry, frames=entries, frame_count=len(entries),
+        **({} if training_context is None else {"training_context": dict(training_context)}))
     path = run_folder / "manifest.json"
     with path.open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=1)
@@ -368,6 +422,25 @@ def raw_review_record(manifest: Mapping, frame_index: int | None = None, *, refe
     return frames[frame_index]
 
 
+def timeline_rows(manifest: Mapping, run: str | None = None) -> list:
+    """The timeline rows of a native manifest: a RAW review's checked frames or historical frame sources."""
+    if manifest.get("format") == RAW_REVIEW_FORMAT:
+        return validate_raw_review_manifest(manifest, manifest["run"] if run is None else run)["frames"]
+    return manifest["frame_sources"]
+
+
+def review_content_shape(manifest: Mapping) -> tuple[int, int]:
+    """The native content shape (height, width) of a RAW review or of a historical native manifest."""
+    key = "native_shape_hw" if manifest.get("format") == RAW_REVIEW_FORMAT else "analysis_image_shape_hw"
+    return tuple(int(value) for value in manifest[key])
+
+
+def raw_review_row(row) -> bool:
+    """Whether a Studio row is a RAW review frame or reference (it names assets and an acquisition)."""
+    return (isinstance(row, Mapping) and isinstance(row.get("assets"), Mapping)
+            and isinstance(row.get("acquisition"), Mapping))
+
+
 def raw_modes_available(manifest: Mapping, modes: Sequence[str], *, reference: bool = False) -> bool:
     """Whether every frame (or the reference) has each of ``modes``; no file I/O."""
     rows = [manifest.get("reference") or {}] if reference else list(manifest.get("frames") or [])
@@ -425,9 +498,10 @@ def load_raw_photo_support(review_root, run, frame_index: int | None = None, *, 
 
 
 __all__ = [
-    "ORIGINAL_MODE", "PHOTO_SUPPORT_ASSET", "RAW_REVIEW_FORMAT", "RAW_SOURCE_CONTRACT",
-    "canvas_content_box", "load_raw_photo_support", "place_on_canvas", "raw_asset_descriptor",
-    "raw_modes_available", "raw_review_record", "raw_sources", "read_raw_review_manifest",
-    "render_display_assets", "render_original", "resolve_raw_photograph",
-    "validate_raw_review_manifest", "write_raw_review_root",
+    "ORIGINAL_MODE", "PHOTO_SUPPORT_ASSET", "RAW_DETAIL_MODE", "RAW_REVIEW_FORMAT", "RAW_SOURCE_CONTRACT",
+    "canvas_content_box", "load_raw_photo_support", "pinned_raw_record", "place_on_canvas",
+    "raw_asset_descriptor", "raw_modes_available", "raw_review_record", "raw_review_row", "raw_sources",
+    "read_raw_review_manifest", "render_display_assets", "render_original", "render_raw_detail_asset",
+    "resolve_raw_photograph", "review_content_shape", "timeline_rows", "validate_raw_review_manifest",
+    "write_raw_review_root",
 ]

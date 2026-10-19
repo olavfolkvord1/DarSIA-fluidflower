@@ -36,7 +36,7 @@ def test_availability_reads_raw_rows_without_file_io(root):
     for rows in (manifest, {"frame_sources": manifest["frames"]}):
         assert photos.display_modes_available(rows)
         assert photos.original_display_available(rows)
-        assert not photos.raw_detail_available(rows)  # Not written for RAW reviews yet.
+        assert photos.raw_detail_available(rows)
     assert photos.display_modes_available(manifest, reference=True)
     assert not photos.change_display_available(root, "ac52")  # No change photograph is written.
 
@@ -44,9 +44,8 @@ def test_availability_reads_raw_rows_without_file_io(root):
 def test_paths_and_images_come_from_the_raw_root(root, app):
     path = photos.resolve_display_mode(root, "ac52", 1, "lift1")
     assert path == (root / "native_frames/ac52/frames/ac52_f2/lift1.png").resolve()
-    with pytest.raises(ValueError, match="raw_detail"):
-        photos.resolve_raw_detail(root, "ac52", 0)
-    for mode in ("natural", "lift2", "original"):
+    assert photos.resolve_raw_detail(root, "ac52", 0).name == "raw_detail.png"
+    for mode in ("natural", "lift2", "original", "raw_detail"):
         image = photos.load_display_image(root, "ac52", 0, mode=mode)
         assert (image.width(), image.height()) == (PHASE_HW[1], PHASE_HW[0])
     original = photos.load_original_display_rgb(root, "ac52", 0)
