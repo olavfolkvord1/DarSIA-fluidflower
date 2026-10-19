@@ -17,7 +17,7 @@ The full geometry-and-facies page remains available as the advanced view.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from . import geometry_workspace_frame as workspace_frame
 from typing import Any
@@ -104,6 +104,9 @@ _BRUSH_MIN_FRACTION = 0.0005
 _BRUSH_MAX_FRACTION = 0.05
 _BRUSH_DEFAULT_FRACTION = 0.006
 _UNDO_LIMIT = 200
+# Column of the layer table whose box shows or hides a layer (display only).
+_SHOW_COLUMN = 4
+_SHOW_TIP = "Show or hide this layer in the photograph (display only)"
 # Short role names for the facies table.
 _ROLE_SHORT = {"porous_medium": "Porous", "free_water": "Free water"}
 _CANVAS_HINT = (
@@ -187,6 +190,51 @@ def _fit_table_height(table: QTableWidget, *, max_rows: int = 8) -> None:
     table.setFixedHeight(height)
 
 
+def insert_point_on_nearest_edge(
+    points: Sequence[tuple[float, float]], row: float, col: float
+) -> tuple[list[tuple[float, float]], int]:
+    """The points of a closed polygon with one point added on its nearest edge.
+
+    Every edge counts, also the closing edge from the last point back to the
+    first. The new point is where (row, col) projects at right angles onto the
+    edge nearest to it, kept between the edge's two end points; it is inserted
+    between those two points. Returns the new list of points and the index of
+    the new point. With fewer than two points, or a position that is not a
+    finite number, the points come back unchanged with index -1. ``points``
+    itself is not changed.
+    """
+
+    vertices = [(float(point[0]), float(point[1])) for point in points]
+    row, col = float(row), float(col)
+    count = len(vertices)
+    if count < 2 or not (math.isfinite(row) and math.isfinite(col)):
+        return vertices, -1
+    best: tuple[float, int, tuple[float, float]] | None = None
+    for index in range(count):
+        start = vertices[index]
+        end = vertices[(index + 1) % count]
+        delta_row, delta_col = end[0] - start[0], end[1] - start[1]
+        length2 = delta_row * delta_row + delta_col * delta_col
+        fraction = 0.0
+        if length2 > 0.0:
+            fraction = (
+                (row - start[0]) * delta_row + (col - start[1]) * delta_col
+            ) / length2
+        if fraction <= 0.0:
+            point = start
+        elif fraction >= 1.0:
+            point = end
+        else:
+            point = (start[0] + fraction * delta_row, start[1] + fraction * delta_col)
+        distance = math.hypot(row - point[0], col - point[1])
+        if best is None or distance < best[0]:
+            best = (distance, index, point)
+    assert best is not None
+    _distance, edge, point = best
+    vertices.insert(edge + 1, point)
+    return vertices, edge + 1
+
+
 # ---------------------------------------------------------------------------
 # Canvas
 
@@ -196,9 +244,20 @@ class LayerCanvas(QGraphicsView):
 
     Polygon tool: a left click adds a point, a right click (without dragging),
     Enter or a double click closes the polygon, Backspace removes the last
-    point and Esc cancels it. Points of finished polygons can be dragged. A
-    right click on a polygon asks for its menu (``polygon_context``). The
-    right or middle button drags the view in every tool.
+    point and Esc cancels it. Points of finished polygons can be dragged with
+    the left button. A right click on a polygon asks for its menu
+    (``polygon_context``: the polygon, the point under the click or -1, and
+    the screen position); just before that, ``last_context_raw`` is set to the
+    raw (row, col) of the click, so that the menu can add a point to the
+    polygon on its nearest edge. The right or middle button drags the view in
+    every tool.
+
+    ``set_hidden_layers`` hides the polygons and strokes of some layers; this
+    changes only what is shown. Polygons of hidden layers are not drawn, get
+    no point handles and cannot be dragged or right-clicked. Strokes of hidden
+    layers are left out of the stroke image; eraser strokes still apply to the
+    strokes that are shown. ``set_overlays_visible`` (all marks, the proposal)
+    works on top of this.
 
     The canvas also serves the rig frame panel: ``image_point_selected`` gives
     clicks in place mode as fractions of the photograph, ``preview`` identifies
@@ -288,6 +347,13 @@ class LayerCanvas(QGraphicsView):
         self._draft_handles: list[QGraphicsRectItem] = []
         self._drag: tuple[int, int] | None = None
         self._drag_points: list[tuple[float, float]] | None = None
+        # Layers whose polygons and strokes are not shown (display only).
+        self._hidden_layers: frozenset[int] = frozenset()
+        # The strokes last rendered, to draw them again when layers are hidden.
+        self._strokes: list[lp.Stroke] = []
+        self._stroke_colors: dict[int, QColor] = {}
+        # Raw (row, col) of the last right click that opened a polygon menu.
+        self.last_context_raw: tuple[float, float] | None = None
 
     # ----------------------------------------------------------- geometry
 
@@ -383,6 +449,8 @@ class LayerCanvas(QGraphicsView):
         self.cancel_polygon()
         self._end_drag()
         self.render_polygons([], {})
+        self._strokes = []
+        self._stroke_colors = {}
         self._display_shape = None
         self._raw_size = None
         self._stroke_image = None
@@ -407,10 +475,35 @@ class LayerCanvas(QGraphicsView):
             self._end_drag()
         self.stroke_item.setVisible(marks)
         self.active_item.setVisible(marks)
-        for item in self._polygon_items:
-            item.setVisible(marks)
+        for item, polygon in zip(self._polygon_items, self._polygons):
+            item.setVisible(marks and polygon.layer_id not in self._hidden_layers)
         self._update_handles()
         self.proposal_item.setVisible(proposal)
+
+    @property
+    def hidden_layers(self) -> frozenset[int]:
+        return self._hidden_layers
+
+    def set_hidden_layers(self, layer_ids: Iterable[int]) -> None:
+        """Hide the polygons and strokes of these layers; show the others.
+
+        Display only: the marks themselves are not changed.
+        """
+
+        hidden = frozenset(int(value) for value in layer_ids)
+        if hidden == self._hidden_layers:
+            return
+        self._hidden_layers = hidden
+        if (
+            self._drag is not None
+            and self._drag[0] < len(self._polygons)
+            and self._polygons[self._drag[0]].layer_id in hidden
+        ):
+            self._end_drag()
+        for item, polygon in zip(self._polygon_items, self._polygons):
+            item.setVisible(self._marks_visible and polygon.layer_id not in hidden)
+        self._update_handles()
+        self._draw_strokes()
 
     def set_proposal(self, rgba: np.ndarray | None) -> None:
         if rgba is None:
@@ -464,23 +557,38 @@ class LayerCanvas(QGraphicsView):
             path.lineTo(point)
         painter.drawPath(path)
 
-    def render_strokes(
-        self, strokes: Sequence[lp.Stroke], colors: Mapping[int, QColor]
-    ) -> None:
+    def _stroke_shown(self, stroke: lp.Stroke) -> bool:
+        return (
+            stroke.layer_id == lp.ERASER or stroke.layer_id not in self._hidden_layers
+        )
+
+    def _draw_strokes(self) -> None:
+        """Draw the stored strokes, leaving out those of hidden layers."""
+
         if self._stroke_image is None:
             return
         self._stroke_image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(self._stroke_image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        for stroke in strokes:
-            self._paint(painter, stroke, colors)
+        for stroke in self._strokes:
+            if self._stroke_shown(stroke):
+                self._paint(painter, stroke, self._stroke_colors)
         painter.end()
         self.stroke_item.setPixmap(QPixmap.fromImage(self._stroke_image))
+
+    def render_strokes(
+        self, strokes: Sequence[lp.Stroke], colors: Mapping[int, QColor]
+    ) -> None:
+        self._strokes = list(strokes)
+        self._stroke_colors = dict(colors)
+        self._draw_strokes()
 
     def add_stroke_to_image(
         self, stroke: lp.Stroke, colors: Mapping[int, QColor]
     ) -> None:
-        if self._stroke_image is None:
+        self._strokes.append(stroke)
+        self._stroke_colors = dict(colors)
+        if self._stroke_image is None or not self._stroke_shown(stroke):
             return
         painter = QPainter(self._stroke_image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -543,7 +651,9 @@ class LayerCanvas(QGraphicsView):
                 # Smaller polygons win where layers overlap, so they lie on top.
                 rank = sum(1 for other in areas if other > areas[index])
                 item.setZValue(8.0 + min(rank, 999) * 1.0e-3)
-                item.setVisible(self._marks_visible)
+                item.setVisible(
+                    self._marks_visible and polygon.layer_id not in self._hidden_layers
+                )
                 self.scene().addItem(item)
                 self._polygon_items.append(item)
         else:
@@ -577,6 +687,10 @@ class LayerCanvas(QGraphicsView):
         ):
             return
         for index, polygon in enumerate(self._polygons):
+            if polygon.layer_id in self._hidden_layers:
+                # No handles, but keep one list per polygon (indexed by polygon).
+                self._handle_items.append([])
+                continue
             points = (
                 self._drag_points
                 if self._drag is not None and self._drag[0] == index
@@ -595,6 +709,8 @@ class LayerCanvas(QGraphicsView):
 
         best: tuple[float, int, int] | None = None
         for index, polygon in enumerate(self._polygons):
+            if polygon.layer_id in self._hidden_layers:
+                continue
             for vertex, (row, col) in enumerate(polygon.points):
                 spot = self.mapFromScene(self.raw_to_scene(row, col))
                 distance = math.hypot(spot.x() - position.x(), spot.y() - position.y())
@@ -603,13 +719,14 @@ class LayerCanvas(QGraphicsView):
         return None if best is None else (best[1], best[2])
 
     def _hit_polygon(self, position: QPointF) -> int | None:
-        """The smallest polygon under a viewport position."""
+        """The smallest shown polygon under a viewport position."""
 
         scene_point = self.mapToScene(position.toPoint())
         hits = [
             index
             for index, item in enumerate(self._polygon_items)
-            if item.path().contains(scene_point)
+            if self._polygons[index].layer_id not in self._hidden_layers
+            and item.path().contains(scene_point)
         ]
         if not hits:
             return None
@@ -1003,6 +1120,9 @@ class LayerCanvas(QGraphicsView):
             return
         hit = self.polygon_at(event.position())
         if hit is not None:
+            self.last_context_raw = self.scene_to_raw(
+                self.mapToScene(event.position().toPoint())
+            )
             self.polygon_context.emit(
                 hit[0], hit[1], self.viewport().mapToGlobal(event.position().toPoint())
             )
@@ -1205,6 +1325,11 @@ class LayerPainterView(QWidget):
         # Snapshots of (polygons, strokes) for undo and redo.
         self._undo_stack: list[tuple[list[lp.Polygon], list[lp.Stroke]]] = []
         self._redo_stack: list[tuple[list[lp.Polygon], list[lp.Stroke]]] = []
+        # Layers hidden in the photograph: a display choice for the session
+        # shown, never saved and never part of the proposal.
+        self._hidden_layers: set[int] = set()
+        self._hidden_session: lp.PaintingSession | None = None
+        self._layer_table_menu_widget: QMenu | None = None
         self._dirty = False
         self._export_stale = True
         self._export_key = ""
@@ -1304,13 +1429,22 @@ class LayerPainterView(QWidget):
                 "Choose a layer and outline it with a polygon: left click adds a "
                 "point, right click or Enter closes it. Rough outlines are enough; "
                 "the boundaries are placed within the snap distance (step 3). Drag "
-                "a point to move it; right-click a polygon to delete it or give it "
-                "to another layer. The brush (B) paints strokes, for example as "
-                "corrections. Mark the ColorChecker, tape and fittings as Excluded."
+                "a point to move it. Right-click a point to remove it, or right-"
+                "click inside a polygon to add a point on its nearest edge, delete "
+                "the polygon or give it to another layer. The brush (B) paints "
+                "strokes, for example as corrections. Mark the ColorChecker, tape "
+                "and fittings as Excluded. Untick Show to hide a layer in the "
+                "photograph; this changes only what is shown. Right-click the list "
+                "to show only one layer, or all layers again."
             )
         )
-        self.layer_table = QTableWidget(0, 4)
-        self.layer_table.setHorizontalHeaderLabels(["", "Layer", "Polygons", "Strokes"])
+        self.layer_table = QTableWidget(0, 5)
+        self.layer_table.setHorizontalHeaderLabels(
+            ["", "Layer", "Polygons", "Strokes", "Show"]
+        )
+        show_header = self.layer_table.horizontalHeaderItem(_SHOW_COLUMN)
+        if show_header is not None:
+            show_header.setToolTip(_SHOW_TIP)
         self.layer_table.verticalHeader().setVisible(False)
         self.layer_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1328,9 +1462,14 @@ class LayerPainterView(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            _SHOW_COLUMN, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.layer_table.itemSelectionChanged.connect(self._layer_selected)
         self.layer_table.itemChanged.connect(self._layer_item_changed)
         self.layer_table.cellDoubleClicked.connect(self._layer_double_clicked)
+        self.layer_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.layer_table.customContextMenuRequested.connect(self._layer_table_menu)
         layout.addWidget(self.layer_table)
         buttons = QHBoxLayout()
         self.add_layer_button = QPushButton("Add layer")
@@ -1362,8 +1501,8 @@ class LayerPainterView(QWidget):
                 "photograph inside the rig frame. Inside a polygon its layer is "
                 "kept; near polygon edges the model places the boundary within the "
                 "snap distance, choosing only between layers marked nearby. Where "
-                "it is wrong, move a polygon point or paint a short stroke of the "
-                "right layer, and propose again."
+                "it is wrong, move or add a polygon point or paint a short stroke "
+                "of the right layer, and propose again."
             )
         )
         row = QHBoxLayout()
@@ -1534,7 +1673,8 @@ class LayerPainterView(QWidget):
                 "Polygon",
                 (
                     "Outline the selected layer (L): left click adds a point, right "
-                    "click or Enter closes the polygon"
+                    "click or Enter closes the polygon. Drag a point to move it; "
+                    "right-click a polygon to add or remove a point"
                 ),
             ),
             ("paint", "Paint", "Paint strokes of the selected layer (B)"),
@@ -1726,6 +1866,10 @@ class LayerPainterView(QWidget):
         """Load the session, photograph and proposal of the reference run."""
 
         self.save_session()
+        # Which layers are hidden is a display choice for the session shown.
+        self._hidden_layers = set()
+        self._hidden_session = None
+        self.canvas.set_hidden_layers(())
         try:
             self._workspace_frame_config = workspace_frame.current_configuration(self.project)
         except (OSError, ValueError) as error:
@@ -2036,6 +2180,7 @@ class LayerPainterView(QWidget):
 
     def _refresh_layers(self) -> None:
         table = self.layer_table
+        self._prune_hidden_layers()
         table.blockSignals(True)
         try:
             current = self.canvas.layer_id
@@ -2066,6 +2211,19 @@ class LayerPainterView(QWidget):
                     )
                     count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     table.setItem(row, column, count)
+                shown = QTableWidgetItem()
+                shown.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                shown.setCheckState(
+                    Qt.CheckState.Unchecked
+                    if layer.layer_id in self._hidden_layers
+                    else Qt.CheckState.Checked
+                )
+                shown.setToolTip(_SHOW_TIP)
+                table.setItem(row, _SHOW_COLUMN, shown)
                 if layer.layer_id == current:
                     selected_row = row
             if selected_row < 0 and layers:
@@ -2106,7 +2264,16 @@ class LayerPainterView(QWidget):
             self.set_tool("polygon")
 
     def _layer_item_changed(self, item: QTableWidgetItem) -> None:
-        if self.session is None or item.column() != 1:
+        if self.session is None:
+            return
+        if item.column() == _SHOW_COLUMN:
+            if item.row() < len(self.session.layers):
+                self.set_layer_visible(
+                    self.session.layers[item.row()].layer_id,
+                    item.checkState() == Qt.CheckState.Checked,
+                )
+            return
+        if item.column() != 1:
             return
         layer = (
             self.session.layers[item.row()]
@@ -2193,6 +2360,10 @@ class LayerPainterView(QWidget):
                 return
         self.canvas.cancel_polygon()
         self.session.remove_layer(layer_id)
+        if layer_id in self._hidden_layers:
+            # A later layer may get the same ID; it starts shown.
+            self._hidden_layers.discard(layer_id)
+            self.canvas.set_hidden_layers(self._hidden_layers)
         # Earlier snapshots may refer to the removed layer.
         self._undo_stack = []
         self._redo_stack = []
@@ -2224,6 +2395,124 @@ class LayerPainterView(QWidget):
         """Former name of :meth:`clear_layer_marks`."""
 
         self.clear_layer_marks(confirm=confirm)
+
+    # --------------------------------------------------- layer visibility
+
+    @property
+    def hidden_layers(self) -> frozenset[int]:
+        """Layers hidden in the photograph (display only, never saved)."""
+
+        return frozenset(self._hidden_layers)
+
+    def layer_visible(self, layer_id: int) -> bool:
+        return int(layer_id) not in self._hidden_layers
+
+    def set_layer_visible(self, layer_id: int, visible: bool) -> None:
+        """Show or hide a layer in the photograph.
+
+        Only the display changes: its polygons, strokes and proposed pixels.
+        The session, the proposal and what is saved or exported stay the same.
+        """
+
+        hidden = set(self._hidden_layers)
+        if visible:
+            hidden.discard(int(layer_id))
+        else:
+            hidden.add(int(layer_id))
+        self._set_hidden_layers(hidden)
+
+    def show_only_layer(self, layer_id: int) -> None:
+        if self.session is None or self.session.layer(layer_id) is None:
+            return
+        self._set_hidden_layers(
+            row.layer_id for row in self.session.layers if row.layer_id != layer_id
+        )
+
+    def show_all_layers(self) -> None:
+        self._set_hidden_layers(())
+
+    def _set_hidden_layers(self, layer_ids: Iterable[int]) -> None:
+        known = (
+            {row.layer_id for row in self.session.layers}
+            if self.session is not None
+            else set()
+        )
+        hidden = {int(value) for value in layer_ids} & known
+        if hidden != self._hidden_layers:
+            self._hidden_layers = hidden
+            self.canvas.set_hidden_layers(hidden)
+            self._render_proposal()
+        self._sync_show_column()
+
+    def _prune_hidden_layers(self) -> None:
+        """Hidden layers belong to the session shown: another session (another
+        run or an imported map) shows every layer; removed layers are dropped."""
+
+        session = self.session
+        if session is not self._hidden_session:
+            self._hidden_session = session
+            hidden: set[int] = set()
+        elif session is None:
+            hidden = set()
+        else:
+            hidden = self._hidden_layers & {row.layer_id for row in session.layers}
+        if hidden != self._hidden_layers:
+            self._hidden_layers = hidden
+            self.canvas.set_hidden_layers(hidden)
+
+    def _sync_show_column(self) -> None:
+        """Tick the Show box of every shown layer."""
+
+        if self.session is None:
+            return
+        table = self.layer_table
+        table.blockSignals(True)
+        try:
+            for row, layer in enumerate(self.session.layers):
+                item = table.item(row, _SHOW_COLUMN)
+                state = (
+                    Qt.CheckState.Unchecked
+                    if layer.layer_id in self._hidden_layers
+                    else Qt.CheckState.Checked
+                )
+                if item is not None and item.checkState() != state:
+                    item.setCheckState(state)
+        finally:
+            table.blockSignals(False)
+
+    def _reveal_layer(self, layer_id: int) -> None:
+        """A layer that gets a new mark is shown, so that the mark can be seen."""
+
+        if int(layer_id) not in self._hidden_layers or self.session is None:
+            return
+        self.set_layer_visible(layer_id, True)
+        layer = self.session.layer(layer_id)
+        if layer is not None:
+            self._canvas_notice(f"{layer.name} is shown again for its new mark.")
+
+    def _layer_table_menu(self, position: QPoint) -> None:
+        """Right-click menu of the layer list: which layers are shown."""
+
+        if self.session is None:
+            return
+        row = self.layer_table.indexAt(position).row()
+        layer = (
+            self.session.layers[row] if 0 <= row < len(self.session.layers) else None
+        )
+        menu = QMenu(self)
+        only = menu.addAction("Show only this layer")
+        only.setEnabled(layer is not None)
+        if layer is not None:
+            only.triggered.connect(
+                lambda _checked=False, layer_id=layer.layer_id: self.show_only_layer(
+                    layer_id
+                )
+            )
+        every = menu.addAction("Show all layers")
+        every.setEnabled(bool(self._hidden_layers))
+        every.triggered.connect(lambda _checked=False: self.show_all_layers())
+        self._layer_table_menu_widget = menu
+        menu.popup(self.layer_table.viewport().mapToGlobal(position))
 
     # ------------------------------------------------------------- marks
 
@@ -2269,6 +2558,7 @@ class LayerPainterView(QWidget):
         self._undo_stack.append(snapshot)
         del self._undo_stack[:-_UNDO_LIMIT]
         self._redo_stack = []
+        self._reveal_layer(stroke.layer_id)
         self.canvas.add_stroke_to_image(stroke, self._layer_colors())
         self._after_mark_change(render=False)
 
@@ -2289,6 +2579,7 @@ class LayerPainterView(QWidget):
         self._undo_stack.append(snapshot)
         del self._undo_stack[:-_UNDO_LIMIT]
         self._redo_stack = []
+        self._reveal_layer(polygon.layer_id)
         self._after_mark_change()
 
     def add_polygon(self, polygon: lp.Polygon) -> None:
@@ -2328,6 +2619,7 @@ class LayerPainterView(QWidget):
             return
         self._push_undo()
         self.session.move_polygon(index, layer_id)
+        self._reveal_layer(layer_id)
         self._after_mark_change()
 
     def remove_polygon_point(self, index: int, vertex: int) -> None:
@@ -2340,6 +2632,27 @@ class LayerPainterView(QWidget):
             point for number, point in enumerate(polygon.points) if number != vertex
         ]
         self._polygon_edited(index, points)
+
+    def add_polygon_point(self, index: int, row: float, col: float) -> int:
+        """Add a point to a polygon on its edge nearest to (row, col).
+
+        (row, col) is in raw pixels, for example where the polygon was
+        right-clicked; the point goes where it projects onto that edge. Like a
+        moved point, the change can be undone. Returns the index of the new
+        point, or -1.
+        """
+
+        if self.session is None or not 0 <= index < len(self.session.polygons):
+            return -1
+        points, inserted = insert_point_on_nearest_edge(
+            self.session.polygons[index].points, row, col
+        )
+        if inserted < 0:
+            return -1
+        self._polygon_edited(index, points)
+        if self.session.polygons[index].points != points:
+            return -1  # refused; the notice says why
+        return inserted
 
     def _polygon_menu(self, index: int, vertex: int, position: QPoint) -> None:
         if self.session is None or not 0 <= index < len(self.session.polygons):
@@ -2354,6 +2667,15 @@ class LayerPainterView(QWidget):
             remove_point.setEnabled(len(polygon.points) > 3)
             remove_point.triggered.connect(
                 lambda _checked=False: self.remove_polygon_point(index, vertex)
+            )
+        elif self.canvas.last_context_raw is not None:
+            # Where the polygon was right-clicked, in raw pixels.
+            clicked = self.canvas.last_context_raw
+            add_point = menu.addAction("Add point here")
+            add_point.triggered.connect(
+                lambda _checked=False, at=clicked: self.add_polygon_point(
+                    index, at[0], at[1]
+                )
             )
         move = menu.addMenu("Move to layer")
         for row in self.session.layers:
@@ -2564,10 +2886,23 @@ class LayerPainterView(QWidget):
         for layer in self.session.layers:
             color = QColor(layer.color)
             table[layer.layer_id] = (color.red(), color.green(), color.blue(), alpha)
+        # Hidden layers are fully transparent (display only).
+        hidden = np.zeros(256, dtype=bool)
+        for layer_id in self._hidden_layers:
+            if 0 < layer_id < 256:
+                hidden[layer_id] = True
+        table[hidden] = 0
         rgba = table[classes]
+        shown = ~hidden[classes]
+        # A boundary pixel is drawn where it touches a shown layer (or the area
+        # outside the rig frame); between hidden layers there is none.
         boundary = np.zeros(classes.shape, dtype=bool)
-        boundary[:, 1:] |= classes[:, 1:] != classes[:, :-1]
-        boundary[1:, :] |= classes[1:, :] != classes[:-1, :]
+        boundary[:, 1:] |= (classes[:, 1:] != classes[:, :-1]) & (
+            shown[:, 1:] | shown[:, :-1]
+        )
+        boundary[1:, :] |= (classes[1:, :] != classes[:-1, :]) & (
+            shown[1:, :] | shown[:-1, :]
+        )
         rgba[boundary] = (255, 255, 255, 235)
         if self.show_uncertain.isChecked():
             uncertain = cv2.resize(
@@ -2577,7 +2912,7 @@ class LayerPainterView(QWidget):
             ).astype(bool)
             rows, cols = np.indices(classes.shape)
             hatch = ((rows + cols) // 3) % 2 == 0
-            rgba[uncertain & hatch] = (255, 0, 255, 200)
+            rgba[uncertain & hatch & shown] = (255, 0, 255, 200)
         self.canvas.set_proposal(rgba)
         self._update_polygon_fill()
 
@@ -3270,4 +3605,9 @@ class LayerPainterView(QWidget):
         return text
 
 
-__all__ = ["LayerCanvas", "LayerPainterView", "StepSection"]
+__all__ = [
+    "LayerCanvas",
+    "LayerPainterView",
+    "StepSection",
+    "insert_point_on_nearest_edge",
+]
