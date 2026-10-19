@@ -39,7 +39,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QTableWidget,
+    QTabWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -594,6 +596,18 @@ class JobsPanel(QWidget):
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
         layout.addWidget(self.context_label)
+        # The job list at full height on the left, the selected job on the
+        # right; no table, log or error text has a height cap (N141).
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        listing = QWidget()
+        list_layout = QVBoxLayout(listing)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        details = QWidget()
+        detail_layout = QVBoxLayout(details)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.detail_tabs = QTabWidget()
+        progress, files = QWidget(), QWidget()
+        progress_layout, files_layout = QVBoxLayout(progress), QVBoxLayout(files)
         actions = QHBoxLayout()
         self.create_button, self.refresh_button = QPushButton(
             "Start analysis…"
@@ -603,24 +617,24 @@ class JobsPanel(QWidget):
         actions.addWidget(self.create_button)
         actions.addWidget(self.refresh_button)
         actions.addStretch()
-        layout.addLayout(actions)
+        list_layout.addLayout(actions)
         self.job_table = _table(
             ["Name", "Series", "Runs", "Frames", "Created", "State"]
         )
-        self.job_table.setMaximumHeight(160)
         self.job_table.itemSelectionChanged.connect(self._selection_changed)
-        layout.addWidget(self.job_table)
+        list_layout.addWidget(self.job_table, 1)
         self.master_label, self.progress_label = _label("No active job"), _label("")
-        layout.addWidget(self.master_label)
-        layout.addWidget(self.progress_label)
+        detail_layout.addWidget(self.master_label)
+        detail_layout.addWidget(self.progress_label)
         self.capacity_button = QPushButton("Check expected space on this machine")
         self.capacity_button.clicked.connect(self.check_capacity)
         self.capacity_label = _label("Expected space not checked. The worker checks fresh free space before claiming a run.")
-        layout.addWidget(self.capacity_button)
-        layout.addWidget(self.capacity_label)
+        files_layout.addWidget(self.capacity_button)
+        files_layout.addWidget(self.capacity_label)
+        files_layout.addStretch()
         # Read-only: an existing job keeps the profile stored in its job.json.
         self.profile_label = _label("Storage profile: no job selected.")
-        layout.addWidget(self.profile_label)
+        detail_layout.addWidget(self.profile_label)
         controls = QHBoxLayout()
         self.backend_combo, self.workers_spin = QComboBox(), QSpinBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -650,24 +664,23 @@ class JobsPanel(QWidget):
         self.resume_button.clicked.connect(self.resume_job)
         self.stop_button.clicked.connect(self.stop_job)
         controls.addWidget(self.add_machine_button)
-        layout.addLayout(controls)
-        self.launch_state_label = _label("No launch request for the selected target.")
-        layout.addWidget(self.launch_state_label)
         self.declare_stopped_button = QPushButton("Declare previous service stopped…")
         self.declare_stopped_button.clicked.connect(
             self.declare_previous_service_stopped
         )
-        layout.addWidget(self.declare_stopped_button)
+        controls.addWidget(self.declare_stopped_button)
+        detail_layout.addLayout(controls)
+        self.launch_state_label = _label("No launch request for the selected target.")
+        detail_layout.addWidget(self.launch_state_label)
         self.control_state_label = _label("Control unavailable: no job selected.")
-        layout.addWidget(self.control_state_label)
+        detail_layout.addWidget(self.control_state_label)
         self.control_note = _label(CONTROL_BOUNDARY + " " + REMOTE_GAP)
-        layout.addWidget(self.control_note)
+        detail_layout.addWidget(self.control_note)
         self.backend_combo.currentIndexChanged.connect(self._target_changed)
         self.machine_table = _table(
             ["Machine", "Committed frames", "Average throughput", "ETA", "Scope"]
         )
-        self.machine_table.setMaximumHeight(130)
-        layout.addWidget(self.machine_table)
+        progress_layout.addWidget(self.machine_table, 1)
         self.worker_table = _table(
             [
                 "Machine",
@@ -678,18 +691,24 @@ class JobsPanel(QWidget):
                 "Verbatim error",
             ]
         )
-        self.worker_table.setMaximumHeight(150)
-        layout.addWidget(self.worker_table)
+        progress_layout.addWidget(self.worker_table, 1)
         self.resource_slot = QVBoxLayout()
-        layout.addLayout(self.resource_slot)
+        progress_layout.addLayout(self.resource_slot)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumBlockCount(2500)
-        layout.addWidget(self.log_text)
         self.error_text = QPlainTextEdit()
         self.error_text.setReadOnly(True)
-        self.error_text.setMaximumHeight(130)
-        layout.addWidget(self.error_text)
+        self.detail_tabs.addTab(progress, "Progress")
+        self.detail_tabs.addTab(self.log_text, "Log")
+        self.detail_tabs.addTab(self.error_text, "Errors")
+        self.detail_tabs.addTab(files, "Files")
+        detail_layout.addWidget(self.detail_tabs, 1)
+        self.splitter.addWidget(listing)
+        self.splitter.addWidget(details)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+        layout.addWidget(self.splitter, 1)
         self.timer = QTimer(self)
         self.timer.setInterval(10000)
         self.timer.timeout.connect(self.refresh)

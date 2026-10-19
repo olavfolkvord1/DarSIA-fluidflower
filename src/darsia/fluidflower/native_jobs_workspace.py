@@ -8,6 +8,7 @@ import traceback
 from PySide6.QtCore import QStandardPaths, Qt
 from PySide6.QtWidgets import (
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -72,8 +73,20 @@ class NativeJobsWorkspace(QWidget):
         self.association_note.setWordWrap(True)
         self.association_note.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.association_note)
-        self.stores = store_panel_factory(self)
-        layout.addWidget(self.stores)
+        # Where jobs and plans come from, collapsed so the job list gets the page (N141).
+        self.sources = QGroupBox("Sources")
+        self.sources.setCheckable(True)
+        self.sources.setChecked(False)
+        sources_layout = QVBoxLayout(self.sources)
+        self.sources_body = QWidget()
+        body_layout = QVBoxLayout(self.sources_body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        sources_layout.addWidget(self.sources_body)
+        self.sources_body.setVisible(False)
+        self.sources.toggled.connect(self.sources_body.setVisible)
+        layout.addWidget(self.sources)
+        self.stores = store_panel_factory(self.sources_body)
+        body_layout.addWidget(self.stores)
         actions = QHBoxLayout()
         self.open_job_button = QPushButton("Open existing job…")
         self.import_plan_button = QPushButton("Import adopted execution plan…")
@@ -82,7 +95,7 @@ class NativeJobsWorkspace(QWidget):
         actions.addWidget(self.open_job_button)
         actions.addWidget(self.import_plan_button)
         actions.addStretch()
-        layout.addLayout(actions)
+        body_layout.addLayout(actions)
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -104,7 +117,7 @@ class NativeJobsWorkspace(QWidget):
                     inventory_provider=inventory_provider,
                 )
             )
-        layout.addWidget(self.panel)
+        layout.addWidget(self.panel, 1)
         self.panel.job_created.connect(self._job_created)
         self.panel.job_table.cellClicked.connect(self._job_clicked)
         self.panel.job_table.itemActivated.connect(
