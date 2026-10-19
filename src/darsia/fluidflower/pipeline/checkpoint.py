@@ -11,7 +11,7 @@ import ntpath
 import re
 from pathlib import Path
 
-from .job_queue import read_json
+from .job_queue import read_json, retired_lease_directory
 
 
 def _key(path):
@@ -98,7 +98,8 @@ def resume_source_for_claim(shared, claim):
         return None
     if record_path.parent.name != old_token:
         raise ValueError("Reclaimed predecessor token differs")
-    old_owner = read_json(record_path.parent / "lease" / "owner.json")
+    old_owner = read_json(
+        retired_lease_directory(shared.root, claim.task["run"], old_token) / "owner.json")
     old_task = dict(old_owner["task"])
     new_task = dict(claim.task)
     old_task.pop("attempt_id", None)

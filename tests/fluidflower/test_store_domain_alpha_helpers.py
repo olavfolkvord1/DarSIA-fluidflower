@@ -136,7 +136,10 @@ def test_alpha_variants_reuse_exact_json_number_sha_and_queue_descriptor(tmp_pat
     sha_original = _compile(_node("overflow.py", "_sha256_file", original=True))
     sha_actual = _forward("overflow.py", "_sha256_file", sha_owner)
     assert sha_actual(path) == sha_original(path)
-    descriptor_owner = _compile(_node("pipeline/job_queue.py", "descriptor"))
+    from darsia.fluidflower.pipeline.job_queue import retry_transient
+    # The queue descriptor waits out a transient SMB read error (N111).
+    descriptor_owner = _compile(_node("pipeline/job_queue.py", "descriptor"),
+                                dict(retry_transient=retry_transient))
     descriptor_original = _compile(_node("pipeline/checkpoint.py", "_descriptor", original=True))
     descriptor_actual = _forward("pipeline/checkpoint.py", "_descriptor", descriptor_owner)
     assert descriptor_actual(path) == descriptor_original(path)

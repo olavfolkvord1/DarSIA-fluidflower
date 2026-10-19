@@ -176,8 +176,9 @@ def test_reclaim_decided_before_publish_wins_and_publisher_gets_lease_lost(tmp_p
     records = shared.reclaim_stale()
     assert [record["previous_attempt"] for record in records] == [claim.token]
     assert records[0]["last_actual_progress_unix_ns"] == 1
-    assert not claim.lease.exists()
-    assert (tmp_path / "reclaimed/sample" / claim.token / "lease/owner.json").is_file()
+    assert claim.lease.is_dir()  # Retired in place: a marker names it, nothing moved.
+    assert jobs.retired_lease_directory(tmp_path, "sample", claim.token) == claim.lease
+    assert (claim.lease / "owner.json").is_file()
     assert read_json(tmp_path / "queue/sample.json")["attempt_id"] == records[0]["next_attempt"]
     assert decisions(tmp_path) == ["sample." + claim.token + ".json"]
     assert shared.reclaim_stale() == []
@@ -233,11 +234,12 @@ def test_concurrent_publish_and_reclaim_leave_exactly_one_consistent_decision(
     assert won == (outcome == "publish") and won != bool(requeued)
     assert (root / "done/sample.json").exists() == won
     assert (root / "queue/sample.json").exists() == (not won)
-    assert claim.lease.is_dir() == won
+    assert claim.lease.is_dir()  # Neither outcome moves the lease.
+    assert (root / "reclaimed/sample" / claim.token / "lease.json").is_file() == (not won)
 
 
 @pytest.mark.parametrize("outcome", ["reclaimed", "rejected"])
-def test_retirement_decision_revokes_the_owner_before_its_lease_moves(tmp_path, server_lease_clock, outcome):
+def test_retirement_decision_revokes_the_owner_before_its_lease_is_marked(tmp_path, server_lease_clock, outcome):
     shared = JobQueue(tmp_path, server_clock=server_lease_clock.clock)
     shared.enqueue(task())
     claim = shared.claim("machine", "cpu", OWNER)
@@ -428,7 +430,9 @@ def test_input_rejection_records_its_decision_and_then_archives(tmp_path, monkey
     claim = alias_claim(queue_, clock, callbacks)
     record = queue_.reject_before_science(claim, "InputHashMismatch: original SHA differs", {"pid": 123})
     assert jobs.read_decision(queue_.root, "ac52", claim.token)["outcome"] == "rejected"
-    assert (queue_.root / "reclaimed/ac52" / claim.token / "lease/owner.json").is_file()
+    assert claim.lease.is_dir() and (claim.lease / "owner.json").is_file()
+    assert jobs.retired_lease_directory(queue_.root, "ac52", claim.token) == claim.lease
+    assert jobs.read_decision(queue_.root, "ac52", claim.token)["next_attempt"] == record["next_attempt"]
     assert read_json(queue_.root / "queue/ac52.json")["attempt_id"] == record["next_attempt"]
     clock.now += 10_000 * 1_000_000_000
     assert queue_.reclaim_stale() == []
@@ -440,13 +444,12 @@ def test_interrupted_reclaim_archive_is_finished_without_a_second_decision_or_re
     real = jobs.rename
 
     def interrupted(source, destination):
-        if Path(source) == claim.lease:
+        if Path(source) == claim.claimed:  # The task-file archive step is interrupted.
             raise sharing_error()
         return real(source, destination)
 
     monkeypatch.setattr(jobs, "rename", interrupted)
-    with pytest.raises(PermissionError):
-        shared.reclaim_stale()
+    assert shared.reclaim_stale() == []  # N111: the step is deferred, never a crash.
     monkeypatch.setattr(jobs, "rename", real)
     decision = jobs.read_decision(tmp_path, "sample", claim.token)
     assert decision["outcome"] == "reclaimed" and claim.lease.is_dir()
@@ -456,7 +459,7 @@ def test_interrupted_reclaim_archive_is_finished_without_a_second_decision_or_re
     records = shared.reclaim_stale()
     assert [record["previous_attempt"] for record in records] == [claim.token]
     assert records[0]["last_actual_progress_unix_ns"] == decision["last_actual_progress_unix_ns"]
-    assert not claim.lease.exists()
+    assert claim.lease.is_dir() and records[0]["next_attempt"] == decision["next_attempt"]
     assert read_json(tmp_path / "queue/sample.json")["attempt_id"] == records[0]["next_attempt"]
     assert decisions(tmp_path) == ["sample." + claim.token + ".json"]
     assert shared.reclaim_stale() == []
@@ -493,14 +496,15 @@ def test_ownerless_reclaim_interrupted_after_its_decision_is_finished_later(tmp_
         return real(source, destination)
 
     monkeypatch.setattr(jobs, "rename", interrupted)
-    with pytest.raises(PermissionError):
-        queue_.reclaim_stale()
+    assert queue_.reclaim_stale() == []  # N111: the step is deferred, never a crash.
     monkeypatch.setattr(jobs, "rename", real)
     assert jobs.read_decision(queue_.root, "ac52", original["attempt_id"])["outcome"] == "reclaimed"
     assert claimed.is_file() and not pending.exists()
     records = queue_.reclaim_stale()
     assert len(records) == 1 and records[0]["previous_attempt"] == original["attempt_id"]
     assert records[0]["interrupted_claim_before_science"] is True
+    assert records[0]["next_attempt"] == jobs.read_decision(
+        queue_.root, "ac52", original["attempt_id"])["next_attempt"]
     assert read_json(pending)["attempt_id"] == records[0]["next_attempt"]
     assert not claimed.exists() and queue_.reclaim_stale() == []
 

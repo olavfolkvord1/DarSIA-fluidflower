@@ -539,7 +539,7 @@ def require_retired_source(task, local_output, output, raw, expected_service=Non
 
 def alias_resume_source(shared, claim):
     """Follow exact preserved input-reject hops to genuine original SCI proof."""
-    from .job_queue import name, read_json
+    from .job_queue import name, read_json, retired_lease_directory
     root=Path(shared.root)
     run=name(claim.task["run"])
     records=root/"reclaimed"/run
@@ -603,7 +603,7 @@ def alias_resume_source(shared, claim):
                 return None
             earlier,value=read_prior(prior)
             return follow(earlier,value,previous)
-        owner=read_json(path.parent/"lease"/"owner.json")
+        owner=read_json(retired_lease_directory(root,run,previous)/"owner.json")
         same_task(owner["task"],previous)
         if owner.get("token")!=previous:
             raise InputHashMismatch("Original owner/token differs")

@@ -11,7 +11,9 @@ from pathlib import Path, PureWindowsPath, PurePosixPath
 import re
 import traceback
 
-from .pipeline.job_queue import descriptor, name, _own_asset, publication_directory, validate_task
+from .pipeline.job_queue import (
+    descriptor, name, _own_asset, publication_directory, retired_lease_directory, validate_task,
+)
 from .storage_profile import declared_storage_profile
 from .pipeline.products_publication import (
     _read_index, read_published_metadata, published_metadata_descriptor, _bound, _json,
@@ -44,6 +46,11 @@ def _commit(record, commit, task):
         raise ValueError("Published commit product SHA/size differs")
     return case
 
+def _lease_token(lease):
+    """Attempt of a lease: leases/<run>.<attempt>, or the legacy reclaimed/<run>/<attempt>/lease."""
+    return lease.parent.name if lease.name == "lease" else lease.name.split(".")[-1]
+
+
 def _lease_chain(root, run, token, base_task, reader):
     """Follow exact task generations, never a highest-output scan."""
     base_token = base_task["attempt_id"]
@@ -71,7 +78,7 @@ def _lease_chain(root, run, token, base_task, reader):
         if (task.get("attempt_id") != previous or task.get("run") != run
                 or not _task_identity(base_task, task)):
             raise ValueError("Archived predecessor task differs")
-        paths.append(path.parent/"lease")
+        paths.append(retired_lease_directory(root, run, previous, reader=reader))
         token = previous
     return list(reversed(paths))
 
@@ -202,7 +209,7 @@ def _phase1_terminal(root, base_task, job, done, reader):
 
 
 def _events(lease, task, reader, *, token=None):
-    token = token or (lease.parent.name if lease.name == "lease" else lease.name.split(".")[-1])
+    token = token or _lease_token(lease)
     events=[]
     for sequence,path in enumerate(sorted(lease.glob("progress_*.json"))):
         value=reader(path)
@@ -397,7 +404,7 @@ def _terminal(root, run_root, base_task, job, done, reader):
     for lease in lineage:
         path=lease/"owner.json"
         if path.exists():
-            owner=reader(path);token=lease.parent.name
+            owner=reader(path);token=_lease_token(lease)
             owners[token]=_owner_machine(owner,base_task,token)
     completion_product=products["completed.json"]
     if (not _same_bytes(completion_product,done["completed"])
@@ -452,7 +459,7 @@ def _failed_publication(root, base_task, failure_path, reader):
         if not path.exists():
             continue
         original = reader(path)
-        original_token = token if lease == directory else lease.parent.name
+        original_token = token if lease == directory else _lease_token(lease)
         machine = _owner_machine(original, base_task, original_token)
         for case, _commit_document, stamp in _events(lease, base_task, reader, token=original_token):
             counted[case] = machine
@@ -505,7 +512,7 @@ def published_snapshot(registration,job,ui,*,reader):
                             if not original_owner_path.exists():
                                 continue  # An ownerless pre-science generation has no frames.
                             original_owner=reader(original_owner_path)
-                            original_token=(original.parent.name if original.name=="lease" else original.name.split(".")[-1])
+                            original_token=_lease_token(original)
                             physical=_owner_machine(original_owner,task,original_token)
                             for case,commit,stamp in _events(original,task,reader):
                                 counted[case]=physical;times.append(stamp)

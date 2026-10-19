@@ -22,6 +22,7 @@ from darsia.fluidflower.pipeline.job_queue import (
     name,
     read_json,
     require_unc,
+    retired_lease_directory,
     write_immutable,
 )
 from .job_launch_state import read_launch_requests
@@ -362,7 +363,10 @@ class JobSnapshotReader:
             if record.get("interrupted_claim_before_science") is True:
                 previous = self.read(archive / "task.json")
             else:
-                owner = self.read(archive / "lease" / "owner.json")
+                owner = self.read(
+                    retired_lease_directory(root, task["run"], token, reader=self.read)
+                    / "owner.json"
+                )
                 if owner.get("token") != token or _key(
                     owner.get("output_path", "")
                 ) != _key(run_root / ".attempts" / token):

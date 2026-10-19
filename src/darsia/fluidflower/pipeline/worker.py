@@ -21,12 +21,19 @@ from pathlib import Path, PureWindowsPath
 from .job_queue import (
     JobQueue,
     LeaseLost,
+    lease_retired,
     name,
     read_json,
     require_unc,
+    retry_transient,
+    transient_os_error,
     utc,
     write_immutable,
 )
+
+# N111: queue steps wait out a transient SMB error this long before each retry,
+# after the file-level retries inside the queue itself.
+QUEUE_RETRY_DELAYS = (5.0, 15.0, 30.0)
 
 
 def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
@@ -243,29 +250,46 @@ def _run_tasks(
             messages.put(dict(kind=requested.state, command=requested.command,
                               traceback=requested.traceback_text, actual_worker=owner))
             return
-        try:
+        held = []
+
+        def next_claim():
             shared.recover_publications()
             for record in shared.reclaim_stale():
                 messages.put(dict(kind="reclaimed", **record))
             if io_runtime is None:
-                claim = shared.claim(machine, backend, owner)
-            else:
-                with io_runtime.capacity_claim(owner,queue_error) as capacity:
-                    claim = shared.claim(machine,backend,owner,
-                        availability=capacity.availability,
-                        output_factory=io_runtime.output_factory,
-                        publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
-                    try:
-                        capacity.bind(claim)
-                    except Exception:
-                        if claim is not None:
-                            # An actual atomic claim exists even if local disk
-                            # bookkeeping failed; the original parent must bind
-                            # it for owned retirement before any replacement.
-                            messages.put(dict(kind="claimed",run=claim.task["run"],
-                                attempt_id=claim.token,actual_worker=owner))
-                        raise
-        except Exception:
+                found = shared.claim(machine, backend, owner)
+                held.extend([found] if found is not None else [])
+                return found
+            with io_runtime.capacity_claim(owner,queue_error) as capacity:
+                found = shared.claim(machine,backend,owner,
+                    availability=capacity.availability,
+                    output_factory=io_runtime.output_factory,
+                    publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
+                held.extend([found] if found is not None else [])
+                try:
+                    capacity.bind(found)
+                except Exception:
+                    if found is not None:
+                        # An actual atomic claim exists even if local disk
+                        # bookkeeping failed; the original parent must bind
+                        # it for owned retirement before any replacement.
+                        messages.put(dict(kind="claimed",run=found.task["run"],
+                            attempt_id=found.token,actual_worker=owner))
+                    raise
+                return found
+
+        def queue_retry(attempt, delay, error):
+            messages.put(dict(kind="queue_transient_retry", attempt=attempt,
+                              delay_seconds=delay, error=repr(error), actual_worker=owner))
+
+        try:
+            # N111: a transient SMB error waits and retries, never once a claim is held.
+            claim = retry_transient(next_claim, delays=QUEUE_RETRY_DELAYS,
+                                    wait=lambda seconds: stop.wait(seconds),
+                                    on_retry=queue_retry, retry_if=lambda error: not held)
+        except Exception as error:
+            if stop.is_set() and transient_os_error(error) and not held:
+                return  # A stop request ended the wait for the share.
             text = traceback.format_exc()
             messages.put(dict(kind="queue_failure", traceback=text))
             raise SystemExit(1)
@@ -840,6 +864,17 @@ def _parent(args, identity, job, commit, log):
     )
     fatal = False
     control_failed = False
+
+    def parent_retry(step):
+        """Log one wait for a transient SMB error in a parent queue step (N111)."""
+        return lambda attempt, delay, error: emit(log, dict(
+            kind="watchdog_transient_retry", step=step, attempt=attempt,
+            delay_seconds=delay, error=repr(error)))
+
+    def maintain():
+        shared.recover_publications()
+        return shared.reclaim_stale()
+
     try:
         while True:
             try:
@@ -964,8 +999,8 @@ def _parent(args, identity, job, commit, log):
                     slot["waiting_reclaim"] = slot["claim"] is not None
                 if slot["waiting_reclaim"]:
                     # Keep the original 600-second actual-progress lease unchanged.
-                    shared.recover_publications()
-                    for record in shared.reclaim_stale():
+                    for record in retry_transient(maintain, delays=QUEUE_RETRY_DELAYS,
+                                                  on_retry=parent_retry("reclaim")):
                         emit(log, dict(kind="reclaimed", **record))
                     claim = slot["claim"]
                     lease = (
@@ -978,18 +1013,25 @@ def _parent(args, identity, job, commit, log):
                     if (args.job / "publishing" / name(claim["run"])).exists():
                         slot["finished"] = True
                         continue
-                    if lease.exists():
+                    # A reclaimed or rejected lease also stays in leases/;
+                    # its decision and recorded retry end the wait.
+                    if lease.exists() and not lease_retired(
+                        args.job, claim["run"], claim["attempt_id"]
+                    ):
                         active = True
                         continue
                     slot["waiting_reclaim"] = False
                 # Re-verify the same startup admission before a replacement imports
                 # checkout code. No per-file code guard or generated start code.
                 if job.get("format")=="darsia-alias-job-v1":
-                    same_job,same_commit=verify_startup(args.job,
+                    same_job,same_commit=retry_transient(lambda: verify_startup(args.job,
                         stores_path=getattr(args,"stores",None),machine_id=args.machine,
-                        expected_stores=args._alias_stores)
+                        expected_stores=args._alias_stores),
+                        delays=QUEUE_RETRY_DELAYS, on_retry=parent_retry("restart_admission"))
                 else:
-                    same_job, same_commit = verify_startup(args.job)
+                    same_job, same_commit = retry_transient(
+                        lambda: verify_startup(args.job), delays=QUEUE_RETRY_DELAYS,
+                        on_retry=parent_retry("restart_admission"))
                 if same_job != job or same_commit != commit:
                     raise RuntimeError("Watchdog restart startup identity differs")
                 slots[number] = _start_slot(

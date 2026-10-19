@@ -4,8 +4,9 @@ The shared filesystem must provide atomic rename within one share. Progress is
 written only for actual I/O or frame advances, never as a synthetic heartbeat.
 An expired attempt keeps its output, but loses the right to publish a run.
 Each attempt is retired by exactly one exclusive-create decision file
-(publish, reclaimed or rejected). Publication never moves the lease directory:
-a run-level marker file binds the run to its published lease in place.
+(publish, reclaimed or rejected). No lease directory is ever moved: a run-level
+marker file binds the run to its published lease in place, and a marker file in
+reclaimed/<run>/<attempt>/ names a reclaimed or rejected lease in place.
 """
 from __future__ import annotations
 
@@ -33,6 +34,52 @@ def utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+TRANSIENT_RETRY_DELAYS = (0.5, 2.0, 5.0)  # Seconds before each retry of one file step.
+# Windows network-path errors that Python may report as a missing file or path.
+_NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 58, 59, 64, 67, 121, 1231, 1236})
+
+
+def transient_os_error(error: BaseException) -> bool:
+    """Whether a file error is a short SMB/NAS interruption worth waiting for.
+
+    Protocol answers are never transient: an existing file (a lost exclusive
+    create), a missing file or folder (moved, claimed or never written) and a
+    wrong file type keep their meaning. A dropped network path is transient
+    even when Python reports it as a missing file.
+    """
+    if not isinstance(error, OSError):
+        return False
+    if getattr(error, "winerror", None) in _NETWORK_WINERRORS:
+        return True
+    return not isinstance(error, (FileExistsError, FileNotFoundError,
+                                  NotADirectoryError, IsADirectoryError))
+
+
+def retry_transient(action, *, delays=None, wait=None, on_retry=None, retry_if=None):
+    """Run action; wait and retry a transient file error, then raise it (N111).
+
+    A single SMB file or claim error must not crash the work: each transient
+    failure waits for the next delay (default TRANSIENT_RETRY_DELAYS) and the
+    action runs again. Other errors, and the last transient one, are raised
+    unchanged. on_retry(attempt, delay, error) records a retry; wait(seconds)
+    may return True to stop early, which raises the error; retry_if(error)
+    can refuse a retry that is not safe at that point.
+    """
+    delays = TRANSIENT_RETRY_DELAYS if delays is None else delays
+    wait = time.sleep if wait is None else wait
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            return action()
+        except OSError as error:
+            if (delay is None or not transient_os_error(error)
+                    or (retry_if is not None and not retry_if(error))):
+                raise
+            if on_retry is not None:
+                on_retry(attempt, delay, error)
+            if wait(delay):
+                raise
+
+
 def read_json(path: Path) -> dict:
     """Read UTF-8 JSON metadata, rejecting duplicate keys and nonfinite numbers.
     """
@@ -48,7 +95,7 @@ def read_json(path: Path) -> dict:
         raise ValueError(f"Nonfinite JSON value: {value}")
 
     return json.loads(
-        Path(path).read_bytes().decode("utf-8-sig"),
+        retry_transient(Path(path).read_bytes).decode("utf-8-sig"),
         object_pairs_hook=unique,
         parse_constant=invalid,
     )
@@ -109,7 +156,26 @@ def _windows_rename(source: Path, destination: Path) -> None:
 
 
 def rename(source: Path, destination: Path) -> None:
-    """Atomic move; briefly let concurrent Windows metadata readers close."""
+    """Atomic move; briefly let concurrent Windows metadata readers close.
+
+    A transient error is retried (N111). When a retry finds the source gone and
+    the destination present, the interrupted try completed on the server.
+    """
+    interrupted = []
+
+    def move():
+        try:
+            _rename_once(source, destination)
+        except FileNotFoundError:
+            if interrupted and Path(destination).exists() and not Path(source).exists():
+                return
+            raise
+
+    retry_transient(move, on_retry=lambda attempt, delay, error: interrupted.append(error))
+
+
+def _rename_once(source, destination):
+    """One atomic move; a Windows reader handle gets one second to close."""
     deadline = time.monotonic() + 1.0
     while True:
         try:
@@ -132,27 +198,65 @@ def _immutable_bytes(document: dict) -> bytes:
 
 def write_immutable(path: Path, document: dict, *, create_parents=True) -> None:
     """Publish complete UTF-8 bytes without ever replacing an existing file."""
-    path = Path(path)
-    if create_parents:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
-    data = _immutable_bytes(document)
-    with temporary.open("xb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    if os.name == "nt":
-        rename(temporary, path)  # Windows refuses an existing destination.
-    else:
-        os.link(temporary, path)  # POSIX rename would replace a file.
-        temporary.unlink()  # Only the successful extra hardlink is removed.
+    _publish_bytes(Path(path), _immutable_bytes(document), create_parents=create_parents)
+
+
+def _publish_bytes(path: Path, data: bytes, *, create_parents: bool) -> None:
+    """Exclusively create a file with exact bytes; retry a transient error (N111).
+
+    A file with identical bytes found after an interrupted try is that try's
+    own completed write. Otherwise an existing file raises FileExistsError.
+    """
+    interrupted = []
+
+    def publish():
+        if create_parents:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+        with temporary.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            if os.name == "nt":
+                rename(temporary, path)  # Windows refuses an existing destination.
+            else:
+                os.link(temporary, path)  # POSIX rename would replace a file.
+                temporary.unlink()  # Only the successful extra hardlink is removed.
+        except FileExistsError:
+            try:
+                same = bool(interrupted) and path.read_bytes() == data
+            except OSError:
+                same = False
+            if not same:
+                raise
+
+    retry_transient(publish, on_retry=lambda attempt, delay, error: interrupted.append(error))
+
+
+def _create_directory(path: Path, *, parents: bool = False) -> None:
+    """Create one new directory; retry a transient error (N111).
+
+    An empty directory found after an interrupted try is that try's own.
+    Otherwise an existing directory raises FileExistsError, as mkdir does.
+    """
+    interrupted = []
+
+    def create():
+        try:
+            path.mkdir(parents=parents)
+        except FileExistsError:
+            if not (interrupted and path.is_dir() and not any(path.iterdir())):
+                raise
+
+    retry_transient(create, on_retry=lambda attempt, delay, error: interrupted.append(error))
 
 
 def descriptor(path: Path) -> dict:
     """Bind the exact bytes of a file to its path, SHA-256, and byte count.
     """
     path = Path(path)
-    data = path.read_bytes()
+    data = retry_transient(path.read_bytes)
     return dict(path=str(path), sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
 
 
@@ -290,22 +394,12 @@ def _own_reference(root, path):
 
 def _write_immutable_raw(path, raw):
     """Copy original completion bytes exactly, with the original exclusive fence."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".partial")
-    with temporary.open("xb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-    if os.name == "nt":
-        rename(temporary, path)
-    else:
-        os.link(temporary, path)
-        temporary.unlink()  # Only the successful extra link is removed.
+    _publish_bytes(Path(path), raw, create_parents=True)
 
 
 DECISION_FORMAT = "darsia-attempt-decision-v1"
 PUBLICATION_MARKER_FORMAT = "darsia-publication-marker-v1"
+RETIRED_LEASE_FORMAT = "darsia-retired-lease-marker-v1"
 OUTCOMES = frozenset({"publish", "reclaimed", "rejected"})
 
 
@@ -316,11 +410,11 @@ def decision_path(root: Path, run: str, token: str) -> Path:
     return Path(root) / "decisions" / f"{name(run)}.{token}.json"
 
 
-def read_decision(root: Path, run: str, token: str) -> dict | None:
+def read_decision(root: Path, run: str, token: str, *, reader=read_json) -> dict | None:
     """Read the standing decision of an attempt, or None while it is undecided."""
     path = decision_path(root, run, token)
     try:
-        value = read_json(path)
+        value = reader(path)
     except FileNotFoundError:
         return None
     run = name(run)
@@ -381,6 +475,40 @@ def publication_directory(root: Path, run: str) -> Path | None:
     return root / "leases" / f"{run}.{token}"
 
 
+def retired_lease_directory(root: Path, run: str, token: str, *, reader=read_json) -> Path:
+    """Return the lease directory of a reclaimed or rejected attempt.
+
+    The lease stays in leases/<run>.<attempt>, and the marker file
+    reclaimed/<run>/<attempt>/lease.json names it, so an open handle inside the
+    lease can never block its retirement. Without a marker this is the legacy
+    location reclaimed/<run>/<attempt>/lease, where older code moved the lease.
+    """
+    root, run = Path(root), name(run)
+    archive = root / "reclaimed" / run / token
+    try:
+        marker = reader(archive / "lease.json")
+    except (FileNotFoundError, NotADirectoryError):
+        return archive / "lease"
+    if (not isinstance(marker, dict)
+            or set(marker) != {"format", "run", "attempt_id", "lease_relative_path"}
+            or marker["format"] != RETIRED_LEASE_FORMAT or marker["run"] != run
+            or marker["attempt_id"] != token
+            or marker["lease_relative_path"] != f"leases/{run}.{token}"):
+        raise ValueError("Retired-lease marker differs from its run/attempt lease")
+    decision = read_decision(root, run, token, reader=reader)
+    if decision is None or decision["outcome"] not in {"reclaimed", "rejected"}:
+        raise ValueError("Retired-lease marker has no standing reclaim or reject decision")
+    return root / "leases" / f"{run}.{token}"
+
+
+def lease_retired(root: Path, run: str, token: str) -> bool:
+    """Whether a reclaim or reject decision retired an attempt and its retry is recorded."""
+    run = name(run)
+    decision = read_decision(root, run, token)
+    return (decision is not None and decision["outcome"] in {"reclaimed", "rejected"}
+            and (Path(root) / "reclaimed" / run / token / "reclaimed.json").is_file())
+
+
 class JobQueue:
     """Filesystem protocol; workers and controllers share this implementation."""
 
@@ -398,7 +526,7 @@ class JobQueue:
         self._progress_lock = threading.Lock()
         self.on_error = on_error
         for directory in ("queue", "claimed", "leases", "decisions", "publishing", "reclaimed", "results", "done", "failed", "logs"):
-            (self.root / directory).mkdir(parents=True, exist_ok=True)
+            retry_transient(lambda path=self.root / directory: path.mkdir(parents=True, exist_ok=True))
 
     def _server(self, machine=None):
         if self._server_clock is None:
@@ -443,7 +571,7 @@ class JobQueue:
                   else task.get("output_directory", str(result_root)))
         value = dict(task, output_directory=output, attempt_id=uuid.uuid4().hex)
         self._validate_output(value)
-        result_root.mkdir()  # Also reserves the case-insensitive run identity.
+        _create_directory(result_root)  # Also reserves the case-insensitive run identity.
         write_immutable(result_root / "task.json", value)
         destination = self.root / "queue" / (run + ".json")
         write_immutable(destination, value)
@@ -473,7 +601,7 @@ class JobQueue:
         if isinstance(exclude_runs, (str, bytes)):
             raise ValueError("exclude_runs must be an explicit worker-incarnation collection")
         excluded = {name(run) for run in exclude_runs}
-        for pending in sorted((self.root / "queue").glob("*.json")):
+        for pending in retry_transient(lambda: sorted((self.root / "queue").glob("*.json"))):
             try:
                 task = read_json(pending)
                 validate_task(task)
@@ -486,6 +614,11 @@ class JobQueue:
                 continue
             except (ValueError, TypeError, KeyError):
                 self._quarantine(pending, machine, owner, traceback.format_exc())
+                continue
+            except OSError as error:
+                if not transient_os_error(error):
+                    raise
+                self._transient("claim", pending, error)  # Try the next task (N111).
                 continue
             if task.get("backend", "any") not in {"any", backend}:
                 continue
@@ -528,12 +661,17 @@ class JobQueue:
             if pending.name != run + ".json" or not re.fullmatch(r"[0-9a-f]{32}", token):
                 raise ValueError("Queue filename or attempt identity differs")
             claimed = self.root / "claimed" / machine / pending.name
-            claimed.parent.mkdir(parents=True, exist_ok=True)
+            retry_transient(lambda: claimed.parent.mkdir(parents=True, exist_ok=True))
             try:
                 if claimed.exists():
                     continue
                 rename(pending, claimed)
             except FileNotFoundError:
+                continue
+            except OSError as error:
+                if not transient_os_error(error):
+                    raise
+                self._transient("claim", pending, error)  # Try the next task (N111).
                 continue
             # Bind the generation actually renamed, not a pre-rename read.
             task = read_json(claimed)
@@ -549,14 +687,20 @@ class JobQueue:
                 rename(claimed, pending)
                 continue
             lease = self.root / "leases" / (run + "." + token)
-            lease.mkdir()
+            try:
+                _create_directory(lease)
+            except FileExistsError:
+                # This generation already has a lease (live, published or
+                # retired in place); a second queue file of it is set aside.
+                rename(claimed, claimed.with_name(f"{run}.duplicate.{uuid.uuid4().hex}.json"))
+                continue
             output_reference = None
             if alias:
                 binding = output_factory(deepcopy(task), token)
                 output, output_reference = self._admit_output(binding, task, machine, token)
             else:
                 output = self.root / "results" / run / ".attempts" / token
-            output.mkdir(parents=True)
+            _create_directory(output, parents=True)
             marker = lease / "claimed.json"
             write_immutable(marker, dict(run=run, attempt_id=token, machine_id=machine,
                                         event="actual_claim_bound"), create_parents=False)
@@ -605,7 +749,7 @@ class JobQueue:
             run = "invalid-" + hashlib.sha256(pending.name.encode()).hexdigest()[:24]
         token = uuid.uuid4().hex
         archived = self.root / "claimed" / machine / f"{run}.invalid.{token}.json"
-        archived.parent.mkdir(parents=True, exist_ok=True)
+        retry_transient(lambda: archived.parent.mkdir(parents=True, exist_ok=True))
         try:
             rename(pending, archived)
         except FileNotFoundError:
@@ -640,7 +784,7 @@ class JobQueue:
         """Record an actual I/O or frame-advance event with a nanosecond timestamp under ownership."""
         with self._progress_lock:
             self.assert_owner(claim)
-            sequence = len(list(claim.output.glob("progress_*.json")))
+            sequence = retry_transient(lambda: len(list(claim.output.glob("progress_*.json"))))
             value = dict(
                 run=claim.task["run"], attempt_id=claim.token, sequence=sequence,
                 event=event, written_unix_ns=self._server(claim.machine).now_ns(), written_utc=utc(),
@@ -724,10 +868,15 @@ class JobQueue:
     def reclaim_stale(self) -> list[dict]:
         """Archive expired claim generations and enqueue fresh attempts without allowing stale writers."""
         reclaimed = []
-        for lease in sorted((self.root / "leases").iterdir()):
+        for lease in retry_transient(lambda: sorted((self.root / "leases").iterdir())):
             try:
                 owner = read_json(lease / "owner.json")
             except FileNotFoundError:
+                continue
+            except OSError as error:
+                if not transient_os_error(error):
+                    raise
+                self._transient("reclaim", lease, error)  # A later pass reads it (N111).
                 continue
             task, token = owner["task"], owner["token"]
             run = name(task["run"])
@@ -739,6 +888,9 @@ class JobQueue:
                 # Published leases stay in leases/ by design; a rejection
                 # belongs to its rejector.
                 continue
+            if outcome == "reclaimed" and (
+                    self.root / "reclaimed" / run / token / "reclaimed.json").exists():
+                continue  # Retired in place, and its retry is recorded.
             try:
                 progress = self._old_progress(owner, lease)
                 from .server_clock import file_mtime_ns
@@ -771,37 +923,49 @@ class JobQueue:
                         self._finish_publication(lease)
                     continue
                 won, decision = decide(self.root, run, token, "reclaimed",
-                                       last_actual_progress_unix_ns=latest_ns)
+                                       last_actual_progress_unix_ns=latest_ns,
+                                       next_attempt=uuid.uuid4().hex)
                 if not won:
                     continue  # A publisher or another reclaimer decided first.
-            # A standing reclaim decision: archive the lease. This also retries
-            # the archive steps when an earlier pass stopped before moving it.
+            # A standing reclaim decision. The lease stays in leases/ and a
+            # marker names it. Every step below is idempotent, so a pass that
+            # was interrupted, or runs at the same time, simply repeats it.
             latest_ns = decision.get("last_actual_progress_unix_ns", latest_ns)
-            archive = self.root / "reclaimed" / run / token
-            archive.mkdir(parents=True, exist_ok=True)
-            try:
-                rename(lease, archive / "lease")
-            except FileNotFoundError:
-                continue  # Another reclaimer archived this lease.
-            except FileExistsError:
-                continue
+            archive = self._retire_lease(run, token)
+            busy = False
             for old in (claimed_path, self.root / "queue" / (run + ".json")):
-                if old.exists() and read_json(old).get("attempt_id") == token:
-                    rename(old, archive / "task.json")
-            if (self.root / "publishing" / run).exists():
-                raise RuntimeError("Reclaimed run already has a publication owner")
+                try:
+                    if read_json(old).get("attempt_id") == token:
+                        rename(old, archive / "task.json")
+                except (FileNotFoundError, FileExistsError):
+                    pass  # Already archived by this or a concurrent pass.
+                except OSError as error:
+                    if not transient_os_error(error):
+                        raise
+                    self._transient("reclaim", old, error)
+                    busy = True
+            if busy:
+                continue  # A later pass repeats these idempotent steps (N111).
             if (archive / "reclaimed.json").exists():
                 continue  # An earlier pass already enqueued and recorded this retry.
-            retry = self._reclaim_retry(task, token)
+            if (self.root / "publishing" / run).exists() and not (
+                    decision.get("next_attempt")
+                    and self._attempt_exists(run, decision["next_attempt"])):
+                # Only this decision's own retry can have published the run.
+                raise RuntimeError("Reclaimed run already has a publication owner")
+            retry = self._reclaim_retry(task, token, decision)
             record = dict(run=task["run"], previous_attempt=token,
                           next_attempt=retry["attempt_id"], reclaimed_utc=utc(),
                           last_actual_progress_unix_ns=latest_ns)
-            write_immutable(archive / "reclaimed.json", record)
+            try:
+                write_immutable(archive / "reclaimed.json", record)
+            except FileExistsError:
+                continue  # A concurrent pass recorded the same retry.
             reclaimed.append(record)
         # A process can die after the task rename but before owner.json exists.
         # No science starts before that owner document and the ownership check.
-        for claimed in (self.root / "claimed").glob("*/*.json"):
-            if ".invalid." in claimed.name:
+        for claimed in retry_transient(lambda: sorted((self.root / "claimed").glob("*/*.json"))):
+            if ".invalid." in claimed.name or ".duplicate." in claimed.name:
                 continue
             try:
                 task = read_json(claimed)
@@ -830,28 +994,35 @@ class JobQueue:
                 decision = read_decision(self.root, run, token)
                 if decision is None:
                     won, decision = decide(self.root, run, token, "reclaimed",
-                                           last_actual_progress_unix_ns=last_ns)
+                                           last_actual_progress_unix_ns=last_ns,
+                                           next_attempt=uuid.uuid4().hex)
                     if not won:
                         continue  # A publisher or retirement decided first.
                 if decision["outcome"] != "reclaimed":
                     continue
                 # A standing reclaim decision whose claim was not archived yet,
                 # also when an earlier reclaim pass stopped after its decision.
+                # A lease that exists stays in place and is only marked.
                 archive = self.root / "reclaimed" / run / token
-                archive.mkdir(parents=True, exist_ok=True)
+                retry_transient(lambda: archive.mkdir(parents=True, exist_ok=True))
                 if lease.exists():
-                    rename(lease, archive / "lease")
+                    self._retire_lease(run, token)
                 rename(claimed, archive / "task.json")
             except FileNotFoundError:
                 continue
             except FileExistsError:
+                continue
+            except OSError as error:
+                if not transient_os_error(error):
+                    raise
+                self._transient("reclaim", claimed, error)  # A later pass repeats it (N111).
                 continue
             if (self.root / "publishing" / run).exists():
                 continue
             if (archive / "reclaimed.json").exists():
                 continue  # An earlier pass already enqueued and recorded this retry.
             present = archive / "lease" if (archive / "lease").exists() else lease
-            retry = self._reclaim_retry(task, token)
+            retry = self._reclaim_retry(task, token, decision)
             record = dict(run=task["run"], previous_attempt=token,
                           next_attempt=retry["attempt_id"], reclaimed_utc=utc(),
                           last_actual_progress_unix_ns=last_ns,
@@ -861,13 +1032,22 @@ class JobQueue:
                           interrupted_claim_before_science=not (present / "owner.json").exists(),
                           prior_resume_lineage=prior_lineage,
                           preserve_prior_resume_lineage=True)
-            write_immutable(archive / "reclaimed.json", record)
+            try:
+                write_immutable(archive / "reclaimed.json", record)
+            except FileExistsError:
+                continue  # A concurrent pass recorded the same retry.
             reclaimed.append(record)
         return reclaimed
 
-    def _reclaim_retry(self, task, token):
-        """Enqueue one fresh generation; reuse the one an interrupted archive pass queued."""
-        pending = self.root / "queue" / (name(task["run"]) + ".json")
+    def _reclaim_retry(self, task, token, decision=None):
+        """Enqueue one fresh generation; reuse the one an interrupted archive pass queued.
+
+        A decision that names next_attempt fixes the identity of the retry, so
+        a repeated or concurrent pass enqueues it only while that generation
+        exists nowhere yet (queued, claimed, leased or decided).
+        """
+        run = name(task["run"])
+        pending = self.root / "queue" / (run + ".json")
         try:
             existing = read_json(pending)
         except FileNotFoundError:
@@ -876,9 +1056,57 @@ class JobQueue:
                 and {key: value for key, value in existing.items() if key != "attempt_id"}
                     == {key: value for key, value in task.items() if key != "attempt_id"}):
             return existing
-        retry = dict(task, attempt_id=uuid.uuid4().hex)
-        write_immutable(pending, retry)  # Any other queued file still refuses, as before.
+        planned = (decision or {}).get("next_attempt")
+        if planned is None:
+            retry = dict(task, attempt_id=uuid.uuid4().hex)
+            write_immutable(pending, retry)  # Any other queued file still refuses, as before.
+            return retry
+        retry = dict(task, attempt_id=planned)
+        if not self._attempt_exists(run, planned):
+            try:
+                write_immutable(pending, retry)
+            except FileExistsError:
+                if not self._attempt_exists(run, planned):
+                    raise  # Another generation is queued; refuse, as before.
         return retry
+
+    def _attempt_exists(self, run, attempt):
+        """Whether a queue generation exists anywhere: queued, claimed, leased or decided."""
+        # A claim renames queue -> claimed and then creates the lease, so the
+        # places are read in that order and a moving generation is still seen.
+        try:
+            if read_json(self.root / "queue" / (run + ".json")).get("attempt_id") == attempt:
+                return True
+        except FileNotFoundError:
+            pass
+        for claimed in (self.root / "claimed").glob("*/" + run + ".json"):
+            try:
+                if read_json(claimed).get("attempt_id") == attempt:
+                    return True
+            except FileNotFoundError:
+                continue
+        return ((self.root / "leases" / f"{run}.{attempt}").exists()
+                or decision_path(self.root, run, attempt).exists())
+
+    def _transient(self, step, path, error):
+        """Report a transient file error after which a queue step was deferred (N111)."""
+        if self.on_error is not None:
+            self.on_error(dict(kind="transient_file_error", step=step, path=str(path),
+                               error=repr(error), deferred=True, utc=utc()))
+
+    def _retire_lease(self, run, token):
+        """Mark a reclaimed or rejected lease in place; never move it. Returns its archive."""
+        archive = self.root / "reclaimed" / run / token
+        retry_transient(lambda: archive.mkdir(parents=True, exist_ok=True))
+        marker = archive / "lease.json"
+        if not (archive / "lease").is_dir() and not marker.exists():
+            try:
+                write_immutable(marker, dict(
+                    format=RETIRED_LEASE_FORMAT, run=run, attempt_id=token,
+                    lease_relative_path=f"leases/{run}.{token}"))
+            except FileExistsError:
+                pass  # A concurrent pass marked it.
+        return archive
 
     def reject_before_science(self, claim: Claim, reason: str, owner: dict) -> dict:
         """Retire only an empty alias admission, then let another machine try it.
@@ -896,21 +1124,18 @@ class JobQueue:
             raise ValueError("Pre-science rejection cannot discard an attempt with output/progress")
         run = name(claim.task["run"])
         prior_lineage = self._prior_resume_lineage(run, claim.token)
-        won, _decision = decide(self.root, run, claim.token, "rejected")
+        won, decision = decide(self.root, run, claim.token, "rejected",
+                               next_attempt=uuid.uuid4().hex)
         if not won:
             raise LeaseLost("Reclaim/publication already retired this input admission")
-        archive = self.root / "reclaimed" / run / claim.token
-        archive.mkdir(parents=True, exist_ok=True)
-        try:
-            rename(claim.lease, archive / "lease")
-        except FileNotFoundError as exc:
-            raise LeaseLost("Reclaim/publication already retired this input admission") from exc
+        # The lease stays in leases/; a marker in the archive names it.
+        archive = self._retire_lease(run, claim.token)
         if read_json(claim.claimed) != claim.task:
             raise LeaseLost("Input rejection lost its exact claim generation")
         rename(claim.claimed, archive / "task.json")
         if (self.root / "publishing" / run).exists():
             raise RuntimeError("Input-rejected run already has a publication owner")
-        retry = dict(claim.task, attempt_id=uuid.uuid4().hex)
+        retry = dict(claim.task, attempt_id=decision["next_attempt"])
         record = dict(run=claim.task["run"], previous_attempt=claim.token,
                       next_attempt=retry["attempt_id"], reclaimed_utc=utc(),
                       interrupted_claim_before_science=True, input_admission_rejected=True,

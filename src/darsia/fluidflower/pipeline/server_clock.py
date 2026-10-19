@@ -20,7 +20,9 @@ class ServerTimeError(RuntimeError):
 
 def file_mtime_ns(path):
     """Return filesystem metadata only; embedded client timestamps are ignored."""
-    info = Path(path).stat()
+    from darsia.fluidflower.pipeline.job_queue import retry_transient
+
+    info = retry_transient(Path(path).stat)
     if not stat.S_ISREG(info.st_mode):
         raise ServerTimeError("Lease-time evidence must be a regular file: " + str(path))
     value = info.st_mtime_ns
@@ -41,24 +43,35 @@ class ServerFileClock:
         from darsia.fluidflower.pipeline.job_queue import name
 
         self.machine_id = name(machine_id)
+        from darsia.fluidflower.pipeline.job_queue import retry_transient
+
         directory = Path(job_root) / "clock_samples" / self.machine_id
-        directory.mkdir(parents=True, exist_ok=True)
-        self.path = directory / (uuid.uuid4().hex + ".clock")
         self._lock = threading.Lock()
         self._last_ns = None
-        with self.path.open("xb") as stream:
-            stream.write(b"DarSIA private server-time samples\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+
+        def create():
+            directory.mkdir(parents=True, exist_ok=True)
+            self.path = directory / (uuid.uuid4().hex + ".clock")  # New on each try.
+            with self.path.open("xb") as stream:
+                stream.write(b"DarSIA private server-time samples\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        retry_transient(create)  # N111: a transient SMB error waits and retries.
 
     def now_ns(self):
         """Sample server mtime; reject backward movement, never use time.time."""
-        with self._lock:
+        from darsia.fluidflower.pipeline.job_queue import retry_transient
+
+        def sample():
             with self.path.open("ab") as stream:
                 stream.write(b".")
                 stream.flush()
                 os.fsync(stream.fileno())
-            value = file_mtime_ns(self.path)
+            return file_mtime_ns(self.path)
+
+        with self._lock:
+            value = retry_transient(sample)  # N111; an extra sample byte is harmless.
             if self._last_ns is not None and value < self._last_ns:
                 raise ServerTimeError("The shared filesystem's clock moved backwards")
             self._last_ns = value
