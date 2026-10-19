@@ -137,6 +137,17 @@ _BACKGROUND_TIP = (
 )
 _BACKGROUND_SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _BACKGROUND_CHOOSE = "choose"
+# A session painted on the raw reference photo, in a project whose geometry
+# is in the saved corrected rig frame, stays on the raw photo.
+_RAW_SESSION_NOTE = (
+    "Painting on the raw reference photo, where these marks were drawn. The "
+    "project's saved corrected rig maps are not shown here."
+)
+_RAW_SESSION_EXPORT_NOTE = (
+    "This painting is on the raw reference photo, while the project's geometry "
+    "is in the saved corrected rig frame. Exporting it into the project is a "
+    "separate step."
+)
 # Short role names for the facies table.
 _ROLE_SHORT = {"porous_medium": "Porous", "free_water": "Free water"}
 _CANVAS_HINT = (
@@ -1884,6 +1895,9 @@ class LayerPainterView(QWidget):
         self.project = project
         self._reference = reference
         self._workspace_frame_config: dict[str, Any] = {}
+        # True while a session painted on the raw reference photo is shown in
+        # a project whose geometry is in the saved corrected rig frame.
+        self._raw_session_frame = False
         self._saved_corrected_boundaries: np.ndarray | None = None
         self.session: lp.PaintingSession | None = None
         self.image: lp.PaintingImage | None = None
@@ -2430,6 +2444,29 @@ class LayerPainterView(QWidget):
 
     # ------------------------------------------------------------- state
 
+    def _session_painted_on_raw_photo(self) -> bool:
+        """Whether the run's saved session has marks on its raw reference photo.
+
+        The marks fit the raw photo when the session's recorded image size is
+        the raw photo's size. Nothing is written.
+        """
+
+        try:
+            reference = self._reference()
+            if reference is None or reference.baseline_image is None:
+                return False
+            if not lp.session_path(self.project, reference.run_id).is_file():
+                return False
+            saved = lp.load_painting_session(self.project, reference)
+            raw_size = photo_size(Path(reference.baseline_image))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        return (
+            bool(saved.polygons or saved.strokes)
+            and saved.image_size is not None
+            and tuple(saved.image_size) == tuple(raw_size)
+        )
+
     def reference(self) -> SeriesRunInputs | None:
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             return workspace_frame.workspace_reference(self._workspace_frame_config, self._reference(), check_files=False)
@@ -2480,6 +2517,7 @@ class LayerPainterView(QWidget):
         self._hidden_layers = set()
         self._hidden_session = None
         self.canvas.set_hidden_layers(())
+        self._raw_session_frame = False
         try:
             self._workspace_frame_config = workspace_frame.current_configuration(self.project)
         except (OSError, ValueError) as error:
@@ -2490,6 +2528,15 @@ class LayerPainterView(QWidget):
             self.propose_button.setEnabled(False)
             self.export_button.setEnabled(False)
             return
+        if (
+            workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
+            and self._session_painted_on_raw_photo()
+        ):
+            # Marks painted on the raw reference photo only fit that photo:
+            # this tab then works in the raw frame. The saved corrected maps
+            # of the project are left as they are.
+            self._raw_session_frame = True
+            self._workspace_frame_config = {}
         self.rig_panel.setEnabled(workspace_frame.frame_kind(self._workspace_frame_config) == "raw")
         self._saved_corrected_boundaries = None
         self.show_proposal.setText("Saved layer boundaries" if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected" else "Proposal")
@@ -2545,6 +2592,8 @@ class LayerPainterView(QWidget):
                     "The baseline photograph of this run has changed since the "
                     "strokes were painted; check that they still fit."
                 )
+            elif self._raw_session_frame and self.image is not None:
+                self.propose_status.setText(_RAW_SESSION_NOTE)
             self.last_export = None
             self._refresh_layers()
             self._refresh_facies_table()
@@ -4212,6 +4261,8 @@ class LayerPainterView(QWidget):
     def export_problems_now(self) -> list[str]:
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             return ["Corrected-frame production export and Build run model are not qualified yet."]
+        if self._raw_session_frame:
+            return [_RAW_SESSION_EXPORT_NOTE]
         if self.session is None:
             return ["Choose a reference run with a baseline photograph."]
         return lp.check_ready_for_revision(
@@ -4221,6 +4272,9 @@ class LayerPainterView(QWidget):
     def save_and_export(self) -> None:
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             self.export_status.setText("Corrected-frame production export and Build run model are not qualified yet.")
+            return
+        if self._raw_session_frame:
+            self.export_status.setText(_RAW_SESSION_EXPORT_NOTE)
             return
         if self.busy() or self.session is None or self.proposal is None:
             if self.proposal is None:
