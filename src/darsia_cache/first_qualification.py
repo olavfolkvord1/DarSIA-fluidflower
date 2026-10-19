@@ -47,8 +47,11 @@ REFERENCE_RELEASES = {
     ),
     # R3, the RAW39 reference: N134 is Olav's release, N136 names the plan and
     # entitlement, and N135 is his choice of this exact entry. N139 lets R3
-    # start with the retained Q123 font file counted instead of an empty cache:
-    # exactly that inventory, verified on disk, and nothing else in the cache.
+    # start with the retained Q123 font file counted instead of an empty cache.
+    # R3's first attempt (service 95c37c1c) stopped before its claim under this
+    # entry. The entry stays so that attempt's request can still be rebuilt, for
+    # its close; its one-file count no longer matches the cache, so it cannot
+    # start again.
     ("N134", "N136", "N139"): dict(
         records={
             "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
@@ -59,6 +62,21 @@ REFERENCE_RELEASES = {
         retained_cache=dict(
             inventory_sha256="be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2",
             logical_bytes=117590,
+        ),
+    ),
+    # N142 adds the font file of that stopped attempt: R3 starts again counting
+    # exactly this two-file inventory, verified on disk, and nothing else.
+    ("N134", "N136", "N139", "N142"): dict(
+        records={
+            "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
+            "N136-CLAUDE-r3-plan-3ea1caa8-entitlement-65728995330B-pinned-for-the-exact-code-entry": "claude",
+            "N139-OLAV-r3-starts-with-the-verified-117590-byte-retained-font-file-counted-file-and-old-approval-untouched": "olav",
+            "N142-OLAV-r3-close-failed-service-95c-count-both-font-files-235180-bytes-one-new-start": "olav",
+        },
+        plan_sha256="3ea1caa8ff432f5c17d2904f7f43080e23aeac039a447d8667a1586749e0426e",
+        retained_cache=dict(
+            inventory_sha256="668f556a8d20c7d82484a9449521e46522b4d22b1bf2a0290e9f77d323c90a35",
+            logical_bytes=235180,
         ),
     ),
 }

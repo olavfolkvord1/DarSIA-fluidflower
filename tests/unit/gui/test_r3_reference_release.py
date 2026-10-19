@@ -1,12 +1,11 @@
 """TESTONLY: R3, the RAW39 reference, is admitted only by its exact release entry.
 
 Like N43, R3 is pinned in REFERENCE_RELEASES: its answer records with their
-deciders and its accepted plan's SHA-256 (N134, N135, N136). Under N139 the
-entry also pins the retained Q123 font file R3 may find in the cache, and
+deciders and its accepted plan's SHA-256 (N134, N135, N136). Under N139 and
+N142 the entry also pins the retained font files R3 may find in the cache, and
 admission counts exactly those verified bytes instead of an empty cache. Any
 other authority set, record, plan or inventory is refused. Synthetic data only.
 """
-from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -22,8 +21,13 @@ R3_GO = ("N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh
 R3_PLAN_RECORD = "N136-CLAUDE-r3-plan-3ea1caa8-entitlement-65728995330B-pinned-for-the-exact-code-entry"
 R3_RETAINED = ("N139-OLAV-r3-starts-with-the-verified-117590-byte-retained-font-file-counted-file-and-old-"
                "approval-untouched")
-R3_INVENTORY = "be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2"
-R3_AUTHORITIES = ("N134", "N136", "N139")
+R3_SECOND_FONT = "N142-OLAV-r3-close-failed-service-95c-count-both-font-files-235180-bytes-one-new-start"
+R3_INVENTORY = "668f556a8d20c7d82484a9449521e46522b4d22b1bf2a0290e9f77d323c90a35"
+FIRST_ATTEMPT_INVENTORY = "be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2"
+R3_BYTES = 235180
+R3_AUTHORITIES = ("N134", "N136", "N139", "N142")
+R3_ANSWERS = [dict(id=R3_GO, decided_by="olav"), dict(id=R3_PLAN_RECORD, decided_by="claude"),
+              dict(id=R3_RETAINED, decided_by="olav"), dict(id=R3_SECOND_FONT, decided_by="olav")]
 
 
 def r3_TESTONLY(answers=None, authority_ids=R3_AUTHORITIES, plan=R3_PLAN, inventory=None,
@@ -31,14 +35,12 @@ def r3_TESTONLY(answers=None, authority_ids=R3_AUTHORITIES, plan=R3_PLAN, invent
     state, value, _read = administration_TESTONLY()
     cache = next(row["path"] for row in value["owned_roots"] if row["role"] == "cache")
     inventory = inventory if inventory is not None else dict(format=first.RETAINED_INVENTORY, root=cache,
-        no_cleanup=True, files=[{"TESTONLY": "one retained font file"}], logical_bytes=117590)
+        no_cleanup=True, files=[{"TESTONLY": "two retained font files"}], logical_bytes=R3_BYTES)
     value.update(authority_ids=list(authority_ids),
                  accepted_plan=dict(path="C:/TESTONLY/R3_N135_accepted_plan.json", sha256=plan, size_bytes=1),
                  retained_cache_inventory=dict(path="C:/TESTONLY/retained_inventory.json",
-                                               sha256=inventory_sha256, size_bytes=413))
-    answers = answers if answers is not None else [
-        dict(id=R3_GO, decided_by="olav"), dict(id=R3_PLAN_RECORD, decided_by="claude"),
-        dict(id=R3_RETAINED, decided_by="olav")]
+                                               sha256=inventory_sha256, size_bytes=651))
+    answers = deepcopy(R3_ANSWERS) if answers is None else answers
 
     def read(binding):
         if binding == value["answers_source"]:
@@ -53,21 +55,31 @@ def r3_TESTONLY(answers=None, authority_ids=R3_AUTHORITIES, plan=R3_PLAN, invent
 def test_r3_is_admitted_by_its_exact_release_entry():
     state, value, read = r3_TESTONLY()
     actual = first.checked_reference_administration(value, state, read=read)
-    assert actual["authority_ids"] == ["N134", "N136", "N139"]
+    assert actual["authority_ids"] == list(R3_AUTHORITIES)
     assert actual["aggregate_entitlement_bytes"] == first.REFERENCE_ENTITLEMENT_BYTES
     assert actual["retained_cache_inventory"]["sha256"] == R3_INVENTORY
+
+
+def without(record):
+    return [row for row in R3_ANSWERS if row["id"] != record]
+
+
+def decided_by(record, decider):
+    return [dict(row, decided_by=decider) if row["id"] == record else dict(row) for row in R3_ANSWERS]
 
 
 @pytest.mark.parametrize("kwargs", [
     dict(plan="3ea1caa8" + "0" * 56),  # Only the short prefix matches.
     dict(authority_ids=("N134", "N136")),  # The empty-cache R3 entry is gone.
-    dict(authority_ids=("N134", "N136", "N140")),
-    dict(authority_ids=("N136", "N134", "N139")),  # Order is part of the entry.
-    dict(answers=[dict(id=R3_GO, decided_by="olav"), dict(id=R3_PLAN_RECORD, decided_by="claude")]),
-    dict(answers=[dict(id=R3_GO, decided_by="olav"), dict(id=R3_PLAN_RECORD, decided_by="claude"),
-                  dict(id=R3_RETAINED, decided_by="claude")]),
-    dict(answers=[dict(id=R3_GO, decided_by="claude"), dict(id=R3_PLAN_RECORD, decided_by="claude"),
-                  dict(id=R3_RETAINED, decided_by="olav")]),
+    dict(authority_ids=("N134", "N136", "N139")),  # The first attempt's entry pins one font file.
+    dict(authority_ids=("N134", "N136", "N139", "N143")),
+    dict(authority_ids=("N134", "N136", "N142", "N139")),  # Order is part of the entry.
+    dict(answers=without(R3_SECOND_FONT)),
+    dict(answers=without(R3_RETAINED)),
+    dict(answers=decided_by(R3_SECOND_FONT, "claude")),
+    dict(answers=decided_by(R3_RETAINED, "claude")),
+    dict(answers=decided_by(R3_GO, "claude")),
+    dict(answers=decided_by(R3_PLAN_RECORD, "olav")),
     dict(answers=[]),
 ])
 def test_r3_refuses_any_other_plan_authority_set_or_record(kwargs):
@@ -76,11 +88,12 @@ def test_r3_refuses_any_other_plan_authority_set_or_record(kwargs):
         first.checked_reference_administration(value, state, read=read)
 
 
-@pytest.mark.parametrize("change", ["missing", "pin", "bytes", "float_bytes", "format", "cleanup", "root"])
+@pytest.mark.parametrize("change", ["missing", "pin", "old_pin", "bytes", "float_bytes", "format", "cleanup", "root"])
 def test_r3_requires_exactly_the_pinned_retained_inventory_of_its_cache_root(change):
-    state, value, read = r3_TESTONLY(inventory_sha256="0" * 64 if change == "pin" else R3_INVENTORY)
+    pins = dict(pin="0" * 64, old_pin="be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2")
+    state, value, read = r3_TESTONLY(inventory_sha256=pins.get(change, R3_INVENTORY))
     inventory = read(value["retained_cache_inventory"])
-    edits = dict(bytes=dict(logical_bytes=117591), float_bytes=dict(logical_bytes=117590.0),
+    edits = dict(bytes=dict(logical_bytes=R3_BYTES + 1), float_bytes=dict(logical_bytes=float(R3_BYTES)),
                  format=dict(format="darsia-cache-retained-file-inventory-v0"), cleanup=dict(no_cleanup=False),
                  root=dict(root="Q:/TESTONLY/another-cache"))
     if change in edits:
@@ -90,6 +103,15 @@ def test_r3_requires_exactly_the_pinned_retained_inventory_of_its_cache_root(cha
         value.pop("retained_cache_inventory")
     with pytest.raises(CachePolicyError):
         first.checked_reference_administration(value, state, read=read)
+
+
+def test_the_first_attempts_request_can_still_be_rebuilt_for_its_close():
+    state, value, read = r3_TESTONLY(authority_ids=("N134", "N136", "N139"), answers=without(R3_SECOND_FONT),
+                                     inventory_sha256=FIRST_ATTEMPT_INVENTORY)
+    inventory = dict(read(value["retained_cache_inventory"]), logical_bytes=R3_BYTES // 2)
+    state, value, read = r3_TESTONLY(authority_ids=("N134", "N136", "N139"), answers=without(R3_SECOND_FONT),
+                                     inventory_sha256=FIRST_ATTEMPT_INVENTORY, inventory=inventory)
+    assert first.checked_reference_administration(value, state, read=read)["authority_ids"] == ["N134", "N136", "N139"]
 
 
 def test_n43_names_no_retained_inventory():
@@ -108,28 +130,39 @@ def test_r3_keeps_the_n43_entitlement():
 
 def test_released_reference_names_only_exact_entries():
     assert first.released_reference(["N43", "Q109", "Q106"]) is first.REFERENCE_RELEASES[("N43", "Q109", "Q106")]
-    r3 = first.released_reference(["N134", "N136", "N139"])
+    r3 = first.released_reference(list(R3_AUTHORITIES))
     assert r3["plan_sha256"] == R3_PLAN
-    assert r3["retained_cache"] == dict(inventory_sha256=R3_INVENTORY, logical_bytes=117590)
+    assert r3["retained_cache"] == dict(inventory_sha256=R3_INVENTORY, logical_bytes=R3_BYTES)
     assert "retained_cache" not in first.REFERENCE_RELEASES[("N43", "Q109", "Q106")]
     assert first.released_reference(["N134", "N136"]) is None
-    assert first.released_reference(("N134", "N136", "N139")) is None  # A list, as stored in JSON.
-    assert first.released_reference([["N134"], "N136", "N139"]) is None
+    first_attempt = first.released_reference(["N134", "N136", "N139"])
+    assert first_attempt["retained_cache"] == dict(inventory_sha256=FIRST_ATTEMPT_INVENTORY, logical_bytes=R3_BYTES // 2)
+    assert first.released_reference(R3_AUTHORITIES) is None  # A list, as stored in JSON.
+    assert first.released_reference([["N134"], "N136", "N139", "N142"]) is None
     assert first.released_reference(None) is None
 
 
-def retained_state_TESTONLY(tmp_path, *, retained=True):
-    """A real retained file and its exact inventory; no actual cache is read."""
+def retained_state_TESTONLY(tmp_path, *, retained=True, first_attempt=False):
+    """Two real retained files and their exact inventory; no actual cache is read.
+
+    With first_attempt=True the inventory lists only the first file, as the
+    first attempt's entry pins it, while both files are on disk.
+    """
     root = tmp_path / "cache"
-    relative = "jobs/" + "e" * 32 + "/matplotlib/fontlist-v390.json"
-    path = root.joinpath(*relative.split("/"))
-    path.parent.mkdir(parents=True)
-    path.write_bytes(b"f" * 117590)
-    info = path.lstat()
-    inventory = dict(format=first.RETAINED_INVENTORY, root=str(root), no_cleanup=True,
-                     files=[dict(relative_path=relative, dev=info.st_dev, ino=info.st_ino,
-                                 size_bytes=info.st_size, mtime_ns=info.st_mtime_ns)],
-                     logical_bytes=117590)
+    rows, paths = [], []
+    for token in ("e" * 32, "f" * 32):
+        relative = "jobs/" + token + "/matplotlib/fontlist-v390.json"
+        path = root.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"f" * (R3_BYTES // 2))
+        info = path.lstat()
+        rows.append(dict(relative_path=relative, dev=info.st_dev, ino=info.st_ino,
+                         size_bytes=info.st_size, mtime_ns=info.st_mtime_ns))
+        paths.append(path)
+    if first_attempt:
+        rows = rows[:1]
+    inventory = dict(format=first.RETAINED_INVENTORY, root=str(root), no_cleanup=True, files=rows,
+                     logical_bytes=sum(row["size_bytes"] for row in rows))
     state = first.FirstQualification.__new__(first.FirstQualification)
     state.reference_build = True
     state.bound_mode = False
@@ -139,16 +172,16 @@ def retained_state_TESTONLY(tmp_path, *, retained=True):
     if retained:
         state.reference_retained_inventory = inventory
         state._reference_retained_seal = first._digest(inventory)
-    token = "a" * 32
     ledger = Ledger_TESTONLY()
-    ledger.documents.update({"cache-r-" + token + ".json": b"{}", "cache-c-" + token + ".json": b"{}"})
+    for token in ("a" * 32, "b" * 32):  # Closed earlier services, such as 35517 and 95c.
+        ledger.documents.update({"cache-r-" + token + ".json": b"{}", "cache-c-" + token + ".json": b"{}"})
     lease = SimpleNamespace(policy=SimpleNamespace(root=str(root)), ledger=ledger)
-    return state, lease, path
+    return state, lease, paths
 
 
-def test_r3_counts_exactly_its_verified_retained_file(tmp_path):
+def test_r3_counts_exactly_its_verified_retained_files(tmp_path):
     state, lease, _ = retained_state_TESTONLY(tmp_path)
-    assert state.initial_cache_bytes(lease) == 117590
+    assert state.initial_cache_bytes(lease) == R3_BYTES
 
 
 def test_without_a_retained_release_a_cold_start_stays_empty(tmp_path):
@@ -159,13 +192,13 @@ def test_without_a_retained_release_a_cold_start_stays_empty(tmp_path):
 
 @pytest.mark.parametrize("change", ["grown", "missing", "open_reservation", "unknown_reservation", "memory"])
 def test_r3_retained_count_refuses_any_changed_file_open_reservation_or_inventory(tmp_path, change):
-    state, lease, path = retained_state_TESTONLY(tmp_path)
+    state, lease, paths = retained_state_TESTONLY(tmp_path)
     if change == "grown":
-        path.write_bytes(b"f" * 117591)
+        paths[1].write_bytes(b"f" * (R3_BYTES // 2 + 1))
     elif change == "missing":
-        path.unlink()
+        paths[1].unlink()
     elif change == "open_reservation":
-        lease.ledger.documents["cache-r-" + "b" * 32 + ".json"] = b"TESTONLY fully written live reservation"
+        lease.ledger.documents["cache-r-" + "c" * 32 + ".json"] = b"TESTONLY fully written live reservation"
     elif change == "unknown_reservation":
         lease.ledger.documents["cache-r-TESTONLY.json"] = b"{}"
     else:
@@ -174,18 +207,27 @@ def test_r3_retained_count_refuses_any_changed_file_open_reservation_or_inventor
         state.initial_cache_bytes(lease)
 
 
+def test_the_first_attempts_entry_cannot_start_with_both_font_files_on_disk(tmp_path, monkeypatch):
+    state, lease, _ = retained_state_TESTONLY(tmp_path, first_attempt=True)
+    admission_TESTONLY(monkeypatch, state)
+    assert state.initial_cache_bytes(lease) == R3_BYTES // 2
+    with lease.ledger.locked():
+        with pytest.raises(CachePolicyError, match="fresh exclusive cache"):
+            state.reference_admission(lease, report=report_TESTONLY(), initial=True)
+
+
 def admission_TESTONLY(monkeypatch, state):
     """Reference admission with only its namespace and length scan replaced."""
     monkeypatch.setattr(state, "_namespace", lambda lease: True, raising=False)
     snapshot = dict(observed_scan_anomalies=[], roots=[dict(role="results", logical_bytes=0)],
-                    logical_bytes=117590, volumes=[])
+                    logical_bytes=R3_BYTES, volumes=[])
     monkeypatch.setattr(first, "reference_scope_snapshot", lambda *args: snapshot)
     monkeypatch.setattr(first, "require_reference_not_stopped", lambda *args: None)
 
 
 def report_TESTONLY(**changes):
     value = dict(reserve_bytes=PHYSICAL_RESERVE_BYTES, hard_filesystem_quota_verified=True,
-                 current_cache_logical_bytes=117590, active_cache_remaining_bytes=0)
+                 current_cache_logical_bytes=R3_BYTES, active_cache_remaining_bytes=0)
     value.update(changes)
     return value
 
@@ -193,7 +235,8 @@ def report_TESTONLY(**changes):
 @pytest.mark.parametrize("retained,changes,admitted", [
     (True, {}, True),
     (True, dict(current_cache_logical_bytes=0), False),
-    (True, dict(current_cache_logical_bytes=117591), False),
+    (True, dict(current_cache_logical_bytes=R3_BYTES // 2), False),  # Only the first font file.
+    (True, dict(current_cache_logical_bytes=R3_BYTES + 1), False),
     (True, dict(active_cache_remaining_bytes=1), False),
     (False, dict(current_cache_logical_bytes=0), True),  # N43 is unchanged.
     (False, {}, False),
@@ -222,7 +265,8 @@ class ProjectingLedger_TESTONLY(Ledger_TESTONLY):
 
 
 @pytest.mark.parametrize("retained,current,admitted", [
-    (True, 117590, True), (True, 0, False), (False, 0, True), (False, 117590, False)])
+    (True, R3_BYTES, True), (True, R3_BYTES // 2, False), (True, 0, False),
+    (False, 0, True), (False, R3_BYTES, False)])
 def test_consume_admits_r3_with_exactly_its_retained_bytes(tmp_path, monkeypatch, retained, current, admitted):
     state, lease, _ = retained_state_TESTONLY(tmp_path, retained=retained)
     lease.ledger = ProjectingLedger_TESTONLY(report_TESTONLY(current_cache_logical_bytes=current))
