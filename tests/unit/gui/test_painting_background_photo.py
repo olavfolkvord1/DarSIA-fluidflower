@@ -8,7 +8,6 @@ series, rig model or NAS input is used.
 """
 
 import json
-import uuid
 
 import pytest
 from PIL import Image
@@ -36,13 +35,15 @@ class _Project:
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
-    """Keep the remembered choice in a private settings file."""
+    """Keep the remembered choice in a private INI file, not the user's registry.
 
-    QSettings.setPath(
-        QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(tmp_path / "qs")
-    )
+    QSettings(organization, application) always uses the native format, which
+    is the registry on Windows, so the view's QSettings is replaced here.
+    """
+
+    path = str(tmp_path / "painting.ini")
     monkeypatch.setattr(
-        slv, "_BACKGROUND_SETTINGS", ("DarSIA-test-" + uuid.uuid4().hex, "painting")
+        slv, "QSettings", lambda *args: QSettings(path, QSettings.Format.IniFormat)
     )
 
 
