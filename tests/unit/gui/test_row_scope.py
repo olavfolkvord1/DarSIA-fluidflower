@@ -33,6 +33,9 @@ def series(tmp_path):
     return root, manifest, common, run, loaded
 
 
+COMMON_LINE = "Settings: whole series (common.toml) · Runs on: AC28"
+
+
 def context(series):
     root, _manifest, _common, _run, loaded = series
     return scopes.load_scope_context(
@@ -69,8 +72,9 @@ def test_phase_rows_and_method_choice_are_series_not_selected_run(
 @pytest.mark.parametrize("item_id", ["color", "mass", "default_mass", "mass_optuna"])
 def test_common_origin_only_when_loaded_branch_is_inherited(series, item_id):
     value = scopes.row_scope(context(series), "calibration", item_id)
-    assert value.scope == "series"
-    assert value.line == "Applies to: whole series AC (2 runs) via common.toml"
+    # Common settings, but the action runs on the selected run (N141).
+    assert value.scope == "run" and value.run_selector_enabled
+    assert value.line == COMMON_LINE
     assert "Shared calibration settings from common.toml" in value.note
     assert "other runs may override" in value.note
     assert "Existing actions use the selected run" in value.note
@@ -82,7 +86,7 @@ def test_run_mass_override_does_not_change_independent_common_colour_scope(serie
     loaded["calibration"]["mass"]["embedding"] = "run-mass"
     current = context(series)
     assert scopes.row_scope(current, "calibration", "mass").scope == "run"
-    assert scopes.row_scope(current, "calibration", "color").scope == "series"
+    assert scopes.row_scope(current, "calibration", "color").line == COMMON_LINE
 
 
 def test_even_identical_explicit_run_override_is_run_provenance(series):
@@ -208,7 +212,7 @@ def test_custom_manifest_paths_are_respected(series):
     )
     assert current.common_path == custom
     assert current.merged_path == root / "controller-configs/ac28.toml"
-    assert scopes.row_scope(current, "calibration", "mass").scope == "series"
+    assert scopes.row_scope(current, "calibration", "mass").line == COMMON_LINE
 
 
 def test_unloaded_explicit_canonical_merged_file_is_metadata_only_fallback(
@@ -229,7 +233,7 @@ def test_unloaded_explicit_canonical_merged_file_is_metadata_only_fallback(
     monkeypatch.setattr(Path, "open", allowed)
     current = scopes.load_scope_context(root, "ffac", "ac28", merged)
     assert reads == [manifest, common, run, merged]
-    assert scopes.row_scope(current, "calibration", "mass").scope == "series"
+    assert scopes.row_scope(current, "calibration", "mass").line == COMMON_LINE
 
 
 def test_unloaded_external_path_is_not_read_or_assumed_common(series, monkeypatch):

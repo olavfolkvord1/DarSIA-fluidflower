@@ -3,6 +3,8 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel, QLayout, QScrollArea, QVBoxLayout, QWidget
 
+from darsia.fluidflower.series_method import METHOD_NAMES
+
 
 class NativeCalibrationHeader:
     """Move existing controls, preserving their signals and settings behaviour."""
@@ -52,10 +54,7 @@ class NativeCalibrationHeader:
         self.scroll.setVisible(active)
         if active:
             selection = w._saved_method
-            method = {
-                "phase_model": "Phase model",
-                "colour_path": "Colour path",
-            }.get(selection.active, "Method not chosen")
+            method = METHOD_NAMES.get(selection.active, "Method not chosen")
             series = w.phase_model_workspace.series_selector.currentText()
             run = w.run_combo.currentText() or "No run loaded"
             self.line.setText(f"{series or 'No series selected'} · {run} · {method}")

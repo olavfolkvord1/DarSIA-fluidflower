@@ -31,6 +31,13 @@ from PySide6.QtWidgets import (
 
 
 METHODS = ("colour_path", "phase_model")
+# Display names of the methods (N141). The keys above and in series.toml stay.
+METHOD_NAMES = {"colour_path": "Direct colour method", "phase_model": "Phase-map method"}
+METHOD_HEADERS = {"colour_path": "Direct colour method (DarSIA original)", "phase_model": "Phase-map method"}
+METHOD_DESCRIPTIONS = {
+    "colour_path": "Colour → concentration → mass; phases from colour-signal thresholds (DarSIA original).",
+    "phase_model": "Trained phase map first; concentration and mass are computed inside the phases.",
+}
 
 
 class ManifestChangedError(RuntimeError):
@@ -209,8 +216,10 @@ class SeriesMethodPanel(QWidget):
         self._load_error = ""
         outer = QVBoxLayout(self)
         outer.addWidget(QLabel("Method used for this series"))
-        self.colour_path_button = QRadioButton("Colour path — original method")
-        self.phase_model_button = QRadioButton("Phase model — classification first")
+        self.colour_path_button = QRadioButton(METHOD_NAMES["colour_path"])
+        self.phase_model_button = QRadioButton(METHOD_NAMES["phase_model"])
+        self.colour_path_button.setToolTip(METHOD_DESCRIPTIONS["colour_path"])
+        self.phase_model_button.setToolTip(METHOD_DESCRIPTIONS["phase_model"])
         self.method_buttons = QButtonGroup(self)
         self.method_buttons.addButton(self.colour_path_button, 0)
         self.method_buttons.addButton(self.phase_model_button, 1)

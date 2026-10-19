@@ -46,6 +46,9 @@ from darsia.fluidflower.series_geometry import series_rig_class
 from darsia.fluidflower.series_geometry_workspace import SeriesGeometryWorkspace
 from darsia.fluidflower.series_paths import configured_series
 from darsia.fluidflower.series_method import (
+    METHOD_DESCRIPTIONS,
+    METHOD_HEADERS,
+    METHOD_NAMES,
     MethodSelection,
     SeriesMethodPanel,
     missing_method_references,
@@ -248,11 +251,7 @@ class NativeHomePage(HomePage):
                 if root in self.series_registry.series_by_path
                 else MethodSelection()
             )
-            method_item.setText(
-                {"phase_model": "phase model", "colour_path": "colour path"}.get(
-                    choice.active, "–"
-                )
-            )
+            method_item.setText(METHOD_NAMES.get(choice.active, "–").lower())
             method_item.setToolTip(
                 choice.error or "Chosen method saved in series.toml."
             )
@@ -1384,6 +1383,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         sidebar_data = {}
         setup_rows = {}
         aliases = {"calibration": {}, "analysis": {}}
+        # Method key of each group, in header order, so grouping never reads display text.
+        self._method_group_keys = {}
         for action, label, icon, rows in self.SIDEBAR_CATEGORIES:
             if action == "setup":
                 display_items = []
@@ -1394,7 +1395,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 groups = [("", display_items)]
             elif action == "calibration":
                 groups = self.calibration_tab.sidebar_items()
-                groups[0] = ("Colour path — original method", groups[0][1])
+                groups[0] = (METHOD_HEADERS["colour_path"], groups[0][1])
+                # The original groups, the danger zone included, belong to the colour method.
+                self._method_group_keys[action] = ["colour_path"] * len(groups) + ["phase_model"]
                 phase_rows = []
                 for text, item_id, help_text in (
                     (
@@ -1411,7 +1414,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     display_id = f"phase_model:{item_id}"
                     aliases[action][display_id] = ("phase_model", item_id)
                     phase_rows.append((text, display_id, "fa5s.circle", help_text))
-                groups.append(("Phase model — classification first", phase_rows))
+                groups.append((METHOD_HEADERS["phase_model"], phase_rows))
             elif action == "analysis":
                 original_rows = [
                     row
@@ -1435,9 +1438,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     aliases[action][display_id] = ("mass_analysis", item_id)
                     phase_rows.append((text, display_id, "fa5s.circle", help_text))
                 aliases[action]["jobs:overview"] = ("jobs", "overview")
+                self._method_group_keys[action] = ["colour_path", "phase_model", "common"]
                 groups = [
-                    ("Original method", original_rows),
-                    ("Phase model", phase_rows),
+                    (METHOD_HEADERS["colour_path"], original_rows),
+                    (METHOD_HEADERS["phase_model"], phase_rows),
                     ("Jobs", [("Jobs", "jobs:overview", "fa5s.tasks",
                                "Read explicitly registered jobs or choose an adopted execution plan; opening this page starts no job.")]),
                 ]
@@ -1663,16 +1667,18 @@ class NativeFluidFlowerMainWindow(MainWindow):
         for category in ("calibration", "analysis"):
             section = self.sidebar._sections[category]
             grouped = {"colour_path": [], "phase_model": [], "common": []}
+            keys = list(self._method_group_keys[category])
             method = "colour_path"
             rows = {}
             for index in range(section.items_layout.count()):
                 widget = section.items_layout.itemAt(index).widget()
-                if isinstance(widget, GroupHeaderLabel) and widget.text().startswith(
-                    "Phase model"
-                ):
-                    method = "phase_model"
-                elif category == "analysis" and isinstance(widget, GroupHeaderLabel) and widget.text() == "Jobs":
-                    method = "common"
+                if isinstance(widget, GroupHeaderLabel):
+                    if not keys:
+                        raise RuntimeError("Sidebar group without a method key: " + widget.text())
+                    method = keys.pop(0)
+                    # The method's own header explains it; later headers (the danger zone) do not.
+                    if not grouped[method] and method in METHOD_DESCRIPTIONS:
+                        widget.setToolTip(METHOD_DESCRIPTIONS[method])
                 grouped[method].append(widget)
                 if isinstance(widget, SidebarRow):
                     _category, key = self.sidebar.display_selection(
@@ -1744,9 +1750,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             from darsia.fluidflower.model_index_names import model_reference_label
 
             model_label = model_reference_label(root, choice.model_version)
-            text = f"Method: phase model · model {model_label} · mass calibration {choice.mass_calibration or 'not referenced'}"
+            text = f"Method: {METHOD_NAMES['phase_model'].lower()} · model {model_label} · mass calibration {choice.mass_calibration or 'not referenced'}"
         elif choice.active == "colour_path":
-            text = f"Method: colour path · calibration {choice.colour_calibration or 'not referenced'}"
+            text = f"Method: {METHOD_NAMES['colour_path'].lower()} · calibration {choice.colour_calibration or 'not referenced'}"
         else:
             text = "Method: not chosen"
         missing = missing_method_references(choice)

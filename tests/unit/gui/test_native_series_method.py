@@ -153,7 +153,7 @@ def test_method_badge_is_visible_in_workflow_categories_and_analysis_repeats_it(
         logical = window.sidebar._logical_selection(category, next(iter(section._rows)))
         window._select_row(logical)
         assert window.method_badge.isVisible() is (category not in {"start", "calibration"}), category
-        assert "Method: phase model" in window.method_badge.text()
+        assert "Method: phase-map method" in window.method_badge.text()
         assert not window.method_panel.isVisible()  # The real step page is stubbed in this navigation fixture.
         assert window.analysis_method_badge.isVisible() is (category == "analysis")
         if category == "start":
@@ -177,7 +177,7 @@ def test_start_lists_each_series_saved_method_without_writing_or_opening_it(
         home.table.item(row, 1).text(): home.table.item(row, 4).text()
         for row in range(home.table.rowCount())
     }
-    assert displayed == {"series-a": "phase model", "series-b": "–"}
+    assert displayed == {"series-a": "phase-map method", "series-b": "–"}
     assert window.content_stack.currentWidget() is home
     assert not window.method_badge.isVisible()
     assert not window.series_header.isVisible()
@@ -187,7 +187,7 @@ def test_start_lists_each_series_saved_method_without_writing_or_opening_it(
         MethodSelection(active="colour_path", colour_calibration="colour"),
     )
     home.refresh()
-    assert home.table.item(1, 4).text() == "colour path"
+    assert home.table.item(1, 4).text() == "direct colour method"
 
 
 def test_unchanged_manifest_refresh_preserves_unsaved_panel_draft(method_window):

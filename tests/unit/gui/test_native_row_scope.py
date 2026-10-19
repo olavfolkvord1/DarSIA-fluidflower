@@ -93,8 +93,9 @@ def test_common_scope_is_data_bound_and_changes_with_selected_run_override(
 ):
     window = scope_window
     window._select_row(("calibration", "mass"))
-    assert "whole series series-a (2 runs) via common.toml" in window.scope_label.text()
-    assert not window.run_combo.isEnabled()
+    # Common settings, but the action runs on the selected run (N141).
+    assert window.scope_label.text() == "Settings: whole series (common.toml) · Runs on: AC28"
+    assert window.run_combo.isEnabled()
     # Changing the chosen run elsewhere is reflected when returning here.
     window._select_row(("analysis", "mass"))
     _select_run(window, "ac47")
@@ -103,8 +104,8 @@ def test_common_scope_is_data_bound_and_changes_with_selected_run_override(
     assert window.run_combo.isEnabled()
     # Colour has no run override, independently of mass.
     window._select_row(("calibration", "color"))
-    assert "via common.toml" in window.scope_label.text()
-    assert not window.run_combo.isEnabled()
+    assert window.scope_label.text() == "Settings: whole series (common.toml) · Runs on: AC47"
+    assert window.run_combo.isEnabled()
 
 
 def test_one_context_updates_all_help_including_existing_popup_without_accumulation(
@@ -131,8 +132,8 @@ def test_one_context_updates_all_help_including_existing_popup_without_accumulat
     assert len(calls) == 1
     for category in ("calibration", "analysis"):
         for candidate in window.sidebar._sections[category]._rows.values():
-            assert "Applies to:" in candidate.help_text
-            assert candidate.help_text.count("Applies to:") == 1
+            lines = candidate.help_text.count("Applies to:") + candidate.help_text.count("Settings: whole series")
+            assert lines == 1, candidate.help_text
     assert row.help_text.startswith(base + "\n")
     assert "run AC47 only" in row.help_text
     assert row._help_popup._help_text == row.help_text

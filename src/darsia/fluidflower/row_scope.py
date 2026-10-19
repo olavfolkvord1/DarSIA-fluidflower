@@ -318,9 +318,11 @@ def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | No
         return None
     shared, origin = common_calibration_origin(context, branch)
     if shared:
+        # The settings are the series' own, but the action runs on one run, so
+        # the run selector stays enabled (N141).
         return RowScope(
-            "series",
-            f"Applies to: whole series {context.series_label} ({len(context.run_ids)} runs) via common.toml",
+            "run",
+            f"Settings: whole series (common.toml) · Runs on: {context.selected_run.upper()}",
             "Shared calibration settings from common.toml. This run has no override; other runs may override these defaults. Existing actions use the selected run.",
         )
     return _run_scope(context, "Uses the selected run.")
