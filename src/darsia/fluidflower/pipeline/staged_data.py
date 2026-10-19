@@ -189,6 +189,9 @@ def validate_phase1_run(config):
     frames = config["frames"]
     if not isinstance(frames, list) or not frames:
         raise ValueError("An explicit nonempty chronological selection is required")
+    raw_mode = any(frame.get("native_task", {}).get("kind") == "raw_rig" for frame in frames)
+    if raw_mode and any(frame.get("native_task", {}).get("kind") != "raw_rig" for frame in frames):
+        raise ValueError("A RAW-only run cannot mix JPEG-positioned native processors")
     ids, digests, last = set(), set(), None
     predecessor = config["phase"]["initial_previous"]["source"]["source_sha256"]
     _sha(predecessor, where="initial predecessor")
