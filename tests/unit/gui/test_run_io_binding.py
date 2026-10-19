@@ -146,6 +146,44 @@ def test_actual_native_code_is_tracked_and_exact_sha_not_arbitrary_repo_data(tmp
         binding._admit_code(relative,"0"*64,"processor_module_sha256")
 
 
+def test_RAW_source_roles_use_real_Git_identities_and_recheck_Windows_EOL_bytes(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline import run_io
+    from darsia.fluidflower.native.io import sha256_file
+    _task, _config, _bound, _host, binding = fixture(tmp_path)
+    blobs, expected, paths = {}, {}, {}
+    for role, relative in {**run_io.RAW_CODE_ROLES, **run_io._PROVENANCE_CODE_ROLES}.items():
+        blob = ("# authored " + relative + "\n").encode()
+        blobs[relative] = blob
+        paths[role] = Path(put(binding.repository / relative, blob.replace(b"\n", b"\r\n"))["path"])
+        if role in run_io.RAW_CODE_ROLES:
+            expected[role] = hashlib.sha256(blob).hexdigest()
+    def git(args, **kwargs):
+        if "ls-tree" in args:
+            assert args[-1] in blobs
+            return args[-1] + "\n"
+        assert args[3] == "show"
+        commit, _, relative = args[4].partition(":")
+        assert commit == binding.commit
+        return blobs[relative]
+    monkeypatch.setattr(run_io.subprocess, "check_output", git)
+    native = dict(source=dict(raw_execution_identity=expected))
+    binding._admit_native_code(native)
+    with binding.activate():
+        for role, path in paths.items():
+            if role in expected:
+                assert sha256_file(path) == expected[role]
+        paths["raw_source"].write_bytes(b"changed executable source")
+        with pytest.raises(InputHashMismatch, match="code changed"):
+            sha256_file(paths["raw_source"])
+
+
+def test_RAW_native_execution_roles_must_be_complete_before_consumption(tmp_path):
+    from darsia.fluidflower.pipeline import run_io
+    _task, _config, _bound, _host, binding = fixture(tmp_path)
+    with pytest.raises(InputHashMismatch, match="RAW-only execution identity is incomplete"):
+        binding._admit_native_code(dict(source=dict(raw_execution_identity={"raw_source": "a" * 64})))
+
+
 def queued_fixture(tmp_path):
     task,_config,_bound,_host,binding=fixture(tmp_path)
     root=tmp_path/"shared";run=root/"results/ac52"

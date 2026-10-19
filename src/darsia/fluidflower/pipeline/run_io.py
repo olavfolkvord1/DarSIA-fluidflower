@@ -32,6 +32,23 @@ _CODE_ROLES = {
     "isolated_invalid_module_sha256": "src/darsia/fluidflower/native/support.py",
 }
 
+# The RAW-only producer consumes these named current code modules. Data files
+# retain their exact byte SHA; source code uses the existing admitted Git-blob
+# identity, with only its Windows EOL representation allowed to differ.
+RAW_CODE_ROLES = {
+    "raw_source": "src/darsia/fluidflower/native/raw_rig_source.py",
+    "raw_positioning": "src/darsia/fluidflower/native/raw_positioning.py",
+    "raw_port": "src/darsia/fluidflower/native/raw_positioning_port.py",
+    "raw_chart": "src/darsia/fluidflower/native/raw_chart.py",
+    "registration": "src/darsia/fluidflower/native/registration.py",
+    "photometry": "src/darsia/fluidflower/native/photometry.py",
+    "source_helpers": "src/darsia/fluidflower/native/source.py",
+    "extension": "src/darsia/fluidflower/native/extension.py",
+    "native_io": "src/darsia/fluidflower/native/io.py",
+    "io_ops": "src/darsia/fluidflower/pipeline/io_ops.py",
+    "raw_camera": "src/darsia/fluidflower/native/raw_camera.py",
+}
+
 
 # Provenance self-hash in native.display_modes.display_contract(). This reader
 # has no field in source.execution_identity: bind this one named repository
@@ -253,15 +270,22 @@ class RunIOBinding:
 
     def _admit_native_code(self, native):
         source = native["source"]
-        expected = source["execution_identity"]
-        required = source["required_execution_identity_keys"]
-        if set(required) != set(expected) or len(required) != len(set(required)):
-            raise InputHashMismatch("Original native execution identity is incomplete")
-        for role in required:
-            relative = _CODE_ROLES.get(role)
-            if relative is None:
-                raise InputHashMismatch("Unsupported explicit native code consumer: " + role)
-            self._admit_code(relative, expected[role], role)
+        if "raw_execution_identity" in source:
+            expected = source["raw_execution_identity"]
+            if not isinstance(expected, dict) or set(expected) != set(RAW_CODE_ROLES):
+                raise InputHashMismatch("RAW-only execution identity is incomplete")
+            for role, relative in RAW_CODE_ROLES.items():
+                self._admit_code(relative, expected[role], "raw_only." + role)
+        else:
+            expected = source["execution_identity"]
+            required = source["required_execution_identity_keys"]
+            if set(required) != set(expected) or len(required) != len(set(required)):
+                raise InputHashMismatch("Original native execution identity is incomplete")
+            for role in required:
+                relative = _CODE_ROLES.get(role)
+                if relative is None:
+                    raise InputHashMismatch("Unsupported explicit native code consumer: " + role)
+                self._admit_code(relative, expected[role], role)
         for role, relative in _PROVENANCE_CODE_ROLES.items():
             original = subprocess.check_output(
                 ["git", "-C", str(self.repository), "show", self.commit + ":" + relative])

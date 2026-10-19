@@ -5,6 +5,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,6 +52,7 @@ def fixture(tmp_path, monkeypatch):
         native_shape_hw=list(shape), asset_aliases={}, homography_min_scale=1e-12,
         homography_match_atol=1e-7, symbols=dict(reference_to_frame_h_key="H_reference_to_frame")),
         registration={}, photometry=photo)
+    parameters["source"]["raw_execution_identity"] = raw.execution_identity()
     binding = dict(contract=raw.CONTRACT, run="fixture", profile_id="camera", native_shape_hw=list(shape),
         baseline_raw=raw_bound, baseline_reference_to_native_h=np.eye(3).tolist(),
         shape_assets=[descriptor(shape_file)], image_metadata={}, models=models,
@@ -130,6 +132,26 @@ def test_catalogue_contains_only_consumed_raw_and_unchanged_model_roles(fixture)
     assert relative == {"raw_binding.json", "B.ARW", "fit.npz", "fit.json",
                         "reference.npz", "reference.json", "existing_shape.npz"}
     assert not any(path.lower().endswith((".jpg", ".jpeg")) for path in relative)
+
+
+def test_RAW_source_identity_matches_the_actual_admitted_Git_blobs():
+    from darsia.fluidflower.pipeline.run_io import RAW_CODE_ROLES
+    root = Path(__file__).resolve().parents[2]
+    identity = raw.execution_identity()
+    assert set(identity) == set(RAW_CODE_ROLES)
+    for name, relative in RAW_CODE_ROLES.items():
+        blob = subprocess.check_output(["git", "show", "HEAD:" + relative], cwd=root)
+        assert identity[name] == sha256(blob).hexdigest()
+
+
+def test_queued_RAW_binding_cannot_omit_or_change_current_code_roles(fixture):
+    f = fixture
+    parameters = deepcopy(f.parameters)
+    parameters["source"].pop("raw_execution_identity")
+    catalog = job_inputs.InputCatalog({"scratch": str(f.root)})
+    with pytest.raises(ValueError, match="explicit native execution binding"):
+        catalog.native_task(dict(kind="raw_rig", processor=dict(raw_binding=descriptor(f.path))),
+                            f.row, parameters, "frame.native")
 
 
 def test_new_RAW_baseline_history_rejects_relabelled_old_producer(fixture):

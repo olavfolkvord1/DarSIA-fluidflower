@@ -10,7 +10,7 @@ from contextvars import ContextVar
 import hashlib
 import os
 from pathlib import Path
-from uuid import uuid4
+from secrets import token_hex
 
 from .job_queue import rename, retry_transient
 
@@ -63,7 +63,7 @@ def publish_file(path, writer, *, reuse_identical=False, expected_sha256=None):
 
     @retry_io
     def serialize():
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+        temporary = path.with_name(f".{path.name}.{token_hex(16)}.partial")
         with temporary.open("xb") as stream:
             writer(stream)
             stream.flush()

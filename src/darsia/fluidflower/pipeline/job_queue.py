@@ -212,7 +212,10 @@ def _publish_bytes(path: Path, data: bytes, *, create_parents: bool) -> None:
     def publish():
         if create_parents:
             path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+        # Temporary IO names must not consume the semantic attempt/frame UUID
+        # stream (the original full writer's identity sequence is preserved).
+        from secrets import token_hex
+        temporary = path.with_name(f".{path.name}.{token_hex(16)}.partial")
         with temporary.open("xb") as stream:
             stream.write(data)
             stream.flush()

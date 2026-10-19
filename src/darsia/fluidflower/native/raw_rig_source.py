@@ -9,6 +9,7 @@ validation gates.
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
@@ -28,12 +29,24 @@ FRAME_CONTRACT = "darsia-raw-native-frame-v1"
 
 
 def execution_identity() -> dict:
-    """Bind the actual implementation, including unchanged numerical helpers."""
-    modules = dict(raw_source=Path(__file__), raw_positioning=Path(raw_positioning.__file__),
-                   raw_port=Path(raw_positioning_port.__file__), raw_chart=Path(raw_chart.__file__),
-                   registration=Path(registration.__file__), photometry=Path(photometry.__file__),
-                   source_helpers=Path(source.__file__), extension=Path(extension.__file__))
-    return {name: sha256_file(path) for name, path in modules.items()}
+    """Bind canonical source content; acquisition/model hashes stay exact bytes.
+
+    Inside a queue attempt, RunIOBinding rechecks the admitted working copy
+    and returns the real Git-blob SHA. Standalone control preparation uses its
+    LF source representation, the representation tracked by these modules.
+    """
+    from ..pipeline.run_io import RAW_CODE_ROLES, current_binding
+    from ..pipeline.job_queue import retry_transient
+    package_root = Path(__file__).resolve().parents[3]
+    identity = {}
+    for name, relative in RAW_CODE_ROLES.items():
+        path = package_root / relative.removeprefix("src/")
+        if current_binding() is not None:
+            identity[name] = sha256_file(path)
+        else:
+            data = retry_transient(path.read_bytes)
+            identity[name] = hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+    return identity
 
 
 def _keys(value, required, *, where):
@@ -65,6 +78,9 @@ def validate_binding(binding: Mapping, parameters: Mapping) -> None:
         _keys(models[name], {"data", "sidecar"}, where=name + " model")
     actual = execution_identity()
     source.verify_execution_identity(actual, binding["execution_identity"], tuple(actual))
+    declared = parameters["source"].get("raw_execution_identity")
+    if declared is not None and declared != binding["execution_identity"]:
+        raise ValueError("RAW source execution binding differs from its native configuration")
 
 
 def validate_frame(row: Mapping, binding: Mapping, parameters: Mapping) -> tuple:

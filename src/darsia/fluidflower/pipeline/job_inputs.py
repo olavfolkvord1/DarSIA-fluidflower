@@ -375,6 +375,8 @@ class InputCatalog:
             from ..image_formats import image_family
             binding = self.doc(processor["raw_binding"], "configuration", use + ".raw_binding")
             validate_binding(binding, parameters)
+            if parameters["source"].get("raw_execution_identity") != binding["execution_identity"]:
+                raise ValueError("Queued RAW source needs its explicit native execution binding")
             validate_frame(geometry, binding, parameters)
             for name, descriptor in (("baseline_raw", binding["baseline_raw"]),
                                      ("acquisition", geometry["acquisition"])):
