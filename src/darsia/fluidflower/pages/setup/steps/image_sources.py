@@ -32,7 +32,9 @@ from darsia.fluidflower.image_formats import (
     DEFAULT_IMAGE_FILE_POLICY,
     IMAGE_FILE_POLICY_ALL,
     IMAGE_FILE_POLICY_PROCESSED,
+    IMAGE_FILE_POLICY_PROCESSED_ONLY,
     IMAGE_FILE_POLICY_RAW,
+    IMAGE_FILE_POLICY_RAW_ONLY,
     normalize_image_file_policy,
 )
 from darsia.fluidflower.indicator_references import (
@@ -274,11 +276,21 @@ class ImageSourcesPage(QWizardPage):
             "Use both processed and RAW files (advanced)",
             IMAGE_FILE_POLICY_ALL,
         )
+        self.image_file_policy.addItem(
+            "Only camera RAW; never JPEG/TIFF/PNG, no fallback",
+            IMAGE_FILE_POLICY_RAW_ONLY,
+        )
+        self.image_file_policy.addItem(
+            "Only JPEG/TIFF/PNG; never camera RAW, no fallback",
+            IMAGE_FILE_POLICY_PROCESSED_ONLY,
+        )
         self.image_file_policy.setToolTip(
             "Choose one series-wide image family before source discovery. When a "
             "folder contains paired JPG and ARW files, the non-preferred copy is "
             "excluded from image counts, integrity reads, and analysis. The preferred "
-            "family falls back to the other family only when it is unavailable."
+            "family falls back to the other family only when it is unavailable. "
+            "The two 'Only' choices never fall back: a folder without that kind "
+            "of file is reported as an error."
         )
         layout.addRow("Image files used by DarSIA", self.image_file_policy)
         layout.addRow(

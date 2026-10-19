@@ -44,6 +44,36 @@ def raw_photo_size(path: str | Path) -> tuple[int, int]:
         raise ValueError(f"Could not read the RAW file {Path(path).name}: {error}") from error
 
 
+def raw_capture_time(path: str | Path):
+    """Capture time of a camera RAW file from its EXIF, or None.
+
+    ARW, NEF and DNG files are TIFF-based. DateTimeOriginal of the EXIF block
+    is used, else DateTime of the first directory, to whole seconds as for
+    JPEG files. Returns a naive ``datetime`` in the camera's clock.
+    """
+
+    from datetime import datetime
+
+    import tifffile
+
+    try:
+        with tifffile.TiffFile(str(path)) as tiff:
+            page = tiff.pages[0]
+            exif = page.tags.get("ExifTag")
+            value = exif.value.get("DateTimeOriginal") if exif and isinstance(exif.value, dict) else None
+            if not value:
+                tag = page.tags.get("DateTime")
+                value = tag.value if tag is not None else None
+    except (OSError, ValueError, tifffile.TiffFileError):
+        return None
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip().rstrip("\x00"), "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def _render_raw_rgb8(path: Path, factor: int) -> np.ndarray:
     """A display rendering of a camera RAW file at 1/factor, as uint8 RGB.
 

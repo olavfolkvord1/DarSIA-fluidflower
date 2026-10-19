@@ -37,7 +37,9 @@ from PySide6.QtWidgets import (
 from darsia.fluidflower.image_formats import (
     IMAGE_FILE_POLICY_ALL,
     IMAGE_FILE_POLICY_PROCESSED,
+    IMAGE_FILE_POLICY_PROCESSED_ONLY,
     IMAGE_FILE_POLICY_RAW,
+    IMAGE_FILE_POLICY_RAW_ONLY,
 )
 from darsia.fluidflower.pages.setup.global_run_structure import (
     GlobalRunStructureDialog,
@@ -603,6 +605,14 @@ class EstablishedSourceSetupEditor(QWidget):
         self.image_file_policy.addItem(
             "Use both processed and RAW files (advanced)",
             IMAGE_FILE_POLICY_ALL,
+        )
+        self.image_file_policy.addItem(
+            "Only camera RAW; never JPEG/TIFF/PNG, no fallback",
+            IMAGE_FILE_POLICY_RAW_ONLY,
+        )
+        self.image_file_policy.addItem(
+            "Only JPEG/TIFF/PNG; never camera RAW, no fallback",
+            IMAGE_FILE_POLICY_PROCESSED_ONLY,
         )
         saved_image_policy = project.image_file_policy()
         image_policy_index = self.image_file_policy.findData(saved_image_policy)

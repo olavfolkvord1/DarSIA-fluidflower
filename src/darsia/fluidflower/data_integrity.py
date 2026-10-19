@@ -25,6 +25,10 @@ from darsia.fluidflower.image_formats import (
     ALL_IMAGE_SUFFIXES,
     CAMERA_RAW_SUFFIXES,
     DEFAULT_IMAGE_FILE_POLICY,
+    IMAGE_FILE_POLICY_ALL,
+    IMAGE_FILE_POLICY_RAW,
+    IMAGE_FILE_POLICY_RAW_ONLY,
+    missing_image_family,
     normalize_image_file_policy,
     select_preferred_images,
 )
@@ -34,6 +38,10 @@ if TYPE_CHECKING:
 
 
 INTEGRITY_REPORT_FORMAT = "darsia-fluidflower-integrity-report-v1"
+# Policies under which the scan reads camera RAW files (size, capture time).
+RAW_READING_POLICIES = frozenset(
+    {IMAGE_FILE_POLICY_RAW, IMAGE_FILE_POLICY_ALL, IMAGE_FILE_POLICY_RAW_ONLY}
+)
 INTEGRITY_WORKER_MEMORY_BUDGET_BYTES = 256 * 1024**2
 IMAGE_SUFFIXES = set(ALL_IMAGE_SUFFIXES)
 _SEQUENCE_PATTERN = re.compile(r"^(.*?)(\d+)$")
@@ -178,6 +186,22 @@ def _parse_exif_datetime(value: Any) -> str:
     return ""
 
 
+def _raw_image_metadata(path: Path, *, read_exif: bool) -> dict[str, Any]:
+    """Size and capture time of a camera RAW file (LibRaw and its EXIF)."""
+
+    from darsia.fluidflower.photograph_io import raw_capture_time, raw_photo_size
+
+    width, height = raw_photo_size(path)
+    taken = raw_capture_time(path) if read_exif else None
+    return {
+        "width": int(width),
+        "height": int(height),
+        "mode": "RGB",
+        "image_format": "RAW",
+        "exif_datetime": taken.isoformat() if taken is not None else "",
+    }
+
+
 def _image_metadata(path: Path, *, verify: bool, read_exif: bool) -> dict[str, Any]:
     with Image.open(path) as image:
         width, height = image.size
@@ -224,14 +248,20 @@ class IntegrityScanner:
         self.options = options or IntegrityScanOptions()
         self.options.validate()
 
-    def _enumerate_source(self, source: Mapping[str, Any]) -> tuple[list[Path], int]:
+    def _enumerate_source(
+        self, source: Mapping[str, Any]
+    ) -> tuple[list[Path], int, list[tuple[Path, str]]]:
+        """Files of one source, read attempts, and folders a strict policy rejects."""
+
         root = Path(str(source.get("path") or "")).expanduser()
         if root.is_file():
-            return [root], 1
+            return [root], 1, []
         if not root.is_dir():
             raise FileNotFoundError(root)
+        missing: list[tuple[Path, str]] = []
 
         def collect() -> list[Path]:
+            missing.clear()
             files: list[Path] = []
             if self.options.recursive:
                 walk_errors: list[OSError] = []
@@ -257,6 +287,10 @@ class IntegrityScanner:
                     for paths in images_by_folder.values()
                     for path in select_preferred_images(paths, policy)
                 }
+                for folder, paths in sorted(images_by_folder.items()):
+                    reason = missing_image_family(paths, policy)
+                    if reason:
+                        missing.append((folder, reason))
                 files = [
                     path
                     for path in files
@@ -265,11 +299,12 @@ class IntegrityScanner:
                 ]
             return sorted(files, key=_natural_key)
 
-        return _retry(
+        paths, attempts = _retry(
             collect,
             attempts=self.options.retry_count,
             delay_s=self.options.retry_delay_s,
         )
+        return paths, attempts, list(missing)
 
     def _inspect_entry(
         self,
@@ -278,6 +313,10 @@ class IntegrityScanner:
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         source_root = Path(str(source.get("path") or "")).expanduser()
         relative = path.name if source_root.is_file() else str(path.relative_to(source_root))
+        # RAW files are read when the source's policy selects them.
+        read_raw = normalize_image_file_policy(
+            source.get("image_file_policy") or DEFAULT_IMAGE_FILE_POLICY
+        ) in RAW_READING_POLICIES
         row: dict[str, Any] = {
             "source_id": str(source.get("source_id") or ""),
             "source_kind": str(source.get("kind") or ""),
@@ -308,7 +347,11 @@ class IntegrityScanner:
                     stat.st_mtime, timezone.utc
                 ).isoformat(),
             }
-            if row["is_image"] and not row["is_camera_raw"]:
+            if row["is_camera_raw"] and read_raw:
+                inspected.update(
+                    _raw_image_metadata(path, read_exif=self.options.read_exif)
+                )
+            elif row["is_image"] and not row["is_camera_raw"]:
                 inspected.update(
                     _image_metadata(
                         path,
@@ -371,7 +414,7 @@ class IntegrityScanner:
         for source in sources:
             source_id = str(source.get("source_id") or "")
             try:
-                paths, attempts = self._enumerate_source(source)
+                paths, attempts, missing_family = self._enumerate_source(source)
             except OSError as exc:
                 issues.append(
                     {
@@ -384,6 +427,16 @@ class IntegrityScanner:
                 )
                 continue
             source_retries[source_id] = attempts
+            for folder, reason in missing_family:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "missing_image_family",
+                        "source_id": source_id,
+                        "path": str(folder),
+                        "message": f"{folder}: {reason}.",
+                    }
+                )
             enumerated.extend((source, path) for path in paths)
 
         inventory_slots: list[dict[str, Any] | None] = [None] * len(enumerated)

@@ -13,6 +13,7 @@ from darsia.fluidflower.image_formats import (
     DEFAULT_IMAGE_FILE_POLICY,
     PROCESSED_IMAGE_SUFFIXES,
     image_file_counts,
+    missing_image_family,
     normalize_image_file_policy,
     select_preferred_images,
 )
@@ -284,7 +285,9 @@ def inspect_run_structure(
             ),
             key=lambda path: _natural_key(path.name),
         )
-        if images or tables:
+        # A folder whose images a strict policy rejects stays visible, with
+        # its reason, instead of silently dropping out of the series.
+        if images or tables or missing_image_family(image_candidates, image_file_policy):
             discovered.append((folder, images, tables, image_candidates))
     records: list[dict[str, Any]] = []
     for folder, images, tables, image_candidates in discovered:
@@ -297,6 +300,9 @@ def inspect_run_structure(
                 "available_image_count": len(image_candidates),
                 "image_file_counts": image_file_counts(image_candidates),
                 "image_file_policy": normalize_image_file_policy(image_file_policy),
+                "missing_image_family": missing_image_family(
+                    image_candidates, image_file_policy
+                ),
                 "selected_image_suffixes": sorted(
                     {path.suffix.casefold() for path in images}
                 ),
@@ -1033,6 +1039,14 @@ def discover_image_source_mapping(
             layout_template,
             image_file_policy=image_file_policy,
         )
+        # A strict image-file policy never falls back: name each used folder
+        # that lacks the required kind of file.
+        for record in assigned:
+            reason = str(record.get("missing_image_family") or "")
+            if reason and str(record.get("role") or ROLE_IGNORE) != ROLE_IGNORE:
+                warnings.append(
+                    f"{record.get('relative_path') or record.get('absolute_path')}: {reason}."
+                )
         image_count, first_image, last_image = _image_summary(
             assigned, (ROLE_INJECTION, ROLE_EXPERIMENT)
         )

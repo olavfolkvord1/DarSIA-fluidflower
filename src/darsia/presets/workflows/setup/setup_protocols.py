@@ -30,7 +30,14 @@ def get_modification_time(filepath: Path) -> datetime:
 
 
 def _extract_exif_datetime(path: Path) -> datetime | None:
-    """Extract EXIF datetime from an image."""
+    """Extract EXIF datetime from an image (camera RAW: from its TIFF EXIF)."""
+    from darsia.fluidflower.photograph_io import is_camera_raw, raw_capture_time
+
+    if is_camera_raw(path):
+        taken = raw_capture_time(path)
+        if taken is None:
+            logger.warning("%s: No EXIF datetime found.", path.name)
+        return taken
     with Image.open(path) as img:
         exif_data = img.getexif()
         if exif_data:

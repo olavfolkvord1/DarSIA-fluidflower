@@ -194,6 +194,12 @@ def _images_of(folder: Path, image_format: str) -> list[Path]:
 def _image_time(path: Path) -> float:
     """Capture time of an image (EXIF), else its modification time."""
 
+    from darsia.fluidflower.photograph_io import is_camera_raw, raw_capture_time
+
+    if is_camera_raw(path):
+        taken = raw_capture_time(path)
+        if taken is not None:
+            return taken.timestamp()
     try:
         from PIL import Image
 
