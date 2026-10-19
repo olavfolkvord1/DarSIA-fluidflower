@@ -350,7 +350,16 @@ def test_current_worker_command_detached_and_immutable_receipt_only(
     assert environment_calls == [declared_environment]
     assert observed[0].values["environment"].keys() == list(declared_environment)
     assert observed[0].values["environment"].value("TEST_ONLY_LOCAL_WORKER_ENV") == "original-default-map"
+    # N109: the stdlib pre-start supervisor wraps the unchanged worker command.
+    assert observed[0].values["program"] == "existing-python"
     assert observed[0].values["arguments"] == [
+        "-B",
+        "-m",
+        "darsia_service.prestart",
+        "--service-log",
+        str(tmp_path / "logs" / "main-cpu.log"),
+        "--",
+        "existing-python",
         "-m",
         "darsia.fluidflower.worker",
         "--job",

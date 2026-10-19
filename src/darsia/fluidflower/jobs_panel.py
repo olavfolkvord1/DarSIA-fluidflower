@@ -408,7 +408,7 @@ def launch_local_worker(
         console.relative_to(root).as_posix() if "relative_path" in job_ref else None
     )
     launch_dir.mkdir(parents=True)
-    command = [
+    worker_command = [
         str(python),
         "-m",
         "darsia.fluidflower.worker",
@@ -425,7 +425,12 @@ def launch_local_worker(
     if stores is not None:
         if not isinstance(stores, (str, Path)) or not str(stores).strip():
             raise ValueError("Choose an existing local store map before Start")
-        command.extend(["--stores", str(stores)])
+        worker_command.extend(["--stores", str(stores)])
+    # N109: the stdlib supervisor starts the unchanged worker command once more
+    # when it stops before the service started; it imports no DarSIA code.
+    service_log = root / "logs" / (name(machine + "-" + backend) + ".log")
+    command = [str(python), "-B", "-m", "darsia_service.prestart",
+               "--service-log", str(service_log), "--", *worker_command]
     process = QProcess()
     environment=QProcessEnvironment()
     for key,value in child_environment.items():
@@ -457,7 +462,7 @@ def launch_local_worker(
             format="darsia-job-local-launch-v2",
             job=job_ref,
             machine=machine, backend=backend, workers=workers,
-            entrypoint="python -m darsia.fluidflower.worker",
+            entrypoint="python -B -m darsia_service.prestart -- python -m darsia.fluidflower.worker",
             requested_utc=record["requested_utc"],
             started=record["started"], launcher_pid=record["launcher_pid"],
             console=alias_console, detached=True,

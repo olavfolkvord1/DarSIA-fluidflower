@@ -90,9 +90,14 @@ def build_remote_worker_launch(job_root, *, target, backend, workers):
     worker = (python, "-B", "-m", "darsia.fluidflower.worker", "--job", job,
               "--backend", backend, "--workers", str(workers), "--machine", machine,
               "--watchdog")
+    # N109: the fixed stdlib supervisor of the same checkout starts this worker
+    # once more when it stops before the service started.
+    service_log = job.rstrip("\\/") + "\\logs\\" + name(machine + "-" + backend) + ".log"
+    supervised = (python, "-B", "-m", "darsia_service.prestart", "--service-log", service_log,
+                  "--", *worker)
     # This is a normal remote CLI invocation. No generated script, encoded
     # program, change-directory command or per-run launcher exists.
-    command = "& " + " ".join(_powershell_literal(value) for value in worker)
+    command = "& " + " ".join(_powershell_literal(value) for value in supervised)
     arguments = ("-n", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                  "-o", "ConnectTimeout=10", "--", alias, command)
     return RemoteWorkerLaunch(ssh, arguments, worker, command, job, target, backend, workers)

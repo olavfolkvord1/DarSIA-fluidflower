@@ -586,8 +586,10 @@ def main(argv=None):
         with (log_root / (identity + ".log")).open("a", encoding="utf-8") as log:
             try:
                 startup_context={}
-                job, commit = verify_startup(args.job,stores_path=args.stores,
-                    machine_id=args.machine,startup_context=startup_context)
+                # N111: a transient SMB error at startup waits and retries.
+                job, commit = retry_transient(lambda: verify_startup(args.job,
+                    stores_path=args.stores,machine_id=args.machine,
+                    startup_context=startup_context), delays=QUEUE_RETRY_DELAYS)
                 args._alias_stores=startup_context.get("stores")
                 from darsia_cache.adapters import bind_actual_worker_owner, require_same_startup_stores
                 if args._alias_stores is not None:
