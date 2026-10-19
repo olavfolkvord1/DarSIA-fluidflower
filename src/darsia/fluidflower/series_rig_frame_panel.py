@@ -712,14 +712,18 @@ class RigFramePanel(QWidget):
 
     def _choose_photo(self) -> None:
         reference = self.reference()
+        from darsia.fluidflower.image_formats import photo_dialog_filter
+
         start = ""
+        baseline = None
         if reference is not None and reference.baseline_image is not None:
-            start = str(Path(reference.baseline_image).parent)
+            baseline = Path(reference.baseline_image)
+            start = str(baseline.parent)
         selected, _filter = QFileDialog.getOpenFileName(
             self,
             "Show a raw photograph",
             start,
-            "Images (*.jpg *.jpeg *.png *.tif *.tiff);;All files (*)",
+            photo_dialog_filter(baseline),
         )
         if selected:
             self.show_photo(Path(selected))

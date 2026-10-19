@@ -70,6 +70,26 @@ def image_family(path: str | Path) -> str:
     return "other"
 
 
+def photo_dialog_filter(reference: str | Path | None = None) -> str:
+    """File-dialog filters for photographs, with the reference photo's kind first.
+
+    Camera RAW comes first when ``reference`` is a RAW file, JPEG/TIFF/PNG
+    first otherwise; then the other kind, then all files. A series works with
+    one kind of file, so the first filter is the one that fits it.
+    """
+
+    raw = "Camera RAW (" + " ".join(f"*{s}" for s in sorted(CAMERA_RAW_SUFFIXES)) + ")"
+    processed = (
+        "Photographs (" + " ".join(f"*{s}" for s in sorted(PROCESSED_IMAGE_SUFFIXES)) + ")"
+    )
+    first, second = (
+        (raw, processed)
+        if reference is not None and image_family(reference) == "raw"
+        else (processed, raw)
+    )
+    return f"{first};;{second};;All files (*)"
+
+
 def select_preferred_images(
     paths: Iterable[Path],
     policy: str = DEFAULT_IMAGE_FILE_POLICY,

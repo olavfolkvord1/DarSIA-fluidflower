@@ -929,8 +929,18 @@ def _comment(value: Any) -> str:
 
 
 def _image_size(path: Path) -> tuple[int, int, int | None]:
-    """Width, height and EXIF orientation from the image header."""
+    """Width, height and EXIF orientation from the image header.
 
+    A camera RAW file (ARW, NEF, ...) gives LibRaw's visible sensor area,
+    already turned upright, and no orientation; see
+    ``photograph_io.raw_photo_size``.
+    """
+
+    from darsia.fluidflower.photograph_io import is_camera_raw, raw_photo_size
+
+    if is_camera_raw(path):
+        width, height = raw_photo_size(path)
+        return width, height, None
     from PIL import Image
 
     with Image.open(path) as image:
@@ -943,7 +953,7 @@ def _image_size(path: Path) -> tuple[int, int, int | None]:
 
 
 def photo_size(path: Path) -> tuple[int, int]:
-    """Width and height of a photograph, from its header."""
+    """Width and height of a photograph, from its header (RAW: upright sensor area)."""
 
     width, height, _orientation = _image_size(Path(path))
     return width, height

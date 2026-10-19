@@ -48,9 +48,9 @@ from darsia.fluidflower.series_geometry import (
     RigFrame,
     SeriesRunInputs,
     _resolved_points,
+    photo_size,
     saved_injection_points,
 )
-from darsia.fluidflower.photograph_io import photograph_size
 
 LAYER_PAINTING_FORMAT = "darsia-fluidflower-layer-painting-v1"
 LAYER_PROPOSAL_FORMAT = "darsia-fluidflower-layer-proposal-v1"
@@ -727,7 +727,7 @@ def load_painting_session(
     size = None
     if reference.baseline_image is not None:
         try:
-            size = photograph_size(reference.baseline_image)
+            size = photo_size(reference.baseline_image)
         except (OSError, ValueError):
             size = None
     session = PaintingSession.default(
@@ -872,7 +872,7 @@ def load_painting_image(
     from darsia.fluidflower.photograph_io import load_reduced
 
     selected = Path(path)
-    width, height = photograph_size(selected)
+    width, height = photo_size(selected)
     factor = max(1, int(math.ceil(max(width, height) / float(display_limit))))
     display = load_reduced(selected, factor)
     target_width = min(int(analysis_width), display.shape[1])
@@ -1964,7 +1964,7 @@ def save_painted_revision(
     if problems:
         raise ValueError(" ".join(problems))
     assert reference.baseline_image is not None
-    width_px, height_px = photograph_size(reference.baseline_image)
+    width_px, height_px = photo_size(reference.baseline_image)
     if (width_px, height_px) != tuple(proposal.image_size):
         raise ValueError(
             f"The baseline photograph of {reference.run_id} has {width_px} x "

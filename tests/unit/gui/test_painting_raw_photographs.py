@@ -4,7 +4,7 @@ A RAW file (Sony ARW, Nikon NEF, ...) is shown with LibRaw's display
 rendering on its own grid: the whole visible sensor area, turned upright. The
 camera's JPEG is cropped and may be lens-corrected, so a RAW background is
 refused for a JPEG reference and the other way round. LibRaw is replaced by a
-fake here; set DARSIA_TEST_ARW and DARSIA_TEST_NEF to real files to run the
+fake here; set DARSIA_TEST_DISPLAY_ARW and DARSIA_TEST_DISPLAY_NEF to real files to run the
 last test on them.
 """
 
@@ -99,7 +99,9 @@ def test_raw_size_is_the_visible_area_turned_upright(tmp_path, libraw, flip, exp
     rgb = _rendering(1, *expected)
     path = _raw_file(libraw, tmp_path / "photo.ARW", rgb, flip=flip)
     assert photograph_io.is_camera_raw(path)
-    assert photograph_io.photograph_size(path) == expected
+    assert photograph_io.raw_photo_size(path) == expected
+    # The shared size reader of DarSIA gives the same for RAW files.
+    assert photo_size(path) == expected
 
 
 @pytest.mark.parametrize("factor", [1, 2, 3])
@@ -124,7 +126,7 @@ def test_an_unreadable_raw_file_is_a_value_error(tmp_path, libraw):
     path = tmp_path / "broken.ARW"
     path.write_bytes(b"broken")
     with pytest.raises(ValueError, match="broken.ARW"):
-        photograph_io.photograph_size(path)
+        photo_size(path)
     with pytest.raises(ValueError, match="broken.ARW"):
         photograph_io.load_reduced_rgb8(path, 1)
 
@@ -134,14 +136,14 @@ def test_raw_files_need_rawpy(tmp_path, monkeypatch):
     path = tmp_path / "photo.ARW"
     path.write_bytes(b"raw")
     with pytest.raises(ValueError, match="rawpy"):
-        photograph_io.photograph_size(path)
+        photo_size(path)
 
 
 def test_jpeg_and_png_keep_the_header_size_without_libraw(tmp_path, libraw):
     path = tmp_path / "photo.png"
     Image.new("RGB", (64, 48), (10, 20, 30)).save(path)
     assert not photograph_io.is_camera_raw(path)
-    assert photograph_io.photograph_size(path) == photo_size(path) == (64, 48)
+    assert photo_size(path) == (64, 48)
     assert libraw.calls == []
 
 
@@ -278,10 +280,44 @@ def test_the_background_dialog_offers_the_reference_photos_kind_first(
     assert raw_first[-1] == jpeg_first[-1] == "All files (*)"
 
 
+def test_the_rig_frame_panel_dialog_follows_the_reference_photo_too(
+    qtbot, monkeypatch, tmp_path, settings, photos
+):
+    seen = []
+    monkeypatch.setattr(
+        slv.QFileDialog,
+        "getOpenFileName",
+        lambda parent, title, start, filters: seen.append(filters.split(";;")) or ("", ""),
+    )
+    from darsia.fluidflower import series_rig_frame_panel as panel_module
+
+    monkeypatch.setattr(
+        panel_module.QFileDialog,
+        "getOpenFileName",
+        lambda parent, title, start, filters: seen.append(filters.split(";;")) or ("", ""),
+    )
+    view = _make_view(qtbot, monkeypatch, tmp_path, photos["reference"], photos["config"])
+    view.rig_panel._choose_photo()
+    assert seen and seen[-1][0].startswith("Camera RAW (")
+
+
+@pytest.mark.parametrize(
+    "reference, first",
+    [("photo.ARW", "Camera RAW ("), ("photo.nef", "Camera RAW ("), ("photo.JPG", "Photographs ("), (None, "Photographs (")],
+)
+def test_the_photo_dialog_filter_puts_the_reference_kind_first(reference, first):
+    from darsia.fluidflower.image_formats import photo_dialog_filter
+
+    filters = photo_dialog_filter(reference).split(";;")
+    assert filters[0].startswith(first)
+    assert len(filters) == 3 and filters[-1] == "All files (*)"
+    assert {"*.arw", "*.nef"} <= set(" ".join(filters).replace("(", " ").replace(")", " ").split())
+
+
 # ------------------------------------------------------------- real files
 
 
-@pytest.mark.parametrize("variable", ["DARSIA_TEST_ARW", "DARSIA_TEST_NEF"])
+@pytest.mark.parametrize("variable", ["DARSIA_TEST_DISPLAY_ARW", "DARSIA_TEST_DISPLAY_NEF"])
 def test_real_raw_files_are_rendered_on_their_visible_area(variable):
     value = os.environ.get(variable)
     if not value or not Path(value).is_file():
@@ -292,7 +328,7 @@ def test_real_raw_files_are_rendered_on_their_visible_area(variable):
         expected = (raw.sizes.width, raw.sizes.height)
         if raw.sizes.flip in (5, 6):
             expected = expected[::-1]
-    assert photograph_io.photograph_size(path) == expected
+    assert photo_size(path) == photograph_io.raw_photo_size(path) == expected
     shown = photograph_io.load_reduced_rgb8(path, 4)
     assert shown.dtype == np.uint8
     assert shown.shape == (expected[1] // 4, expected[0] // 4, 3)

@@ -28,19 +28,14 @@ def _raw_size(sizes) -> tuple[int, int]:
     return (height, width) if int(sizes.flip) in (5, 6) else (width, height)
 
 
-def photograph_size(path: str | Path) -> tuple[int, int]:
-    """Width and height of a photograph as the display surfaces show it.
+def raw_photo_size(path: str | Path) -> tuple[int, int]:
+    """Width and height of a camera RAW file: LibRaw's visible area, upright.
 
-    A camera RAW file is shown on LibRaw's whole visible sensor area, turned
-    upright, which is the grid the RAW decoders use. It is not the camera's
-    JPEG grid: that is cropped and, for some cameras, lens-corrected. Other
-    files give their header size (``series_geometry.photo_size``).
+    This is the grid the RAW decoders and the RAW display rendering use. It is
+    not the camera's JPEG grid, which is cropped and, for some cameras,
+    lens-corrected. ``series_geometry.photo_size`` uses it for RAW files.
     """
 
-    if not is_camera_raw(path):
-        from darsia.fluidflower.series_geometry import photo_size
-
-        return photo_size(Path(path))
     rawpy = _rawpy()
     try:
         with rawpy.imread(str(path)) as raw:
@@ -78,7 +73,7 @@ def load_reduced_rgb8(path: Path, factor: int) -> np.ndarray:
 
     JPEG files are decoded at reduced size directly (DCT scaling). Camera RAW
     files get LibRaw's display rendering on their own grid (see
-    ``photograph_size``). A full resolution photograph (factor 1) costs one
+    ``raw_photo_size``). A full resolution photograph (factor 1) costs one
     byte per value, a quarter of the float copy that ``load_reduced`` returns.
     """
 

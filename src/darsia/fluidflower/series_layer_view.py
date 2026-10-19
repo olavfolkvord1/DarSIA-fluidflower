@@ -89,17 +89,13 @@ from PySide6.QtWidgets import (
 )
 
 from darsia.fluidflower import layer_painting as lp
-from darsia.fluidflower.image_formats import (
-    CAMERA_RAW_SUFFIXES,
-    PROCESSED_IMAGE_SUFFIXES,
-    image_family,
-)
-from darsia.fluidflower.photograph_io import photograph_size
+from darsia.fluidflower.image_formats import image_family, photo_dialog_filter
 from darsia.fluidflower.series_geometry import (
     RigFrame,
     SeriesRunInputs,
     default_actor,
     export_native_setup,
+    photo_size,
     rig_frame_from_inputs,
     saved_rig_frames,
 )
@@ -142,20 +138,6 @@ _BACKGROUND_TIP = (
     "between the reference photo and the chosen photo."
 )
 _BACKGROUND_SETTINGS = ("DarSIA", "FluidFlower layer painting")
-# The background dialog offers the reference photo's kind of file first: the
-# kind the series was set up with (Setup, "Image files").
-_PHOTO_FILTERS = {
-    "raw": "Camera RAW (" + " ".join(f"*{s}" for s in sorted(CAMERA_RAW_SUFFIXES)) + ")",
-    "processed": "Photographs (" + " ".join(f"*{s}" for s in sorted(PROCESSED_IMAGE_SUFFIXES)) + ")",
-}
-
-
-def _photo_filter(reference: Path | str) -> str:
-    """File dialog filters with the reference photo's kind of file first."""
-
-    first = "raw" if image_family(reference) == "raw" else "processed"
-    second = "processed" if first == "raw" else "raw"
-    return f"{_PHOTO_FILTERS[first]};;{_PHOTO_FILTERS[second]};;All files (*)"
 _BACKGROUND_CHOOSE = "choose"
 # A session painted on the raw reference photo, in a project whose geometry
 # is in the saved corrected rig frame, stays on the raw photo.
@@ -2550,7 +2532,7 @@ class LayerPainterView(QWidget):
             if not lp.session_path(self.project, reference.run_id).is_file():
                 return False
             saved = lp.load_painting_session(self.project, reference)
-            raw_size = photograph_size(Path(reference.baseline_image))
+            raw_size = photo_size(Path(reference.baseline_image))
         except (OSError, ValueError, KeyError, TypeError):
             return False
         return (
@@ -2782,7 +2764,7 @@ class LayerPainterView(QWidget):
         from darsia.fluidflower.photograph_io import load_reduced_rgb8
 
         try:
-            width, height = photograph_size(Path(path))
+            width, height = photo_size(Path(path))
             factor = max(1, int(math.ceil(max(width, height) / lp.DETAIL_LIMIT_PX)))
             detail = load_reduced_rgb8(Path(path), factor)
         except (OSError, ValueError):
@@ -2859,7 +2841,7 @@ class LayerPainterView(QWidget):
         from darsia.fluidflower.photograph_io import load_reduced
 
         try:
-            width, height = photograph_size(Path(path))
+            width, height = photo_size(Path(path))
             factor = max(1, int(math.ceil(max(width, height) / lp.DISPLAY_LIMIT_PX)))
             rgb = load_reduced(Path(path), factor)
         except (OSError, ValueError) as error:
@@ -2943,7 +2925,7 @@ class LayerPainterView(QWidget):
                 )
             return False
         try:
-            width, height = photograph_size(path)
+            width, height = photo_size(path)
         except (OSError, ValueError) as error:
             if not quiet:
                 QMessageBox.warning(self, "Could not read the photograph", str(error))
@@ -3019,7 +3001,7 @@ class LayerPainterView(QWidget):
             self,
             "Background photo of the same run",
             str(start),
-            _photo_filter(self.image.path),
+            photo_dialog_filter(self.image.path),
         )
         if not path:
             self._refresh_background_choice()
