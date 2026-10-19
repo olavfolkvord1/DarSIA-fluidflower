@@ -7,6 +7,8 @@ import os
 import uuid
 from pathlib import Path
 
+from darsia.fluidflower.series_paths import darsia_source_checkout
+
 
 _FORMAT = "darsia-phase-model-studio-reviewer-v1"
 _RELATIVE_PATH = Path("config") / "phase_model_studio_reviewer.json"
@@ -18,8 +20,14 @@ def _preference_path(project_root: Path | str) -> Path:
     root = Path(project_root).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
-    if any((folder / ".git").exists() for folder in (root, *root.parents)):
-        raise ValueError("Reviewer preferences belong in a project folder outside a Git checkout")
+    # A project folder may be its own Git repository (configuration and small
+    # inputs); only the DarSIA source checkout itself is refused.
+    checkout = darsia_source_checkout()
+    if checkout is not None and root.is_relative_to(checkout):
+        raise ValueError(
+            "Reviewer preferences belong in a project folder outside the "
+            "DarSIA source checkout"
+        )
     return root / _RELATIVE_PATH
 
 

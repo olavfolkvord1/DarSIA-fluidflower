@@ -252,6 +252,21 @@ def package_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def darsia_source_checkout() -> Path | None:
+    """Return the Git working tree that holds the imported DarSIA code, if any.
+
+    A series project folder may be a Git repository of its own; only this
+    checkout must never receive series-owned or per-user files. An installed
+    copy (``site-packages``) has no source checkout, even inside a repository.
+    """
+    package = package_root().parent
+    for folder in package.parents:
+        if (folder / ".git").exists():
+            between = {part.casefold() for part in package.relative_to(folder).parts}
+            return None if between & {"site-packages", "dist-packages"} else folder
+    return None
+
+
 def tool_path(name: str) -> Path:
     stem = name[:-3] if name.endswith(".py") else name
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", stem):

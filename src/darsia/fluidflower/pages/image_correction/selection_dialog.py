@@ -39,10 +39,10 @@ from darsia.fluidflower.image_selection_plan import (
     resolve_selection,
     resolve_selection_files,
 )
+from darsia.fluidflower.series_paths import darsia_source_checkout
 
 
 _SECTION_RE = re.compile(r"(?m)^\s*\[([^]\r\n]+)\]\s*(?:#.*)?$")
-_REPO_ROOT = Path(__file__).resolve().parents[5]
 _SELECTED_PAGE_SIZE = 250
 
 
@@ -517,10 +517,13 @@ class ImageSelectionPlanDialog(QDialog):
         path = Path(text.strip()).expanduser().resolve()
         if not path.is_relative_to(self.project_root):
             raise ValueError("Save in the selected project")
-        if path.is_relative_to(_REPO_ROOT) or any(
-            (parent / ".git").exists() for parent in path.parents
-        ):
-            raise ValueError("Generated plans and receipts must be outside a Git checkout")
+        # The project folder may be its own Git repository; only the DarSIA
+        # source checkout itself never receives generated plans or receipts.
+        checkout = darsia_source_checkout()
+        if checkout is not None and path.is_relative_to(checkout):
+            raise ValueError(
+                "Generated plans and receipts must be outside the DarSIA source checkout"
+            )
         expected_folder = "results" if label.startswith("new JSON") else "config"
         relative = path.relative_to(self.project_root)
         if not relative.parts or relative.parts[0].casefold() != expected_folder:
