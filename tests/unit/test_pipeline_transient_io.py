@@ -124,3 +124,46 @@ def test_n1_json_retains_canonical_bytes(tmp_path):
     path = tmp_path / "row.json"
     n1_pipeline._write_json(path, dict(b=2, a=[1., None]))
     assert path.read_bytes() == b'{"a":[1.0,null],"b":2}'
+
+
+def test_input_hash_admission_retries_only_file_errors_and_retains_exact_hash_gate(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline import store_runtime
+    path = tmp_path / "input.json"
+    path.write_bytes(b'{"source":"raw"}')
+    bound = n1_pipeline.asset(path)
+    reference = dict(sha256=bound["sha256"], bytes=bound["size_bytes"])
+    row = store_runtime.ResolvedInput(reference, path, ("input",))
+    original = Path.open
+    calls = []
+    def once_locked(source, *args, **kwargs):
+        if source == path:
+            calls.append(source)
+            if len(calls) == 1:
+                raise sharing_error()
+        return original(source, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", once_locked)
+    verified = store_runtime.verify_inputs(dict(run="fixture"), [row])
+    assert verified.digests[str(path)] == bound["sha256"] and len(calls) == 2
+    changed = store_runtime.ResolvedInput(dict(reference, sha256="0" * 64), path, ("input",))
+    with pytest.raises(store_runtime.InputHashMismatch):
+        store_runtime.verify_inputs(dict(run="fixture"), [changed])
+    assert len(calls) == 3
+
+
+def test_verified_metadata_waits_for_a_transient_file_handle(tmp_path, monkeypatch):
+    from darsia.fluidflower.pipeline import store_runtime
+    path = tmp_path / "input.json"
+    path.write_bytes(b'{"source":"raw"}')
+    bound = n1_pipeline.asset(path)
+    row = store_runtime.ResolvedInput(dict(sha256=bound["sha256"], bytes=bound["size_bytes"]), path, ("input",))
+    verified = store_runtime.verify_inputs(dict(run="fixture"), [row])
+    original = Path.open
+    calls = []
+    def once_locked(source, *args, **kwargs):
+        if source == path:
+            calls.append(source)
+            if len(calls) == 1:
+                raise sharing_error()
+        return original(source, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", once_locked)
+    assert verified.metadata("input") == dict(source="raw") and len(calls) == 2

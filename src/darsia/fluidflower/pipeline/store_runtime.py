@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+from .io_ops import retry_io
 import stat
 
 from ..job_filesystem import inspect_results_root
@@ -51,6 +52,7 @@ class VerifiedInputs:
             raise InputHashMismatch("Exactly one input is required for consumer " + use)
         return rows[0]
 
+    @retry_io
     def metadata(self, use):
         row = self.for_use(use)
         before = row.path.stat()
@@ -79,18 +81,37 @@ def resolve_catalog(task, stores, series_id):
     for item in catalog["inputs"]:
         reference = item["reference"]
         try:
-            located = resolve_input_reference(reference, stores, series_id)
-            path = require_real_containment(roots[reference["root_alias"]], located)
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode):
-                raise RunUnavailable("Input is not a regular file")
-            if info.st_size != reference["bytes"]:
-                raise RunUnavailable("Input byte count differs")
+            path = _available_input(reference, stores, series_id, roots)
         except (OSError, ValueError) as error:
             raise RunUnavailable("Input unavailable for " + ", ".join(item["uses"]) +
                                  ": " + str(error)) from error
         rows.append(ResolvedInput(dict(reference), path, tuple(item["uses"])))
     return tuple(rows)
+
+
+@retry_io
+def _available_input(reference, stores, series_id, roots):
+    located = resolve_input_reference(reference, stores, series_id)
+    path = require_real_containment(roots[reference["root_alias"]], located)
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RunUnavailable("Input is not a regular file")
+    if info.st_size != reference["bytes"]:
+        raise RunUnavailable("Input byte count differs")
+    return path
+
+
+@retry_io
+def _verify_input_bytes(path):
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(8 * 1024 * 1024):
+            digest.update(block)
+    after = path.stat()
+    if _version(before) != _version(after):
+        raise InputHashMismatch("Input changed during admission: " + str(path))
+    return _version(after), digest.hexdigest()
 
 
 def verify_inputs(task, rows):
@@ -99,15 +120,7 @@ def verify_inputs(task, rows):
     for row in rows:
         key = str(row.path)
         if key not in digests:
-            before = row.path.stat()
-            digest = hashlib.sha256()
-            with row.path.open("rb") as stream:
-                while block := stream.read(8 * 1024 * 1024):
-                    digest.update(block)
-            after = row.path.stat()
-            if _version(before) != _version(after):
-                raise InputHashMismatch("Input changed during admission: " + key)
-            versions[key], digests[key] = _version(after), digest.hexdigest()
+            versions[key], digests[key] = _verify_input_bytes(row.path)
         if (digests[key] != row.reference["sha256"]
                 or versions[key][2] != row.reference["bytes"]):
             raise InputHashMismatch("Input SHA/bytes differ for " + ", ".join(row.uses))

@@ -338,6 +338,7 @@ class RunIOBinding:
             raise InputHashMismatch("Admitted current code changed")
         return code["sha256"]
 
+    @retry_io
     def _input_digest(self, row):
         """Use only actual run-admission evidence, with a fresh file version."""
         key = str(row.path)
