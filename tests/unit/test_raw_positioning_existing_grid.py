@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from hashlib import sha256
+import json
 from types import SimpleNamespace
 import sys
 
@@ -12,6 +13,7 @@ import pytest
 import tifffile
 
 from darsia.fluidflower.native import raw_positioning as raw
+from darsia.fluidflower.native import raw_photograph as photograph
 from darsia.fluidflower.native import registration as legacy
 
 
@@ -52,7 +54,8 @@ def source(tmp_path, monkeypatch):
         sensor=dict(raw_wh=[16, 12], camera_wh=[12, 8], content_wh=[9, 6],
                     black_level=1008, black_levels=[1008] * 4, white_maximum=16383,
                     cfa_pattern=[[0, 1], [3, 2]], color_description="RGBG", tile_rows=3,
-                    green_mean_weight=.5, plane_stride=2),
+                    green_mean_weight=.5, plane_stride=2,
+                    libraw_crop_xywh=[2, 2, 12, 8]),
         profiles=dict(calibrated=dict(distortion=list(zeros), coefficients=dict(
             cu=5.5, cv=3.5, tx=0., ty=0., R=8., amp=1.))),
         lens=dict(knots=[0., .5, 1.], distortion_denominator=16384.,
@@ -120,7 +123,8 @@ def test_wrong_lens_table_stops_before_decoding(source):
 
 
 @pytest.mark.parametrize("field,value,match", [
-    ("crop_width", 11, "U extent"), ("crop_left_margin", 3, "crop origin")])
+    ("crop_width", 11, "explicit sensor profile"),
+    ("crop_left_margin", 3, "explicit sensor profile")])
 def test_raw_metadata_must_define_the_calibrated_u_grid(source, field, value, match):
     setattr(source.fake.sizes, field, value)
     with pytest.raises(ValueError, match=match):
@@ -163,3 +167,44 @@ def test_new_source_mode_refuses_a_processed_photo_before_any_decode(source):
         raw.read_sensor(source.path.with_suffix(".JPG"), expected_sha256=source.digest,
                         parameters=source.parameters, profile_id="calibrated")
     assert not source.calls
+
+
+def test_lens_origin_is_not_assumed_to_equal_an_unbound_preview_crop(source):
+    del source.parameters["common"]["sensor"]["libraw_crop_xywh"]
+    source.fake.sizes.crop_left_margin = 0
+    sensor = read(source)
+    assert sensor.metadata["crop_xywh"][0] == 0
+    assert source.parameters["common"]["lens"]["raw_offset_xy"][0] == 2
+
+
+def test_display_and_science_use_the_shared_u_profile(source):
+    profile = source.path.with_suffix(".profile.json")
+    profile.write_text(json.dumps(dict(registration=source.parameters)), encoding="utf8")
+    binding = dict(profile_path=profile, profile_sha256=sha256(profile.read_bytes()).hexdigest(),
+                   profile_id="calibrated", expected_sha256=source.digest)
+    yy, xx = np.mgrid[0:12, 0:16]
+    display = np.stack([xx * 10, yy * 10, (xx + yy) * 5], axis=-1).astype(np.uint8)
+    calls = []
+    def postprocess(**kwargs):
+        calls.append(kwargs)
+        return display
+    source.fake.postprocess = postprocess
+    rgb = photograph.load_camera_u_rgb8(source.path, **binding)
+    np.testing.assert_array_equal(rgb, display[2:10, 2:14])
+    linear = photograph.load_camera_u_linear(source.path, **binding)
+    np.testing.assert_array_equal(linear, raw.camera_u(read(source), parameters=source.parameters))
+    assert photograph.camera_u_size(**{k:v for k,v in binding.items() if k!='expected_sha256'}) == (12, 8)
+    assert calls == [dict(use_camera_wb=True, no_auto_bright=True, output_bps=8,
+                          half_size=False, user_flip=0)]
+
+
+def test_display_reduction_happens_after_the_u_geometry(source):
+    profile = source.path.with_suffix(".profile.json")
+    profile.write_text(json.dumps(source.parameters), encoding="utf8")
+    yy, xx = np.mgrid[0:12, 0:16]
+    display = np.stack([xx * 10, yy * 10, (xx + yy) * 5], axis=-1).astype(np.uint8)
+    source.fake.postprocess = lambda **kwargs: display
+    rgb = photograph.load_camera_u_rgb8(source.path, profile_path=profile,
+        profile_sha256=sha256(profile.read_bytes()).hexdigest(), profile_id='calibrated', factor=2)
+    expected = np.asarray(Image.fromarray(display[2:10, 2:14]).resize((6, 4), Image.Resampling.BOX))
+    np.testing.assert_array_equal(rgb, expected)

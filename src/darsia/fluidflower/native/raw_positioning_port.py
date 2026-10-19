@@ -31,7 +31,9 @@ def render(arw_path, camera_path=None, review_path=None, *,
     # Numeric consumers still use these names for grids/coefficients. None is
     # an acquisition-JPEG binding; the producer certificate above is RAW-only.
     certificate.update(
-        source_id=source_id, profile=profile_id,
+        source_id=source_id, run=source_id, profile=profile_id,
+        sources=dict(arw_sha256=sensor.source["sha256"]),
+        white_level=sensor.metadata["white_level"],
         review_to_camera_h=certificate["native_to_camera_u_h"],
         camera_jpeg_wh=certificate["camera_u_wh"],
         raw_visible_wh=sensor.metadata["raw_visible_wh"],

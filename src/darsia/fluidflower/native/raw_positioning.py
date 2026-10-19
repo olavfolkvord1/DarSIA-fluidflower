@@ -89,10 +89,12 @@ def read_sensor(path: str | Path, *, expected_sha256: str,
             raise ValueError("RAW values exceed the verified uint16 demosaic headroom")
         crop = (int(raw.sizes.crop_left_margin), int(raw.sizes.crop_top_margin),
                 int(raw.sizes.crop_width), int(raw.sizes.crop_height))
-        if crop[2:] != tuple(policy["camera_wh"]):
-            raise ValueError("ARW crop does not define the calibrated U extent")
-        if crop[:2] != tuple(common["lens"]["raw_offset_xy"]):
-            raise ValueError("ARW crop origin differs from the lens calibration")
+        # A preview crop is not the lens-map origin on every camera. For
+        # example Sony profiles can combine two independently declared crop
+        # origins. Bind the metadata only when the profile explicitly does so.
+        if ("libraw_crop_xywh" in policy
+                and crop != tuple(policy["libraw_crop_xywh"])):
+            raise ValueError("RAW LibRaw crop differs from the explicit sensor profile")
         metadata = dict(make=identity.make, model=identity.model,
                         orientation=identity.orientation,
                         raw_visible_wh=list(policy["raw_wh"]),
@@ -117,6 +119,24 @@ def sample_sensor(sensor: Sensor, homography: np.ndarray, *,
                   shape_hw: Sequence[int], parameters: Mapping,
                   channels: Sequence[int] = (0, 1, 2)) -> np.ndarray:
     """Sample sensor DN once, using the original per-channel lens/warp math."""
+    return sample_rgb_values(sensor, sensor.rgb, homography, shape_hw=shape_hw,
+                             parameters=parameters, channels=channels,
+                             chromatic=True)
+
+
+def sample_rgb_values(sensor: Sensor, values: np.ndarray, homography: np.ndarray, *,
+                      shape_hw: Sequence[int], parameters: Mapping,
+                      channels: Sequence[int] = (0, 1, 2),
+                      chromatic: bool = True) -> np.ndarray:
+    """Share the lens geometry with display values, without changing their units.
+
+    Camera-native scientific channels use per-channel CA. Display RGB already
+    mixes camera channels, so its common positioning lattice uses the G map.
+    """
+    values = np.asarray(values)
+    if values.shape != sensor.rgb.shape or values.dtype not in (
+            np.dtype("uint8"), np.dtype("uint16"), np.dtype("float32")):
+        raise ValueError("RGB values must share the verified full-sensor grid")
     common = parameters["common"]
     height, width = (int(v) for v in shape_hw)
     h = np.asarray(homography, np.float64)
@@ -133,8 +153,8 @@ def sample_sensor(sensor: Sensor, homography: np.ndarray, *,
     coefficients = common["profiles"][sensor.profile_id]["coefficients"]
     output = np.empty((len(selected), height, width), np.float32)
     for index, channel in enumerate(selected):
-        plane = sensor.rgb[..., channel].astype(np.float32)
-        ca = (sensor.ca_red, None, sensor.ca_blue)[channel]
+        plane = values[..., channel].astype(np.float32)
+        ca = (sensor.ca_red, None, sensor.ca_blue)[channel] if chromatic else None
         for y0 in range(0, height, rows):
             y1 = min(y0 + rows, height)
             yy, xx = np.mgrid[y0:y1, 0:width].astype(np.float32)
