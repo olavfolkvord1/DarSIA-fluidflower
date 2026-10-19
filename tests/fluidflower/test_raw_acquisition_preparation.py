@@ -20,7 +20,7 @@ def test_prepared_masked_core_and_source_backed_temporal_ring_round_trip(tmp_pat
         policy_sources=dict(no_ring="core", ring="ring"))
     support = dict(grid_shape_hw=[2, 3], grid_archive_key="sand", guard_px=0,
         keep_policy="keep", fill_policy="fill", keep_contract="keep", fill_contract="fill",
-        hole_max_area_px=0, connectivity=4, vertical_gap_max_px=0, vertical_gap_rule="none",
+        hole_max_area_px=0, connectivity=4, vertical_gap_max_px=1, vertical_gap_rule="none",
         homography_epsilon=1e-12, cell_to_reference_native=np.eye(3).tolist())
     ring = dict(contract="fixture-ring", maximum_center_delta_log=0,
                 expected_keys=["top", "bottom", "left", "right", "pad_px", "contract"])
