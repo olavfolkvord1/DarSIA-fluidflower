@@ -160,6 +160,15 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
         result_relative = _relative(result_bound["path"], attempt)
         frame_path = Path(origin(attempt)["accessible_root"]).joinpath(*result_relative.split("/"))
         frame = _json(_verified_bytes(frame_path, result_bound, limit=MAX_METADATA_BYTES))
+        from ..storage_profile import frame_storage, store_assets, dropped_after_commit
+        lean = frame_storage(frame)
+        if lean is not None:
+            # A lean frame regenerates its omitted static fields from this
+            # once-per-run store; it is a final product of its producer.
+            index, archive = store_assets(lean)
+            add(index, attempt, kind="operational_receipt")
+            add(archive, attempt, kind="map")
+        dropped = dropped_after_commit(frame)
         binding = (frame.get("prediction") or {}).get("pipeline")
         if binding is None:
             continue  # Original standalone N1 output has no native/phase stage.
@@ -170,7 +179,10 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
             validate_publication_binding(binding)
         # The existing producer's exact inventory includes phase maps and the
         # temporal predecessor assets. No preparation directory is scanned.
-        for asset in binding["files"].values():
+        # Colour intermediates a lean 'drop' frame removed are not products.
+        for leaf, asset in binding["files"].items():
+            if leaf in dropped:
+                continue
             add(asset, attempt)
     # Keep the exact original origin proof as a small immutable shared copy;
     # a later consumer must not depend on access to a predecessor's local disk.

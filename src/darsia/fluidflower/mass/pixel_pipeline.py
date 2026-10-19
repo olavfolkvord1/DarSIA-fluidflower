@@ -105,6 +105,8 @@ def _reference_basis(pipeline, spec, shape):
                    for key, value in expected.items())):
         raise ValueError("Frozen response state belongs to another source, phase or calibration")
     static = original["static"]
+    if "storage" in static or static["asset"] is None:
+        raise ValueError("A frozen response basis must be a full-profile reference frame")
     for name in ("sha256", "size_bytes"):
         if basis["geometry"][name] != static["asset"][name]:
             raise ValueError("Frozen response geometry differs from its producer")

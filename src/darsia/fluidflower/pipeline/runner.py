@@ -121,17 +121,23 @@ def validate_frame_artifacts(spec, result, final_directory, config):
         or product["phase"]["source_sha256"] != spec["source"]["source_sha256"]
     ):
         raise ValueError("Committed native/phase source identity differs")
+    from ..storage_profile import dropped_after_commit
     reader = DataReader(unc_only=False)
     owned = Path(final_directory).resolve().parents[1] / "preparation" / spec["case_id"]
     inventory = product["files"]
     if not inventory:
         raise ValueError("Committed series-stage inventory is empty")
+    # A lean 'drop' frame declared before its commit that these two colour
+    # intermediates are removed afterwards; absent ones are not verified.
+    dropped = dropped_after_commit(result)
     for relative, bound in inventory.items():
         if (
             Path(relative).name != relative
             or Path(bound["path"]).resolve() != (owned / relative).resolve()
         ):
             raise ValueError("Committed stage file escapes its actual producer attempt")
+        if relative in dropped and not Path(bound["path"]).exists():
+            continue
         reader.path(bound)
     for key in ("labels", "classes", "area", "qa", "operator_masks", "history_input"):
         bound = product["phase"][key]
@@ -166,6 +172,8 @@ def validate_frame_artifacts(spec, result, final_directory, config):
     for bound in (history["temporal_log"], history["temporal_valid"]):
         if bound["sha256"] != inventory[Path(bound["path"]).name]["sha256"]:
             raise ValueError("Temporal history differs from committed stage inventory")
+        if Path(bound["path"]).name in dropped and not Path(bound["path"]).exists():
+            continue
         reader.path(bound)
     if result["source_binding"] != spec["source"]["source_binding"]:
         raise ValueError("Mass source binding differs from actual selected acquisition")
@@ -180,9 +188,18 @@ def _restore_predecessor(inputs, result, spec):
     from ..phase.inputs import TemporalNativeInput
     from . import phase_inputs as loaders
 
+    from ..storage_profile import dropped_after_commit
     product = result["prediction"]["pipeline"]
     history = inputs.reader.json(product["phase"]["history_input"])
     series.restore_history(history, spec)
+    dropped = dropped_after_commit(result)
+    if dropped and not all(
+        (Path(product["files"][name]["path"])).exists() for name in dropped
+    ):
+        raise ValueError(
+            "Resume needs the predecessor's colour intermediates, which the lean "
+            "'drop' retention removed; start a fresh attempt"
+        )
     full, valid = loaders.compose_extended_scientific(
         history["full"],
         parameters=inputs.parameters["scientific"],
@@ -275,6 +292,11 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
 
     config = series.load_run(task)
     config["_configuration_sha256"] = task["configuration"]["sha256"]
+    from ..storage_profile import resolve as storage_setting
+    setting = storage_setting(config)
+    if ("storage_profile" in config["mass"]["template"]
+            and storage_setting(config["mass"]["template"]) != setting):
+        raise ValueError("The series storage_profile differs from its mass template")
     storage_request = None
     if "storage" in config:
         from .. import storage_outputs
@@ -342,6 +364,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
         frames={spec["case_id"]: spec for spec in config["frames"]},
         resume_checkpoint=resume_asset,
     )
+    if setting["profile"] == "lean":
+        manifest["storage_profile"] = dict(setting)
     manifest_asset = _write_json(output / "manifest.json", manifest)
     records = list(prefix["records"])
     producers = list(prefix["frame_producers"])
@@ -378,6 +402,11 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
         mass = N1Pipeline(
             mass_config, precision=precision, pixel_math=math_provider, unc_only=True
         )
+        lean = None
+        if setting["profile"] == "lean":
+            from ..storage_profile import LeanRun
+            lean = LeanRun(output, mass_config, mass, setting,
+                           colour_intermediates_produced=True)
         for position in range(len(records), len(config["frames"])):
             spec = config["frames"][position]
             ipp_before = scientific_thread("run_series:" + spec["case_id"] + ":before")
@@ -455,12 +484,15 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                 backend,
                 position,
                 elapsed,
+                lean=lean,
             )
             records.append(record)
             producers.append(frame_producer(output, record, manifest_asset))
             # Full commit precedes advancement and actual progress. LeaseLost
             # from the original callback prevents any later queue publication.
             inputs.advance(frame)
+            if lean is not None:
+                lean.committed(stage)
             del frame, inferred, evaluated, native
             if storage_request is not None:
                 del phase_capture, mass_capture, storage_entry
@@ -477,6 +509,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
                     )
                 )
         table = scalar_table(records, config["table_fields"], output / "mass_table.csv")
+        if lean is not None:
+            lean.finish()
         wall = time.perf_counter() - clock
         result = dict(
             complete=True,
@@ -504,6 +538,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
             elapsed_seconds=wall,
             opencv_ipp=require_ipp_off("run_series:completed"),
         )
+        if lean is not None:
+            result["lean_storage"] = lean.outcome_record()
         del mass
     finally:
         if inputs is not None:

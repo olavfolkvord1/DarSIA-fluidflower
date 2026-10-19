@@ -430,10 +430,20 @@ def verify_prefix(prefix, task, config, request):
         entry = binding["storage"]
         if entry["attempt_directory"] != producer["attempt_directory"]:
             raise ValueError("Storage closure has a different genuine prefix producer")
-        product_asset = dict(record["files"]["products.npz"], path=str(directory / "products.npz"))
-        native_products = reader.archive(product_asset, ("mass_total", "mass_aqueous", "mass_free_gas", "phase_labels"))
-        geometry_asset = dict(record["files"]["native_geometry.npz"], path=str(directory / "native_geometry.npz"))
-        weights = reader.archive(geometry_asset, ("transport_weight_l",))["transport_weight_l"]
+        if native_result.get("lean_storage") is None:
+            product_asset = dict(record["files"]["products.npz"], path=str(directory / "products.npz"))
+            native_products = reader.archive(product_asset, ("mass_total", "mass_aqueous", "mass_free_gas", "phase_labels"))
+            geometry_asset = dict(record["files"]["native_geometry.npz"], path=str(directory / "native_geometry.npz"))
+            weights = reader.archive(geometry_asset, ("transport_weight_l",))["transport_weight_l"]
+        else:
+            # Lean frames rebuild mass_total and regenerate omitted static
+            # fields; both readers verify the producer's recorded SHA-256.
+            from .storage_profile import read_products, read_static_fields
+            if (native_result["products"]["sha256"] != record["files"]["products.npz"]["sha256"]
+                    or native_result["products"]["size_bytes"] != record["files"]["products.npz"]["size_bytes"]):
+                raise ValueError("Lean frame products differ from the committed inventory")
+            native_products = read_products(native_result, directory, ("mass_total", "mass_aqueous", "mass_free_gas", "phase_labels"), reader=reader)
+            weights = read_static_fields(native_result, directory, ("transport_weight_l",), reader=reader)["transport_weight_l"]
         phase_asset = native_result["prediction"]["pipeline"]["phase"]["labels"]
         verify_entry(entry, task, spec, request, phase_asset, native_result,
                      native_products, transport_weight_l=weights, reader=reader)

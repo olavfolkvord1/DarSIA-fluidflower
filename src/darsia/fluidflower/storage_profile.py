@@ -1,0 +1,683 @@
+"""Explicit storage profiles for native N1 frame products: 'full' or 'lean'.
+
+``full`` is today's layout and stays the layout of references, qualification
+and the exact gates. Its code path is the unchanged writer.
+
+``lean`` changes storage only. The per-frame computation, including the
+per-frame interpolation of the static fields through the frame's registration,
+is unchanged and still runs in memory. The profile drops three per-frame writes:
+
+* ``mass_total`` in ``products.npz``. A reader rebuilds it as the elementwise
+  sum ``mass_free_gas + mass_aqueous`` in their stored dtype (float32 in
+  production), with the producer's operand order. The writer computes this
+  sum before it drops the array and keeps ``mass_total`` when the result is
+  not bit-identical to the computed array.
+* the per-frame static fields of ``native_geometry.npz``. Each run stores its
+  constant inputs once (``lean_run_static.npz`` with its index
+  ``lean_run_static.json``, exclusive create, SHA-256 bound). Each frame
+  stores its registration descriptor, its retained per-frame inputs (bound by
+  SHA-256) and the identity of every field it would have written. The writer
+  regenerates every field once through :func:`read_static_fields`' own
+  regeneration and drops only those that are bit-identical; any other field
+  keeps being written per frame.
+* optionally, the two colour intermediates ``native_log.npy`` and
+  ``temporal_log.npy`` of the native/phase series stage (switch ``keep`` or
+  ``drop``, default ``keep``).
+
+The setting is an optional run-configuration entry::
+
+    "storage_profile": {"profile": "lean", "colour_intermediates": "keep"}
+
+Without the entry :data:`DEFAULT_STORAGE_PROFILE` applies.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+from pathlib import Path
+
+#: The one default storage profile. References, qualification and the exact
+#: gates use "full". Production selects "lean" after its exact gate, either
+#: per run configuration or by changing this single constant.
+DEFAULT_STORAGE_PROFILE = "full"
+
+PROFILES = ("full", "lean")
+COLOUR_RETENTION = ("keep", "drop")
+DEFAULT_COLOUR_INTERMEDIATES = "keep"
+SETTING = "storage_profile"
+LEAN_FORMAT = "darsia-lean-storage-v1"
+STORE_FORMAT = "darsia-lean-run-static-v1"
+REGENERATION_FORMAT = "darsia-lean-static-regeneration-v1"
+STORE_INDEX = "lean_run_static.json"
+STORE_ARCHIVE = "lean_run_static.npz"
+COLOUR_INTERMEDIATES = ("native_log.npy", "temporal_log.npy")
+MASS_TOTAL_RULE = "mass_free_gas + mass_aqueous, elementwise in their stored dtype"
+_STORE_ARRAYS = ("physical_facies", "physical_domain", "physical_porosity", "physical_depth_m",
+                 "floor_curve", "depth_points", "reference_matrix", "correction_matrix")
+_N1_FIELDS = ("pixel_area_m2", "depth_m", "porosity", "facies", "transport_weight_l")
+_N16_FIELDS = ("n16_solubility_g_per_l", "full_physical_depth_m", "full_physical_porosity",
+               "full_physical_pixel_pore_volume_m3", "full_physical_facies",
+               "full_physical_physical_area_m2")
+
+
+def resolve(config):
+    """Return the explicit or default storage setting of one run configuration."""
+    value = config.get(SETTING) if isinstance(config, dict) else None
+    if value is None:
+        return dict(profile=DEFAULT_STORAGE_PROFILE,
+                    colour_intermediates=DEFAULT_COLOUR_INTERMEDIATES)
+    if (not isinstance(value, dict) or "profile" not in value
+            or set(value) - {"profile", "colour_intermediates"}):
+        raise ValueError("storage_profile needs 'profile' and optionally 'colour_intermediates'")
+    profile = value["profile"]
+    colour = value.get("colour_intermediates", DEFAULT_COLOUR_INTERMEDIATES)
+    if not isinstance(profile, str) or profile not in PROFILES:
+        raise ValueError("Unknown storage profile: " + repr(profile))
+    if not isinstance(colour, str) or colour not in COLOUR_RETENTION:
+        raise ValueError("Colour-intermediate retention must be 'keep' or 'drop'")
+    if colour == "drop" and profile != "lean":
+        raise ValueError("The colour-intermediate retention switch belongs to the lean profile")
+    return dict(profile=profile, colour_intermediates=colour)
+
+
+def frame_storage(result):
+    """Return a frame result's lean record, or None for the full layout."""
+    value = result.get("lean_storage")
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or value.get("format") != LEAN_FORMAT
+            or value.get("profile") != "lean"):
+        raise ValueError("Unknown frame storage record")
+    return value
+
+
+def dropped_after_commit(result):
+    """Names of retained-stage files a lean frame removed after its commit."""
+    value = frame_storage(result)
+    if value is None:
+        return frozenset()
+    names = frozenset(value.get("dropped_after_commit", ()))
+    if not names <= set(COLOUR_INTERMEDIATES):
+        raise ValueError("Only the colour intermediates may be dropped after commit")
+    return names
+
+
+def store_assets(record):
+    """The per-run constant-input files a lean frame depends on (path/SHA)."""
+    store = record["store"]
+    return [dict(store["index"]), dict(store["archive"])]
+
+
+def _default_reader(reader):
+    if reader is not None:
+        return reader
+    from .mass.n1_pipeline import DataReader
+    return DataReader(unc_only=False)
+
+
+def _identity(value):
+    from .mass.n1_pipeline import _array_identity
+    return _array_identity(value)
+
+
+# ---------------------------------------------------------------- products
+
+
+def _rebuild_mass_total(arrays):
+    import numpy as np
+    gas, aqueous = np.asarray(arrays["mass_free_gas"]), np.asarray(arrays["mass_aqueous"])
+    if (gas.dtype != aqueous.dtype or gas.shape != aqueous.shape
+            or gas.dtype not in (np.dtype(np.float32), np.dtype(np.float64))):
+        raise ValueError("mass_total needs two floating component maps of one dtype and grid")
+    # The producers form the total as raw_gas + raw_aqueous; keep that order.
+    return np.add(gas, aqueous)
+
+
+def read_products(result, directory, names=None, *, reader=None):
+    """Read products.npz of a frame; rebuild and verify an omitted mass_total."""
+    reader = _default_reader(reader)
+    bound = dict(result["products"], path=str(Path(directory) / result["products"]["path"]))
+    record = frame_storage(result)
+    omitted = {} if record is None else dict(record["products"]["omitted"])
+    import numpy as np
+    with np.load(reader.path(bound), allow_pickle=False) as archive:
+        stored = list(archive.files)
+    names = list(stored) + [name for name in omitted if name not in stored] if names is None else list(names)
+    unknown = [name for name in names if name not in stored and name not in omitted]
+    if unknown:
+        raise KeyError("Frame products do not contain: " + ", ".join(unknown))
+    needed = {name for name in names if name in stored}
+    if any(name in omitted for name in names):
+        needed |= {"mass_free_gas", "mass_aqueous"}
+    arrays = reader.archive(bound, tuple(sorted(needed)))
+    for name in names:
+        if name in omitted and name not in stored:
+            if name != "mass_total" or omitted[name].get("rule") != MASS_TOTAL_RULE:
+                raise ValueError("Unknown omitted product rule: " + name)
+            value = _rebuild_mass_total(arrays)
+            if _identity(value) != omitted[name]["identity"]:
+                raise ValueError("Rebuilt mass_total differs from its recorded SHA-256")
+            arrays[name] = value
+    return {name: arrays[name] for name in names}
+
+
+# ------------------------------------------------------------- run store
+
+
+class RunStore:
+    """Verified constant inputs of one lean run, read back from their files."""
+
+    def __init__(self, document, arrays, index):
+        self.document, self.arrays, self.index = document, arrays, dict(index)
+        tables = document["tables"]
+        self.tables = tables
+        self.physical = {name: arrays["physical_" + name]
+                         for name in ("facies", "domain", "porosity", "depth_m")}
+        self.floor = arrays["floor_curve"]
+        self.depth_points = arrays["depth_points"]
+        self.reference_matrix = arrays["reference_matrix"]
+        self.correction = arrays["correction_matrix"]
+        self.porosity_by_facies = {key: value for key, value in tables["porosity_by_facies"]}
+        self.swi_by_facies = {key: value for key, value in tables["swi_by_facies"]}
+        self.dimensions_m = tuple(tables["dimensions_m"])
+
+
+def load_store(index, *, reader=None):
+    """Read a run's constant-input store, verifying file and array SHA-256."""
+    reader = _default_reader(reader)
+    document = reader.json(index)
+    if (not isinstance(document, dict) or document.get("format") != STORE_FORMAT
+            or document.get("complete") is not True
+            or set(document.get("arrays", {})) != set(_STORE_ARRAYS)):
+        raise ValueError("A complete lean run-static store is required")
+    archive = document["archive"]
+    if archive.get("path") != STORE_ARCHIVE:
+        raise ValueError("The lean run-static archive must sit next to its index")
+    location = Path(reader.path(index)).parent / STORE_ARCHIVE
+    arrays = reader.archive(dict(archive, path=str(location)), _STORE_ARRAYS)
+    for name, value in arrays.items():
+        if _identity(value) != document["arrays"][name]:
+            raise ValueError("Lean run-static array differs from its SHA-256: " + name)
+    return RunStore(document, arrays, index)
+
+
+def _pairs(mapping):
+    return [[key, value] for key, value in mapping.items()]
+
+
+# ------------------------------------------------------- regeneration
+
+
+def _transport_weight(domain, depth_m, porosity, unknown_physical_mask, pixel_area_m2, dimensions_m):
+    """FrameData.known_physical_domain and NativeAnalysis Geometry, same operations."""
+    import numpy as np
+    import darsia
+    shape = domain.shape
+    depth_view = np.broadcast_to(np.asarray(depth_m), shape)
+    pore_view = np.broadcast_to(np.asarray(porosity), shape)
+    known = domain & np.isfinite(depth_view) & np.isfinite(pore_view) & (depth_view > 0) & (pore_view > 0)
+    known &= ~unknown_physical_mask
+    depth = np.broadcast_to(np.asarray(depth_m, np.float64), shape).copy()
+    pore = np.broadcast_to(np.asarray(porosity, np.float64), shape).copy()
+    depth = np.where(known, depth, 0.)
+    pore = np.where(known, pore, 0.)
+    geometry = darsia.ExtrudedPorousGeometry(porosity=pore, depth=depth, space_dim=2,
+                                             num_voxels=shape, dimensions=list(dimensions_m))
+    nominal_volume = geometry.voxel_volume.copy()
+    nominal_area = float(np.prod(dimensions_m)) / np.prod(shape)
+    geometry.voxel_volume = nominal_volume * (pixel_area_m2 / nominal_area)
+    geometry.cached_voxel_volume = geometry.voxel_volume.copy()
+    return np.asarray(geometry.cached_voxel_volume, np.float64) * 1000.0
+
+
+class _Regeneration:
+    """Recompute one frame's static fields with the run's own library calls."""
+
+    def __init__(self, store, value, reader):
+        if (not isinstance(value, dict) or value.get("format") != REGENERATION_FORMAT
+                or value.get("route") not in {"n1", "pixel_domain"}
+                or value.get("precision") not in {"float32", "float64"}):
+            raise ValueError("Unknown lean static regeneration descriptor")
+        if value.get("n16") and value["route"] != "pixel_domain":
+            raise ValueError("N16 regeneration requires the pixel-domain route")
+        self.store, self.value, self.reader = store, value, reader
+        self.fields = {}
+        self._done = set()
+
+    def field(self, name):
+        if name not in self.fields:
+            route = self.value["route"]
+            if route == "n1" and name in _N1_FIELDS:
+                self._n1()
+            elif route == "pixel_domain" and name in _N1_FIELDS:
+                self._pixel_domain()
+            elif route == "pixel_domain" and self.value.get("n16") and name in _N16_FIELDS:
+                self._pixel_domain()
+                self._n16(name)
+            if name not in self.fields:
+                raise KeyError("No lean regeneration rule for static field: " + name)
+        return self.fields[name]
+
+    def _common(self):
+        if "common" in self._done:
+            return
+        import numpy as np
+        from darsia._opencv_runtime import scientific_thread
+        scientific_thread("lean-static-regeneration")
+        value = self.value
+        shape = tuple(int(size) for size in value["phase_shape_hw"])
+        h = np.asarray(value["source_to_native_h"], np.float64)
+        if h.shape != (3, 3) or not np.isfinite(h).all() or abs(np.linalg.det(h)) < 1e-12:
+            raise ValueError("A registered native homography is required")
+        origin = value["native_origin_xy"]
+        current_matrix = np.asarray([
+            [1.0, 0.0, -float(origin[0])],
+            [0.0, 1.0, -float(origin[1])],
+            [0.0, 0.0, 1.0],
+        ]) @ h
+        area = np.asarray(self.reader.array(value["inputs"]["area"]), np.float64) / 1e6
+        if area.shape != shape or not np.isfinite(area).all() or np.any(area <= 0):
+            raise ValueError("Positive original per-pixel areas required")
+        self.shape, self.h, self.current_matrix, self.area = shape, h, current_matrix, area
+        self.geometry_row = {self.store.tables["geometry_fields"]["source_to_native"]:
+                             value["source_to_native_h"]}
+        self._done.add("common")
+
+    def _n1(self):
+        """N1Pipeline.load_frame and correct_prepared, physical fields only."""
+        if "n1" in self._done:
+            return
+        import numpy as np
+        import cv2
+        from .mass import n1_geometry as geometry
+        from .mass.production_precision import PixelMath
+        self._common()
+        store, value, shape = self.store, self.value, self.shape
+        tables = store.tables
+        math = PixelMath(value["precision"])
+        physical = geometry.transport_physical_reference(
+            store.physical, self.current_matrix, shape, math, cv2)
+        domain = self.reader.archive(value["inputs"]["classes"], ("rig_domain",))["rig_domain"]
+        if domain.dtype != bool or domain.shape != shape:
+            raise ValueError("Rig classes use a different native grid")
+        revision = {"phase_shape_hw": list(shape), "native_origin_xy": value["native_origin_xy"]}
+        x, y = geometry.frame_coordinates(store.reference_matrix, self.geometry_row, revision,
+                                          fields=tables["geometry_fields"])
+        floor = geometry.transport_curve(
+            store.floor, H_source_to_target=self.h,
+            source_origin_xy=tables["floor_origin_xy"],
+            target_origin_xy=revision["native_origin_xy"], target_width=shape[1])
+        good = np.flatnonzero(np.isfinite(floor))
+        if not len(good):
+            raise ValueError("Transported sand floor has no valid columns")
+        floor[: good[0]], floor[good[-1] + 1:] = floor[good[0]], floor[good[-1]]
+        if not np.isfinite(floor).all():
+            raise ValueError("Transported floor has an interior gap")
+        facies = None
+        if not np.array_equal(store.correction, np.eye(3)):
+            facies = cv2.warpPerspective(
+                np.asarray(store.physical["facies"], np.uint8),
+                self.current_matrix @ store.correction, shape[::-1],
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        floor = np.asarray(floor, np.float64)
+        below = domain & (np.arange(shape[0])[:, None] > floor[None, :])
+        corrected_domain = domain & ~below
+        labels = physical["facies"] if facies is None else facies
+        corrected, _fill = geometry.fill_to_edges(labels, corrected_domain,
+                                                  sand_labels=store.porosity_by_facies)
+        measured = geometry.measured_geometry(
+            x, y, corrected, store.depth_points,
+            porosity_by_facies=store.porosity_by_facies, swi_by_facies=store.swi_by_facies)
+        known = corrected_domain & measured["known"]
+        weights = _transport_weight(corrected_domain, measured["depth_m"], measured["porosity"],
+                                    corrected_domain & ~known, self.area, store.dimensions_m)
+        self.fields.update(
+            pixel_area_m2=np.broadcast_to(np.asarray(self.area), shape),
+            depth_m=np.broadcast_to(np.asarray(measured["depth_m"]), shape),
+            porosity=np.broadcast_to(np.asarray(measured["porosity"]), shape),
+            facies=corrected, transport_weight_l=weights)
+        self._done.add("n1")
+
+    def _pixel_domain(self):
+        """pixel_pipeline.prepare_frame and evaluate, physical fields only."""
+        if "pixel_domain" in self._done:
+            return
+        import numpy as np
+        import cv2
+        from .geometry.pixels import polygon_pixel_domain, extend_column_geometry
+        from .mass import n1_geometry as geometry
+        from .mass.production_precision import PixelMath
+        self._common()
+        store, value, shape = self.store, self.value, self.shape
+        tables, declared = store.tables, value["pixel_domain"]
+        policy = tables["pixel_domain"]
+        domain, inside, fixtures = polygon_pixel_domain(
+            declared["inner_polygon_native"],
+            {name: points for name, points in declared["fixture_polygons_native"]}, list(shape),
+            native_origin_xy=declared["native_origin_xy"],
+            raster_scale=policy["raster_scale"], raster_shift=policy["raster_shift"])
+        revision = dict(phase_shape_hw=list(shape), native_origin_xy=declared["native_origin_xy"])
+        x, y = geometry.frame_coordinates(store.reference_matrix, self.geometry_row, revision,
+                                          fields=tables["geometry_fields"])
+        math = PixelMath(value["precision"])
+        transported = geometry.transport_physical_reference(
+            store.physical, self.current_matrix @ store.correction, shape, math, cv2)
+        columns = extend_column_geometry(
+            transported["facies"], transported["domain"], domain, y,
+            porosity_by_facies=store.porosity_by_facies, swi_by_facies=store.swi_by_facies)
+        known = domain & ~columns.geometry_unknown
+        depth = self.reader.archive(value["inputs"]["basis_geometry"], ("depth_m",))["depth_m"]
+        if depth.dtype != np.float64 or depth.shape != shape:
+            raise ValueError("Target measured depth must be float64 on the full grid")
+        area = np.asarray(self.area, np.float64)
+        weights = _transport_weight(domain, depth, columns.porosity, domain & ~known,
+                                    self.area, store.dimensions_m)
+        self.fields.update(pixel_area_m2=area, depth_m=depth, porosity=columns.porosity,
+                           facies=columns.facies, transport_weight_l=weights)
+        self.transported, self.inside, self.fixtures, self.y = transported, inside, fixtures, y
+        self.depth = depth
+        self._done.add("pixel_domain")
+
+    def _n16(self, name):
+        """pixel_pipeline._prepare_n16 geometry and prepare_response physics."""
+        import numpy as np
+        import darsia
+        store, value, shape = self.store, self.value, self.shape
+        if name == "n16_solubility_g_per_l":
+            from .mass.n1_models import TypedPhysics
+            from .mass.production_precision import PixelMath
+            physics = value["physics"]
+            math = PixelMath(value["precision"])
+            scalar = darsia.ScalarImage(np.asarray(np.zeros(shape, math.dtype), math.dtype),
+                                        dimensions=list(store.dimensions_m))
+            scalar.time = float(physics["elapsed_h"]) * 3600
+            state = TypedPhysics.__new__(TypedPhysics)
+            state.pixel_math = math
+            TypedPhysics.__init__(
+                state, scalar, atmospheric_pressure=physics["pressure_bar"],
+                atmospheric_temperature=physics["temperature_c"],
+                atmospheric_pressure_gradient=physics["pressure_gradient_bar_per_m"],
+                atmospheric_temperature_gradient=physics["temperature_gradient_c_per_m"])
+            self.fields[name] = state.solubility_co2
+            return
+        if "n16" in self._done:
+            return
+        from .geometry.pixels import hidden_physical_geometry
+        bound = value["inputs"]["not_sand"]
+        not_sand = np.zeros(shape, bool) if bound is None else self.reader.array(bound)
+        if not_sand.dtype != bool or not_sand.shape != shape:
+            raise ValueError("N16 bound not_sand mask differs from the native grid")
+        transported = self.transported
+        physical = hidden_physical_geometry(
+            transported["facies"], transported["domain"], self.inside, self.fixtures, self.y,
+            porosity_by_facies=store.porosity_by_facies, swi_by_facies=store.swi_by_facies)
+        inside = physical["physical_mask"] & ~not_sand
+        columns = physical["geometry"]
+        area = np.asarray(self.area, np.float64)
+        depth = np.asarray(self.depth, np.float64)
+        phi = np.asarray(columns.porosity, np.float64)
+        dimensions = store.dimensions_m
+        geometry = darsia.ExtrudedPorousGeometry(
+            porosity=np.where(inside, phi, 0.), depth=np.where(inside, depth, 0.), space_dim=2,
+            num_voxels=inside.shape, dimensions=list(dimensions))
+        nominal_volume = geometry.voxel_volume.copy()
+        nominal_area = float(np.prod(dimensions)) / np.prod(inside.shape)
+        geometry.voxel_volume = nominal_volume * (area / nominal_area)
+        geometry.cached_voxel_volume = geometry.voxel_volume.copy()
+        self.fields.update(
+            full_physical_depth_m=depth, full_physical_porosity=phi,
+            full_physical_pixel_pore_volume_m3=np.asarray(geometry.cached_voxel_volume, np.float64),
+            full_physical_facies=columns.facies, full_physical_physical_area_m2=area)
+        self._done.add("n16")
+
+
+def regenerate_static(store, regeneration, names, *, reader=None):
+    """Recompute named static fields from a run store and a frame descriptor."""
+    engine = _Regeneration(store, regeneration, _default_reader(reader))
+    return {name: engine.field(name) for name in names}
+
+
+def read_static_fields(result, directory, names=None, *, reader=None, store=None):
+    """Return a frame's static fields, written or regenerated and SHA-verified.
+
+    A full frame reads native_geometry.npz. A lean frame reads its written
+    fallback fields and regenerates the others from the run store and its
+    registration descriptor. Every returned array must equal the identity the
+    producer recorded; a mismatch raises ValueError.
+    """
+    reader = _default_reader(reader)
+    static = result["static"]
+    identities = static["arrays"]
+    names = list(identities) if names is None else list(names)
+    unknown = [name for name in names if name not in identities]
+    if unknown:
+        raise KeyError("Frame static fields do not contain: " + ", ".join(unknown))
+    storage = static.get("storage")
+    written = list(identities) if storage is None else list(storage["written"])
+    arrays = {}
+    selected = [name for name in names if name in written]
+    if selected:
+        if static["asset"] is None:
+            raise ValueError("Written static fields need their native_geometry.npz")
+        bound = dict(static["asset"], path=str(Path(directory) / static["asset"]["path"]))
+        arrays.update(reader.archive(bound, tuple(selected)))
+    rest = [name for name in names if name not in written]
+    if rest:
+        if storage.get("format") != LEAN_FORMAT or set(rest) - set(storage["regenerated"]):
+            raise ValueError("Static field is neither written nor regenerable")
+        regeneration = storage["regeneration"]
+        if store is None:
+            store = load_store(regeneration["store"], reader=reader)
+        engine = _Regeneration(store, regeneration, reader)
+        for name in rest:
+            arrays[name] = engine.field(name)
+    for name in names:
+        if _identity(arrays[name]) != identities[name]:
+            raise ValueError("Static field differs from its recorded SHA-256: " + name)
+    return {name: arrays[name] for name in names}
+
+
+# ------------------------------------------------------------ writer
+
+
+class LeanRun:
+    """One lean run: its per-run constant-input store and write-time gates."""
+
+    def __init__(self, output, config, pipeline, setting, *, colour_intermediates_produced):
+        from .mass.n1_pipeline import _write_json, _write_npz
+        import numpy as np
+        if setting.get("profile") != "lean":
+            raise ValueError("LeanRun requires the explicit lean profile")
+        if setting["colour_intermediates"] == "drop" and not colour_intermediates_produced:
+            raise ValueError("This stage writes no colour intermediates; set their retention "
+                             "on the native/phase series run")
+        self.setting = dict(setting)
+        self.output = Path(output)
+        self.reader = pipeline.reader
+        shared = config["shared"]
+        arrays = dict(
+            physical_facies=np.asarray(pipeline.physical["facies"]),
+            physical_domain=np.asarray(pipeline.physical["domain"]),
+            physical_porosity=np.asarray(pipeline.physical["porosity"]),
+            physical_depth_m=np.asarray(pipeline.physical["depth_m"]),
+            floor_curve=np.asarray(pipeline.floor),
+            depth_points=np.asarray(pipeline.depth_points, np.float64),
+            reference_matrix=np.asarray(pipeline.reference_matrix, np.float64),
+            correction_matrix=np.asarray(pipeline.correction, np.float64))
+        tables = dict(
+            porosity_by_facies=_pairs(shared["porosity_by_facies"]),
+            swi_by_facies=_pairs(shared["swi_by_facies"]),
+            floor_origin_xy=list(shared["floor_origin_xy"]),
+            dimensions_m=list(config["dimensions_m"]),
+            geometry_fields=dict(config["geometry_fields"]))
+        if "pixel_domain" in config:
+            policy = config["pixel_domain"]
+            tables["pixel_domain"] = dict(raster_scale=policy["raster_scale"],
+                                          raster_shift=policy["raster_shift"],
+                                          fixture_names=list(policy["fixture_names"]))
+        sources = dict(physical_reference=deepcopy(shared["physical_reference"]),
+                       floor_curve=deepcopy(shared["floor_curve"]),
+                       depth_points=deepcopy(shared["depth_points"]),
+                       physical_correction=deepcopy(config["physical_correction"]))
+        for key in ("reference_matrix", "physical_coordinate_provenance", "legacy_dimensions_m"):
+            if key in shared:
+                sources[key] = deepcopy(shared[key])
+        archive = _write_npz(self.output / STORE_ARCHIVE, arrays)
+        document = dict(
+            format=STORE_FORMAT, complete=True, run=config["run"], profile="lean",
+            archive=dict(path=STORE_ARCHIVE, sha256=archive["sha256"],
+                         size_bytes=archive["size_bytes"]),
+            arrays={name: _identity(value) for name, value in arrays.items()},
+            tables=tables, sources=sources,
+            role="constant inputs of the per-frame static fields, stored once per run")
+        index = _write_json(self.output / STORE_INDEX, document)
+        self.store_record = dict(index=dict(index), archive=dict(archive))
+        # The write-time gate uses the store exactly as a reader loads it.
+        self.store = load_store(dict(index), reader=self.reader)
+        self._last_stage = None
+
+    def manifest_record(self):
+        return dict(self.setting, format=LEAN_FORMAT, store=deepcopy(self.store_record))
+
+    def outcome_record(self):
+        return dict(self.setting, format=LEAN_FORMAT, store=deepcopy(self.store_record))
+
+    def frame(self, spec, evaluated):
+        return LeanFrame(self, spec, evaluated)
+
+    # Colour intermediates of the native/phase series stage.
+    def committed(self, stage):
+        """After a frame commit: drop the previous frame's colour intermediates."""
+        if self.setting["colour_intermediates"] != "drop":
+            return
+        previous, self._last_stage = self._last_stage, Path(stage)
+        if previous is not None:
+            self._drop(previous)
+
+    def finish(self):
+        """After the run: drop the last frame's colour intermediates."""
+        if self.setting["colour_intermediates"] == "drop" and self._last_stage is not None:
+            self._drop(self._last_stage)
+            self._last_stage = None
+
+    def _drop(self, stage):
+        root = (self.output / "preparation").resolve()
+        stage = Path(stage)
+        if stage.resolve().parent != root:
+            raise ValueError("Only this attempt's own preparation files may be dropped")
+        for name in COLOUR_INTERMEDIATES:
+            path = stage / name
+            if path.exists():
+                path.unlink()
+
+
+class LeanFrame:
+    """Write-time gates of one frame; nothing here changes a computed value."""
+
+    def __init__(self, run, spec, evaluated):
+        self.run, self.spec, self.evaluated = run, spec, evaluated
+        self.products_record = None
+        self.storage = None
+
+    def products(self, products):
+        """Return the arrays to write; omit mass_total only if rebuilt bit for bit."""
+        written = dict(products)
+        omitted, kept = {}, {}
+        if "mass_total" in products:
+            identity = _identity(products["mass_total"])
+            try:
+                same = _identity(_rebuild_mass_total(products)) == identity
+                reason = None if same else "rebuilt sum is not bit-identical"
+            except (KeyError, TypeError, ValueError) as error:
+                same, reason = False, type(error).__name__ + ": " + str(error)
+            if same:
+                del written["mass_total"]
+                omitted["mass_total"] = dict(identity=identity, rule=MASS_TOTAL_RULE)
+            else:
+                kept["mass_total"] = reason
+        self.products_record = dict(stored=list(written), omitted=omitted, kept_reasons=kept)
+        return written
+
+    def regeneration(self):
+        """Registration descriptor and retained inputs of this frame's static fields."""
+        spec, evaluated, run = self.spec, self.evaluated, self.run
+        frame = evaluated["response"]["frame"]
+        current = spec["current"]
+        fields = run.store.tables["geometry_fields"]
+        area = dict(spec["area"])
+        area.setdefault("array_key", "pixel_area_mm2")
+        route = "pixel_domain" if "pixel_domain" in evaluated else "n1"
+        value = dict(
+            format=REGENERATION_FORMAT, route=route, n16="n16_producer" in evaluated,
+            precision=evaluated["result"]["precision"], store=deepcopy(run.store_record["index"]),
+            source_to_native_h=deepcopy(current["binding"]["geometry"][fields["source_to_native"]]),
+            native_origin_xy=deepcopy(current["native_origin_xy"]),
+            phase_shape_hw=[int(size) for size in frame.domain.shape],
+            inputs=dict(area=area))
+        if route == "n1":
+            value["inputs"]["classes"] = deepcopy(spec["classes"])
+        else:
+            declared = spec["pixel_domain_geometry"]
+            value["pixel_domain"] = dict(
+                inner_polygon_native=deepcopy(declared["inner_polygon_native"]),
+                fixture_polygons_native=[[name, deepcopy(points)] for name, points
+                                         in declared["fixture_polygons_native"].items()],
+                native_origin_xy=deepcopy(declared["native_origin_xy"]))
+            value["inputs"]["basis_geometry"] = dict(
+                deepcopy(spec["frozen_response_basis"]["geometry"]), array_key="depth_m")
+            if value["n16"]:
+                value["inputs"]["not_sand"] = deepcopy(declared["n16_masks"]["not_sand"])
+                value["physics"] = dict(
+                    pressure_bar=frame.pressure_bar, temperature_c=frame.temperature_c,
+                    pressure_gradient_bar_per_m=frame.pressure_gradient_bar_per_m,
+                    temperature_gradient_c_per_m=frame.temperature_gradient_c_per_m,
+                    elapsed_h=frame.elapsed_h)
+        return value
+
+    def geometry(self, temporary, fields):
+        """Write only the fields the regeneration does not reproduce bit for bit."""
+        from .mass.n1_pipeline import _write_npz, _jsonable
+        identities = {name: _identity(value) for name, value in fields.items()}
+        reasons, regenerated = {}, []
+        try:
+            # Gate with the descriptor exactly as result.json will return it.
+            regeneration = json.loads(json.dumps(_jsonable(self.regeneration()), allow_nan=False))
+            engine = _Regeneration(self.run.store, regeneration, self.run.reader)
+        except (KeyError, TypeError, ValueError) as error:
+            regeneration, engine = None, None
+            reasons = {name: "no regeneration descriptor: " + type(error).__name__ + ": " + str(error)
+                       for name in fields}
+        if engine is not None:
+            for name in fields:
+                try:
+                    same = _identity(engine.field(name)) == identities[name]
+                    if not same:
+                        reasons[name] = "regenerated field is not bit-identical"
+                except Exception as error:  # Any failure keeps the field written.
+                    reasons[name] = type(error).__name__ + ": " + str(error)
+                else:
+                    if same:
+                        regenerated.append(name)
+            del engine
+        written = [name for name in fields if name not in regenerated]
+        asset = None
+        if written:
+            archive = _write_npz(Path(temporary) / "native_geometry.npz",
+                                 {name: fields[name] for name in written})
+            asset = {"path": "native_geometry.npz", "sha256": archive["sha256"],
+                     "size_bytes": archive["size_bytes"]}
+        self.storage = dict(format=LEAN_FORMAT, profile="lean", written=written,
+                            regenerated=regenerated, kept_reasons=reasons,
+                            regeneration=regeneration)
+        return asset, identities
+
+    def record(self):
+        """The frame's result.json lean record."""
+        value = dict(format=LEAN_FORMAT, profile="lean",
+                     colour_intermediates=self.run.setting["colour_intermediates"],
+                     store=deepcopy(self.run.store_record), products=deepcopy(self.products_record),
+                     static=dict(written=list(self.storage["written"]),
+                                 regenerated=list(self.storage["regenerated"])))
+        if self.run.setting["colour_intermediates"] == "drop":
+            value["dropped_after_commit"] = list(COLOUR_INTERMEDIATES)
+        return value

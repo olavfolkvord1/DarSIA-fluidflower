@@ -277,7 +277,7 @@ def verify_frame_prefix(
             "native_statistics.json.gz",
             "result.json",
         }
-        if not required.issubset(files):
+        if not required.issubset(files) and not _lean_without_geometry(final, files, required):
             raise ValueError("Resume frame omitted a required scientific product")
         if {p.name for p in final.iterdir()} != set(files) | {"commit.json"}:
             raise ValueError("Resume finalized frame inventory differs")
@@ -345,6 +345,8 @@ def verify_frame_prefix(
             or result.get("bindings", {}).get("code_sha256") != manifest["code_sha256"]
         ):
             raise ValueError("Resume result producer/precision/calibration differs")
+        if result.get("lean_storage") is not None:
+            _verify_lean_frame(result, files)
         if n1:
             bindings = dict(
                 source_sha256=spec["source_binding"]["source_sha256"],
@@ -406,6 +408,41 @@ def verify_frame_prefix(
         predecessor_input=previous_input,
         predecessor_index=len(records) - 1 if records else None,
     )
+
+
+def _lean_without_geometry(final, files, required):
+    """A lean frame may omit native_geometry.npz when it wrote no fallback field."""
+    if required - set(files) != {"native_geometry.npz"}:
+        return False
+    result = _bound_json(dict(files["result.json"], path=str(Path(final) / "result.json")))
+    lean = result.get("lean_storage")
+    static = result.get("static") or {}
+    return (isinstance(lean, dict) and isinstance(static.get("storage"), dict)
+            and static.get("asset") is None and static["storage"].get("written") == [])
+
+
+def _verify_lean_frame(result, files):
+    """Bind a lean frame's written geometry and its run store by their bytes."""
+    from ..storage_profile import frame_storage, store_assets
+    lean = frame_storage(result)
+    static = result["static"]
+    storage = static.get("storage")
+    if not isinstance(storage, dict) or storage.get("profile") != "lean":
+        raise ValueError("Resume lean frame lacks its static storage record")
+    if (static["asset"] is None) != (not storage["written"]):
+        raise ValueError("Resume lean frame geometry record differs from its fallback fields")
+    if static["asset"] is not None and (
+        "native_geometry.npz" not in files
+        or files["native_geometry.npz"]["sha256"] != static["asset"]["sha256"]
+        or files["native_geometry.npz"]["size_bytes"] != static["asset"]["size_bytes"]
+    ):
+        raise ValueError("Resume lean frame geometry differs from its committed file")
+    if storage["regeneration"] is not None and (
+        storage["regeneration"]["store"] != lean["store"]["index"]
+    ):
+        raise ValueError("Resume lean frame regenerates from another run store")
+    for bound in store_assets(lean):
+        _verify_file(bound["path"], bound)
 
 
 def _descriptor(path):

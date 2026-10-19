@@ -983,8 +983,13 @@ def _publish_frame(
     compute_seconds,
     *,
     storage_context=None,
+    lean=None,
 ):
-    """Publish one Main-format scientific frame directly on its owned output."""
+    """Publish one Main-format scientific frame directly on its owned output.
+
+    ``lean`` is the run's explicit lean storage context, or None for the
+    unchanged full layout (see darsia.fluidflower.storage_profile).
+    """
     from darsia._opencv_runtime import require_ipp_off
     require_ipp_off("publish_frame:before")
     import numpy as np
@@ -1034,7 +1039,9 @@ def _publish_frame(
         U_rest_amendment_sha256=np.asarray(amendment),
         **{name: np.asarray(value) for name, value in bindings.items()},
     )
-    product_asset = _write_npz(temporary / "products.npz", products)
+    lean_frame = None if lean is None else lean.frame(spec, evaluated)
+    stored_products = products if lean_frame is None else lean_frame.products(products)
+    product_asset = _write_npz(temporary / "products.npz", stored_products)
     geometry_fields = dict(
         pixel_area_m2=np.broadcast_to(
             np.asarray(frame.pixel_area_m2), frame.domain.shape
@@ -1049,16 +1056,21 @@ def _publish_frame(
     )
     if "pixel_domain" in evaluated:
         geometry_fields = evaluated["geometry_fields"]
-    geometry_asset = _write_npz(temporary / "native_geometry.npz", geometry_fields)
-    static = dict(
-        asset={
+    if lean_frame is None:
+        geometry_asset = _write_npz(temporary / "native_geometry.npz", geometry_fields)
+        geometry_record = {
             "path": "native_geometry.npz",
             "sha256": geometry_asset["sha256"],
             "size_bytes": geometry_asset["size_bytes"],
-        },
-        arrays={
+        }
+        identities = {
             name: _array_identity(value) for name, value in geometry_fields.items()
-        },
+        }
+    else:
+        geometry_record, identities = lean_frame.geometry(temporary, geometry_fields)
+    static = dict(
+        asset=geometry_record,
+        arrays=identities,
         per_frame_geometry=True,
         units=dict(
             pixel_area_m2="m2",
@@ -1068,6 +1080,8 @@ def _publish_frame(
             transport_weight_l="L pore volume per pixel",
         ),
     )
+    if lean_frame is not None:
+        static["storage"] = lean_frame.storage
     if "n16_producer" in evaluated:
         static["units"].update(full_physical_depth_m="m", full_physical_porosity="1",
             full_physical_pixel_pore_volume_m3="m3 pore volume per pixel",
@@ -1132,6 +1146,8 @@ def _publish_frame(
         scope="frozen_evaluation",
         opencv_ipp=evaluated.get("opencv_ipp"),
     )
+    if lean_frame is not None:
+        record["lean_storage"] = lean_frame.record()
     if "pixel_domain" in evaluated:
         domain = evaluated["pixel_domain"]
         record.update(
@@ -1311,6 +1327,8 @@ def _run_n1(
     )
     if config["run"] != task["run"] or backend not in {"cpu", "cuda"}:
         raise ValueError("Task run and explicit numerical backend are required")
+    from ..storage_profile import resolve as storage_setting
+    setting = storage_setting(config)  # Explicit or default; validated before any output.
     if on_progress is not None and not callable(on_progress):
         raise TypeError("Progress callback must be callable")
     output = Path(output)
@@ -1377,6 +1395,10 @@ def _run_n1(
         if storage_request is not None:
             from ..storage_n1_outputs import Phase2Storage
             storage_context = Phase2Storage(config, pipeline.reader, storage_request)
+        lean = None
+        if setting["profile"] == "lean":
+            from ..storage_profile import LeanRun
+            lean = LeanRun(output, config, pipeline, setting, colour_intermediates_produced=False)
         settings = dict(
             host=socket.gethostname(),
             backend=backend,
@@ -1410,6 +1432,8 @@ def _run_n1(
                 phase1=storage_context.binding, ordered_case_ids=[frame["case_id"] for frame in config["frames"]])
         if resume_asset is not None:
             manifest["resume_checkpoint"] = resume_asset
+        if lean is not None:
+            manifest["storage_profile"] = lean.manifest_record()
         manifest_asset = _write_json(output / "manifest.json", manifest)
         for position, spec in enumerate(config["frames"]):
             if position < resumed:
@@ -1443,6 +1467,7 @@ def _run_n1(
                 position,
                 compute_seconds,
                 storage_context=None if storage_context is None else (storage_context, capture),
+                lean=lean,
             )
             del capture
             records.append(publication)
@@ -1500,6 +1525,11 @@ def _run_n1(
         if "pixel_domain" in config:
             outcome["table"] = table
             outcome["pixel_domain"] = config["pixel_domain"]
+        if lean is not None:
+            outcome.update(
+                static_geometry="lean: per-run lean_run_static store, per-frame regeneration descriptor",
+                lean_storage=lean.outcome_record(),
+            )
         del pipeline
     finally:
         close = getattr(math, "close", None)

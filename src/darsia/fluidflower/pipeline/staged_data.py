@@ -586,10 +586,15 @@ def validate_phase2_run(config):
     """Admit an explicit sealed N1 stage; never infer a stage or domain policy."""
     from ..mass.n1_pipeline import CONFIG_FORMAT, CONFIG_REQUIRED, FRAME_REQUIRED
     _keys(config, {"format", *CONFIG_REQUIRED, "precision", "phase1", "geometry_fields"},
-          {"atmosphere_series", "dose", "contracts", "provenance", "data_aliases", "storage", "pixel_domain"},
+          {"atmosphere_series", "dose", "contracts", "provenance", "data_aliases", "storage", "pixel_domain",
+           "storage_profile"},
           where="phase-two configuration")
     if config["format"] != CONFIG_FORMAT or config["precision"] not in {"float32", "float64"}:
         raise ValueError("Explicit precision-bound ordinary N1 stage required")
+    if "storage_profile" in config:
+        from ..storage_profile import resolve
+        if resolve(config)["colour_intermediates"] != "keep":
+            raise ValueError("Phase two writes no colour intermediates; their retention is not set here")
     _bound(config["calibration"], where="phase-two fitted calibration")
     if not isinstance(config["frames"], list) or not config["frames"]:
         raise ValueError("Explicit nonempty phase-two case order required")
@@ -706,6 +711,8 @@ def validate_n16_frame_binding(config, spec, *, authority, source, original, cal
             or original["anchor"] != config["anchor"]):
         raise ValueError("N16 actual response basis differs from this calibration, anchor or frame")
     static = original["static"]
+    if "storage" in static or static.get("asset") is None:
+        raise ValueError("N16 measured depth needs a full-profile reference frame")
     if (any(basis["geometry"][key] != static["asset"][key] for key in ("sha256", "size_bytes"))
             or basis["arrays"] != static["arrays"] or basis["per_frame_geometry"] != static["per_frame_geometry"]
             or declared["target_depth"].get("array_key") != "depth_m"
@@ -715,7 +722,8 @@ def validate_n16_frame_binding(config, spec, *, authority, source, original, cal
 
 def seal_phase2_configuration(destination, completion_bound, configuration_bound, *,
                               expected_phase1_commit, fitted_calibration, fitted_anchor,
-                              storage_data=None, pixel_domain_data=None, reader):
+                              storage_data=None, pixel_domain_data=None, reader,
+                              storage_profile=None):
     """Seal ordinary N1 DATA from actual phase-one products and explicit new fit.
 
     No native/inference or mass evaluation occurs. The returned DATA still needs
@@ -755,6 +763,8 @@ def seal_phase2_configuration(destination, completion_bound, configuration_bound
         candidate["storage"] = deepcopy(storage_data)
         from ..storage_outputs import parse_request
         parse_request(candidate, candidate["precision"])
+    if storage_profile is not None:
+        candidate["storage_profile"] = deepcopy(storage_profile)
     if pixel_domain_data is not None:
         _keys(pixel_domain_data, {"pixel_domain", "frames"}, where="explicit N16 phase-two inputs")
         additions = pixel_domain_data["frames"]
