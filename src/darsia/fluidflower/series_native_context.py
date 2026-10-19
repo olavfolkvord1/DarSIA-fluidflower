@@ -123,6 +123,16 @@ def read_series_native_binding(series_root: str | Path | None) -> SeriesNativeBi
     A present malformed table/pair/digest is an error, not the no-native case.
     This function has no context or environment side effects.
     """
+    found = _series_native_parameters(series_root)
+    if found is None:
+        return None
+    root, path, digest, parameters = found
+    runtime_parameters, code_bindings = _bind_current_saved_readers(parameters)
+    return SeriesNativeBinding(root, path, digest, runtime_parameters, code_bindings)
+
+
+def _series_native_parameters(series_root):
+    """The series.toml [native] document: (root, path, sha256, parameters), or None."""
     if series_root is None:
         return None
     root = Path(series_root).expanduser().resolve()
@@ -148,9 +158,50 @@ def read_series_native_binding(series_root: str | Path | None) -> SeriesNativeBi
     path = (path if path.is_absolute() else root / path).resolve()
     from .native.config import load_parameters
 
-    parameters = load_parameters(path, digest)
-    runtime_parameters, code_bindings = _bind_current_saved_readers(parameters)
-    return SeriesNativeBinding(root, path, digest, runtime_parameters, code_bindings)
+    return root, path, digest, load_parameters(path, digest)
+
+
+@dataclass(frozen=True)
+class CameraUProfile:
+    """A run's configured camera-U profile: the SHA-bound document and its id."""
+
+    path: Path
+    sha256: str
+    profile_id: str
+    camera_wh: tuple[int, int]
+
+
+def camera_u_profile(series_root: str | Path | None, run_id: str) -> CameraUProfile | None:
+    """Return the run's camera-U profile from series.toml [native], or None.
+
+    The series' SHA-bound native parameter document declares the camera
+    profiles (registration.common.profiles), the size of the camera grid U
+    (registration.common.sensor.camera_wh) and each run's profile
+    (source.profiles). A series without them, or a run without a profile, has
+    no camera-U rendering. A run naming an undeclared profile is an error.
+    """
+    # Only the SHA-bound document is read; no saved-reader code is bound here.
+    found = _series_native_parameters(series_root)
+    if found is None:
+        return None
+    _root, path, digest, document = found
+    source = document.get("source")
+    registration = document.get("registration", document)
+    common = registration.get("common") if isinstance(registration, Mapping) else None
+    if not isinstance(source, Mapping) or not isinstance(common, Mapping):
+        return None
+    profiles = source.get("profiles")
+    if not isinstance(profiles, Mapping):
+        return None
+    by_run = {str(key).casefold(): value for key, value in profiles.items()}
+    profile_id = by_run.get(str(run_id).casefold())
+    if profile_id is None:
+        return None
+    declared = common.get("profiles")
+    if not isinstance(declared, Mapping) or profile_id not in declared:
+        raise ValueError(f"Run {run_id} names camera profile {profile_id!r}, which is not declared")
+    width, height = common["sensor"]["camera_wh"]
+    return CameraUProfile(path, digest, str(profile_id), (int(width), int(height)))
 
 
 class SeriesNativeContext:

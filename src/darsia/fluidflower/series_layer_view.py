@@ -1999,6 +1999,9 @@ class LayerPainterView(QWidget):
         self._background_enhanced: np.ndarray | None = None
         self._background_token: dict[str, Any] | None = None
         self._background_shown = False
+        # The reference run's configured camera-U profile (N106), cached per run.
+        self._camera_u_key: tuple[str, str] | None = None
+        self._camera_u: Any = None
         # The reference and background photos at full resolution (uint8),
         # plain and with enhanced contrast, shown when zoomed in.
         self._detail_plain: np.ndarray | None = None
@@ -2913,17 +2916,26 @@ class LayerPainterView(QWidget):
         assert self.image is not None
         path = Path(path)
         expected = (int(self.image.image_size[0]), int(self.image.image_size[1]))
+        camera_u = None
         if image_family(path) != image_family(self.image.path):
-            if not quiet:
-                QMessageBox.warning(
-                    self,
-                    "Background photo",
-                    f"{path.name} and the reference photo {Path(self.image.path).name} "
-                    "are not the same kind of file (camera RAW or JPEG/TIFF/PNG). "
-                    "A camera's JPEG is cropped and lens-corrected, so the two do "
-                    "not line up. Choose a photograph of the same kind.",
-                )
-            return False
+            # A camera RAW is shown under a JPEG reference only on the camera
+            # grid U of the run's configured profile (N106), never on its own grid.
+            if image_family(path) == "raw":
+                camera_u = self._camera_u_profile()
+            if camera_u is None or tuple(camera_u.camera_wh) != expected:
+                if not quiet:
+                    QMessageBox.warning(
+                        self,
+                        "Background photo",
+                        f"{path.name} and the reference photo {Path(self.image.path).name} "
+                        "are not the same kind of file (camera RAW or JPEG/TIFF/PNG). "
+                        "A camera's JPEG is cropped and lens-corrected, so the two do "
+                        "not line up without a camera profile for this run. Choose a "
+                        "photograph of the same kind.",
+                    )
+                return False
+        if camera_u is not None:
+            return self._set_camera_u_background(path, camera_u, expected, show=show, quiet=quiet)
         try:
             width, height = photo_size(path)
         except (OSError, ValueError) as error:
@@ -2955,10 +2967,63 @@ class LayerPainterView(QWidget):
 
             rgb = cv2.resize(rgb, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
         rgb = np.clip(rgb, 0.0, 1.0)
+        return self._install_background(path, rgb, self._full_resolution(path), expected, show)
+
+    def _camera_u_profile(self):
+        """The reference run's configured camera-U profile, or None (cached per run)."""
+
+        reference = self.reference()
+        root = getattr(self.project, "root", None)
+        if reference is None or root is None:
+            return None
+        key = (str(root), str(reference.run_id))
+        if self._camera_u_key != key:
+            from darsia.fluidflower.series_native_context import camera_u_profile
+
+            try:
+                self._camera_u = camera_u_profile(root, reference.run_id)
+            except (OSError, ValueError, KeyError, TypeError):
+                self._camera_u = None
+            self._camera_u_key = key
+        return self._camera_u
+
+    def _set_camera_u_background(self, path, camera_u, expected, *, show, quiet) -> bool:
+        """Show a camera RAW on the run's camera grid U under a JPEG reference.
+
+        The shared renderer places the RAW on exactly the grid of the camera's
+        JPEG, so marks drawn on the JPEG fit it unchanged (N106/N108).
+        """
+
+        from darsia.fluidflower.native.raw_photograph import load_camera_u_rgb8
+
+        try:
+            full = load_camera_u_rgb8(path, profile_path=camera_u.path,
+                                      profile_sha256=camera_u.sha256,
+                                      profile_id=camera_u.profile_id)
+        except (OSError, ValueError, KeyError, ImportError) as error:
+            if not quiet:
+                QMessageBox.warning(self, "Could not read the photograph", str(error))
+            return False
+        if (full.shape[1], full.shape[0]) != expected:
+            if not quiet:
+                QMessageBox.warning(self, "Background photo",
+                                    f"{path.name} renders at {full.shape[1]} x {full.shape[0]} pixels, "
+                                    f"the reference photo is {expected[0]} x {expected[1]}.")
+            return False
+        import cv2
+
+        rows, cols = self.image.display.shape[:2]
+        rgb = cv2.resize(full, (cols, rows), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        detail = full if full.shape[0] > rows and full.shape[1] > cols else None
+        return self._install_background(path, np.clip(rgb, 0.0, 1.0), detail, expected, show)
+
+    def _install_background(self, path, rgb, detail, expected, show) -> bool:
+        """Install a loaded background photo (display copy and detail) and show it."""
+
         self._background_path = path
         self._background_rgb = rgb
         self._background_plain = np.rint(255.0 * rgb).astype(np.uint8)
-        self._background_detail_plain = self._full_resolution(path)
+        self._background_detail_plain = detail
         self._update_background_enhanced()
         self._background_token = {
             "baseline": self._background_plain,
