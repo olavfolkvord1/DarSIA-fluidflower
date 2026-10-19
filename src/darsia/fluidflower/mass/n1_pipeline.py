@@ -736,12 +736,13 @@ class N1Pipeline:
         )
         return frame, x, y, photo_support, report
 
-    def _prepare_statistics(self, spec):
+    def _prepare_statistics(self, spec, *, colour_coordinate=False):
         """Run the original calibration-independent native summary prefix once.
 
         The fixed summary baseline_gain, beta=0 and historical summary anchor
         remain inside summarize_round3_response. No fitted mass parameters are
-        read here.
+        read here. ``colour_coordinate`` only captures the colour-path
+        coordinate of the interpretation (storage_profile option).
         """
         import numpy as np
         import darsia
@@ -755,7 +756,10 @@ class N1Pipeline:
 
         frame, x, y, photo, report = self.load_frame(spec)
         shared, math, config = self.config["shared"], self.math, self.config
-        response = prepare_response(frame, self.models, math, shared["swi_by_facies"])
+        # The default call stays exactly the original one.
+        capture = dict(colour_coordinate=True) if colour_coordinate else {}
+        response = prepare_response(frame, self.models, math, shared["swi_by_facies"],
+                                    **capture)
         geometry = build_estimate_geometry(
             x,
             y,
@@ -847,7 +851,10 @@ class N1Pipeline:
             exact_prediction,
         )
 
-        prepared = self._prepare_statistics(spec)
+        from ..storage_profile import stores_colour_coordinate
+        stores = stores_colour_coordinate(getattr(self, "config", {}))
+        capture = dict(colour_coordinate=True) if stores else {}
+        prepared = self._prepare_statistics(spec, **capture)  # Default call unchanged.
         frame, x, y = prepared["frame"], prepared["x_m"], prepared["y_m"]
         response, row, report = (prepared["response"], prepared["statistics"],
                                  prepared["sandmap"])
@@ -1042,6 +1049,10 @@ def _publish_frame(
     lean_frame = None if lean is None else lean.frame(spec, evaluated)
     stored_products = products if lean_frame is None else lean_frame.products(products)
     product_asset = _write_npz(temporary / "products.npz", stored_products)
+    from ..storage_profile import (COLOUR_COORDINATE_RECORD, stores_colour_coordinate,
+                                   write_colour_coordinate)
+    coordinate_record = (write_colour_coordinate(temporary, response)
+                         if stores_colour_coordinate(config) else None)
     geometry_fields = dict(
         pixel_area_m2=np.broadcast_to(
             np.asarray(frame.pixel_area_m2), frame.domain.shape
@@ -1148,6 +1159,8 @@ def _publish_frame(
     )
     if lean_frame is not None:
         record["lean_storage"] = lean_frame.record()
+    if coordinate_record is not None:
+        record[COLOUR_COORDINATE_RECORD] = coordinate_record
     if "pixel_domain" in evaluated:
         domain = evaluated["pixel_domain"]
         record.update(

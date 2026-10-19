@@ -29,6 +29,13 @@ The setting is an optional run-configuration entry::
     "storage_profile": {"profile": "lean", "colour_intermediates": "keep"}
 
 Without the entry :data:`DEFAULT_STORAGE_PROFILE` applies.
+
+The same entry takes the optional ``"store_colour_coordinate": true`` (default
+:data:`DEFAULT_STORE_COLOUR_COORDINATE` = off). In either profile each frame
+then also writes ``colour_path_coordinate.npz``: the per-pixel colour-path
+coordinate of the frame's own interpretation (see
+:data:`COLOUR_COORDINATE_DEFINITION`), recorded with its SHA-256 in
+result.json and in the frame's file inventory.
 """
 from __future__ import annotations
 
@@ -40,6 +47,21 @@ from pathlib import Path
 #: gates use "full". Production selects "lean" after its exact gate, either
 #: per run configuration or by changing this single constant.
 DEFAULT_STORAGE_PROFILE = "full"
+
+#: Optional per-pixel colour-path coordinate (``"store_colour_coordinate"`` in
+#: the storage_profile entry). Off by default: without the explicit setting no
+#: frame writes it and every output stays byte-identical to the writer before.
+DEFAULT_STORE_COLOUR_COORDINATE = False
+COLOUR_COORDINATE_SETTING = "store_colour_coordinate"
+COLOUR_COORDINATE_FORMAT = "darsia-colour-path-coordinate-v1"
+COLOUR_COORDINATE_ARCHIVE = "colour_path_coordinate.npz"
+COLOUR_COORDINATE_ARRAY = "colour_path_coordinate"
+COLOUR_COORDINATE_RECORD = "colour_coordinate"
+COLOUR_COORDINATE_DEFINITION = (
+    "distance parameter of the pixel's baseline-relative, clear-water-normalised RGB "
+    "along its facies' frozen colour path (equidistant parametrisation; "
+    "PixelMath.fit_color_path inside n1_models.TypedColor), before the path's "
+    "value table, the signal model and the titration flash")
 
 PROFILES = ("full", "lean")
 COLOUR_RETENTION = ("keep", "drop")
@@ -67,8 +89,11 @@ def resolve(config):
         return dict(profile=DEFAULT_STORAGE_PROFILE,
                     colour_intermediates=DEFAULT_COLOUR_INTERMEDIATES)
     if (not isinstance(value, dict) or "profile" not in value
-            or set(value) - {"profile", "colour_intermediates"}):
-        raise ValueError("storage_profile needs 'profile' and optionally 'colour_intermediates'")
+            or set(value) - {"profile", "colour_intermediates", COLOUR_COORDINATE_SETTING}):
+        raise ValueError("storage_profile needs 'profile' and optionally "
+                         "'colour_intermediates' and '" + COLOUR_COORDINATE_SETTING + "'")
+    if not isinstance(value.get(COLOUR_COORDINATE_SETTING, False), bool):
+        raise ValueError(COLOUR_COORDINATE_SETTING + " must be true or false")
     profile = value["profile"]
     colour = value.get("colour_intermediates", DEFAULT_COLOUR_INTERMEDIATES)
     if not isinstance(profile, str) or profile not in PROFILES:
@@ -78,6 +103,73 @@ def resolve(config):
     if colour == "drop" and profile != "lean":
         raise ValueError("The colour-intermediate retention switch belongs to the lean profile")
     return dict(profile=profile, colour_intermediates=colour)
+
+
+def stores_colour_coordinate(config):
+    """Whether a run stores the per-pixel colour-path coordinate (default off)."""
+    resolve(config)  # The whole entry is validated, the flag's type included.
+    value = config.get(SETTING) if isinstance(config, dict) else None
+    if value is None:
+        return DEFAULT_STORE_COLOUR_COORDINATE
+    return value.get(COLOUR_COORDINATE_SETTING, DEFAULT_STORE_COLOUR_COORDINATE)
+
+
+def require_template_colour_coordinate(series_config, template):
+    """A series' mass stage reads the option from its template: they must agree."""
+    if stores_colour_coordinate(series_config) != stores_colour_coordinate(template):
+        raise ValueError("The series colour-coordinate storage differs from its mass template")
+
+
+# ---------------------------------------------------- colour-path coordinate
+
+
+def write_colour_coordinate(directory, response):
+    """Write a frame's captured colour-path coordinate next to products.npz.
+
+    The array is the coordinate n1_models.prepare_response captured during the
+    frame's own interpretation (float32 on the native grid, NaN outside the
+    colour-quantifiable support). Returns the frame's result.json record.
+    """
+    import numpy as np
+    from .mass.n1_pipeline import _write_npz
+    value = response.get(COLOUR_COORDINATE_ARRAY)
+    shape = response["frame"].domain.shape
+    if value is None:
+        raise ValueError("The colour-path coordinate was not captured for this frame")
+    if not isinstance(value, np.ndarray) or value.dtype != np.float32 or value.shape != shape:
+        raise ValueError("The colour-path coordinate must be float32 on the native grid")
+    archive = _write_npz(Path(directory) / COLOUR_COORDINATE_ARCHIVE,
+                         {COLOUR_COORDINATE_ARRAY: value})
+    return dict(format=COLOUR_COORDINATE_FORMAT, path=COLOUR_COORDINATE_ARCHIVE,
+                sha256=archive["sha256"], size_bytes=archive["size_bytes"],
+                array=COLOUR_COORDINATE_ARRAY, identity=_identity(value),
+                definition=COLOUR_COORDINATE_DEFINITION,
+                invalid="NaN outside the colour-quantifiable support "
+                        "(prepare_response 'quantifiable': support and not an ignored facies)",
+                units="colour-path distance (per facies path)")
+
+
+def read_colour_coordinate(result, directory, *, reader=None):
+    """Return a frame's stored colour-path coordinate, file and array verified.
+
+    Both storage profiles store it the same way. A frame written without the
+    option has no coordinate: that raises KeyError, never a substitute.
+    """
+    record = result.get(COLOUR_COORDINATE_RECORD)
+    if record is None:
+        raise KeyError("This frame stores no colour-path coordinate ("
+                       + COLOUR_COORDINATE_SETTING + " was off)")
+    if (not isinstance(record, dict) or record.get("format") != COLOUR_COORDINATE_FORMAT
+            or record.get("path") != COLOUR_COORDINATE_ARCHIVE
+            or record.get("array") != COLOUR_COORDINATE_ARRAY):
+        raise ValueError("Unknown colour-path coordinate record")
+    reader = _default_reader(reader)
+    bound = dict(path=str(Path(directory) / record["path"]), sha256=record["sha256"],
+                 size_bytes=record["size_bytes"])
+    value = reader.archive(bound, (record["array"],))[record["array"]]
+    if _identity(value) != record["identity"]:
+        raise ValueError("Colour-path coordinate differs from its recorded identity")
+    return value
 
 
 def frame_storage(result):

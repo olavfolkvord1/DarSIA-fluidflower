@@ -108,9 +108,15 @@ class FrameData:
 
 class TypedColor:
     """Saved ColorPath interpretation using the chosen pixel provider."""
-    def __init__(self, original, math):
-        """Retain the saved supports, values and ignore-spectrum semantics."""
+    def __init__(self, original, math, *, capture=None, label=None):
+        """Retain the saved supports, values and ignore-spectrum semantics.
+
+        ``capture`` (optional) is a dict shared by this model and the copies a
+        HeterogeneousModel makes of it; each call stores the computed path
+        parameter there under ``label``. Nothing is computed differently.
+        """
         self.original, self.math = original, math
+        self.capture, self.label = capture, label
 
     def __call__(self, colors):
         """Use the original fit/interpolation and ignore threshold/order."""
@@ -127,6 +133,10 @@ class TypedColor:
             sub_colors = colors[mask]
             sub_parameter = math.fit_color_path(sub_colors, supports, path.equidistant_distances)
             parameter[mask] = sub_parameter
+        if self.capture is not None:
+            if self.label in self.capture:
+                raise ValueError("The colour-path coordinate of a facies was captured twice")
+            self.capture[self.label] = parameter
         return math.interpret_color_path(parameter, path.equidistant_distances, original.values)
 
 
@@ -202,8 +212,13 @@ class TypedPhysics(darsia.CO2MassAnalysis):
 
 class NativeAnalysis:
     """Native saved optical pipeline with explicit data and a pixel provider."""
-    def __init__(self, frame, baseline, models, math, *, domain=None, depth=None, porosity=None):
-        """Build the same native ConcentrationAnalysis/Geometry objects."""
+    def __init__(self, frame, baseline, models, math, *, domain=None, depth=None,
+                 porosity=None, capture_colour_coordinate=False):
+        """Build the same native ConcentrationAnalysis/Geometry objects.
+
+        ``capture_colour_coordinate`` keeps each facies' colour-path parameter
+        of the next interpretation for :meth:`colour_path_coordinate`.
+        """
         self.math, self.models = math, models
         self.shape, self.dimensions = frame.domain.shape, frame.dimensions_m
         self.domain = frame.known_physical_domain if domain is None else domain
@@ -225,7 +240,11 @@ class NativeAnalysis:
         if not unique.issubset(models["metadata"]["label_ids"]):
             raise ValueError("Per-frame facies are outside the saved native basis")
         ignored = list(map(int, models["metadata"]["ignore_labels"]))
-        color_models = {label:TypedColor(models["colors"][label], math) for label in unique}
+        self.colour_capture = {} if capture_colour_coordinate else None
+        self.colour_ignored = ignored
+        color_models = {label:TypedColor(models["colors"][label], math,
+                                         capture=self.colour_capture, label=label)
+                        for label in unique}
         signal_models = {label:TypedSignal(models["signals"][label], math) for label in unique}
         options = {"diff option":"plain", "restoration -> model":False}
         color_model = darsia.CombinedModel([TypedFacies(color_models, labels, ignored, math)])
@@ -255,8 +274,31 @@ class NativeAnalysis:
         """Apply native plain-relative colour then saved signal transforms."""
         return self.signal_analysis(self.color_analysis(self.rgb(rgb)))
 
+    def colour_path_coordinate(self, valid):
+        """The captured colour-path parameter of every pixel, float32, NaN elsewhere.
 
-def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=None):
+        Each facies' values are placed with the same label mask that the
+        per-facies scatter used, so every pixel holds exactly the parameter its
+        interpretation consumed. Pixels outside ``valid`` and ignored facies
+        are NaN. The capture is released afterwards.
+        """
+        capture = self.colour_capture
+        if capture is None:
+            raise ValueError("This analysis was built without colour-coordinate capture")
+        coordinate = np.full(self.shape, np.nan, np.float32)
+        for label in np.unique(self.labels):
+            if int(label) in self.colour_ignored:
+                continue
+            if int(label) not in capture:
+                raise ValueError("A facies' colour-path coordinate was not captured")
+            coordinate[self.labels == label] = capture[int(label)]
+        coordinate[~np.asarray(valid, bool)] = np.nan
+        capture.clear()
+        return coordinate
+
+
+def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=None,
+                     colour_coordinate=False):
     """Interpret RGB with the original titration flash and explicit reference support.
 
     ``solubility_domain`` may bind the physical support used when the frozen
@@ -264,6 +306,10 @@ def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=No
     change this median and therefore the colour-to-concentration transform.
     It is a reference for the flash only, never a mass or visibility mask.
     Omitting it retains the existing measured physical support exactly.
+
+    ``colour_coordinate=True`` also returns ``colour_path_coordinate``: the
+    colour-path parameter this interpretation computed per pixel (float32, NaN
+    outside ``quantifiable``). It changes no computed value.
     """
     basis = frame.known_physical_domain if solubility_domain is None else np.asarray(solubility_domain)
     if basis.dtype != bool or basis.shape != frame.domain.shape or not basis.any():
@@ -276,7 +322,9 @@ def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=No
         raise ValueError("Nonfinite clear-water normalized signal")
     baseline = np.where(support[..., None], baseline, 0.).astype(math.dtype)
     current = np.where(support[..., None], current, baseline).astype(math.dtype)
-    analysis = NativeAnalysis(frame, baseline, models, math)
+    # The default call stays exactly the original one.
+    analysis = (NativeAnalysis(frame, baseline, models, math, capture_colour_coordinate=True)
+                if colour_coordinate else NativeAnalysis(frame, baseline, models, math))
     phase = np.where(frame.known_physical_domain & (frame.phase_labels != 255), frame.phase_labels, 0).astype(np.uint8)
     scalar = analysis.scalar(np.zeros(phase.shape, math.dtype), frame.elapsed_h)
     # The native constructor invokes setup: attach the provider before it runs.
@@ -304,9 +352,12 @@ def prepare_response(frame, models, math, swi_by_facies, *, solubility_domain=No
             raise ValueError("Measured Swi must be in [0,1]")
         swi[frame.facies == int(label)] = math.dtype(value)
     quantifiable = support & ~np.isin(frame.facies, models["metadata"]["ignore_labels"])
-    return dict(frame=frame, analysis=analysis, physics=physics, flash=flash,
+    response = dict(frame=frame, analysis=analysis, physics=physics, flash=flash,
         prepared=prepared, native_signal=np.asarray(signal.img, math.dtype), quantifiable=quantifiable,
         metadata=models["metadata"], swi=swi, precision=math.precision)
+    if colour_coordinate:
+        response["colour_path_coordinate"] = analysis.colour_path_coordinate(quantifiable)
+    return response
 
 
 def own_colour_response(response, geometry, photo_support, models, math):

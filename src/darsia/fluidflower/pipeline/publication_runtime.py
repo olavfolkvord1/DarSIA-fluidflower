@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from ..storage_profile import COLOUR_COORDINATE_ARCHIVE
 from .job_queue import descriptor, name, read_json
 from .products_publication import (
     MAX_METADATA_BYTES, _bound, _copy, _fresh_root, _target, _verified_bytes,
@@ -51,7 +52,7 @@ def _kind(filename):
         return "film"
     if filename in {"phase_labels.png", "phase_classes.npz", "phase_area.npz",
                     "phase_operator_masks.npz", "products.npz", "native_geometry.npz",
-                    "phase_probabilities.npz"}:
+                    "phase_probabilities.npz", COLOUR_COORDINATE_ARCHIVE}:
         return "map"
     return "intermediate"
 

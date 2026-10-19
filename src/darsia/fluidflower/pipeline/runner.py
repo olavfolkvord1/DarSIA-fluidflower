@@ -297,6 +297,8 @@ def _run_series(task, output, backend, precision, on_progress, runtime):
     if ("storage_profile" in config["mass"]["template"]
             and storage_setting(config["mass"]["template"]) != setting):
         raise ValueError("The series storage_profile differs from its mass template")
+    from ..storage_profile import require_template_colour_coordinate
+    require_template_colour_coordinate(config, config["mass"]["template"])
     storage_request = None
     if "storage" in config:
         from .. import storage_outputs

@@ -246,11 +246,14 @@ def evaluate(pipeline, spec, *, output_capture=None):
     from .n1_models import prepare_response
     from .pixels import evaluate_pixels
 
+    from ..storage_profile import stores_colour_coordinate
+
     frame, x, y, visible, context = pipeline.load_frame(spec)
     config, math = pipeline.config, pipeline.math
+    capture = dict(colour_coordinate=True) if stores_colour_coordinate(config) else {}
     response = prepare_response(
         frame, pipeline.models, math, config["shared"]["swi_by_facies"],
-        solubility_domain=context["flash_support"],
+        solubility_domain=context["flash_support"], **capture,
     )
     weights = np.asarray(response["analysis"].geometry.cached_voxel_volume, np.float64) * 1000.0
     if (not np.isfinite(weights).all() or np.any(weights < 0)
