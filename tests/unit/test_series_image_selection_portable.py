@@ -331,6 +331,7 @@ def _quality_receipt(path, raw_folder, metadata):
 def test_imported_receipt_paths_follow_the_storage_aliases(tmp_path, registry):
     root, raw = _project(tmp_path)
     receipt = _quality_receipt(tmp_path / "quality.json", raw, _metadata(root))
+    saved_receipt = receipt.read_bytes()
     photos = tmp_path / "student" / "photos" / "AC17"
     _move(raw, photos)
     registry({raw: photos})
@@ -341,4 +342,8 @@ def test_imported_receipt_paths_follow_the_storage_aliases(tmp_path, registry):
     assert set(quality["classes"]) == {
         proposal._key(row["source_path"]) for row in metadata.frames
     }
-    assert str(raw) in receipt.read_text() and str(photos) not in receipt.read_text()
+    assert receipt.read_bytes() == saved_receipt
+    assert all(
+        Path(row["source_path"]).parent == raw
+        for row in json.loads(saved_receipt)["selected"]
+    )

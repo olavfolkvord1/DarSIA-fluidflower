@@ -158,28 +158,33 @@ def test_remap_without_aliases_returns_the_authored_text(no_registry, value):
 
 def test_remap_maps_only_values_under_an_alias_prefix(registry, tmp_path):
     clone = tmp_path / "clone"
-    registry({"/srv/nas/series": clone, r"\\NAS\share\raw": tmp_path / "raw"})
+    source = tmp_path / "srv/nas/series"
+    registry({str(source): clone, r"\\NAS\share\raw": tmp_path / "raw"})
     remap = storage_paths.storage_path_remapper()
-    assert remap("/srv/nas/series/config/a.toml") == str(clone / "config/a.toml")
-    assert remap("/srv/nas/series") == str(clone)
+    assert remap(str(source / "config/a.toml")) == str(clone / "config/a.toml")
+    assert remap(str(source)) == str(clone)
     # A Windows-saved path is readable on another machine through its alias.
     assert remap(r"\\NAS\share\raw\AC1\img.jpg") == str(tmp_path / "raw/AC1/img.jpg")
-    for value in ("/srv/nas/series2/a.toml", "data/a.toml", "JPG", "/srv/nas"):
+    for value in (str(source) + "2/a.toml", "data/a.toml", "JPG", str(source.parent)):
         assert remap(value) is value
 
 
 def test_alias_rows_are_normalized_and_longest_first(registry, tmp_path):
-    path = registry({"/srv/A": "/new/a", "/srv/A/deeper": "relative/b"})
+    source = tmp_path / "srv/A"
+    destination = tmp_path / "new/a"
+    path = registry({str(source): str(destination), str(source / "deeper"): "relative/b"})
     assert storage_paths._alias_rows() == [
-        ("/srv/a/deeper", (path.parent / "relative/b").as_posix()),
-        ("/srv/a", "/new/a"),
+        ((source / "deeper").as_posix().casefold(), (path.parent / "relative/b").as_posix()),
+        (source.as_posix().casefold(), destination.as_posix()),
     ]
 
 
 def test_resolve_storage_path_is_unchanged_by_the_refactor(registry, tmp_path):
-    registry({"/srv/old": tmp_path / "new"})
-    assert storage_paths.resolve_storage_path("/srv/old/x") == tmp_path / "new/x"
-    assert storage_paths.resolve_storage_path("/srv/other/x") == Path("/srv/other/x")
+    source = tmp_path / "srv/old"
+    other = tmp_path / "srv/other/x"
+    registry({str(source): tmp_path / "new"})
+    assert storage_paths.resolve_storage_path(str(source / "x")) == tmp_path / "new/x"
+    assert storage_paths.resolve_storage_path(str(other)) == other
 
 
 def test_resolve_with_rows_maps_chains_and_refuses_cycles():
@@ -246,9 +251,10 @@ def test_aliases_remap_values_and_table_keys_of_native_sections(registry, tmp_pa
 
 
 def test_alias_keys_that_meet_one_path_are_refused(registry, tmp_path):
-    registry({"/srv/old": "/srv/new"})
+    source, destination = tmp_path / "srv/old", tmp_path / "srv/new"
+    registry({str(source): str(destination)})
     with pytest.raises(ValueError, match="same path"):
-        utils._with_storage_aliases({"/srv/old/a": "x", "/srv/new/a": "y"})
+        utils._with_storage_aliases({str(source / "a"): "x", str(destination / "a"): "y"})
 
 
 def test_alias_job_workers_keep_their_authored_paths(registry, tmp_path, worker):
