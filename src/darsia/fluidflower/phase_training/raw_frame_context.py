@@ -29,6 +29,7 @@ SUPPORT_CONTRACT = "darsia-raw-frame-feature-source-support-v1"
 # Training on RAW reviews uses baseline B and the previous frame on the native
 # centre, each with its exact valid mask (no extended ring).
 TEMPORAL_CONTRACT = "darsia-raw-native-centre-source-supported-v1"
+OBSERVABLE_DOMAIN = "observable_phase_domain"
 CONTEXT_BINDING_KEYS = frozenset({
     "reference_context_path", "reference_context_sha256",
     "photo_certified_sand_mask_path", "photo_certified_sand_mask_sha256",
@@ -115,12 +116,30 @@ class RawFrameGeometryCohort:
 
     def context(self, index: int, *, fields: Iterable[str] | None = None
                 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-        """Source-bound physical context of one frame, through the V5 derivation."""
-        from .frame_context import V5FrameGeometryCohort
+        """Source-bound context of one frame, through the V5 derivation.
 
-        if fields is None:
+        A request for at most the observable phase domain and the two photo-sand
+        masks, which is what training on a RAW review asks for, needs no physical
+        reference context. Its photo masks come from the unchanged derivation
+        alone (the frame's reference H, the bound photo source, guard and fill
+        policy), and its observable domain is the whole native grid, that
+        derivation's own policy. Any physical or facies field takes the full,
+        strict derivation, which refuses a reference context lacking its fields.
+        """
+        from .frame_context import PHOTO_FIELDS, V5FrameGeometryCohort, derive_frame_context
+
+        requested = None if fields is None else tuple(fields)
+        if requested is not None and set(requested) <= {OBSERVABLE_DOMAIN, *PHOTO_FIELDS}:
+            binding = self.frame(index)
+            photo = set(requested) & set(PHOTO_FIELDS)
+            result = (derive_frame_context(binding, fields=photo, expected_shape_hw=self.shape_hw)
+                      if photo else {})
+            if OBSERVABLE_DOMAIN in requested:
+                result[OBSERVABLE_DOMAIN] = np.ones(self.shape_hw, dtype=bool)
+            return result, binding
+        if requested is None:
             return V5FrameGeometryCohort.context(self, index)
-        return V5FrameGeometryCohort.context(self, index, fields=fields)
+        return V5FrameGeometryCohort.context(self, index, fields=requested)
 
     def H_v5_B_to_frame(self, index: int) -> np.ndarray:
         """Exact baseline B to current native frame transform, as the V5 cohort gives it."""
@@ -195,4 +214,5 @@ class RawFrameGeometryCohort:
         return safe, receipt
 
 
-__all__ = ["CONTEXT_BINDING_KEYS", "CONTRACT", "SUPPORT_CONTRACT", "TEMPORAL_CONTRACT", "RawFrameGeometryCohort"]
+__all__ = ["CONTEXT_BINDING_KEYS", "CONTRACT", "OBSERVABLE_DOMAIN", "SUPPORT_CONTRACT", "TEMPORAL_CONTRACT",
+           "RawFrameGeometryCohort"]

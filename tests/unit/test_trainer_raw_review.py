@@ -14,7 +14,7 @@ import pytest
 from darsia.fluidflower import raw_photographic_review as review
 from darsia.fluidflower.native.config import configure_parameters, reset_parameters
 from darsia.fluidflower.phase_saved_assets import asset
-from .test_raw_frame_context import CONFIGURATION, EXPORTS, _reference_context
+from .test_raw_frame_context import CONFIGURATION, EXPORTS
 from .test_raw_photographic_review import NATIVE_HW, PHASE_HW, inputs  # noqa: F401
 
 # The training alignment and optical-feature parameters are configuration, never
@@ -39,7 +39,11 @@ def trainer(tmp_path, inputs):
     certified[1:-1, 1:-1] = True
     photo = tmp_path / "photo_sand.npz"
     np.savez(photo, photo_certified_sand_domain=certified, photo_boundary_uncertain_domain=~certified)
-    context = _reference_context(tmp_path / "ac28_context.npz")
+    # As on the real RAW run, the AC28 context lacks the physical/safe fields:
+    # training asks only for the observable domain and the photo-sand masks.
+    np.savez(tmp_path / "ac28_partial.npz", domain=certified, facies=certified.astype(np.uint8),
+             permeability=np.ones(NATIVE_HW, np.float32), x_m=np.zeros(NATIVE_HW[1]), y_m=np.zeros(NATIVE_HW[0]))
+    context = asset(tmp_path / "ac28_partial.npz")
     training_context = dict(
         reference_context_path=context["path"], reference_context_sha256=context["sha256"],
         photo_sand_qa_pass=True, photo_sand_qa_scope="certified-photo-sand-mask",

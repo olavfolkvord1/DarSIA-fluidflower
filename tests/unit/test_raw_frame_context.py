@@ -20,7 +20,8 @@ EXPORTS = dict(
     RASTER_FIELDS=dict(value=RASTER, python_type="tuple"),
     PHOTO_FIELDS=dict(value=["photo_certified_sand_domain", "photo_boundary_uncertain_domain"], python_type="tuple"),
     REFERENCE_SAFE_KEY=dict(value="facies_safe_interior", python_type="str"),
-    PHOTO_SAFE_CORE_GUARD_PX=dict(value=1, python_type="int"))
+    PHOTO_SAFE_CORE_GUARD_PX=dict(value=1, python_type="int"),
+    PHOTO_SAFE_CORE_CONTRACT=dict(value="transported_safe_B_sand_core_only", python_type="str"))
 CONFIGURATION = dict(
     support=dict(homography_epsilon=1e-12, coverage_tolerance=1e-6, texture_footprint_hw=[1, 1]),
     saved_review_metadata=dict(training_frame_context=dict(
@@ -76,6 +77,49 @@ def test_transforms_and_context_use_the_v5_derivations(cohort):
     context, binding = cohort.context(0, fields=("domain", "facies"))
     assert binding["frame_index"] == 0
     assert context["domain"][3, 5] and not context["domain"][3, 4] and context["facies"][6, 11] == 2
+
+
+def _photo_only_root(tmp_path, inputs):
+    # Photo-sand masks, but an AC28 context without its physical/safe fields, as on the real run.
+    from darsia.fluidflower import raw_photographic_review as review
+    certified = np.zeros(NATIVE_HW, dtype=bool)
+    certified[2:8, 3:13] = True
+    np.savez(tmp_path / "photo_sand.npz", photo_certified_sand_domain=certified,
+             photo_boundary_uncertain_domain=~certified)
+    np.savez(tmp_path / "ac28_partial.npz", domain=certified, facies=certified.astype(np.uint8),
+             permeability=np.ones(NATIVE_HW, np.float32), x_m=np.zeros(NATIVE_HW[1]), y_m=np.zeros(NATIVE_HW[0]))
+    partial, photo = asset(tmp_path / "ac28_partial.npz"), asset(tmp_path / "photo_sand.npz")
+    review.write_raw_review_root(
+        tmp_path / "photo_review", run="ac52", native_configuration=inputs["configuration"],
+        raw_binding=inputs["binding"], reference=inputs["reference"], frames=inputs["frames"],
+        training_context=dict(reference_context_path=partial["path"], reference_context_sha256=partial["sha256"],
+                              photo_sand_qa_pass=True, photo_sand_qa_scope="certified-photo-sand-mask",
+                              photo_certified_sand_mask_path=photo["path"],
+                              photo_certified_sand_mask_sha256=photo["sha256"]))
+    return tmp_path / "photo_review", certified
+
+
+def test_training_fields_need_no_physical_reference_context(tmp_path, inputs, cohort):
+    root, certified = _photo_only_root(tmp_path, inputs)
+    photo_cohort = raw_context.RawFrameGeometryCohort(root, "ac52")
+    fields = ("observable_phase_domain", "photo_certified_sand_domain", "photo_boundary_uncertain_domain")
+    context, binding = photo_cohort.context(1, fields=iter(fields))
+    assert set(context) == set(fields) and binding["frame_index"] == 1
+    assert context["observable_phase_domain"].all() and context["observable_phase_domain"].shape == NATIVE_HW
+    assert np.array_equal(context["photo_certified_sand_domain"], certified)
+    assert np.array_equal(context["photo_boundary_uncertain_domain"], ~certified)
+    assert photo_cohort.context(0, fields=("observable_phase_domain",))[0]["observable_phase_domain"].all()
+    for physical in (("observable_phase_domain", "domain"), ("facies",), None):
+        with pytest.raises(ValueError, match="missing physical/safe fields"):
+            photo_cohort.context(1, fields=physical)
+
+
+def test_photo_masks_still_need_their_qa(tmp_path, inputs, cohort):
+    root, _certified = _photo_only_root(tmp_path, inputs)
+    bound = raw_context.RawFrameGeometryCohort(root, "ac52").context_binding
+    unchecked = raw_context.RawFrameGeometryCohort(root, "ac52", context_binding=dict(bound, photo_sand_qa_pass=False))
+    with pytest.raises(ValueError, match="independent QA"):
+        unchecked.context(1, fields=("photo_certified_sand_domain",))
 
 
 def test_feature_support_uses_the_raw_records_valid_masks(cohort):
