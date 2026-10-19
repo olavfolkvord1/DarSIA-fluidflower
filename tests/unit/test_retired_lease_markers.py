@@ -170,6 +170,7 @@ def test_input_rejection_marks_the_lease_and_queues_its_decided_retry(
     # worker results root must still be local, as in an actual alias job.
     local_results = None
     if tmp_path.drive.startswith("\\\\"):
+        from pathlib import Path
         import tempfile
         local_results = Path(tempfile.mkdtemp(prefix="n112-local-results-"))
     queue_, clock, callbacks, _events = alias_fixture(
