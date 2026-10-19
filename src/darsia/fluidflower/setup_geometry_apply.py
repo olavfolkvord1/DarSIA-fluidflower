@@ -30,6 +30,7 @@ from darsia.fluidflower.series_geometry import (
     series_run_inputs,
     _storage_path,
 )
+from darsia.fluidflower.storage_paths import storage_path_remapper
 
 
 def _sha(data: bytes) -> str:
@@ -252,7 +253,9 @@ def prepare_crop_plan(
     source_name = str(frame_data.get("image") or "").strip()
     if not source_name:
         raise ValueError("The exported rig frame does not identify its raw photograph.")
-    source = Path(source_name)
+    # The export keeps the absolute path it was made with; this machine may
+    # reach the same raw photograph through a [storage.path_aliases] prefix.
+    source = Path(storage_path_remapper()(source_name))
     if not source.is_absolute():
         raise ValueError("The exported rig frame photograph must be an absolute path.")
     source_photo = PhotoBinding.read(source)

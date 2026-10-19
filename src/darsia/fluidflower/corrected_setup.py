@@ -22,8 +22,8 @@ from darsia.fluidflower.geometry_facies import GEOMETRY_REVISION_FORMAT, Geometr
 from darsia.fluidflower.geometry_workspace_frame import adopted_content_digest, frame_kind, selected_fields
 from darsia.fluidflower.project import utc_now
 from darsia.fluidflower.series_geometry import (
-    NATIVE_SETUP_EXPORT_FORMAT, NATIVE_LABEL_COLORS, native_color_index,
-    native_series_link, _storage_path,
+    NATIVE_SETUP_EXPORT_FORMAT, NATIVE_LABEL_COLORS, geometry_package_root,
+    native_color_index, native_series_link, _storage_path,
 )
 from darsia.fluidflower.setup_geometry_apply import ReadBinding, _exclusive
 from darsia.fluidflower.setup_rig import _require_exact_grid
@@ -223,7 +223,7 @@ def _dual_configuration_binding_v2(value, run, configuration, selected, *, serie
             or re.fullmatch(r"[0-9a-f]{64}", value["comparison_sha256"]) is None):
         raise ValueError("The v2 selected-run configuration metadata is not explicit and complete.")
     if (project_root is None or not Path(project_root).is_absolute()
-            or not _same(project_root, Path(series) / "geometry_facies")
+            or not _same(project_root, geometry_package_root(Path(series)))
             or not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{32}", revision) is None):
         raise ValueError("The v2 output pointer requires the actual series project and revision.")
     original = _configuration_identity(value["source_configuration"])
@@ -328,7 +328,7 @@ def _private_manual_configuration_binding(value,run,configuration,selected,*,ser
     if (not isinstance(value,dict) or set(value)!=keys or value["format"]!=PRIVATE_MANUAL_CONFIGURATION_FORMAT
             or value["run_id"]!=run or re.fullmatch(r"[0-9a-f]{64}",str(value["comparison_sha256"])) is None
             or project_root is None or str(project_root).startswith(("\\\\","//"))
-            or not _same(project_root,Path(series)/"geometry_facies")
+            or not _same(project_root,geometry_package_root(Path(series)))
             or re.fullmatch(r"[0-9a-f]{32}",str(revision)) is None):
         raise ValueError("Private Q121 output binding needs its exact local project/run/revision.")
     original=_configuration_identity(value["source_configuration"])
