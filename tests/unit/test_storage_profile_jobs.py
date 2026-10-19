@@ -427,6 +427,22 @@ def test_the_frame_writer_follows_the_tasks_choice(tmp_path):
     assert not (tmp_path / "legacy_asking_lean").exists()  # Refused before any output.
 
 
+def test_an_explicit_full_task_writes_byte_for_byte_what_the_base_writer_writes(tmp_path, monkeypatch):
+    """The explicit field changes no output byte of the full layout (base 3ee2e7b3 writer)."""
+    from .test_lean_storage import _Clock, _base_writer, _run, _tree
+    config = _synthetic(tmp_path)
+    base = _base_writer()
+    clock = _Clock(monkeypatch, (n1, base))
+    clock.reset()
+    expected = _run(tmp_path, "out", config, module=base, job_id="job")
+    (tmp_path / "out").rename(tmp_path / "base_out")
+    clock.reset()
+    actual = _run(tmp_path, "out", config, job_id="job", storage_profile="full")
+    old, new = _tree(tmp_path / "base_out"), _tree(tmp_path / "out")
+    assert sorted(old) == sorted(new) and [name for name in old if old[name] != new[name]] == []
+    assert json.dumps(expected, sort_keys=True, default=str) == json.dumps(actual, sort_keys=True, default=str)
+
+
 def test_the_series_runner_follows_the_tasks_choice(tmp_path, monkeypatch):
     from darsia.fluidflower.pipeline import series
     config = dict(storage_profile={"profile": "lean"}, mass=dict(template={}))
