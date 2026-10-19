@@ -123,6 +123,19 @@ def test_frame_geometry_cannot_change_the_frozen_reference_placement(fixture):
         raw.validate_frame(row, f.binding, f.parameters)
 
 
+def test_model_sidecar_change_during_loading_is_rejected_before_rendering(fixture, monkeypatch):
+    f = fixture
+    original = photometry.load_baseline
+    def changed(path, **kwargs):
+        result = original(path, **kwargs)
+        with Path(path).with_suffix(".json").open("ab") as stream:
+            stream.write(b" ")
+        return result
+    monkeypatch.setattr(photometry, "load_baseline", changed)
+    with pytest.raises(ValueError, match="binding"):
+        raw.RawRigSourceProcessor(f.path, parameters=f.parameters)
+
+
 def test_catalogue_contains_only_consumed_raw_and_unchanged_model_roles(fixture):
     f = fixture
     catalog = job_inputs.InputCatalog({"scratch": str(f.root)})

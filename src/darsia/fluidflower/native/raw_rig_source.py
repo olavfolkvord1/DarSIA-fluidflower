@@ -20,8 +20,7 @@ import numpy as np
 
 from . import extension, photometry, raw_chart, raw_positioning, raw_positioning_port
 from . import registration, source
-from .io import resolve_asset_path, sha256_file
-from ..pipeline.job_queue import read_json
+from .io import resolve_asset_path, sha256_file, read_bound_json
 
 
 CONTRACT = "darsia-raw-rig-source-v1"
@@ -106,7 +105,7 @@ class RawRigSourceProcessor:
         self.parameters = parameters
         self.binding_path = self._path(binding_path)
         self.binding_sha256 = sha256_file(self.binding_path)
-        self.binding = read_json(self.binding_path)
+        self.binding = read_bound_json(self.binding_path, self.binding_sha256)
         validate_binding(self.binding, parameters)
         b = self.binding
         # Both the NPZ and the exact sidecar are inputs. An internally
@@ -118,13 +117,18 @@ class RawRigSourceProcessor:
             if sidecar != data.with_suffix(".json"):
                 raise ValueError("RAW model sidecar differs from the loader's actual input")
             loaded[name] = photometry.load_baseline(data, parameters=parameters["photometry"])
+            # The legacy model loader derives its sidecar name. Verify both
+            # consumed files again after loading, retaining their outer pins.
+            self._asset(model["data"])
+            self._asset(model["sidecar"])
         fit, grid = loaded["fit"]
         reference, ref_grid = loaded["reference"]
         # The virtual-reference asset has its own historical run string
         # (e.g. a donor-consensus name). Its exact bound bytes define its role.
         if fit.run != b["run"] or grid != ref_grid:
             raise ValueError("RAW source and frozen photometric models/grid differ")
-        fit_receipt = read_json(self._asset(b["models"]["fit"]["sidecar"]))
+        fit_sidecar = b["models"]["fit"]["sidecar"]
+        fit_receipt = read_bound_json(self._asset(fit_sidecar), fit_sidecar["sha256"])
         if fit_receipt["source"]["source_arw_sha256"] != b["baseline_raw"]["sha256"]:
             raise ValueError("RAW baseline acquisition differs from the unchanged B fit")
         old_field = None
