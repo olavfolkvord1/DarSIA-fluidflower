@@ -2293,21 +2293,21 @@ def reference_scope_snapshot(first, lease):
                         entries+=1
                         if entries>value["entry_limit"]:
                             raise CachePolicyError("N43 finite aggregate accounting entry limit exceeded")
-                        pending.append((entry.name,entry.path))
+                        try:
+                            info=Path(entry.path).lstat()
+                        except FileNotFoundError:
+                            anomalies.append(dict(path=entry.path,state="VANISHED_DURING_SAMPLE"));continue
+                        if getattr(info,"st_reparse_tag",0) or getattr(info,"st_file_attributes",0)&0x400:
+                            raise CachePolicyError("N43 aggregate reparse entry refused")
+                        if not stat.S_ISDIR(info.st_mode) and (not stat.S_ISREG(info.st_mode) or info.st_nlink!=1):
+                            raise CachePolicyError("N43 aggregate file type/hardlink refused")
+                        pending.append((entry.name,entry.path,info))
                 # Close this directory's iterator before inspecting children or
                 # descending; an ancestor monitor handle must not span recursion.
-                for name,path in pending:
-                    try:
-                        info=Path(path).lstat()
-                    except FileNotFoundError:
-                        anomalies.append(dict(path=path,state="VANISHED_DURING_SAMPLE"));continue
-                    if getattr(info,"st_reparse_tag",0) or getattr(info,"st_file_attributes",0)&0x400:
-                        raise CachePolicyError("N43 aggregate reparse entry refused")
+                for name,path,info in pending:
                     if stat.S_ISDIR(info.st_mode):
                         walk(Path(path))
                     else:
-                        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
-                            raise CachePolicyError("N43 aggregate file type/hardlink refused")
                         identity=(info.st_dev,info.st_ino)
                         if identity in identities:
                             # A live directory rename can expose the same

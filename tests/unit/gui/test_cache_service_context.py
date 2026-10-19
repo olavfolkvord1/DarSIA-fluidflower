@@ -465,6 +465,123 @@ def test_typed_authorities_cache_cannot_relabel_an_object_or_invalid_rows(docume
         once.read_authorities(pin)
 
 
+@pytest.mark.parametrize("fault", [None,"unnamed_new_close","wrong_current_map"])
+def test_Q134_two_request_time_maps_reconstruct_new_close_then_named_old_first_and_close(tmp_path,monkeypatch,fault):
+    """Real request/Root/map bytes and constructors; external host ledger is synthetic.
+
+    Capacity arithmetic and physical original-service resolution are separate
+    tested boundaries. No authority reader or first/close constructor is mocked.
+    """
+    from tests.unit.gui.test_cache_bootstrap_environment import _historical_authority_case
+    from tests.unit.gui.test_cache_first_qualification import provider
+    from darsia_cache import first_qualification as first
+    from darsia_cache.retained_qualification import RetainedColdScope
+    case=_historical_authority_case(tmp_path)
+    read=lambda binding:bootstrap._exact(binding,case.package)
+    dummy=case.write("unused_metadata.json",{})
+    declared=provider();provider_pin=case.write("provider.json",declared)
+    task={key:value for key,value in declared["scope"].items() if key!="backend"}
+    task.update(attempt_id="2"*32,job_id="TESTONLY-nested")
+    task_pin=case.write("task.json",task)
+    control_root=tmp_path/"synthetic_ledger";control_root.mkdir()
+    contexts={};resolved=[]
+    monkeypatch.setattr(first,"checked_required_capacity_bound",lambda value:{"TESTONLY":"separate capacity boundary"})
+    def output_check(task,value,*,task_binding,read,read_authorities):
+        return {"authority_records":read_authorities(value["answers_source"])}
+    monkeypatch.setattr(first,"checked_output_entitlement",output_check)
+    def make_first(name,*,cold=None,map_pin=None,answers=None):
+        request=dict(format=first.REQUEST,execution_authorized=True,authority_ids=["Q97","Q99"],
+            provider=provider_pin,stores_source=dummy,namespace_admission=declared["namespace_admission"],
+            scope=declared["scope"],task=task_pin,cache_stat_period_seconds=30,
+            public_command=["TESTONLY-python","-B","-m","darsia.fluidflower.worker"])
+        if cold is not None:
+            request.update(format=first.BOUND_REQUEST,
+                authority_ids=["Q97","Q99","Q102","Q104","Q106","Q109","Q117","Q119"],
+                capacity_bound_plan=dummy,q123_cold_scope=cold,
+                output_entitlement_plan=case.write(name+"_output.json",dict(answers_source=answers)))
+        release=dict(format="darsia-cache-first-qualification-root-release-v1",execution_authorized=True,
+            provider=provider_pin,stores_source=dummy,scope=declared["scope"],request_payload_sha256=first._digest(request))
+        if map_pin is not None:release["historical_authority_resolution"]=map_pin
+        request["root_release"]=case.write(name+"_release.json",release)
+        return case.write(name+"_request.json",request)
+    def make_context(label,token):
+        service=case.write(label+"_service.json",dict(TESTONLY=label))
+        context=SimpleNamespace(entry_kind="worker",purpose="jobs",reservation=dict(token=token,pool="a"*64,sha256="b"*64),
+            manifest=dict(owner=deepcopy(PRIMARY)),ledger=SimpleNamespace(bound=dict(path=str(control_root))),
+            policy=SimpleNamespace(root=str(tmp_path/"synthetic_cache")))
+        contexts[service["path"]]=context
+        return service,context
+    def make_close(name,service,original_request,context,*,map_pin=None,answers=None):
+        request=dict(format="darsia-cache-retained-service-close-request-v1",authority_ids=["Q123"],
+            original_service_receipt=service,original_request=original_request,original_native_retirement=dummy,
+            original_lifecycle_eligibility=dummy,recorded_owner_retirement=dummy,retained_cache_inventory=dummy,
+            answers_source=answers)
+        release=dict(format="darsia-cache-retained-service-close-root-release-v1",execution_authorized=True,
+            request_payload_sha256=first._digest(request))
+        if map_pin is not None:release["historical_authority_resolution"]=map_pin
+        request["root_release"]=case.write(name+"_release.json",release)
+        request_pin=case.write(name+"_request.json",request)
+        raw=b'{"TESTONLY":"closed metadata; no operation performed"}'
+        path=control_root/("cache-c-"+context.reservation["token"]+".json");path.write_bytes(raw)
+        close_pin=dict(path=str(path),sha256=hashlib.sha256(raw).hexdigest(),size_bytes=len(raw))
+        result=dict(format="darsia-cache-retained-service-close-result-v1",request=request_pin,
+            reservation=context.reservation,close_record=close_pin,original_service_receipt=service,
+            original_lifecycle_eligibility=dummy,original_native_retirement=dummy,retained_cache_inventory=dummy,
+            all_files_retained=True,retained_bytes_are_still_used=True,cleanup_authorized=False,rearm_authorized=False)
+        return request_pin,case.write(name+"_result.json",result)
+    def cold(name,result,answers):
+        return case.write(name+"_cold.json",dict(format="darsia-q123-bound-cold-scope-v1",authority_ids=["Q123"],
+            answers_source=answers,original_close_result=result,retained_cache_inventory=dummy,
+            matplotlib_namespace=dict(path=str(tmp_path/name/"mpl"),identity=dict(TESTONLY="not admitted"))))
+    base_first=make_first("old_base")
+    old_service,old_context=make_context("old_base","a"*32)
+    old_close,old_result=make_close("old_close",old_service,base_first,old_context,answers=case.old_pin)
+    old_first=make_first("old_first",cold=cold("old_first",old_result,case.old_pin),answers=case.old_pin)
+    map1=deepcopy(case.value);map1["preserved_requests"]=[base_first,old_close,old_first]
+    map1_pin=case.write("map1_at_new_close_request_time.json",map1)
+    new_service,new_context=make_context("failed_old_first","b"*32)
+    new_close,new_result=make_close("new_close",new_service,old_first,new_context,
+        map_pin=map1_pin,answers=case.current_pin)
+    later=case.current+[{"id":"later_request_authority","decided_by":"claude"}]
+    live_later=case.write("claude_answers.json",later)
+    later_snapshot=case.write("later_answers_snapshot.json",later)
+    live_status=case.write("claude_status.json",dict(seq=264))
+    status_snapshot=case.write("later_status_snapshot.json",dict(seq=264))
+    map2=deepcopy(map1)
+    map2["current_authorities"]=dict(claude_answers=dict(source=live_later,snapshot=later_snapshot),
+        claude_status=dict(source=live_status,snapshot=status_snapshot))
+    if fault!="unnamed_new_close":map2["preserved_requests"].append(new_close)
+    map2_pin=case.write("map2_at_later_first_request_time.json",map2)
+    new_first=make_first("new_first",cold=cold("new_first",new_result,later_snapshot),
+        map_pin=map1_pin if fault=="wrong_current_map" else map2_pin,answers=later_snapshot)
+    def original_context(service,*,package_file,first_request=None,retained_close=None,historical_authorities=None):
+        # Stand in only for original host/ledger metadata. Exercise the actual
+        # nested first constructor, which recursively builds the actual old close.
+        child=first.FirstQualification(first_request,provider_binding=provider_pin,stores_source=dummy,
+            namespace=declared["namespace_admission"],read=read,
+            read_authorities=historical_authorities.for_original(first_request),
+            historical_authorities=historical_authorities)
+        resolved.append(first_request)
+        if first_request==old_first:
+            assert isinstance(child.q123_cold_scope,RetainedColdScope)
+        return contexts[service["path"]]
+    monkeypatch.setattr(resolver,"resolve_original_service_context",original_context)
+    monkeypatch.setattr(resolver.RetainedServiceCloseContext,"close_retained",
+        lambda self:pytest.fail("Constructors must never perform a close"))
+    if fault is not None:
+        with pytest.raises(CachePolicyError):
+            first.FirstQualification(new_first,provider_binding=provider_pin,stores_source=dummy,
+                namespace=declared["namespace_admission"],read=read,read_authorities=lambda pin:pytest.fail("outer stale reader"))
+        assert not resolved
+    else:
+        current=first.FirstQualification(new_first,provider_binding=provider_pin,stores_source=dummy,
+            namespace=declared["namespace_admission"],read=read,read_authorities=lambda pin:pytest.fail("outer stale reader"))
+        assert isinstance(current.q123_cold_scope.closed,resolver.RetainedServiceCloseContext)
+        assert resolved==[base_first,old_first]
+        assert current.historical_authorities.binding==map2_pin
+        assert new_close not in map1["preserved_requests"] and new_close in map2["preserved_requests"]
+
+
 @pytest.mark.parametrize("new_format", [
     "darsia-cache-volume-bound-import-profile-v1",
     "darsia-cache-volume-bound-job-profile-v1",

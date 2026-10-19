@@ -142,7 +142,9 @@ def _historical_authority_case(tmp_path):
         raw = json.dumps(value, indent=1).encode() if raw is None else raw
         path.write_bytes(raw)
         return dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
-    old = [{"id": "N43", "decided_by": "olav"}, {"id": "Q123", "decided_by": "claude"}]
+    old = [{"id": "N43", "decided_by": "olav"},
+        {"id": "Q123-answer-option1-append-only-closeout-and-new-empty-exclusive-scope-retained-bytes-counted",
+            "decided_by": "claude"}]
     old_raw = json.dumps(old, indent=1).encode()
     live_answers = write("claude_answers.json", old, raw=old_raw)
     historical_snapshot = write("historical_answers.json", old, raw=old_raw)
@@ -257,3 +259,31 @@ def test_q134_metadata_once_uses_explicit_original_reader_and_preserves_copy_gua
     assert once.read_authorities(case.old_pin) == case.old
     with pytest.raises(CachePolicyError, match="descriptor changed"):
         once.read_authorities({**case.old_pin, "sha256": "a" * 64})
+
+
+def test_q134_live_append_after_stable_capture_is_not_reopened_or_adopted(monkeypatch,tmp_path):
+    from pathlib import Path
+    case = _historical_authority_case(tmp_path)
+    reader = bootstrap._HistoricalAuthorityReader(case.binding, case.package)
+    live = Path(case.value["current_authorities"]["claude_answers"]["source"]["path"])
+    original_open, original_decode = Path.open, bootstrap._authority_records
+    reads=[]
+    def counted_open(path, mode="r", *args, **kwargs):
+        if path == live and "r" in mode:
+            reads.append(str(path))
+        return original_open(path, mode, *args, **kwargs)
+    def append_before_parse(raw):
+        case.write("claude_answers.json", case.current + [{"id": "appended_after_stable_capture"}])
+        return original_decode(raw)
+    monkeypatch.setattr(Path,"open",counted_open)
+    monkeypatch.setattr(bootstrap,"_authority_records",append_before_parse)
+    reader._verify_actual_prefix(case.current)
+    assert reads == [str(live)]
+    monkeypatch.setattr(bootstrap,"_authority_records",original_decode)
+    assert reader.current_authorities(case.current_pin) == case.current
+
+
+@pytest.mark.parametrize("raw", [b'[{"id":"a","id":"b"}]', b'[{"x":NaN}]', b'[null]', b'{}'])
+def test_q134_captured_prefix_decoder_keeps_duplicate_nonfinite_and_list_guards(raw):
+    with pytest.raises(CachePolicyError):
+        bootstrap._authority_records(raw)

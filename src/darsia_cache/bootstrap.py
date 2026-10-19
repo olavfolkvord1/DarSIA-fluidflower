@@ -89,6 +89,11 @@ def _exact_authority_list(binding, package_file):
     if (version(before) != version(after) or len(raw) != pin["size_bytes"]
             or hashlib.sha256(raw).hexdigest() != pin["sha256"]):
         raise CachePolicyError("Authority metadata SHA/size/version changed")
+    return _authority_records(raw)
+
+
+def _authority_records(raw):
+    """Decode one captured raw authority list with the original strict parser."""
     from .capacity import _json_bytes
     # Reuse the original duplicate-key/nonfinite parser without changing the
     # original artifact bytes or the ordinary object-only metadata reader.
@@ -173,13 +178,13 @@ class _HistoricalAuthorityReader:
         before = path.stat()
         if not 0 < before.st_size <= 16 * 1024**2:
             raise CachePolicyError("Bounded current authority prefix source required")
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            raw = stream.read(before.st_size + 1)
         after = path.stat()
         version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
         if version(before) != version(after) or len(raw) != before.st_size:
             raise CachePolicyError("Current authority prefix source changed while reading")
-        actual = _exact_authority_list(dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(),
-            size_bytes=len(raw)), self.package_file)
+        actual = _authority_records(raw)
         if actual[:len(snapshot)] != snapshot:
             raise CachePolicyError("Current authority entry-prefix provenance differs")
 
