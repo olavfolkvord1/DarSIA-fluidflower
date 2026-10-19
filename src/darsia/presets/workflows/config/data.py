@@ -44,7 +44,7 @@ class DataConfig:
         metadata={
             "name": "Format",
             "help": "Image file format/extension.",
-            "options": ["JPG", "PNG", "TIF", "TIFF", "BMP"],
+            "options": ["JPG", "PNG", "TIF", "TIFF", "BMP", "ARW", "NEF", "DNG"],
             "group": "Input",
         },
     )
