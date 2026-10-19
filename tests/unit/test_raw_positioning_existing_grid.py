@@ -51,7 +51,8 @@ def source(tmp_path, monkeypatch):
     parameters = dict(edge_aware=edge, common=dict(
         sensor=dict(raw_wh=[16, 12], camera_wh=[12, 8], content_wh=[9, 6],
                     black_level=1008, black_levels=[1008] * 4, white_maximum=16383,
-                    cfa_pattern=[[0, 1], [3, 2]], color_description="RGBG", tile_rows=3),
+                    cfa_pattern=[[0, 1], [3, 2]], color_description="RGBG", tile_rows=3,
+                    green_mean_weight=.5, plane_stride=2),
         profiles=dict(calibrated=dict(distortion=list(zeros), coefficients=dict(
             cu=5.5, cv=3.5, tx=0., ty=0., R=8., amp=1.))),
         lens=dict(knots=[0., .5, 1.], distortion_denominator=16384.,
@@ -89,6 +90,9 @@ def test_scientific_samples_match_the_existing_renderer_bit_for_bit(source, monk
     Image.fromarray(np.zeros((8, 12, 3), np.uint8)).save(camera)
     Image.fromarray(np.zeros((6, 9, 3), np.uint8)).save(review)
     monkeypatch.setattr(legacy, "review_to_camera", lambda *a, **k: (homography, {}))
+    # This oracle fixes H to compare DN sampling. Independent registration QA
+    # requires real-sized scenes and is covered by test_native_registration.
+    monkeypatch.setattr(legacy, "raw_review_residual", lambda *a, **k: {})
     original, _ = legacy.registered_edge_aware_sensor_linear(
         source.path, camera, review, expected_source_hashes=dict(
             arw_sha256=source.digest, camera_jpeg_sha256=sha256(camera.read_bytes()).hexdigest(),
