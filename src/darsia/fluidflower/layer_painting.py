@@ -48,6 +48,7 @@ from darsia.fluidflower.series_geometry import (
     RigFrame,
     SeriesRunInputs,
     _resolved_points,
+    native_series_link,
     photo_size,
     saved_injection_points,
 )
@@ -872,8 +873,24 @@ def photo_camera_u(project: FluidFlowerProject, run_id: str, path: Path | str | 
 
     from darsia.fluidflower.image_formats import image_family
 
-    root = getattr(project, "root", None)
-    if path is None or root is None or image_family(path) != "raw":
+    if path is None or image_family(path) != "raw":
+        return None
+    return run_camera_u(project, run_id)
+
+
+def run_camera_u(project: FluidFlowerProject, run_id: str):
+    """The camera-U profile configured for a run of the project's series, or None.
+
+    The profiles live in the series' series.toml [native] document. A
+    geometry-and-facies package is not the series root: it names that root in
+    its manifest (tools.native_series.series_root). Any other project is taken
+    to be the series root itself. A present but malformed profile raises.
+    """
+
+    manifest = getattr(project, "manifest", None)
+    linked = native_series_link(project).get("series_root") if isinstance(manifest, Mapping) else None
+    root = linked or getattr(project, "root", None)
+    if root is None:
         return None
     from darsia.fluidflower.series_native_context import camera_u_profile
 
@@ -2141,6 +2158,7 @@ __all__ = [
     "load_painting_session",
     "photo_camera_u",
     "reference_camera_u",
+    "run_camera_u",
     "load_proposal",
     "merge_small_regions",
     "minimum_region_pixels",

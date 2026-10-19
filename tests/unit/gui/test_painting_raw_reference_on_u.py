@@ -109,6 +109,22 @@ def test_the_camera_u_of_a_photo_needs_a_raw_and_a_profiled_run(tmp_path, raw_fi
     assert lp.reference_camera_u(project, None) is None
 
 
+def test_a_geometry_package_finds_the_camera_u_in_its_linked_series(tmp_path, raw_file):
+    # FF_AC's layout: the painting project is the geometry package inside the
+    # series, and only its manifest link names the series root.
+    root = _series(tmp_path, {"AC17": "early"})
+    package = root / "geometry_facies"
+    package.mkdir()
+    linked = _Project(package)
+    linked.manifest["tools"] = {"native_series": {"series_root": str(root)}}
+    found = lp.run_camera_u(linked, "ac17")
+    assert (found.profile_id, found.camera_wh) == ("early", (80, 60))
+    assert lp.photo_camera_u(linked, "ac17", raw_file) == found
+    assert lp.run_camera_u(_Project(root), "ac17") == found  # A series root itself.
+    assert lp.run_camera_u(_Project(package), "ac17") is None  # No link, no series.toml.
+    assert lp.run_camera_u(_Project(None), "ac17") is None
+
+
 def test_a_raw_painting_image_on_u_has_the_u_size(raw_file, profile, renders):
     image = lp.load_painting_image(raw_file, camera_u=profile)
     assert image.image_size == (80, 60) and image.camera_u is profile

@@ -2982,10 +2982,8 @@ class LayerPainterView(QWidget):
             return None
         key = (str(root), str(reference.run_id))
         if self._camera_u_key != key:
-            from darsia.fluidflower.series_native_context import camera_u_profile
-
             try:
-                self._camera_u = camera_u_profile(root, reference.run_id)
+                self._camera_u = lp.run_camera_u(self.project, reference.run_id)
             except (OSError, ValueError, KeyError, TypeError):
                 self._camera_u = None
             self._camera_u_key = key

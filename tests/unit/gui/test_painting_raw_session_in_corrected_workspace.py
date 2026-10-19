@@ -20,7 +20,9 @@ from PySide6.QtWidgets import QMenu
 
 from darsia.fluidflower import geometry_workspace_frame as workspace_frame
 from darsia.fluidflower import layer_painting as lp
+from darsia.fluidflower import photograph_io
 from darsia.fluidflower import series_layer_view as slv
+from darsia.fluidflower.native import raw_photograph
 from darsia.fluidflower.series_geometry import SeriesRunInputs
 from darsia.fluidflower.series_layer_view import LayerPainterView
 
@@ -229,3 +231,50 @@ def test_a_session_without_marks_keeps_the_corrected_view(make_view, project):
     assert view.image is not None
     assert view.image.image_size == (CORRECTED_SHAPE[1], CORRECTED_SHAPE[0])
     assert not view.canvas.paint_enabled
+
+
+def test_a_raw_session_on_a_camera_raw_opens_on_u_from_the_linked_series(
+    qtbot, monkeypatch, settings, tmp_path, paths, project
+):
+    # FF_AC's layout: the project is the geometry package, its manifest links
+    # the series root, and that series profiles the run's camera RAW on grid U.
+    # The marks were drawn on U, so the tab must find the profile through the
+    # link and open the RAW on U instead of clearing the canvas.
+    series = paths["baseline"].parent
+    document = {
+        "registration": {"common": {"profiles": {"early": {}},
+                                    "sensor": {"camera_wh": list(RAW_SIZE)}}},
+        "source": {"profiles": {"AC52": "early"}},
+    }
+    raw = json.dumps(document).encode("utf-8")
+    (series / "native.json").write_bytes(raw)
+    (series / "series.toml").write_text(
+        f'[native]\nconfiguration = "native.json"\nsha256 = "{hashlib.sha256(raw).hexdigest()}"\n',
+        encoding="utf-8",
+    )
+    project.manifest["tools"] = {"native_series": {"series_root": str(series)}}
+    camera_raw = series / "DSC00441.ARW"
+    camera_raw.write_bytes(b"synthetic camera RAW placeholder")
+    rendered = (90, 180, 120)
+    monkeypatch.setattr(
+        raw_photograph, "load_camera_u_rgb8",
+        lambda path, **kwargs: np.full((RAW_SIZE[1], RAW_SIZE[0], 3), rendered, dtype=np.uint8),
+    )
+    photograph_io._CAMERA_U_CACHE.clear()
+    saved = _save_session(project, _corrected_path(project), RAW_SIZE, [RAW_POLYGON])
+    marks_before = json.loads(saved.read_text(encoding="utf-8"))["polygons"]
+    monkeypatch.setattr(QMenu, "popup", lambda self, *args, **kwargs: None)
+    reference = SeriesRunInputs(
+        "ac52", paths["config"], baseline_image=camera_raw, width_m=0.9, height_m=0.49
+    )
+    view = LayerPainterView(project, lambda: reference)
+    qtbot.addWidget(view)
+    view.resize(1400, 900)
+    view.show()
+    qtbot.waitExposed(view)
+    assert view.image is not None and view.image.image_size == RAW_SIZE
+    assert view.image.camera_u is not None and str(view.image.path) == str(camera_raw)
+    assert view.canvas.paint_enabled
+    assert [polygon.to_list() for polygon in view.session.polygons] == marks_before
+    assert view.propose_status.text() == slv._RAW_SESSION_NOTE
+    assert view.background_available()
