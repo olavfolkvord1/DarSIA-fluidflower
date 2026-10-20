@@ -62,6 +62,8 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGraphicsEllipseItem,
@@ -92,6 +94,9 @@ from PySide6.QtWidgets import (
 )
 
 from darsia.fluidflower import layer_painting as lp
+from darsia.fluidflower.layer_painting_join import (
+    JoinEdgesError, JoinPreview, join_to_neighbour,
+)
 from darsia.fluidflower.image_formats import image_family, photo_dialog_filter
 from darsia.fluidflower.project import utc_now
 from darsia.fluidflower.series_geometry import (
@@ -2472,6 +2477,116 @@ class LayerCanvas(QGraphicsView):
 # Step sections
 
 
+class _JoinEdgesDialog(QDialog):
+    """Preview the old and shared stretches on the photograph before applying."""
+
+    def __init__(self, parent, canvas, points, neighbours, pixels_per_mm):
+        super().__init__(parent)
+        self.setWindowTitle("Join to neighbour's edge")
+        self.canvas = canvas
+        self.points = points
+        self.neighbours = neighbours
+        self.pixels_per_mm = pixels_per_mm
+        self.preview: JoinPreview | None = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "The selected polygon follows the neighbour's outline within the distance.\n"
+            "The neighbour keeps its outline. Orange: old stretches; cyan: shared edge."
+        ))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Neighbour"))
+        self.neighbour = QComboBox()
+        for index, label, _points in neighbours:
+            self.neighbour.addItem(label, index)
+        row.addWidget(self.neighbour)
+        row.addWidget(QLabel("Distance"))
+        self.distance = QDoubleSpinBox()
+        self.distance.setRange(0.0, lp.MAX_SNAP_MM)
+        self.distance.setDecimals(2)
+        self.distance.setValue(5.0)
+        self.distance.setSuffix(" mm")
+        row.addWidget(self.distance)
+        layout.addLayout(row)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.old_item = QGraphicsPathItem()
+        self.new_item = QGraphicsPathItem()
+        self.error_item = QGraphicsPathItem()
+        for item, color, style in (
+            (self.old_item, "#ff9900", Qt.PenStyle.DashLine),
+            (self.new_item, "#00ffff", Qt.PenStyle.SolidLine),
+            (self.error_item, "#ff3333", Qt.PenStyle.SolidLine),
+        ):
+            pen = QPen(QColor(color), 3.0, style)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setZValue(40.0)
+            canvas.scene().addItem(item)
+        self.neighbour.currentIndexChanged.connect(self.refresh_preview)
+        self.distance.valueChanged.connect(self.refresh_preview)
+        self.finished.connect(self.clear_preview)
+        self.refresh_preview()
+
+    def _path(self, stretches):
+        path = QPainterPath()
+        for points in stretches:
+            if points:
+                path.moveTo(self.canvas.raw_to_scene(*points[0]))
+                for point in points[1:]:
+                    path.lineTo(self.canvas.raw_to_scene(*point))
+        return path
+
+    def refresh_preview(self, *_args):
+        self.preview = None
+        self.old_item.setPath(QPainterPath())
+        self.new_item.setPath(QPainterPath())
+        self.error_item.setPath(QPainterPath())
+        try:
+            other = self.neighbours[self.neighbour.currentIndex()][2]
+            self.preview = join_to_neighbour(
+                self.points, other, self.distance.value() * self.pixels_per_mm
+            )
+            self.old_item.setPath(self._path([row.before for row in self.preview.stretches]))
+            self.new_item.setPath(self._path([row.after for row in self.preview.stretches]))
+            count = len(self.preview.stretches)
+            length = self.preview.length_px / self.pixels_per_mm
+            self.summary.setText(
+                f"{count} stretch{'es' if count != 1 else ''}, {length:.2f} mm of old outline. "
+                + ("Apply changes both polygons in one undo step."
+                   if count else "No stretch can be joined at this distance.")
+                + ("\nLengths: " + "; ".join(
+                    f"{number}: {stretch.length_px / self.pixels_per_mm:.2f} mm"
+                    for number, stretch in enumerate(self.preview.stretches, 1)
+                ) if count else "")
+            )
+        except JoinEdgesError as error:
+            self.summary.setText(str(error))
+            if error.location is not None:
+                point = self.canvas.raw_to_scene(*error.location)
+                size = 7.0 / max(abs(self.canvas.transform().m11()), 1.0e-6)
+                path = QPainterPath()
+                path.moveTo(point.x() - size, point.y() - size)
+                path.lineTo(point.x() + size, point.y() + size)
+                path.moveTo(point.x() - size, point.y() + size)
+                path.lineTo(point.x() + size, point.y() - size)
+                self.error_item.setPath(path)
+        self.buttons.button(QDialogButtonBox.StandardButton.Apply).setEnabled(
+            self.preview is not None and bool(self.preview.stretches)
+        )
+
+    def clear_preview(self, *_args):
+        for item in (self.old_item, self.new_item, self.error_item):
+            if item.scene() is not None:
+                item.scene().removeItem(item)
+
+
 class StepSection(QFrame):
     """A numbered step with a header that folds its content."""
 
@@ -3216,6 +3331,13 @@ class LayerPainterView(QWidget):
         self.canvas.set_follow_edges(self.follow_edges.isChecked())
         self.follow_edges.toggled.connect(self._follow_edges_toggled)
         tools.addWidget(self.follow_edges)
+        self.join_edge_button = QToolButton()
+        self.join_edge_button.setText("Join edge…")
+        self.join_edge_button.setToolTip(
+            "Join the selected polygon to a shown neighbour's edge; preview before applying"
+        )
+        self.join_edge_button.clicked.connect(lambda: self._join_selected_polygon())
+        tools.addWidget(self.join_edge_button)
         tools.addSpacing(8)
         tools.addWidget(QLabel("Brush"))
         self.brush_size = QSlider(Qt.Orientation.Horizontal)
@@ -4886,6 +5008,8 @@ class LayerPainterView(QWidget):
                     index, at[0], at[1]
                 )
             )
+        join = menu.addAction("Join to neighbour's edge…")
+        join.triggered.connect(lambda _checked=False: self._join_polygon_dialog(index))
         move = menu.addMenu("Move to layer")
         for row in self.session.layers:
             action = move.addAction(_swatch(row.color), row.name)
@@ -4900,6 +5024,76 @@ class LayerPainterView(QWidget):
         delete.triggered.connect(lambda _checked=False: self.delete_polygon(index))
         self._polygon_menu_widget = menu
         menu.popup(position)
+
+    def _join_selected_polygon(self) -> None:
+        indices = {index for index, _vertex in self.canvas.selected_points}
+        if len(indices) != 1:
+            self._canvas_notice("Select points of one polygon with Edit, or right-click its outline.")
+            return
+        self._join_polygon_dialog(next(iter(indices)))
+
+    def _join_polygon_dialog(self, index: int) -> None:
+        if self.session is None or self.image is None or self.busy():
+            return
+        if not 0 <= index < len(self.session.polygons):
+            return
+        target = self.session.polygons[index]
+        if target.layer_id in self.canvas.hidden_layers:
+            return
+        neighbours = []
+        from shapely.geometry import LineString
+
+        outline = LineString([*target.points, target.points[0]])
+        for number, polygon in enumerate(self.session.polygons):
+            if number == index or polygon.layer_id in self.canvas.hidden_layers:
+                continue
+            layer = self.session.layer(polygon.layer_id)
+            label = f"{layer.name if layer else 'Layer'} · polygon {number + 1}"
+            points = list(polygon.points)
+            distance = outline.distance(LineString([*points, points[0]]))
+            neighbours.append((distance, number, label, points))
+        if not neighbours:
+            self._canvas_notice("Show another polygon to join to its edge.")
+            return
+        neighbours.sort(key=lambda row: (row[0], row[1]))
+        per_mm = lp.snap_pixels(1.0, self.current_frame(), (1.0, 1.0), self.image.image_size)
+        dialog = _JoinEdgesDialog(self, self.canvas, list(target.points),
+                                  [(n, label, pts) for _d, n, label, pts in neighbours], per_mm)
+        # The modal dialog prevents edits between its preview and Apply.
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.preview is not None:
+                self._apply_join_preview(index, int(dialog.neighbour.currentData()), dialog.preview)
+        finally:
+            dialog.clear_preview()
+            dialog.deleteLater()
+
+    def _apply_join_preview(self, index: int, neighbour: int, preview: JoinPreview) -> bool:
+        if self.session is None or not preview.stretches or self.busy():
+            return False
+        if index == neighbour or any(
+            not 0 <= number < len(self.session.polygons)
+            or self.session.polygons[number].layer_id in self.canvas.hidden_layers
+            for number in (index, neighbour)
+        ):
+            return False
+        changes = {
+            index: lp.Polygon(self.session.polygons[index].layer_id, list(preview.target)),
+            neighbour: lp.Polygon(self.session.polygons[neighbour].layer_id, list(preview.neighbour)),
+        }
+        try:
+            # Validate both before either changes, so this is an atomic edit.
+            for polygon in changes.values():
+                self.session._check_polygon(polygon)
+        except ValueError as error:
+            self._canvas_notice(str(error))
+            return False
+        self._push_undo()
+        for number, polygon in changes.items():
+            self.session.replace_polygon(number, polygon)
+        self.canvas.clear_selection()
+        self._after_mark_change()
+        self._canvas_notice("Joined to the neighbour's edge. Ctrl+Z restores both polygons.")
+        return True
 
     def _draft_changed(self, count: int) -> None:
         if count:
