@@ -24,6 +24,12 @@ revision and exports it for native Setup.
 Polygons and strokes are stored in raw-image pixels (row, col), strokes with a
 brush radius in raw pixels, in ``<package>/annotations/layer_painting/<run>.json``.
 The latest proposal is stored next to it.
+
+Hand corrections are drawn on top of a proposal: brush strokes and lasso
+outlines that give pixels a layer, region fills, and restore strokes that bring
+the proposal back. They are stored in their own file next to the session and
+never change the polygons, the strokes or the proposal; the saved map is the
+proposal with the corrections applied in drawing order.
 """
 
 from __future__ import annotations
@@ -1819,6 +1825,308 @@ def load_proposal(project: FluidFlowerProject, run_id: str) -> LayerProposal | N
 
 
 # ---------------------------------------------------------------------------
+# Hand corrections on top of a proposal
+
+LAYER_CORRECTIONS_FORMAT = "darsia-fluidflower-layer-corrections-v1"
+CORRECTION_KINDS = ("brush", "restore", "lasso", "fill")
+_CORRECTION_POINTS = {"brush": 1, "restore": 1, "lasso": 3, "fill": 1}
+
+
+@dataclass
+class Correction:
+    """A hand correction drawn on top of a proposal; points in raw pixels (row, col).
+
+    ``brush`` gives the pixels along ``points`` (radius ``radius_px``) the
+    layer; ``restore`` brushes the proposal back there, which undoes earlier
+    corrections; ``lasso`` gives the inside of the closed outline ``points``
+    the layer; ``fill`` gives the connected region at ``points[0]`` the layer
+    while that region still has ``replaced_layer``. ``proposal_digest`` names
+    the proposal the correction was drawn on. Coordinates are kept to 0.1 px
+    and the radius to 0.01 px, as saved.
+    """
+
+    kind: str
+    layer_id: int
+    points: list[tuple[float, float]]
+    radius_px: float = 0.0
+    replaced_layer: int | None = None
+    proposal_digest: str = ""
+    created_utc: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in CORRECTION_KINDS:
+            raise ValueError(f"Unknown correction {self.kind!r}")
+        self.points = [
+            (round(float(row), 1), round(float(col), 1)) for row, col in self.points
+        ]
+        if len(self.points) < _CORRECTION_POINTS[self.kind]:
+            raise ValueError(
+                "A lasso needs an outline of at least three points"
+                if self.kind == "lasso"
+                else "A correction needs a point"
+            )
+        if self.kind == "restore":
+            self.layer_id = ERASER
+        elif not 0 < int(self.layer_id) < 256:
+            raise ValueError("A correction needs a layer")
+        self.layer_id = int(self.layer_id)
+        self.radius_px = round(float(self.radius_px), 2)
+        if self.kind in ("brush", "restore") and self.radius_px <= 0.0:
+            raise ValueError("A brush correction needs a positive radius")
+        if self.kind == "fill":
+            if self.replaced_layer is None:
+                raise ValueError("A fill names the layer it replaces")
+            self.replaced_layer = int(self.replaced_layer)
+
+    def to_dict(self) -> dict[str, Any]:
+        row: dict[str, Any] = {"kind": self.kind, "layer_id": self.layer_id}
+        if self.kind in ("brush", "restore"):
+            row["radius_px"] = self.radius_px
+        if self.kind == "fill":
+            row["replaced_layer"] = self.replaced_layer
+        row["points"] = [[row_px, col_px] for row_px, col_px in self.points]
+        row["proposal_digest"] = self.proposal_digest
+        row["created_utc"] = self.created_utc
+        return row
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> Correction:
+        replaced = payload.get("replaced_layer")
+        return cls(
+            kind=str(payload.get("kind") or ""),
+            layer_id=int(payload.get("layer_id") or 0),
+            points=[
+                (float(row), float(col)) for row, col in payload.get("points") or []
+            ],
+            radius_px=float(payload.get("radius_px") or 0.0),
+            replaced_layer=None if replaced is None else int(replaced),
+            proposal_digest=str(payload.get("proposal_digest") or ""),
+            created_utc=str(payload.get("created_utc") or ""),
+        )
+
+
+def corrections_path(project: FluidFlowerProject, run_id: str) -> Path:
+    """The run's hand-correction file, next to its session and proposal."""
+
+    return painting_folder(project) / f"{_file_stem(run_id)}.corrections.json"
+
+
+def load_corrections(project: FluidFlowerProject, run_id: str) -> list[Correction]:
+    """The run's hand corrections in drawing order; none without a file."""
+
+    path = corrections_path(project, run_id)
+    if not path.is_file():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if payload.get("format") != LAYER_CORRECTIONS_FORMAT:
+        raise ValueError("Unsupported layer correction file")
+    return [Correction.from_dict(row) for row in payload.get("corrections") or []]
+
+
+def save_corrections(
+    project: FluidFlowerProject,
+    run_id: str,
+    corrections: Sequence[Correction],
+    *,
+    actor: str = "",
+) -> Path | None:
+    """Write the run's hand corrections, one per line; returns the file.
+
+    Without corrections and without an earlier file nothing is written (None),
+    so a proposal that is never corrected gains no file.
+    """
+
+    path = corrections_path(project, run_id)
+    if not corrections and not path.exists():
+        return None
+    header = {
+        "schema": 1,
+        "format": LAYER_CORRECTIONS_FORMAT,
+        "run_id": str(run_id),
+        "updated_utc": utc_now(),
+        "updated_by": str(actor or ""),
+    }
+    text = json.dumps(header, indent=2, ensure_ascii=False)
+    text = text[: text.rfind("}")].rstrip()
+    lines = ",\n".join(
+        "    " + json.dumps(row.to_dict(), separators=(",", ":"), ensure_ascii=False)
+        for row in corrections
+    )
+    body = "\n" + lines + "\n  " if corrections else ""
+    text += ',\n  "corrections": [' + body + "]"
+    text += "\n}\n"
+    _atomic_write_text(path, text)
+    return path
+
+
+def corrections_digest(corrections: Sequence[Correction]) -> str:
+    """SHA-256 of the corrections as saved ("" for none)."""
+
+    if not corrections:
+        return ""
+    rows = [row.to_dict() for row in corrections]
+    return hashlib.sha256(
+        json.dumps(rows, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _grid_seed(
+    point: tuple[float, float], shape: tuple[int, int], scale: tuple[float, float]
+) -> tuple[int, int] | None:
+    row = int(round((point[0] + 0.5) * scale[0] - 0.5))
+    col = int(round((point[1] + 0.5) * scale[1] - 0.5))
+    if 0 <= row < shape[0] and 0 <= col < shape[1]:
+        return row, col
+    return None
+
+
+def layer_at(
+    classes: np.ndarray, point: tuple[float, float], scale: tuple[float, float]
+) -> int | None:
+    """The class under a raw point (row, col) on a grid, or None off the grid."""
+
+    seed = _grid_seed(point, classes.shape, scale)
+    return None if seed is None else int(classes[seed])
+
+
+def _correction_mask(
+    correction: Correction, shape: tuple[int, int], scale: tuple[float, float]
+) -> tuple[tuple[slice, slice], np.ndarray] | None:
+    """Where a brush or lasso correction lies on a grid: its bounds and mask.
+
+    Only the bounding box is drawn, so that a correction costs its own size,
+    not the grid's. None when it misses the grid.
+    """
+
+    rows = [(row + 0.5) * scale[0] - 0.5 for row, _col in correction.points]
+    cols = [(col + 0.5) * scale[1] - 0.5 for _row, col in correction.points]
+    pad = 2.0
+    if correction.kind != "lasso":
+        pad += float(correction.radius_px) * 0.5 * (scale[0] + scale[1])
+    top = max(0, int(math.floor(min(rows) - pad)))
+    left = max(0, int(math.floor(min(cols) - pad)))
+    bottom = min(shape[0], int(math.ceil(max(rows) + pad)) + 1)
+    right = min(shape[1], int(math.ceil(max(cols) + pad)) + 1)
+    if top >= bottom or left >= right:
+        return None
+    # Raw points moved so that the box starts at the grid's origin.
+    offset_row, offset_col = top / scale[0], left / scale[1]
+    points = [(row - offset_row, col - offset_col) for row, col in correction.points]
+    box = (bottom - top, right - left)
+    if correction.kind == "lasso":
+        mask = np.zeros(box, dtype=np.uint8)
+        _fill_polygon(mask, Polygon(1, points), scale, 1)
+    else:
+        mask = rasterize_strokes([Stroke(1, correction.radius_px, points)], box, scale)
+    return (slice(top, bottom), slice(left, right)), mask > 0
+
+
+def apply_corrections(
+    classes: np.ndarray,
+    corrections: Sequence[Correction],
+    scale: tuple[float, float],
+    *,
+    inside: np.ndarray | None = None,
+    layer_ids: Sequence[int] | set[int] | None = None,
+    start: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """The classes with the corrections applied in drawing order.
+
+    ``classes`` (left unchanged) is the proposal on a grid with ``scale`` grid
+    pixels per raw pixel along rows and columns. Corrections act only inside
+    ``inside``, the rig frame. Returns the corrected classes, the mask of the
+    pixels a correction decided, and the indices of the corrections that do
+    not apply: a fill whose region no longer has the layer it replaced, or a
+    correction whose layer is not in ``layer_ids``. ``start`` continues from
+    the corrected classes and decided mask of earlier corrections, as
+    returned, so that corrections can be added one at a time; a restore
+    stroke still brings back ``classes``.
+    """
+
+    from scipy import ndimage as ndi
+
+    if start is None:
+        result = classes.copy()
+        decided = np.zeros(classes.shape, dtype=bool)
+    else:
+        result, decided = start[0].copy(), start[1].copy()
+    skipped: list[int] = []
+    structure = ndi.generate_binary_structure(2, 1)
+    known = None if layer_ids is None else {int(value) for value in layer_ids}
+    for index, correction in enumerate(corrections):
+        if (
+            correction.kind != "restore"
+            and known is not None
+            and correction.layer_id not in known
+        ):
+            skipped.append(index)
+            continue
+        if correction.kind == "fill":
+            seed = _grid_seed(correction.points[0], classes.shape, scale)
+            if (
+                seed is None
+                or (inside is not None and not inside[seed])
+                or int(result[seed]) != int(correction.replaced_layer)
+            ):
+                skipped.append(index)
+                continue
+            components, _count = ndi.label(result == result[seed], structure=structure)
+            box = (slice(None), slice(None))
+            region = components == components[seed]
+        else:
+            found = _correction_mask(correction, classes.shape, scale)
+            if found is None:
+                continue
+            box, region = found
+            if inside is not None:
+                region &= inside[box]
+        if correction.kind == "restore":
+            result[box][region] = classes[box][region]
+            decided[box][region] = False
+        else:
+            result[box][region] = correction.layer_id
+            decided[box][region] = True
+    return result, decided, skipped
+
+
+def proposal_grid_scale(proposal: LayerProposal) -> tuple[float, float]:
+    """Proposal grid pixels per raw pixel along rows and columns."""
+
+    height, width = proposal.classes.shape
+    return height / proposal.image_size[1], width / proposal.image_size[0]
+
+
+def corrected_classes(
+    proposal: LayerProposal,
+    corrections: Sequence[Correction],
+    *,
+    layer_ids: Sequence[int] | set[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """The proposal's classes with the corrections, on the proposal's grid."""
+
+    return apply_corrections(
+        proposal.classes,
+        corrections,
+        proposal_grid_scale(proposal),
+        inside=proposal.classes != OUTSIDE,
+        layer_ids=layer_ids,
+    )
+
+
+def corrections_not_applied(
+    proposal: LayerProposal | None,
+    corrections: Sequence[Correction],
+    *,
+    layer_ids: Sequence[int] | set[int] | None = None,
+) -> list[int]:
+    """Indices of the corrections that do not apply to ``proposal``."""
+
+    if proposal is None or not corrections:
+        return []
+    return corrected_classes(proposal, corrections, layer_ids=layer_ids)[2]
+
+
+# ---------------------------------------------------------------------------
 # Revision and export
 
 
@@ -1892,8 +2200,13 @@ def check_ready_for_revision(
     proposal: LayerProposal | None,
     frame: RigFrame | None,
     reference: SeriesRunInputs | None,
+    corrections: Sequence[Correction] = (),
 ) -> list[str]:
-    """Reasons why the proposal cannot be saved yet (empty when it can)."""
+    """Reasons why the proposal cannot be saved yet (empty when it can).
+
+    With hand corrections the layers present and the region count are those
+    of the corrected map.
+    """
 
     problems: list[str] = []
     if reference is None or reference.baseline_image is None:
@@ -1913,6 +2226,16 @@ def check_ready_for_revision(
             "the rig size."
         )
     present = {int(row["layer_id"]) for row in proposal.layers if row.get("pixels")}
+    classes = None
+    if corrections:
+        classes = corrected_classes(
+            proposal, corrections, layer_ids={row.layer_id for row in session.layers}
+        )[0]
+        present = {
+            int(value)
+            for value in np.flatnonzero(np.bincount(classes.ravel(), minlength=256))
+            if value != OUTSIDE
+        }
     missing: list[str] = []
     for name in facies_ids(session, sorted(present)):
         entry = session.facies.get(name, FaciesEntry())
@@ -1928,7 +2251,10 @@ def check_ready_for_revision(
             + ", ".join(missing)
             + " (step 4)."
         )
-    regions = proposal_region_count(proposal)
+    if classes is None:
+        regions = proposal_region_count(proposal)
+    else:
+        regions = class_region_count(classes)
     if regions > NATIVE_MAX_REGIONS:
         problems.append(
             f"The proposal has {regions} regions; native Setup supports at most "
@@ -1943,6 +2269,18 @@ def proposal_region_count(proposal: LayerProposal) -> int:
 
     count = sum(int(row.get("regions") or 0) for row in proposal.layers)
     if np.any(proposal.classes == OUTSIDE):
+        count += 1
+    return count
+
+
+def class_region_count(classes: np.ndarray) -> int:
+    """Connected regions of a class map, counted as for a proposal."""
+
+    counts = _region_counts(classes)
+    count = sum(
+        regions for value, (_pixels, regions) in counts.items() if value != OUTSIDE
+    )
+    if OUTSIDE in counts:
         count += 1
     return count
 
@@ -1963,8 +2301,13 @@ def painted_label_map(
     *,
     frame: RigFrame | None,
     progress: ProgressCallback | None = None,
+    corrections: Sequence[Correction] = (),
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Label map on the raw photograph's grid and one region row per label."""
+    """Label map on the raw photograph's grid and one region row per label.
+
+    Hand corrections are applied at full resolution after the proposal and
+    its exact polygons; the pixels they decide are never merged away.
+    """
 
     from scipy import ndimage as ndi
 
@@ -2002,6 +2345,23 @@ def painted_label_map(
             for value in np.flatnonzero(np.bincount(classes.ravel(), minlength=256))
             if value != OUTSIDE
         ]
+    protected = None
+    if corrections:
+        _progress(progress, "Applying the hand corrections…")
+        classes, decided, _skipped = apply_corrections(
+            classes,
+            corrections,
+            scale,
+            inside=inside,
+            layer_ids={row.layer_id for row in session.layers},
+        )
+        protected = np.where(decided, classes, 0).astype(np.uint8)
+        del decided
+        present = [
+            int(value)
+            for value in np.flatnonzero(np.bincount(classes.ravel(), minlength=256))
+            if value != OUTSIDE
+        ]
     grid_ratio = (width / proposal.classes.shape[1]) * (
         height / proposal.classes.shape[0]
     )
@@ -2009,8 +2369,8 @@ def painted_label_map(
     # protected; here only slivers of the upsampling (two grid cells) go.
     min_pixels = int(math.ceil(2.0 * grid_ratio))
     _progress(progress, "Cleaning up small regions…")
-    classes, _merged = merge_small_regions(classes, min_pixels)
-    del inside
+    classes, _merged = merge_small_regions(classes, min_pixels, protected=protected)
+    del inside, protected
 
     _progress(progress, "Numbering the regions…")
     structure = ndi.generate_binary_structure(2, 1)
@@ -2137,8 +2497,9 @@ def save_painted_revision(
     frame: RigFrame | None,
     actor: str = "",
     progress: ProgressCallback | None = None,
+    corrections: Sequence[Correction] = (),
 ) -> dict[str, Any]:
-    """Store the proposal as a validated geometry revision."""
+    """Store the proposal, with any hand corrections, as a geometry revision."""
 
     from darsia.fluidflower.geometry_facies import (
         GeometryRevisionStore,
@@ -2147,7 +2508,9 @@ def save_painted_revision(
         validate_geometry_config,
     )
 
-    problems = check_ready_for_revision(session, proposal, frame, reference)
+    problems = check_ready_for_revision(
+        session, proposal, frame, reference, corrections
+    )
     if problems:
         raise ValueError(" ".join(problems))
     assert reference.baseline_image is not None
@@ -2164,7 +2527,7 @@ def save_painted_revision(
     width_m, height_m = size
 
     labels, regions = painted_label_map(
-        session, proposal, frame=frame, progress=progress
+        session, proposal, frame=frame, progress=progress, corrections=corrections
     )
     if len(regions) > NATIVE_MAX_REGIONS:
         raise ValueError(
@@ -2243,6 +2606,14 @@ def save_painted_revision(
             },
         }
     )
+    if corrections:
+        config["facies_generation"].update(
+            {
+                "corrections_path": str(corrections_path(project, session.run_id)),
+                "corrections_sha256": corrections_digest(corrections),
+                "correction_count": len(corrections),
+            }
+        )
     _progress(progress, "Validating…")
     validation = validate_geometry_config(config)
     errors = [
@@ -2264,6 +2635,19 @@ def save_painted_revision(
 
 
 __all__ = [
+    "CORRECTION_KINDS",
+    "LAYER_CORRECTIONS_FORMAT",
+    "Correction",
+    "apply_corrections",
+    "class_region_count",
+    "corrected_classes",
+    "corrections_digest",
+    "corrections_not_applied",
+    "corrections_path",
+    "layer_at",
+    "load_corrections",
+    "proposal_grid_scale",
+    "save_corrections",
     "DEFAULT_EDGE_FILL_MM",
     "DEFAULT_LAYERS",
     "DEFAULT_SNAP_MM",

@@ -91,6 +91,7 @@ from PySide6.QtWidgets import (
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower.image_formats import image_family, photo_dialog_filter
+from darsia.fluidflower.project import utc_now
 from darsia.fluidflower.series_geometry import (
     RigFrame,
     SeriesRunInputs,
@@ -128,6 +129,17 @@ _BRUSH_MIN_FRACTION = 0.0005
 _BRUSH_MAX_FRACTION = 0.05
 _BRUSH_DEFAULT_FRACTION = 0.006
 _UNDO_LIMIT = 200
+# Tools that draw a path while the button is held, and those of them with a brush.
+_STROKE_TOOLS = frozenset({"paint", "erase", "correct", "restore", "lasso"})
+_BRUSH_TOOLS = frozenset({"paint", "erase", "correct", "restore"})
+# Tools that correct the proposal by hand; they never change the marks.
+_CORRECTION_TOOLS = frozenset({"correct", "restore", "lasso", "fill"})
+# Tools that draw on the reference photo.
+_DRAWING_TOOLS = frozenset({"polygon", "edit", "paint", "erase"}) | _CORRECTION_TOOLS
+# Outline of the corrected areas on the proposal (RGBA).
+_CORRECTED_EDGE = (255, 196, 0, 255)
+# Polygons, strokes and corrections, as kept for undo and redo.
+_Snapshot = tuple[list[lp.Polygon], list[lp.Stroke], list[lp.Correction]]
 # Column of the layer table whose box shows or hides a layer (display only).
 _SHOW_COLUMN = 4
 _SHOW_TIP = "Show or hide this layer in the photograph (display only)"
@@ -156,7 +168,8 @@ _ROLE_SHORT = {"porous_medium": "Porous", "free_water": "Free water"}
 _CANVAS_HINT = (
     "Wheel: zoom · right or middle drag: pan · Ctrl+Z / Ctrl+Y: undo / redo. "
     "On the photo: L draw · V edit · B paint · E erase · H pan · [ ] brush "
-    "size · 1-9 layer · P propose · F fit"
+    "size · 1-9 layer · P propose · F fit · on the proposal: C correct · "
+    "R restore · A lasso · G fill"
 )
 _DRAFT_HINT = (
     "Polygon with {count} point{plural}: left click adds a point · right click, "
@@ -318,7 +331,8 @@ class LayerCanvas(QGraphicsView):
     """Photograph with polygons, painted strokes and the proposed layers on top.
 
     The tools are ``pan``, ``polygon`` (the Draw button), ``edit``, ``paint``
-    and ``erase``. The right or middle button drags the view in every tool.
+    and ``erase``, and the correction tools ``correct``, ``restore``, ``lasso``
+    and ``fill``. The right or middle button drags the view in every tool.
 
     Draw (``polygon``) only draws new polygons: a left click adds a point, a
     right click (without dragging), Enter or a double click closes the
@@ -359,6 +373,13 @@ class LayerCanvas(QGraphicsView):
     that are shown. ``set_overlays_visible`` (all marks, the proposal) works
     on top of this.
 
+    The correction tools draw on top of the proposal and never change the
+    marks: ``correct`` and ``restore`` are brushes, ``lasso`` draws a closed
+    outline while the button is held, and ``fill`` reports a click.
+    ``correction_drawn`` gives the finished ``lp.Correction`` (without the
+    proposal it was drawn on and its time) and ``fill_requested`` the raw
+    (row, col) of a Fill click.
+
     The canvas also serves the rig frame panel: ``image_point_selected`` gives
     clicks in place mode as fractions of the photograph, ``preview`` identifies
     the photograph shown and ``set_model`` shows another one.
@@ -386,8 +407,22 @@ class LayerCanvas(QGraphicsView):
     # Points of the polygon being drawn (0: none).
     draft_changed = Signal(int)
     notice = Signal(str)
+    # A hand correction drawn with Correct, Restore or Lasso (an lp.Correction).
+    correction_drawn = Signal(object)
+    # The raw (row, col) clicked with Fill.
+    fill_requested = Signal(float, float)
 
-    TOOLS = ("pan", "polygon", "edit", "paint", "erase")
+    TOOLS = (
+        "pan",
+        "polygon",
+        "edit",
+        "paint",
+        "erase",
+        "correct",
+        "restore",
+        "lasso",
+        "fill",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -1536,12 +1571,12 @@ class LayerCanvas(QGraphicsView):
         return (
             self.paint_enabled
             and not self.place_mode
-            and self.tool in {"paint", "erase"}
+            and self.tool in _STROKE_TOOLS
             and self._raw_size is not None
         )
 
     def _update_cursor(self, scene_point: QPointF | None = None) -> None:
-        if not self._painting():
+        if not self._painting() or self.tool == "lasso":
             self.cursor_item.hide()
             return
         if scene_point is None:
@@ -1578,20 +1613,26 @@ class LayerCanvas(QGraphicsView):
         else:
             self._path.lineTo(scene_point)
         path = QPainterPath(self._path)
-        if len(self._points) == 1:
+        if len(self._points) == 1 and self.tool != "lasso":
             radius = max(0.5, self.display_radius())
             path.addEllipse(scene_point, radius, radius)
         self.active_item.setPath(path)
 
     def _start_stroke(self, scene_point: QPointF) -> None:
         self._cancel_stroke()
-        color = (
-            QColor(255, 255, 255) if self.tool == "erase" else QColor(self.layer_color)
-        )
+        clearing = self.tool in {"erase", "restore"}
+        color = QColor(255, 255, 255) if clearing else QColor(self.layer_color)
+        if self.tool == "lasso":
+            outline = QPen(color, 2.0)
+            outline.setCosmetic(True)
+            self.active_item.setPen(outline)
+            self.active_item.setBrush(Qt.BrushStyle.NoBrush)
+            self._extend(scene_point)
+            return
         pen = QPen(color, max(1.0, 2.0 * self.display_radius()))
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        if self.tool == "erase":
+        if clearing:
             pen.setStyle(Qt.PenStyle.SolidLine)
             color.setAlpha(120)
             pen.setColor(color)
@@ -1603,13 +1644,37 @@ class LayerCanvas(QGraphicsView):
         if not self._points:
             self._cancel_stroke()
             return
-        stroke = lp.Stroke(
-            lp.ERASER if self.tool == "erase" else int(self.layer_id),
-            float(self.radius_px),
-            list(self._points),
-        )
+        points, tool = list(self._points), self.tool
         self._cancel_stroke()
+        if tool in _CORRECTION_TOOLS:
+            self._finish_correction(tool, points)
+            return
+        stroke = lp.Stroke(
+            lp.ERASER if tool == "erase" else int(self.layer_id),
+            float(self.radius_px),
+            points,
+        )
         self.stroke_finished.emit(stroke)
+
+    def _finish_correction(self, tool: str, points: list[tuple[float, float]]) -> None:
+        """Report a finished Correct, Restore or Lasso path as a correction."""
+
+        kind = {"correct": "brush", "restore": "restore", "lasso": "lasso"}[tool]
+        try:
+            correction = lp.Correction(
+                kind,
+                int(self.layer_id),
+                points,
+                radius_px=0.0 if kind == "lasso" else float(self.radius_px),
+            )
+        except ValueError as error:
+            self.notice.emit(
+                "Hold the button and go round the area to draw a lasso."
+                if kind == "lasso"
+                else str(error)
+            )
+            return
+        self.correction_drawn.emit(correction)
 
     # ------------------------------------------------------------ events
 
@@ -1662,6 +1727,19 @@ class LayerCanvas(QGraphicsView):
                 return
             if self.pixmap_item.boundingRect().contains(point) or self._draft:
                 self._add_draft_point(point)
+                event.accept()
+                return
+        if (
+            button == Qt.MouseButton.LeftButton
+            and self.tool == "fill"
+            and self.paint_enabled
+            and not self.place_mode
+            and self._raw_size is not None
+        ):
+            point = self.mapToScene(event.position().toPoint())
+            if self.pixmap_item.boundingRect().contains(point):
+                row, col = self.scene_to_raw(point)
+                self.fill_requested.emit(float(row), float(col))
                 event.accept()
                 return
         if button == Qt.MouseButton.LeftButton and self._painting():
@@ -1857,6 +1935,52 @@ class StepSection(QFrame):
 # Workers
 
 
+class _CorrectedGrid:
+    """The corrected proposal on one grid, extended as corrections are added.
+
+    ``get`` applies only the corrections added since the last call when the
+    proposal, grid and layers are the same and the earlier corrections are
+    unchanged; otherwise it starts again from the proposal.
+    """
+
+    def __init__(self) -> None:
+        self.key: Any = None
+        self.done: tuple[lp.Correction, ...] = ()
+        self.state: tuple[np.ndarray, np.ndarray] | None = None
+
+    def get(
+        self,
+        key: Any,
+        base: np.ndarray,
+        corrections: Sequence[lp.Correction],
+        scale: tuple[float, float],
+        layer_ids: Iterable[int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The corrected classes on ``base``'s grid and the corrected pixels."""
+
+        if (
+            self.state is None
+            or self.key != key
+            or len(self.done) > len(corrections)
+            or any(old is not new for old, new in zip(self.done, corrections))
+        ):
+            self.key, self.done = key, ()
+            self.state = (base, np.zeros(base.shape, dtype=bool))
+        rest = list(corrections[len(self.done):])
+        if rest:
+            result, decided, _skipped = lp.apply_corrections(
+                base,
+                rest,
+                scale,
+                inside=base != lp.OUTSIDE,
+                layer_ids=set(layer_ids),
+                start=self.state,
+            )
+            self.state = (result, decided)
+            self.done = tuple(corrections)
+        return self.state
+
+
 class _ProposalWorker(QObject):
     progress = Signal(str)
     finished = Signal(object)
@@ -1907,6 +2031,8 @@ class _SaveWorker(QObject):
         reference: SeriesRunInputs,
         frame: RigFrame | None,
         actor: str,
+        *,
+        corrections: Sequence[lp.Correction] = (),
     ) -> None:
         super().__init__()
         self.project = project
@@ -1915,6 +2041,7 @@ class _SaveWorker(QObject):
         self.reference = reference
         self.frame = frame
         self.actor = actor
+        self.corrections = tuple(corrections)
 
     @Slot()
     def run(self) -> None:
@@ -1927,6 +2054,7 @@ class _SaveWorker(QObject):
                 frame=self.frame,
                 actor=self.actor,
                 progress=self.progress.emit,
+                corrections=self.corrections,
             )
             self.progress.emit("Exporting for native Setup…")
             export = export_native_setup(
@@ -1974,9 +2102,19 @@ class LayerPainterView(QWidget):
         self.image: lp.PaintingImage | None = None
         self.proposal: lp.LayerProposal | None = None
         self.last_export: Any = None
-        # Snapshots of (polygons, strokes) for undo and redo.
-        self._undo_stack: list[tuple[list[lp.Polygon], list[lp.Stroke]]] = []
-        self._redo_stack: list[tuple[list[lp.Polygon], list[lp.Stroke]]] = []
+        # Snapshots of (polygons, strokes, corrections) for undo and redo.
+        self._undo_stack: list[_Snapshot] = []
+        self._redo_stack: list[_Snapshot] = []
+        # Hand corrections drawn on top of the proposal, in drawing order.
+        # They have their own file; drawing them never writes the session.
+        self.corrections: list[lp.Correction] = []
+        self._corrections_dirty = False
+        # Why the run's correction file could not be read; no correction is
+        # drawn or saved then, so that the file is never overwritten.
+        self._corrections_error = ""
+        # The corrected proposal on the display grid, extended as corrections
+        # are added.
+        self._display_corrections = _CorrectedGrid()
         # Layers hidden in the photograph: a display choice for the session
         # shown, never saved and never part of the proposal.
         self._hidden_layers: set[int] = set()
@@ -2028,6 +2166,8 @@ class LayerPainterView(QWidget):
         self.canvas.polygon_context.connect(self._polygon_menu)
         self.canvas.draft_changed.connect(self._draft_changed)
         self.canvas.notice.connect(self._canvas_notice)
+        self.canvas.correction_drawn.connect(self._correction_drawn)
+        self.canvas.fill_requested.connect(self._fill_requested)
 
         from darsia.fluidflower.series_rig_frame_panel import RigFramePanel
 
@@ -2181,7 +2321,9 @@ class LayerPainterView(QWidget):
                 "kept; near polygon edges the model places the boundary within the "
                 "snap distance, choosing only between layers marked nearby. Where "
                 "it is wrong, move or add a polygon point with Edit (V) or paint "
-                "a short stroke of the right layer, and propose again."
+                "a short stroke of the right layer, and propose again. Or correct "
+                "the proposal by hand with Correct, Restore, Lasso and Fill: the "
+                "corrections are kept on top of it and saved with the map."
             )
         )
         row = QHBoxLayout()
@@ -2421,6 +2563,7 @@ class LayerPainterView(QWidget):
         fit.clicked.connect(self.canvas.fit_image)
         tools.addWidget(fit)
         layout.addLayout(tools)
+        layout.addLayout(self._build_correction_tools())
 
         display = QHBoxLayout()
         display.addWidget(QLabel("Show"))
@@ -2485,6 +2628,64 @@ class LayerPainterView(QWidget):
         layout.addWidget(self.canvas_hint)
         return column
 
+    def _build_correction_tools(self) -> QHBoxLayout:
+        """The tools that correct the proposal by hand, and their state."""
+
+        row = QHBoxLayout()
+        title = QLabel("Correct the proposal")
+        title.setToolTip(
+            "Corrections are drawn on top of the proposal and kept in their own "
+            "file; the polygons, strokes and the proposal stay as they are"
+        )
+        row.addWidget(title)
+        for key, label, tip in (
+            ("correct", "Correct", "Paint the selected layer onto the proposal (C)"),
+            (
+                "restore",
+                "Restore",
+                "Brush the proposal back where corrections were drawn (R)",
+            ),
+            (
+                "lasso",
+                "Lasso",
+                "Hold the button and go round an area: it takes the selected "
+                "layer (A)",
+            ),
+            (
+                "fill",
+                "Fill",
+                "Click a region of the proposal: it takes the selected layer (G)",
+            ),
+        ):
+            button = QToolButton()
+            button.setText(label)
+            button.setToolTip(tip)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, name=key: self.set_tool(name))
+            self.tool_group.addButton(button)
+            self.tool_buttons[key] = button
+            row.addWidget(button)
+        self.show_corrections = QCheckBox("Show")
+        self.show_corrections.setChecked(True)
+        self.show_corrections.setToolTip(
+            "Show the corrections on the proposal; they are always saved with the map"
+        )
+        self.show_corrections.toggled.connect(self._corrections_shown)
+        row.addWidget(self.show_corrections)
+        self.clear_corrections_button = QToolButton()
+        self.clear_corrections_button.setText("Clear")
+        self.clear_corrections_button.setToolTip(
+            "Remove all corrections of this run (Ctrl+Z brings them back)"
+        )
+        self.clear_corrections_button.clicked.connect(self._clear_corrections_clicked)
+        row.addWidget(self.clear_corrections_button)
+        self.corrections_label = QLabel()
+        self.corrections_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        row.addWidget(self.corrections_label, 1)
+        return row
+
     def _install_shortcuts(self) -> None:
         """Single keys act on the photograph only, so that typing in a table
         or field is never taken as a shortcut; undo and redo work in the view."""
@@ -2505,6 +2706,10 @@ class LayerPainterView(QWidget):
             ("V", lambda: self.set_tool("edit")),
             ("B", lambda: self.set_tool("paint")),
             ("E", lambda: self.set_tool("erase")),
+            ("C", lambda: self.set_tool("correct")),
+            ("R", lambda: self.set_tool("restore")),
+            ("A", lambda: self.set_tool("lasso")),
+            ("G", lambda: self.set_tool("fill")),
             ("H", lambda: self.set_tool("pan")),
             ("F", self.canvas.fit_image),
             ("P", self.propose),
@@ -2641,6 +2846,9 @@ class LayerPainterView(QWidget):
             self.proposal = None
             self._undo_stack = []
             self._redo_stack = []
+            self.corrections = []
+            self._corrections_dirty = False
+            self._corrections_error = ""
             self.canvas.cancel_polygon()
             self.canvas.clear_selection()
             self._other_photo = None
@@ -2682,6 +2890,7 @@ class LayerPainterView(QWidget):
                     and tuple(proposal.image_size) == tuple(self.image.image_size)
                 ):
                     self.proposal = proposal
+                self.corrections = self._read_corrections(reference.run_id)
             self._sync_settings()
             if self.session is not None and self.session.photo_changed:
                 self.propose_status.setText(
@@ -3187,6 +3396,7 @@ class LayerPainterView(QWidget):
 
     def save_session(self) -> None:
         self._save_timer.stop()
+        self._save_corrections()
         if not self._dirty or self.session is None:
             return
         try:
@@ -3203,16 +3413,16 @@ class LayerPainterView(QWidget):
     # ------------------------------------------------------------- tools
 
     def set_tool(self, tool: str) -> None:
-        if (
-            tool in {"polygon", "edit", "paint", "erase"}
-            and self._other_photo is not None
-        ):
+        if tool in _DRAWING_TOOLS and self._other_photo is not None:
             self.show_reference_photo()
+        if tool in _CORRECTION_TOOLS and not self.corrections_available():
+            self._canvas_notice(self._corrections_unavailable())
+            tool = self.canvas.tool
         self.canvas.set_tool(tool)
         button = self.tool_buttons.get(tool)
         if button is not None:
             button.setChecked(True)
-        painting = tool in {"paint", "erase"}
+        painting = tool in _BRUSH_TOOLS
         self.brush_size.setEnabled(painting)
         self.brush_label.setEnabled(painting)
 
@@ -3667,7 +3877,7 @@ class LayerPainterView(QWidget):
 
     # ------------------------------------------------------------- marks
 
-    def _snapshot(self) -> tuple[list[lp.Polygon], list[lp.Stroke]]:
+    def _snapshot(self) -> _Snapshot:
         assert self.session is not None
         return (
             [
@@ -3678,11 +3888,14 @@ class LayerPainterView(QWidget):
                 lp.Stroke(row.layer_id, row.radius_px, list(row.points))
                 for row in self.session.strokes
             ],
+            # Corrections are never changed once drawn: the list is enough.
+            list(self.corrections),
         )
 
-    def _restore(self, snapshot: tuple[list[lp.Polygon], list[lp.Stroke]]) -> None:
+    def _restore(self, snapshot: _Snapshot) -> None:
         assert self.session is not None
-        polygons, strokes = snapshot
+        polygons, strokes, corrections = snapshot
+        self.corrections = list(corrections)
         self.session.polygons = [
             lp.Polygon(row.layer_id, list(row.points)) for row in polygons
         ]
@@ -3930,7 +4143,7 @@ class LayerPainterView(QWidget):
             self.canvas.clear_selection()  # the polygons change
         self._redo_stack.append(current)
         self._restore(snapshot)
-        self._after_mark_change()
+        self._after_restore(current, snapshot)
 
     def redo(self) -> None:
         if self.session is None or not self._redo_stack:
@@ -3940,7 +4153,201 @@ class LayerPainterView(QWidget):
             self.canvas.clear_selection()  # the polygons change
         self._undo_stack.append(current)
         self._restore(snapshot)
-        self._after_mark_change()
+        self._after_restore(current, snapshot)
+
+    def _after_restore(self, before: _Snapshot, after: _Snapshot) -> None:
+        """Refresh what an undo or redo changed: the marks, the corrections or both.
+
+        A change of the corrections alone does not write the session.
+        """
+
+        if before[:2] != after[:2]:
+            self._after_mark_change()
+        if before[2] != after[2]:
+            self._after_correction_change()
+
+    # ------------------------------------------------------- corrections
+
+    def _layer_ids(self) -> set[int]:
+        if self.session is None:
+            return set()
+        return {layer.layer_id for layer in self.session.layers}
+
+    def _read_corrections(self, run_id: str) -> list[lp.Correction]:
+        """The run's corrections; none, and correcting off, when unreadable."""
+
+        try:
+            return lp.load_corrections(self.project, run_id)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self._corrections_error = (
+                f"The corrections of {run_id} could not be read ({error}); "
+                "correcting is off until the file is fixed."
+            )
+            return []
+
+    def _save_corrections(self) -> None:
+        if not self._corrections_dirty or self.session is None:
+            return
+        try:
+            lp.save_corrections(
+                self.project,
+                self.session.run_id,
+                self.corrections,
+                actor=default_actor(),
+            )
+        except OSError as error:
+            self.propose_status.setText(f"The corrections could not be saved: {error}")
+            return
+        self._corrections_dirty = False
+
+    def _corrections_unavailable(self) -> str:
+        """Why no correction can be drawn now ("" when one can)."""
+
+        if self.session is None or self.image is None:
+            return "Choose a reference run with a baseline photograph first."
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            return "Saved corrected rig maps are shown; corrections need a proposal."
+        if self._corrections_error:
+            return self._corrections_error
+        if self.proposal is None or tuple(self.proposal.image_size) != tuple(
+            self.image.image_size
+        ):
+            return (
+                "Propose the boundaries first (step 3); corrections are drawn on "
+                "the proposal."
+            )
+        return ""
+
+    def corrections_available(self) -> bool:
+        """True when hand corrections can be drawn on the proposal shown."""
+
+        return not self._corrections_unavailable()
+
+    @Slot(object)
+    def _correction_drawn(self, correction: lp.Correction) -> None:
+        self.add_correction(correction)
+
+    def add_correction(self, correction: lp.Correction) -> bool:
+        """Add a hand correction on top of the proposal shown.
+
+        Used by the correction tools, scripts and tests. The correction is
+        bound to the proposal it is drawn on and is one step to undo. Returns
+        False, and says why, when no correction can be drawn now.
+        """
+
+        problem = self._corrections_unavailable()
+        if problem:
+            self._canvas_notice(problem)
+            return False
+        assert self.proposal is not None
+        correction.proposal_digest = self.proposal.digest
+        correction.created_utc = utc_now()
+        self._push_undo()
+        self.corrections.append(correction)
+        if correction.kind != "restore":
+            self._reveal_layer(correction.layer_id)
+        self._after_correction_change()
+        return True
+
+    @Slot(float, float)
+    def _fill_requested(self, row: float, col: float) -> None:
+        self.fill_region_at(row, col)
+
+    def fill_region_at(self, row: float, col: float) -> bool:
+        """Give the region of the corrected proposal under a raw point the selected
+        layer, as one correction."""
+
+        problem = self._corrections_unavailable()
+        if problem:
+            self._canvas_notice(problem)
+            return False
+        assert self.proposal is not None
+        classes = lp.corrected_classes(
+            self.proposal, self.corrections, layer_ids=self._layer_ids()
+        )[0]
+        scale = lp.proposal_grid_scale(self.proposal)
+        current = lp.layer_at(classes, (row, col), scale)
+        layer = int(self.canvas.layer_id)
+        if current is None or current == lp.OUTSIDE:
+            self._canvas_notice("Fill works on the regions inside the rig frame.")
+            return False
+        if current == layer:
+            self._canvas_notice("That region already has the selected layer.")
+            return False
+        return self.add_correction(
+            lp.Correction("fill", layer, [(row, col)], replaced_layer=current)
+        )
+
+    def clear_corrections(self, *, confirm: bool = True) -> bool:
+        """Remove all corrections of the run shown, as one step to undo."""
+
+        if not self.corrections:
+            return False
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "Clear corrections",
+                f"Remove all {len(self.corrections)} corrections of this run? "
+                "Undo (Ctrl+Z) brings them back.",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        self._push_undo()
+        self.corrections = []
+        self._after_correction_change()
+        return True
+
+    def _clear_corrections_clicked(self) -> None:
+        self.clear_corrections(confirm=True)
+
+    def _corrections_shown(self, _checked: bool) -> None:
+        self._render_proposal()
+
+    def _mark_corrections_dirty(self) -> None:
+        self._corrections_dirty = True
+        self._export_stale = True
+        if not self._loading:
+            self._save_timer.start()
+        self.changed.emit()
+
+    def _after_correction_change(self) -> None:
+        self._mark_corrections_dirty()
+        self._render_proposal()
+        self._refresh_status()
+
+    def _corrections_text(self) -> str:
+        if self._corrections_error:
+            return self._corrections_error
+        if not self.corrections:
+            return "No corrections." if self.proposal is not None else ""
+        parts = [f"{len(self.corrections)} correction(s)"]
+        if self.proposal is not None:
+            earlier = sum(
+                row.proposal_digest != self.proposal.digest for row in self.corrections
+            )
+            if earlier:
+                parts.append(f"{earlier} drawn on an earlier proposal")
+            missed = lp.corrections_not_applied(
+                self.proposal, self.corrections, layer_ids=self._layer_ids()
+            )
+            if missed:
+                parts.append(f"{len(missed)} no longer apply")
+        return " · ".join(parts)
+
+    def _refresh_corrections(self) -> None:
+        """The corrections line and which correction tools can be used."""
+
+        if getattr(self, "corrections_label", None) is None:
+            return  # Called before the canvas column is built.
+        self.corrections_label.setText(self._corrections_text())
+        self.clear_corrections_button.setEnabled(
+            bool(self.corrections) and not self._corrections_error
+        )
+        available = self.corrections_available()
+        for key in _CORRECTION_TOOLS:
+            self.tool_buttons[key].setEnabled(available)
+        if not available and self.canvas.tool in _CORRECTION_TOOLS:
+            self.set_tool("pan")
 
     def _after_mark_change(self, *, render: bool = True) -> None:
         if render:
@@ -4122,6 +4529,16 @@ class LayerPainterView(QWidget):
         classes = cv2.resize(
             self.proposal.classes, (width, height), interpolation=cv2.INTER_NEAREST
         )
+        corrected = None
+        if self.corrections and self.show_corrections.isChecked():
+            layer_ids = frozenset(self._layer_ids())
+            classes, corrected = self._display_corrections.get(
+                (id(self.proposal), self.proposal.digest, classes.shape, layer_ids),
+                classes,
+                self.corrections,
+                (height / self.image.image_size[1], width / self.image.image_size[0]),
+                layer_ids,
+            )
         alpha = int(round(2.55 * self.opacity.value()))
         table = np.zeros((256, 4), dtype=np.uint8)
         table[lp.OUTSIDE] = (0, 0, 0, 110)
@@ -4154,7 +4571,12 @@ class LayerPainterView(QWidget):
             ).astype(bool)
             rows, cols = np.indices(classes.shape)
             hatch = ((rows + cols) // 3) % 2 == 0
+            if corrected is not None:
+                uncertain &= ~corrected  # A correction decided these pixels.
             rgba[uncertain & hatch & shown] = (255, 0, 255, 200)
+        if corrected is not None and np.any(corrected):
+            inner = cv2.erode(corrected.astype(np.uint8), np.ones((3, 3), np.uint8))
+            rgba[corrected & ~inner.astype(bool)] = _CORRECTED_EDGE
         self.canvas.set_proposal(rgba)
         self._update_polygon_fill()
 
@@ -4557,7 +4979,11 @@ class LayerPainterView(QWidget):
         if self.session is None:
             return ["Choose a reference run with a baseline photograph."]
         return lp.check_ready_for_revision(
-            self.session, self.proposal, self.current_frame(), self.reference()
+            self.session,
+            self.proposal,
+            self.current_frame(),
+            self.reference(),
+            self.corrections,
         )
 
     def save_and_export(self) -> None:
@@ -4588,6 +5014,7 @@ class LayerPainterView(QWidget):
             reference,
             self.current_frame(),
             default_actor(),
+            corrections=tuple(self.corrections),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -4766,6 +5193,7 @@ class LayerPainterView(QWidget):
             self.export_button.setEnabled(False)
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
+            self._refresh_corrections()
             return
         marked = session.marked_layers()
         parts = [f"{len(marked)} of {len(session.layers)} layers marked"]
@@ -4791,6 +5219,7 @@ class LayerPainterView(QWidget):
             self.step_propose.set_status("Out of date: propose again", "warn")
         if self.proposal is not None:
             self.proposal_summary.setText(self._proposal_text())
+        self._refresh_corrections()
 
         problems = self.export_problems_now()
         if self._save_thread is not None:

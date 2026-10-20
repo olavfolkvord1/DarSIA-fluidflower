@@ -146,19 +146,31 @@ def _menu_action(view, text):
 
 
 def test_draw_and_edit_buttons_tooltips_and_shortcuts(view):
-    assert LayerCanvas.TOOLS == ("pan", "polygon", "edit", "paint", "erase")
+    marks = ("pan", "polygon", "edit", "paint", "erase")
+    corrections = ("correct", "restore", "lasso", "fill")
+    assert LayerCanvas.TOOLS == marks + corrections
     buttons = view.tool_buttons
-    assert list(buttons) == ["pan", "polygon", "edit", "paint", "erase"]
+    assert list(buttons) == list(marks + corrections)
     assert [buttons[key].text() for key in buttons] == [
         "Pan",
         "Draw",
         "Edit",
         "Paint",
         "Erase",
+        "Correct",
+        "Restore",
+        "Lasso",
+        "Fill",
     ]
-    # Edit sits right after Draw.
-    lefts = [buttons[key].x() for key in buttons]
+    # Edit sits right after Draw; the tools that correct the proposal have
+    # their own row below.
+    lefts = [buttons[key].x() for key in marks]
     assert lefts == sorted(lefts)
+    def tops(keys):
+        return {buttons[key].mapToGlobal(QPoint(0, 0)).y() for key in keys}
+
+    assert len(tops(marks)) == 1 and len(tops(corrections)) == 1
+    assert min(tops(corrections)) > max(tops(marks))
     assert buttons["polygon"].toolTip() == (
         "Draw a new polygon for the selected layer (L): left click adds a point, "
         "right click or Enter closes it"
