@@ -2309,6 +2309,7 @@ def corrections_not_applied(
 
 LAYER_VERSION_FORMAT = "darsia-fluidflower-layer-painting-version-v1"
 VERSION_FILES = ("session.json", "proposal.npz", "corrections.json")
+LAYER_APPROVAL_FORMAT = "darsia-fluidflower-layer-map-approval-v1"
 
 
 def versions_folder(project: FluidFlowerProject, run_id: str) -> Path:
@@ -2466,6 +2467,90 @@ def restore_version(
     if corrections or path.exists():
         save_corrections(project, session.run_id, corrections)
     return session, proposal, corrections
+
+
+def approvals_path(project: FluidFlowerProject, run_id: str) -> Path:
+    """The run's map approvals, one record per line, beside its saved versions."""
+
+    return versions_folder(project, run_id) / "approvals.jsonl"
+
+
+def read_map_approvals(
+    project: FluidFlowerProject, run_id: str
+) -> list[dict[str, Any]]:
+    """Every approval of the run's saved map versions, oldest first.
+
+    A malformed line raises ValueError, so that a damaged record is never
+    read as "not approved".
+    """
+
+    path = approvals_path(project, run_id)
+    if not path.is_file():
+        return []
+    records = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict) or record.get("format") != LAYER_APPROVAL_FORMAT:
+            raise ValueError(f"Line {number} of {path} is not a map approval record")
+        records.append(record)
+    return records
+
+
+def map_approval(
+    approvals: Sequence[Mapping[str, Any]], sha256: str
+) -> dict[str, Any] | None:
+    """The latest approval of the map with this SHA-256 (``map_digest``), or None."""
+
+    matches = [row for row in approvals if sha256 and row.get("sha256") == sha256]
+    return dict(matches[-1]) if matches else None
+
+
+def approve_version(
+    record: Mapping[str, Any],
+    *,
+    reviewer: str | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Approve a saved version as its run's map: append a record and return it.
+
+    The version's files are checked against their SHA-256 first, as for a
+    restore. The record names the version (its folder, name and kind), the
+    map's SHA-256 (``map_digest``), the SHA-256 of each file, ``reviewer``
+    (the series' reviewer setting; None when there is none) and the UTC
+    time. It goes to ``approvals.jsonl`` beside the run's versions, and
+    earlier records stay as they are. Approving changes no map, session,
+    proposal, version or geometry revision. A transient file error is
+    retried (N111).
+    """
+
+    from darsia.fluidflower.pipeline.job_queue import retry_transient
+
+    load_version(record)  # A changed file raises ValueError.
+    folder = Path(str(record["folder"]))
+    approval = {
+        "format": LAYER_APPROVAL_FORMAT,
+        "run_id": str(record.get("run_id") or ""),
+        "version": folder.name,
+        "name": str(record.get("name") or ""),
+        "kind": str(record.get("kind") or ""),
+        "sha256": str(record.get("sha256") or ""),
+        "files": dict(record.get("files") or {}),
+        "reviewer": (str(reviewer).strip() or None) if reviewer else None,
+        "approved_utc": now or utc_now(),
+    }
+    line = json.dumps(approval, ensure_ascii=False, sort_keys=True) + "\n"
+    path = folder.parent / "approvals.jsonl"
+
+    def append() -> None:
+        with path.open("ab") as stream:
+            stream.write(line.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    retry_transient(append)
+    return approval
 
 
 # ---------------------------------------------------------------------------
@@ -3048,6 +3133,11 @@ __all__ = [
     "corrections_path",
     "layer_at",
     "list_versions",
+    "approve_version",
+    "approvals_path",
+    "map_approval",
+    "read_map_approvals",
+    "LAYER_APPROVAL_FORMAT",
     "load_corrections",
     "load_version",
     "map_digest",

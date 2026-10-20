@@ -2821,6 +2821,10 @@ class LayerPainterView(QWidget):
         self._display_corrections = _CorrectedGrid()
         # Saved versions of the run's map, oldest first (records with a folder).
         self.versions: list[dict[str, Any]] = []
+        # Approvals of the run's saved versions, oldest first, and why they
+        # could not be read ("" when they could).
+        self.map_approvals: list[dict[str, Any]] = []
+        self._map_approvals_error = ""
         # Layers hidden in the photograph: a display choice for the session
         # shown, never saved and never part of the proposal.
         self._hidden_layers: set[int] = set()
@@ -3140,7 +3144,9 @@ class LayerPainterView(QWidget):
             _note(
                 "Save the proposal, with its corrections, as a version at any "
                 "time. A saved version is never changed. Restoring one first saves "
-                "the current map as a version, so that it can be restored again."
+                "the current map as a version, so that it can be restored again. "
+                "Approve the version that is the run's map; the approval records "
+                "its SHA-256, the reviewer and the time, and changes nothing else."
             )
         )
         buttons = QHBoxLayout()
@@ -3156,11 +3162,18 @@ class LayerPainterView(QWidget):
         )
         self.restore_version_button.clicked.connect(self._restore_version_clicked)
         buttons.addWidget(self.restore_version_button)
+        self.approve_version_button = QPushButton("Approve…")
+        self.approve_version_button.setToolTip(
+            "Approve the selected version as this run's map: records its SHA-256, "
+            "the reviewer and the time; changes no map, proposal or geometry"
+        )
+        self.approve_version_button.clicked.connect(self._approve_version_clicked)
+        buttons.addWidget(self.approve_version_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
-        self.versions_table = QTableWidget(0, 4)
+        self.versions_table = QTableWidget(0, 5)
         self.versions_table.setHorizontalHeaderLabels(
-            ["Name", "Saved (UTC)", "Map", "SHA-256"]
+            ["Name", "Saved (UTC)", "Map", "SHA-256", "Approved (UTC)"]
         )
         self.versions_table.verticalHeader().setVisible(False)
         self.versions_table.setSelectionBehavior(
@@ -3174,7 +3187,7 @@ class LayerPainterView(QWidget):
         )
         header = self.versions_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.versions_table.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -3250,6 +3263,13 @@ class LayerPainterView(QWidget):
         unit_row.addWidget(self.unit)
         unit_row.addStretch(1)
         layout.addLayout(unit_row)
+        # Whether the map to be saved is the approved version (step 3).
+        self.map_status = QLabel()
+        self.map_status.setWordWrap(True)
+        self.map_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.map_status)
         self.export_problems = QLabel()
         self.export_problems.setWordWrap(True)
         layout.addWidget(self.export_problems)
@@ -3673,6 +3693,7 @@ class LayerPainterView(QWidget):
             self._corrections_dirty = False
             self._corrections_error = ""
             self.versions = []
+            self.map_approvals, self._map_approvals_error = [], ""
             self.canvas.cancel_polygon()
             self.canvas.clear_selection()
             self._other_photo = None
@@ -3716,6 +3737,7 @@ class LayerPainterView(QWidget):
                     self.proposal = proposal
                 self.corrections = self._read_corrections(reference.run_id)
                 self.versions = self._read_versions(reference.run_id)
+                self._read_approvals(reference.run_id)
             self._sync_settings()
             if self.session is not None and self.session.photo_changed:
                 self.propose_status.setText(
@@ -5341,6 +5363,22 @@ class LayerPainterView(QWidget):
         except OSError:
             return []
 
+    def _read_approvals(self, run_id: str) -> None:
+        """Read the run's map approvals; an unreadable file is said, never
+        taken as "not approved"."""
+
+        try:
+            self.map_approvals = lp.read_map_approvals(self.project, run_id)
+            self._map_approvals_error = ""
+        except (OSError, ValueError) as error:
+            self.map_approvals = []
+            self._map_approvals_error = str(error)
+
+    def _approval_text(self, approval: Mapping[str, Any]) -> str:
+        when = str(approval.get("approved_utc") or "")[:16].replace("T", " ")
+        reviewer = approval.get("reviewer")
+        return f"approved {when} UTC" + (f" by {reviewer}" if reviewer else "")
+
     def _versions_unavailable(self) -> str:
         """Why no version can be saved now ("" when one can)."""
 
@@ -5366,8 +5404,14 @@ class LayerPainterView(QWidget):
             count = int(record.get("correction_count") or 0)
             kind = f"edited ({count})" if count else "proposal"
             saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
+            approval = lp.map_approval(self.map_approvals, digest)
+            approved = (
+                str(approval.get("approved_utc") or "")[:16].replace("T", " ")
+                if approval
+                else ""
+            )
             for column, value in enumerate(
-                (str(record.get("name") or ""), saved, kind, digest[:12])
+                (str(record.get("name") or ""), saved, kind, digest[:12], approved)
             ):
                 item = QTableWidgetItem(value)
                 item.setToolTip(f"SHA-256 {digest}")
@@ -5381,6 +5425,52 @@ class LayerPainterView(QWidget):
         self.restore_version_button.setEnabled(
             self._selected_version() is not None and not self.busy()
         )
+        self.approve_version_button.setEnabled(
+            self._selected_version() is not None
+            and not self.busy()
+            and not self._map_approvals_error
+        )
+        self._refresh_map_status()
+
+    def _refresh_map_status(self) -> None:
+        """Say in step 4 whether the map to be saved is the approved version."""
+
+        label = getattr(self, "map_status", None)
+        if label is None:
+            return  # Called before the steps are built.
+        if self._map_approvals_error:
+            label.setText(
+                f"Map approvals could not be read: {self._map_approvals_error}"
+            )
+            return
+        if self.session is None or self.proposal is None:
+            label.setText("")
+            return
+        try:
+            digest = lp.map_digest(self.session, self.proposal, self.corrections)
+        except (OSError, ValueError, TypeError) as error:
+            label.setText(f"The map's SHA-256 could not be computed: {error}")
+            return
+        version = next(
+            (row for row in reversed(self.versions) if row.get("sha256") == digest),
+            None,
+        )
+        approval = lp.map_approval(self.map_approvals, digest)
+        if approval is not None:
+            label.setText(
+                f"Map to save: the approved version {approval.get('name')} "
+                f"(SHA-256 {digest[:12]}…, {self._approval_text(approval)})."
+            )
+        elif version is not None:
+            label.setText(
+                f"Map to save: the saved version {version.get('name')} (SHA-256 "
+                f"{digest[:12]}…), not approved. Approve it in step 3, Versions."
+            )
+        else:
+            label.setText(
+                "Map to save: not saved as a version. Save it as a version in "
+                "step 3 and approve it there before saving the revision."
+            )
 
     def _selected_version(self) -> dict[str, Any] | None:
         table = getattr(self, "versions_table", None)
@@ -5394,10 +5484,15 @@ class LayerPainterView(QWidget):
     def _version_selected(self) -> None:
         record = self._selected_version()
         if record is not None:
-            self.versions_note.setText(
-                f"{record.get('name')}: SHA-256 {record.get('sha256')}"
-            )
+            text = f"{record.get('name')}: SHA-256 {record.get('sha256')}"
+            approval = lp.map_approval(self.map_approvals, str(record.get("sha256")))
+            if approval is not None:
+                text += f" · {self._approval_text(approval)}"
+            self.versions_note.setText(text)
         self.restore_version_button.setEnabled(record is not None and not self.busy())
+        self.approve_version_button.setEnabled(
+            record is not None and not self.busy() and not self._map_approvals_error
+        )
 
     def _version_double_clicked(self, _item: QTableWidgetItem) -> None:
         self._restore_version_clicked()
@@ -5450,6 +5545,59 @@ class LayerPainterView(QWidget):
             f"Saved {record['name']} ({record['kind']}): SHA-256 {record['sha256']}"
         )
         return record
+
+    def _reviewer(self) -> str:
+        """The series' reviewer setting ("" when none is set or it cannot be read)."""
+
+        from darsia.fluidflower.reviewer_preferences import load_reviewer_name
+
+        try:
+            return load_reviewer_name(getattr(self.project, "root", ""))
+        except (OSError, ValueError):
+            return ""
+
+    def _approve_version_clicked(self) -> None:
+        record = self._selected_version()
+        if record is None:
+            return
+        reviewer = self._reviewer()
+        who = (
+            f"The reviewer recorded is {reviewer} (the series' reviewer setting)."
+            if reviewer
+            else "No reviewer is set for this series, so the record names nobody."
+        )
+        run = record.get("run_id") or "this run"
+        answer = QMessageBox.question(
+            self,
+            "Approve version",
+            f"Approve {record.get('name')} ({record.get('kind')}) as the map of "
+            f"{run}? The approval records its SHA-256 {record.get('sha256')} and "
+            f"the time. {who} It changes no map, proposal or geometry revision.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.approve_version(record)
+
+    def approve_version(self, record: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Approve a saved version as the run's map, with the series' reviewer
+        setting. Returns the approval record, or None (the note says why)."""
+
+        if self.busy() or self._map_approvals_error:
+            self.versions_note.setText(
+                self._map_approvals_error or "Wait until the proposal or export has finished."
+            )
+            return None
+        try:
+            approval = lp.approve_version(record, reviewer=self._reviewer() or None)
+        except (OSError, ValueError, KeyError) as error:
+            self.versions_note.setText(f"The version could not be approved: {error}")
+            return None
+        self._read_approvals(str(record.get("run_id") or ""))
+        self._refresh_versions()
+        self.versions_note.setText(
+            f"{approval['name']}: SHA-256 {approval['sha256']} · "
+            f"{self._approval_text(approval)}"
+        )
+        return approval
 
     def _restore_version_clicked(self) -> None:
         record = self._selected_version()

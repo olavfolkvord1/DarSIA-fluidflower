@@ -1,0 +1,81 @@
+"""Layer painting tab: approving a saved version as the run's map.
+
+The Versions box approves the selected version: the record names its SHA-256,
+the series' reviewer setting and the time, and nothing else changes. Step 4
+says whether the map to be saved is the approved version. A synthetic 80 x 60
+photograph and a project in a temporary folder; no real series is used.
+"""
+
+from PySide6.QtWidgets import QMessageBox
+
+from darsia.fluidflower import layer_painting as lp
+from darsia.fluidflower.reviewer_preferences import save_reviewer_name
+
+from .test_painting_corrections import (  # noqa: F401
+    COARSE,
+    _proposal,
+    _show,
+    view,
+)
+
+
+def _brush(view):
+    view.select_layer_row(2)  # Coarse sand
+    view.add_correction(lp.Correction("brush", COARSE, [(30.0, 10.0)], radius_px=2.0))
+
+
+def test_approve_records_the_version_and_step_4_names_the_approved_map(view):
+    assert view.approve_version_button.text() == "Approve…"
+    assert view.versions_table.horizontalHeaderItem(4).text() == "Approved (UTC)"
+    _show(view, _proposal())
+    assert not view.approve_version_button.isEnabled()
+    assert "not saved as a version" in view.map_status.text()
+    record = view.save_version("Map A")
+    assert "the saved version Map A" in view.map_status.text()
+    assert "not approved" in view.map_status.text()
+    save_reviewer_name(view.project.root, "Test reviewer")
+    approval = view.approve_version(record)
+    assert approval["sha256"] == record["sha256"] and approval["reviewer"] == "Test reviewer"
+    assert lp.read_map_approvals(view.project, "ac52") == [approval]
+    assert view.versions_table.item(0, 4).text() == approval["approved_utc"][:16].replace("T", " ")
+    assert "the approved version Map A" in view.map_status.text()
+    assert "by Test reviewer" in view.map_status.text()
+    assert "by Test reviewer" in view.versions_note.text()
+    # Another map is not the approved one, until it is that version again.
+    _brush(view)
+    assert "not saved as a version" in view.map_status.text()
+    view.restore_version(record)
+    assert "the approved version Map A" in view.map_status.text()
+    # Approving changed nothing of the map.
+    assert view.corrections == [] and view.proposal is not None
+
+
+def test_the_button_asks_first_and_an_unreadable_file_blocks_approval(view, monkeypatch):
+    _show(view, _proposal())
+    record = view.save_version("Map A")
+    view.versions_table.selectRow(0)
+    assert view.approve_version_button.isEnabled()
+    questions = []
+
+    def answer(_parent, title, text, *args, **kwargs):
+        questions.append((title, text))
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    view.approve_version_button.click()
+    assert lp.read_map_approvals(view.project, "ac52") == []
+    title, text = questions[0]
+    assert title == "Approve version" and record["sha256"] in text
+    assert "No reviewer is set" in text
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    view.approve_version_button.click()
+    assert len(lp.read_map_approvals(view.project, "ac52")) == 1
+    # A damaged approvals file is said, and nothing more is approved.
+    path = lp.approvals_path(view.project, "ac52")
+    path.write_text("not json\n", encoding="utf-8")
+    view.reload()
+    assert "could not be read" in view.map_status.text()
+    view.versions_table.selectRow(0)
+    assert not view.approve_version_button.isEnabled()
+    assert view.approve_version(view.versions[0]) is None
+    assert path.read_text(encoding="utf-8") == "not json\n"
