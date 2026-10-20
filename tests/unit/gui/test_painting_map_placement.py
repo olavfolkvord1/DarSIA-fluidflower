@@ -40,10 +40,12 @@ def _index(folder):
             "format": mp.GEOMETRY_FORMAT,
             "run_id": run,
             "H_metric_mm_to_camera_u": matrix,
-            "reference_image": {"path": f"{run}.arw", "shape_hw": SHAPE},
+            "reference_image": {"path": f"{run}.arw"},
+            "shape_hw": SHAPE,
         }
-        (folder / run / "reference_model.json").write_text(json.dumps(model), encoding="utf-8")
-        runs[run] = {"reference_model": f"{run}/reference_model.json"}
+        path = folder / run / "reference_model.json"
+        path.write_text(json.dumps(model), encoding="utf-8")
+        runs[run] = {"run": run, "reference_model": {"path": str(path)}}
     path = folder / "index.json"
     path.write_text(json.dumps({"format": mp.GEOMETRY_FORMAT, "runs": runs}), encoding="utf-8")
     return path

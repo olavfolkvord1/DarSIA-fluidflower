@@ -65,15 +65,39 @@ def _matrix(value: Any, label: str) -> np.ndarray:
     return matrix
 
 
+def _model_path(index_path: Path, run: str, binding: Any) -> Path:
+    """The reference model file a run's index entry names.
+
+    The binding is a path, or ``{"path", "sha256", "size_bytes"}``; a
+    relative path is taken from the index's folder. A bound size or SHA-256
+    that no longer matches is refused.
+    """
+
+    from darsia.fluidflower.project import sha256_file
+
+    row = dict(binding) if isinstance(binding, Mapping) else {"path": binding}
+    text = row.get("path")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"{index_path}: run {run} names no reference model")
+    path = Path(text)
+    path = path if path.is_absolute() else (index_path.parent / path).resolve()
+    if "size_bytes" in row and path.stat().st_size != int(row["size_bytes"]):
+        raise ValueError(f"{path} is not the reference model the index bound (size)")
+    if row.get("sha256") and sha256_file(path) != row["sha256"]:
+        raise ValueError(f"{path} is not the reference model the index bound (SHA-256)")
+    return path
+
+
 def read_run_geometry(index_path: Path | str) -> dict[str, RunGeometry]:
     """Every run's measured geometry from a geometry index.
 
     ``index.json`` has ``format`` GEOMETRY_FORMAT and ``runs``: a mapping of
-    run id to ``{"reference_model": "<relative path>"}`` (or a list of such
-    entries with ``run_id``). Each reference model holds
+    run id to ``{"reference_model": <binding>}`` (or a list of such entries
+    with ``run_id``), where the binding is ``{"path", "sha256",
+    "size_bytes"}`` or a path. Each reference model holds
     ``H_metric_mm_to_camera_u`` (or ``H_camera_u_to_metric_mm``, inverted
-    here), its ``reference_image`` binding (path, sha256, size_bytes) and
-    optionally ``shape_hw`` there. Run ids are compared case-insensitively.
+    here), ``shape_hw`` of its grid and its ``reference_image`` binding
+    (path, sha256, size_bytes). Run ids are compared case-insensitively.
     """
 
     index_path = Path(index_path)
@@ -89,11 +113,10 @@ def read_run_geometry(index_path: Path | str) -> dict[str, RunGeometry]:
         raise ValueError(f"{index_path} lists no runs")
     result: dict[str, RunGeometry] = {}
     for entry in entries:
-        run = str(entry.get("run_id") or "").strip().casefold()
-        relative = entry.get("reference_model")
-        if not run or not isinstance(relative, str) or not relative:
-            raise ValueError(f"{index_path}: each run needs run_id and reference_model")
-        model_path = (index_path.parent / relative).resolve()
+        run = str(entry.get("run_id") or entry.get("run") or "").strip().casefold()
+        if not run:
+            raise ValueError(f"{index_path}: each run needs its run id")
+        model_path = _model_path(index_path, run, entry.get("reference_model"))
         model = _read_json(model_path)
         if model.get("format", GEOMETRY_FORMAT) != GEOMETRY_FORMAT:
             raise ValueError(f"{model_path} is not a {GEOMETRY_FORMAT} model")
@@ -106,7 +129,7 @@ def read_run_geometry(index_path: Path | str) -> dict[str, RunGeometry]:
         else:
             raise ValueError(f"{model_path} has no metric-to-camera homography")
         image = dict(model.get("reference_image") or {})
-        shape = image.get("shape_hw")
+        shape = model.get("shape_hw") or image.get("shape_hw")
         result[run] = RunGeometry(
             run_id=run,
             metric_to_grid=metric_to_grid,

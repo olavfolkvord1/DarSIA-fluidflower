@@ -7,6 +7,7 @@ goes to a run as inverse(H_target_grid_to_mm) @ H_reference_grid_to_mm.
 Temporary folders and synthetic arrays only.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -24,21 +25,34 @@ SHIFTED_H = [[2.0, 0.0, 13.0], [0.0, 2.0, 4.0], [0.0, 0.0, 1.0]]
 
 
 def _index(folder, runs):
+    """An index in the builder's form: each model bound by path, SHA-256 and size."""
+
     folder.mkdir(parents=True, exist_ok=True)
     entries = {}
     for run, matrix in runs.items():
         (folder / run).mkdir(exist_ok=True)
         model = {
             "format": mp.GEOMETRY_FORMAT,
+            "run": run,
             "run_id": run,
-            "reference_image": {"path": f"{run}.arw", "shape_hw": list(SHAPE)},
+            "reference_image": {"path": f"{run}.arw", "sha256": "0" * 64, "size_bytes": 1},
+            "grid": "camera_u",
+            "shape_hw": list(SHAPE),
         }
         if run.endswith("inv"):
             model["H_camera_u_to_metric_mm"] = np.linalg.inv(matrix).tolist()
         else:
             model["H_metric_mm_to_camera_u"] = matrix
-        (folder / run / "reference_model.json").write_text(json.dumps(model), encoding="utf-8")
-        entries[run] = {"reference_model": f"{run}/reference_model.json"}
+        path = folder / run / "reference_model.json"
+        path.write_text(json.dumps(model), encoding="utf-8")
+        entries[run] = {
+            "run": run,
+            "reference_model": {
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "size_bytes": path.stat().st_size,
+            },
+        }
     path = folder / "index.json"
     path.write_text(json.dumps({"format": mp.GEOMETRY_FORMAT, "runs": entries}), encoding="utf-8")
     return path
@@ -62,8 +76,19 @@ def test_the_geometry_index_is_read_with_either_matrix(tmp_path):
     bad.write_text(json.dumps({"format": "other", "runs": {}}), encoding="utf-8")
     with pytest.raises(ValueError, match="is not a darsia-measured-run-geometry-v1 index"):
         mp.read_run_geometry(bad)
+    # A model that changed after the index bound it is refused.
     model = tmp_path / "geometry" / "run1" / "reference_model.json"
+    model.write_text(model.read_text(encoding="utf-8").replace("run1", "run9"), encoding="utf-8")
+    with pytest.raises(ValueError, match="is not the reference model the index bound"):
+        mp.read_run_geometry(path)
+    # A model given by a relative path is taken from the index's folder.
     model.write_text(json.dumps({"format": mp.GEOMETRY_FORMAT}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {"format": mp.GEOMETRY_FORMAT, "runs": {"run1": {"reference_model": "run1/reference_model.json"}}}
+        ),
+        encoding="utf-8",
+    )
     with pytest.raises(ValueError, match="no metric-to-camera homography"):
         mp.read_run_geometry(path)
 
