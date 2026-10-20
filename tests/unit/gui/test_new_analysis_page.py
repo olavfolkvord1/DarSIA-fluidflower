@@ -90,6 +90,32 @@ def test_the_page_offers_the_dialogs_profile_choice_estimate_and_choices(qtbot):
     qtbot.waitUntil(lambda: page.can_close() and panel.can_close(), timeout=5000)
 
 
+def test_dialog_and_page_are_freed_by_their_last_reference(qtbot):
+    """Q160: no reference cycle may keep a parentless dialog or page alive.
+
+    Such a widget is otherwise left to the cyclic garbage collector, which can
+    run in a Jobs worker thread and destroy it there; that hung a full suite.
+    """
+    import gc
+    import weakref
+
+    plan_row = dict(path=r"\\server\share\fixed.toml", sha256="a" * 64, size_bytes=15, label="Frozen")
+    panel = jobs.JobsPanel(local_machine="Main")
+    qtbot.addWidget(panel)
+    enabled = gc.isenabled()
+    gc.disable()  # Only reference counting may free them here.
+    try:
+        dialog = jobs.StartAnalysisDialog([plan_row])
+        page = jobs.NewAnalysisPage(panel, facts_reader=lambda row: dict(FACTS))
+        refs = [weakref.ref(item) for item in (dialog, dialog.form, page, page.form)]
+        del dialog, page
+        assert [ref() is None for ref in refs] == [True, True, True, True]
+    finally:
+        if enabled:
+            gc.enable()
+    assert panel.can_close()
+
+
 def test_computed_at_is_native_with_the_coarse_grids_disabled(qtbot):
     combo = jobs.computing_resolution_combo()
     qtbot.addWidget(combo)

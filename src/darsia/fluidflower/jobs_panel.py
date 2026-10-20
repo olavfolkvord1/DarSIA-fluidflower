@@ -253,13 +253,15 @@ class StartAnalysisChoices(QObject):
 
     The one implementation behind the New analysis page and the Start analysis
     dialog (N141): the same controls, labels, default, estimate and choices.
+    The host is only the Qt parent, never a Python attribute: a reference back
+    to it would put a parentless dialog in a reference cycle, and the cyclic
+    garbage collector could then destroy it in a Jobs worker thread (Q160).
     """
 
     changed = Signal()
 
     def __init__(self, plans=(), host=None, *, free_space=None):
         super().__init__(host)
-        self.host = host
         self.plans, self.free_space, self._imported = [], None, []
         self.plan_combo = QComboBox()
         self.name_edit, self.job_edit = QLineEdit(), QLineEdit()
@@ -317,8 +319,9 @@ class StartAnalysisChoices(QObject):
         self.changed.emit()
 
     def _import_plan(self):
+        host = self.parent()
         path, _ = QFileDialog.getOpenFileName(
-            self.host, "Choose an existing adopted execution plan", "", "TOML (*.toml)"
+            host, "Choose an existing adopted execution plan", "", "TOML (*.toml)"
         )
         if not path:
             return
@@ -326,7 +329,7 @@ class StartAnalysisChoices(QObject):
             require_unc(path)
             bound = descriptor(Path(path))
         except Exception:
-            QMessageBox.warning(self.host, "Could not select plan", traceback.format_exc())
+            QMessageBox.warning(host, "Could not select plan", traceback.format_exc())
             return
         row = dict(bound, label=Path(path).name)
         self._imported.append(row)
