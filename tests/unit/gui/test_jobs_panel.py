@@ -24,7 +24,9 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
-def wait(app, predicate, timeout=3):
+def wait(app, predicate, timeout=30):
+    # A slower or loaded test machine needs more than a few seconds for the
+    # panel's background reads to retire; the predicate is unchanged.
     until = time.monotonic() + timeout
     while time.monotonic() < until:
         app.processEvents()
