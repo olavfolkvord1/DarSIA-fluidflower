@@ -111,10 +111,15 @@ def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_p
         ["AC54", "no geometry", ""],
         ["AC53", "placed", "3.0 / 3.0"],
     ]
-    assert cells[2][3] == str(3 * 60)  # The 3 columns the map does not reach.
+    # A uniform photograph has no edge to measure; the 3 columns the map does
+    # not reach lie inside the painted area, so they are gaps to fill.
+    assert cells[2][3:6] == ["none measured", str(3 * 60), "0"]
+    assert dialog.legend.text().count("■") == 2
+    assert "layer offsets" in dialog.details.text()
     assert not dialog.view.item.pixmap().isNull()
     assert dialog.view.item.pixmap().size().width() == 80
     assert not dialog.show_run(1) and "no geometry" in dialog.status.text()
+    assert "not measured" in dialog.details.text()
     assert dialog.show_run(2) and "AC53" in dialog.status.text()
     # Nothing in the painting folder changed: no map, session, version or approval.
     assert _files(lp.painting_folder(view.project)) == painting_before

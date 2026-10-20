@@ -112,27 +112,56 @@ def test_a_map_is_carried_through_the_rig_to_another_run(tmp_path):
     }
 
 
-def test_the_overlay_draws_each_boundary_in_its_layers_colour():
+def test_the_overlay_has_two_labelled_line_types():
     photo = np.full(SHAPE + (3,), 100, dtype=np.uint8)
     layers = _layers()
-    colors = {1: (0, 0, 255), 2: (255, 0, 0), 3: (0, 255, 0)}
-    overlay = mp.boundary_overlay(photo, layers, colors)
-    assert tuple(overlay[19, 5]) == (255, 0, 0) and tuple(overlay[20, 5]) == (0, 0, 255)
-    assert tuple(overlay[5, 29]) == (255, 0, 0) and tuple(overlay[5, 30]) == (0, 255, 0)
-    assert tuple(overlay[5, 5]) == (100, 100, 100)  # Away from the boundaries.
+    uncovered = np.zeros(SHAPE, dtype=bool)
+    uncovered[:, :3] = True
+    overlay = mp.boundary_overlay(photo, layers, uncovered)
+    boundary, gap = mp.BOUNDARY_COLOR, mp.GAP_COLOR
+    assert tuple(overlay[19, 10]) == boundary and tuple(overlay[20, 10]) == boundary
+    assert tuple(overlay[5, 29]) == boundary and tuple(overlay[5, 30]) == boundary
+    assert tuple(overlay[5, 2]) == gap and tuple(overlay[5, 3]) == gap
+    assert tuple(overlay[5, 10]) == (100, 100, 100)  # Away from the lines.
+    assert [color for _label, color in mp.OVERLAY_LEGEND] == [boundary, gap]
     assert np.array_equal(photo, np.full(SHAPE + (3,), 100, dtype=np.uint8))
     with pytest.raises(ValueError, match="differ in size"):
-        mp.boundary_overlay(photo[:10], layers, colors)
+        mp.boundary_overlay(photo[:10], layers)
+
+
+def test_layer_offsets_use_the_existing_band_measurement():
+    shape = (120, 200)
+    layers = np.full(shape, 2, dtype=np.uint8)
+    layers[:, 100:] = 3
+    photo = np.full(shape + (3,), 40, dtype=np.uint8)
+    photo[:, 106:] = 200  # The visible edge lies 6 px (3 mm) right of the boundary.
+    geometry = mp.RunGeometry("run1", np.asarray(REFERENCE_H), {}, shape, "")
+    assert mp.grid_spacing_mm(geometry, shape) == pytest.approx((0.5, 0.5))
+    roles = {2: "porous_medium", 3: "porous_medium"}
+    result = mp.layer_offsets(photo, layers, geometry, roles)
+    assert result["band_mm"] == 25.0 and result["spacing_mm"] == [0.5, 0.5]
+    (boundary,) = result["boundaries"]
+    assert boundary["labels"] == [2, 3] and boundary["status"] == "candidate"
+    assert boundary["median_mm"] == 3.0 and boundary["p10_mm"] == boundary["p90_mm"] == 3.0
+    assert boundary["measured_sample_count"] == boundary["sample_count"] == 120
+    # On a reduced grid the same edge is found, to within the coarser spacing.
+    coarse = mp.layer_offsets(photo, layers, geometry, roles, spacing_mm=1.0)
+    assert coarse["spacing_mm"] == [1.0, 1.0]
+    assert abs(coarse["boundaries"][0]["median_mm"] - 3.0) <= 0.5
 
 
 def test_the_checks_and_the_review_order():
     layers = _layers()
     layers[0, 0] = 9
+    layers[10, 10] = 1  # Free water enclosed in the sand.
     uncovered = np.zeros(SHAPE, dtype=bool)
     uncovered[:, :2] = True
     checks = mp.run_checks(layers, uncovered, {1: "free_water"}, {1, 2, 3})
-    assert checks["free_water_pixels"] == 20 * 60 and checks["inside_pixels"] == 40 * 60
-    assert checks["uncovered_pixels"] == 2 * 40
+    assert checks["free_water_pixels"] == 20 * 60 + 1 and checks["inside_pixels"] == 40 * 60
+    assert checks["water_pocket_pixels"] == 1
+    assert checks["uncovered_pixels"] == 2 * 40 and checks["gap_pixels"] == 2 * 40
+    layers[:, :2] = 0  # Pixels outside the map are not gaps.
+    assert mp.run_checks(layers, uncovered, {1: "free_water"}, {1, 2, 3})["gap_pixels"] == 0
     assert checks["unknown_layer_ids"] == [9] and checks["outside_pixels"] == 0
     assert mp.review_order(["run1", "run2", "run3", "run4"], "RUN3", ["run4", "nope"]) == [
         "run3", "run4", "run1", "run2"
@@ -154,8 +183,8 @@ def test_a_placement_writes_a_new_review_folder_only(tmp_path):
         geometry_index=index,
         runs=["run1", "run2", "run3"],
         photo_loader=photo,
-        colors={1: (0, 0, 255), 2: (255, 0, 0), 3: (0, 255, 0)},
-        roles={1: "free_water"},
+        roles={1: "free_water", 2: "porous_medium", 3: "porous_medium"},
+        names={1: "Free water", 2: "Fine sand", 3: "Coarse sand"},
         version={"name": "Map A", "sha256": "a" * 64},
     )
     folder = Path(result["folder"])
@@ -171,15 +200,23 @@ def test_a_placement_writes_a_new_review_folder_only(tmp_path):
     assert result["runs"][1]["checks"]["uncovered_pixels"] == 3 * 40
     assert result["runs"][0]["offset_px"]["max_px"] == 0.0
     assert result["runs"][1]["offset_px"] == {"median_px": 3.0, "max_px": 3.0}
+    assert result["layers"]["3"] == {"name": "Coarse sand", "role": "porous_medium"}
+    assert [row["label"] for row in result["overlay_legend"]] == [
+        label for label, _color in mp.OVERLAY_LEGEND
+    ]
+    # A uniform photograph shows no edge to measure an offset against.
+    offsets = result["runs"][1]["layer_offsets"]
+    assert offsets["band_mm"] == 25.0 and offsets["boundaries"]
+    assert all(row["median_mm"] is None for row in offsets["boundaries"])
     assert sorted(path.name for path in folder.iterdir()) == ["index.json", "run1", "run2"]
     with pytest.raises(ValueError, match="no model for the reference run"):
         mp.place_map_in_runs(
             tmp_path / "reviews", _layers(), reference_run="run9", geometry_index=index,
-            runs=["run1"], photo_loader=photo, colors={}, roles={}, version={},
+            runs=["run1"], photo_loader=photo, roles={}, version={},
         )
     with pytest.raises(ValueError, match="is not on the reference run's grid"):
         mp.place_map_in_runs(
             tmp_path / "reviews", _layers()[:20], reference_run="run1", geometry_index=index,
-            runs=["run1"], photo_loader=photo, colors={}, roles={}, version={},
+            runs=["run1"], photo_loader=photo, roles={}, version={},
         )
     assert len(list((tmp_path / "reviews").iterdir())) == 1

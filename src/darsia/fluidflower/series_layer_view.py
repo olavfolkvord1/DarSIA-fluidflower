@@ -2726,16 +2726,6 @@ class _ProposalWorker(QObject):
         self.finished.emit(proposal)
 
 
-def _rgb(color: str) -> tuple[int, int, int]:
-    """(red, green, blue) of a #rrggbb colour; white when it is not one."""
-
-    value = str(color).lstrip("#")
-    try:
-        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
-    except ValueError:
-        return 255, 255, 255
-
-
 class _PlacementWorker(QObject):
     """Place an approved map version in all runs (a review folder only)."""
 
@@ -2764,7 +2754,6 @@ class _PlacementWorker(QObject):
                 table[int(row["label_id"])] = int(row["layer_id"])
             layers = table[labels]
             del labels
-            colors = {row.layer_id: _rgb(row.color) for row in session.layers}
             roles = {
                 row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
             }
@@ -2775,8 +2764,8 @@ class _PlacementWorker(QObject):
                 geometry_index=self.options["geometry_index"],
                 runs=self.options["runs"],
                 photo_loader=self.options["photo_loader"],
-                colors=colors,
                 roles=roles,
+                names={row.layer_id: row.name for row in session.layers},
                 version={
                     key: self.record.get(key)
                     for key in ("name", "kind", "sha256", "created_utc", "folder")
@@ -5660,7 +5649,8 @@ class LayerPainterView(QWidget):
             f"{len(runs)} runs through each run's measured geometry?\n\nThis writes a new "
             "review folder with each run's placed map and an overlay on its reference "
             "photograph. It changes no map, geometry revision or run configuration. It "
-            "reads every run's reference photograph and takes a few minutes.\n\n"
+            "reads every run's reference photograph, measures each layer's offset from "
+            "the edges in it and takes several minutes.\n\n"
             "Runs to review first, after this run (optional, separated by commas):",
             text=str(settings.value(_FIRST_RUNS_KEY, "") or ""),
         )

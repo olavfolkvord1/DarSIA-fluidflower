@@ -10,8 +10,13 @@ pixels flagged).
 
 A placement writes only a new review folder: per run the placed layer map
 and an overlay of its boundaries on the run's own reference photograph, and
-one ``index.json`` with each run's offset and checks. It changes no map,
-session, geometry revision, run configuration or result.
+one ``index.json`` with each run's shift, layer offsets and checks. The
+layer offsets are the existing read-only measurement of
+:mod:`geometry_offset` (the strongest colour edge within +/-25 mm of each
+boundary; median, 10th and 90th percentiles). The checks are the round-5
+review's: layer ids missing from the map's table, free water enclosed in the
+medium, and pixels the map does not cover that need filling. A placement
+changes no map, session, geometry revision, run configuration or result.
 """
 
 from __future__ import annotations
@@ -30,6 +35,16 @@ import numpy as np
 GEOMETRY_FORMAT = "darsia-measured-run-geometry-v1"
 PLACEMENT_FORMAT = "darsia-fluidflower-map-placement-v1"
 MAX_JSON_BYTES = 16 * 1024 * 1024
+# The overlays have at most two labelled line types.
+BOUNDARY_COLOR = (255, 255, 0)
+GAP_COLOR = (255, 0, 255)
+OVERLAY_LEGEND = (
+    ("Boundaries of the placed map", BOUNDARY_COLOR),
+    ("Outline of the pixels the map does not cover", GAP_COLOR),
+)
+# The layer offsets are measured on the run's grid reduced to about this
+# many millimetres per pixel.
+OFFSET_SPACING_MM = 0.5
 
 
 @dataclass(frozen=True)
@@ -174,29 +189,130 @@ def place_layer_map(
     )
 
 
-def boundary_overlay(
-    photo: np.ndarray, layers: np.ndarray, colors: Mapping[int, tuple[int, int, int]]
-) -> np.ndarray:
-    """The photograph (uint8 RGB) with each layer's boundary drawn in its colour.
+def _edges(values: np.ndarray) -> np.ndarray:
+    """Pixels whose 4-neighbour below or to the right differs, on both sides."""
 
-    A pixel is on a boundary when its 4-neighbour below or to the right has
-    another layer; both sides of the boundary are drawn, two pixels wide.
-    """
-
-    if photo.shape[:2] != layers.shape:
-        raise ValueError("The photograph and the layer map differ in size")
-    overlay = np.ascontiguousarray(photo[..., :3], dtype=np.uint8).copy()
-    edge = np.zeros(layers.shape, dtype=bool)
-    down = layers[1:, :] != layers[:-1, :]
-    right = layers[:, 1:] != layers[:, :-1]
+    edge = np.zeros(values.shape, dtype=bool)
+    down = values[1:, :] != values[:-1, :]
+    right = values[:, 1:] != values[:, :-1]
     edge[1:, :] |= down
     edge[:-1, :] |= down
     edge[:, 1:] |= right
     edge[:, :-1] |= right
-    for layer_id in np.unique(layers[edge]):
-        color = colors.get(int(layer_id), (255, 255, 255))
-        overlay[edge & (layers == layer_id)] = color
+    return edge
+
+
+def boundary_overlay(
+    photo: np.ndarray, layers: np.ndarray, uncovered: np.ndarray | None = None
+) -> np.ndarray:
+    """The photograph (uint8 RGB) with the two line types of OVERLAY_LEGEND:
+    the placed map's boundaries and the outline of the pixels it does not
+    cover. Each line is two pixels wide, one on each side of the change."""
+
+    if photo.shape[:2] != layers.shape:
+        raise ValueError("The photograph and the layer map differ in size")
+    overlay = np.ascontiguousarray(photo[..., :3], dtype=np.uint8).copy()
+    overlay[_edges(layers)] = BOUNDARY_COLOR
+    if uncovered is not None:
+        overlay[_edges(np.asarray(uncovered, dtype=bool))] = GAP_COLOR
     return overlay
+
+
+def grid_spacing_mm(geometry: RunGeometry, shape_hw: tuple[int, int]) -> tuple[float, float]:
+    """Millimetres per pixel down a column and along a row at the grid's centre."""
+
+    to_mm = np.linalg.inv(geometry.metric_to_grid)
+    row, col = (shape_hw[0] - 1) / 2.0, (shape_hw[1] - 1) / 2.0
+    points = np.array([[col, col + 1.0, col], [row, row, row + 1.0], [1.0, 1.0, 1.0]])
+    mm = to_mm @ points
+    mm = mm[:2] / mm[2]
+    along = float(np.hypot(*(mm[:, 1] - mm[:, 0])))
+    down = float(np.hypot(*(mm[:, 2] - mm[:, 0])))
+    return down, along
+
+
+def layer_offsets(
+    photo: np.ndarray,
+    layers: np.ndarray,
+    geometry: RunGeometry,
+    roles: Mapping[int, str],
+    *,
+    spacing_mm: float = OFFSET_SPACING_MM,
+) -> dict[str, Any]:
+    """How far each layer boundary lies from the edge seen in the photograph.
+
+    The existing read-only method, geometry_offset.measure_arrays: along each
+    boundary's normal within +/-25 mm, the strongest colour edge, and per pair
+    of layers the median and the 10th and 90th percentiles in millimetres.
+    It runs on the run's grid reduced to about ``spacing_mm`` per pixel
+    (block means of the photograph, block centres of the map), with the
+    spacing of the grid's centre from the run's geometry. Descriptive only.
+    """
+
+    import cv2
+
+    from darsia.fluidflower.geometry_offset import measure_arrays
+
+    down, along = grid_spacing_mm(geometry, layers.shape)
+    factor = max(1, int(round(spacing_mm / min(down, along))))
+    height, width = layers.shape[0] // factor, layers.shape[1] // factor
+    start = factor // 2
+    reduced = np.ascontiguousarray(
+        layers[start : height * factor : factor, start : width * factor : factor]
+    )
+    image = np.ascontiguousarray(photo[: height * factor, : width * factor, :3])
+    if factor > 1:
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+    report, _drawings = measure_arrays(
+        image,
+        reduced,
+        {
+            "space_dim": 2,
+            "indexing": "ij",
+            "dimensions": [height * factor * down / 1000.0, width * factor * along / 1000.0],
+        },
+        [
+            {"label_id": int(layer), "analysis_role": str(role), "enabled": True}
+            for layer, role in roles.items()
+        ],
+    )
+
+    def number(value: Any) -> float | None:
+        return None if value is None else round(float(value), 2)
+
+    return {
+        "method": "geometry_offset.measure_arrays",
+        "band_mm": float(report["parameters"]["band_mm"]),
+        "spacing_mm": [round(float(value), 4) for value in report["spacing_mm"]],
+        "sign_convention": report["sign_convention"],
+        "boundaries": [
+            {
+                "labels": list(row["labels"]),
+                "median_mm": number(row["median_mm"]),
+                "p10_mm": number(row["p10_mm"]),
+                "p90_mm": number(row["p90_mm"]),
+                "measured_sample_count": int(row["measured_sample_count"]),
+                "sample_count": int(row["sample_count"]),
+                "status": row["status"],
+            }
+            for row in report["boundaries"]
+            if row["measurement_eligible"]
+        ],
+    }
+
+
+def water_pockets(layers: np.ndarray, roles: Mapping[int, str]) -> int:
+    """Free-water pixels outside the largest connected free-water region:
+    water enclosed in the medium, which the review looks for."""
+
+    from scipy import ndimage as ndi
+
+    water = np.isin(layers, [layer for layer, role in roles.items() if role == "free_water"])
+    labelled, count = ndi.label(water)
+    if count <= 1:
+        return 0
+    sizes = np.bincount(labelled.ravel())[1:]
+    return int(sizes.sum() - sizes.max())
 
 
 def map_offset(
@@ -230,8 +346,10 @@ def run_checks(
     layers: np.ndarray, uncovered: np.ndarray, roles: Mapping[int, str], known: set[int]
 ) -> dict[str, Any]:
     """Counts for the review: pixels per layer, pixels inside the map (any
-    layer), free-water pixels, pixels the map does not cover, and layer ids
-    that are not in the map's layer table."""
+    layer), free-water pixels, free water enclosed in the medium, pixels the
+    map does not cover, those of them inside the map (gaps to fill, nearest
+    sand in the row, then in the column) and layer ids that are not in the
+    map's layer table."""
 
     counts = np.bincount(layers.ravel(), minlength=256)
     present = {int(value): int(counts[value]) for value in np.flatnonzero(counts)}
@@ -241,7 +359,9 @@ def run_checks(
         "pixels_per_layer": present,
         "inside_pixels": int(layers.size - present.get(0, 0)),
         "free_water_pixels": int(water),
+        "water_pocket_pixels": water_pockets(layers, roles),
         "uncovered_pixels": int(np.count_nonzero(uncovered)),
+        "gap_pixels": int(np.count_nonzero(uncovered & (layers != 0))),
         "outside_pixels": int(present.get(0, 0)),
         "unknown_layer_ids": unknown,
     }
@@ -264,23 +384,25 @@ def place_map_in_runs(
     geometry_index: Path | str,
     runs: Sequence[str],
     photo_loader: Callable[[str, RunGeometry], np.ndarray],
-    colors: Mapping[int, tuple[int, int, int]],
     roles: Mapping[int, str],
     version: Mapping[str, Any],
+    names: Mapping[int, str] | None = None,
     first_runs: Sequence[str] = (),
+    measure_offsets: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Place the map in every run and write a new review folder.
 
-    ``layers`` is the map's layer ids on the reference run's grid;
-    ``photo_loader(run, geometry)`` returns that run's reference photograph
-    as uint8 RGB on its grid; ``version`` names the approved map version
-    (name, sha256, approval); ``first_runs`` are shown right after the
-    reference run. The folder ``<destination_root>/<UTC>-<id>`` gets
-    ``<run>/layers.npz`` (exact), ``<run>/overlay.jpg`` (for viewing) and
-    ``index.json`` (format PLACEMENT_FORMAT, with the runs in review order and
-    each run's offset and checks). Runs without a geometry are listed as
-    such. Returns the index.
+    ``layers`` is the map's layer ids on the reference run's grid; ``roles``
+    and ``names`` give each layer id's role and name; ``photo_loader(run,
+    geometry)`` returns that run's reference photograph as uint8 RGB on its
+    grid; ``version`` names the approved map version (name, sha256,
+    approval); ``first_runs`` are shown right after the reference run. The
+    folder ``<destination_root>/<UTC>-<id>`` gets ``<run>/layers.npz``
+    (exact), ``<run>/overlay.jpg`` (for viewing) and ``index.json`` (format
+    PLACEMENT_FORMAT, with the runs in review order and each run's shift,
+    layer offsets and checks). Runs without a geometry are listed as such.
+    Returns the index.
     """
 
     from PIL import Image
@@ -304,7 +426,7 @@ def place_map_in_runs(
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
     folder.mkdir(parents=True, exist_ok=False)
-    known = set(colors)
+    known = {int(layer) for layer in roles}
     rows = []
     for number, run in enumerate(order, 1):
         if progress is not None:
@@ -323,9 +445,14 @@ def place_map_in_runs(
         np.savez_compressed(run_folder / "layers.npz", layers=placed, uncovered=uncovered)
         # A full-resolution JPEG without chroma subsampling: the boundaries
         # stay sharp, at a fraction of a PNG's size. The exact map is the npz.
-        Image.fromarray(boundary_overlay(photo, placed, colors)).save(
+        Image.fromarray(boundary_overlay(photo, placed, uncovered)).save(
             run_folder / "overlay.jpg", quality=92, subsampling=0
         )
+        offsets = None
+        if measure_offsets:
+            if progress is not None:
+                progress(f"Measuring the layer offsets in {run.upper()} ({number} of {len(order)})…")
+            offsets = layer_offsets(photo, placed, target, roles)
         del photo
         rows.append(
             {
@@ -336,6 +463,7 @@ def place_map_in_runs(
                 "shape_hw": [int(shape[0]), int(shape[1])],
                 "geometry_model": target.source,
                 "offset_px": map_offset(layers, reference, target),
+                "layer_offsets": offsets,
                 "checks": run_checks(placed, uncovered, roles, known),
             }
         )
@@ -344,6 +472,13 @@ def place_map_in_runs(
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "reference_run": reference_key,
         "map_version": dict(version),
+        "layers": {
+            str(int(layer)): {"name": str((names or {}).get(layer, "")), "role": str(role)}
+            for layer, role in sorted(roles.items())
+        },
+        "overlay_legend": [
+            {"label": label, "rgb": list(color)} for label, color in OVERLAY_LEGEND
+        ],
         "geometry_index": {
             "path": str(index_path.resolve()),
             "sha256": sha256_file(index_path),
@@ -370,7 +505,12 @@ __all__ = [
     "GEOMETRY_FORMAT",
     "PLACEMENT_FORMAT",
     "RunGeometry",
+    "BOUNDARY_COLOR",
+    "GAP_COLOR",
+    "OVERLAY_LEGEND",
     "boundary_overlay",
+    "grid_spacing_mm",
+    "layer_offsets",
     "map_offset",
     "place_layer_map",
     "place_map_in_runs",
@@ -378,4 +518,5 @@ __all__ = [
     "read_run_geometry",
     "review_order",
     "run_checks",
+    "water_pockets",
 ]
