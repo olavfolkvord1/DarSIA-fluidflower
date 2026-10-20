@@ -11,7 +11,7 @@ from contextvars import copy_context
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
@@ -176,6 +176,13 @@ class MassAnalysisWorkspace(QWidget):
         approval.addWidget(self.approve_button)
         layout.addWidget(self.approval)
         self.approval.hide()
+        # The viewed run's pressure and temperature source, Calibration review only.
+        self.pressure_line = QLabel()
+        self.pressure_line.setWordWrap(True)
+        self.pressure_line.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.pressure_line)
+        self.pressure_line.hide()
+        self._pressure_choices = None
         # Build published dataset (N169), shown in Results and export only.
         self.publish_button = QPushButton("Build published dataset…")
         self.publish_button.setToolTip(
@@ -213,6 +220,7 @@ class MassAnalysisWorkspace(QWidget):
         if results:
             saved.export_toggle.setChecked(True)
         saved.export_body.setVisible(results and saved.export_toggle.isChecked())
+        self._pressure_choices = None
         self.refresh_approval()
 
     def build_published_dataset(self) -> None:
@@ -241,13 +249,40 @@ class MassAnalysisWorkspace(QWidget):
             raise ValueError(choice.error)
         return calibration_identity(self.project_root, choice.mass_calibration)
 
+    def _show_pressure_line(self) -> None:
+        """One line: the viewed run's configured pressure and temperature source."""
+        from darsia.fluidflower.pressure_source import (
+            calibration_pressure, pressure_line, run_configuration_choices, run_pressure_source)
+        from darsia.fluidflower.series_method import read_series_method
+
+        self.pressure_line.show()
+        run = self.saved_results.view_experiment.currentData()
+        if not run:
+            self.pressure_line.setText(pressure_line(None))
+            return
+        if self._pressure_choices is None:
+            # The run files once per series display; each run then reads its own two files.
+            choices = {str(name).casefold(): (str(name), path, note)
+                       for name, path, note in run_configuration_choices(self.project_root)}
+            fit = calibration_pressure(
+                "phase_model", read_series_method(self.project_root).mass_calibration,
+                self.project_root)
+            self._pressure_choices = choices, fit
+        choices, fit = self._pressure_choices
+        entry = choices.get(str(run).casefold())
+        row = None if entry is None else run_pressure_source(
+            entry[0], entry[1], note=entry[2], fit=fit)
+        self.pressure_line.setText(pressure_line(row, run))
+
     def refresh_approval(self, *_args) -> None:
         """Show whether the viewed run is approved for the current calibration."""
         if self.view != "review":
             self.approval.hide()
+            self.pressure_line.hide()
             return
         from darsia.fluidflower.calibration_approvals import read_run_approvals, run_approval
 
+        self._show_pressure_line()
         self.approval.show()
         run = self.saved_results.view_experiment.currentData()
         self.approve_button.setText(f"Approve {str(run).upper()}" if run else "Approve run")
@@ -311,6 +346,7 @@ class MassAnalysisWorkspace(QWidget):
         self.saved_results.series.setCurrentIndex(
             self.saved_results.series.findData(self.series))
         self.refresh_models()
+        self._pressure_choices = None
         self.refresh_approval()
 
     def _series_selection_changed(self, _index: int) -> None:

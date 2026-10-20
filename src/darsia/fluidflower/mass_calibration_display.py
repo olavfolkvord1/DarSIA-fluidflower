@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -36,6 +36,7 @@ MAX_CSV_BYTES = 256 * 1024
 MAX_SIGNAL_FILES = 64
 MAX_DIRECTORY_ENTRIES = 256
 MAX_SIGNAL_ROWS = 128
+PRESSURE_COLUMNS = ("Run", "Source", "Pressure · temperature", "Time span", "Status", "In the fit")
 
 
 @dataclass(frozen=True)
@@ -391,7 +392,11 @@ def read_mass_calibration_display(
 
 
 class MassCalibrationDisplay(QWidget):
-    """Reusable read-only table; both future calculation modes stay disabled."""
+    """Reusable read-only table; both future calculation modes stay disabled.
+
+    A page may also show each run's pressure and temperature source below it,
+    from rows that ``pressure_source`` reads; the widget itself reads nothing.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -432,7 +437,101 @@ class MassCalibrationDisplay(QWidget):
         self.notes.setWordWrap(True)
         self.notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.notes)
+        # Pressure and temperature per run (whole series). Hidden until a page
+        # hands it rows; the read-only calibration dialog never does.
+        self.pressure_box = QWidget()
+        pressure = QVBoxLayout(self.pressure_box)
+        pressure.setContentsMargins(0, 0, 0, 0)
+        self.pressure_title = QLabel()
+        self.pressure_title.setWordWrap(True)
+        pressure.addWidget(self.pressure_title)
+        self.pressure_table = QTableWidget(0, len(PRESSURE_COLUMNS))
+        self.pressure_table.setHorizontalHeaderLabels(PRESSURE_COLUMNS)
+        self.pressure_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.pressure_table.horizontalHeader().setStretchLastSection(True)
+        self.pressure_table.verticalHeader().hide()
+        pressure.addWidget(self.pressure_table, 1)
+        self.pressure_notes = QLabel()
+        self.pressure_notes.setTextFormat(Qt.TextFormat.PlainText)
+        self.pressure_notes.setWordWrap(True)
+        self.pressure_notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        pressure.addWidget(self.pressure_notes)
+        layout.addWidget(self.pressure_box, 1)
+        self.pressure_box.hide()
+        self.pressure_complete = True
+        self._pressure_steps = None
+        self._pressure_timer = QTimer(self)
+        self._pressure_timer.setInterval(0)
+        self._pressure_timer.timeout.connect(self._next_pressure_step)
         self.set_display(read_mass_calibration_display("", None))
+
+    def set_pressure_sources(self, sources) -> None:
+        """Render read pressure rows (pressure_source.PressureSources); no I/O.
+
+        None hides the table.
+        """
+        if sources is None:
+            self.pressure_table.setRowCount(0)
+            self.pressure_box.hide()
+            return
+        rows = tuple(sources.rows)
+        self.pressure_complete = bool(sources.complete)
+        self.pressure_title.setText(
+            f"Pressure and temperature per run — whole series ({len(rows)} runs)"
+        )
+        self.pressure_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            cells = (str(row.run).upper(), row.source, row.values, row.span, row.status, row.fit)
+            for column, value in enumerate(cells):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(row.detail or str(value))
+                self.pressure_table.setItem(index, column, item)
+        self.pressure_table.resizeColumnsToContents()
+        self.pressure_notes.setText("\n".join(sources.notes))
+        self.pressure_box.show()
+
+    def follow_pressure_sources(self, snapshots) -> None:
+        """Show each snapshot of an iterator of PressureSources as it is read.
+
+        One snapshot is taken per Qt timer tick in this thread, so the window
+        stays responsive while network files are read; a new call replaces the
+        previous iterator. None hides the table.
+        """
+        self._pressure_timer.stop()
+        self._pressure_steps = None
+        if snapshots is None:
+            self.pressure_complete = True
+            self.set_pressure_sources(None)
+            return
+        self.pressure_complete = False
+        self._pressure_steps = iter(snapshots)
+        self._next_pressure_step()
+        if self._pressure_steps is not None:
+            self._pressure_timer.start()
+
+    def _next_pressure_step(self) -> None:
+        steps = self._pressure_steps
+        if steps is None:
+            self._pressure_timer.stop()
+            return
+        try:
+            snapshot = next(steps)
+        except StopIteration:
+            snapshot = None
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            snapshot = None
+            self.pressure_notes.setText(f"Pressure sources could not be read: {error}")
+            self.pressure_box.show()
+        if snapshot is None:
+            self._pressure_timer.stop()
+            self._pressure_steps = None
+            self.pressure_complete = True
+            return
+        self.set_pressure_sources(snapshot)
+        if snapshot.complete:
+            self._pressure_timer.stop()
+            self._pressure_steps = None
 
     def set_display(self, display: SavedMassCalibrationData) -> None:
         """Render already loaded metadata; this method performs no I/O."""

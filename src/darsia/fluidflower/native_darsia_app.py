@@ -1772,6 +1772,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         from darsia.fluidflower.mass_calibration_display import (
             read_mass_calibration_display,
         )
+        from darsia.fluidflower.pressure_source import iter_series_pressure_sources
 
         selection = self.method_panel.selection()
         reference = (
@@ -1779,10 +1780,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
             if method == "phase_model"
             else selection.colour_calibration
         )
-        data = read_mass_calibration_display(
-            method, reference, series_root=self._method_series_root()
-        )
+        root = self._method_series_root()
+        data = read_mass_calibration_display(method, reference, series_root=root)
         self.mass_calibration_display.set_display(data)
+        self.mass_calibration_display.follow_pressure_sources(
+            None if root is None else iter_series_pressure_sources(
+                root, method=method, calibration=reference))
         self._displayed_mass_method = method
         self.content_stack.setCurrentWidget(self.mass_calibration_display)
 
