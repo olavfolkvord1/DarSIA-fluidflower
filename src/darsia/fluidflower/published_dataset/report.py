@@ -25,12 +25,13 @@ MASS_LABELS = (("total", "Total CO2"), ("aqueous", "Dissolved CO2"), ("gas", "Fr
 
 
 def report_document(*, manifest: dict, check: dict, settings: dict, summary: dict, frames: list,
-                    machine: dict, timing: dict | None = None) -> dict:
+                    machine: dict, timing: dict | None = None, differences: list | None = None) -> dict:
     """The report as one JSON document.
 
     ``check`` holds the code comparison and environment differences,
-    ``settings`` the scope and machine settings, ``summary`` the verdicts and
-    ``frames`` the per-frame comparisons (as dictionaries).
+    ``settings`` the scope and machine settings, ``summary`` the verdicts,
+    ``frames`` the per-frame comparisons (as dictionaries) and ``differences``
+    the settings that differ from the published plan.
     """
     identity = manifest["identity"]
     reproduction = bool(check["code"].get("same"))
@@ -45,6 +46,7 @@ def report_document(*, manifest: dict, check: dict, settings: dict, summary: dic
         "environment_differences": list(check.get("environment") or ()),
         "machine": machine,
         "settings": settings,
+        "differences_from_published_plan": list(differences or ()),
         "rule": manifest["reproducibility"],
         "known_variation": manifest.get("known_variation") or [],
         "verdict": summary,
@@ -162,6 +164,10 @@ def render_html(report: dict, figures: dict[str, str]) -> str:
     if first:
         parts.append(f"<h2>First divergence</h2><p>Run {_escape(first['run'])}, frame {_escape(first['case_id'])}: "
                      f"{_escape(first['quantity'])} ({_escape(first.get('detail', ''))}).</p>")
+    if report.get("differences_from_published_plan"):
+        parts.append("<h2>Settings that differ from the published plan</h2><ul>")
+        parts += [f"<li>{_escape(line)}</li>" for line in report["differences_from_published_plan"]]
+        parts.append("</ul>")
     if report["environment_differences"]:
         parts.append("<h2>Environment differences</h2><ul>")
         parts += [f"<li>{_escape(line)}</li>" for line in report["environment_differences"]]

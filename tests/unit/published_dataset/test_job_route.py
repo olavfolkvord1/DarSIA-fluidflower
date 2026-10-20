@@ -17,7 +17,7 @@ import pytest
 
 from darsia.fluidflower.job_filesystem import SharedFolderAdmission
 from darsia.fluidflower.pipeline import alias_job, job_inputs
-from darsia.fluidflower.published_dataset import builder, job_route, scan
+from darsia.fluidflower.published_dataset import builder, job_route, read_only, scan
 from darsia.fluidflower.published_dataset.comparison import IDENTICAL
 from darsia.fluidflower.published_dataset.reproduce import Reproduction, Settings, choose_scope, execute
 from tests.unit.published_dataset.synthetic import COMMIT, make_series, write_run_results
@@ -88,8 +88,12 @@ def test_a_moved_dataset_reproduces_identically_and_stays_read_only(dataset, tmp
     scope = choose_scope(check.manifest, "all")
     settings = Settings(workers=2, threads=2, remove_scratch=True)
     states = []
-    result = execute(reproduction, scope, settings, progress=states.append,
-                     machine={"cpu": "fixture"})
+    read_only.protect(dataset.dataset)  # Any write into the dataset by the route would raise.
+    try:
+        result = execute(reproduction, scope, settings, progress=states.append,
+                         machine={"cpu": "fixture"})
+    finally:
+        read_only.unprotect(dataset.dataset)
     assert result["summary"]["dataset"] == IDENTICAL and result["summary"]["reproduced"] is True
     assert snapshot(dataset.dataset) == before
     assert states[-1] == {"r1": "done", "r2": "done"}

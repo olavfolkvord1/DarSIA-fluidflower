@@ -92,6 +92,27 @@ def scope_frames(manifest: dict, scope: Scope) -> list[tuple[str, dict]]:
     return pairs
 
 
+def plan_differences(manifest: dict, scope: Scope, settings: Settings, code: dict) -> list[str]:
+    """The settings of a new analysis that differ from the dataset's published plan, in words."""
+    machine = manifest.get("machine") or {}
+    runs = [row["run"] for row in manifest["runs"]]
+    lines = []
+    if scope.kind == "quick":
+        run = scope.runs[0]
+        lines.append(f"Scope: the quick check, the first {scope.frames[run]} frame(s) of run {run} "
+                     f"(the published plan has {len(runs)} run(s))")
+    elif scope.runs != runs:
+        lines.append(f"Scope: run(s) {', '.join(scope.runs)} of the published {len(runs)}")
+    if machine.get("threads") is not None and settings.threads != machine["threads"]:
+        lines.append(f"Threads per worker: {settings.threads} (published: {machine['threads']})")
+    if machine.get("backend") is not None and settings.backend != machine["backend"]:
+        lines.append(f"Backend: {settings.backend} (published: {machine['backend']})")
+    if not code.get("same"):
+        lines.append(f"DarSIA commit: {code.get('installed')} (published: {code.get('published')}); "
+                     "not a reproduction")
+    return lines
+
+
 class Reproduction:
     """One reproduction of a dataset into a results folder, step by step."""
 
@@ -175,7 +196,8 @@ class Reproduction:
                       **{key: value for key, value in asdict(settings).items()},
                       "precision": manifest["plan"].get("precision")},
             summary=self.summary, frames=[comparison.as_dict() for comparison in self.comparisons],
-            machine=machine if machine is not None else machine_facts(), timing=timing)
+            machine=machine if machine is not None else machine_facts(), timing=timing,
+            differences=plan_differences(manifest, scope, settings, self.check.code))
         verdicts = {(item.run, item.case_id): item.verdict for item in self.comparisons}
         rows = mass_rows(manifest, verdicts, self.reproduced_masses)
         return write_report(self.results_root / REPORT_FOLDER, report, rows)

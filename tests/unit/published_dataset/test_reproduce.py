@@ -11,7 +11,7 @@ from darsia.fluidflower.published_dataset import builder, dataset_check, reprodu
 from darsia.fluidflower.published_dataset.comparison import IDENTICAL, OUTSIDE, load_layer
 from darsia.fluidflower.published_dataset.layout import inside
 from darsia.fluidflower.published_dataset.reproduce import (Reproduction, ReproductionRefused, Settings,
-                                                           choose_scope, execute, scope_frames)
+                                                           choose_scope, execute, plan_differences, scope_frames)
 from tests.unit.published_dataset.synthetic import COMMIT, make_series
 
 INSTALLED = {"commit": COMMIT, "clean": True, "source": "Git checkout"}
@@ -158,3 +158,26 @@ def test_command_line_refusals_and_usage(dataset, tmp_path, monkeypatch):
                         lambda arguments: opened_with.append(arguments) or 0)
     assert reproduce_cli.main([]) == 0 and len(opened_with) == 1
     assert isinstance(opened_with[0], Namespace)
+
+
+def test_settings_that_differ_from_the_published_plan_are_named(dataset, tmp_path):
+    manifest = json.loads((dataset / "dataset_manifest.json").read_text(encoding="utf-8"))
+    machine, same = manifest["machine"], {"same": True}
+    published = Settings(workers=1, threads=machine["threads"], backend=machine["backend"])
+    assert plan_differences(manifest, choose_scope(manifest, "all"), published, same) == []
+    changed = Settings(workers=1, threads=machine["threads"] + 1, backend="cuda")
+    lines = plan_differences(manifest, choose_scope(manifest, "run", run="r2"), changed,
+                             {"same": False, "installed": "e" * 40, "published": COMMIT})
+    assert lines == ["Scope: run(s) r2 of the published 2",
+                     f"Threads per worker: {machine['threads'] + 1} (published: {machine['threads']})",
+                     f"Backend: cuda (published: {machine['backend']})",
+                     f"DarSIA commit: {'e' * 40} (published: {COMMIT}); not a reproduction"]
+    quick = plan_differences(manifest, choose_scope(manifest, "quick", quick_frames=2), published, same)
+    assert quick == ["Scope: the quick check, the first 2 frame(s) of run r1 (the published plan has 2 run(s))"]
+    reproduction = opened(dataset, tmp_path / "results")
+    scope = choose_scope(reproduction.check.manifest, "run", run="r1")
+    result = execute(reproduction, scope, Settings(workers=1, threads=machine["threads"]), machine={})
+    report = json.loads(result["files"]["json"].read_text(encoding="utf-8"))
+    assert report["differences_from_published_plan"] == ["Scope: run(s) r1 of the published 2"]
+    html = result["files"]["html"].read_text(encoding="utf-8")
+    assert "Settings that differ from the published plan" in html and "run(s) r1 of the published 2" in html

@@ -883,6 +883,46 @@ def guard_config_file(window) -> None:
     window._config_stamp = None
 
 
+def guard_published_dataset(window) -> None:
+    """Refuse settings saves and workflows while the series is a published dataset.
+
+    A published dataset opens read-only (its folder is protected in this
+    process). Saving settings and DarSIA's workflows would write into it, so
+    they are refused with a note; New analysis writes to the user's results
+    location instead.
+    """
+
+    factory = window.settings_factory
+    runner = window.process_runner
+    save = factory.save_settings
+    start = runner.start_workflow_process
+
+    def save_settings(*args, **kwargs):
+        """Save as before, unless the series is a published dataset."""
+        if window.dataset_series_root() is not None:
+            window.print_log(
+                "This series is a published dataset and opens read-only; "
+                "settings are not saved."
+            )
+            return None
+        return save(*args, **kwargs)
+
+    def start_workflow_process(argv, *args, **kwargs):
+        """Start as before, unless the series is a published dataset."""
+        if window.dataset_series_root() is not None:
+            window.print_log(
+                "Workflows write into the series folder, and a published dataset is "
+                "read-only. Use New analysis, which writes to your results location."
+            )
+            return None
+        return start(argv, *args, **kwargs)
+
+    save_settings.__wrapped__ = save
+    start_workflow_process.__wrapped__ = start
+    factory.save_settings = save_settings
+    runner.start_workflow_process = start_workflow_process
+
+
 def settle_settings_before_sync(window) -> None:
     """Let DarSIA fill its settings fields before their values are read back.
 
@@ -1253,7 +1293,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         use_environment_python(self.process_runner)
         clear_config_placeholder(self)
         guard_config_file(self)
+        guard_published_dataset(self)
         settle_settings_before_sync(self)
+        self.dataset_analysis_page = None
         self._config_series: str | None = None
         self._current_category = "start"
         self._last_sidebar_selection = ("start", "series")
@@ -1269,6 +1311,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.scope_context = None
         self.current_row_scope = None
         series = tuple(configured_series())
+        from darsia.fluidflower.published_dataset.dataset_series import protect_datasets
+
+        # A published dataset is read-only in this process from the start.
+        protect_datasets(root for _key, _label, root in series)
         initial_series = initial_series or (series[0][0] if series else "")
         if initial_series and initial_series not in {
             key for key, _label, _root in series
@@ -1852,6 +1898,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         if root is None or root != self._method_root:
             self.print_log("Choose a series before recording its method.")
             return
+        if self.dataset_series_root() is not None:
+            self.print_log(
+                "This series is a published dataset and opens read-only; "
+                "its method is not changed."
+            )
+            return
         try:
             save_series_method(
                 root, selection, expected_bytes=self._method_manifest_bytes
@@ -1952,6 +2004,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             if show_errors:
                 QMessageBox.warning(self, "Could not refresh series", str(error))
             return
+        from darsia.fluidflower.published_dataset.dataset_series import protect_datasets
+
+        protect_datasets(root for _key, _label, root in series)
         workspace = self.phase_model_workspace
         if series != workspace.configured_series:
             page = workspace.studio_page
@@ -2255,9 +2310,30 @@ class NativeFluidFlowerMainWindow(MainWindow):
         if not folder:
             return
         from darsia.fluidflower.series_paths import register_series
+        from darsia.fluidflower.published_dataset import dataset_series, read_only
 
+        # A published dataset opens read-only; its results need a location outside it.
+        dataset = read_only.dataset_root(folder)
+        results = None
+        if dataset is not None:
+            if not (dataset / "series.toml").is_file():
+                QMessageBox.warning(
+                    self,
+                    "Dataset not unpacked",
+                    "Unpack series.zip and expected.zip into the dataset folder, "
+                    "then add it again.",
+                )
+                return
+            results = self._choose_dataset_results(dataset)
+            if results is None:
+                return
         try:
-            series_id, _label, _root = register_series(Path(folder))
+            series_id, _label, _root = register_series(
+                dataset if dataset is not None else Path(folder)
+            )
+            if dataset is not None:
+                dataset_series.register_dataset(_root, results)
+                read_only.protect(_root)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.warning(
                 self,
@@ -2269,6 +2345,69 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._refresh_series(preferred_series=series_id, show_errors=True)
 
         self._open_series_from_start(str(_root))
+
+    def dataset_series_root(self) -> Path | None:
+        """The selected series' folder when it is a published dataset, else None."""
+        from darsia.fluidflower.published_dataset.layout import MANIFEST
+
+        workspace = getattr(self, "phase_model_workspace", None)
+        if workspace is None:
+            return None
+        root = workspace.series_roots.get(workspace.series_id)
+        if root is None or not (Path(root) / MANIFEST).is_file():
+            return None
+        return Path(root)
+
+    def _choose_dataset_results(self, dataset: Path) -> Path | None:
+        """Ask for a results location outside a published dataset; None when cancelled."""
+        from darsia.fluidflower.published_dataset import dataset_series
+
+        while True:
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                "Choose a results location outside the published dataset",
+                str(Path(dataset).parent),
+            )
+            if not folder:
+                return None
+            problems = dataset_series.results_location_problems(dataset, folder)
+            if not problems:
+                return Path(folder)
+            QMessageBox.warning(self, "Choose another results location", problems[0])
+
+    def ensure_dataset_analysis(self) -> QWidget:
+        """The New analysis page of published datasets (created once)."""
+        if self.dataset_analysis_page is None:
+            from darsia.fluidflower.published_dataset import dataset_analysis
+
+            self.dataset_analysis_page = dataset_analysis.DatasetAnalysisPage(self)
+            self.content_stack.addWidget(self.dataset_analysis_page)
+        return self.dataset_analysis_page
+
+    def _show_dataset_analysis(self) -> bool:
+        """Show New analysis for a published dataset series; False for other series."""
+        root = self.dataset_series_root()
+        if root is None:
+            return False
+        from darsia.fluidflower.published_dataset import dataset_series
+
+        results = dataset_series.dataset_results(root)
+        if results is None:
+            results = self._choose_dataset_results(root)
+            if results is None:
+                return True
+            dataset_series.register_dataset(root, results)
+        page = self.ensure_dataset_analysis()
+        if page.root != root.resolve() or page.results != results:
+            page.set_dataset(root.resolve(), results)
+        else:
+            page.offer_fresh_results()
+        self.content_stack.setCurrentWidget(page)
+        self.print_log(
+            "Published dataset: the series is read-only, so its other pages stay closed. "
+            f"New analysis runs its plan into {results}."
+        )
+        return True
 
     def open_image_selection_plan(self) -> None:
         """Open the series' explicit image editor; no numerical work starts."""
@@ -2301,6 +2440,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         target = ("preprocessing", "protocols")
         self._select_series(series_id)
         if self.phase_model_workspace.series_id != series_id:
+            return
+        if self.dataset_series_root() is not None:
+            # A published dataset opens on New analysis; its folder is never written.
+            self._select_row(("jobs", "new_analysis"))
+            if self.content_stack.currentWidget() is not self.dataset_analysis_page:
+                self._show_dataset_analysis()
             return
         if not self._load_reference_configuration():
             # An old/foreign configuration must never look like successful
@@ -2397,6 +2542,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
     ) -> None:
         """Load the selected run and use DarSIA's unchanged per-run wizard."""
         self._home_series_selected()
+        if self._show_dataset_analysis():
+            return  # A published dataset is read-only; it opens on New analysis.
         selected = self.home_page.selected_series()
         path = self.run_combo.currentData()
         if not selected or selected != self.phase_model_workspace.series_id or not path:
@@ -2447,6 +2594,11 @@ class NativeFluidFlowerMainWindow(MainWindow):
         dialog.exec()
 
     def open_wizard_for(self, category: str) -> None:
+        if self.dataset_series_root() is not None:
+            self.print_log(
+                "Wizards change the series folder, and a published dataset is read-only."
+            )
+            return None
         if category != "preprocessing":
             return super().open_wizard_for(category)
         from darsia.gui.ui.main_window import load_wizard_dialog_class
@@ -2655,6 +2807,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._set_method_category_visibility(action, item_id)
         self._refresh_method_state()
         self._refresh_scope_display()
+        open_page = action == "start" or (action, item_id) == ("jobs", "jobs")
+        if not open_page and self._show_dataset_analysis():
+            # A published dataset is read-only: pages that change the series stay closed.
+            self.selected_action, self.selected_checkbox_id = "jobs", "new_analysis"
+            self._update_run_action()
+            return
         if (action, item_id) in {
             ("calibration", "mass"),
             ("phase_model", "mass_from_phase"),

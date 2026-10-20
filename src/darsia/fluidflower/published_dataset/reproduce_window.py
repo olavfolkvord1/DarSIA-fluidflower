@@ -59,6 +59,7 @@ class ReproduceWindow(QWidget):
     """Reproduce a published dataset: dataset, results, scope, machine settings, run, report."""
 
     progress_changed = Signal(object)
+    dataset_opened = Signal()
 
     def __init__(self, *, runner_factory=None, installed=None, fingerprint=None, machine=None, inventory=None):
         """Lay out the steps; ``runner_factory`` etc. replace the real machine in tests."""
@@ -232,6 +233,7 @@ class ReproduceWindow(QWidget):
         self.precision_label.setText(f"{manifest['plan'].get('precision')} (fixed by the dataset)")
         self.verify_button.setEnabled(True)
         self.refresh_settings()
+        self.dataset_opened.emit()
 
     def verify(self):
         """The full SHA-256 check, in a worker thread."""
