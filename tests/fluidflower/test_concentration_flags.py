@@ -1,4 +1,4 @@
-"""Saturated and not-quantified flags (Claude, 18 Oct 2026)."""
+"""Saturated and not-quantified flags."""
 import numpy as np
 import pytest
 

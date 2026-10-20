@@ -11,7 +11,7 @@ Two honest states that a concentration map must carry instead of a number:
   measure dissolved CO2 at all. Reported as a mask, never as zero.
 
 The functions are pure numpy and series agnostic. The defaults (threshold
-``f_min = 0.05``) are proposals awaiting Olav's decision (Claude, 18 Oct 2026).
+``f_min = 0.05``) are proposals awaiting the project owner's decision.
 """
 from __future__ import annotations
 

@@ -39,7 +39,7 @@ def model(tmp_path):
         training_request_sha256=hashlib.sha256(
             (root / "training_request.json").read_bytes()
         ).hexdigest(),
-        display_name="Olavs modell \u00e6\u00f8\u00e5",
+        display_name="Testmodell \u00e6\u00f8\u00e5",
         recorded_by="researcher",
         recorded_utc="2026-10-16T00:00:00Z",
     )

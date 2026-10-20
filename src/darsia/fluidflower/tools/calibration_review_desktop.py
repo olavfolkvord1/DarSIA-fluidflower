@@ -11568,7 +11568,7 @@ class ReviewHubWindow(QMainWindow):
         identity_layout.addWidget(identity_title, 0, 0, 1, 3)
         identity_layout.addWidget(QLabel("Reviewer"), 1, 0)
         self.reviewer_name = QLineEdit(self.initial_reviewer_name)
-        self.reviewer_name.setPlaceholderText("Full name, for example Olav Folkvord")
+        self.reviewer_name.setPlaceholderText("Reviewer full name")
         self.reviewer_name.textChanged.connect(self._update_open_gate)
         identity_layout.addWidget(self.reviewer_name, 1, 1, 1, 2)
         identity_layout.addWidget(QLabel("Local save folder"), 2, 0)

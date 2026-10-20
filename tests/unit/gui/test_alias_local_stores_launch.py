@@ -157,7 +157,7 @@ def test_native_owner_provider_tracks_actual_settings_panel_path(app,tmp_path,lo
 
 
 def test_remote_worker_cli_uses_remote_default_not_the_local_selected_map():
-    target=remote.RemoteWorkerTarget(machine="Olav",ssh_alias="olav",
+    target=remote.RemoteWorkerTarget(machine="Second",ssh_alias="second",
         python=r"C:\existing\python.exe",checkout=r"C:\existing\repo",
         ssh_executable=r"C:\Windows\System32\OpenSSH\ssh.exe",default_shell="windows-powershell")
     launch=remote.build_remote_worker_launch(r"\\NAS\share\jobs\explicit",target=target,

@@ -38,7 +38,7 @@ def resolve(path, origin):
     return resolve_review_path(result if result.is_absolute() else origin / result)
 
 def _same_historical_localcache_manifest(source: Path, bound: Path) -> bool:
-    """Recognize the old Codex MSIX LocalCache spelling of one source path.
+    """Recognize the old packaged-app (MSIX) LocalCache spelling of one source path.
 
     This is intentionally limited to phase-transfer source manifests. It does
     not make arbitrary same-content files interchangeable as provenance.

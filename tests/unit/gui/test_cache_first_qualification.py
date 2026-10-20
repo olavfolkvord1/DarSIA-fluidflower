@@ -708,7 +708,7 @@ def test_Q104_all_stage_data_checks_every_published_and_retained_file():
 @pytest.mark.parametrize("change", [
     lambda c, m: c.update(backend="cuda"),
     lambda c, m: c.update(actual_worker=None),
-    lambda c, m: c["actual_worker"].update(machine="olav-cpu"),
+    lambda c, m: c["actual_worker"].update(machine="second-cpu"),
     lambda c, m: c.update(commit="e" * 40),
     lambda c, m: c.update(newly_computed_frames=38),
     lambda c, m: c["frame_producers"].reverse(),
@@ -1271,7 +1271,7 @@ def test_Q106_existing_stop_uses_actual_master_and_preserves_current_command_CAS
 
 def test_Q106_foreign_master_or_failed_stop_records_STOP_without_retry_or_fallback(monkeypatch):
     from darsia.fluidflower import job_control
-    state,_=protocol();lease=lease_for(state);lease.owner["machine"]="TESTONLY-Olav"
+    state,_=protocol();lease=lease_for(state);lease.owner["machine"]="TESTONLY-Second"
     state.request["public_command"] += ["--job","C:/TESTONLY/TESTONLY-job"]
     monkeypatch.setattr(job_control,"read_json",lambda path:dict(commit=state.task["commit"]))
     monkeypatch.setattr(job_control,"read_control",lambda root:dict(action="run",sequence=0))
@@ -1282,7 +1282,7 @@ def test_Q106_foreign_master_or_failed_stop_records_STOP_without_retry_or_fallba
     actual=first.request_existing_frame_boundary_stop(state,lease)
     assert actual["requested"] is False and actual["error_type"]=="ValueError"
     assert actual["state"]=="STOP_COMMAND_NOT_PUBLISHED"
-    assert calls==[dict(machine="TESTONLY-Olav",expected_previous=None)]
+    assert calls==[dict(machine="TESTONLY-Second",expected_previous=None)]
 
 
 def test_empty_python_module_is_exact_source_not_empty_metadata():

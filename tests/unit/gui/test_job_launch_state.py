@@ -55,7 +55,7 @@ def test_launch_reservation_survives_reopen_without_claiming_worker_or_progress(
 def test_ssh_exit_launcher_pid_and_frame_completion_never_release(metadata_job):
     root, _, _ = metadata_job
     request = launches.begin_launch_request(
-        root, machine="Olav", backend="cpu", workers=1, kind="ssh", now=T0
+        root, machine="Second", backend="cpu", workers=1, kind="ssh", now=T0
     )
     put(
         Path(request["launch_directory"]) / "launch.json",
@@ -273,7 +273,7 @@ def test_repeated_remote_start_same_normalized_alias_backend_versions_is_blocked
     root = tmp_path / "job"
     put(root / "job.json", dict(expected_runs=["ac52"]))
     one = record(root, facts(tmp_path))
-    two = record(root, dict(facts(tmp_path), machine="OLAV"), suffix=".version")
+    two = record(root, dict(facts(tmp_path), machine="SECOND"), suffix=".version")
     monkeypatch.setattr(remote, "require_unc", lambda path: None)
     calls = []
     widget.remote_launcher = lambda root, **kw: (

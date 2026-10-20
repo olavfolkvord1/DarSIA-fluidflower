@@ -69,7 +69,7 @@ def test_n43_refuses_wrong_entitlement_scope_reserve_and_hidden_root_overlap(mut
     with pytest.raises(CachePolicyError):first.checked_reference_administration(value,state,read=read)
 
 
-def test_olav_exception_is_only_the_human_one_run_D_namespace():
+def test_second_host_exception_is_only_the_human_one_run_D_namespace():
     state,value,read=administration_TESTONLY("olav")
     assert first.checked_reference_administration(value,state,read=read)["host_policy"].endswith("uncapped-d")
     value["owned_roots"][0]["path"]="C:/TESTONLY/cache"

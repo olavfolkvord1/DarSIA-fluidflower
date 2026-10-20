@@ -90,10 +90,10 @@ def test_unrequested_extensive_does_not_force_collect_but_explicit_reader_does(t
         assert not str(path).startswith(str(state["root"])), "Foreign producer path was probed"
         return original_stat(path, *args, **kwargs)
     monkeypatch.setattr(Path, "stat", guard)
-    old = indexed.read_indexed_stored_run(index, current_machine_id="Olav", collections=[collection])
+    old = indexed.read_indexed_stored_run(index, current_machine_id="Second", collections=[collection])
     assert old["frames"][0]["mass_totals_g"]["total"] == 9.
     run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
-        current_machine_id="Olav", collections=[collection])
+        current_machine_id="Second", collections=[collection])
     with pytest.raises(saved.StoredProductCollectionRequired) as caught:
         next(run["frames"])
     assert Path(caught.value.descriptor["path"]).name == payload.ARCHIVE
@@ -109,7 +109,7 @@ def test_explicit_extensive_real_collect_uses_no_producer_or_native_fallback(tmp
         return original_read(path)
     monkeypatch.setattr(Path, "read_bytes", guard)
     run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
-        current_machine_id="Olav", collections=[collection])
+        current_machine_id="Second", collections=[collection])
     assert next(run["frames"])["metadata"]["native_mass_totals_g"] == dict(total=9., aqueous=3., gas=3.)
 
 
@@ -120,7 +120,7 @@ def test_collected_extensive_archive_still_checks_original_SHA(tmp_path):
     path = Path(collection["path"]).parent / "products/storage/storage_extensive_frame.npz"
     path.write_bytes(path.read_bytes() + b"changed")
     run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
-        current_machine_id="Olav", collections=[collection])
+        current_machine_id="Second", collections=[collection])
     with pytest.raises(ValueError): next(run["frames"])
 
 
@@ -139,7 +139,7 @@ def test_resealed_spatial_mass_attack_is_rejected_after_real_foreign_collect(tmp
     _state, index, _ = _published(tmp_path, extensive_inputs=True, alter_state=alter)
     collection = _collect(tmp_path, index)
     run = payload.read_indexed_extensive_run(index, producer_kind="native-phase-n1",
-        current_machine_id="Olav", collections=[collection])
+        current_machine_id="Second", collections=[collection])
     with pytest.raises(ValueError, match="Extensive total cell masses differ from committed coarse arrays"):
         next(run["frames"])
 
@@ -162,7 +162,7 @@ def test_foreign_machine_requires_collect_without_probing_producer_disk(tmp_path
         return original_stat(path, *args, **kwargs)
     monkeypatch.setattr(Path, "stat", guard)
     with pytest.raises(saved.StoredProductCollectionRequired) as caught:
-        indexed.read_indexed_stored_run(index, current_machine_id="Olav")
+        indexed.read_indexed_stored_run(index, current_machine_id="Second")
     assert caught.value.descriptor["path"].endswith("storage_stored_frame.npz")
 
 
@@ -174,7 +174,7 @@ def test_real_collect_receipt_reads_coarse_arrays_on_other_machine(tmp_path, mon
         assert not str(path).startswith(str(state["root"])), "Producer payload fallback"
         return original_read(path)
     monkeypatch.setattr(Path, "read_bytes", guard)
-    result = indexed.read_indexed_stored_run(index, current_machine_id="Olav",
+    result = indexed.read_indexed_stored_run(index, current_machine_id="Second",
         collections=[collection], load_before=True)
     frame = result["frames"][0]
     assert frame["mass_totals_g"] == dict(total=9., aqueous=3., gas=3.)
@@ -186,16 +186,16 @@ def test_real_collect_receipt_reads_coarse_arrays_on_other_machine(tmp_path, mon
 def test_optional_before_does_not_force_unrequested_native_png_collect(tmp_path):
     _state, index, _ = _published(tmp_path)
     collection = _collect(tmp_path, index, include_before=False)
-    result = indexed.read_indexed_stored_run(index, current_machine_id="Olav", collections=[collection])
+    result = indexed.read_indexed_stored_run(index, current_machine_id="Second", collections=[collection])
     assert result["frames"][0]["before_native"] is None
     with pytest.raises(saved.StoredProductCollectionRequired):
-        indexed.read_indexed_stored_run(index, current_machine_id="Olav", collections=[collection], load_before=True)
+        indexed.read_indexed_stored_run(index, current_machine_id="Second", collections=[collection], load_before=True)
 
 
 def test_pending_before_survives_collect_without_inventing_a_score(tmp_path):
     _state, index, _ = _published(tmp_path, pending=True)
     collection = _collect(tmp_path, index)
-    frame = indexed.read_indexed_stored_run(index, current_machine_id="Olav",
+    frame = indexed.read_indexed_stored_run(index, current_machine_id="Second",
         collections=[collection], load_before=True)["frames"][0]
     assert frame["before_rules"]["state"] == "pending" and frame["before_native"] is None
     assert "gas_probability_before_rules" not in frame["arrays"]
@@ -207,7 +207,7 @@ def test_changed_collected_payload_is_never_accepted_by_its_filename(tmp_path):
     path = Path(collection["path"]).parent / "products/storage/storage_stored_frame.npz"
     raw = bytearray(path.read_bytes()); raw[len(raw)//2] ^= 1; path.write_bytes(raw)
     with pytest.raises(ValueError, match="Stored product SHA"):
-        indexed.read_indexed_stored_run(index, current_machine_id="Olav", collections=[collection])
+        indexed.read_indexed_stored_run(index, current_machine_id="Second", collections=[collection])
 
 
 @pytest.mark.parametrize("field,value", [("run", "ac21"), ("original_attempt_id", "b" * 32),
@@ -218,7 +218,7 @@ def test_resealed_collection_must_match_original_index_identity(tmp_path, field,
     doc = json.loads(Path(collection["path"]).read_bytes()); doc[field] = value
     altered = _write(tmp_path / "altered.json", doc)
     with pytest.raises(ValueError, match="original products index"):
-        indexed.indexed_asset_resolver(index, current_machine_id="Olav", collections=[altered])
+        indexed.indexed_asset_resolver(index, current_machine_id="Second", collections=[altered])
 
 
 @pytest.mark.parametrize("field,value", [("sha256", "f" * 64), ("machine_id", "Other"),
@@ -230,13 +230,13 @@ def test_collected_asset_keeps_full_original_producer_and_owned_path(tmp_path, f
     doc = json.loads(Path(collection["path"]).read_bytes()); doc["copies"][0][field] = value
     altered = _write(tmp_path / "altered.json", doc)
     with pytest.raises(ValueError):
-        indexed.indexed_asset_resolver(index, current_machine_id="Olav", collections=[altered])
+        indexed.indexed_asset_resolver(index, current_machine_id="Second", collections=[altered])
 
 
 def test_unindexed_alias_or_asset_never_triggers_search_or_collection(tmp_path):
     _state, index, _ = _published(tmp_path)
     with pytest.raises(ValueError, match="indexed product IDs"):
-        indexed.indexed_asset_resolver(index, current_machine_id="Olav", source_paths={"unknown": "C:/whatever"})
+        indexed.indexed_asset_resolver(index, current_machine_id="Second", source_paths={"unknown": "C:/whatever"})
     resolve = indexed.indexed_asset_resolver(index, current_machine_id="Main")
     with pytest.raises(ValueError, match="exact products-index closure"):
         resolve(dict(path="C:/unrelated/product.npz", sha256="f" * 64, size_bytes=1))
@@ -255,10 +255,10 @@ def test_real_N15_N16_writer_index_collect_and_foreign_extensive_reader(tmp_path
     index = fixture._index(tmp_path, completion)
     _, _, rows = publication._read_index(index)
     wanted = [key for key, row in rows.items() if "/storage_" in key and row["kind"] == "map"]
-    collected = publication.collect_products(index, wanted, tmp_path / "collected", current_machine_id="Olav",
+    collected = publication.collect_products(index, wanted, tmp_path / "collected", current_machine_id="Second",
         source_paths={key: row["local_path"] for key, row in rows.items() if key in wanted}, file_writers_closed=True)
     result = extensive_io.read_indexed_extensive_run(index, producer_kind="n1-mass-only",
-        current_machine_id="Olav", collections=[collected], qualification=extensive_io.GENUINE_QUALIFICATION)
+        current_machine_id="Second", collections=[collected], qualification=extensive_io.GENUINE_QUALIFICATION)
     frames = list(result["frames"])
     assert result["ordered_case_ids"] == completion["ordered_case_ids"]
     assert len(frames) == 2

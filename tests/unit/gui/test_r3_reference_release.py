@@ -34,27 +34,27 @@ R3_BYTES = 4 * FONT_BYTES
 R3_AUTHORITIES = ("N134", "N139", "N142", "N145", "N152", "N154")
 
 
-def olav(record):
+def owner_answer(record):
     return dict(id=record, decided_by="olav")
 
 
-def claude(record):
+def agent_answer(record):
     return dict(id=record, decided_by="claude")
 
 
-R3_ANSWERS = [olav(R3_GO), olav(R3_RETAINED), olav(R3_SECOND_FONT), olav(R3_THIRD_FONT), olav(R3_FOURTH_FONT),
-              claude(R3_PLAN_RECORD)]
+R3_ANSWERS = [owner_answer(R3_GO), owner_answer(R3_RETAINED), owner_answer(R3_SECOND_FONT), owner_answer(R3_THIRD_FONT), owner_answer(R3_FOURTH_FONT),
+              agent_answer(R3_PLAN_RECORD)]
 # Earlier attempts' entries: authority ids -> (pinned inventory, retained files, plan, records).
 EARLIER = {
     ("N134", "N136", "N139"): (
         "be5c8bf204e6a5021f79bd10125542bcfd87adaf80c2401e66cb7ce9463852a2", 1, OLD_PLAN,
-        [olav(R3_GO), claude(OLD_PLAN_RECORD), olav(R3_RETAINED)]),
+        [owner_answer(R3_GO), agent_answer(OLD_PLAN_RECORD), owner_answer(R3_RETAINED)]),
     ("N134", "N136", "N139", "N142"): (
         "668f556a8d20c7d82484a9449521e46522b4d22b1bf2a0290e9f77d323c90a35", 2, OLD_PLAN,
-        [olav(R3_GO), claude(OLD_PLAN_RECORD), olav(R3_RETAINED), olav(R3_SECOND_FONT)]),
+        [owner_answer(R3_GO), agent_answer(OLD_PLAN_RECORD), owner_answer(R3_RETAINED), owner_answer(R3_SECOND_FONT)]),
     ("N134", "N136", "N139", "N142", "N145"): (
         "96986702430169ac39fe43ea62195db66d36229cd287ddac6fe57f5e46890fce", 3, OLD_PLAN,
-        [olav(R3_GO), claude(OLD_PLAN_RECORD), olav(R3_RETAINED), olav(R3_SECOND_FONT), olav(R3_THIRD_FONT)]),
+        [owner_answer(R3_GO), agent_answer(OLD_PLAN_RECORD), owner_answer(R3_RETAINED), owner_answer(R3_SECOND_FONT), owner_answer(R3_THIRD_FONT)]),
 }
 
 

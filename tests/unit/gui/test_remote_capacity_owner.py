@@ -184,7 +184,7 @@ def test_changed_metadata_size_is_refused_before_opening_payload(tmp_path, monke
         cap.read_bound(dict(path=str(path), sha256="0" * 64, size_bytes=2))
 
 
-@pytest.mark.parametrize("host", ["moderskipet", "olav"])
+@pytest.mark.parametrize("host", ["reference-host", "second-host"])
 def test_N51_both_hosts_can_use_admitted_NAS_without_owner_or_results_quota(tmp_path, monkeypatch, host):
     settings = settings_doc(tmp_path)
     assert "remote_owner" not in settings["capacity"]
@@ -206,14 +206,14 @@ def test_N51_two_actual_hosts_keep_separate_local_bindings_for_same_NAS(tmp_path
     monkeypatch.setattr(cap, "read_bound", lambda _: (deepcopy(doc), b"verified synthetic metadata"))
     common = local.context_provider()
     a = cap.CapacityLedger(stores, "FF_AC", ROOT, volume_provider=lambda _: dict(state),
-        context_provider=lambda: dict(common, host="moderskipet"))
+        context_provider=lambda: dict(common, host="reference-host"))
     b = cap.CapacityLedger(stores, "FF_AC", ROOT, volume_provider=lambda _: dict(state),
-        context_provider=lambda: dict(common, host="olav", service_account_sid="S-1-5-21-200"))
+        context_provider=lambda: dict(common, host="second-host", service_account_sid="S-1-5-21-200"))
     assert a.remote_scope == b.remote_scope
     assert a.key != b.key and a.binding_path != b.binding_path and a.root != b.root
     with a.locked():
         a.bind(tmp_path / "main-job", claim_fixture(), owner(), estimate())
     with b.locked():
-        b.bind(tmp_path / "olav-job", claim_fixture(job="two", token="2" * 32), owner(124), estimate())
+        b.bind(tmp_path / "second-job", claim_fixture(job="two", token="2" * 32), owner(124), estimate())
     assert a.remaining() == b.remaining() == 390
     assert a._common_binding() is True and b._common_binding() is True

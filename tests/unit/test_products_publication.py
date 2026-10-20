@@ -116,7 +116,7 @@ def test_collect_reads_shared_publication_on_another_machine_and_keeps_origin(tm
     index = publish(tmp_path, data)
     bundle = publication.publish_indexed_products(index, tmp_path / "shared-large", current_machine_id="Main", file_writers_closed=True)
     Path(data["film"]["path"]).unlink()  # Original is deliberately unavailable to the consumer.
-    collection = publication.collect_products(index, ["film.mp4", "completed.json"], tmp_path / "collected", current_machine_id="Olav", payload_publications=[bundle], file_writers_closed=True)
+    collection = publication.collect_products(index, ["film.mp4", "completed.json"], tmp_path / "collected", current_machine_id="Second", payload_publications=[bundle], file_writers_closed=True)
     result = json.loads(Path(collection["path"]).read_bytes())
     assert result["copies"][0]["machine_id"] == "Main"
     assert result["copies"][0]["local_path"] == data["film"]["path"]
@@ -135,7 +135,7 @@ def test_foreign_local_source_is_not_even_probed_without_explicit_accessible_cop
 
     monkeypatch.setattr(publication, "_file", reject_foreign)
     with pytest.raises(publication.ProductUnavailable, match="another machine"):
-        publication.collect_products(index, ["maps.npz"], tmp_path / "foreign", current_machine_id="Olav", file_writers_closed=True)
+        publication.collect_products(index, ["maps.npz"], tmp_path / "foreign", current_machine_id="Second", file_writers_closed=True)
     assert not (tmp_path / "foreign").exists()
 
 
@@ -144,7 +144,7 @@ def test_explicit_accessible_copy_is_hash_verified_and_origin_is_not_relabelled(
     index = publish(tmp_path, data)
     accessible = tmp_path / "mounted-original-copy.npz"
     accessible.write_bytes(Path(data["maps"]["path"]).read_bytes())
-    collection = publication.collect_products(index, ["maps.npz"], tmp_path / "collected", current_machine_id="Olav", source_paths={"maps.npz": accessible}, file_writers_closed=True)
+    collection = publication.collect_products(index, ["maps.npz"], tmp_path / "collected", current_machine_id="Second", source_paths={"maps.npz": accessible}, file_writers_closed=True)
     row = json.loads(Path(collection["path"]).read_bytes())["copies"][0]
     assert row["machine_id"] == "Main"
     assert row["local_path"] == data["maps"]["path"]
@@ -154,15 +154,15 @@ def test_explicit_accessible_copy_is_hash_verified_and_origin_is_not_relabelled(
 def test_resumed_frame_metadata_keeps_old_machine_and_uses_only_explicit_copy(tmp_path):
     data = fixture(tmp_path)
     products = [dict(row) for row in data["products"]]
-    products[0]["machine_id"] = "Olav"
-    products[0]["local_path"] = "Z:/original-olav-attempt/frames/f1/result.json"
+    products[0]["machine_id"] = "Second"
+    products[0]["local_path"] = "Z:/original-second-attempt/frames/f1/result.json"
     with pytest.raises(publication.ProductUnavailable):
         publish(tmp_path, data, products=products)
     assert not (tmp_path / "shared-metadata").exists()
     index = publish(tmp_path, data, products=products, source_paths={"frames/f1/result.json": data["scalar"]["path"]})
     row = json.loads(Path(index["path"]).read_bytes())["products"][1]
-    assert row["machine_id"] == "Olav"
-    assert row["local_path"].startswith("Z:/original-olav-attempt/")
+    assert row["machine_id"] == "Second"
+    assert row["local_path"].startswith("Z:/original-second-attempt/")
     assert publication.read_published_metadata(index, "frames/f1/result.json") == Path(data["scalar"]["path"]).read_bytes()
 
 
@@ -267,7 +267,7 @@ def test_index_sha_change_and_payload_bundle_from_another_index_are_refused(tmp_
     other = publish(other_root, other_data)
     assert other["sha256"] != index["sha256"]
     with pytest.raises(ValueError, match="differs"):
-        publication.collect_products(other, ["film.mp4"], tmp_path / "target", current_machine_id="Olav", payload_publications=[bundle], file_writers_closed=True)
+        publication.collect_products(other, ["film.mp4"], tmp_path / "target", current_machine_id="Second", payload_publications=[bundle], file_writers_closed=True)
     Path(index["path"]).write_bytes(b"{}")
     with pytest.raises(ValueError, match="Metadata"):
         publication.read_published_metadata(index)

@@ -1,4 +1,4 @@
-"""Titration model: recipe, reference values and round trips (Claude, 18 Oct 2026)."""
+"""Titration model: recipe, reference values and round trips."""
 import numpy as np
 import pytest
 

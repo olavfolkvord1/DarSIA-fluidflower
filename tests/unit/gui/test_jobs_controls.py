@@ -172,7 +172,7 @@ def test_stale_window_supplies_its_displayed_previous_not_a_fresh_retry(controls
 def test_non_master_and_legacy_without_master_never_publish(controls, app):
     panel, _launches, root = controls
     before = bytes_of(root)
-    panel.local_machine = "Olav"
+    panel.local_machine = "Second"
     panel._target_changed()
     assert not any(
         button.isEnabled()

@@ -24,7 +24,7 @@ where
 
 Everything is in grams. The functions take plain numbers and tables so that
 they can be used from the pipeline, from a notebook and from tests alike.
-Defaults are proposals awaiting Olav's decision (Claude, 18 Oct 2026).
+Defaults are proposals awaiting the project owner's decision.
 
 Several injection ports (FF_UM ports A and B, FF_BM's two ports with changing
 rates) are described by ``PortSchedule``: an id, an optional rig position
@@ -37,7 +37,7 @@ conditions are the experimenter's choice). ``cycle_budget_from_ports`` closes
 a cycle on the total of all ports with ``cycle_budget`` (same rules) and
 keeps the mass per port. A run without an overflow balance (FF_UM, FF_RE e0)
 passes ``scale_term_available=False``: its free-gas and overflow terms are
-then absent, NaN in the result and never 0 (Claude, 19 Oct 2026).
+then absent, NaN in the result and never 0.
 """
 from __future__ import annotations
 

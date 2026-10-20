@@ -1,4 +1,4 @@
-"""Frame corner transfer between camera positions on a synthetic rig (Claude, 18 Oct 2026)."""
+"""Frame corner transfer between camera positions on a synthetic rig."""
 import math
 
 import cv2

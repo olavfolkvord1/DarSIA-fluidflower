@@ -41,7 +41,7 @@ The tools package includes protected callable SDK adapters and saved-review/trai
 
 `src/darsia/fluidflower/mass/mass_cuda.py` remains byte-identical to the locked provider: SHA256 `ebc695edf36bc308b7f994d589c0de74660c1f692c8d09b25d764ba351a9e5ea`, 26,135 bytes. Its historical in-file wording and runtime fact fields remain unchanged. The package initializer supplies runtime __doc__ help strings for exactly the 23 methods whose original in-file docstring is absent; the function objects, numeric codeobjects and provider bytes stay unchanged. No CuPy is imported or device allocated by this CPU-side documentation attachment. The table describes the same physical-purpose contracts:
 
-`\\UNAS-Pro-8\UiB_FluidFlower\FF_AC\DarSIA\code\validation\cleanup_20261014\step6_readonly_preparation\qualified_cuda_public_API_documentation_exception_v1.json` — SHA256 `a95dcb6307bc3ea8a8accdcc00b7e35081c43cb426b08a2c9a53b0e985a4166c`, 4,006 bytes.
+`\\<nas>\<share>\FF_AC\DarSIA\code\validation\cleanup_20261014\step6_readonly_preparation\qualified_cuda_public_API_documentation_exception_v1.json` — SHA256 `a95dcb6307bc3ea8a8accdcc00b7e35081c43cb426b08a2c9a53b0e985a4166c`, 4,006 bytes.
 
 The provider has a host ABI with explicit uploads, scoped device kernels, synchronization and returned host arrays. Working dtype, continuous sampling, frozen operands and float64 host reductions retain the locked conventions. Its memory-admission/scope guards and input errors remain unchanged. Final source/gate adoption and GPU permission require actual qualification receipts. This documentation preparation performs no GPU work and makes no throughput or new qualification claim.
 

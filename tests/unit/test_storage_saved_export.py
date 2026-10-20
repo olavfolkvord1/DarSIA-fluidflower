@@ -243,7 +243,7 @@ def test_other_machine_reports_explicit_photo_collect_required_without_implicit_
     def forbidden(*args, **kwargs):
         raise AssertionError("Exporter must not collect implicitly")
     monkeypatch.setattr(publication, "collect_products", forbidden)
-    result = export.export_indexed_storage(index, tmp_path / "out", current_machine_id="Olav",
+    result = export.export_indexed_storage(index, tmp_path / "out", current_machine_id="Second",
         collections=[collection], film_field="saturation", fps=12.,
         geometry_producer_sha256="f" * 64, photographs={"ac52_f1": photograph["receipt"]})
     assert result["film_frames"]["sequence"]["blocked"]["ac52_f1"]["reason"] == "explicit_photo_collect_required"
@@ -285,12 +285,12 @@ def test_cli_preserves_explicit_index_collection_options_scales_and_fps(tmp_path
         return dict(state="synthetic CLI dispatch only")
     monkeypatch.setattr(export, "export_indexed_storage", observe)
     assert export.main(["--index", "index.json", "--index-sha256", "a" * 64,
-        "--index-size-bytes", "123", "--machine", "Olav", "--output", "fresh-output",
+        "--index-size-bytes", "123", "--machine", "Second", "--output", "fresh-output",
         "--bindings", str(bindings), "--table", "--film-field", "concentration",
         "--concentration-limit-g-l", "2.5", "--fps", "12",
         "--geometry-producer-sha256", "f" * 64]) == 0
     assert called["index"] == dict(path="index.json", sha256="a" * 64, size_bytes=123)
-    assert called["current_machine_id"] == "Olav" and called["fps"] == 12.
+    assert called["current_machine_id"] == "Second" and called["fps"] == 12.
     assert called["concentration_limit_g_l"] == 2.5 and called["table"] is True
     assert "synthetic CLI dispatch only" in capsys.readouterr().out
 

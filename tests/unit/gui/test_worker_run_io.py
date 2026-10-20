@@ -23,7 +23,7 @@ def test_fast_input_reject_claim_is_bound_from_its_actual_archive(tmp_path):
     assert worker_io.claimed_task_after_archive(tmp_path,"main-cpu",
         dict(run="ac52",attempt_id=task["attempt_id"]))==task
     with pytest.raises(ValueError,match="worker service"):
-        worker_io.claimed_task_after_archive(tmp_path,"olav-cpu",
+        worker_io.claimed_task_after_archive(tmp_path,"second-cpu",
             dict(run="ac52",attempt_id=task["attempt_id"]))
 
 
@@ -273,7 +273,7 @@ def test_N16_sealer_never_invents_a_refit_basis_or_repairs_missing_inputs(
         domain["frames"].pop(config["frames"][-1]["case_id"])
     else:
         authority = json.loads(Path(domain["pixel_domain"]["n16"]["authority"]["path"]).read_bytes())
-        authority["decided_by"] = "not_olav"
+        authority["decided_by"] = "another_decider"
         domain["pixel_domain"]["n16"]["authority"] = _json(tmp_path / "wrong_authority.json", authority)
     def forbidden(*args, **kwargs):
         raise AssertionError("N16 DATA sealer evaluated fitted mass")

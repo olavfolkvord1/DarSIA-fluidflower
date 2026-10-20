@@ -6,7 +6,7 @@ a fixed positive illumination field, its support and three normalization levels.
 No sRGB response, chart fit, black/white endpoint, clipping, extrapolation,
 illumination fit or normalization statistic is inferred here. The proposed
 piecewise-linear interpolation, field normalization and float precision remain
-``needs_olav`` choices. Nothing imports this module from an existing pipeline.
+open choices for the project owner. Nothing imports this module from an existing pipeline.
 """
 
 from __future__ import annotations

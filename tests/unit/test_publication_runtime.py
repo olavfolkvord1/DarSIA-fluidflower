@@ -82,9 +82,9 @@ def fixture(tmp_path, *, prefix=False, film=False, publish=None, export_kind=Non
         retirement = write(old / "retirement.json", {
             "complete": True, "all_absent": True, "worker_os_references_closed": True,
             "run": "ac52", "attempt_id": old.name, "attempt_directory": str(old),
-            "machine_id": "Olav",
+            "machine_id": "Second",
         })
-        proofs[str(old)] = {"machine_id": "Olav", "proof_descriptor": retirement,
+        proofs[str(old)] = {"machine_id": "Second", "proof_descriptor": retirement,
                             "accessible_root": str(old)}
     record, producer, phase = frame(output, cases[-1], film=film, export_kind=export_kind)
     records.append(record); producers.append(producer); phases.append(phase)
@@ -152,7 +152,7 @@ def test_prefix_machine_and_exact_retirement_evidence_are_preserved_in_shared_in
     index, document = index_of(data, prepared)
     prefix = data.result["frame_producers"][0]["attempt_directory"]
     prefix_rows = [row for row in document["products"] if row["local_path"].startswith(prefix)]
-    assert prefix_rows and all(row["machine_id"] == "Olav" for row in prefix_rows)
+    assert prefix_rows and all(row["machine_id"] == "Second" for row in prefix_rows)
     current_rows = [row for row in document["products"] if row["local_path"].startswith(str(data.claim.output))]
     assert current_rows and all(row["machine_id"] == "Main" for row in current_rows)
     proof = next(row for row in prefix_rows if row["local_path"].endswith("retirement.json"))

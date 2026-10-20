@@ -149,7 +149,7 @@ def _ids(document):
 def test_requested_reviewers_and_the_reviewer_of_each_item():
     assert scope.requested_reviewers({}) is None
     assert scope.requested_reviewers({"reviewers": []}) is None
-    assert scope.requested_reviewers({"reviewers": ["Bob", "Ada Lovelace", "bob"]}) == ("ada-lovelace", "bob")
+    assert scope.requested_reviewers({"reviewers": ["Bob", "Ada Example", "bob"]}) == ("ada-example", "bob")
     assert scope.requested_reviewers({"reviewers": "Ada"}) == ("ada",)
     record = {"reviewer": "Ada", "reviewer_id": "ada"}
     assert scope.evidence_reviewer({"reviewer_id": "carl"}, record) == "carl"
@@ -312,10 +312,10 @@ def studio(qtbot, monkeypatch, tmp_path):
     page = module.SharedPhaseModelTrainingPage()
     qtbot.addWidget(page)
     sessions = [
-        {"reviewer": "Ada Lovelace", "reviewer_id": "ada-lovelace", "session_path": str(tmp_path / "s1"),
+        {"reviewer": "Ada Example", "reviewer_id": "ada-example", "session_path": str(tmp_path / "s1"),
          "manual_regions": 2, "modified_timestamp": 3.0},
         {"reviewer": "Bob", "session_path": str(tmp_path / "s2"), "manual_regions": 1, "modified_timestamp": 2.0},
-        {"reviewer": "Ada Lovelace", "reviewer_id": "ada-lovelace", "session_path": str(tmp_path / "s3"),
+        {"reviewer": "Ada Example", "reviewer_id": "ada-example", "session_path": str(tmp_path / "s3"),
          "blind_region_labels": 4, "modified_timestamp": 1.0},
     ]
     page._install_review_sessions(sessions)
@@ -327,7 +327,7 @@ def test_annotators_list_defaults_to_everyone_filters_sessions_and_passes_the_ch
 
     page, module = studio.page, studio.module
     labels = [page.annotators.item(row).text() for row in range(page.annotators.count())]
-    assert labels == ["Ada Lovelace (ada-lovelace)", "Bob (bob)"]
+    assert labels == ["Ada Example (ada-example)", "Bob (bob)"]
     assert all(page.annotators.item(row).checkState() == Qt.CheckState.Checked for row in range(2))
     assert page._selected_annotators() is None
     assert len(page.visible_review_sessions) == 3
@@ -346,15 +346,15 @@ def test_annotators_list_defaults_to_everyone_filters_sessions_and_passes_the_ch
     assert isinstance(captured[0], dict) and "reviewers" not in captured[0]
     assert captured[1] == "stop after capturing the request settings"
     page.annotators.item(1).setCheckState(Qt.CheckState.Unchecked)
-    assert page._selected_annotators() == ["ada-lovelace"]
+    assert page._selected_annotators() == ["ada-example"]
     assert [row["session_path"] for row in page.visible_review_sessions] == [
         studio.sessions[0]["session_path"], studio.sessions[2]["session_path"]]
     page._start_training()
-    assert captured[2]["reviewers"] == ["ada-lovelace"]
+    assert captured[2]["reviewers"] == ["ada-example"]
     assert {key: value for key, value in captured[2].items() if key != "reviewers"} == captured[0]
     # A rediscovery keeps the choice; nobody ticked is refused before preparation.
     page._install_review_sessions(studio.sessions)
-    assert page._selected_annotators() == ["ada-lovelace"]
+    assert page._selected_annotators() == ["ada-example"]
     page.annotators.item(0).setCheckState(Qt.CheckState.Unchecked)
     assert page.visible_review_sessions == []
     page._start_training()

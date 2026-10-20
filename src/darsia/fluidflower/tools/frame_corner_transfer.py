@@ -16,7 +16,7 @@ border, because the inner corner structure lies inside); normalised
 cross-correlation within a search window; a 4-point similarity fit; a second
 pass with templates warped by that similarity around the predicted corners;
 corners below ``ncc_min`` are replaced by the similarity prediction and
-flagged. Validated on FF_RE (Claude, 18 Oct 2026): control runs with the same
+flagged. Validated on FF_RE (18 Oct 2026): control runs with the same
 camera position reproduce the reference corners within 1-2 px.
 """
 from __future__ import annotations

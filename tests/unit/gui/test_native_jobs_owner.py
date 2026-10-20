@@ -307,7 +307,7 @@ def test_local_alias_registration_does_not_duplicate_b6_machine_and_missing_rss_
     workspace.panel.current = dict(
         registered_machines=[
             dict(machine="MAIN", source=dict(path="only-metadata")),
-            dict(machine="Olav", source=dict(path="remote-metadata")),
+            dict(machine="Second", source=dict(path="remote-metadata")),
         ]
     )
     rows = workspace._machines_provider()

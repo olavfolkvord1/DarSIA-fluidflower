@@ -52,7 +52,7 @@ def test_known_legacy_ff_ac_identity_does_not_claim_historical_start_choice(
     display = read_rig_display(tmp_path, registered_id, catalogue_loader=catalogue)
     assert display.physical_rig == "Albus"
     assert "chosen at Start" not in display.line
-    assert "explicitly identified by Olav" in display.note
+    assert "explicitly identified by the project owner" in display.note
 
 
 def test_same_dimensions_never_infer_physical_identity(tmp_path):

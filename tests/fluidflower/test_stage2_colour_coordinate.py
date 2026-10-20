@@ -1,4 +1,4 @@
-"""Stage-2 adapter for the stored stage-1 colour-path coordinate (Claude, 19 Oct 2026)."""
+"""Stage-2 adapter for the stored stage-1 colour-path coordinate."""
 
 import hashlib
 import json

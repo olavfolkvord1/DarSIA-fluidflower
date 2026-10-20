@@ -22,7 +22,7 @@ def originals(root):
     }
 
 
-def completion(root, *, machine="Olav", precision="float32"):
+def completion(root, *, machine="Second", precision="float32"):
     doc = dict(
         complete=True,
         worker_references_closed=True,
@@ -117,7 +117,7 @@ def test_current_completion_reads_actual_machine_precision_threads_no_inferred_s
     before = originals(tmp_path)
     sample = receipts.load_measurement_receipt(path)
     assert (
-        sample["machine"] == "Olav"
+        sample["machine"] == "Second"
         and sample["precision"] == "float32"
         and sample["threads"] == 1
     )
@@ -254,7 +254,7 @@ def test_local_immutable_registry_creates_nothing_until_explicit_import_and_relo
     assert Path(imported["registry_path"]).read_bytes() == stored
     assert originals(sources) == before
     loaded = receipts.MeasurementRegistry(registry.root).merge_machines([])
-    assert loaded[0]["machine"] == "Olav" and loaded[0]["inventory"] == {}
+    assert loaded[0]["machine"] == "Second" and loaded[0]["inventory"] == {}
     assert loaded[0]["history"][0]["source"] == imported["source"]
     assert len(list(registry.root.glob("*.json"))) == 1
 
@@ -266,7 +266,7 @@ def test_bare_and_summary_import_deduplicate_same_original_sample_keep_explicit_
     registry = receipts.MeasurementRegistry(tmp_path / "registry")
     registry.import_receipt(path)
     registry.import_receipt(summary["whole_run_completion"]["path"])
-    rows = [dict(machine="Olav", inventory=dict(cpu=dict(logical_cores=4)), history=[])]
+    rows = [dict(machine="Second", inventory=dict(cpu=dict(logical_cores=4)), history=[])]
     before = deepcopy(rows)
     merged = registry.merge_machines(rows)
     assert rows == before and len(merged[0]["history"]) == 1

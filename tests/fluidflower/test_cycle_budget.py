@@ -1,4 +1,4 @@
-"""Per-cycle mass budget (Claude, 18 Oct 2026)."""
+"""Per-cycle mass budget."""
 import math
 
 import pytest

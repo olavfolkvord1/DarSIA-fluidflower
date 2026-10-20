@@ -1,4 +1,4 @@
-"""Stage 2 post-processing of stored per-frame maps (Claude, 19 Oct 2026)."""
+"""Stage 2 post-processing of stored per-frame maps."""
 
 import math
 import os

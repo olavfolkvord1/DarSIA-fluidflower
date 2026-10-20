@@ -2426,7 +2426,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         dialog = load_wizard_dialog_class("preprocessing")(self)
         wizard_inputs = self.settings_inputs.copy()
-        # Adapt this instance only; neither Jakub's wizard nor its catalogue changes.
+        # Adapt this instance only; neither the upstream wizard nor its catalogue changes.
         label, profile = rig_preset
         preset_name = f"{label} (rig only)"
         dialog._catalogue.presets[preset_name] = SeriesPreset(
@@ -2957,7 +2957,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
 
 def create_application() -> tuple[QApplication, bool]:
-    """Use Jakub's saved theme and an existing QApplication when embedded."""
+    """Use the upstream saved theme and an existing QApplication when embedded."""
     existing = QApplication.instance()
     app = existing if existing is not None else QApplication(sys.argv[:1])
     if existing is None:

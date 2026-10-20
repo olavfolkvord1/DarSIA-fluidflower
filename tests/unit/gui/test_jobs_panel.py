@@ -252,7 +252,7 @@ def test_resource_choice_for_other_machine_cannot_change_local_controls(panel, a
     widget.set_resource_panel(resource)
     received = []
     widget.workers_selected.connect(received.append)
-    resource.workers_selected.emit(dict(machine="Olav", backend="cuda", workers=5))
+    resource.workers_selected.emit(dict(machine="Second", backend="cuda", workers=5))
     assert (
         widget.workers_spin.value() == 1 and widget.backend_combo.currentData() == "cpu"
     )
@@ -410,17 +410,17 @@ def test_machine_registration_records_facts_without_contact_or_overwrite(
     monkeypatch.setattr(ui, "require_unc", lambda path: None)
     put(tmp_path / "job.json", dict(job="fixture"))
     facts = dict(
-        machine="Olav",
+        machine="Second",
         host="existing-host",
         checkout="existing-repo",
         python="existing-env",
         ssh_alias="existing-alias",
     )
-    receipt = ui.register_machine_facts(tmp_path, facts, local_machine="Olav")
+    receipt = ui.register_machine_facts(tmp_path, facts, local_machine="Second")
     value = model.read_json(Path(receipt["path"]))
     assert value["remote_contacted"] is False and value["installed"] is False
     assert value["checkout"] == "existing-repo" and value["job"] == model.descriptor(
         tmp_path / "job.json"
     )
     with pytest.raises(FileExistsError):
-        ui.register_machine_facts(tmp_path, facts, local_machine="Olav")
+        ui.register_machine_facts(tmp_path, facts, local_machine="Second")

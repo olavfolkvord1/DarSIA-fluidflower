@@ -33,7 +33,7 @@ REFERENCE_REQUEST = "darsia-n43-reference-build-request-v1"
 REFERENCE_ADMINISTRATION = "darsia-n43-reference-build-administration-v1"
 REFERENCE_ENTITLEMENT_BYTES = 65728995330
 REFERENCE_CASE_IDS = ["ac52_f" + str(i) for i in range(1, 44) if i not in {8, 15, 22, 24}]
-# Reference builds Olav released, each pinned exactly here and reviewed as code:
+# Reference builds the project owner released, each pinned exactly here and reviewed as code:
 # authority ids -> the answer records with their deciders, and the accepted plan.
 # Every one keeps the aggregate entitlement REFERENCE_ENTITLEMENT_BYTES.
 REFERENCE_RELEASES = {
@@ -45,7 +45,7 @@ REFERENCE_RELEASES = {
         },
         plan_sha256="9dc0979d5cd48ce18df6391253ed3f178f181c0c321626cef179c25a2e59e988",
     ),
-    # R3, the RAW39 reference: N134 is Olav's release, N136 names the plan and
+    # R3, the RAW39 reference: N134 is the project owner's release, N136 names the plan and
     # entitlement, and N135 is his choice of this exact entry. N139 lets R3
     # start with the retained Q123 font file counted instead of an empty cache.
     # R3's first attempt (service 95c37c1c) stopped before its claim under this
@@ -97,7 +97,7 @@ REFERENCE_RELEASES = {
             logical_bytes=352770,
         ),
     ),
-    # R3 on the drift-fixed RAW positioning (Q159, N152). Codex re-minted the
+    # R3 on the drift-fixed RAW positioning (Q159, N152). The integration agent re-minted the
     # RAW binding, configurations and plan for it, and N154 names that plan.
     # N152 adds the font file of the third attempt: R3 starts counting exactly
     # this four-file inventory, verified on disk, and nothing else.

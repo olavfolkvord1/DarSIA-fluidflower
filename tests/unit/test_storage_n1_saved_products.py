@@ -228,7 +228,7 @@ def test_optional_extensive_genuine_N1_index_collect_remains_saved_only(tiny_con
         return original_read(path)
     monkeypatch.setattr(Path, "read_bytes", guard)
     run = payload.read_indexed_extensive_run(index, producer_kind="n1-mass-only",
-        current_machine_id="Olav", collections=[collection])
+        current_machine_id="Second", collections=[collection])
     assert not isinstance(run["frames"], list)
     assert len(list(run["frames"])) == 2
 
@@ -371,11 +371,11 @@ def test_actual_writer_publication_collect_and_foreign_saved_reader_need_no_nati
     index = _index(tmp_path, completion)
     _, _, rows = publication._read_index(index)
     wanted = [key for key, row in rows.items() if "/storage_" in key and row["kind"] == "map"]
-    collected = publication.collect_products(index, wanted, tmp_path / "collected", current_machine_id="Olav",
+    collected = publication.collect_products(index, wanted, tmp_path / "collected", current_machine_id="Second",
         source_paths={key: row["local_path"] for key, row in rows.items() if key in wanted}, file_writers_closed=True)
     def forbidden(*args, **kwargs): raise AssertionError("Saved reader attempted native evaluation")
     monkeypatch.setattr(n1.N1Pipeline, "evaluate", forbidden)
-    stored = saved_n1.read_indexed_n1_stored_run(index, current_machine_id="Olav", collections=[collected], load_before=True)
+    stored = saved_n1.read_indexed_n1_stored_run(index, current_machine_id="Second", collections=[collected], load_before=True)
     assert len(stored["frames"]) == 2
     assert all("/storage_" in str(bound["path"]).replace("\\", "/") or Path(bound["path"]).name in {"manifest.json", "result.json", "commit.json"}
                for item in stored["frames"] for bound in item["loaded_assets"])

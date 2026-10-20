@@ -26,7 +26,7 @@ Colour -> DIC is closed form: H = Ka_I (1 - f) / f and
 
 Reference values for the FF_RE recipe (1 g NaOH and 9.04 g BTB per 20 L) are
 in ``tests/fluidflower/test_titration.py``. Every default in this module is a
-proposal awaiting Olav's decision (Claude, 18 Oct 2026); none of it changes
+proposal awaiting the project owner's decision; none of it changes
 the existing FF_AC method.
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ class IndicatorRecipe:
         return self.sodium_m
 
 
-# FF_RE recipe (Olav, 18 Oct 2026): 1 g NaOH and 9.04 g BTB per 20 L; the lye
+# FF_RE recipe (project owner, 18 Oct 2026): 1 g NaOH and 9.04 g BTB per 20 L; the lye
 # wash uses the same 1 g NaOH per 20 L. The BTB form is assumed to be the sodium
 # salt: the free acid would give a green solution at pH 7.5 without any CO2.
 FFRE_RECIPE = IndicatorRecipe(naoh_g_per_l=1.0 / 20.0, btb_g_per_l=9.04 / 20.0)
@@ -120,7 +120,7 @@ class TitrationModel:
         """``blue_fraction_floor`` keeps the closed form finite at f = 0 and
         f = 1 (proposal: 1e-9); ``clip_negative_dic`` maps the small negative
         DIC that noise above the fresh-solution colour would give to 0
-        (proposal: True). Both are policies for Olav's decision, not physics.
+        (proposal: True). Both are policies for the project owner's decision, not physics.
         Invalid inputs (NaN, negative DIC, f outside [0, 1]) give NaN."""
         if not 0.0 < blue_fraction_floor < 0.5:
             raise ValueError("blue_fraction_floor must lie in (0, 0.5)")

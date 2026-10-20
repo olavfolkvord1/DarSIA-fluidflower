@@ -238,8 +238,8 @@ def test_input_reject_chain_preserves_original_retired_scientific_attempt(tmp_pa
 def test_foreign_origin_refused_before_reading_foreign_local_retirement(tmp_path,monkeypatch):
     from darsia.fluidflower.pipeline.run_io import alias_resume_output
     root,claim,binding=queued_fixture(tmp_path)
-    owner=dict(format="darsia-alias-lease-owner-v1",machine="olav-cpu",actual_owner=dict(machine="olav-cpu"),
-               output=dict(machine_id="Olav",root_alias="results",relative_path="unit/ac52/.attempts/"+"2"*32))
+    owner=dict(format="darsia-alias-lease-owner-v1",machine="second-cpu",actual_owner=dict(machine="second-cpu"),
+               output=dict(machine_id="Second",root_alias="results",relative_path="unit/ac52/.attempts/"+"2"*32))
     with pytest.raises(RunUnavailable,match="another machine"):
         alias_resume_output(owner,binding.local_output,claim.task,"2"*32)
 
@@ -330,7 +330,7 @@ def test_prefix_validator_exception_removes_temporary_view_and_keeps_SHA_checks(
     assert binding._prefix_validation_root is None and binding.resume_roots==set()
     # A physically foreign retirement never opens even the temporary path view.
     proof=json.loads(Path(source["retirement"]["path"]).read_bytes())
-    proof["machine_id"]="Olav"
+    proof["machine_id"]="Second"
     foreign=dict(source,retirement=doc(Path(source["retirement"]["path"]),proof))
     with binding.activate(),pytest.raises(RunUnavailable,match="same-machine"):
         with binding.prefix_validation(foreign):

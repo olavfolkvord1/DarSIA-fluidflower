@@ -14,11 +14,11 @@ def facts(tmp_path, *, shell="windows-powershell"):
     ssh.parent.mkdir(exist_ok=True)
     ssh.write_bytes(b"not an executable; fixture only")
     return dict(
-        machine="Olav",
+        machine="Second",
         host="existing-host",
         checkout=r"C:\Existing repo\DarSIA-worker",
         python=r"C:\Existing env\Scripts\python.exe",
-        ssh_alias="existing-olav-alias",
+        ssh_alias="existing-second-alias",
         ssh_executable=str(ssh),
         default_shell=shell,
     )
@@ -173,7 +173,7 @@ def test_start_selected_machine_routes_registered_remote_and_local_separately(
     widget.start_selected_machine()
     wait(app, widget.can_close)
     assert len(launches) == 1 and not local and not oldcalls and len(delivered) == 1
-    assert launches[0][1]["target"].ssh_alias == "existing-olav-alias"
+    assert launches[0][1]["target"].ssh_alias == "existing-second-alias"
     assert launches[0][1]["backend"] == "cuda" and launches[0][1]["workers"] == 2
     assert (
         not delivered[0]["numerical_progress_claimed"]
@@ -240,7 +240,7 @@ def test_resource_remote_choice_cannot_guess_between_explicit_registration_versi
     monkeypatch.setattr(remote, "require_unc", lambda path: None)
     widget.set_context(jobs_provider=lambda: [dict(root=str(root))])
     wait(app, widget.can_close)
-    widget._resource_choice(dict(machine="Olav", backend="cuda", workers=3))
+    widget._resource_choice(dict(machine="Second", backend="cuda", workers=3))
     assert (
         widget.target_combo.currentData()["local"] and widget.workers_spin.value() == 1
     )

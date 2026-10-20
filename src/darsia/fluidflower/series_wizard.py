@@ -51,7 +51,7 @@ from darsia.fluidflower.templates import RIG_CLASSES
 
 _ID_FROM_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
-# Physical Medium rigs reference Jakub's existing profiles; extend this list.
+# Physical Medium rigs reference the existing upstream profiles; extend this list.
 PHYSICAL_RIGS = (("Albus", "FF AC"), ("Bilbo", "FF Bilbo"))
 
 

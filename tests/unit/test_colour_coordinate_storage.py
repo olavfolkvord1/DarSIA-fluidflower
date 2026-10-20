@@ -32,7 +32,7 @@ from darsia.fluidflower.mass.production_precision import PixelMath
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 # The exported patch's six old source blobs match this local integration base.
-# Claude's private 2d8ccda3 commit object is not part of a format-patch export.
+# The private 2d8ccda3 commit object is not part of a format-patch export.
 HEAD_COMMIT = "563e562f5ca6ae4deefaab9c91a617bfc97270b8"
 ON = {"profile": "full", "store_colour_coordinate": True}
 LEAN_ON = {"profile": "lean", "store_colour_coordinate": True}

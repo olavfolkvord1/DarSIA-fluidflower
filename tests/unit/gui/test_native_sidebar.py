@@ -427,7 +427,7 @@ def test_start_series_selection_is_applied_before_showing_destination(
     assert "series-b" in window.setup_series_label.text()
 
 
-def test_collapsing_active_jakub_category_disables_play(native_window, qtbot):
+def test_collapsing_active_upstream_category_disables_play(native_window, qtbot):
     window = native_window
     window._select_row(("preprocessing", "protocols"))
     assert window.toolbar_builder.play_action.isEnabled()
@@ -462,7 +462,7 @@ def test_workflow_completion_cannot_enable_play_on_custom_pages(
     play.setEnabled(True)
     assert not play.isEnabled()
 
-    # The custom-page guard must leave Jakub's own completion behavior intact.
+    # The custom-page guard must leave the upstream completion behavior intact.
     window._select_row(("preprocessing", "protocols"))
     assert play.isEnabled()
     play.setEnabled(False)

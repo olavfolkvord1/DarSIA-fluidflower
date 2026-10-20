@@ -185,11 +185,11 @@ def test_indexed_probability_reader_requires_exact_producer_and_explicit_collect
     assert actual["arrays"]["pixel_probability"].dtype == np.float32
     from darsia.fluidflower.storage_saved_products import StoredProductCollectionRequired
     with pytest.raises(StoredProductCollectionRequired):
-        indexed.read_indexed_phase_probabilities(index, "case-one", current_machine_id="Olav")
+        indexed.read_indexed_phase_probabilities(index, "case-one", current_machine_id="Second")
     maps = [row["product_id"] for row in rows if row["kind"] == "map"]
     collected = publication.collect_products(index, maps, tmp_path / "collected",
         current_machine_id="Main", file_writers_closed=True)
-    replay = indexed.read_indexed_phase_probabilities(index, "case-one", current_machine_id="Olav",
+    replay = indexed.read_indexed_phase_probabilities(index, "case-one", current_machine_id="Second",
                                                      collections=[collected])
     assert replay["arrays"]["pixel_probability"].tobytes() == actual["arrays"]["pixel_probability"].tobytes()
 

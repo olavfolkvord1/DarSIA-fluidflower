@@ -1,4 +1,4 @@
-"""Port schedules and the multi-port cycle budget (Claude, 19 Oct 2026).
+"""Port schedules and the multi-port cycle budget.
 
 Hand values: grams = mL x density in kg/m3 x 1e-3; at 15 C (1.872 kg/m3)
 100 mL is 0.1872 g. The schedules are synthetic.

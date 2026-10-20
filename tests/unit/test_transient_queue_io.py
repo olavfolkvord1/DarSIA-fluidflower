@@ -1,6 +1,6 @@
 """A single transient SMB file or claim error waits and retries; it never crashes the work.
 
-Olav's rule N111. Tiny synthetic metadata only; the waits are set to zero.
+The project owner's rule N111. Tiny synthetic metadata only; the waits are set to zero.
 """
 import io
 from pathlib import Path

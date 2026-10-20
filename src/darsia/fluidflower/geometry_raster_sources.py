@@ -28,7 +28,7 @@ SILENT_EDIT = (
     "Imported rasters are independently authoritative. Save cannot silently "
     "derive facies from labels or edit their sources/properties. Create an "
     "explicit canonical edit draft first; it will report the difference to "
-    "the imported parent. Registered geometry still requires Olav's decision."
+    "the imported parent. Registered geometry still requires the project owner's decision."
 )
 
 

@@ -60,7 +60,7 @@ def read_rig_display(
 
     The caller must supply only a configuration already known to belong to this
     series when loaded_config is supplied. Missing physical identity is reported
-    honestly. FF_AC -> Albus is Olav's explicit historical identity, not a guess
+    honestly. FF_AC -> Albus is the project owner's explicit historical identity, not a guess
     based on dimensions, and is never written back by this display helper.
     """
     if series_root is None:
@@ -93,7 +93,7 @@ def read_rig_display(
     if chosen_at_start:
         notes.append("Physical rig profile recorded by the Start choice.")
     elif known_albus:
-        notes.append("FF_AC is Albus, as explicitly identified by Olav.")
+        notes.append("FF_AC is Albus, as explicitly identified by the project owner.")
     else:
         notes.append("The physical rig choice is not recorded for this series.")
     config = loaded_config

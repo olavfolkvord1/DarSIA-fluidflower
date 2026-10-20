@@ -27,7 +27,7 @@ def outcome(fn,*a,**kw):
     try:return ("value",fn(*a,**kw))
     except Exception as e:return ("error",type(e).__name__,str(e))
 
-@pytest.mark.parametrize("name",["Olav"," Åsa  ÆØÅ ","","___","Alice.BOB  2",None,12])
+@pytest.mark.parametrize("name",["Reviewer"," Åsa  ÆØÅ ","","___","Alice.BOB  2",None,12])
 def test_reviewer_identifier_matches_original_and_shared_owner(monkeypatch,name):
     canonical=load(PAIRWISE,"_reviewer_identifier")
     module=types.ModuleType("darsia.fluidflower.tools.calibration_pairwise_review")

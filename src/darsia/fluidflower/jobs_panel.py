@@ -175,7 +175,7 @@ START_ANALYSIS_NOTE = "Choose an already adopted, frozen execution-series plan. 
 LEAN_NOTE = "Lean: same computation, fewer stored files. In the 39-frame test, Lean took 1.1 GB and Full took 13.6 GB."
 
 # Computed at (N144). Native is today's computation and the default. The coarse
-# grids are the placeholder of spec section 3.5 and wait for Olav's decision, so
+# grids are the placeholder of spec section 3.5 and wait for the project owner's decision, so
 # they are offered disabled. storage_resolution.COMPUTING_RESOLUTIONS_MM takes
 # over from this tuple when N146 is integrated.
 COARSE_COMPUTING_MM = (0.5, 1.0)

@@ -41,7 +41,7 @@ stage-1 gain, dilution factor and clipping as a calibration.
 Every method parameter is a field of ``Stage2Config`` without a default: the BTB
 form and recipe, pKa, temperature, the two titration policies, f_min, the CO2
 pressure of the solubility bound and the gas densities with their declared
-reference conditions (Claude, 19 Oct 2026).
+reference conditions.
 """
 
 from __future__ import annotations

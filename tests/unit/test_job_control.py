@@ -86,7 +86,7 @@ def test_stale_window_and_non_master_cannot_publish(job):
     with pytest.raises(ValueError, match="refresh"):
         control.publish_control(job, "run", machine="Main", expected_previous=None)
     with pytest.raises(ValueError, match="master machine"):
-        control.publish_control(job, "stop", machine="Olav", expected_previous=first)
+        control.publish_control(job, "stop", machine="Second", expected_previous=first)
     assert snapshot(job) == before
 
 

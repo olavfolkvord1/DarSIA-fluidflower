@@ -1407,7 +1407,7 @@ class GeometryFaciesPage(ModulePage):
         self.geometry_quality_basis.setText(
             "Imported rasters: labels and facies are independent authoritative maps; "
             "the FULL original properties CSV is retained. Fields are read-only. "
-            "Create a canonical edit draft to edit; registered geometry still requires Olav's decision.")
+            "Create a canonical edit draft to edit; registered geometry still requires the project owner's decision.")
 
     def _begin_canonical_edit(self) -> None:
         from darsia.fluidflower.geometry_raster_sources import prepare_canonical_edit

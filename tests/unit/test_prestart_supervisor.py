@@ -168,13 +168,13 @@ def test_the_supervisor_imports_no_darsia_numerics_or_qt():
 
 def test_both_launchers_start_the_worker_through_the_supervisor():
     from darsia.fluidflower import remote_worker_launch as remote
-    target = remote.RemoteWorkerTarget(machine="Olav", ssh_alias="olav",
+    target = remote.RemoteWorkerTarget(machine="Second", ssh_alias="second",
         python=r"C:\existing\python.exe", checkout=r"C:\existing\repo",
         ssh_executable=r"C:\Windows\System32\OpenSSH\ssh.exe", default_shell="windows-powershell")
     launch = remote.build_remote_worker_launch(r"\\NAS\share\jobs\explicit", target=target,
                                                backend="cpu", workers=1)
     assert launch.worker_argv[:4] == (target.python, "-B", "-m", "darsia.fluidflower.worker")
     expected = ("& 'C:\\existing\\python.exe' '-B' '-m' 'darsia_service.prestart' '--service-log' "
-                "'\\\\NAS\\share\\jobs\\explicit\\logs\\olav-cpu.log' '--' ")
+                "'\\\\NAS\\share\\jobs\\explicit\\logs\\second-cpu.log' '--' ")
     assert launch.remote_command.startswith(expected)
     assert launch.remote_command.endswith(" '--watchdog'")

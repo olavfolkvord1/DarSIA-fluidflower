@@ -334,7 +334,7 @@ def plan_series_conversion(root, choices):
     pending = []
     if selection is not None:
         if not isinstance(selection, dict) or not selection.get("authority"):
-            raise ValueError("A selected model needs explicit Olav authority")
+            raise ValueError("A selected model needs explicit project-owner authority")
         model = _input(root, selection["path"])
         selected, errors = inspect_models(root, [selection["path"]], before["series_id"])
         if len(selected) != 1 or errors:

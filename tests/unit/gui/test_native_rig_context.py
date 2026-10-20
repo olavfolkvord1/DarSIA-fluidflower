@@ -141,7 +141,7 @@ def test_native_wizard_hides_repeated_choices_without_mutating_existing_rig(
     window.open_wizard_for("preprocessing")
     assert len(seen) == 1 and seen[0]._native_rig_readonly
     assert window.config_dict["rig"] == rig
-    # Jakub's ordinary wizard class and another instance remain unchanged.
+    # The upstream ordinary wizard class and another instance remain unchanged.
     ordinary = PreprocessingWizardDialog(window)
     index = next(i for i, entry in enumerate(STEPS) if entry[0] == "rig")
     ordinary._goto(index)
