@@ -41,6 +41,7 @@ PHASE_CALIBRATION = [
     ("phase_model:overflow", "Free gas vs overflow"),
     ("phase_model:mass_from_phase", "Mass calibration"),
     ("phase_model:calibration_review", "Calibration review"),
+    ("phase_model:checks", "Checks"),
 ]
 COLOUR_CALIBRATION = [
     ("color", "Colour path"),

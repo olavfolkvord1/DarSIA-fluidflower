@@ -293,6 +293,8 @@ def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | No
         return series_scope(context, note="Jobs retain their own explicit whole-run selections; opening this list performs no calculation.")
     if action == "jobs" and item_id == "new_analysis":
         return series_scope(context, note="The adopted plan fixes the runs and images; opening this page performs no calculation.")
+    if action == "phase_model" and item_id == "checks":
+        return series_scope(context, note="Check results cover the whole series; opening a file performs no calculation and writes nothing.")
     if (
         (
             action == "phase_model"

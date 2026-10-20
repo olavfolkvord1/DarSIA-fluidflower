@@ -1482,6 +1482,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                                 "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs."),
                     _native_row(aliases, action, "Calibration review", "phase_model", "calibration_review",
                                 "View the saved concentration, mass and curves of a model and calibration, one run at a time; opening it starts no calculation."),
+                    _native_row(aliases, action, "Checks", "phase_model", "checks",
+                                "View the held-out checks 1-3 of a check-score file, or of two side by side; opening a file starts no calculation and writes nothing."),
                 ]
                 # Image normalisation comes before both methods and Use for this
                 # series after them (N141); the original groups, the danger zone
@@ -2397,6 +2399,16 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.content_stack.addWidget(self.dataset_analysis_page)
         return self.dataset_analysis_page
 
+    def ensure_calibration_checks(self) -> QWidget:
+        """The read-only Checks page of the Phase-map method (created once)."""
+        page = getattr(self, "calibration_checks_page", None)
+        if page is None:
+            from darsia.fluidflower.calibration_checks_view import CalibrationChecksPage
+
+            page = self.calibration_checks_page = CalibrationChecksPage()
+            self.content_stack.addWidget(page)
+        return page
+
     def _show_dataset_analysis(self) -> bool:
         """Show New analysis for a published dataset series; False for other series."""
         root = self.dataset_series_root()
@@ -2882,6 +2894,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.content_stack.setCurrentWidget(self.overflow_data_page)
             elif (action, item_id) == ("phase_model", "calibration_review"):
                 self._show_mass_analysis_view("review")
+            elif (action, item_id) == ("phase_model", "checks"):
+                self.content_stack.setCurrentWidget(self.ensure_calibration_checks())
             elif (action, item_id) == ("phase_model", "overflow"):
                 self._show_overflow_use()
             elif action in {"phase_model", "method"}:

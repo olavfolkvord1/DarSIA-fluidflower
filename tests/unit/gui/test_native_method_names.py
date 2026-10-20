@@ -68,7 +68,7 @@ def test_grouping_reads_group_keys_not_header_text(method_window):
     assert keys(rows, calibration["first"]) == ["phase_model:normalisation"]
     assert keys(rows, calibration["phase_model"]) == [
         "phase_model:training", "phase_model:overflow", "phase_model:mass_from_phase",
-        "phase_model:calibration_review"]
+        "phase_model:calibration_review", "phase_model:checks"]
     assert keys(rows, calibration["common"]) == ["method:use_for_series"]
     assert rows["reset"] in calibration["colour_path"]
     analysis = before["analysis"]

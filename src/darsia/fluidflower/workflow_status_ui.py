@@ -22,6 +22,7 @@ NO_STATUS_ROWS = {
     ("phase_model", "normalisation"),
     ("phase_model", "overflow"),
     ("phase_model", "calibration_review"),
+    ("phase_model", "checks"),
     ("method", "use_for_series"),
     ("jobs", "new_analysis"),
     ("overflow_data", "runs"),
