@@ -201,6 +201,15 @@ _MOVE_SHARED_TIP = (
     "other edges. No: the boundary lies exactly on the shared edge, also in "
     "the exported map; other edges keep their snap distance."
 )
+# How saturated the photograph is shown, in percent: the user's choice, kept
+# with the background choice and not in the painting session.
+_SATURATION_KEY = "display/saturation"
+_SATURATION_TIP = (
+    "Colour saturation of the photograph shown, from 0 % (grey) to 100 % (its "
+    "own colours). Grey can make layer boundaries easier to trace. Display "
+    "only: the proposal, the session and the export always use the photograph "
+    "itself."
+)
 
 
 def _muted(widget: QWidget) -> QColor:
@@ -243,6 +252,27 @@ def _swatch(color: str, size: int = 14) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(QColor(color))
     return QIcon(pixmap)
+
+
+def photo_with_saturation(rgb: np.ndarray, saturation: float) -> np.ndarray:
+    """An RGB uint8 photograph shown with less colour saturation.
+
+    ``saturation`` 1 (or more) returns ``rgb`` itself, unchanged; 0 (or less)
+    gives its grey, the luma with OpenCV's RGB-to-grey weights in all three
+    channels; a value between blends the two. The result is uint8 RGB of the
+    same shape. For display only.
+    """
+
+    import cv2
+
+    value = min(max(float(saturation), 0.0), 1.0)
+    if value >= 1.0:
+        return rgb
+    image = np.ascontiguousarray(rgb, dtype=np.uint8)
+    grey = cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+    if value <= 0.0:
+        return grey
+    return cv2.addWeighted(image, value, grey, 1.0 - value, 0.0)
 
 
 def _parse_number(text: str) -> float | None:
@@ -2718,6 +2748,11 @@ class LayerPainterView(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
         self._save_timer.timeout.connect(self.save_session)
+        # The saturation is applied once the slider rests for a moment.
+        self._saturation_timer = QTimer(self)
+        self._saturation_timer.setSingleShot(True)
+        self._saturation_timer.setInterval(150)
+        self._saturation_timer.timeout.connect(self.apply_saturation)
 
         self.canvas = LayerCanvas()
         self.canvas.stroke_finished.connect(self._stroke_finished)
@@ -3258,6 +3293,23 @@ class LayerPainterView(QWidget):
         display.addWidget(self.background)
         self._refresh_background_choice()
         display.addStretch(1)
+        # The saturation of the photograph, in a row of its own so that the
+        # display row keeps its width.
+        photo = QHBoxLayout()
+        saturation_label = QLabel("Saturation")
+        saturation_label.setToolTip(_SATURATION_TIP)
+        photo.addWidget(saturation_label)
+        self.saturation = QSlider(Qt.Orientation.Horizontal)
+        self.saturation.setRange(0, 100)
+        self.saturation.setFixedWidth(120)
+        self.saturation.setToolTip(_SATURATION_TIP)
+        self.saturation.setValue(self._stored_saturation())
+        self.saturation.valueChanged.connect(self._saturation_changed)
+        photo.addWidget(self.saturation)
+        self.saturation_value = QLabel(f"{self.saturation.value()} %")
+        self.saturation_value.setToolTip(_SATURATION_TIP)
+        photo.addWidget(self.saturation_value)
+        photo.addStretch(1)
 
         self.photo_note_row = QWidget()
         note_layout = QHBoxLayout(self.photo_note_row)
@@ -3272,6 +3324,7 @@ class LayerPainterView(QWidget):
         layout.addWidget(self.photo_note_row)
         layout.addWidget(self.canvas, 1)
         layout.addLayout(display)
+        layout.addLayout(photo)
         self.canvas_hint = _note(_CANVAS_HINT)
         layout.addWidget(self.canvas_hint)
         return column
@@ -3691,6 +3744,10 @@ class LayerPainterView(QWidget):
                 else self._background_detail_plain
             )
         assert display is not None
+        saturation = self.saturation.value() / 100.0
+        display = photo_with_saturation(display, saturation)
+        if detail is not None:
+            detail = photo_with_saturation(detail, saturation)
         self.canvas.set_photo(
             display,
             self.image.image_size,
@@ -3732,6 +3789,7 @@ class LayerPainterView(QWidget):
             return False
         plain = np.rint(255.0 * np.clip(rgb, 0.0, 1.0)).astype(np.uint8)
         display = lp.enhance_contrast(rgb) if self.enhance.isChecked() else plain
+        display = photo_with_saturation(display, self.saturation.value() / 100.0)
         token = {"baseline": plain, "path": str(path), "raw_size": (width, height)}
         self.canvas.set_photo(display, (width, height), token=token, reset_view=True)
         self.canvas.paint_enabled = False
@@ -3994,6 +4052,32 @@ class LayerPainterView(QWidget):
         if isinstance(value, str):
             return value.strip().lower() not in {"false", "0", "no", "off"}
         return bool(value)
+
+    def _stored_saturation(self) -> int:
+        """The user's last saturation of the photograph in percent; 100 when
+        none is stored."""
+
+        value = QSettings(*_BACKGROUND_SETTINGS).value(_SATURATION_KEY, 100)
+        try:
+            return min(max(int(float(value)), 0), 100)
+        except (TypeError, ValueError):
+            return 100
+
+    def _saturation_changed(self, value: int) -> None:
+        self.saturation_value.setText(f"{int(value)} %")
+        self._saturation_timer.start()
+
+    def apply_saturation(self) -> None:
+        """Show the photograph at the slider's saturation, and remember it."""
+
+        self._saturation_timer.stop()
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        settings.setValue(_SATURATION_KEY, int(self.saturation.value()))
+        settings.sync()
+        if self._other_photo is not None:
+            self.show_frame_photo(self._other_photo)
+        elif self.image is not None:
+            self._show_reference(reset_view=False)
 
     def _follow_edges_toggled(self, checked: bool) -> None:
         self.canvas.set_follow_edges(checked)
