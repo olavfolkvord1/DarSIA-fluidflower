@@ -474,7 +474,11 @@ class CacheBudgetLedger:
 
 
 def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=False):
-    """One original exact-v1 reader, shared by claim and read-only projection."""
+    """One original exact-v1 reader, shared by claim and read-only projection.
+
+    A typed volume-bound profile covers every full task on its qualified head
+    and route (N188 D2); the old measured profile stays exact in case count and commit.
+    """
     from .capacity import read_bound
     verify = adapter.verify_profile_projection if projection else adapter.verify_profile
     binding = policy.profiles.get("jobs")
@@ -487,13 +491,22 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
         read_authorities=lambda pin:_exact_authority_list(pin, adapter.lease.package_file))
     from .first_qualification import BOUND_JOB_PROFILE, BOUND_WRITER_CONTRACT
     if profile.get("format") == BOUND_JOB_PROFILE:
-        scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
-        if (profile.get("scope") != scope or profile.get("purpose") != "jobs"
+        # The service-only writers add no claim bytes, so the qualified profile
+        # covers every full task on its qualified head and route, whichever run
+        # it is. The qualified task itself is covered as before.
+        from darsia.fluidflower.storage_profile import declared_storage_profile
+        route = ("commit", "pipeline", "backend", "precision")
+        qualified = profile.get("scope")
+        other_run = (isinstance(qualified, dict)
+                     and {key: task.get(key) for key in (*route, "run", "ordered_case_ids")} != qualified)
+        if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in route)
+                or (other_run and declared_storage_profile(task) != "full")
+                or profile.get("purpose") != "jobs"
                 or profile.get("writer_contract") != BOUND_WRITER_CONTRACT
                 or profile.get("additional_claim_cache_bytes") != 0
                 or profile.get("allocation_model") != "shared-service-only-no-claim-files-v1"
                 or profile.get("result_estimate_excludes_cache") is not True):
-            raise CachePolicyError("Bound cache profile is outside the exact qualified worker scope")
+            raise CachePolicyError("Bound cache profile is outside its qualified head and route")
         measured, _ = read_bound(profile["measurement"])
         complete, _ = read_bound(profile["completion"])
         if verify(task, estimate, binding, profile, measured, complete) is not True:

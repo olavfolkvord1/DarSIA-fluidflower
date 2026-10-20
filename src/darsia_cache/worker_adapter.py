@@ -271,12 +271,20 @@ class WorkerCacheAdapter:
         return True
 
     def _verify_bound_profile(self, task, estimate, binding, profile, measured, complete, *, remember):
+        """A typed volume-bound profile, for every task on its qualified head and route.
+
+        The task may be another run than the qualified one (N188 D2; another
+        run must be a full task, see applicable_job_cache_profile): its claim
+        adds no cache bytes, and the shared service keeps the qualified
+        entitlement. Commit, backend, pipeline and precision stay exact.
+        """
         from .first_qualification import BOUND_WRITER_CONTRACT
-        scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
-        if (scope != profile.get("scope") or scope["commit"] != self.runtime.commit
-                or scope["backend"] != self.runtime.backend or self.runtime.backend != "cpu"
-                or scope["pipeline"] != "native-phase-n1" or scope["precision"] != "float32"
-                or scope["run"] != "ac52" or len(scope["ordered_case_ids"]) != 39
+        qualified = profile.get("scope") if isinstance(profile.get("scope"), dict) else {}
+        if (not qualified
+                or any(task.get(key) != qualified.get(key) for key in ("commit", "pipeline", "backend", "precision"))
+                or task.get("commit") != self.runtime.commit
+                or task.get("backend") != self.runtime.backend or self.runtime.backend != "cpu"
+                or task.get("pipeline") != "native-phase-n1" or task.get("precision") != "float32"
                 or profile.get("provider") != binding or binding != self.lease.profile_binding
                 or profile.get("namespace_admission") != self.lease.document["cache_bootstrap"]["namespace_admission"]
                 or profile.get("stores_source") != self.lease.source
@@ -290,7 +298,7 @@ class WorkerCacheAdapter:
                 or measured.get("cache_operational_reserve_crossed") is not False
                 or measured.get("first_stop") is not None
                 or complete.get("complete") is not True or complete.get("passed") is not True
-                or complete.get("scope") != scope):
+                or complete.get("scope") != qualified):
             raise CachePolicyError("Typed physical-bound qualification is not applicable to this actual service/task")
         cap = self.lease.policy.volume_cap
         if (cap is None or cap.maximum_size_bytes != 500*1024**3

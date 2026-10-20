@@ -115,7 +115,7 @@ def test_bound_output_reader_uses_original_estimate_arithmetic_for_all_retained_
 
 
 @pytest.mark.parametrize("change", [
-    lambda t,c,p:p["configuration"].update(sha256="f"*64),
+    # Another run's own configuration is covered (N188 D2): test_bound_profile_other_runs.
     lambda t,c,p:c.update(storage={"TESTONLY":"not measured by this profile"}),
     lambda t,c,p:c.update(gas_probability_storage={"TESTONLY":"not measured"}),
     lambda t,c,p:p["result_profile"]["writers"].pop(),

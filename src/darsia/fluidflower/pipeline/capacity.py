@@ -181,12 +181,22 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None):
     return layout
 
 
-def _check_measured_native_layout(profile, requested):
+# The layout fields a run takes from its own run DATA: its configurations, its
+# RAW binding and where its native box sits in the camera frame. The box size is
+# the native grid, which every layout check below pins.
+_LAYOUT_RUN_FIELDS = {"native_configuration_sha256", "phase_configuration_sha256",
+                      "raw_source_binding_sha256", "source_box_xywh"}
+
+
+def _check_measured_native_layout(profile, requested, *, other_run=False):
     """The measured and requested layouts must be the same closed layout exactly.
 
     A rig layout has the original ten fields. A RAW-only layout has those plus
     native_task_kind 'raw_rig' and its RAW source binding SHA-256. Each kind is
     measured on its own frames; neither kind's profile applies to the other.
+    With other_run the task is another run than the measured one: its own
+    _LAYOUT_RUN_FIELDS may differ, while its kind, grid, canvas, channels and
+    precision must equal the measured ones.
     """
     fields = {"format", "pipeline", "precision", "native_shape_hw", "phase_shape_hw",
               "native_shape_chw", "feature_rgb_dtype", "source_box_xywh",
@@ -217,7 +227,10 @@ def _check_measured_native_layout(profile, requested):
     if measured.get("native_task_kind") != requested.get("native_task_kind"):
         raise ValueError("Requested native processor kind differs from the measured profile: rig and "
                          "RAW-only (raw_rig) frames each need a profile measured on their own kind")
-    if json.dumps(measured, sort_keys=True, separators=(",", ":")) != json.dumps(requested, sort_keys=True, separators=(",", ":")):
+    compared = lambda value: json.dumps({key: item for key, item in value.items()
+                                         if not (other_run and key in _LAYOUT_RUN_FIELDS)},
+                                        sort_keys=True, separators=(",", ":"))
+    if compared(measured) != compared(requested):
         raise ValueError("Requested native layout/configuration differs from measured profile; no size/default fallback")
 
 
@@ -558,14 +571,18 @@ def n43_entitlement(runtime, task, config, rows):
 
 
 def estimate_run(task, config, profile, *, measurement, completion, layout=None,
-                 layout_bytes=0, profile_identity=None, requested_native_layout=None):
-    """Pure metadata estimate; missing applicability is refusal, not a default."""
+                 layout_bytes=0, profile_identity=None, requested_native_layout=None, other_run=False):
+    """Pure metadata estimate; missing applicability is refusal, not a default.
+
+    other_run: the task is another run than the measured one (see
+    _check_measured_native_layout); the arithmetic is the same per frame.
+    """
     if any(not isinstance(row,dict) for row in (task,config,profile,measurement,completion)):
         raise ValueError("Explicit typed capacity metadata objects required")
     if task.get("pipeline") == "native-phase-statistics":
         raise ValueError("Phase-one output layout has no separately measured capacity contract; no full-pipeline profile reuse")
     if task.get("pipeline") == "native-phase-n1":
-        _check_measured_native_layout(profile, requested_native_layout)
+        _check_measured_native_layout(profile, requested_native_layout, other_run=other_run)
         if profile["measured_native_layout"]["precision"] != task.get("precision"):
             raise ValueError("Measured native layout and original task precision differ")
     cases = task.get("ordered_case_ids")
@@ -736,21 +753,30 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
 
 
 def _bound_result_estimate(stores, series_id, task, config, profile, binding, *, repository, metadata_rows):
-    """Original estimate arithmetic on genuine closed whole-allstage inventory."""
-    scope = {key:task.get(key) for key in ("commit", "pipeline", "backend", "precision", "run", "ordered_case_ids")}
-    if (profile.get("scope") != scope or profile.get("configuration") != task.get("configuration")
-            or scope["pipeline"] != "native-phase-n1" or scope["backend"] != "cpu"
-            or scope["precision"] != "float32" or scope["run"] != "ac52"
-            or len(scope["ordered_case_ids"]) != 39
+    """Original estimate arithmetic on genuine closed whole-allstage inventory.
+
+    A qualified profile estimates every full task on its qualified head and
+    route (commit, native-phase-n1, CPU, float32), not only the task it
+    qualified (N188 D2): the qualified bytes per frame times the task's frame
+    count, plus its largest frame in flight. Another run's layout must have the
+    measured kind, grid and canvas; it names its own configurations and binding.
+    """
+    route = ("commit", "pipeline", "backend", "precision")
+    qualified = profile.get("scope")
+    if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in route)
+            or task.get("pipeline") != "native-phase-n1" or task.get("backend") != "cpu"
+            or task.get("precision") != "float32"
             or config.get("storage") is not None or config.get("pixel_domain") is not None
             or "gas_probability_storage" in config or config.get("probability_storage") is not None):
-        raise ValueError("Qualified output profile does not cover this exact full/allstage scientific task")
+        raise ValueError("Qualified output profile does not cover this full/allstage task on its qualified head and route")
+    other_run = ({key: task.get(key) for key in (*route, "run", "ordered_case_ids")} != qualified
+                 or profile.get("configuration") != task.get("configuration"))
     actual = profile["result_profile"]
     required = {"src/darsia/fluidflower/mass/n1_pipeline.py", "src/darsia/fluidflower/mass/n1_statistics.py",
         "src/darsia/fluidflower/pipeline/series.py", "src/darsia/fluidflower/native/sidecar.py",
         "src/darsia/fluidflower/pipeline/runner.py"}
     if (actual.get("format") != PROFILE_FORMAT or actual.get("measured_commit") != task["commit"]
-            or actual.get("measured_case_ids") != task["ordered_case_ids"]
+            or actual.get("measured_case_ids") != qualified.get("ordered_case_ids")
             or not isinstance(actual.get("writers"), list)
             or len(actual["writers"]) != len(required)
             or {row.get("relative_path") for row in actual["writers"]} != required):
@@ -760,7 +786,7 @@ def _bound_result_estimate(stores, series_id, task, config, profile, binding, *,
     requested = _native_layout_for_task(stores, series_id, task, config, metadata_rows)
     return estimate_run(task, config, actual, measurement=actual["measurement"],
         completion=actual["completion"], requested_native_layout=requested,
-        profile_identity=dict(binding))
+        profile_identity=dict(binding), other_run=other_run)
 
 
 def volume_info(root):
