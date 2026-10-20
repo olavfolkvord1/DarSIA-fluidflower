@@ -20,7 +20,7 @@ from .io import sha256_file
 from ..pipeline.job_queue import retry_transient
 
 
-CONTRACT = "darsia-raw-positioning-existing-grid-v1"
+CONTRACT = "darsia-raw-positioning-existing-grid-v2"
 
 
 @dataclass(frozen=True)
@@ -196,10 +196,44 @@ def load_shape_chain(assets: Sequence[Mapping]) -> list:
     return chain
 
 
+def drift_view(fraction: np.ndarray) -> np.ndarray:
+    """sRGB (IEC 61966-2-1) encoding of linear [0, 1] values, for drift features only.
+
+    The saved drift corrections were built on camera JPEGs, which are sRGB
+    encoded, and their feature matcher works on 8-bit values. Values outside
+    [0, 1] (demosaic overshoot) are clipped for this view only.
+    """
+    x = np.clip(np.asarray(fraction, np.float32), 0.0, 1.0)
+    return np.where(x <= 0.0031308, 12.92 * x,
+                    1.055 * np.power(x, 1 / 2.4) - 0.055).astype(np.float32)
+
+
+def _apply_drift(image, correction) -> None:
+    """Apply a saved DriftCorrection, estimating its translation on the sRGB view.
+
+    The steps are DriftCorrection.correct_array's, except that the estimator
+    sees drift_view of the ROI. The translation it finds warps the linear values.
+    """
+    roi = correction.roi
+    values = image.img if roi is None else image.img[roi]
+    translation, intact = correction.translation_estimator.find_effective_translation(
+        drift_view(values), correction.base, None, roi)
+    if not intact:
+        raise ValueError("ROIs cannot be aligned by translation.")
+    height, width = correction.base.shape[:2]
+    image.img = cv2.warpAffine(image.img, translation, (width, height))
+    image.update_metadata(correction.correct_metadata(image.metadata()))
+
+
 def native_review_rgb(camera_rgb: np.ndarray, chain: Sequence, *,
                       white_range_dn: int, shape_hw: Sequence[int],
                       image_metadata: Mapping) -> np.ndarray:
-    """Use the saved per-frame shape/motion chain, without fitting a new rig."""
+    """Use the saved per-frame shape/motion chain, without fitting a new rig.
+
+    A drift step measures its translation on the sRGB view of the linear
+    values (drift_view), as its JPEG-built base expects. Every other step, and
+    the returned DN values, use the linear values.
+    """
     import darsia
 
     camera_rgb = np.asarray(camera_rgb)
@@ -209,8 +243,12 @@ def native_review_rgb(camera_rgb: np.ndarray, chain: Sequence, *,
         raise ValueError("A finite camera-U RGB view and existing shape chain are required")
     scale = np.float32(white_range_dn)
     image = darsia.OpticalImage(
-        np.moveaxis(camera_rgb, 0, -1) / scale,
-        transformations=list(chain), color_space="RGB", **dict(image_metadata))
+        np.moveaxis(camera_rgb, 0, -1) / scale, color_space="RGB", **dict(image_metadata))
+    for correction in chain:
+        if isinstance(correction, darsia.DriftCorrection) and correction.active:
+            _apply_drift(image, correction)
+        elif correction is not None and hasattr(correction, "__call__"):
+            correction(image, overwrite=True)
     review = np.moveaxis(np.asarray(image.img, np.float32), -1, 0) * scale
     if review.shape != (3, *shape_hw) or not np.isfinite(review).all():
         raise ValueError("RAW-derived review does not share the existing native grid")
@@ -246,6 +284,7 @@ def render_native(sensor: Sensor, *, shape_assets: Sequence[Mapping],
         registration=quality, sensor_metadata=dict(sensor.metadata),
         profile_id=sensor.profile_id,
         white_balance_applied=False, gamma_applied=False,
+        drift_estimation_view="sRGB (IEC 61966-2-1) of linear DN/white, ROI only; warp applied to linear values",
         scientific_units="black-subtracted camera DN",
         scientific_interpolation="one direct per-channel sensor-to-native bilinear float32 warp",
         new_rig_fit=False, new_photometric_fit=False, training=False,
