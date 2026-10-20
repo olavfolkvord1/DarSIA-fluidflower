@@ -506,6 +506,7 @@ def test_right_click_menu_in_edit_removes_the_selected_points(view):
         "Polygon of Coarse sand",
         "Remove this point",
         "Remove 2 selected points",
+        "Join to neighbour's edge…",
         "Move to layer",
         "",
         "Delete polygon",
