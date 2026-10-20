@@ -79,12 +79,14 @@ def _native_layout_shape(value, count, where):
     return list(value)
 
 
-def _native_layout_for_task(stores, series_id, task, config, rows=None, *, raw_reference=False):
+def _native_layout_for_task(stores, series_id, task, config, rows=None):
     """Only already-declared JSON metadata; never array/image reads or a claim.
 
-    Measured profiles exist for rig frames only. RAW-only frames (raw_rig) are
-    read only with raw_reference=True, the released reference-build route: their
-    native grid is their RAW source binding's, and the layout names that binding.
+    Rig frames and RAW-only frames (raw_rig) are read the same way on every
+    route: the released reference build, the bound first qualification and the
+    ordinary measured profiles. A RAW-only layout takes its native grid from the
+    frames' one RAW source binding and names that binding, so it never equals a
+    rig layout, and a profile or reference of one kind never matches the other.
     """
     from .store_runtime import resolve_catalog
     if (task.get("pipeline") != "native-phase-n1"
@@ -131,7 +133,7 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None, *, raw_r
     if not isinstance(frames, list) or not frames:
         raise ValueError("Actual nonempty frame layout required")
     kinds = {frame["native_task"]["kind"] for frame in frames}
-    raw = raw_reference and kinds == {"raw_rig"}
+    raw = kinds == {"raw_rig"}
     if kinds != {"rig"} and not raw:
         raise ValueError("Unmeasured native processor route requires its own profile")
     raw_bindings = set()
@@ -173,19 +175,30 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None, *, raw_r
                   phase_configuration_sha256=config["phase"]["configuration"]["sha256"])
     if raw:
         if len(raw_bindings) != 1:
-            raise ValueError("A RAW-only reference layout requires one RAW source binding")
+            raise ValueError("A RAW-only layout requires one RAW source binding")
         # Never equal to a rig layout, so no rig profile or reference can match it.
         layout.update(native_task_kind="raw_rig", raw_source_binding_sha256=raw_bindings.pop())
     return layout
 
 
 def _check_measured_native_layout(profile, requested):
+    """The measured and requested layouts must be the same closed layout exactly.
+
+    A rig layout has the original ten fields. A RAW-only layout has those plus
+    native_task_kind 'raw_rig' and its RAW source binding SHA-256. Each kind is
+    measured on its own frames; neither kind's profile applies to the other.
+    """
     fields = {"format", "pipeline", "precision", "native_shape_hw", "phase_shape_hw",
               "native_shape_chw", "feature_rgb_dtype", "source_box_xywh",
               "native_configuration_sha256", "phase_configuration_sha256"}
+    raw_fields = fields | {"native_task_kind", "raw_source_binding_sha256"}
     measured = profile.get("measured_native_layout")
     for where, value in (("measured", measured), ("requested", requested)):
-        if (not isinstance(value, dict) or set(value) != fields
+        raw = isinstance(value, dict) and "native_task_kind" in value
+        if (not isinstance(value, dict) or set(value) != (raw_fields if raw else fields)
+                or (raw and (value["native_task_kind"] != "raw_rig"
+                    or not isinstance(value["raw_source_binding_sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", value["raw_source_binding_sha256"]) is None))
                 or value["format"] != "darsia-native-phase-n1-measured-layout-v1"
                 or value["pipeline"] != "native-phase-n1"
                 or value["precision"] not in {"float32", "float64"}
@@ -201,6 +214,9 @@ def _check_measured_native_layout(profile, requested):
         for key in ("native_configuration_sha256", "phase_configuration_sha256"):
             if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
                 raise ValueError("Explicit measured/requested native/phase configuration SHA required")
+    if measured.get("native_task_kind") != requested.get("native_task_kind"):
+        raise ValueError("Requested native processor kind differs from the measured profile: rig and "
+                         "RAW-only (raw_rig) frames each need a profile measured on their own kind")
     if json.dumps(measured, sort_keys=True, separators=(",", ":")) != json.dumps(requested, sort_keys=True, separators=(",", ":")):
         raise ValueError("Requested native layout/configuration differs from measured profile; no size/default fallback")
 
@@ -518,7 +534,7 @@ def n43_entitlement(runtime, task, config, rows):
     _state,_reserve,binding=settings(runtime.stores,runtime.job["series_id"])
     if binding!=first.request["reference_administration"]:
         raise ValueError("Result-space administration differs from the exact Root-released N43 request")
-    actual=_native_layout_for_task(runtime.stores,runtime.job["series_id"],task,config,rows,raw_reference=True)
+    actual=_native_layout_for_task(runtime.stores,runtime.job["series_id"],task,config,rows)
     admin=first.reference_administration
     if actual!=admin["requested_native_layout"]:
         raise ValueError("N43 actual native layout differs from the predeclared producer")
