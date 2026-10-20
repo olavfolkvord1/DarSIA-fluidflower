@@ -434,9 +434,12 @@ def reference_machine(request: BuildRequest, job: FinishedJob, report: BuildRepo
         return values[0] if values else None
 
     seconds = sorted(row["seconds_per_frame"] for row in measured if row.get("seconds_per_frame"))
+    output = sorted(sum(product.size_bytes for product in job.products[run].values())
+                    // max(1, len(job.frames(run))) for run in job.runs)
     machine = {"label": "reference machine", "backend": one("backend"), "precision": one("precision"),
                "threads": one("threads"), "seconds_per_frame": seconds[len(seconds) // 2] if seconds else None,
                "seconds_per_frame_basis": "median over the runs of wall time per computed frame",
+               "output_bytes_per_frame": output[len(output) // 2] if output else None,
                "peak_memory_bytes": request.peak_memory_bytes,
                "peak_memory_basis": request.peak_memory_basis or (
                    "not recorded" if request.peak_memory_bytes is None else "measured on the reference machine")}
@@ -619,6 +622,8 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
                  "job_reference": {key: plan_reference[key] for key in ("root_alias", "relative_path")},
                  "series_manifest": job.series_manifest_reference()["relative_path"]},
         "roots": {"series": ".", **{alias: alias for alias in sorted(camera_roots) if alias != "series"}},
+        "inputs": {"series": [{"path": relative, "sha256": item.sha256, "size_bytes": item.size_bytes,
+                               "role": item.role} for relative, item in sorted(series_files.items())]},
         "runs": [{"run": run, "frames": [{key: frame[key] for key in ("case_id", "frame_index", "elapsed_h", "raw")}
                                          for frame in frames.get(run, ())],
                   "references": references.get(run, [])} for run in job.runs],

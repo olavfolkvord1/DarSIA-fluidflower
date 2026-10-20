@@ -82,8 +82,16 @@ def _bound_source(value):
     )
 
 
-def resource_advice(machine, job, backend, threads, *, policy_budget=False):
-    """Pure display arithmetic; precision, CPU RAM and device VRAM stay separate."""
+def resource_advice(machine, job, backend, threads, *, policy_budget=False,
+                    reserve_bytes=40 * GIB, measured_memory=None, run_limit=None):
+    """Pure display arithmetic; precision, CPU RAM and device VRAM stay separate.
+
+    ``measured_memory`` ({"bytes", "basis"}) is a memory measurement made
+    elsewhere, such as a published dataset's reference machine; it replaces
+    this machine's matching samples. ``reserve_bytes`` replaces the shared
+    machine's host-RAM reserve, and ``run_limit`` caps the count at the runs in
+    scope. The defaults are the Jobs panel's rules.
+    """
     if type(threads) is not int or threads < 1 or backend not in {"cpu", "cuda"}:
         raise ValueError(
             "Explicit CPU/CUDA backend and positive worker thread count required"
@@ -133,6 +141,10 @@ def resource_advice(machine, job, backend, threads, *, policy_budget=False):
             20 * GIB,
             "Policy budget: 20 GiB/worker; this is not measured RSS.",
         )
+    elif measured_memory is not None:
+        memory, basis = measured_memory["bytes"], measured_memory["basis"]
+        if type(memory) is not int or memory < 1:
+            return unknown("The supplied memory measurement is not a positive byte count.")
     elif rss:
         memory, basis = (
             max(rss),
@@ -143,9 +155,9 @@ def resource_advice(machine, job, backend, threads, *, policy_budget=False):
             "No peak worker RSS measurement matches this machine, backend, precision, threads, pipeline and commit. Historical timings do not measure memory. Choose an explicit policy budget or override the worker count."
         )
     core_limit = cores // threads
-    ram_limit = max(0, available - 40 * GIB) // memory
+    ram_limit = max(0, available - reserve_bytes) // memory
     count = min(core_limit, ram_limit)
-    reason = f"min({cores} cores / {threads} threads = {core_limit}, available RAM minus 40 GiB reserve / worker memory = {ram_limit}). {basis}"
+    reason = f"min({cores} cores / {threads} threads = {core_limit}, available RAM minus {reserve_bytes / GIB:g} GiB reserve / worker memory = {ram_limit}). {basis}"
     if backend == "cuda":
         device_id = str(machine.get("device_id", ""))
         devices = [
@@ -170,6 +182,9 @@ def resource_advice(machine, job, backend, threads, *, policy_budget=False):
         vram_limit = free_vram // max(vram)
         count = min(count, vram_limit)
         reason += f" Separate measured device-memory limit = {vram_limit}."
+    if run_limit is not None and run_limit < count:
+        count = run_limit
+        reason += f" At most {run_limit} run(s) are in scope, and a run never spans workers."
     return {
         "workers": count,
         "reason": reason,

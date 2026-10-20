@@ -16,7 +16,8 @@ def test_checksum_list_round_trip_and_problems(tmp_path):
     assert path.read_text(encoding="ascii").splitlines()[0] == f"{digests['README.md']}  README.md"
     assert checksums.read_checksums(tmp_path) == digests
     assert checksums.verify_checksums(tmp_path) == []
-    assert checksums.verify_checksums(tmp_path, sizes={"a.zip": 2}, full=False) == ["Size differs from the manifest: a.zip"]
+    assert checksums.verify_checksums(tmp_path, sizes={"a.zip": 2}, full=False) == [
+        "Size differs from the manifest: a.zip"]
     (tmp_path / "a.zip").write_bytes(b"b")
     assert checksums.verify_checksums(tmp_path) == ["Checksum differs: a.zip"]
     assert checksums.verify_checksums(tmp_path, full=False) == []

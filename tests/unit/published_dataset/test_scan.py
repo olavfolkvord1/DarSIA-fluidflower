@@ -54,7 +54,8 @@ def test_reviewer_fields_may_name_the_validator_and_nothing_else():
 
 def test_content_reads_json_toml_text_npz_png_npy_and_binary():
     scanner = NameScanner([HOST])
-    assert scanner.content(b'{"a": {"example-host": 1}}', file="a.json", suffix=".json")[0].where == "key /a/example-host"
+    hits = scanner.content(b'{"a": {"example-host": 1}}', file="a.json", suffix=".json")
+    assert hits[0].where == "key /a/example-host"
     assert scanner.content(b'name = "example-host"\n', file="a.toml", suffix=".toml")[0].where == "key /name"
     assert scanner.content(b"x\nexample-host\n", file="a.csv", suffix=".csv")[0].where == "line 2"
     assert scanner.content(b"{not json example-host", file="a.json", suffix=".json")[0].where == "line 1"

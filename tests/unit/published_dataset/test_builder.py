@@ -260,7 +260,8 @@ def test_simulator_record_needs_an_explicit_resolution(tmp_path):
     assert sorted(os.listdir(record)) == ["CHECKSUMS.sha256", "README.md", "dataset_manifest.json",
                                           "simulator_r1.zip", "simulator_r2.zip"]
     with zipfile.ZipFile(record / "simulator_r1.zip") as archive:
-        assert set(archive.namelist()) == {"products/r1/mass_table.csv", "products/r1/timeseries/protocols/injection.csv",
+        assert set(archive.namelist()) == {"products/r1/mass_table.csv",
+                                           "products/r1/timeseries/protocols/injection.csv",
                                            *(f"products/r1/r1_f{i}/storage_stored_frame.npz" for i in (1, 2, 3))}
     assert load_manifest(record)["simulator"]["resolution_mm"] == 1.0
 
