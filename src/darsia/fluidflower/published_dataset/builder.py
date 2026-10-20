@@ -28,8 +28,8 @@ from .environment import lock_summary
 from .job_reader import (LAYER_FILE, LAYER_RECEIPT, FinishedJob, Input, JobError,
                          producer_is_this_machine)
 from .layout import (ALIASES, EXPECTED_ARCHIVE, FILE_LIMIT, FORMAT, MANIFEST, PROVENANCE_FOLDER,
-                     README, SERIES_ARCHIVE, TIER_BUDGETS, raw_archive_name, require_record_type,
-                     require_tier)
+                     README, REPLAY_PIPELINES, SERIES_ARCHIVE, TIER_BUDGETS, raw_archive_name,
+                     require_record_type, require_tier, task_path)
 from .manifest import DEFAULT_RULE, LABEL_LEGEND, manifest_text, validate_manifest, validate_rule
 from .proof import inputs_digest, load_proof, proof_problems
 from .quick_check import quick_check_validity
@@ -61,7 +61,9 @@ class BuildRequest:
     ``roots`` maps the job's input root aliases to folders on this machine
     (default: the series folder for ``series`` and the series' declared roots).
     ``published_plan`` is a clean revision of the job's execution plan; it and
-    a ``published_commit`` other than the job's need a ``proof``.
+    a ``published_commit`` other than the job's need a ``proof``, and an R
+    record then needs ``proof_job``, the finished job of the run that proved the
+    revision (its prepared tasks are published).
     ``simulator_resolution_mm`` is required for an S record; it has no default.
     """
 
@@ -76,6 +78,7 @@ class BuildRequest:
     published_plan: Path | None = None
     published_commit: str | None = None
     proof: Path | None = None
+    proof_job: Path | None = None
     known_variation: Path | None = None
     peak_memory_bytes: int | None = None
     peak_memory_basis: str = ""
@@ -406,6 +409,62 @@ def published_revision(request: BuildRequest, job: FinishedJob, roots: dict,
     return result
 
 
+def published_tasks(request: BuildRequest, job: FinishedJob, published: Published,
+                    report: BuildReport) -> dict[str, bytes]:
+    """Each run's prepared task, exact bytes, by its path in the dataset (``plan/tasks/<run>.json``).
+
+    The launcher replays these tasks with the production code. Without a
+    revision they are the production job's own; a revision needs the finished
+    job of the run that proved it (``proof_job``), whose commit, plan and inputs
+    must be the published ones. A task must be a replayable alias task whose
+    inputs are exactly the inputs the record publishes for its run.
+    """
+    from ..pipeline.job_inputs import validate_catalog
+    from ..pipeline.job_queue import name
+
+    source = job
+    if published.plan_sha256 != job.plan_reference()["sha256"] or published.commit != job.job["commit"]:
+        if request.proof_job is None:
+            report.refuse("A published revision needs the finished job of the run that proved it "
+                          "(its prepared tasks are published)")
+            return {}
+        try:
+            source = FinishedJob(request.proof_job)
+        except (JobError, OSError, KeyError, ValueError) as error:
+            report.refuse(f"The proof job is not a finished job: {error}")
+            return {}
+        if source.job.get("commit") != published.commit or source.plan_reference()["sha256"] != published.plan_sha256:
+            report.refuse("The proof job ran another commit or plan than the published revision")
+            return {}
+        if source.runs != job.runs:
+            report.refuse("The proof job ran other runs than the production job")
+            return {}
+    files = {}
+    for run in job.runs:
+        path = Path(source.root) / "results" / name(run) / "task.json"
+        try:
+            raw = path.read_bytes()
+            task = json.loads(raw)
+            validate_catalog(task["input_catalog"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            report.refuse(f"Run {run}: its prepared task is unreadable ({error})")
+            continue
+        if task != source.tasks[run] or task.get("format") != "darsia-alias-task-v1" or task.get("run") != run:
+            report.refuse(f"Run {run}: its prepared task is not the job's alias task")
+            continue
+        if task.get("pipeline") not in REPLAY_PIPELINES:
+            report.refuse(f"Run {run}: the launcher cannot replay the pipeline {task.get('pipeline')!r}")
+            continue
+        inputs = {(entry["reference"]["root_alias"], entry["reference"]["relative_path"], entry["reference"]["sha256"])
+                  for entry in task["input_catalog"]["inputs"]}
+        if inputs != {(item.root_alias, item.relative_path, item.sha256)
+                      for item in published.inputs_by_run.get(run, ())}:
+            report.refuse(f"Run {run}: its prepared task reads other inputs than the record publishes")
+            continue
+        files[task_path(run)] = raw
+    return files
+
+
 def run_configurations(job: FinishedJob, roots: dict, report: BuildReport) -> list[dict]:
     """The job's run configurations, read from the series folder, in run order."""
     configs = []
@@ -572,6 +631,7 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
         if alias not in roots:
             report.refuse(f"The input root {alias!r} has no folder on this machine")
     series_files = series_inputs(published.inputs_by_run, report)
+    tasks = published_tasks(request, job, published, report) if request.record == "R" else {}
     check_tiers(request, frames, report)
     commit, proof = published.commit, published.proof
     pipeline = job.tasks[job.runs[0]].get("pipeline") or "native-phase-n1"
@@ -620,7 +680,10 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
                  "precision": job.job.get("precision"),
                  "storage_profile": job.job.get("storage_profile", "full"),
                  "job_reference": {key: plan_reference[key] for key in ("root_alias", "relative_path")},
-                 "series_manifest": job.series_manifest_reference()["relative_path"]},
+                 "series_manifest": job.series_manifest_reference()["relative_path"],
+                 "tasks": {run: {"path": task_path(run), "sha256": _sha(tasks[task_path(run)]),
+                                 "size_bytes": len(tasks[task_path(run)])}
+                           for run in job.runs if task_path(run) in tasks}},
         "roots": {"series": ".", **{alias: alias for alias in sorted(camera_roots) if alias != "series"}},
         "inputs": {"series": [{"path": relative, "sha256": item.sha256, "size_bytes": item.size_bytes,
                                "role": item.role} for relative, item in sorted(series_files.items())]},
@@ -645,7 +708,7 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
     archives = {}
     if request.record == "R":
         generated = {PLAN_COPY: plan_bytes, ALIASES: alias_bindings(camera_roots),
-                     **provenance_records(job, machine, environment)}
+                     **provenance_records(job, machine, environment), **tasks}
         archives[SERIES_ARCHIVE] = (
             [Member(relative, roots["series"] / relative, item.sha256, item.size_bytes)
              for relative, item in sorted(series_files.items())]

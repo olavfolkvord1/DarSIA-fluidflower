@@ -75,7 +75,8 @@ def render_readme(manifest: dict) -> str:
         lines += [
             "## Reproducing the results",
             "",
-            f"1. Install DarSIA at commit `{code['published_commit']}` (a Git checkout of that commit) "
+            f"1. Install DarSIA at commit `{code['published_commit']}` from a Git clone checked out at that "
+            "commit (not a source archive: the launcher checks the code it runs against the commit) "
             f"with Python {manifest['environment'].get('python') or '3'} and the pinned packages of "
             f"`{(manifest['environment'].get('lock') or {}).get('path', 'requirements-worker.lock')}`.",
             "2. Run `darsia-reproduce` and choose the unpacked folder and an empty results folder, or run "

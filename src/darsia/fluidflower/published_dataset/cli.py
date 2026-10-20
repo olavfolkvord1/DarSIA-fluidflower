@@ -43,6 +43,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--published-plan", type=Path, help="A clean revision of the job's execution plan")
     build.add_argument("--published-commit", help="The DarSIA commit the record publishes (default: the job's)")
     build.add_argument("--proof", type=Path, help="Proof record for a published revision")
+    build.add_argument("--proof-job", type=Path,
+                       help="The finished job of the run that proved a published revision (its tasks are published)")
     build.add_argument("--known-variation", type=Path, help="JSON list of known variation between machines")
     build.add_argument("--peak-memory-bytes", type=int, help="Measured peak memory per worker, in bytes")
     build.add_argument("--peak-memory-basis", default="", help="How the peak memory was measured")
@@ -67,7 +69,7 @@ def request_from(arguments) -> "BuildRequest":
         series_root=arguments.series, job_root=arguments.job, record=arguments.record, tier=arguments.tier,
         output=arguments.output, title=arguments.title, tiers_file=arguments.tiers,
         roots=dict(arguments.root) or None, published_plan=arguments.published_plan,
-        published_commit=arguments.published_commit, proof=arguments.proof,
+        published_commit=arguments.published_commit, proof=arguments.proof, proof_job=arguments.proof_job,
         known_variation=arguments.known_variation, peak_memory_bytes=arguments.peak_memory_bytes,
         peak_memory_basis=arguments.peak_memory_basis,
         expected_resolution_mm=arguments.expected_resolution_mm,

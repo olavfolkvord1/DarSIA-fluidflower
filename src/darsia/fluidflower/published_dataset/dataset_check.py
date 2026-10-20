@@ -104,7 +104,8 @@ def record_problems(root: Path, manifest: dict) -> list[str]:
         elif path.stat().st_size != size:
             problems.append(f"Size differs from the manifest: {name}")
     if manifest["identity"]["record"] == "R":
-        for name in ("series.toml", manifest["plan"]["path"]):
+        tasks = [task["path"] for task in (manifest["plan"].get("tasks") or {}).values()]
+        for name in ("series.toml", manifest["plan"]["path"], *tasks):
             if not inside(root, name).is_file():
                 problems.append(f"Not unpacked: {name} (unpack series.zip into the dataset folder)")
         for run in manifest["expected"]["runs"].values():
@@ -125,11 +126,12 @@ def _sha256(path: Path) -> str:
 
 
 def full_check(root: Path, manifest: dict, *, progress=None) -> list[str]:
-    """The full SHA-256 check: record files, unpacked series inputs and expected results."""
+    """The full SHA-256 check: record files, unpacked series inputs, prepared tasks and expected results."""
     root = Path(root)
     problems = verify_checksums(root)
     items = [(row["path"], row["sha256"]) for row in (manifest.get("inputs") or {}).get("series", ())]
     if manifest["identity"]["record"] == "R":
+        items += [(task["path"], task["sha256"]) for task in (manifest["plan"].get("tasks") or {}).values()]
         for run in manifest["expected"]["runs"].values():
             items.append((run["mass_table"]["path"], run["mass_table"]["sha256"]))
             items += [(frame["layer"]["path"], frame["layer"]["sha256"]) for frame in run["frames"].values()]

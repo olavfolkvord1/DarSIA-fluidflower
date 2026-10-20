@@ -5,7 +5,8 @@ Without arguments it opens the launcher window. With ``--dataset`` and
 choose the scope and the machine settings, run, compare and write the report.
 Exit status: 0 when the results are reproduced (every frame IDENTICAL or
 WITHIN EXPECTED VARIATION), 1 when a frame is OUTSIDE or the launcher refuses,
-2 for a usage error.
+2 for a usage error. The runs are replayed with the production code of a clean
+Git clone of DarSIA checked out at the dataset's commit (not a source archive).
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ def run(arguments, *, runner=None, machine=None, installed=None) -> int:
     from .reproduce import Reproduction, ReproductionRefused, Settings, choose_scope, execute
 
     if runner is None:
-        from .job_route import JobLayerRunner
+        from .replay import ReplayRunner
 
-        runner = JobLayerRunner()
+        runner = ReplayRunner()
     reproduction = Reproduction(arguments.dataset, arguments.results, runner=runner)
     check = reproduction.open(installed=installed)
     manifest = check.manifest

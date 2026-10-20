@@ -85,6 +85,10 @@ def validate_manifest(document: dict) -> dict:
             record_relative(raw.get("path", ""))
         if identity["record"] == "R":
             _require(row["run"] in expected, f"run {row['run']} has no expected results")
+            task = (((document.get("plan") or {}).get("tasks") or {}).get(row["run"])) or {}
+            _require(_SHA.fullmatch(str(task.get("sha256", ""))) is not None,
+                     f"run {row['run']} has no prepared task")
+            record_relative(task.get("path", ""))
             cases = {frame["case_id"] for frame in frames}
             _require(set(expected[row["run"]].get("frames", {})) == cases,
                      f"run {row['run']}: expected results and frames differ")

@@ -2,8 +2,9 @@
 
 Choose the unpacked dataset and an empty results folder, the scope and the
 machine settings, then Start. Checking, running, comparing and reporting run
-in worker threads; Pause and Resume publish the job's existing controls. The
-window and ``darsia-reproduce --dataset ... --results ...`` share every step.
+in worker threads. Pause stops each worker at its next frame boundary; Resume
+replays a paused run from its first frame. The window and
+``darsia-reproduce --dataset ... --results ...`` share every step.
 """
 
 from __future__ import annotations
@@ -198,9 +199,9 @@ class ReproduceWindow(QWidget):
         self.dataset_label.setText("Reading the dataset…")
         self.runner = self.runner_factory() if self.runner_factory is not None else None
         if self.runner is None:
-            from .job_route import JobLayerRunner
+            from .replay import ReplayRunner
 
-            self.runner = JobLayerRunner()
+            self.runner = ReplayRunner()
         reproduction = Reproduction(path, Path(self.results_edit.text().strip() or "."), runner=self.runner)
         self._start_task(lambda: reproduction.open(installed=self.installed, fingerprint=self.fingerprint),
                          lambda result, error: self._opened(reproduction, result, error))

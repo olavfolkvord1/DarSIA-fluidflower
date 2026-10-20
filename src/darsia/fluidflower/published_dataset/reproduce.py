@@ -8,7 +8,8 @@
    says it is valid), one run, or all runs.
 4. Machine settings: workers from the published measurement, threads from the
    manifest, CPU unless CUDA is chosen; the precision is the manifest's.
-5. Run: the dataset's plan, run by a runner (the production job layer).
+5. Run: the dataset's prepared tasks, replayed on this machine with the
+   production code by a runner (``replay.ReplayRunner``).
 6. Compare and report: three verdicts per frame, report.json, report.html and
    English figures in the results folder.
 
@@ -156,7 +157,7 @@ class Reproduction:
                                             self.estimate(scope, max(1, settings.workers or 1))["needed_bytes"])
         runner_preflight = getattr(self.runner, "preflight", None)
         if callable(runner_preflight):
-            problems += runner_preflight(self.results_root)
+            problems += runner_preflight(self.results_root, check=self.check, scope=scope, settings=settings)
         return problems
 
     def run(self, scope: Scope, settings: Settings, *, progress=None) -> None:
@@ -190,11 +191,12 @@ class Reproduction:
 
         manifest = self.check.manifest
         frames = scope_frames(manifest, scope)
+        route = getattr(self.runner, "route", None)
         report = report_document(
             manifest=manifest, check={"code": self.check.code, "environment": self.check.environment},
             settings={"scope": scope.kind, "runs": ", ".join(scope.runs), "frames": len(frames),
                       **{key: value for key, value in asdict(settings).items()},
-                      "precision": manifest["plan"].get("precision")},
+                      "precision": manifest["plan"].get("precision"), **({"route": route} if route else {})},
             summary=self.summary, frames=[comparison.as_dict() for comparison in self.comparisons],
             machine=machine if machine is not None else machine_facts(), timing=timing,
             differences=plan_differences(manifest, scope, settings, self.check.code))

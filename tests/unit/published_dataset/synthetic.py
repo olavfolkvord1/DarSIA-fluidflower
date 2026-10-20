@@ -162,7 +162,7 @@ def write_run_results(job: Path, results: Path, run: str, run_index: int, cases:
                            "sha256": sha(index), "bytes": len(index)}}))
 
 
-def run_configuration(run: str, frames: list, baseline: bytes, calibration: bytes) -> dict:
+def run_configuration(run: str, frames: list, baseline: bytes, calibration: bytes, native: bytes) -> dict:
     """A run configuration that the job layer's run reader admits."""
     specs, previous = [], sha(baseline)
     for index, data in enumerate(frames):
@@ -178,7 +178,8 @@ def run_configuration(run: str, frames: list, baseline: bytes, calibration: byte
     return {"format": "darsia-native-phase-n1-run-v1", "run": run, "history_policy": "camera chronology",
             "selection_index_field": "frame_index", "frames": specs,
             "phase": {"initial_previous": {"source": {"source_sha256": sha(baseline)}}},
-            "native": {}, "mass": {"calibration": calibration_bound, "template": {"calibration": calibration_bound}},
+            "native": {"configuration": bound("config/native.json", native)},
+            "mass": {"calibration": calibration_bound, "template": {"calibration": calibration_bound}},
             "table_fields": ["case_id", "total_mass_g"]}
 
 
@@ -208,7 +209,7 @@ def make_series(root: Path, *, runs=("r1", "r2"), frames: int = 3, resolution_mm
         raws[run] = [write(camera / run / f"IMG_{index + 1:04d}.ARW", tiff(f"{run} frame {index}".encode() * 50))
                      for index in range(frames)]
         configs[run] = write(series / "config" / "runs" / f"{run}.json",
-                             as_json(run_configuration(run, raws[run], baselines[run], calibration)))
+                             as_json(run_configuration(run, raws[run], baselines[run], calibration, native)))
     selection = write(series / "plan" / "selection.json", as_json({"complete": True, "runs": [
         {"run": run, "ordered_case_ids": [f"{run}_f{index + 1}" for index in range(frames)]} for run in runs]}))
     plan_text = "\n".join([
@@ -256,12 +257,22 @@ def make_series(root: Path, *, runs=("r1", "r2"), frames: int = 3, resolution_mm
         if run_index == 0:
             inputs += [{"reference": ref("raw", relative, write(camera / relative, data), "image"),
                         "uses": ["native.extra_reference"]} for relative, data in (extra_camera or {}).items()]
+        # As the job layer prepares it: the catalogue sorted by reference, its configuration bound.
+        configuration = ref("series", f"config/runs/{run}.json", configs[run], "configuration")
+        inputs.sort(key=lambda entry: tuple(entry["reference"][key]
+                                            for key in ("root_alias", "relative_path", "sha256", "role")))
         write(job / "results" / run / "task.json", as_json({
-            "format": "darsia-alias-task-v1", "run": run, "pipeline": "native-phase-n1", "backend": "cpu",
-            "threads": 2, "commit": COMMIT, "precision": "float32", "job_id": "job-1", "ordered_case_ids": cases,
-            "configuration": ref("series", f"config/runs/{run}.json", configs[run], "configuration"),
+            "format": "darsia-alias-task-v1", "format_version": 1, "run": run, "pipeline": "native-phase-n1",
+            "backend": "cpu", "threads": 2, "commit": COMMIT, "calibration_sha256": sha(calibration),
+            "precision": "float32", "job_id": "job-1", "ordered_case_ids": cases, "configuration": configuration,
+            "series": ref("series", "plan/execution.toml", plan, "configuration"),
+            "series_manifest": ref("series", "series.toml", manifest, "configuration"),
+            "storage_profile": "full", "execution_ready": True, "output_directory": f"results/{run}",
+            "attempt_id": TOKEN,
             "input_catalog": {"format": "darsia-role-input-catalog-v1", "complete": True, "run": run,
-                              "inputs": inputs}}))
+                              "configuration": configuration, "inputs": inputs,
+                              "payload_hashes_verified": False, "numerical_calls_started": False,
+                              "runtime_support": "darsia-role-io-runtime-v1"}}))
         write_run_results(job, results, run, run_index, cases, raws[run], resolution_mm=resolution_mm)
     if tiers is None:
         tiers = {"S50": {"runs": {run: [row["name"] for row in frame_names[run]] for run in runs}}}

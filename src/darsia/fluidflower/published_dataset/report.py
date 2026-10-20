@@ -145,6 +145,9 @@ def render_html(report: dict, figures: dict[str, str]) -> str:
     ]
     if report["note"]:
         parts.append(f"<p><strong>{_escape(report['note'])}</strong></p>")
+    if report["settings"].get("route"):
+        parts.append(f"<p>Route: {_escape(report['settings']['route'])} on this machine, without the job queue. "
+                     "Reproduction runs are not qualified and not production.</p>")
     parts.append("<h2>Runs</h2><table><tr><th>Run</th><th>Verdict</th></tr>")
     parts += [f"<tr><td>{_escape(run)}</td><td>{badge(value)}</td></tr>" for run, value in verdict["runs"].items()]
     parts.append("</table>")

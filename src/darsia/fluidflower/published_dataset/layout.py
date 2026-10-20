@@ -20,6 +20,8 @@ EXPECTED_ARCHIVE = "expected.zip"
 ALIASES = "dataset_aliases.toml"
 PLAN_FOLDER = "plan"
 PROVENANCE_FOLDER = "provenance"
+# Pipelines whose prepared tasks the launcher replays with the production code.
+REPLAY_PIPELINES = frozenset({"native-phase-n1", "lattice-phase-n1"})
 EXPECTED_FOLDER = "expected"
 RAW_FOLDER = "raw"
 
@@ -44,6 +46,14 @@ def require_tier(value: str) -> str:
     if value not in TIER_BUDGETS:
         raise ValueError(f"Tier must be one of {', '.join(TIER_ORDER)}: {value!r}")
     return value
+
+
+def task_path(run: str) -> str:
+    """Where a run's prepared task (its input catalogue) lies in the dataset."""
+    from ..pipeline.job_queue import name
+
+    name(run)
+    return f"{PLAN_FOLDER}/tasks/{run}.json"
 
 
 def raw_archive_name(run: str) -> str:

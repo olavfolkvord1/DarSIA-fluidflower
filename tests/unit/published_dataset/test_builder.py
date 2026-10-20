@@ -74,6 +74,12 @@ def test_r_record_is_flat_stored_and_complete(tmp_path):
         assert archive.read("plan/adopted_plan.toml") == (series.series / "plan" / "execution.toml").read_bytes()
         provenance = json.loads(archive.read("provenance/r1.json"))
         assert provenance["machine"] == "reference machine" and provenance["threads"] == 2
+        # Each run's prepared task, exact bytes, for the launcher's replay.
+        for run in ("r1", "r2"):
+            task = (series.job / "results" / run / "task.json").read_bytes()
+            assert archive.read(f"plan/tasks/{run}.json") == task
+            assert manifest["plan"]["tasks"][run] == {"path": f"plan/tasks/{run}.json", "sha256": sha(task),
+                                                      "size_bytes": len(task)}
     texts = b"".join((record / name).read_bytes() for name in os.listdir(record))
     with zipfile.ZipFile(record / "series.zip") as archive:
         texts += b"".join(archive.read(name) for name in archive.namelist())
@@ -174,6 +180,14 @@ def test_inputs_outside_the_dataset_or_changed_since_the_job_refuse(tmp_path):
                for item in report.refusals)
 
 
+def test_a_task_that_cannot_be_replayed_is_refused(tmp_path):
+    series = make_series(tmp_path)
+    path = series.job / "results" / "r1" / "task.json"
+    path.write_bytes(as_json(dict(json.loads(path.read_bytes()), pipeline="n1")))
+    report = build_record(request(series))
+    assert "Run r1: the launcher cannot replay the pipeline 'n1'" in report.refusals
+
+
 def test_a_published_revision_needs_a_matching_proof(tmp_path):
     series = make_series(tmp_path)
     published = "d" * 40
@@ -194,9 +208,32 @@ def test_a_published_revision_needs_a_matching_proof(tmp_path):
     assert "Proof: A frame of the proof is not bit-identical" in report.refusals
     (tmp_path / "proof.json").write_bytes(as_json(proof))
     report = build_record(request(series, published_commit=published, proof=tmp_path / "proof.json"))
+    assert report.refusals == ["A published revision needs the finished job of the run that proved it "
+                               "(its prepared tasks are published)"]
+    # The proof run's job ran the published commit; its prepared tasks are the ones published.
+    proof_job = tmp_path / "proof-job"
+    shutil.copytree(series.job, proof_job)
+    for path in [proof_job / "job.json", *proof_job.glob("results/*/task.json")]:
+        path.write_bytes(as_json(dict(json.loads(path.read_bytes()), commit=published)))
+    report = build_record(request(series, published_commit=published, proof=tmp_path / "proof.json",
+                                  proof_job=series.job, output=tmp_path / "out-wrong"))
+    assert "The proof job ran another commit or plan than the published revision" in report.refusals
+    task_path = proof_job / "results" / "r2" / "task.json"
+    task = json.loads(task_path.read_bytes())
+    short = dict(task, input_catalog=dict(task["input_catalog"], inputs=task["input_catalog"]["inputs"][1:]))
+    task_path.write_bytes(as_json(short))
+    report = build_record(request(series, published_commit=published, proof=tmp_path / "proof.json",
+                                  proof_job=proof_job))
+    assert "Run r2: its prepared task reads other inputs than the record publishes" in report.refusals
+    task_path.write_bytes(as_json(task))
+    report = build_record(request(series, published_commit=published, proof=tmp_path / "proof.json",
+                                  proof_job=proof_job))
     assert report.built, report.text()
     assert report.manifest["code"]["published_commit"] == published
     assert report.manifest["code"]["proof"]["verdict"] == "IDENTICAL"
+    task = (proof_job / "results" / "r1" / "task.json").read_bytes()
+    assert report.manifest["plan"]["tasks"]["r1"] == {"path": "plan/tasks/r1.json", "sha256": sha(task),
+                                                      "size_bytes": len(task)}
 
 
 @pytest.mark.parametrize("name, source", [

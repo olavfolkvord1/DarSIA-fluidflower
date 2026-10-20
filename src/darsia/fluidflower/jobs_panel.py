@@ -770,15 +770,12 @@ def launch_local_worker(
     cwd=None,
     launch_directory=None,
     stores=None,
-    exit_when_idle=False,
 ):
     """Explicit existing worker command via detached QProcess, never a generated script.
 
     Detaching preserves valid workers when the GUI closes. Fresh launch console
     files retain startup failures before the service's own job log is opened.
     Launch PID is only a launcher fact, never evidence of numerical progress.
-    ``exit_when_idle`` passes the worker's own --exit-when-idle (the
-    reproduction launcher's workers stop when the queue is empty).
     """
     _admit_gui_job_root(job_root)
     if backend not in {"cpu", "cuda"} or type(workers) is not int or workers < 1:
@@ -827,8 +824,6 @@ def launch_local_worker(
         if not isinstance(stores, (str, Path)) or not str(stores).strip():
             raise ValueError("Choose an existing local store map before Start")
         worker_command.extend(["--stores", str(stores)])
-    if exit_when_idle:
-        worker_command.append("--exit-when-idle")
     # N109: the stdlib supervisor starts the unchanged worker command once more
     # when it stops before the service started; it imports no DarSIA code.
     service_log = root / "logs" / (name(machine + "-" + backend) + ".log")
