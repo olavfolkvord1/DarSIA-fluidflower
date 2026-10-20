@@ -30,6 +30,10 @@ outlines that give pixels a layer, region fills, and restore strokes that bring
 the proposal back. They are stored in their own file next to the session and
 never change the polygons, the strokes or the proposal; the saved map is the
 proposal with the corrections applied in drawing order.
+
+Versions of the map are saved on request: the session, the proposal and the
+corrections in a new folder under ``versions/<run>`` that is never changed
+afterwards. A version can be restored later; its SHA-256 identifies the map.
 """
 
 from __future__ import annotations
@@ -798,6 +802,14 @@ def save_painting_session(
 ) -> Path:
     session.updated_utc = utc_now()
     session.updated_by = str(actor or session.updated_by or "")
+    path = session_path(project, session.run_id)
+    _atomic_write_text(path, _session_text(session))
+    return path
+
+
+def _session_text(session: PaintingSession) -> str:
+    """The session file's text: settings indented, one polygon or stroke per line."""
+
     payload = session.to_dict()
     marks = {key: payload.pop(key) for key in ("polygons", "strokes")}
     text = json.dumps(payload, indent=2, ensure_ascii=False)
@@ -809,9 +821,7 @@ def save_painting_session(
         )
         text += f',\n  "{key}": [' + ("\n" + lines + "\n  " if rows else "") + "]"
     text += "\n}\n"
-    path = session_path(project, session.run_id)
-    _atomic_write_text(path, text)
-    return path
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1924,11 +1934,7 @@ def load_corrections(project: FluidFlowerProject, run_id: str) -> list[Correctio
 
 
 def save_corrections(
-    project: FluidFlowerProject,
-    run_id: str,
-    corrections: Sequence[Correction],
-    *,
-    actor: str = "",
+    project: FluidFlowerProject, run_id: str, corrections: Sequence[Correction]
 ) -> Path | None:
     """Write the run's hand corrections, one per line; returns the file.
 
@@ -1939,12 +1945,18 @@ def save_corrections(
     path = corrections_path(project, run_id)
     if not corrections and not path.exists():
         return None
+    _atomic_write_text(path, _corrections_text(run_id, corrections))
+    return path
+
+
+def _corrections_text(run_id: str, corrections: Sequence[Correction]) -> str:
+    """The correction file's text: a short header and one correction per line."""
+
     header = {
         "schema": 1,
         "format": LAYER_CORRECTIONS_FORMAT,
         "run_id": str(run_id),
         "updated_utc": utc_now(),
-        "updated_by": str(actor or ""),
     }
     text = json.dumps(header, indent=2, ensure_ascii=False)
     text = text[: text.rfind("}")].rstrip()
@@ -1955,8 +1967,7 @@ def save_corrections(
     body = "\n" + lines + "\n  " if corrections else ""
     text += ',\n  "corrections": [' + body + "]"
     text += "\n}\n"
-    _atomic_write_text(path, text)
-    return path
+    return text
 
 
 def corrections_digest(corrections: Sequence[Correction]) -> str:
@@ -2124,6 +2135,170 @@ def corrections_not_applied(
     if proposal is None or not corrections:
         return []
     return corrected_classes(proposal, corrections, layer_ids=layer_ids)[2]
+
+
+# ---------------------------------------------------------------------------
+# Saved versions of the map
+
+LAYER_VERSION_FORMAT = "darsia-fluidflower-layer-painting-version-v1"
+VERSION_FILES = ("session.json", "proposal.npz", "corrections.json")
+
+
+def versions_folder(project: FluidFlowerProject, run_id: str) -> Path:
+    """The folder of a run's saved versions, one subfolder per version."""
+
+    return painting_folder(project) / "versions" / _file_stem(run_id)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def map_digest(
+    session: PaintingSession,
+    proposal: LayerProposal,
+    corrections: Sequence[Correction],
+) -> str:
+    """SHA-256 of what the painted map depends on.
+
+    The session without its save time and author, the proposal's cells,
+    confidence, size and input digest, and the corrections. The same map
+    gives the same digest whenever it is saved.
+    """
+
+    payload = session.to_dict()
+    payload.pop("updated_utc", None)
+    payload.pop("updated_by", None)
+    digest = hashlib.sha256()
+    settings = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    digest.update(settings.encode("utf-8"))
+    shape = [list(proposal.image_size), list(proposal.classes.shape), proposal.digest]
+    digest.update(json.dumps(shape).encode("utf-8"))
+    digest.update(np.ascontiguousarray(proposal.classes, dtype=np.uint8).tobytes())
+    digest.update(np.ascontiguousarray(proposal.confidence, dtype=np.uint8).tobytes())
+    digest.update(corrections_digest(corrections).encode("ascii"))
+    return digest.hexdigest()
+
+
+def save_version(
+    project: FluidFlowerProject,
+    session: PaintingSession,
+    proposal: LayerProposal,
+    corrections: Sequence[Correction],
+    *,
+    name: str,
+) -> dict[str, Any]:
+    """Save the map as a new version and return its record.
+
+    The session, proposal and corrections go into a new folder that is never
+    changed afterwards, so no earlier version is overwritten. The record holds
+    the name, the kind (``proposal`` or ``edited map``), the time, ``sha256``
+    (``map_digest`` of the content) and the SHA-256 of each file.
+    """
+
+    name = str(name).strip()
+    if not name:
+        raise ValueError("A version needs a name")
+    digest = map_digest(session, proposal, corrections)
+    root = versions_folder(project, session.run_id)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    folder = root / f"{stamp}-{digest[:12]}"
+    count = 1
+    while True:
+        try:
+            folder.mkdir()
+            break
+        except FileExistsError:
+            count += 1
+            folder = root / f"{stamp}-{digest[:12]}-{count}"
+    (folder / "session.json").write_text(_session_text(session), encoding="utf-8")
+    proposal.save(folder / "proposal.npz")
+    (folder / "corrections.json").write_text(
+        _corrections_text(session.run_id, corrections), encoding="utf-8"
+    )
+    record = {
+        "schema": 1,
+        "format": LAYER_VERSION_FORMAT,
+        "run_id": session.run_id,
+        "name": name,
+        "kind": "edited map" if corrections else "proposal",
+        "sha256": digest,
+        "created_utc": utc_now(),
+        "proposal_digest": proposal.digest,
+        "correction_count": len(corrections),
+        "files": {file: _file_sha256(folder / file) for file in VERSION_FILES},
+    }
+    _atomic_write_text(
+        folder / "version.json", json.dumps(record, indent=2, ensure_ascii=False) + "\n"
+    )
+    return dict(record, folder=str(folder))
+
+
+def list_versions(project: FluidFlowerProject, run_id: str) -> list[dict[str, Any]]:
+    """The run's saved versions, oldest first; folders without a readable
+    record are left out."""
+
+    root = versions_folder(project, run_id)
+    if not root.is_dir():
+        return []
+    rows = []
+    for folder in sorted(root.iterdir()):
+        try:
+            record = json.loads((folder / "version.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("format") == LAYER_VERSION_FORMAT:
+            rows.append(dict(record, folder=str(folder)))
+    return sorted(
+        rows, key=lambda row: (str(row.get("created_utc") or ""), row["folder"])
+    )
+
+
+def load_version(
+    record: Mapping[str, Any],
+) -> tuple[PaintingSession, LayerProposal, list[Correction]]:
+    """The session, proposal and corrections of a saved version.
+
+    Each file is checked against the SHA-256 in its record first.
+    """
+
+    folder = Path(str(record["folder"]))
+    for file, expected in dict(record.get("files") or {}).items():
+        if _file_sha256(folder / file) != expected:
+            raise ValueError(
+                f"The saved version's {file} has changed since it was saved"
+            )
+    session = PaintingSession.from_dict(
+        json.loads((folder / "session.json").read_text(encoding="utf-8"))
+    )
+    proposal = LayerProposal.load(folder / "proposal.npz")
+    payload = json.loads((folder / "corrections.json").read_text(encoding="utf-8"))
+    rows = payload.get("corrections") or []
+    corrections = [Correction.from_dict(row) for row in rows]
+    return session, proposal, corrections
+
+
+def restore_version(
+    project: FluidFlowerProject, record: Mapping[str, Any], *, actor: str = ""
+) -> tuple[PaintingSession, LayerProposal, list[Correction]]:
+    """Make a saved version the run's current session, proposal and corrections.
+
+    The version itself is not changed. The caller saves the current state as a
+    version first when it should be kept.
+    """
+
+    session, proposal, corrections = load_version(record)
+    save_painting_session(project, session, actor=actor)
+    proposal.save(proposal_path(project, session.run_id))
+    path = corrections_path(project, session.run_id)
+    if corrections or path.exists():
+        save_corrections(project, session.run_id, corrections)
+    return session, proposal, corrections
 
 
 # ---------------------------------------------------------------------------
@@ -2645,7 +2820,15 @@ __all__ = [
     "corrections_not_applied",
     "corrections_path",
     "layer_at",
+    "list_versions",
     "load_corrections",
+    "load_version",
+    "map_digest",
+    "restore_version",
+    "save_version",
+    "versions_folder",
+    "LAYER_VERSION_FORMAT",
+    "VERSION_FILES",
     "proposal_grid_scale",
     "save_corrections",
     "DEFAULT_EDGE_FILL_MM",

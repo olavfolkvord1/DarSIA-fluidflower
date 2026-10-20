@@ -2115,6 +2115,8 @@ class LayerPainterView(QWidget):
         # The corrected proposal on the display grid, extended as corrections
         # are added.
         self._display_corrections = _CorrectedGrid()
+        # Saved versions of the run's map, oldest first (records with a folder).
+        self.versions: list[dict[str, Any]] = []
         # Layers hidden in the photograph: a display choice for the session
         # shown, never saved and never part of the proposal.
         self._hidden_layers: set[int] = set()
@@ -2397,6 +2399,69 @@ class LayerPainterView(QWidget):
         self.proposal_summary = QLabel()
         self.proposal_summary.setWordWrap(True)
         layout.addWidget(self.proposal_summary)
+        layout.addWidget(self._build_versions())
+        return widget
+
+    def _build_versions(self) -> QWidget:
+        """Saved versions of the map: save one, see them, restore one."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 6, 0, 0)
+        title = QLabel("<b>Versions</b>")
+        layout.addWidget(title)
+        layout.addWidget(
+            _note(
+                "Save the proposal, with its corrections, as a version at any "
+                "time. A saved version is never changed. Restoring one first saves "
+                "the current map as a version, so that it can be restored again."
+            )
+        )
+        buttons = QHBoxLayout()
+        self.save_version_button = QPushButton("Save version…")
+        self.save_version_button.setToolTip(
+            "Save the proposal and its corrections as a new version"
+        )
+        self.save_version_button.clicked.connect(self._save_version_clicked)
+        buttons.addWidget(self.save_version_button)
+        self.restore_version_button = QPushButton("Restore…")
+        self.restore_version_button.setToolTip(
+            "Make the selected version the current map (double-click works too)"
+        )
+        self.restore_version_button.clicked.connect(self._restore_version_clicked)
+        buttons.addWidget(self.restore_version_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        self.versions_table = QTableWidget(0, 4)
+        self.versions_table.setHorizontalHeaderLabels(
+            ["Name", "Saved (UTC)", "Map", "SHA-256"]
+        )
+        self.versions_table.verticalHeader().setVisible(False)
+        self.versions_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.versions_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.versions_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        header = self.versions_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.versions_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.versions_table.itemSelectionChanged.connect(self._version_selected)
+        self.versions_table.itemDoubleClicked.connect(self._version_double_clicked)
+        layout.addWidget(self.versions_table)
+        self.versions_note = QLabel()
+        self.versions_note.setWordWrap(True)
+        self.versions_note.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.versions_note)
         return widget
 
     def _build_export_step(self) -> QWidget:
@@ -2849,6 +2914,7 @@ class LayerPainterView(QWidget):
             self.corrections = []
             self._corrections_dirty = False
             self._corrections_error = ""
+            self.versions = []
             self.canvas.cancel_polygon()
             self.canvas.clear_selection()
             self._other_photo = None
@@ -2891,6 +2957,7 @@ class LayerPainterView(QWidget):
                 ):
                     self.proposal = proposal
                 self.corrections = self._read_corrections(reference.run_id)
+                self.versions = self._read_versions(reference.run_id)
             self._sync_settings()
             if self.session is not None and self.session.photo_changed:
                 self.propose_status.setText(
@@ -4189,12 +4256,7 @@ class LayerPainterView(QWidget):
         if not self._corrections_dirty or self.session is None:
             return
         try:
-            lp.save_corrections(
-                self.project,
-                self.session.run_id,
-                self.corrections,
-                actor=default_actor(),
-            )
+            lp.save_corrections(self.project, self.session.run_id, self.corrections)
         except OSError as error:
             self.propose_status.setText(f"The corrections could not be saved: {error}")
             return
@@ -4348,6 +4410,161 @@ class LayerPainterView(QWidget):
             self.tool_buttons[key].setEnabled(available)
         if not available and self.canvas.tool in _CORRECTION_TOOLS:
             self.set_tool("pan")
+
+    # ---------------------------------------------------------- versions
+
+    def _read_versions(self, run_id: str) -> list[dict[str, Any]]:
+        try:
+            return lp.list_versions(self.project, run_id)
+        except OSError:
+            return []
+
+    def _versions_unavailable(self) -> str:
+        """Why no version can be saved now ("" when one can)."""
+
+        if self.busy():
+            return "Wait until the proposal or export has finished."
+        problem = self._corrections_unavailable()
+        if problem:
+            return problem
+        return ""
+
+    def _refresh_versions(self) -> None:
+        """The versions table, newest first, and its buttons."""
+
+        if getattr(self, "versions_table", None) is None:
+            return  # Called before the steps are built.
+        selected = self._selected_version()
+        keep = selected.get("folder") if selected else None
+        table = self.versions_table
+        table.blockSignals(True)
+        table.setRowCount(len(self.versions))
+        for row, record in enumerate(reversed(self.versions)):
+            digest = str(record.get("sha256") or "")
+            count = int(record.get("correction_count") or 0)
+            kind = f"edited ({count})" if count else "proposal"
+            saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
+            for column, value in enumerate(
+                (str(record.get("name") or ""), saved, kind, digest[:12])
+            ):
+                item = QTableWidgetItem(value)
+                item.setToolTip(f"SHA-256 {digest}")
+                item.setData(Qt.ItemDataRole.UserRole, record.get("folder"))
+                table.setItem(row, column, item)
+            if keep is not None and record.get("folder") == keep:
+                table.selectRow(row)
+        table.blockSignals(False)
+        available = not self._versions_unavailable()
+        self.save_version_button.setEnabled(available)
+        self.restore_version_button.setEnabled(
+            self._selected_version() is not None and not self.busy()
+        )
+
+    def _selected_version(self) -> dict[str, Any] | None:
+        table = getattr(self, "versions_table", None)
+        if table is None:
+            return None
+        rows = table.selectionModel().selectedRows()
+        item = table.item(rows[0].row(), 0) if rows else None
+        folder = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        return next((row for row in self.versions if row.get("folder") == folder), None)
+
+    def _version_selected(self) -> None:
+        record = self._selected_version()
+        if record is not None:
+            self.versions_note.setText(
+                f"{record.get('name')}: SHA-256 {record.get('sha256')}"
+            )
+        self.restore_version_button.setEnabled(record is not None and not self.busy())
+
+    def _version_double_clicked(self, _item: QTableWidgetItem) -> None:
+        self._restore_version_clicked()
+
+    def _save_version_clicked(self) -> None:
+        problem = self._versions_unavailable()
+        if problem:
+            self.versions_note.setText(problem)
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save version",
+            "Name of this version:",
+            text=f"Version {len(self.versions) + 1}",
+        )
+        if accepted and name.strip():
+            self.save_version(name)
+
+    def save_version(self, name: str) -> dict[str, Any] | None:
+        """Save the current map, the proposal with its corrections, as a version.
+
+        Returns the version's record, or None (the note says why).
+        """
+
+        problem = self._versions_unavailable()
+        if problem:
+            self.versions_note.setText(problem)
+            return None
+        assert self.session is not None and self.proposal is not None
+        self.save_session()
+        try:
+            record = lp.save_version(
+                self.project, self.session, self.proposal, self.corrections, name=name
+            )
+        except (OSError, ValueError) as error:
+            self.versions_note.setText(f"The version could not be saved: {error}")
+            return None
+        self.versions = self._read_versions(self.session.run_id)
+        self._refresh_versions()
+        self.versions_note.setText(
+            f"Saved {record['name']} ({record['kind']}): SHA-256 {record['sha256']}"
+        )
+        return record
+
+    def _restore_version_clicked(self) -> None:
+        record = self._selected_version()
+        if record is None:
+            return
+        saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
+        keep = (
+            "The current map is saved as a version first, so that it can be "
+            "restored again."
+            if self.proposal is not None
+            else "The current marks have no proposal and are replaced."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Restore version",
+            f"Restore {record.get('name')} ({record.get('kind')}, saved {saved} UTC)? "
+            + keep,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.restore_version(record)
+
+    def restore_version(self, record: Mapping[str, Any]) -> bool:
+        """Make a saved version the current map.
+
+        The current map is saved as a version first unless an identical one
+        is already saved. The version itself is never changed.
+        """
+
+        if self.busy() or self.session is None:
+            return False
+        if self.proposal is not None and not self._corrections_error:
+            current = lp.map_digest(self.session, self.proposal, self.corrections)
+            if not any(row.get("sha256") == current for row in self.versions):
+                if self.save_version(f"Before restoring {record.get('name')}") is None:
+                    return False
+        self.save_session()
+        try:
+            lp.restore_version(self.project, record, actor=default_actor())
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "Could not restore the version", str(error))
+            return False
+        self.reload()
+        self.versions_note.setText(
+            f"Restored {record.get('name')}: SHA-256 {record.get('sha256')}"
+        )
+        return True
 
     def _after_mark_change(self, *, render: bool = True) -> None:
         if render:
@@ -5194,6 +5411,7 @@ class LayerPainterView(QWidget):
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
             self._refresh_corrections()
+            self._refresh_versions()
             return
         marked = session.marked_layers()
         parts = [f"{len(marked)} of {len(session.layers)} layers marked"]
@@ -5220,6 +5438,7 @@ class LayerPainterView(QWidget):
         if self.proposal is not None:
             self.proposal_summary.setText(self._proposal_text())
         self._refresh_corrections()
+        self._refresh_versions()
 
         problems = self.export_problems_now()
         if self._save_thread is not None:
