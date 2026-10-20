@@ -141,7 +141,6 @@ class ScaleImageReaderDialog(QDialog):
         self._launch_worker.ready.connect(self._reader_ready)
         self._launch_worker.failed.connect(self._reader_failed)
         self._launch_worker.finished.connect(self._launch_thread.quit)
-        self._launch_worker.finished.connect(self._launch_worker.deleteLater)
         self._launch_thread.finished.connect(self._launch_finished)
         self._launch_thread.finished.connect(self._launch_thread.deleteLater)
         self._launch_thread.start()
@@ -174,6 +173,9 @@ class ScaleImageReaderDialog(QDialog):
 
     @Slot()
     def _launch_finished(self) -> None:
+        # After wait() the worker is freed here, in the GUI thread (Q185).
+        self._launch_thread.wait()
+        self._launch_worker = None
         if self._close_requested:
             self._allow_close = True
             self.close()

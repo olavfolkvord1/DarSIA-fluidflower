@@ -573,8 +573,6 @@ class ResourceAdvisorPanel(QWidget):
         worker.failed.connect(self._hardware_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
         thread.finished.connect(self._probe_closed)
         thread.finished.connect(thread.deleteLater)
         self._probe_thread, self._probe_worker = thread, worker
@@ -628,8 +626,6 @@ class ResourceAdvisorPanel(QWidget):
         worker.failed.connect(self._measurement_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
         thread.finished.connect(self._measurement_closed)
         thread.finished.connect(thread.deleteLater)
         self._history_thread, self._history_worker = thread, worker

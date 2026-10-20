@@ -955,9 +955,6 @@ class DataIntegrityPage(ModulePage):
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._worker.cancelled.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.failed.connect(self._worker.deleteLater)
-        self._worker.cancelled.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread_finished)
         self._thread.start()
         self.status_changed.emit()
@@ -1141,6 +1138,9 @@ class DataIntegrityPage(ModulePage):
     @Slot()
     def _thread_finished(self) -> None:
         thread = self._thread
+        if thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            thread.wait()
         self.scan_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self._worker = None

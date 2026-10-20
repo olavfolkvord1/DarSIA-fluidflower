@@ -1368,9 +1368,9 @@ class ImageCorrectionPage(ModulePage):
             self._invalidate_batch_inventory()
 
     def _inventory_thread_finished(self) -> None:
-        if self._inventory_worker is not None:
-            self._inventory_worker.deleteLater()
         if self._inventory_thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            self._inventory_thread.wait()
             self._inventory_thread.deleteLater()
         self._inventory_worker = None
         self._inventory_thread = None

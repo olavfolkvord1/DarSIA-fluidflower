@@ -846,8 +846,6 @@ class NativeColouredMapWorkflow(QObject):
         worker.failed.connect(self._capture_failure)
         worker.completed.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
         thread.finished.connect(self._finish)
         thread.finished.connect(thread.deleteLater)
         self._thread, self._worker = thread, worker
@@ -869,6 +867,9 @@ class NativeColouredMapWorkflow(QObject):
             "The import worker exited without a completion result.",
         )
         view, context = self._view, self._context
+        if self._thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            self._thread.wait()
         self._thread = self._worker = None
         self.window.setEnabled(self._previous_enabled)
         QApplication.restoreOverrideCursor()

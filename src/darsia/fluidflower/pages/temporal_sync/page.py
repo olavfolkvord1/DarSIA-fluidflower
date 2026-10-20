@@ -1161,13 +1161,13 @@ class TimelinePage(ModulePage):
 
     @Slot()
     def _protocol_thread_finished(self) -> None:
-        worker = self._protocol_worker
         thread = self._protocol_thread
+        if thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            thread.wait()
         self._protocol_worker = None
         self._protocol_thread = None
         self.reload_protocols.setEnabled(True)
-        if worker is not None:
-            worker.deleteLater()
         if thread is not None:
             thread.deleteLater()
 

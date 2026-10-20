@@ -483,9 +483,9 @@ class FrameQualityPanel(QWidget):
 
     @Slot()
     def _thread_finished(self) -> None:
-        if self._worker is not None:
-            self._worker.deleteLater()
         if self._thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            self._thread.wait()
             self._thread.deleteLater()
         self._worker = None
         self._thread = None

@@ -101,8 +101,6 @@ class CorrectedSetupExportDialog(QDialog):
         worker.failed.connect(self._capture_failure)
         worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
         thread.finished.connect(self._finish)
         self._thread, self._worker = thread, worker
         thread.start()
@@ -118,6 +116,9 @@ class CorrectedSetupExportDialog(QDialog):
     @Slot()
     def _finish(self):
         thread = self._thread
+        if thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            thread.wait()
         self._thread = self._worker = None
         if thread is not None:
             thread.deleteLater()

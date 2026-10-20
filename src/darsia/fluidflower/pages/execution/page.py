@@ -734,9 +734,9 @@ class ExecutionPage(QWidget):
         thread.start()
 
     def _hardware_thread_finished(self) -> None:
-        if self._hardware_worker is not None:
-            self._hardware_worker.deleteLater()
         if self._hardware_thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            self._hardware_thread.wait()
             self._hardware_thread.deleteLater()
         self._hardware_worker = None
         self._hardware_thread = None
@@ -1324,9 +1324,9 @@ class ExecutionPage(QWidget):
         thread.start()
 
     def _queue_thread_finished(self) -> None:
-        if self._queue_worker is not None:
-            self._queue_worker.deleteLater()
         if self._queue_thread is not None:
+            # After wait() the worker is freed here, in the GUI thread (Q185).
+            self._queue_thread.wait()
             self._queue_thread.deleteLater()
         self._queue_worker = None
         self._queue_thread = None
