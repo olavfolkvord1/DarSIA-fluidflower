@@ -17,6 +17,7 @@ import pytest
 from darsia.fluidflower import job_filesystem, published_jobs_snapshot as snapshot
 from darsia.fluidflower.pipeline import alias_job, enqueue, job_queue, phase1_protocol as protocol
 from darsia.fluidflower.pipeline import publication_runtime
+from darsia.fluidflower.pipeline.job_inputs import catalog_order_key
 from darsia.fluidflower.pipeline.store_runtime import ResolvedInput
 from .test_phase1_worker_protocol import metadata, scientific_fixture, SyntheticServerClock
 from .test_staged_data import _write
@@ -185,7 +186,8 @@ def builder_inputs(tmp_path, monkeypatch):
             calls.append(deepcopy(current))
             reference = self.add(bound, "configuration", "run.configuration")
             return dict(format="darsia-role-input-catalog-v1", complete=True, run=current["run"],
-                configuration=reference, inputs=list(self.rows.values()))
+                configuration=reference,
+                inputs=sorted(self.rows.values(), key=lambda row: catalog_order_key(row["reference"])))
     monkeypatch.setattr(alias_job, "shared_output_admission", lambda root: object())
     job = dict(format=alias_job.JOB_FORMAT, pipeline=protocol.PIPELINE, commit=old["commit"],
         precision=old["precision"], expected_runs=[old["run"]], publish=[], created_utc="synthetic-unit-fixture",

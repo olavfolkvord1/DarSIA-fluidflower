@@ -517,4 +517,16 @@ def validate_catalog(value):
             consumers[use] = row["reference"]
     if value["configuration"] not in [row["reference"] for row in value["inputs"]]:
         raise ValueError("Catalogue omits its bound configuration input")
+    order = [catalog_order_key(row["reference"]) for row in value["inputs"]]
+    if order != sorted(order):
+        raise ValueError("Role input catalogue is not in its canonical order")
     return value
+
+
+def catalog_order_key(reference):
+    """Return the key InputCatalog sorts its inputs by: alias, path, SHA-256, role.
+
+    A replay rebuilds the catalogue in this order and compares whole lists, so
+    a catalogue in any other order can never run. Refuse it when it is made.
+    """
+    return (reference["root_alias"], reference["relative_path"], reference["sha256"], reference["role"])

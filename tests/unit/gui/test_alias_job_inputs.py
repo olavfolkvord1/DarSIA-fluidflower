@@ -188,6 +188,24 @@ def test_ambiguous_named_consumer_refuses_at_collection_and_at_catalogue_admissi
         inputs.validate_catalog(changed)
 
 
+def test_catalogue_out_of_its_canonical_order_is_refused_when_made():
+    """A real collection is in canonical order; a row moved by hand is refused."""
+    files=MemoryFiles();config,bound=mass_fixture(files)
+    valid=files.catalog().collect(bound,config)
+    order=[inputs.catalog_order_key(row["reference"]) for row in valid["inputs"]]
+    assert len(order)>=2 and order==sorted(order)
+    inputs.validate_catalog(valid)
+    moved=deepcopy(valid);moved["inputs"].append(moved["inputs"].pop(0))
+    with pytest.raises(ValueError,match="canonical order"):
+        inputs.validate_catalog(moved)
+
+
+def test_catalog_order_key_is_alias_path_sha_role():
+    """The order key is the InputCatalog entry key: alias, path, SHA-256, role."""
+    reference=dict(root_alias="series",relative_path="a/b.json",sha256="0"*64,bytes=3,role="rig_model")
+    assert inputs.catalog_order_key(reference)==("series","a/b.json","0"*64,"rig_model")
+
+
 def test_toml_boxes_are_bound_as_original_roi_input_without_json_decoding():
     files = MemoryFiles()
     config, _ = mass_fixture(files)

@@ -28,8 +28,8 @@ def task_fixture(tmp_path):
                 series_manifest=reference("series.toml", b"series_id='FF_AC'\n"))
     task["input_catalog"] = dict(format="darsia-role-input-catalog-v1", complete=True,
                                  run="ac52", configuration=config,
-                                 inputs=[dict(reference=config, uses=["run.configuration"]),
-                                         dict(reference=task["series"], uses=["run.execution_series"]),
+                                 inputs=[dict(reference=task["series"], uses=["run.execution_series"]),
+                                         dict(reference=config, uses=["run.configuration"]),
                                          dict(reference=task["series_manifest"], uses=["run.series_manifest"])])
     text = ("[machine]\nid='test-main'\n[stores.FF_AC]\nseries=" +
             json.dumps(str(tmp_path)) + "\nresults=" +
