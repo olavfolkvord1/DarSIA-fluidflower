@@ -475,6 +475,7 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         self.d1_edit = QLineEdit("0.25")
         form.addRow("First post-injection delay d1 (hours)", self.d1_edit)
         self.d1_edit.textEdited.connect(self._proposal_parameter_changed)
+        self._build_time_grid_row(form)
         self.stored_status = QLabel(
             "Stored plan: Load the run to inspect its explicit source binding."
         )
@@ -574,6 +575,63 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         )
         self._update_controls()
 
+    def _build_time_grid_row(self, form):
+        """The time grid choice and its two proposal buttons."""
+        from darsia.fluidflower.image_selection_grid import (
+            grid_families,
+            read_time_grids,
+        )
+
+        self.grid_proposal = self.applied_grid = None
+        self.grid_edited = False
+        try:
+            self.grids, problem = read_time_grids(self.root), ""
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
+            self.grids, problem = {}, f"{type(error).__name__}: {error}"
+        line = QWidget()
+        horizontal = QHBoxLayout(line)
+        horizontal.setContentsMargins(0, 0, 0, 0)
+        self.grid_combo = QComboBox()
+        for family, names in grid_families(self.grids).items():
+            times = {
+                round(value, 9) for name in names for value in self.grids[name]["times_h"]
+            }
+            count = len(times)
+            self.grid_combo.addItem(f"{family} ({count} times)", names)
+            self.grid_combo.setItemData(
+                self.grid_combo.count() - 1, ", ".join(names), Qt.ItemDataRole.ToolTipRole
+            )
+        if not self.grids:
+            self.grid_combo.addItem(problem or "No time grids in config/common.toml", None)
+        self.grid_combo.setToolTip(
+            "Times after injection start from the [[data_time]] tables in config/common.toml. "
+            "Each time gets the nearest camera image within 15 s up to 3 h and 150 s after; "
+            "a rejected image is replaced by an ok one within 60 s or 600 s."
+        )
+        self.grid_button = QPushButton("Propose from time grid")
+        self.grid_button.setToolTip(
+            "Match this run's camera images to the chosen grid; inspect, then Apply and Save."
+        )
+        self.grid_all_button = QPushButton("Propose and save for all runs…")
+        self.grid_all_button.setToolTip(
+            "For every run: propose from the chosen grid, apply it and save it to series.toml, "
+            "one run after another, after one question."
+        )
+        horizontal.addWidget(self.grid_combo, 1)
+        horizontal.addWidget(self.grid_button)
+        horizontal.addWidget(self.grid_all_button)
+        form.addRow("Time grid", line)
+        self.grid_button.clicked.connect(
+            lambda: self._clicked("Time grid not proposed", self.propose_from_time_grid)
+        )
+        self.grid_all_button.clicked.connect(self._grid_all_clicked)
+
+    def _chosen_grids(self):
+        names = self.grid_combo.currentData() if hasattr(self, "grid_combo") else None
+        if not names:
+            raise ValueError("Choose a time grid from config/common.toml.")
+        return list(names)
+
     def _update_controls(self):
         super()._update_controls()
         if not hasattr(self, "apply_button"):
@@ -583,7 +641,13 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
             and self.run_combo.currentData() == self._loaded_run
         )
         self.suggest_button.setEnabled(ready)
-        self.apply_button.setEnabled(ready and self.proposal is not None)
+        self.apply_button.setEnabled(
+            ready and (self.proposal is not None or self.grid_proposal is not None)
+        )
+        if hasattr(self, "grid_button"):
+            has_grid = bool(self.grids)
+            self.grid_button.setEnabled(ready and has_grid)
+            self.grid_all_button.setEnabled(has_grid and self.run_combo.count() > 0)
         self.apply_stored_button.setEnabled(ready and self.stored_plan is not None)
         self.import_stored_button.setEnabled(ready)
         self.import_quality_button.setEnabled(ready)
@@ -622,6 +686,8 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         draft = self.drafts.get(self._loaded_run, {})
         saved = self.saved_table["runs"].get(self._loaded_run, {})
         self.stored_plan = self.quality = self.proposal = self.applied_proposal = None
+        self.grid_proposal = self.applied_grid = None
+        self.grid_edited = False
         self.manual_edits_after_apply = False
         self.d1_edit.setText(draft.get("d1", str(saved.get("default20_d1_h", 0.25))))
         self.proposal_table.setRowCount(0)
@@ -747,9 +813,12 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         super()._draft_changed(*args)
         if self.applied_proposal is not None:
             self.manual_edits_after_apply = True
+        if getattr(self, "applied_grid", None) is not None:
+            self.grid_edited = True
 
     def _proposal_parameter_changed(self, *_args):
         self.proposal = None
+        self.grid_proposal = None
         self.proposal_table.setRowCount(0)
         self.proposal_status.setText(
             "Parameters changed; Propose again before Apply. The current draft is unchanged."
@@ -768,6 +837,7 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         self.proposal = default20_proposal(
             self.metadata, d1_h=float(self.d1_edit.text()), quality=self.quality
         )
+        self.grid_proposal = None
         rows = self.proposal["target_matches"]
         self.proposal_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
@@ -815,9 +885,151 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
         finally:
             self._changing = False
 
+    def propose_from_time_grid(self):
+        """Propose this run's images for the chosen time grid (shown, not applied)."""
+        from darsia.fluidflower.image_selection_grid import (
+            proposal_summary,
+            propose_from_grid,
+        )
+
+        if self.metadata is None or self.run_combo.currentData() != self._loaded_run:
+            raise ValueError("Load this run's metadata first.")
+        result = propose_from_grid(
+            self.metadata, self.grids, self._chosen_grids(), quality=self.quality
+        )
+        self.grid_proposal, self.proposal = result, None
+        rows = result["target_matches"]
+        self.proposal_table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            if row["selected"]:
+                flags = []
+                if row.get("replacement"):
+                    replaced = Path(str(row["replacement"].get("source_path", ""))).name
+                    flags.append(f"replaces rejected {replaced}")
+                if not (row.get("quality") or {}).get("recorded", True):
+                    flags.append("quality not recorded")
+                values = (
+                    i,
+                    row["target_hour"],
+                    Path(str(row["source_path"])).name,
+                    row["elapsed_h"],
+                    round(row["offset_seconds"], 1),
+                    row.get("frame_quality_class", "Not recorded"),
+                    "; ".join(flags),
+                )
+            else:
+                reason = row.get("reason", "")
+                values = (i, row["target_hour"], "Not selected", "—", "—", "—", reason)
+            for j, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(
+                    f"{self.proposal_table.horizontalHeaderItem(j).text()}: {value}\n"
+                    + str(row.get("source_path") or "")
+                )
+                self.proposal_table.setItem(i, j, item)
+        self.proposal_status.setText(
+            "Time grid proposal: " + proposal_summary(result) + " Explicit Apply required."
+        )
+        self._update_controls()
+        return result
+
+    def _apply_time_grid(self):
+        """Put the inspected time grid proposal in the manual draft."""
+        from darsia.fluidflower.image_selection_grid import propose_from_grid
+
+        fresh = propose_from_grid(
+            self.metadata, self.grids, self.grid_proposal["grids"], quality=self.quality
+        )
+        if fresh["selected_paths"] != self.grid_proposal["selected_paths"]:
+            raise ValueError("The time grid proposal changed; inspect it again before Apply.")
+        self._set_draft_paths(fresh["selected_paths"])
+        matched = [
+            row["target_hour"] for row in fresh["target_matches"] if row["selected"]
+        ]
+        self.targets.setText(", ".join(repr(value) for value in matched))
+        self.tolerance.setText("150")
+        self.applied_grid, self.applied_proposal = fresh, None
+        self.grid_edited = False
+        self._dirty_runs.add(self._loaded_run)
+        self._selection_status(
+            "Time grid proposal applied to the draft only. Save remains explicit."
+        )
+        return self.selected_paths()
+
+    def _saved_rule(self):
+        from darsia.fluidflower.image_selection_proposal import RULE
+
+        if self.applied_proposal is not None:
+            return RULE
+        if self.applied_grid is not None and not self.grid_edited:
+            return "time grid: " + ", ".join(self.applied_grid["grids"])
+        return "manual_or_edited_targets"
+
+    def propose_and_save_all(self):
+        """For every run in turn: load it, propose from the chosen grid, apply
+        and save. Stops at the first run that cannot be saved; returns one
+        result line per run."""
+        from darsia.fluidflower.image_selection_grid import proposal_summary
+
+        names = self._chosen_grids()
+        unsaved = sorted(run.upper() for run in self._dirty_runs)
+        if unsaved:
+            raise ValueError(
+                "Save or reload the runs with unsaved image choices first: "
+                + ", ".join(unsaved)
+            )
+        start = self.run_combo.currentIndex()
+        lines = []
+        try:
+            for index in range(self.run_combo.count()):
+                run = self.run_combo.itemData(index)
+                self.run_combo.setCurrentIndex(index)
+                try:
+                    self.load_run()
+                    result = self.propose_from_time_grid()
+                    self.apply_proposal()
+                    self.save_run()
+                except Exception as error:
+                    failure = f"{type(error).__name__}: {error}"
+                    lines.append(f"{str(run).upper()}: not saved: {failure}")
+                    lines.append("The remaining runs were not changed.")
+                    raise RuntimeError("\n".join(lines)) from error
+                lines.append(f"{str(run).upper()}: saved; " + proposal_summary(result))
+        finally:
+            self.run_combo.setCurrentIndex(start)
+        self.status.setText(
+            f"Saved the {', '.join(names)} choices of {len(lines)} runs in series.toml."
+        )
+        return lines
+
+    def _grid_all_clicked(self):
+        try:
+            names = self._chosen_grids()
+        except ValueError as error:
+            QMessageBox.warning(self, "Time grid not proposed", str(error))
+            return
+        answer = QMessageBox.question(
+            self,
+            "Propose and save for all runs",
+            f"For each of the {self.run_combo.count()} runs, choose the camera images for "
+            f"{', '.join(names)} and save them to series.toml, one run after another? "
+            "Each run's earlier choice is replaced; the first run that cannot be saved stops "
+            "the rest. No image is decoded and no calculation starts.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            lines = self.propose_and_save_all()
+        except (RuntimeError, ValueError) as error:
+            QMessageBox.warning(self, "Not all runs were saved", str(error))
+            return
+        QMessageBox.information(self, "Saved for all runs", "\n".join(lines))
+
     def apply_proposal(self):
         from darsia.fluidflower.image_selection_proposal import default20_proposal
 
+        if self.proposal is None and self.grid_proposal is not None:
+            return self._apply_time_grid()
         if self.proposal is None:
             raise ValueError("Request and inspect a proposal first.")
         fresh = default20_proposal(
@@ -899,8 +1111,6 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
             )
 
     def save_run(self):
-        from darsia.fluidflower.image_selection_proposal import RULE
-
         if self.metadata is None or self.run_combo.currentData() != self._loaded_run:
             raise ValueError("Load this run first.")
         if getattr(self, "_source_errors", {}):
@@ -919,11 +1129,7 @@ class SeriesImageSelectionDialog(_ManualImageSelectionDialog):
             expected_bytes=self.expected_bytes,
             target_hours=targets,
             tolerance_seconds=float(self.tolerance.text()),
-            rule=(
-                RULE
-                if self.applied_proposal is not None
-                else "manual_or_edited_targets"
-            ),
+            rule=self._saved_rule(),
             proposal=self.applied_proposal,
             stored_plan=self.stored_plan,
             quality=self.quality,
