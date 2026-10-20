@@ -125,6 +125,8 @@ DEFAULT_EDGE_FILL_MM = 5.0
 PROPOSAL_DETAILS = ("normal", "fine")
 # Without a rig size, the photograph is taken to be this wide.
 NOMINAL_IMAGE_WIDTH_M = 1.0
+# Polygon points this close (raw pixels) are one shared point.
+SHARED_POINT_PX = 0.5
 
 ProgressCallback = Callable[[str], None]
 
@@ -255,6 +257,10 @@ class PaintingSession:
     snap_mm: float = DEFAULT_SNAP_MM
     edge_fill_mm: float = DEFAULT_EDGE_FILL_MM
     detail: str = "normal"
+    # Whether the classifier may move edges that polygons of different layers
+    # share, within the snap distance like other edges. False keeps them
+    # exactly where they are drawn.
+    move_shared_edges: bool = True
     updated_utc: str = ""
     updated_by: str = ""
     # Set when the run's baseline photograph differs from the one painted on.
@@ -643,6 +649,9 @@ class PaintingSession:
                 "snap_mm": self.snap_mm,
                 "edge_fill_mm": self.edge_fill_mm,
                 "detail": self.detail,
+                # Only when shared edges are kept: sessions with the default
+                # stay as they were.
+                **({} if self.move_shared_edges else {"move_shared_edges": False}),
             },
             "updated_utc": self.updated_utc,
             "updated_by": self.updated_by,
@@ -681,6 +690,7 @@ class PaintingSession:
                 else float(min(max(edge, 0.0), MAX_SNAP_MM))
             ),
             detail=detail if detail in PROPOSAL_DETAILS else "normal",
+            move_shared_edges=bool(settings.get("move_shared_edges", True)),
             updated_utc=str(payload.get("updated_utc") or ""),
             updated_by=str(payload.get("updated_by") or ""),
         )
@@ -1115,6 +1125,136 @@ def rasterize_polygons(
     return owner
 
 
+def _point_groups(
+    points_by_polygon: Mapping[int, Sequence[tuple[float, float]]], tolerance: float
+) -> tuple[list[tuple[int, int]], np.ndarray]:
+    """Every polygon point as (polygon, point), and the group of each.
+
+    Points within ``tolerance`` raw pixels of each other, also through a chain
+    of such points, are in one group.
+    """
+
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    keys = [
+        (int(index), vertex)
+        for index, points in points_by_polygon.items()
+        for vertex in range(len(points))
+    ]
+    if not keys:
+        return [], np.zeros(0, dtype=np.int64)
+    coordinates = np.asarray(
+        [points_by_polygon[index][vertex] for index, vertex in keys], dtype=np.float64
+    )
+    pairs = cKDTree(coordinates).query_pairs(float(tolerance), output_type="ndarray")
+    graph = coo_matrix(
+        (np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(keys), len(keys))
+    )
+    _count, groups = connected_components(graph, directed=False)
+    return keys, groups
+
+
+def shared_points(
+    points_by_polygon: Mapping[int, Sequence[tuple[float, float]]],
+    tolerance: float = SHARED_POINT_PX,
+) -> list[list[tuple[int, int]]]:
+    """Points that several polygons share.
+
+    ``points_by_polygon`` maps a polygon index to its points (raw row, col).
+    Points within ``tolerance`` raw pixels of each other, also through a
+    chain of such points, are one shared point when they belong to at least
+    two polygons. Returns each shared point as its sorted (polygon, point)
+    indices, ordered by the first of them.
+    """
+
+    keys, groups = _point_groups(points_by_polygon, tolerance)
+    members: dict[int, list[tuple[int, int]]] = {}
+    for key, group in zip(keys, groups):
+        members.setdefault(int(group), []).append(key)
+    return sorted(
+        sorted(rows)
+        for rows in members.values()
+        if len({index for index, _vertex in rows}) >= 2
+    )
+
+
+def _edge_sharing(
+    polygons: Sequence[Polygon], tolerance: float
+) -> tuple[list[tuple[tuple[float, float], tuple[float, float]]], list[Any]]:
+    """The edges that polygons of different layers share, and all other
+    edges, each as its two end points (raw row, col)."""
+
+    keys, groups = _point_groups(
+        {index: polygon.points for index, polygon in enumerate(polygons)}, tolerance
+    )
+    group_of = {key: int(group) for key, group in zip(keys, groups)}
+    edges: list[tuple[frozenset[int], tuple[float, float], tuple[float, float]]] = []
+    layers: dict[frozenset[int], set[int]] = {}
+    for index, polygon in enumerate(polygons):
+        count = len(polygon.points)
+        for vertex in range(count):
+            following = (vertex + 1) % count
+            ends = frozenset(
+                {group_of[(index, vertex)], group_of[(index, following)]}
+            )
+            edges.append((ends, polygon.points[vertex], polygon.points[following]))
+            if len(ends) == 2:
+                layers.setdefault(ends, set()).add(int(polygon.layer_id))
+    shared: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    other: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    seen: set[frozenset[int]] = set()
+    for ends, start, end in edges:
+        if len(layers.get(ends, ())) < 2:
+            other.append((start, end))
+        elif ends not in seen:
+            seen.add(ends)
+            shared.append((start, end))
+    return shared, other
+
+
+def shared_edges(
+    polygons: Sequence[Polygon], tolerance: float = SHARED_POINT_PX
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Edges that polygons of different layers share.
+
+    An edge is shared when polygons of at least two layers each have an edge
+    between the same two shared points (see :func:`shared_points`). Each
+    shared edge is returned once, as its two end points (raw row, col) in the
+    first polygon that has it.
+    """
+
+    return _edge_sharing(polygons, tolerance)[0]
+
+
+def _segments_mask(
+    segments: Sequence[tuple[tuple[float, float], tuple[float, float]]],
+    shape: tuple[int, int],
+    scale: tuple[float, float],
+    width_px: int,
+) -> np.ndarray:
+    """Grid pixels on lines ``width_px`` grid pixels wide along segments
+    given by their end points (raw row, col)."""
+
+    import cv2
+
+    mask = np.zeros(shape, dtype=np.uint8)
+    shift = 4
+    for start, end in segments:
+        first, second = _grid_points([start, end], scale, shift)
+        cv2.line(
+            mask,
+            (int(first[0]), int(first[1])),
+            (int(second[0]), int(second[1])),
+            1,
+            thickness=max(1, int(width_px)),
+            lineType=cv2.LINE_8,
+            shift=shift,
+        )
+    return mask.astype(bool)
+
+
 def _distance_to(mask: np.ndarray) -> np.ndarray:
     """Euclidean distance (grid pixels) to the nearest pixel of ``mask``."""
 
@@ -1168,6 +1308,7 @@ def polygon_guide(
     *,
     min_training_pixels: int = 50,
     layer_snap_px: Mapping[int, float] | None = None,
+    keep_shared_edges: bool = False,
 ) -> PolygonGuide:
     """Fixed interiors and allowed layers of a set of polygons on a grid.
 
@@ -1185,6 +1326,12 @@ def polygon_guide(
     ``snap_px``, both for fixing their polygon pixels and for how far from
     their polygons they compete. With 0 a layer keeps its polygons exactly and
     does not spread beyond them where the area is covered by polygons.
+
+    With ``keep_shared_edges`` the edges that polygons of different layers
+    share (:func:`shared_edges`) get no snap band: polygon pixels along them
+    are fixed, so the boundary stays on the shared edge, unless they lie
+    within the snap distance of another edge. Which pixels may serve as
+    training samples does not change.
     """
 
     import cv2
@@ -1207,6 +1354,17 @@ def polygon_guide(
         distance[layer_id] = _distance_to((mask > 0) & inside)
     edges &= inside
     distance_edge = _distance_to(edges)
+    # The edges a snap band lies along.
+    band_edge = distance_edge
+    if keep_shared_edges:
+        shared, other = _edge_sharing(polygons, SHARED_POINT_PX)
+        if shared:
+            # Edge pixels on a shared edge, nearer to it than to any other
+            # polygon edge, do not count.
+            to_shared = _distance_to(_segments_mask(shared, shape, scale, 1))
+            to_other = _distance_to(_segments_mask(other, shape, scale, 1))
+            along = (to_shared <= to_other) & (to_shared <= 1.5)
+            band_edge = _distance_to(edges & ~along)
 
     snap = max(0.0, float(snap_px))
     own_snap = {int(key): max(0.0, float(value)) for key, value in (layer_snap_px or {}).items()}
@@ -1214,9 +1372,9 @@ def polygon_guide(
         snap_map = np.full(shape, snap, dtype=np.float32)
         for layer_id, value in own_snap.items():
             snap_map[owner == layer_id] = value
-        fixed = covered & ((distance_edge > snap_map) | (snap_map <= 0.0))
+        fixed = covered & ((band_edge > snap_map) | (snap_map <= 0.0))
     else:
-        fixed = covered & (distance_edge > snap) if snap > 0.0 else covered.copy()
+        fixed = covered & (band_edge > snap) if snap > 0.0 else covered.copy()
     reach = max([snap, *own_snap.values()])
     if reach > 0.0 and distance:
         nearest = np.minimum.reduce(list(distance.values()))
@@ -1479,6 +1637,9 @@ def proposal_digest(session: PaintingSession, frame: RigFrame | None) -> str:
         }
         if layer_snaps:
             payload["layer_snap_mm"] = layer_snaps
+        if not session.move_shared_edges:
+            # Only when shared edges are kept, so that other proposals stay current.
+            payload["move_shared_edges"] = False
     if session.detail != "normal":
         payload["detail"] = session.detail
     return hashlib.sha256(
@@ -1636,7 +1797,13 @@ def propose_layers(
     if session.polygons:
         _progress(progress, "Reading the polygons…")
         guide = polygon_guide(
-            session.polygons, shape, scale, inside, snap_px, layer_snap_px=layer_snap_px
+            session.polygons,
+            shape,
+            scale,
+            inside,
+            snap_px,
+            layer_snap_px=layer_snap_px,
+            keep_shared_edges=not session.move_shared_edges,
         )
         # A stroke corrects the polygons under it.
         guide.training[painted > 0] = 0
@@ -2470,6 +2637,53 @@ def _rig_size(
     return None
 
 
+def _kept_shared_edges(
+    session: PaintingSession,
+    proposal: LayerProposal,
+    frame: RigFrame | None,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Pixels of the raw grid (``shape``) near the shared edges a proposal
+    kept exactly, or None.
+
+    These are the proposal grid cells within two cells of a shared edge that
+    the proposal fixed to their polygon's layer (``move_shared_edges`` off).
+    """
+
+    if session.move_shared_edges or not session.polygons:
+        return None
+    shared = shared_edges(session.polygons)
+    if not shared:
+        return None
+    grid = proposal.classes.shape
+    scale = proposal_grid_scale(proposal)
+    size = tuple(proposal.image_size)
+    guide = polygon_guide(
+        session.polygons,
+        grid,
+        scale,
+        frame_mask(frame, grid, scale),
+        snap_pixels(session.snap_mm, frame, scale, size),
+        layer_snap_px={
+            row.layer_id: snap_pixels(row.snap_mm, frame, scale, size)
+            for row in session.layers
+            if row.snap_mm is not None
+        },
+        keep_shared_edges=True,
+    )
+    near = _segments_mask(shared, grid, scale, 5) & guide.fixed
+    if not np.any(near):
+        return None
+    height, width = shape
+    rows = np.minimum(
+        ((np.arange(height) + 0.5) * (grid[0] / height)).astype(np.intp), grid[0] - 1
+    )
+    cols = np.minimum(
+        ((np.arange(width) + 0.5) * (grid[1] / width)).astype(np.intp), grid[1] - 1
+    )
+    return near[rows[:, None], cols[None, :]]
+
+
 def painted_label_map(
     session: PaintingSession,
     proposal: LayerProposal,
@@ -2480,8 +2694,10 @@ def painted_label_map(
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     """Label map on the raw photograph's grid and one region row per label.
 
-    Hand corrections are applied at full resolution after the proposal and
-    its exact polygons; the pixels they decide are never merged away.
+    Polygons used exactly (snap 0) and shared edges kept exactly
+    (``move_shared_edges`` off) are drawn at full resolution. Hand
+    corrections are applied at full resolution after the proposal and its
+    exact polygons; the pixels they decide are never merged away.
     """
 
     from scipy import ndimage as ndi
@@ -2502,13 +2718,18 @@ def painted_label_map(
     exact = sorted(
         {row.layer_id for row in session.polygons if session.layer_snap_mm(row.layer_id) <= 0.0}
     )
-    if exact:
+    kept = _kept_shared_edges(session, proposal, frame, (height, width))
+    if exact or kept is not None:
         # Polygons used exactly (snap 0, common or the layer's own) keep their
-        # outline at full resolution; strokes inside them still correct them.
+        # outline at full resolution, and so do shared edges kept exactly;
+        # strokes inside them still correct them.
         _progress(progress, "Drawing the polygons at full resolution…")
         owner = rasterize_polygons(session.polygons, (height, width), scale)
         owner[~inside] = 0
         covered = np.isin(owner, exact)
+        if kept is not None:
+            covered |= kept & (owner > 0)
+            del kept
         classes[covered] = owner[covered]
         del owner
         painted = rasterize_strokes(session.strokes, (height, width), scale)
@@ -2766,6 +2987,11 @@ def save_painted_revision(
                 "stroke_count": len(session.strokes),
                 "polygon_count": len(session.polygons),
                 "snap_mm": session.snap_mm if session.polygons else None,
+                **(
+                    {}
+                    if session.move_shared_edges
+                    else {"move_shared_edges": False}
+                ),
                 "layers": [
                     {
                         "layer_id": layer.layer_id,
@@ -2813,6 +3039,7 @@ __all__ = [
     "CORRECTION_KINDS",
     "LAYER_CORRECTIONS_FORMAT",
     "Correction",
+    "SHARED_POINT_PX",
     "apply_corrections",
     "class_region_count",
     "corrected_classes",
@@ -2878,6 +3105,8 @@ __all__ = [
     "save_painted_revision",
     "save_painting_session",
     "session_path",
+    "shared_edges",
+    "shared_points",
     "snap_pixels",
     "stretch_contrast_rgb8",
     "upsample_classes",

@@ -20,13 +20,14 @@ import hashlib
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from . import geometry_workspace_frame as workspace_frame
 from typing import Any
 
 import numpy as np
 from PySide6.QtCore import (
+    QEvent,
     QObject,
     QPoint,
     QPointF,
@@ -111,6 +112,13 @@ _CLICK_SLOP_PX = 4.0
 # Point handles of the Edit tool (screen pixels); selected points are larger.
 _HANDLE_PX = 7.0
 _SELECTED_HANDLE_PX = 11.0
+# Round handles: a point that several polygons share (Edit), and the points of
+# a new polygon that snapped onto a shown polygon or follow its outline (Draw).
+_SHARED_HANDLE_PX = 9.0
+_FOLLOWED_HANDLE_PX = 5.0
+# Held, this key makes a Draw click place a free point, and an Edit press on
+# a shared point take only the point of the polygon pressed into.
+_ALONE = Qt.KeyboardModifier.AltModifier
 # Screen pixels that an arrow key moves the selected points (with Shift).
 _NUDGE_PX = 1.0
 _NUDGE_SHIFT_PX = 10.0
@@ -153,6 +161,15 @@ _BACKGROUND_TIP = (
 )
 _BACKGROUND_SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _BACKGROUND_CHOOSE = "choose"
+# Whether Draw follows the edges of shown polygons: the user's choice, kept in
+# the same settings and not in the painting session.
+_FOLLOW_EDGES_KEY = "draw/follow_edges"
+_FOLLOW_EDGES_TIP = (
+    "Draw: a click near a point or edge of a shown polygon snaps onto it, and "
+    "between two such clicks on one polygon the new polygon follows its "
+    "outline, the shorter way round (Tab: the other way). Neighbouring layers "
+    "then share their boundary exactly. Alt+click places a free point."
+)
 # A session painted on the raw reference photo, in a project whose geometry
 # is in the saved corrected rig frame, stays on the raw photo.
 _RAW_SESSION_NOTE = (
@@ -176,6 +193,13 @@ _DRAFT_HINT = (
     "Polygon with {count} point{plural}: left click adds a point · right click, "
     "Enter or a double click closes · Backspace removes the last point · Esc "
     "cancels"
+)
+_FOLLOW_HINT = " · Tab: follow the other way round · Alt+click: a free point"
+_MOVE_SHARED_TIP = (
+    "Edges that polygons of different layers share, for example drawn with "
+    "Follow edges. Yes: the model places them within the snap distance, like "
+    "other edges. No: the boundary lies exactly on the shared edge, also in "
+    "the exported map; other edges keep their snap distance."
 )
 
 
@@ -310,6 +334,105 @@ def _segment_distance(point: QPointF, start: QPointF, end: QPointF) -> float:
     )
 
 
+def _ways_round(
+    points: Sequence[tuple[float, float]],
+    start: tuple[int, float],
+    end: tuple[int, float],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """The points of a closed outline passed on the way from one place on it
+    to another, going forwards and going backwards.
+
+    A place is (edge, fraction): on the edge from point ``edge`` to the next
+    point, ``fraction`` of the way along (0: on point ``edge`` itself).
+    """
+
+    count = len(points)
+    first = start[0] + start[1]
+    last = end[0] + end[1]
+    ways = []
+    for step in (1, -1):
+        span = ((last - first) * step) % count
+        if step > 0:
+            vertex = start[0] + 1
+        else:
+            vertex = start[0] if start[1] > 0.0 else start[0] - 1
+        passed = []
+        for _number in range(count):
+            if ((vertex - first) * step) % count >= span - 1.0e-9:
+                break
+            row, col = points[vertex % count]
+            passed.append((float(row), float(col)))
+            vertex += step
+        ways.append(passed)
+    return ways[0], ways[1]
+
+
+def insert_point_on_shared_edge(
+    polygons: Mapping[int, Sequence[tuple[float, float]]],
+    index: int,
+    row: float,
+    col: float,
+    *,
+    tolerance: float = lp.SHARED_POINT_PX,
+) -> dict[int, tuple[list[tuple[float, float]], int]]:
+    """One point added on the nearest edge of polygon ``index`` and on that
+    edge in every other polygon that shares it.
+
+    ``polygons`` maps polygon indices to their points. The point goes where
+    :func:`insert_point_on_nearest_edge` puts it in polygon ``index``. Another
+    polygon gets the same point when one of its edges joins two points within
+    ``tolerance`` raw pixels of that edge's end points. Returns {polygon:
+    (new points, index of the new point)}, empty when no point can be added.
+    ``polygons`` itself is not changed.
+    """
+
+    points, inserted = insert_point_on_nearest_edge(polygons[index], row, col)
+    if inserted < 0:
+        return {}
+    changes = {int(index): (points, inserted)}
+    point = points[inserted]
+    ends = (points[inserted - 1], points[(inserted + 1) % len(points)])
+
+    def near(first: Sequence[float], second: Sequence[float]) -> bool:
+        return math.hypot(first[0] - second[0], first[1] - second[1]) <= tolerance
+
+    for other, other_points in polygons.items():
+        count = len(other_points)
+        if other == index or count < 2:
+            continue
+        for vertex in range(count):
+            start, end = other_points[vertex], other_points[(vertex + 1) % count]
+            if (near(start, ends[0]) and near(end, ends[1])) or (
+                near(start, ends[1]) and near(end, ends[0])
+            ):
+                new_points = [
+                    (float(value[0]), float(value[1])) for value in other_points
+                ]
+                new_points.insert(vertex + 1, point)
+                changes[int(other)] = (new_points, vertex + 1)
+                break
+    return changes
+
+
+@dataclass
+class _DraftPoint:
+    """A point clicked while drawing a polygon."""
+
+    # Raw (row, col): where it was clicked, or the point or edge position of a
+    # shown polygon it snapped onto.
+    point: tuple[float, float]
+    snapped: bool = False
+    # Ways round a shown polygon's outline from the previous point, as the
+    # outline points passed (raw), shortest first; and the way taken.
+    ways: list[list[tuple[float, float]]] = field(default_factory=list)
+    way: int = 0
+
+    def followed(self) -> list[tuple[float, float]]:
+        """The outline points followed on the way to this point."""
+
+        return list(self.ways[self.way]) if self.ways else []
+
+
 @dataclass
 class _PointDrag:
     """Selected points being dragged with the Edit tool."""
@@ -341,6 +464,19 @@ class LayerCanvas(QGraphicsView):
     polygons show no point handles here, and a click on one of their points
     adds a point to the new polygon; it never moves the existing point.
 
+    With ``follow_edges`` (the default) a Draw click within the point-hit
+    distance of a point of a shown polygon snaps onto that point, else onto
+    the nearest position on an edge within that distance; Alt places a free
+    point. When two consecutive clicked points lie on one shown polygon's
+    outline, the new polygon follows the outline between them and takes its
+    points, the shorter way round; Tab takes the other way (Shift+Tab back),
+    and the preview shows the way the next click would follow. Backspace
+    removes the last clicked point with the outline followed to it. When the
+    polygon is closed, its points that snapped onto an edge are added to the
+    polygons whose outline they lie on: just before ``polygon_finished``,
+    ``finished_outline_points`` holds {index: new points} of those polygons,
+    so that the new polygon and their new points are one change.
+
     Edit (``edit``) changes existing polygons and never starts a polygon, a
     stroke or a draft. Every shown polygon has point handles, and selected
     points (``selected_points``) are drawn larger, white with a dark outline.
@@ -358,6 +494,13 @@ class LayerCanvas(QGraphicsView):
     undone in one step: ``polygon_edited`` (index and new points) when one
     polygon changed, ``polygons_edited`` ({index: new points}) when several
     did.
+
+    Points of shown polygons at one position (within ``lp.SHARED_POINT_PX``)
+    are one shared point, with a round handle. A click selects all of them,
+    so that dragging, nudging and deleting act on all of them; an Alt+press
+    selects and drags only the point of the polygon pressed into, which is
+    then no longer shared. A double click on an edge that several polygons
+    share adds the point to all of them.
 
     A right click on a polygon asks for its menu (``polygon_context``: the
     polygon, the point under the click or -1, and the screen position); with
@@ -465,6 +608,16 @@ class LayerCanvas(QGraphicsView):
         cursor_pen.setCosmetic(True)
         self.cursor_item.setPen(cursor_pen)
         self.cursor_item.hide()
+        # Where a Draw click would snap to (follow edges).
+        self.snap_item = QGraphicsEllipseItem(-6.0, -6.0, 12.0, 12.0)
+        self.snap_item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True
+        )
+        snap_pen = QPen(QColor(255, 255, 255, 240), 2.0)
+        snap_pen.setCosmetic(True)
+        self.snap_item.setPen(snap_pen)
+        self.snap_item.setZValue(29.0)
+        self.snap_item.hide()
         for item in (
             self.pixmap_item,
             self.detail_item,
@@ -475,6 +628,7 @@ class LayerCanvas(QGraphicsView):
             self.rubber_item,
             self.band_item,
             self.cursor_item,
+            self.snap_item,
         ):
             self.scene().addItem(item)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -507,12 +661,25 @@ class LayerCanvas(QGraphicsView):
         self._polygon_colors: dict[int, QColor] = {}
         self._polygon_items: list[QGraphicsPathItem] = []
         # Point handles of each polygon (Edit tool only).
-        self._handle_items: list[list[QGraphicsRectItem]] = []
+        self._handle_items: list[list[QGraphicsItem]] = []
         self._draft: list[tuple[float, float]] = []
-        self._draft_handles: list[QGraphicsRectItem] = []
+        self._draft_handles: list[QGraphicsItem] = []
+        # The points clicked for the polygon being drawn; _draft holds them
+        # with the outline points followed between them.
+        self._clicks: list[_DraftPoint] = []
+        # Draw snaps onto and follows the edges of shown polygons.
+        self.follow_edges = True
+        # Set only while polygon_finished is emitted (see the class notes).
+        self.finished_outline_points: dict[int, list[tuple[float, float]]] = {}
+        # The last viewport position over the canvas while drawing, and whether
+        # Alt was held, for the preview.
+        self._draw_hover: tuple[QPointF, bool] | None = None
         # Edit tool: the selected points as (polygon index, point index), a
         # drag of them in progress and where a rubber band started (viewport).
         self._selection: set[tuple[int, int]] = set()
+        # Shared points of the shown polygons: the (polygon, point) indices of
+        # each point's shared point.
+        self._shared: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
         self._drag: _PointDrag | None = None
         self._band_origin: QPointF | None = None
         # Layers whose polygons and strokes are not shown (display only).
@@ -691,6 +858,7 @@ class LayerCanvas(QGraphicsView):
             self.cancel_polygon()
             self._end_drag()
             self._cancel_band()
+            self.snap_item.hide()
         self.stroke_item.setVisible(marks)
         self.active_item.setVisible(marks)
         for item, polygon in zip(self._polygon_items, self._polygons):
@@ -723,6 +891,7 @@ class LayerCanvas(QGraphicsView):
         }
         for item, polygon in zip(self._polygon_items, self._polygons):
             item.setVisible(self._marks_visible and polygon.layer_id not in hidden)
+        self._refresh_shared()
         self._update_handles()
         self._draw_strokes()
 
@@ -895,12 +1064,14 @@ class LayerCanvas(QGraphicsView):
                 self._polygon_items.append(item)
         else:
             self._polygon_items = []
+        self._refresh_shared()
         self._update_handles()
 
     def _handle(
-        self, point: QPointF, color: QColor, *, size: float = 7.0
-    ) -> QGraphicsRectItem:
-        item = QGraphicsRectItem(-size / 2.0, -size / 2.0, size, size)
+        self, point: QPointF, color: QColor, *, size: float = 7.0, rounded: bool = False
+    ) -> QGraphicsRectItem | QGraphicsEllipseItem:
+        shape = QGraphicsEllipseItem if rounded else QGraphicsRectItem
+        item = shape(-size / 2.0, -size / 2.0, size, size)
         item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
         item.setPos(point)
         pen = QPen(QColor(20, 20, 20, 230), 1.0)
@@ -912,15 +1083,27 @@ class LayerCanvas(QGraphicsView):
         return item
 
     def _style_handle(
-        self, item: QGraphicsRectItem, color: QColor, selected: bool
+        self,
+        item: QGraphicsRectItem | QGraphicsEllipseItem,
+        color: QColor,
+        selected: bool,
+        shared: bool = False,
     ) -> None:
-        """A point handle in its layer's colour; larger and white when selected."""
+        """A point handle in its layer's colour; larger and white when selected.
+
+        A shared point's handle is round, a little larger, with a white rim.
+        """
 
         size = _SELECTED_HANDLE_PX if selected else _HANDLE_PX
+        if shared and not selected:
+            size = _SHARED_HANDLE_PX
         item.setRect(-size / 2.0, -size / 2.0, size, size)
-        pen = QPen(
-            QColor(20, 20, 20, 255 if selected else 230), 2.0 if selected else 1.0
-        )
+        if shared and not selected:
+            pen = QPen(QColor(255, 255, 255, 240), 1.5)
+        else:
+            pen = QPen(
+                QColor(20, 20, 20, 255 if selected else 230), 2.0 if selected else 1.0
+            )
         pen.setCosmetic(True)
         item.setPen(pen)
         item.setBrush(QColor(255, 255, 255) if selected else QColor(color))
@@ -954,8 +1137,11 @@ class LayerCanvas(QGraphicsView):
             color = QColor(self._polygon_colors.get(polygon.layer_id, "#ffffff"))
             handles = []
             for vertex, (row, col) in enumerate(points):
-                item = self._handle(self.raw_to_scene(row, col), color)
-                self._style_handle(item, color, (index, vertex) in self._selection)
+                shared = (index, vertex) in self._shared
+                item = self._handle(self.raw_to_scene(row, col), color, rounded=shared)
+                self._style_handle(
+                    item, color, (index, vertex) in self._selection, shared
+                )
                 handles.append(item)
             self._handle_items.append(handles)
 
@@ -976,6 +1162,7 @@ class LayerCanvas(QGraphicsView):
                 self._handle_items[index][vertex],
                 color,
                 (index, vertex) in self._selection,
+                (index, vertex) in self._shared,
             )
 
     def _hit_vertex(self, position: QPointF) -> tuple[int, int] | None:
@@ -1045,6 +1232,59 @@ class LayerCanvas(QGraphicsView):
             index = self._hit_edge(position)
         return None if index is None else (index, -1)
 
+    # ------------------------------------------------------ shared points
+
+    def _refresh_shared(self) -> None:
+        """Find the shared points of the shown polygons."""
+
+        shown = {
+            index: polygon.points
+            for index, polygon in enumerate(self._polygons)
+            if polygon.layer_id not in self._hidden_layers
+        }
+        self._shared = {}
+        for group in lp.shared_points(shown):
+            members = tuple(group)
+            for member in members:
+                self._shared[member] = members
+
+    def shared_with(self, index: int, vertex: int) -> list[tuple[int, int]]:
+        """The (polygon, point) indices of a shown polygon's point and of the
+        points it is shared with (only itself when it is not shared)."""
+
+        point = (int(index), int(vertex))
+        return list(self._shared.get(point, (point,)))
+
+    def _with_shared(self, points: Iterable[tuple[int, int]]) -> set[tuple[int, int]]:
+        chosen: set[tuple[int, int]] = set()
+        for index, vertex in points:
+            chosen.update(self.shared_with(index, vertex))
+        return chosen
+
+    def _pressed_point(
+        self, hit: tuple[int, int], position: QPointF
+    ) -> tuple[int, int]:
+        """Of a shared point, the point of the polygon pressed into: the
+        smallest shown polygon that contains the viewport position, else the
+        polygon of the selected layer, else the point hit."""
+
+        members = self.shared_with(*hit)
+        if len(members) < 2:
+            return hit
+        scene_point = self.mapToScene(position.toPoint())
+        inside = [
+            member
+            for member in members
+            if member[0] < len(self._polygon_items)
+            and self._polygon_items[member[0]].path().contains(scene_point)
+        ]
+        if inside:
+            return min(inside, key=lambda member: self._polygons[member[0]].area())
+        for member in members:
+            if self._polygons[member[0]].layer_id == self.layer_id:
+                return member
+        return hit
+
     # ---------------------------------------------------- selecting points
 
     @property
@@ -1089,13 +1329,22 @@ class LayerCanvas(QGraphicsView):
         """The selection as it will be once these points of polygon ``index``
         are removed: they leave it, and later points of that polygon move up."""
 
-        removed = {int(vertex) for vertex in vertices}
+        return self.selection_without_points((index, vertex) for vertex in vertices)
+
+    def selection_without_points(
+        self, points: Iterable[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """The selection as it will be once these (polygon, point) points are
+        removed: they leave it, and later points of their polygons move up."""
+
+        removed: dict[int, set[int]] = {}
+        for index, vertex in points:
+            removed.setdefault(int(index), set()).add(int(vertex))
         kept = []
         for polygon, vertex in self._selection:
-            if polygon != index:
-                kept.append((polygon, vertex))
-            elif vertex not in removed:
-                earlier = sum(1 for number in removed if number < vertex)
+            gone = removed.get(polygon, set())
+            if vertex not in gone:
+                earlier = sum(1 for number in gone if number < vertex)
                 kept.append((polygon, vertex - earlier))
         return sorted(kept)
 
@@ -1239,7 +1488,8 @@ class LayerCanvas(QGraphicsView):
 
     def _insert_point_at(self, position: QPointF) -> bool:
         """Add a point on the polygon edge under a viewport position (not on a
-        point) and select it."""
+        point), also in the shown polygons that share that edge, and select
+        it."""
 
         if self._hit_vertex(position) is not None:
             return False
@@ -1247,16 +1497,26 @@ class LayerCanvas(QGraphicsView):
         if index is None:
             return False
         row, col = self.scene_to_raw(self.mapToScene(position.toPoint()))
-        points, inserted = insert_point_on_nearest_edge(
-            self._polygons[index].points, row, col
-        )
-        if inserted < 0:
+        shown = {
+            number: polygon.points
+            for number, polygon in enumerate(self._polygons)
+            if polygon.layer_id not in self._hidden_layers
+        }
+        added = insert_point_on_shared_edge(shown, index, row, col)
+        if not added:
             return False
-        self._emit_edits({index: points})
-        if index < len(self._polygons) and list(self._polygons[index].points) == points:
-            self.set_selection([(index, inserted)])
-            return True
-        return False
+        self._emit_edits(
+            {number: points for number, (points, _vertex) in added.items()}
+        )
+        applied = [
+            (number, vertex)
+            for number, (points, vertex) in added.items()
+            if number < len(self._polygons)
+            and list(self._polygons[number].points) == points
+        ]
+        if applied:
+            self.set_selection(applied)
+        return bool(applied)
 
     def _edit_press(self, event: Any) -> None:
         """A left press with the Edit tool: select points, then drag them or
@@ -1274,10 +1534,19 @@ class LayerCanvas(QGraphicsView):
             self._band_origin = QPointF(position)
             return
         selection = set(self._selection)
-        if extend:
-            selection ^= {hit}
-        elif hit not in selection:
+        if event.modifiers() & _ALONE:
+            # Only the pressed polygon's point, to move it off a shared point.
+            hit = self._pressed_point(hit, position)
             selection = {hit}
+        else:
+            # A shared point is selected, and moves, in all its polygons.
+            members = set(self.shared_with(*hit))
+            if extend:
+                selection = (
+                    selection - members if members <= selection else selection | members
+                )
+            elif not members <= selection:
+                selection = members
         self.set_selection(selection)
         if hit in self._selection:
             self._start_drag(position)
@@ -1315,14 +1584,14 @@ class LayerCanvas(QGraphicsView):
         self._cancel_band()
         if not dragged:
             return
-        chosen = set(self._selection)
+        chosen: set[tuple[int, int]] = set()
         for index, polygon in enumerate(self._polygons):
             if polygon.layer_id in self._hidden_layers:
                 continue
             for vertex, (row, col) in enumerate(polygon.points):
                 if rect.contains(self.raw_to_scene(row, col)):
                     chosen.add((index, vertex))
-        self.set_selection(chosen)
+        self.set_selection(set(self._selection) | self._with_shared(chosen))
 
     def _cancel_band(self) -> None:
         self._band_origin = None
@@ -1381,7 +1650,15 @@ class LayerCanvas(QGraphicsView):
             pen.setStyle(Qt.PenStyle.DashLine)
         return pen
 
-    def _render_draft(self, cursor: QPointF | None = None) -> None:
+    def _render_draft(
+        self,
+        cursor: QPointF | None = None,
+        way: Sequence[tuple[float, float]] = (),
+    ) -> None:
+        """Draw the polygon being drawn, and a dashed line from its last point
+        to the cursor, along ``way`` (raw points) when the next click would
+        follow an outline, and back to its first point."""
+
         for item in self._draft_handles:
             self.scene().removeItem(item)
         self._draft_handles = []
@@ -1398,41 +1675,295 @@ class LayerCanvas(QGraphicsView):
         rubber = QPainterPath()
         if cursor is not None:
             rubber.moveTo(scene_points[-1])
+            for row, col in way:
+                rubber.lineTo(self.raw_to_scene(row, col))
             rubber.lineTo(cursor)
             if len(scene_points) >= 2:
                 rubber.lineTo(scene_points[0])
         self.rubber_item.setPen(self._draft_pen(dashed=True))
         self.rubber_item.setPath(rubber)
-        for index, point in enumerate(scene_points):
-            # The first point is larger: clicking it closes the polygon.
+        for number, click in enumerate(self._clicks):
+            for row, col in click.followed():
+                self._draft_handles.append(
+                    self._handle(
+                        self.raw_to_scene(row, col),
+                        self.layer_color,
+                        size=_FOLLOWED_HANDLE_PX,
+                        rounded=True,
+                    )
+                )
+            # The first point is larger: clicking it closes the polygon. A
+            # point that snapped onto a polygon is round.
+            size = 10.0 if number == 0 else 7.0
             self._draft_handles.append(
-                self._handle(point, self.layer_color, size=10.0 if index == 0 else 7.0)
+                self._handle(
+                    self.raw_to_scene(*click.point),
+                    self.layer_color,
+                    size=size + 2.0 if click.snapped else size,
+                    rounded=click.snapped,
+                )
             )
 
-    def _add_draft_point(self, scene_point: QPointF) -> None:
+    def _update_draft(self) -> None:
+        """The polygon's points: the clicked points with the outline points
+        followed between them."""
+
+        self._draft = [
+            point
+            for click in self._clicks
+            for point in (*click.followed(), click.point)
+        ]
+
+    def set_follow_edges(self, follow: bool) -> None:
+        """Whether Draw snaps onto, and follows, the edges of shown polygons."""
+
+        self.follow_edges = bool(follow)
+        self._refresh_preview()
+
+    def _shown_polygons(self) -> list[tuple[int, lp.Polygon]]:
+        return [
+            (index, polygon)
+            for index, polygon in enumerate(self._polygons)
+            if polygon.layer_id not in self._hidden_layers
+        ]
+
+    def _viewport_points(self, points: Sequence[tuple[float, float]]) -> np.ndarray:
+        """Viewport (x, y) of raw (row, col) points, one row per point."""
+
+        raw = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        scale_rows, scale_cols = self._scale()
+        x = (raw[:, 1] + 0.5) * scale_cols - 0.5
+        y = (raw[:, 0] + 0.5) * scale_rows - 0.5
+        transform = self.viewportTransform()
+        return np.column_stack(
+            (
+                transform.m11() * x + transform.m21() * y + transform.dx(),
+                transform.m12() * x + transform.m22() * y + transform.dy(),
+            )
+        )
+
+    def snap_point(self, position: QPointF) -> tuple[float, float] | None:
+        """Where a Draw click at a viewport position snaps to (raw row, col).
+
+        The nearest point of a shown polygon within the point-hit distance,
+        else the nearest position on an edge of a shown polygon within that
+        distance; None when there is neither.
+        """
+
+        target = np.asarray([position.x(), position.y()], dtype=np.float64)
+        shown = []
+        for _index, polygon in self._shown_polygons():
+            points = np.asarray(polygon.points, dtype=np.float64).reshape(-1, 2)
+            if len(points):
+                shown.append((points, self._viewport_points(points)))
+        best: tuple[float, tuple[float, float]] | None = None
+        for points, spots in shown:
+            distance = np.hypot(spots[:, 0] - target[0], spots[:, 1] - target[1])
+            nearest = int(np.argmin(distance))
+            if distance[nearest] <= _VERTEX_HIT_PX and (
+                best is None or distance[nearest] < best[0]
+            ):
+                best = (float(distance[nearest]), tuple(map(float, points[nearest])))
+        if best is not None:
+            return best[1]
+        for points, spots in shown:
+            if len(points) < 2:
+                continue
+            delta = np.roll(spots, -1, axis=0) - spots
+            length2 = np.einsum("ij,ij->i", delta, delta)
+            along = np.einsum("ij,ij->i", target - spots, delta)
+            fraction = np.clip(along / np.maximum(length2, 1e-12), 0.0, 1.0)
+            near = spots + fraction[:, None] * delta
+            distance = np.hypot(near[:, 0] - target[0], near[:, 1] - target[1])
+            edge = int(np.argmin(distance))
+            if distance[edge] <= _VERTEX_HIT_PX and (
+                best is None or distance[edge] < best[0]
+            ):
+                start, end = points[edge], points[(edge + 1) % len(points)]
+                raw = start + fraction[edge] * (end - start)
+                best = (float(distance[edge]), (float(raw[0]), float(raw[1])))
+        return None if best is None else best[1]
+
+    def _outline_places(
+        self, point: tuple[float, float]
+    ) -> list[tuple[int, int, float]]:
+        """Shown polygons whose outline passes through a raw point (within
+        ``lp.SHARED_POINT_PX``): (polygon, edge, fraction) per polygon, with
+        fraction 0 on the edge's first point."""
+
+        row, col = point
+        places = []
+        for index, polygon in self._shown_polygons():
+            points = np.asarray(polygon.points, dtype=np.float64)
+            if len(points) < 2:
+                continue
+            distance = np.hypot(points[:, 0] - row, points[:, 1] - col)
+            vertex = int(np.argmin(distance))
+            if distance[vertex] <= lp.SHARED_POINT_PX:
+                places.append((index, vertex, 0.0))
+                continue
+            delta = np.roll(points, -1, axis=0) - points
+            length2 = np.einsum("ij,ij->i", delta, delta)
+            along = (row - points[:, 0]) * delta[:, 0]
+            along += (col - points[:, 1]) * delta[:, 1]
+            fraction = np.clip(along / np.maximum(length2, 1e-12), 0.0, 1.0)
+            near = points + fraction[:, None] * delta
+            distance = np.hypot(near[:, 0] - row, near[:, 1] - col)
+            edge = int(np.argmin(distance))
+            if distance[edge] <= lp.SHARED_POINT_PX and 0.0 < fraction[edge] < 1.0:
+                places.append((index, edge, float(fraction[edge])))
+        return places
+
+    def _ways_between(
+        self, start: tuple[float, float], end: tuple[float, float]
+    ) -> list[list[tuple[float, float]]]:
+        """Ways round the outline of a shown polygon through both raw points,
+        as the outline points passed, shortest first; empty when no shown
+        polygon's outline passes through both."""
+
+        ends = {
+            index: (edge, fraction)
+            for index, edge, fraction in self._outline_places(end)
+        }
+        found: dict[tuple[tuple[float, float], ...], list[tuple[float, float]]] = {}
+        for index, edge, fraction in self._outline_places(start):
+            if index not in ends:
+                continue
+            outline = self._polygons[index].points
+            for way in _ways_round(outline, (edge, fraction), ends[index]):
+                found.setdefault(tuple(way), way)
+
+        def length(way: Sequence[tuple[float, float]]) -> float:
+            points = [start, *way, end]
+            return sum(
+                math.hypot(second[0] - first[0], second[1] - first[1])
+                for first, second in zip(points, points[1:])
+            )
+
+        return sorted(found.values(), key=length)
+
+    def _add_draft_point(self, scene_point: QPointF, *, free: bool = False) -> None:
+        """Add a clicked point to the polygon being drawn.
+
+        With ``follow_edges`` and without ``free`` it snaps onto a shown
+        polygon, and after a point that snapped onto the same outline the
+        polygon follows the outline to it.
+        """
+
         raw = self.scene_to_raw(self._clamped_scene(scene_point))
+        snapped = None
+        if self.follow_edges and not free:
+            snapped = self.snap_point(self.viewportTransform().map(scene_point))
+        if snapped is not None:
+            raw = snapped
+            scene_point = self.raw_to_scene(*raw)
         if self._draft:
             last = self.mapFromScene(self.raw_to_scene(*self._draft[-1]))
             spot = self.mapFromScene(scene_point)
             if math.hypot(last.x() - spot.x(), last.y() - spot.y()) < 2.0:
                 return
-        self._draft.append(raw)
+        click = _DraftPoint(raw, snapped is not None)
+        if click.snapped and self._clicks and self._clicks[-1].snapped:
+            click.ways = self._ways_between(self._clicks[-1].point, raw)
+        self._clicks.append(click)
+        self._update_draft()
         self._render_draft(scene_point)
         self.draft_changed.emit(len(self._draft))
 
-    def remove_last_point(self) -> None:
+    def switch_way(self, step: int = 1) -> bool:
+        """Follow the outline the other way round to the last clicked point
+        (Tab; Shift+Tab goes back). False when there is no other way."""
+
+        click = self._clicks[-1] if self._clicks else None
+        if click is None or len(click.ways) < 2:
+            return False
+        click.way = (click.way + int(step)) % len(click.ways)
+        self._update_draft()
+        self._refresh_preview()
+        self.draft_changed.emit(len(self._draft))
+        return True
+
+    def _hover_draw(self, position: QPointF | None, *, free: bool = False) -> None:
+        """Show where a Draw click at a viewport position would go: a ring
+        where it would snap, and the dashed line from the last point, along
+        the outline the click would follow."""
+
+        self._draw_hover = None if position is None else (QPointF(position), bool(free))
+        snapped = None
+        if position is not None and self.follow_edges and not free:
+            snapped = self.snap_point(position)
+        if snapped is None:
+            self.snap_item.hide()
+        else:
+            self.snap_item.setPos(self.raw_to_scene(*snapped))
+            self.snap_item.show()
         if not self._draft:
             return
-        self._draft.pop()
+        if position is None:
+            self._render_draft()
+        elif snapped is None:
+            self._render_draft(self._clamped_scene(self.mapToScene(position.toPoint())))
+        else:
+            way: list[tuple[float, float]] = []
+            if self._clicks and self._clicks[-1].snapped:
+                ways = self._ways_between(self._clicks[-1].point, snapped)
+                way = ways[0] if ways else []
+            self._render_draft(self.raw_to_scene(*snapped), way)
+
+    def _refresh_preview(self) -> None:
+        if self._draw_hover is not None and self._drawing():
+            position, free = self._draw_hover
+            self._hover_draw(position, free=free)
+        else:
+            self.snap_item.hide()
+            self._render_draft()
+
+    def remove_last_point(self) -> None:
+        """Remove the last clicked point, with the outline followed to it."""
+
+        if not self._clicks:
+            return
+        self._clicks.pop()
+        self._update_draft()
         self._render_draft()
         self.draft_changed.emit(len(self._draft))
 
     def cancel_polygon(self) -> None:
-        had = bool(self._draft)
-        self._draft = []
+        had = bool(self._clicks)
+        self._clicks = []
+        self._update_draft()
         self._render_draft()
         if had:
             self.draft_changed.emit(0)
+
+    def _outline_points(self) -> dict[int, list[tuple[float, float]]]:
+        """The shown polygons that get the new polygon's points that snapped
+        onto their edges: {index: new points}."""
+
+        added: dict[int, list[tuple[int, float, tuple[float, float]]]] = {}
+        for click in self._clicks:
+            if not click.snapped:
+                continue
+            for index, edge, fraction in self._outline_places(click.point):
+                if fraction > 0.0:
+                    added.setdefault(index, []).append((edge, fraction, click.point))
+        changes = {}
+        for index, rows in added.items():
+            points = [
+                (float(row), float(col)) for row, col in self._polygons[index].points
+            ]
+            done: set[tuple[int, float]] = set()
+            # From the last edge position back, so that earlier edges keep
+            # their indices.
+            for edge, fraction, point in sorted(
+                rows, key=lambda row: row[:2], reverse=True
+            ):
+                if (edge, round(fraction, 9)) in done:
+                    continue
+                done.add((edge, round(fraction, 9)))
+                points.insert(edge + 1, (float(point[0]), float(point[1])))
+            changes[index] = points
+        return changes
 
     def close_polygon(self) -> bool:
         """Finish the polygon being drawn; False when it has too few points."""
@@ -1449,10 +1980,16 @@ class LayerCanvas(QGraphicsView):
         if polygon.area() < 1.0:
             self.notice.emit("The polygon encloses no area.")
             return False
-        self._draft = []
+        outline = self._outline_points()
+        self._clicks = []
+        self._update_draft()
         self._render_draft()
         self.draft_changed.emit(0)
-        self.polygon_finished.emit(polygon)
+        self.finished_outline_points = outline
+        try:
+            self.polygon_finished.emit(polygon)
+        finally:
+            self.finished_outline_points = {}
         return True
 
     def _near_first_point(self, position: QPointF) -> bool:
@@ -1546,6 +2083,8 @@ class LayerCanvas(QGraphicsView):
             self.cancel_polygon()
             # Only the Edit tool has selected points.
             self.clear_selection()
+            self.snap_item.hide()
+            self._draw_hover = None
         self.tool = tool
         self._cancel_stroke()
         self.setDragMode(
@@ -1727,7 +2266,7 @@ class LayerCanvas(QGraphicsView):
                 event.accept()
                 return
             if self.pixmap_item.boundingRect().contains(point) or self._draft:
-                self._add_draft_point(point)
+                self._add_draft_point(point, free=bool(event.modifiers() & _ALONE))
                 event.accept()
                 return
         if (
@@ -1789,8 +2328,10 @@ class LayerCanvas(QGraphicsView):
             self._move_band(event.position())
             event.accept()
             return
-        if self._draft and self._drawing():
-            self._render_draft(self._clamped_scene(point))
+        if self._drawing():
+            self._hover_draw(event.position(), free=bool(event.modifiers() & _ALONE))
+        else:
+            self.snap_item.hide()
         if self._points and self._painting():
             self._extend(self._clamped_scene(point))
             self._update_cursor(point)
@@ -1850,6 +2391,21 @@ class LayerCanvas(QGraphicsView):
                 hit[0], hit[1], self.viewport().mapToGlobal(event.position().toPoint())
             )
 
+    def event(self, event: QEvent) -> bool:
+        # While a polygon is drawn with Follow edges, Tab (Shift+Tab back)
+        # takes the other way round the outline instead of moving the
+        # keyboard focus.
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and self._clicks
+            and self.follow_edges
+            and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
+        ):
+            self.switch_way(-1 if event.key() == Qt.Key.Key_Backtab else 1)
+            event.accept()
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event: Any) -> None:
         if self._draft:
             key = event.key()
@@ -1872,6 +2428,8 @@ class LayerCanvas(QGraphicsView):
 
     def leaveEvent(self, event: Any) -> None:
         self.cursor_item.hide()
+        self.snap_item.hide()
+        self._draw_hover = None
         if self._draft:
             self._render_draft()
         super().leaveEvent(event)
@@ -2243,12 +2801,19 @@ class LayerPainterView(QWidget):
                 "point, right click or Enter closes the polygon. Rough outlines "
                 "are enough; the boundaries are placed within the snap distance "
                 "(step 3). Draw only adds new polygons and never moves a point "
-                "that is already there. To change existing polygons, use Edit "
-                "(V): click a point to select it and drag to move it, Ctrl+click "
-                "to select more points, or drag on empty space to select the "
-                "points in a rectangle. Delete removes the selected points, the "
-                "arrow keys move them a little (Shift: more) and Esc clears the "
-                "selection. Double-click an edge to add a point there. Right-"
+                "that is already there. With Follow edges, a click near a point "
+                "or edge of a shown polygon snaps onto it, and between two such "
+                "clicks the new polygon follows that polygon's outline (Tab: the "
+                "other way round; Alt+click: a free point), so that neighbouring "
+                "layers share their boundary. To change existing polygons, use "
+                "Edit (V): click a point to select it and drag to move it, "
+                "Ctrl+click to select more points, or drag on empty space to "
+                "select the points in a rectangle. A point that several polygons "
+                "share has a round handle and moves in all of them; Alt+drag "
+                "moves it in the polygon pressed into only. Delete removes the "
+                "selected points, the arrow keys move them a little (Shift: "
+                "more) and Esc clears the selection. Double-click an edge to add "
+                "a point there. Right-"
                 "click a polygon to add or remove a point, delete the polygon or "
                 "give it to another layer. The brush (B) paints strokes, for "
                 "example as corrections. Mark the ColorChecker, tape and fittings "
@@ -2395,6 +2960,16 @@ class LayerPainterView(QWidget):
         )
         self.detail.currentIndexChanged.connect(self._settings_changed)
         snap_row.addWidget(self.detail)
+        snap_row.addSpacing(10)
+        shared_label = QLabel("Classifier may move shared edges")
+        shared_label.setToolTip(_MOVE_SHARED_TIP)
+        snap_row.addWidget(shared_label)
+        self.move_shared_edges = QComboBox()
+        self.move_shared_edges.addItem("Yes", True)
+        self.move_shared_edges.addItem("No", False)
+        self.move_shared_edges.setToolTip(_MOVE_SHARED_TIP)
+        self.move_shared_edges.currentIndexChanged.connect(self._settings_changed)
+        snap_row.addWidget(self.move_shared_edges)
         snap_row.addStretch(1)
         layout.addLayout(snap_row)
         self.proposal_summary = QLabel()
@@ -2599,6 +3174,13 @@ class LayerPainterView(QWidget):
             self.tool_buttons[key] = button
             tools.addWidget(button)
         self.tool_group.setExclusive(True)
+        tools.addSpacing(8)
+        self.follow_edges = QCheckBox("Follow edges")
+        self.follow_edges.setToolTip(_FOLLOW_EDGES_TIP)
+        self.follow_edges.setChecked(self._stored_follow_edges())
+        self.canvas.set_follow_edges(self.follow_edges.isChecked())
+        self.follow_edges.toggled.connect(self._follow_edges_toggled)
+        tools.addWidget(self.follow_edges)
         tools.addSpacing(8)
         tools.addWidget(QLabel("Brush"))
         self.brush_size = QSlider(Qt.Orientation.Horizontal)
@@ -3405,6 +3987,22 @@ class LayerPainterView(QWidget):
             settings.setValue(key, str(path))
         settings.sync()
 
+    def _stored_follow_edges(self) -> bool:
+        """The user's last Follow edges choice; on when none is stored."""
+
+        value = QSettings(*_BACKGROUND_SETTINGS).value(_FOLLOW_EDGES_KEY, True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off"}
+        return bool(value)
+
+    def _follow_edges_toggled(self, checked: bool) -> None:
+        self.canvas.set_follow_edges(checked)
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        settings.setValue(_FOLLOW_EDGES_KEY, bool(checked))
+        settings.sync()
+        if self.canvas.drafting():
+            self._draft_changed(len(self.canvas.draft_points))
+
     def _restore_background(self) -> None:
         """Load the background photo last chosen for this run (not shown)."""
 
@@ -3420,7 +4018,14 @@ class LayerPainterView(QWidget):
 
     def _sync_settings(self) -> None:
         session = self.session
-        widgets = (self.smoothing, self.min_region, self.snap, self.detail, self.unit)
+        widgets = (
+            self.smoothing,
+            self.min_region,
+            self.snap,
+            self.detail,
+            self.move_shared_edges,
+            self.unit,
+        )
         for widget in widgets:
             widget.blockSignals(True)
         try:
@@ -3431,6 +4036,9 @@ class LayerPainterView(QWidget):
                 self.min_region.setValue(float(session.min_region_cm2))
                 self.snap.setValue(float(session.snap_mm))
                 self.detail.setCurrentIndex(max(0, self.detail.findData(session.detail)))
+                self.move_shared_edges.setCurrentIndex(
+                    0 if session.move_shared_edges else 1
+                )
                 self.unit.setCurrentIndex(
                     max(0, self.unit.findData(session.permeability_unit))
                 )
@@ -3447,6 +4055,7 @@ class LayerPainterView(QWidget):
             self.min_region,
             self.snap,
             self.detail,
+            self.move_shared_edges,
             self.unit,
             self.add_facies_button,
             self.remove_facies_button,
@@ -4003,9 +4612,19 @@ class LayerPainterView(QWidget):
         if self.session is None:
             return
         snapshot = self._snapshot()
+        # Points drawn onto edges of other polygons become their points too,
+        # in the same change (Follow edges).
+        outline = dict(self.canvas.finished_outline_points)
         try:
+            for index, points in sorted(outline.items()):
+                if 0 <= index < len(self.session.polygons):
+                    layer_id = self.session.polygons[index].layer_id
+                    self.session.replace_polygon(
+                        index, lp.Polygon(layer_id, list(points))
+                    )
             self.session.add_polygon(polygon)
         except ValueError as error:
+            self._restore(snapshot)
             self._canvas_notice(str(error))
             return
         self._undo_stack.append(snapshot)
@@ -4084,19 +4703,36 @@ class LayerPainterView(QWidget):
         self._after_mark_change()
 
     def remove_polygon_point(self, index: int, vertex: int) -> None:
+        """Remove a polygon point, from every shown polygon that shares it, as
+        one change; a polygon that would keep fewer than three points keeps
+        it."""
+
         if self.session is None or not 0 <= index < len(self.session.polygons):
             return
         polygon = self.session.polygons[index]
         if len(polygon.points) <= 3 or not 0 <= vertex < len(polygon.points):
             return
-        points = [
-            point for number, point in enumerate(polygon.points) if number != vertex
-        ]
+        removed: dict[int, set[int]] = {}
+        for number, shared in self.canvas.shared_with(index, vertex):
+            if 0 <= number < len(self.session.polygons):
+                removed.setdefault(number, set()).add(shared)
+        changes = {
+            number: [
+                point
+                for position, point in enumerate(self.session.polygons[number].points)
+                if position not in gone
+            ]
+            for number, gone in removed.items()
+            if len(self.session.polygons[number].points) - len(gone) >= 3
+        }
         # The other selected points keep their selection.
-        selection = self.canvas.selection_without(index, (vertex,))
-        self._polygon_edited(index, points)
-        if self.session.polygons[index].points == points:
+        selection = self.canvas.selection_without_points(
+            (number, shared) for number in changes for shared in removed[number]
+        )
+        if index in self._polygons_edited(changes):
             self.canvas.set_selection(selection)
+        if len(changes) < len(removed):
+            self._canvas_notice(_TOO_FEW_POINTS)
 
     def remove_selected_points(self) -> int:
         """Remove the points selected with the Edit tool, as one change to undo.
@@ -4118,16 +4754,22 @@ class LayerPainterView(QWidget):
 
         if self.session is None or not 0 <= index < len(self.session.polygons):
             return -1
-        points, inserted = insert_point_on_nearest_edge(
-            self.session.polygons[index].points, row, col
-        )
-        if inserted < 0:
+        # Shown polygons that share the edge get the point too.
+        shown = {
+            number: polygon.points
+            for number, polygon in enumerate(self.session.polygons)
+            if number == index or polygon.layer_id not in self.canvas.hidden_layers
+        }
+        added = insert_point_on_shared_edge(shown, index, row, col)
+        if not added:
             return -1
-        self._polygon_edited(index, points)
-        if self.session.polygons[index].points != points:
+        applied = self._polygons_edited(
+            {number: points for number, (points, _vertex) in added.items()}
+        )
+        if index not in applied:
             return -1  # refused; the notice says why
-        self.canvas.set_selection([(index, inserted)])
-        return inserted
+        self.canvas.set_selection([(number, added[number][1]) for number in applied])
+        return added[index][1]
 
     def _polygon_menu(self, index: int, vertex: int, position: QPoint) -> None:
         if self.session is None or not 0 <= index < len(self.session.polygons):
@@ -4177,9 +4819,10 @@ class LayerPainterView(QWidget):
 
     def _draft_changed(self, count: int) -> None:
         if count:
-            self.canvas_hint.setText(
-                _DRAFT_HINT.format(count=count, plural="s" if count != 1 else "")
-            )
+            hint = _DRAFT_HINT.format(count=count, plural="s" if count != 1 else "")
+            if self.canvas.follow_edges:
+                hint += _FOLLOW_HINT
+            self.canvas_hint.setText(hint)
         else:
             self.canvas_hint.setText(_CANVAS_HINT)
 
@@ -4612,6 +5255,9 @@ class LayerPainterView(QWidget):
         self.session.min_region_cm2 = float(self.min_region.value())
         self.session.snap_mm = float(self.snap.value())
         self.session.detail = str(self.detail.currentData() or "normal")
+        self.session.move_shared_edges = (
+            self.move_shared_edges.currentData() is not False
+        )
         self._mark_dirty()
         self._refresh_status()
 

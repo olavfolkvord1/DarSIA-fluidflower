@@ -205,12 +205,14 @@ def test_draw_shows_no_handles_and_a_click_on_a_point_adds_a_draft_point(view):
     corner = _at(canvas, 5.0, 35.0)
     assert canvas._hit_vertex(QPointF(corner)) == (0, 1)
     # Pressing on the existing point and moving the mouse drags nothing: the
-    # press adds the first point of a new polygon there.
+    # press adds the first point of a new polygon there, exactly on the
+    # existing point (Follow edges is on by default).
     _press(canvas, corner)
     _move(canvas, corner + QPoint(30, 20))
     _release(canvas, corner + QPoint(30, 20))
     assert len(canvas.draft_points) == 1
-    assert canvas.draft_points[0] == pytest.approx(_raw(canvas, corner))
+    assert canvas.draft_points[0] == pytest.approx(_raw(canvas, corner), abs=0.1)
+    assert canvas.draft_points[0] == (5.0, 35.0)
     assert view.session.polygons[0].points == POLYGON_A
     assert edits == [] and canvas.selected_points == []
     assert canvas._handle_items == []
@@ -224,7 +226,10 @@ def test_draw_shows_no_handles_and_a_click_on_a_point_adds_a_draft_point(view):
     assert view.session.polygons[0].points == POLYGON_A
     added = view.session.polygons[1]
     assert added.layer_id == 3 and len(added.points) == 4
-    assert added.points[1] == pytest.approx(_raw(canvas, _at(canvas, 30.0, 35.0)))
+    assert added.points[1] == pytest.approx(
+        _raw(canvas, _at(canvas, 30.0, 35.0)), abs=0.1
+    )
+    assert added.points[:2] == [(5.0, 35.0), (30.0, 35.0)]
     assert edits == [] and canvas._handle_items == []
 
 
