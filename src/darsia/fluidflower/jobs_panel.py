@@ -1223,8 +1223,11 @@ class JobsPanel(QWidget):
         worker.failed.connect(self._error)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
+        # No deleteLater for the worker. Deleted in its own thread, it needs the
+        # GIL while Qt holds a signal-slot lock (the Python QThread's
+        # disconnectNotify), and a GUI thread that holds the GIL and waits for
+        # that lock deadlocks (Q185). The *_closed slots drop its Python owner
+        # after wait(), which frees it in the GUI thread.
         thread.finished.connect(closed)
         thread.finished.connect(thread.deleteLater)
         thread.start()

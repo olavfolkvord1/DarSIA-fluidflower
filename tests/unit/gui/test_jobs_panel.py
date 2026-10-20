@@ -8,7 +8,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Signal
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
 from shiboken6 import isValid
@@ -95,6 +95,29 @@ def test_passive_navigation_reads_only_explicit_roots_no_creation_or_launch(pane
     )
     assert "recorded master" in widget.pause_button.toolTip()
     assert "Unknown" in widget.progress_label.text()
+
+
+def test_read_worker_is_freed_by_its_owner_in_the_gui_thread(panel, app):
+    """Q185: a call worker is never deleted in its own thread.
+
+    Deleted there, Qt calls the Python QThread's disconnectNotify under a
+    signal-slot lock, which needs the GIL. QTest.qWait keeps the GIL while it
+    deletes widgets that earlier tests left; it waited for that lock, and the
+    focused GUI run hung. The worker's Python owner frees it in the GUI thread.
+    """
+    widget, _ = panel
+    widget.set_context(
+        series_label="Local", jobs_provider=lambda: [dict(root="r", active=True)]
+    )
+    worker = widget._read_worker
+    wait(app, widget.can_close)  # The read retired and its thread has finished.
+    assert widget._read_worker is None
+    assert isValid(worker), "the call worker was deleted in its own thread"
+    watcher = QObject()
+    worker.destroyed.connect(watcher.deleteLater)
+    del worker  # The last owner lets go here, in the GUI thread.
+    QCoreApplication.sendPostedEvents(watcher, QEvent.DeferredDelete)
+    assert not isValid(watcher)
 
 
 def test_context_switch_discards_old_read_and_does_not_drop_new_registration(
