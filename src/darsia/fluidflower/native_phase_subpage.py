@@ -13,6 +13,9 @@ from darsia.fluidflower.pages.phase_interpretation.subpages.train_model import (
 class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
     def __init__(self, series_id="", project_root=None, *, step_options=None):
         super().__init__(series_id, project_root)
+        # The native steps scroll themselves; the standalone page's 700 px
+        # minimum would set the height of every page of the main window.
+        self.setMinimumHeight(0)
         self.step_options = dict(step_options or {})
         self.native_steps = None
         self.native_numbered_steps = True
@@ -34,9 +37,6 @@ class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
 
             studio = SharedPhaseModelTrainingPage()
             options = dict(self.step_options)
-            before_attach = options.pop("before_attach", None)
-            if before_attach is not None:
-                before_attach()
             if "normalisation" not in options:
                 from darsia.fluidflower.normalisation_step import NormalisationStep
 

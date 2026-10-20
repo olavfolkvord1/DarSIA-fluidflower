@@ -5,19 +5,20 @@ from pathlib import Path
 import tomllib
 import traceback
 
-from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .jobs_metadata import create_job_from_plan
-from .jobs_panel import JobsPanel
+from .jobs_panel import JobsPanel, NewAnalysisPage
 from .native_jobs_registry import JobsUIRegistry
 from .pipeline.job_queue import name
 from .store_map_ui import StoreAvailabilityPanel
@@ -28,8 +29,11 @@ class NativeJobsWorkspace(QWidget):
 
     Registration/selection is local UI state, not evidence that a scientific job
     was built for a series. Only the original B5 exact-plan admission can create
-    a job after the explicit dialog action.
+    a job after the explicit Create action. It shows two views (N141): the job
+    list ("jobs") and the New analysis page ("new_analysis").
     """
+
+    new_analysis_requested = Signal()
 
     def __init__(
         self,
@@ -73,6 +77,9 @@ class NativeJobsWorkspace(QWidget):
         self.association_note.setWordWrap(True)
         self.association_note.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.association_note)
+        self.jobs_view = QWidget()
+        jobs_layout = QVBoxLayout(self.jobs_view)
+        jobs_layout.setContentsMargins(0, 0, 0, 0)
         # Where jobs and plans come from, collapsed so the job list gets the page (N141).
         self.sources = QGroupBox("Sources")
         self.sources.setCheckable(True)
@@ -84,7 +91,7 @@ class NativeJobsWorkspace(QWidget):
         sources_layout.addWidget(self.sources_body)
         self.sources_body.setVisible(False)
         self.sources.toggled.connect(self.sources_body.setVisible)
-        layout.addWidget(self.sources)
+        jobs_layout.addWidget(self.sources)
         self.stores = store_panel_factory(self.sources_body)
         body_layout.addWidget(self.stores)
         actions = QHBoxLayout()
@@ -117,7 +124,15 @@ class NativeJobsWorkspace(QWidget):
                     inventory_provider=inventory_provider,
                 )
             )
-        layout.addWidget(self.panel, 1)
+        jobs_layout.addWidget(self.panel, 1)
+        self.new_analysis = NewAnalysisPage(self.panel)
+        self.panel.attach_new_analysis(self.new_analysis)
+        self.panel.new_analysis_requested.connect(self.new_analysis_requested)
+        self.views = QStackedWidget()
+        self.views.addWidget(self.jobs_view)
+        self.views.addWidget(self.new_analysis)
+        layout.addWidget(self.views, 1)
+        self.view = "jobs"
         self.panel.job_created.connect(self._job_created)
         self.panel.job_table.cellClicked.connect(self._job_clicked)
         self.panel.job_table.itemActivated.connect(
@@ -333,6 +348,21 @@ class NativeJobsWorkspace(QWidget):
                 self.refresh_registered()
         except Exception:
             self.status_label.setText(traceback.format_exc())
+
+    def show_view(self, name):
+        """Show the job list ("jobs") or the New analysis page ("new_analysis").
+
+        The New analysis page borrows the job toolbar's machine, backend and
+        workers choice and the resource advisor while it is shown.
+        """
+        if name not in ("jobs", "new_analysis"):
+            raise ValueError(f"Unknown Jobs view: {name}")
+        page = self.new_analysis if name == "new_analysis" else None
+        self.panel.place_target_controls(page)
+        if page is not None:
+            self.panel.prepare_new_analysis()
+        self.views.setCurrentWidget(page or self.jobs_view)
+        self.view = name
 
     def start_analysis(self):
         if self.series_root is None:

@@ -16,6 +16,15 @@ from darsia.fluidflower.series_paths import series_key
 from darsia.presets.workflows.results_folder import open_in_file_explorer
 
 
+# Rows of the native pages (N141) with no saved-output status of their own.
+# They get no status line rather than an invented "Not done".
+NO_STATUS_ROWS = {
+    ("phase_model", "normalisation"),
+    ("phase_model", "calibration_review"),
+    ("method", "use_for_series"),
+    ("jobs", "new_analysis"),
+}
+
 STATE_LABELS = {
     "done": "Done",
     "missing": "Not done",
@@ -101,6 +110,8 @@ class NativeWorkflowStatus:
                 continue
             for row in section._rows.values():
                 logical = (row.action, row.checkbox_id)
+                if logical in NO_STATUS_ROWS:
+                    continue
                 controls = QWidget(row)
                 vertical = QVBoxLayout(controls)
                 vertical.setContentsMargins(0, 0, 0, 0)

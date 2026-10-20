@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -170,29 +171,99 @@ class _CallWorker(QObject):
             self.failed.emit(traceback.format_exc())
 
 
-class StartAnalysisDialog(QDialog):
-    """Choose an already adopted saved execution plan and a fresh UNC job root."""
+START_ANALYSIS_NOTE = "Choose an already adopted, frozen execution-series plan. Create writes job files only; no worker is started and no image is computed."
+LEAN_NOTE = "Lean: same computation, fewer stored files. In the 39-frame test, Lean took 1.1 GB and Full took 13.6 GB."
 
-    def __init__(self, plans, parent=None, *, free_space=None):
-        super().__init__(parent)
-        self.setWindowTitle("Start analysis — create job metadata")
-        self.plans = deepcopy(list(plans))
-        self.free_space = deepcopy(free_space)
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            _label(
-                "Choose an already adopted, frozen execution-series plan. Create writes job files only; no worker is started and no image is computed."
-            )
+# Computed at (N144). Native is today's computation and the default. The coarse
+# grids are the placeholder of spec section 3.5 and wait for Olav's decision, so
+# they are offered disabled. storage_resolution.COMPUTING_RESOLUTIONS_MM takes
+# over from this tuple when N146 is integrated.
+COARSE_COMPUTING_MM = (0.5, 1.0)
+NOT_AVAILABLE_YET = "Not available yet"
+
+
+def computing_resolution_combo():
+    """The Computed at choice: native, and the coarse grids disabled."""
+    combo = QComboBox()
+    combo.addItem("Native (full resolution)", None)
+    for step in COARSE_COMPUTING_MM:
+        combo.addItem(f"{step:g} mm — {NOT_AVAILABLE_YET}", step)
+        item = combo.model().item(combo.count() - 1)
+        item.setEnabled(False)
+        item.setToolTip("Computing the phase-map method on a coarser grid waits for a decision.")
+    combo.setCurrentIndex(0)
+    combo.setToolTip("Native is today's computation. The coarse grids are not available yet.")
+    return combo
+
+
+def stored_not_finer(stored_mm, computed_mm):
+    """Stored cells may equal or exceed the computing grid, never be finer.
+
+    None stands for native, the finest grid, in both arguments.
+    """
+    if computed_mm is None:
+        return True
+    return stored_mm is not None and float(stored_mm) >= float(computed_mm)
+
+
+def read_plan_facts(plan, *, reader=None):
+    """The adopted plan's runs, images, precision and bound storage request.
+
+    The plan and its run configurations are read through the pipeline's own
+    byte-bound reader; nothing is computed or written. ``storage_mm`` holds one
+    value per run: None for native, else the stored cell size in millimetres.
+    """
+    if reader is None:
+        from .pipeline.series import read_series as reader
+    from .storage_resolution import resolution_mm
+
+    value, configurations, _bound = reader(
+        Path(plan["path"]), expected_sha256=plan["sha256"]
+    )
+    storage = []
+    for config in configurations:
+        request = config.get("storage")
+        storage.append(
+            resolution_mm(request.get("resolution_mm"))
+            if isinstance(request, dict)
+            else None
         )
-        form = QFormLayout()
+    job = value.get("job") or {}
+    return dict(
+        runs=[config.get("run") for config in configurations],
+        frames=sum(len(config.get("frames") or ()) for config in configurations),
+        precision=job.get("precision"),
+        storage_mm=storage,
+    )
+
+
+def stored_at_text(storage_mm):
+    """Stored at, as the adopted plan binds it for its runs (read-only)."""
+    labels = ["native" if step is None else f"{step:g} mm" for step in storage_mm]
+    distinct = list(dict.fromkeys(labels))
+    if not distinct:
+        return "Not bound: the plan has no runs."
+    if len(distinct) == 1:
+        return f"{distinct[0]}, bound in the adopted plan for all {len(labels)} runs (read-only)"
+    return "Differs per run: " + ", ".join(distinct) + ", bound in the adopted plan (read-only)"
+
+
+class StartAnalysisChoices(QObject):
+    """The plan, job name, fresh job folder and file profile chosen before Create.
+
+    The one implementation behind the New analysis page and the Start analysis
+    dialog (N141): the same controls, labels, default, estimate and choices.
+    """
+
+    changed = Signal()
+
+    def __init__(self, plans=(), host=None, *, free_space=None):
+        super().__init__(host)
+        self.host = host
+        self.plans, self.free_space, self._imported = [], None, []
         self.plan_combo = QComboBox()
-        for row in self.plans:
-            self.plan_combo.addItem(str(row.get("label") or row["path"]), row)
         self.name_edit, self.job_edit = QLineEdit(), QLineEdit()
         self.job_edit.setPlaceholderText(r"\\server\share\DarSIA\jobs\fresh-job-name")
-        form.addRow("Saved execution plan", self.plan_combo)
-        form.addRow("Job name", self.name_edit)
-        form.addRow("Fresh UNC job folder", self.job_edit)
         # The job's storage profile is chosen here, once, before any worker.
         self.profile_combo = QComboBox()
         self.profile_combo.addItem(
@@ -204,47 +275,50 @@ class StartAnalysisDialog(QDialog):
         self.profile_combo.setCurrentIndex(
             self.profile_combo.findData(DEFAULT_STORAGE_PROFILE)
         )
-        form.addRow("Storage profile", self.profile_combo)
-        layout.addLayout(form)
-        browse = QPushButton("Import saved execution plan…")
-        browse.clicked.connect(self._import_plan)
-        layout.addWidget(browse)
+        self.import_button = QPushButton("Import saved execution plan…")
+        self.import_button.clicked.connect(self._import_plan)
         self.binding_label = _label()
-        layout.addWidget(self.binding_label)
         self.estimate_label = _label()
-        layout.addWidget(self.estimate_label)
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
-        )
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "Create job files"
-        )
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
         self.plan_combo.currentIndexChanged.connect(self._update_binding)
         self.job_edit.textChanged.connect(self._update_binding)
         self.profile_combo.currentIndexChanged.connect(self._update_estimate)
+        self.set_plans(plans, free_space=free_space)
+
+    def set_plans(self, plans, *, free_space=None):
+        """Offer these plans, and those imported here, with the known free space."""
+        previous = (self.plan_combo.currentData() or {}).get("path")
+        self.plans = deepcopy(list(plans))
+        self.free_space = deepcopy(free_space)
+        listed = {row["path"] for row in self.plans}
+        with QSignalBlocker(self.plan_combo):
+            self.plan_combo.clear()
+            for row in self.plans + [r for r in self._imported if r["path"] not in listed]:
+                self.plan_combo.addItem(str(row.get("label") or row["path"]), row)
+            paths = [self.plan_combo.itemData(i)["path"] for i in range(self.plan_combo.count())]
+            self.plan_combo.setCurrentIndex(paths.index(previous) if previous in paths else 0)
         self._update_binding()
         self._update_estimate()
+
+    def ready(self):
+        """A plan and a fresh job folder are chosen, so Create can be offered."""
+        return bool(self.plan_combo.currentData()) and bool(self.job_edit.text().strip())
 
     def _update_estimate(self, *_):
         self.estimate_label.setText(
             choice_estimate_text(self.profile_combo.currentData(), self.free_space)
         )
+        self.changed.emit()
 
     def _update_binding(self, *_):
         plan = self.plan_combo.currentData() or {}
         self.binding_label.setText(
             f"Plan: {plan.get('path') or 'Not selected'}\nSHA256: {plan.get('sha256') or 'Not selected'}\nThe existing producer validates adoption, ordered runs and all scientific bindings."
         )
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
-            bool(plan) and bool(self.job_edit.text().strip())
-        )
+        self.changed.emit()
 
     def _import_plan(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Choose an existing adopted execution plan", "", "TOML (*.toml)"
+            self.host, "Choose an existing adopted execution plan", "", "TOML (*.toml)"
         )
         if not path:
             return
@@ -252,9 +326,10 @@ class StartAnalysisDialog(QDialog):
             require_unc(path)
             bound = descriptor(Path(path))
         except Exception:
-            QMessageBox.warning(self, "Could not select plan", traceback.format_exc())
+            QMessageBox.warning(self.host, "Could not select plan", traceback.format_exc())
             return
         row = dict(bound, label=Path(path).name)
+        self._imported.append(row)
         self.plan_combo.addItem(row["label"], row)
         self.plan_combo.setCurrentIndex(self.plan_combo.count() - 1)
 
@@ -265,6 +340,291 @@ class StartAnalysisDialog(QDialog):
             "display_name": self.name_edit.text().strip(),
             "storage_profile": self.profile_combo.currentData(),
         }
+
+
+class StartAnalysisDialog(QDialog):
+    """Choose an already adopted saved execution plan and a fresh UNC job root.
+
+    The app's New analysis page replaces this dialog. A JobsPanel without that
+    page still opens it, with the same StartAnalysisChoices.
+    """
+
+    def __init__(self, plans, parent=None, *, free_space=None):
+        super().__init__(parent)
+        self.setWindowTitle("Start analysis — create job metadata")
+        layout = QVBoxLayout(self)
+        layout.addWidget(_label(START_ANALYSIS_NOTE))
+        self.form = StartAnalysisChoices(plans, self, free_space=free_space)
+        for name in ("plans", "free_space", "plan_combo", "name_edit", "job_edit",
+                     "profile_combo", "binding_label", "estimate_label"):
+            setattr(self, name, getattr(self.form, name))
+        form = QFormLayout()
+        form.addRow("Saved execution plan", self.plan_combo)
+        form.addRow("Job name", self.name_edit)
+        form.addRow("Fresh UNC job folder", self.job_edit)
+        form.addRow("Storage profile", self.profile_combo)
+        layout.addLayout(form)
+        layout.addWidget(self.form.import_button)
+        layout.addWidget(self.binding_label)
+        layout.addWidget(self.estimate_label)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Create job files"
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.form.changed.connect(self._update_ok)
+        self._update_ok()
+
+    def _update_ok(self):
+        """Offer Create job files once a plan and a fresh job folder are chosen."""
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            self.form.ready()
+        )
+
+    def choices(self):
+        """The chosen plan, job folder, job name and storage profile."""
+        return self.form.choices()
+
+
+class NewAnalysisPage(QWidget):
+    """New analysis (N141, spec 3.1): What, Resolution and files, Where, Actions.
+
+    It replaces the Start analysis dialog in the app, with the dialog's choices
+    (StartAnalysisChoices) and the same two explicit actions: Create job files,
+    then Start. The Jobs controls row lends its machine, backend and workers
+    choice and the resource advisor while the page is shown. Opening the page
+    starts nothing.
+    """
+
+    def __init__(self, panel, parent=None, *, facts_reader=read_plan_facts):
+        super().__init__(parent)
+        self.panel = panel
+        self.facts_reader = facts_reader
+        self.form = StartAnalysisChoices((), self)
+        self.created_root = None
+        self.facts = self.facts_error = None
+        self._facts_key = None
+        self._facts_thread = self._facts_worker = None
+        self._facts_pending = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # The page's one scroll area; the lent resource advisor has none here.
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(_label(START_ANALYSIS_NOTE))
+
+        self.what = QGroupBox("What")
+        what = QFormLayout(self.what)
+        self.method_label = _label("Not known yet.")
+        what.addRow("Series and method", self.method_label)
+        plan_row = QHBoxLayout()
+        plan_row.addWidget(self.form.plan_combo, 1)
+        plan_row.addWidget(self.form.import_button)
+        what.addRow("Saved execution plan", plan_row)
+        what.addRow(self.form.binding_label)
+        self.selection_label = _label()
+        what.addRow("Image selection", self.selection_label)
+        layout.addWidget(self.what)
+
+        self.files = QGroupBox("Resolution and files")
+        files = QFormLayout(self.files)
+        self.computed_combo = computing_resolution_combo()
+        files.addRow("Computed at", self.computed_combo)
+        self.stored_label = _label()
+        files.addRow("Stored at", self.stored_label)
+        files.addRow("File profile", self.form.profile_combo)
+        files.addRow(_label(LEAN_NOTE))
+        files.addRow(self.form.estimate_label)
+        self.precision_label = _label()
+        files.addRow("Precision", self.precision_label)
+        layout.addWidget(self.files)
+
+        self.where = QGroupBox("Where")
+        where = QVBoxLayout(self.where)
+        names = QFormLayout()
+        names.addRow("Job name", self.form.name_edit)
+        names.addRow("Fresh UNC job folder", self.form.job_edit)
+        where.addLayout(names)
+        self.machine_note = _label(
+            "Create the job files first. The machine, backend and workers are then chosen for that job."
+        )
+        where.addWidget(self.machine_note)
+        self.machine_box = QWidget()
+        machine = QVBoxLayout(self.machine_box)
+        machine.setContentsMargins(0, 0, 0, 0)
+        self.target_layout = QHBoxLayout()
+        machine.addLayout(self.target_layout)
+        self.resource_layout = QVBoxLayout()
+        machine.addLayout(self.resource_layout)
+        where.addWidget(self.machine_box)
+        layout.addWidget(self.where)
+
+        self.actions = QGroupBox("Actions")
+        actions = QVBoxLayout(self.actions)
+        row = QHBoxLayout()
+        self.create_button = QPushButton("Create job files")
+        self.create_button.clicked.connect(self.create)
+        self.start_button = QPushButton("Start")
+        self.start_button.clicked.connect(self.start)
+        row.addWidget(self.create_button)
+        row.addWidget(self.start_button)
+        row.addStretch()
+        actions.addLayout(row)
+        self.action_label = _label("No job files created on this page yet.")
+        actions.addWidget(self.action_label)
+        layout.addWidget(self.actions)
+
+        self.scroll.setWidget(body)
+        outer.addWidget(self.scroll)
+        self.form.changed.connect(self._choices_changed)
+        self.computed_combo.currentIndexChanged.connect(self._show_facts)
+        panel.job_created.connect(self._job_created)
+        self._show_facts()
+
+    def set_context(self, *, method_text=""):
+        """Series and method as Calibration recorded them (read-only)."""
+        self.method_label.setText(method_text or "Not known yet.")
+
+    def set_plans(self, plans, *, free_space=None):
+        """Offer the adopted plans and the known free space, then read the plan."""
+        self.form.set_plans(plans, free_space=free_space)
+
+    def reset(self):
+        """Forget the job created here, for another series."""
+        self.created_root = None
+        self.action_label.setText("No job files created on this page yet.")
+        self.sync_actions()
+
+    def stored_allowed(self):
+        """False only when the plan stores finer than the chosen computing grid."""
+        if self.facts is None:
+            return True
+        computed = self.computed_combo.currentData()
+        return all(stored_not_finer(step, computed) for step in self.facts["storage_mm"])
+
+    def _choices_changed(self):
+        """Read a newly chosen plan and update the actions."""
+        plan = self.form.plan_combo.currentData() or {}
+        if (plan.get("path"), plan.get("sha256")) != self._facts_key:
+            self._read_facts()
+        self.sync_actions()
+
+    def _read_facts(self):
+        """Read the chosen plan's facts off the UI thread; one read at a time."""
+        plan = self.form.plan_combo.currentData()
+        self.facts = self.facts_error = None
+        self._facts_key = ((plan or {}).get("path"), (plan or {}).get("sha256"))
+        self._show_facts()
+        if not plan:
+            return
+        if self._facts_thread is not None:
+            self._facts_pending = True
+            return
+        key, reader = self._facts_key, self.facts_reader
+
+        def read():
+            try:
+                return dict(key=key, facts=reader(plan))
+            except Exception as error:
+                return dict(key=key, error=f"{type(error).__name__}: {error}")
+
+        self._facts_thread, self._facts_worker = self.panel._start_call(
+            read, self._facts_ready, self._facts_closed
+        )
+
+    @Slot(object)
+    def _facts_ready(self, result):
+        """Show a read's facts unless another plan was chosen meanwhile."""
+        if result["key"] != self._facts_key:
+            return
+        self.facts, self.facts_error = result.get("facts"), result.get("error")
+        self._show_facts()
+
+    @Slot()
+    def _facts_closed(self):
+        """Retire the finished read and read a plan chosen while it ran."""
+        if self._facts_thread is not None:
+            self._facts_thread.wait()
+        self._facts_thread = self._facts_worker = None
+        if self._facts_pending:
+            self._facts_pending = False
+            self._read_facts()
+
+    def _show_facts(self, *_):
+        """Show the image selection, Stored at and Precision of the chosen plan."""
+        facts = self.facts
+        if facts is None:
+            if self.facts_error:
+                text = "Not read: " + self.facts_error
+            elif self.form.plan_combo.currentData():
+                text = "Reading the adopted plan…"
+            else:
+                text = "Choose a saved execution plan."
+            for label in (self.selection_label, self.stored_label, self.precision_label):
+                label.setText(text)
+        else:
+            self.selection_label.setText(
+                f"{len(facts['runs'])} runs, {facts['frames']} images, fixed by the adopted plan"
+            )
+            stored = stored_at_text(facts["storage_mm"])
+            if not self.stored_allowed():
+                stored += ". Finer than Computed at, which is not allowed."
+            self.stored_label.setText(stored)
+            self.precision_label.setText(
+                f"{facts['precision'] or 'Not recorded'}, bound in the adopted plan (read-only)"
+            )
+        self.sync_actions()
+
+    def sync_actions(self):
+        """Create needs the choices; Start needs the job created on this page."""
+        panel = self.panel
+        self.create_button.setEnabled(
+            self.form.ready() and panel.create_button.isEnabled() and self.stored_allowed()
+        )
+        current = (panel.current or {}).get("root")
+        own = bool(self.created_root and current and Path(current) == Path(self.created_root))
+        self.machine_box.setEnabled(own)
+        self.machine_note.setVisible(not own)
+        self.start_button.setEnabled(own and panel.start_button.isEnabled())
+        self.start_button.setToolTip(
+            panel.start_button.toolTip() if own else "Create the job files on this page first."
+        )
+
+    def create(self):
+        """Create job files with the page's choices; no worker starts."""
+        if not self.create_button.isEnabled():
+            return
+        self.action_label.setText("Creating job files… No worker is started.")
+        self.panel.create_job(**self.form.choices())
+        self.sync_actions()
+
+    @Slot(object)
+    def _job_created(self, registration):
+        """Remember the job created here, so Start can follow."""
+        self.created_root = (registration or {}).get("root")
+        self.action_label.setText(
+            f"Job files created: {self.created_root}. Choose the machine, backend and workers, then Start."
+        )
+        self.sync_actions()
+
+    def start(self):
+        """Start the created job on the chosen machine, as Jobs does."""
+        if not self.start_button.isEnabled():
+            return
+        self.panel.start_selected_machine()
+        self.action_label.setText("Start requested. Follow the progress on Jobs.")
+        self.sync_actions()
+
+    def can_close(self):
+        """True once no plan read is running."""
+        return self._facts_thread is None
 
 
 class RegisterMachineDialog(QDialog):
@@ -537,6 +897,7 @@ class JobsPanel(QWidget):
     operator_declaration_recorded = Signal(object)
     workers_selected = Signal(object)
     error_reported = Signal(str)
+    new_analysis_requested = Signal()
 
     def __init__(
         self,
@@ -593,6 +954,8 @@ class JobsPanel(QWidget):
         self._known_free_space = None
         self._creation_estimates = {}
         self._resume_after_control = None
+        self.new_analysis = None
+        self._target_borrower = None
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
         layout.addWidget(self.context_label)
@@ -669,6 +1032,7 @@ class JobsPanel(QWidget):
             self.declare_previous_service_stopped
         )
         controls.addWidget(self.declare_stopped_button)
+        self._controls = controls
         detail_layout.addLayout(controls)
         self.launch_state_label = _label("No launch request for the selected target.")
         detail_layout.addWidget(self.launch_state_label)
@@ -726,8 +1090,11 @@ class JobsPanel(QWidget):
         selection_provider=None,
     ):
         self._generation += 1
+        changed = (series_root, series_id) != (self.series_root, self.series_id)
         self.series_label = str(series_label)
         self.series_root, self.series_id = series_root, series_id
+        if changed and self.new_analysis is not None:
+            self.new_analysis.reset()
         for key, value in (
             ("jobs_provider", jobs_provider),
             ("plans_provider", plans_provider),
@@ -745,6 +1112,7 @@ class JobsPanel(QWidget):
             if self.create_button.isEnabled()
             else "Create is blocked until the saved current-series B4 selection is bound to the existing execution plan."
         )
+        self._sync_new_analysis()
         self.context_label.setText(
             "Jobs — " + (self.series_label or "No series selected")
         )
@@ -1083,23 +1451,77 @@ class JobsPanel(QWidget):
             )
         self.workers_selected.emit(deepcopy(choice))
 
-    def open_create_dialog(self):
+    def attach_new_analysis(self, page):
+        """Let the app's New analysis page replace the Start analysis dialog (N141)."""
+        if self.new_analysis is not None:
+            raise ValueError("New analysis page already attached")
+        self.new_analysis = page
+
+    def _new_analysis_inputs(self):
+        """The plans and known free space offered for a new job, or None if blocked."""
         if not self.selection_provider or not self.series_root or not self.series_id:
             self._error(
                 "Create is blocked until the current-series B4 image selection is connected and exactly matches the saved execution plan."
             )
-            return
+            return None
         try:
             plans = self.plans_provider() if self.plans_provider else []
         except Exception:
             self._error(traceback.format_exc())
-            return
+            return None
         known = self._known_free_space
-        dialog = StartAnalysisDialog(
-            plans,
-            self,
-            free_space=known if known and known["series_id"] == self.series_id else None,
-        )
+        return plans, (known if known and known["series_id"] == self.series_id else None)
+
+    def prepare_new_analysis(self):
+        """Offer the current plans and known free space on the New analysis page."""
+        inputs = self._new_analysis_inputs()
+        plans, free_space = inputs if inputs is not None else ([], None)
+        self.new_analysis.set_plans(plans, free_space=free_space)
+
+    def place_target_controls(self, page=None):
+        """Lend the machine, backend and workers choice and the resource advisor.
+
+        With a page they move to its Where section; with None they return to
+        the job toolbar and the Progress tab. The same objects and signals
+        move; nothing is copied.
+        """
+        if page is self._target_borrower:
+            return
+        source = self._controls if self._target_borrower is None else self._target_borrower.target_layout
+        for index, widget in enumerate((self.target_combo, self.backend_combo, self.workers_spin)):
+            hidden = widget.isHidden()
+            source.removeWidget(widget)
+            if page is None:
+                self._controls.insertWidget(index, widget)
+            else:
+                page.target_layout.addWidget(widget)
+            widget.setHidden(hidden)
+        if self.resource_panel is not None:
+            hidden = self.resource_panel.isHidden()
+            if page is None:
+                self._target_borrower.resource_layout.removeWidget(self.resource_panel)
+                self.resource_scroll_area.setWidget(self.resource_panel)
+            else:
+                self.resource_scroll_area.takeWidget()
+                page.resource_layout.addWidget(self.resource_panel)
+            self.resource_panel.setHidden(hidden)
+        self._target_borrower = page
+
+    def _sync_new_analysis(self):
+        """Let the New analysis page follow Create and Start availability."""
+        if self.new_analysis is not None:
+            self.new_analysis.sync_actions()
+
+    def open_create_dialog(self):
+        if self.new_analysis is not None:
+            # The app shows its New analysis page instead of the dialog.
+            self.new_analysis_requested.emit()
+            return
+        inputs = self._new_analysis_inputs()
+        if inputs is None:
+            return
+        plans, free_space = inputs
+        dialog = StartAnalysisDialog(plans, self, free_space=free_space)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.create_job(**dialog.choices())
 
@@ -1107,6 +1529,7 @@ class JobsPanel(QWidget):
         if self._create_thread is not None:
             return
         self.create_button.setEnabled(False)
+        self._sync_new_analysis()
         kwargs = {
             "display_name": display_name,
             "series_label": self.series_label,
@@ -1152,6 +1575,7 @@ class JobsPanel(QWidget):
         self.create_button.setEnabled(
             bool(self.selection_provider and self.series_root and self.series_id)
         )
+        self._sync_new_analysis()
 
     def start_local_workers(self):
         if not self.current or not self.current.get("job_facts"):
@@ -1481,6 +1905,7 @@ class JobsPanel(QWidget):
         )
         self.control_note.setText(CONTROL_BOUNDARY + " " + (reason or REMOTE_GAP))
         self._show_control_state()
+        self._sync_new_analysis()
 
     def _read_control_snapshot(self, root):
         """Read commands and the bound master; never initialize a UI namespace."""
@@ -1759,6 +2184,7 @@ class JobsPanel(QWidget):
             and self._control_thread is None
             and not self._control_pending
             and (self.resource_panel is None or self.resource_panel.can_close())
+            and (self.new_analysis is None or self.new_analysis.can_close())
         )
 
     def showEvent(self, event):

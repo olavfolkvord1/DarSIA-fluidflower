@@ -152,10 +152,14 @@ def test_method_badge_is_visible_in_workflow_categories_and_analysis_repeats_it(
         section = window.sidebar._sections[category]
         logical = window.sidebar._logical_selection(category, next(iter(section._rows)))
         window._select_row(logical)
-        assert window.method_badge.isVisible() is (category not in {"start", "calibration"}), category
+        # The badges are details of the one header line on every page but Start (N141).
+        assert (not window.method_badge.isHidden()) is (category != "start"), category
+        assert window.status_header.line.isVisible() is (category != "start"), category
+        if category != "start":
+            assert " · Phase-map method · model " in window.status_header.line.text()
         assert "Method: phase-map method" in window.method_badge.text()
         assert not window.method_panel.isVisible()  # The real step page is stubbed in this navigation fixture.
-        assert window.analysis_method_badge.isVisible() is (category == "analysis")
+        assert (not window.analysis_method_badge.isHidden()) is (category == "analysis")
         if category == "start":
             assert not window.series_header.isVisible()
         if category == "analysis":
@@ -215,8 +219,9 @@ def test_original_category_header_hides_method_panel(method_window, qtbot, categ
     section.set_expanded(False)
     qtbot.mouseClick(section.header_button, Qt.MouseButton.LeftButton)
     assert not window.method_panel.isVisible()
-    assert not window.analysis_method_badge.isVisible()
-    assert window.method_badge.isVisible()
+    assert window.analysis_method_badge.isHidden()
+    assert not window.method_badge.isHidden()
+    assert window.status_header.line.isVisible()
 
 
 @pytest.mark.parametrize("method", ["colour_path", "phase_model"])
@@ -286,17 +291,19 @@ def test_mass_calibration_uses_one_readonly_display_and_cannot_launch(
         assert "Not reported" in rows["Saved mass-balance error"]
 
 
-def test_colour_mass_retains_row_and_phase_mass_moves_into_step_five(method_window):
+def test_colour_mass_row_reads_mass_and_phase_mass_calibration_has_its_own_row(method_window):
     section = method_window.sidebar._sections["calibration"]
-    rows = [
-        row
+    shown = {
+        (row.action, row.checkbox_id): row.label
         for row in section._rows.values()
-        if row.label == "Mass calibration" and not row.isHidden()
-    ]
-    assert {(row.action, row.checkbox_id) for row in rows} == {
-        ("calibration", "mass"),
+        if not row.isHidden()
     }
-    assert section.get_row("phase_model:mass_from_phase").isHidden()
+    # N141: Direct colour method "Mass" (read-only) and Phase-map "Mass calibration".
+    assert shown[("calibration", "mass")] == "Mass"
+    assert shown[("phase_model", "mass_from_phase")] == "Mass calibration"
+    assert [key for key, label in shown.items() if label == "Mass calibration"] == [
+        ("phase_model", "mass_from_phase")
+    ]
     for key in ("mass_optuna", "default_mass"):
         assert section.get_row(key).isHidden()
         assert not section.get_row(key).isEnabled()
@@ -346,7 +353,7 @@ def test_chosen_analysis_group_first_original_keys_and_header_default(
     _phase_choice(root)
     window._refresh_method_state()
     section = window.sidebar._sections["analysis"]
-    assert next(iter(section._rows)) == "mass_analysis:frozen"
+    assert next(iter(section._rows)) == "jobs:new_analysis"
     phase = section.get_row("mass_analysis:frozen")
     original = section.get_row("mass")
     assert (phase.action, phase.checkbox_id) == ("mass_analysis", "frozen")
@@ -355,7 +362,7 @@ def test_chosen_analysis_group_first_original_keys_and_header_default(
     assert "not the chosen method" in original.label
     section.set_expanded(False)
     qtbot.mouseClick(section.header_button, Qt.MouseButton.LeftButton)
-    assert window.sidebar.get_selected() == ("mass_analysis", "frozen")
+    assert window.sidebar.get_selected() == ("jobs", "new_analysis")
     save_series_method(
         root,
         MethodSelection(active="colour_path", colour_calibration="existing-colour-fit"),

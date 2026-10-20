@@ -163,9 +163,14 @@ def setup(qtbot):
     )
 
 
-def test_one_numbered_page_reuses_actual_widgets_and_original_parameters(setup):
+def test_sections_reuse_actual_widgets_and_original_parameters(setup):
     s = setup
-    assert len(s.steps.groups) == 6
+    # N141: Image normalisation, Phase model (three tabs) and Use for this series.
+    assert sorted(s.steps.groups) == [1, 2, 3, 4, 6]
+    assert list(s.steps.sections) == ["normalisation", "phase_model", "use"]
+    tabs = s.steps.phase_tabs
+    assert [tabs.tabText(index) for index in range(tabs.count())] == ["Basis", "Review and label", "Train"]
+    assert [tabs.widget(index) for index in range(tabs.count())] == [s.steps.groups[i] for i in (2, 3, 4)]
     assert s.studio.validation_model is s.choices
     assert s.studio.saved_sessions is s.sessions
     assert s.choices.parentWidget() is s.steps.groups[2]
@@ -197,7 +202,7 @@ def test_missing_normalisation_blocks_original_direct_review_and_resume(setup):
     s.studio._resume_selected_session()
     s.studio.resume_session_button.clicked.emit()
     assert not s.studio.calls
-    assert all(s.steps.groups[i].isEnabled() for i in range(2, 7))
+    assert all(s.steps.groups[i].isEnabled() for i in (2, 3, 4, 6))
     assert not s.studio.open_model_correction.isEnabled()
     assert s.studio.saved_sessions.isEnabled()
     s.steps.set_normalisation_ready(True)
@@ -361,7 +366,6 @@ def test_nested_context_row_hides_label_and_wrapper_only(qtbot):
 def test_adapter_with_real_retained_studio_controls(qtbot, monkeypatch, tmp_path):
     from darsia.fluidflower.ui import model_training as module
     from darsia.fluidflower.series_method import SeriesMethodPanel
-    from darsia.fluidflower.mass_calibration_display import MassCalibrationDisplay
 
     monkeypatch.setattr(
         module, "configured_series", lambda: (("ffac", "Local FF_AC", tmp_path),)
@@ -381,17 +385,29 @@ def test_adapter_with_real_retained_studio_controls(qtbot, monkeypatch, tmp_path
     original_dropdown = studio.validation_model
     original_training = studio.start_button
     method = SeriesMethodPanel()
+    reviews = []
     steps = ui.NativePhaseSteps(
         studio,
         method_panel=method,
-        mass_panel=MassCalibrationDisplay(),
+        phase_review=lambda: reviews.append("phase review"),
         actor_provider=lambda: "local-test-user",
     )
     qtbot.addWidget(steps)
     steps.set_context(tmp_path, "ffac")
     steps.show()
     qtbot.wait(20)
-    assert len(steps.groups) == 6
+    assert sorted(steps.groups) == [1, 2, 3, 4, 6]
+    # The page's one scroll area; the advanced settings hold the original
+    # training content without its scroll area (N141).
+    for area in steps.findChildren(QScrollArea):
+        parent = area.parentWidget()
+        while parent is not None and parent is not steps:
+            assert not isinstance(parent, QScrollArea), area
+            parent = parent.parentWidget()
+    assert steps.advanced.isCheckable() and not steps.advanced.isChecked()
+    assert not steps.advanced.findChildren(QScrollArea)
+    steps.phase_review_button.click()
+    assert reviews == ["phase review"]
     assert studio.validation_model is original_dropdown
     assert studio.start_button is original_training
     assert steps.groups[2].isAncestorOf(original_dropdown)
@@ -414,7 +430,7 @@ def test_native_wording_survives_original_refresh_without_masking_errors(setup):
     studio.status.setText("Add reviewed evidence and enter a researcher name.")
     steps.refresh()
     assert studio.open_model_correction.text() == "Review and label…"
-    assert "step 1" in studio.status.text()
+    assert "Image normalisation" in studio.status.text()
     assert "researcher" not in studio.status.text()
     studio.status.setText("RuntimeError: preserve the original failure verbatim")
     steps.refresh()

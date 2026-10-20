@@ -254,6 +254,21 @@ def series_scope(context: ScopeContext, *, note: str = "") -> RowScope:
     )
 
 
+def scope_summary(context: ScopeContext, scope: RowScope | None) -> str:
+    """The scope part of the header line: the whole series with its run count, or the run."""
+    if scope is None:
+        return ""
+    if scope.scope == "series":
+        count = (
+            f" ({len(context.run_ids)} runs)"
+            if context.run_count_known
+            else " (run count unavailable)"
+        )
+        return "Whole series" + count
+    text = scope.line.removeprefix("Applies to: ")
+    return text[:1].upper() + text[1:]
+
+
 def _run_scope(context: ScopeContext, note: str = "") -> RowScope:
     loaded_run_bound = context.loaded_path is None or any(
         _same_path(context.loaded_path, path)
@@ -276,10 +291,13 @@ def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | No
     """Return supported rows' actual scope; unknown rows are never invented."""
     if action == "jobs" and item_id == "overview":
         return series_scope(context, note="Jobs retain their own explicit whole-run selections; opening this list performs no calculation.")
+    if action == "jobs" and item_id == "new_analysis":
+        return series_scope(context, note="The adopted plan fixes the runs and images; opening this page performs no calculation.")
     if (
         (
             action == "phase_model"
-            and item_id in {"training", "mass_from_phase", "selection_plan"}
+            and item_id
+            in {"normalisation", "training", "mass_from_phase", "calibration_review", "selection_plan"}
         )
         or (action == "mass_analysis" and item_id in {"frozen", "review"})
         or (action == "method" and item_id == "use_for_series")

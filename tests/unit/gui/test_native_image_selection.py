@@ -142,8 +142,9 @@ def test_moved_setup_row_opens_passive_series_panel_without_protocol_or_config_l
     assert w.sidebar.display_selection("image_selection", "plan")[0] == "setup"
     assert w.content_stack.currentWidget() is w.image_selection_workflow.panel
     assert w.current_row_scope.scope == "series" and not w.run_combo.isEnabled()
-    assert w.rig_label.isVisible() and not w.calibration_header.line.isVisible()
-    assert w.method_badge.isVisible() and not w.method_panel.isVisible()
+    # The rig and method lines are details of the one header line (N141).
+    assert not w.rig_label.isHidden() and w.status_header.line.isVisible()
+    assert not w.method_badge.isHidden() and not w.method_panel.isVisible()
     assert (
         not w.toolbar_builder.play_action.isEnabled()
         and not w.toolbar_builder.wizard_action.isEnabled()

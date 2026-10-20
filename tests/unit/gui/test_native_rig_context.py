@@ -56,8 +56,10 @@ def test_header_follows_current_series_and_is_hidden_on_start_without_writes(
     original = {path: path.read_bytes() for path in context.paths}
     _select_run(window, "series-a", "first")
     window._select_row(("preprocessing", "protocols"))
-    assert window.rig_label.isVisible()
+    # The rig line is a detail of the one header line (N141).
+    assert not window.rig_label.isHidden()
     assert "Albus" in window.rig_label.text()
+    assert "Albus" in window.status_header.line.toolTip()
     assert "chosen at Start" in window.rig_label.text()
     assert window.geometry_workspace.rig_class.isHidden()
     assert not window.geometry_workspace.rig_class.isEnabled()

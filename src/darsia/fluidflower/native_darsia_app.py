@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from darsia.fluidflower.calibration_header import NativeStatusHeader, row_category, status_line
 from darsia.fluidflower.image_selection_ui import NativeImageSelectionWorkflow
 from darsia.fluidflower.depth_setup_ui import NativeDepthWorkflow
 from darsia.fluidflower.rig_display import NativeRigContext
@@ -309,6 +310,21 @@ class NativeHomePage(HomePage):
             )
 
 
+# The section of the Calibration page each native row shows (N141).
+PHASE_PAGE_SECTIONS = {
+    ("phase_model", "normalisation"): "normalisation",
+    ("phase_model", "training"): "phase_model",
+    ("method", "use_for_series"): "use",
+}
+
+
+def _native_row(aliases, category, text, source, item_id, help_text, icon="fa5s.circle"):
+    """One sidebar row of a native page, routed by its logical (source, item_id)."""
+    display_id = f"{source}:{item_id}"
+    aliases[category][display_id] = (source, item_id)
+    return (text, display_id, icon, help_text)
+
+
 class PhaseModelWorkspace(QWidget):
     """Training and calibration backed by one lazily loaded Studio instance."""
 
@@ -331,6 +347,7 @@ class PhaseModelWorkspace(QWidget):
         self.studio_page: QWidget | None = None
         self.native_context_binder = native_context_binder
         self._requested_mode = "training"
+        self._requested_section = "phase_model"
 
         layout = QVBoxLayout(self)
         heading = QLabel("Phase-model workflow · training and calibration")
@@ -543,6 +560,9 @@ class PhaseModelWorkspace(QWidget):
         if self.studio_page is not None:
             self.studio_page.show()
         if getattr(self.studio_page, "native_numbered_steps", False):
+            steps = getattr(self.studio_page, "native_steps", None)
+            if steps is not None:
+                steps.show_section(self._requested_section)
             return
         studio = getattr(self.studio_page, "studio", None)
         tabs = getattr(studio, "tabs", None)
@@ -1241,6 +1261,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._method_root = None
         self._method_manifest_bytes = None
         self._saved_method = MethodSelection()
+        self._method_line_parts = ["Method not chosen"]
         self._method_panel_seed = MethodSelection()
         self._scope_base_help = {}
         self.scope_context = None
@@ -1277,11 +1298,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "when the series has one, else config/runs/<run>.toml"
         )
         top.addWidget(self.run_combo)
-        self.run_scope_note = QLabel("applies to the whole series")
-        self.run_scope_note.setTextFormat(Qt.TextFormat.PlainText)
-        self.run_scope_note.setObjectName("secondaryText")
-        self.run_scope_note.hide()
-        top.addWidget(self.run_scope_note)
         self.run_path = QLabel()
         self.run_path.setObjectName("secondaryText")
         self.run_path.setTextInteractionFlags(
@@ -1363,8 +1379,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.phase_model_workspace.native_step_options = {
             "method_panel": self.method_panel,
             "method_use": self._save_method_choice,
-            "mass_panel": MassCalibrationDisplay(),
-            "before_attach": self._detach_phase_method_from_header,
+            "phase_review": self._open_existing_phase_review,
         }
         self.content_stack.addWidget(self.phase_model_workspace)
         self.depth_workflow = NativeDepthWorkflow(self)
@@ -1394,56 +1409,52 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     display_items.append((text, display_id, "fa5s.circle", help_text))
                 groups = [("", display_items)]
             elif action == "calibration":
-                groups = self.calibration_tab.sidebar_items()
-                groups[0] = (METHOD_HEADERS["colour_path"], groups[0][1])
-                # The original groups, the danger zone included, belong to the colour method.
-                self._method_group_keys[action] = ["colour_path"] * len(groups) + ["phase_model"]
-                phase_rows = []
-                for text, item_id, help_text in (
-                    (
-                        "Phase model",
-                        "training",
-                        "Choose, review and train a saved phase-model version.",
-                    ),
-                    (
-                        "Mass calibration",
-                        "mass_from_phase",
-                        "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs.",
-                    ),
-                ):
-                    display_id = f"phase_model:{item_id}"
-                    aliases[action][display_id] = ("phase_model", item_id)
-                    phase_rows.append((text, display_id, "fa5s.circle", help_text))
-                groups.append((METHOD_HEADERS["phase_model"], phase_rows))
+                colour_groups = self.calibration_tab.sidebar_items()
+                colour_groups[0] = (METHOD_HEADERS["colour_path"], colour_groups[0][1])
+                phase_rows = [
+                    _native_row(aliases, action, "Phase model", "phase_model", "training",
+                                "Choose, review and train a saved phase-model version."),
+                    _native_row(aliases, action, "Mass calibration", "phase_model", "mass_from_phase",
+                                "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs."),
+                    _native_row(aliases, action, "Calibration review", "phase_model", "calibration_review",
+                                "View the saved concentration, mass and curves of a model and calibration, one run at a time; opening it starts no calculation."),
+                ]
+                # Image normalisation comes before both methods and Use for this
+                # series after them (N141); the original groups, the danger zone
+                # included, belong to the colour method.
+                groups = [
+                    ("", [_native_row(aliases, action, "Image normalisation", "phase_model", "normalisation",
+                                      "Review and save the series' image normalisation (v5 to a reference run); Phase model and Mass calibration use it.")]),
+                    *colour_groups,
+                    (METHOD_HEADERS["phase_model"], phase_rows),
+                    ("", [_native_row(aliases, action, "Use for this series", "method", "use_for_series",
+                                      "Choose the method, model and calibration this series uses; only an explicit save writes series.toml.")]),
+                ]
+                self._method_group_keys[action] = [
+                    "first", *["colour_path"] * len(colour_groups), "phase_model", "common"
+                ]
             elif action == "analysis":
                 original_rows = [
                     row
                     for _group, rows in self.analysis_tab.sidebar_items()
                     for row in rows
                 ]
-                phase_rows = []
-                for text, item_id, help_text in (
-                    (
-                        "Frozen model mass analysis",
-                        "frozen",
-                        "Inspect and export the selected model's completed concentration and mass results.",
-                    ),
-                    (
-                        "Phase review window",
-                        "review",
-                        "Open the existing prepared model-correction review window; a loaded model with bound phase maps is required.",
-                    ),
-                ):
-                    display_id = f"mass_analysis:{item_id}"
-                    aliases[action][display_id] = ("mass_analysis", item_id)
-                    phase_rows.append((text, display_id, "fa5s.circle", help_text))
-                aliases[action]["jobs:overview"] = ("jobs", "overview")
-                self._method_group_keys[action] = ["colour_path", "phase_model", "common"]
+                phase_rows = [
+                    _native_row(aliases, action, "New analysis", "jobs", "new_analysis",
+                                "Choose the adopted plan, file profile and machine, create the job files, then start; opening this page starts nothing."),
+                    _native_row(aliases, action, "Jobs", "jobs", "overview",
+                                "Read explicitly registered jobs or choose an adopted execution plan; opening this page starts no job.",
+                                "fa5s.tasks"),
+                    _native_row(aliases, action, "Results and export", "mass_analysis", "frozen",
+                                "Browse the finished results per run for the chosen model and calibration, and export them; opening this page starts no calculation."),
+                    # A button on Phase model > Review and label; the row stays routable, hidden.
+                    _native_row(aliases, action, "Phase review window", "mass_analysis", "review",
+                                "Open the existing prepared model-correction review window; a loaded model with bound phase maps is required."),
+                ]
+                self._method_group_keys[action] = ["colour_path", "phase_model"]
                 groups = [
                     (METHOD_HEADERS["colour_path"], original_rows),
                     (METHOD_HEADERS["phase_model"], phase_rows),
-                    ("Jobs", [("Jobs", "jobs:overview", "fa5s.tasks",
-                               "Read explicitly registered jobs or choose an adopted execution plan; opening this page starts no job.")]),
                 ]
             else:
                 groups = (
@@ -1472,8 +1483,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         # The helper captures its calibration section, so install it after replacement.
         add_automatic_mass_calibration(self)
         section = self.sidebar._sections["calibration"]
+        # The Direct colour method's rows read "Colour path" and "Mass" (N141).
+        colour_row = section.get_row("color")
+        colour_row.label = "Colour path"
+        colour_row._text_label.setText(colour_row.label)
         mass_row = section.get_row("mass")
-        mass_row.label = "Mass calibration"
+        mass_row.label = "Mass"
         mass_row._text_label.setText(mass_row.label)
         mass_row.help_text = "Show saved colour-path parameters and reported mass-balance error; calibration runs belong to Jobs."
         # Retain the original implementations and logical IDs, but offer one
@@ -1495,9 +1510,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         run_calibration.__wrapped__ = original_calibration
         self.calibration_tab.run_calibration = run_calibration
         self._capture_method_groups()
-        # The saved parameters now belong to step 5 of the single Phase model
-        # page. Keep its old logical route for external callers, out of the UI.
-        self.sidebar._sections["calibration"].get_row("phase_model:mass_from_phase").hide()
+        # The Phase review window is a button on Phase model > Review and label
+        # (N141). Keep its old Analysis route for external callers, out of the UI.
+        self.sidebar._sections["analysis"].get_row("mass_analysis:review").hide()
         self._install_method_analysis_guard()
         self.toolbar_builder.play_action.changed.connect(self._guard_custom_play)
         from darsia.fluidflower.workflow_status_ui import NativeWorkflowStatus
@@ -1525,9 +1540,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.home_page.recent_requested.connect(self._open_series_from_start)
         self._sync_series_display()
         self._select_row(("start", "series"))
-        from darsia.fluidflower.calibration_header import NativeCalibrationHeader
-
-        self.calibration_header = NativeCalibrationHeader(self)
+        self.status_header = NativeStatusHeader(self)
 
     def refresh_sidebar_progress(self):
         """Native metadata status; preserve unrelated shallow completion dots."""
@@ -1573,7 +1586,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 "sidebar",
                 "run_combo",
                 "method_scope_label",
-                "run_scope_note",
                 "_scope_base_help",
             )
         ):
@@ -1632,9 +1644,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         whole_series = series_scope(context)
         self.method_scope_label.setText(whole_series.line)
         self.method_scope_label.setToolTip(whole_series.note)
-        category = {"phase_model": "calibration", "mass_analysis": "analysis", "image_selection": "setup", "jobs": "analysis"}.get(
-            self._current_category, self._current_category
-        )
+        category = row_category(self._current_category)
         selected = self.sidebar.get_selected()
         scope = (
             row_scope(context, *selected)
@@ -1649,24 +1659,25 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.scope_label.setVisible(
             scope is not None and category in {"setup", "calibration", "analysis"}
         )
-        series_row = scope is not None and not scope.run_selector_enabled
-        self.run_combo.setEnabled(not series_row)
-        self.run_scope_note.setVisible(series_row)
+        # A series page hides the run selector; the header line names the whole
+        # series instead (N141, layout rule 5).
+        self.run_combo.setEnabled(scope is None or scope.run_selector_enabled)
         if getattr(self, "depth_workflow", None) is not None:
             self.depth_workflow.keep_selection_disabled_if_running()
         if getattr(self, "rig_context", None) is not None:
             self.rig_context.refresh()
-        if getattr(self, "calibration_header", None) is not None:
-            self.calibration_header.refresh()
+        if getattr(self, "status_header", None) is not None:
+            self.status_header.refresh()
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""
         self._method_group_widgets = {}
         self._method_row_labels = {}
         self._method_group_order = {}
+        self._method_first_rows = {}
         for category in ("calibration", "analysis"):
             section = self.sidebar._sections[category]
-            grouped = {"colour_path": [], "phase_model": [], "common": []}
+            grouped = {"first": [], "colour_path": [], "phase_model": [], "common": []}
             keys = list(self._method_group_keys[category])
             method = "colour_path"
             rows = {}
@@ -1690,11 +1701,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
             # custom aliases after it has inserted its row, without rebuilding UI.
             section._rows = rows
             self._method_group_widgets[category] = grouped
-
-    def _detach_phase_method_from_header(self) -> None:
-        header = getattr(self, "calibration_header", None)
-        if header is not None:
-            header.widgets = [widget for widget in header.widgets if widget is not self.method_panel]
 
     def _method_series_root(self) -> Path | None:
         workspace = self.phase_model_workspace
@@ -1751,15 +1757,22 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
             model_label = model_reference_label(root, choice.model_version)
             text = f"Method: {METHOD_NAMES['phase_model'].lower()} · model {model_label} · mass calibration {choice.mass_calibration or 'not referenced'}"
+            parts = [METHOD_NAMES["phase_model"], f"model {model_label}",
+                     f"calibration {choice.mass_calibration or 'not referenced'}"]
         elif choice.active == "colour_path":
             text = f"Method: {METHOD_NAMES['colour_path'].lower()} · calibration {choice.colour_calibration or 'not referenced'}"
+            parts = [METHOD_NAMES["colour_path"], f"calibration {choice.colour_calibration or 'not referenced'}"]
         else:
             text = "Method: not chosen"
+            parts = ["Method not chosen"]
         missing = missing_method_references(choice)
         if missing:
             text += " · missing " + " and ".join(missing)
+            parts.append("missing " + " and ".join(missing))
         if choice.error:
             text += " · " + choice.error
+            parts.append(choice.error)
+        self._method_line_parts = parts
         for badge in (self.method_badge, self.analysis_method_badge):
             badge.setText(text)
             badge.setStyleSheet(
@@ -1770,10 +1783,6 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._order_method_groups()
         if self.content_stack.currentWidget() is self.mass_calibration_display:
             self._show_mass_calibration_values(self._displayed_mass_method)
-        page = getattr(self.phase_model_workspace, "studio_page", None)
-        steps = getattr(page, "native_steps", None)
-        if steps is not None:
-            steps.refresh_mass_values()
 
     def _order_method_groups(self) -> None:
         if not hasattr(self, "_method_group_widgets"):
@@ -1788,15 +1797,17 @@ class NativeFluidFlowerMainWindow(MainWindow):
             section = self.sidebar._sections[category]
             keys = {id(row): key for key, row in section._rows.items()}
             rows = {}
-            for method in (*order, "common"):
+            method_rows = {}
+            for method in ("first", *order, "common"):
                 for widget in groups[method]:
                     section.items_layout.removeWidget(widget)
                     section.items_layout.addWidget(widget)
                     if isinstance(widget, SidebarRow):
+                        method_rows.setdefault(method, []).append(keys[id(widget)])
                         base = self._method_row_labels[id(widget)]
                         suffix = (
                             " (not the chosen method for this series)"
-                            if category == "analysis" and method not in {chosen, "common"}
+                            if category == "analysis" and method not in {chosen, "first", "common"}
                             else ""
                         )
                         widget.label = base + suffix
@@ -1807,6 +1818,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
                         rows[keys[id(widget)]] = widget
             section._rows = rows
             self._method_group_order[category] = order
+            # Expanding the category opens the chosen method's first row.
+            self._method_first_rows[category] = next(
+                (key for method in order for key in method_rows.get(method, ())
+                 if not rows[key].isHidden()),
+                next(iter(rows)),
+            )
 
     def _set_method_category_visibility(self, action: str, item_id: str) -> None:
         category, _item = self.sidebar.display_selection(action, item_id)
@@ -2023,14 +2040,21 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.jobs_workspace = NativeJobsWorkspace(
                 self, resource_factory=ResourceAdvisorPanel
             )
+            self.jobs_workspace.new_analysis_requested.connect(
+                lambda: self._select_row(("jobs", "new_analysis"))
+            )
             self.content_stack.addWidget(self.jobs_workspace)
         self._refresh_jobs_context()
         return self.jobs_workspace
 
     def show_jobs(self, *, start_analysis: bool = False) -> None:
-        self._select_row(("jobs", "overview"))
-        if start_analysis:
-            self.ensure_jobs().start_analysis()
+        """Open Jobs, or New analysis, which replaces the start dialog (N141)."""
+        self._select_row(("jobs", "new_analysis" if start_analysis else "overview"))
+
+    def _series_method_text(self) -> str:
+        """The series and method as the header line names them, for New analysis."""
+        series = self.phase_model_workspace.series_selector.currentText()
+        return status_line(series or "No series selected", self._method_line_parts, "")
 
     def closeEvent(self, event) -> None:
         jobs = getattr(self, "jobs_workspace", None)
@@ -2065,6 +2089,15 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.mass_analysis_page, lambda: self.show_jobs(start_analysis=True)
             )
         return self.mass_analysis_page
+
+    def _show_mass_analysis_view(self, view: str) -> None:
+        """Calibration review and Results and export share the saved-result page."""
+        if not self.phase_model_workspace.series_id:
+            self.content_stack.setCurrentWidget(self.mass_analysis_placeholder)
+            return
+        page = self.ensure_mass_analysis()
+        page.show_view(view)
+        self.content_stack.setCurrentWidget(page)
 
     def _mass_analysis_series_selected(self, series_id: str) -> None:
         self._select_series(series_id)
@@ -2542,7 +2575,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
             if is_expanded and not self._selecting_sidebar:
                 self._sync_home_series_before_navigation()
                 self._refresh_method_state()
-                first = next(iter(self.sidebar._sections[action]._rows))
+                first = self._method_first_rows.get(action) or next(
+                    iter(self.sidebar._sections[action]._rows)
+                )
                 logical = self.sidebar._logical_selection(action, first)
                 self.sidebar.select(*logical)
                 return
@@ -2640,7 +2675,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 )
                 if target is not None:
                     target.setFocus()
-            elif action == "phase_model":
+            elif (action, item_id) == ("phase_model", "calibration_review"):
+                self._show_mass_analysis_view("review")
+            elif action in {"phase_model", "method"}:
                 workspace = self.phase_model_workspace
                 if item_id == "selection_plan":
                     self.content_stack.setCurrentWidget(workspace)
@@ -2658,24 +2695,27 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 with QSignalBlocker(workspace.calibration_sidebar):
                     workspace.select_calibration(mode)
                 workspace._requested_mode = mode
+                # Each Calibration row shows its own section of the page (N141).
+                workspace._requested_section = PHASE_PAGE_SECTIONS.get(
+                    (action, item_id), "phase_model"
+                )
                 self.content_stack.setCurrentWidget(workspace)
                 if workspace.series_id:
                     workspace.ensure_studio()
                 workspace._show_selected_studio_mode()
             elif action == "jobs":
-                self.content_stack.setCurrentWidget(self.ensure_jobs())
+                jobs = self.ensure_jobs()
+                if item_id == "new_analysis":
+                    jobs.new_analysis.set_context(method_text=self._series_method_text())
+                jobs.show_view("new_analysis" if item_id == "new_analysis" else "jobs")
+                self.content_stack.setCurrentWidget(jobs)
             elif action == "mass_analysis":
                 if item_id == "review":
                     self._open_existing_phase_review()
                     self._sync_wizard_action_state()
                     self._update_run_action()
                     return
-                page = (
-                    self.ensure_mass_analysis()
-                    if self.phase_model_workspace.series_id
-                    else self.mass_analysis_placeholder
-                )
-                self.content_stack.setCurrentWidget(page)
+                self._show_mass_analysis_view("results")
             self._sync_wizard_action_state()
         self._update_run_action()
 
@@ -2686,9 +2726,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.frozen_reference_line.show_for_analysis(False)
         self.scope_label.hide()
         self.rig_label.hide()
-        self.run_scope_note.hide()
         self.run_combo.setEnabled(True)
         self.content_stack.setCurrentWidget(self.settings_scroll_area)
+        self.status_header.hide()
+        self.series_header.hide()
         super()._on_open_full_config()
         self._update_run_action()
 

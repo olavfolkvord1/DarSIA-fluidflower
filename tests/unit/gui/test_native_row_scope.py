@@ -67,21 +67,24 @@ def _snapshot(window):
     }
 
 
-def test_series_scope_disables_run_selector_and_panel_has_independent_series_scope(
+def test_series_scope_hides_run_selector_and_panel_has_independent_series_scope(
     scope_window,
 ):
     window = scope_window
     before = _snapshot(window)
     window._select_row(("phase_model", "training"))
-    assert window.scope_label.isVisible()
+    # The scope line sits in the header details; the header line names the
+    # whole series and the run selector is hidden on a series page (N141).
+    assert not window.scope_label.isHidden()
     assert "whole series series-a (2 runs)" in window.scope_label.text()
     assert not window.run_combo.isEnabled()
-    assert window.run_scope_note.isVisible()
-    assert window.run_scope_note.text() == "applies to the whole series"
+    assert not window.run_combo.isVisible()
+    assert window.status_header.line.text().endswith(" · Whole series (2 runs)")
     window._select_row(("analysis", "mass"))
     assert window.run_combo.isEnabled()
-    assert not window.run_scope_note.isVisible()
+    assert window.run_combo.isVisible()
     assert window.scope_label.text() == "Applies to: run AC28 only"
+    assert window.status_header.line.text().endswith(" · Run AC28 only")
     window._select_row(("calibration", "delete"))
     assert window.scope_label.text() == "Applies to: run AC28 only"
     assert "whole series series-a (2 runs)" in window.method_scope_label.text()
@@ -184,8 +187,8 @@ def test_other_category_headers_restore_run_selector_and_hide_scope_line(
     section.set_expanded(False)
     qtbot.mouseClick(section.header_button, Qt.MouseButton.LeftButton)
     assert window.run_combo.isEnabled()
-    assert not window.scope_label.isVisible()
-    assert not window.run_scope_note.isVisible()
+    assert window.run_combo.isVisible() is (category != "start")
+    assert window.scope_label.isHidden()
 
 
 def test_series_switch_updates_top_panel_and_all_help_scope_without_writes(

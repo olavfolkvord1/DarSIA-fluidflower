@@ -2,6 +2,7 @@
 
 This page selects frozen phase models and embeds the retained saved-result
 browser. Opening it never fits a calibration, starts workers, or publishes mass output.
+The native app shows it as Calibration review and as Results and export (N141).
 """
 
 from __future__ import annotations
@@ -92,7 +93,17 @@ class _ModelChoicesLookup(QThread):
 
 
 class MassAnalysisWorkspace(QWidget):
-    """Choose a model and saved native fit, then coordinate a frozen campaign."""
+    """Choose a model and saved native fit, then coordinate a frozen campaign.
+
+    Two views share the page (N141): "review" (Calibration review) shows the
+    viewer; "results" (Results and export) adds the preparation section, the
+    export buttons and any Start analysis action. The page is the one scroll
+    area: the viewer's tabs fill the remaining height and their figures rescale
+    without scroll areas of their own. The page scrolls only where the
+    retained controls are wider or taller than the window.
+    """
+
+    VIEW_TITLES = {"review": "Calibration review", "results": "Results and export"}
 
     series_selected = Signal(str)
 
@@ -111,13 +122,13 @@ class MassAnalysisWorkspace(QWidget):
         self._background_lookups: list[QThread] = []
 
         outer = QVBoxLayout(self)
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        outer.addWidget(scroll)
-        content = QWidget(scroll)
-        scroll.setWidget(content)
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        outer.addWidget(self.scroll)
+        content = QWidget(self.scroll)
+        self.scroll.setWidget(content)
         layout = QVBoxLayout(content)
-        title = QLabel("Mass analysis · frozen model and calibration")
+        self.title = title = QLabel("Mass analysis · frozen model and calibration")
         font = title.font(); font.setBold(True); title.setFont(font)
         layout.addWidget(title)
         note = QLabel("Choose a phase model, saved native calibration and experiments here. "
@@ -154,11 +165,29 @@ class MassAnalysisWorkspace(QWidget):
         self.saved_results = SeriesMassWorkspace(self, selected_model=self._selected_model)
         self.saved_results.series.setCurrentIndex(
             self.saved_results.series.findData(self.series))
-        layout.addWidget(self.saved_results)
+        layout.addWidget(self.saved_results, 1)
+        self.view = None
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_lookups)
         self.refresh_models()
+
+    def show_view(self, view: str) -> None:
+        """Show the page as Calibration review ("review") or Results and export ("results")."""
+        if view not in self.VIEW_TITLES:
+            raise ValueError(f"Unknown mass-analysis view: {view}")
+        self.view = view
+        self.title.setText(self.VIEW_TITLES[view])
+        results = view == "results"
+        saved = self.saved_results
+        for widget in (saved.setup_toggle, saved.export_toggle,
+                       getattr(self, "native_start_analysis_button", None)):
+            if widget is not None:
+                widget.setVisible(results)
+        saved.setup_body.setVisible(results and saved.setup_toggle.isChecked())
+        if results:
+            saved.export_toggle.setChecked(True)
+        saved.export_body.setVisible(results and saved.export_toggle.isChecked())
 
     def set_series(self, series: str, project_root: str | Path) -> None:
         self.series = str(series).casefold()

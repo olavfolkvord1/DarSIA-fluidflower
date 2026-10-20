@@ -280,8 +280,11 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert window.content_stack.currentWidget() is _custom_page(window, category)
     assert not window.toolbar_builder.play_action.isEnabled()
     assert not window.toolbar_builder.wizard_action.isEnabled()
-    assert window.run_combo.isVisible() is (category != "start")
-    assert window.setup_series_label.isVisible() is (category not in {"start", "phase_model"})
+    # The run selector shows on run pages only; the header line names the
+    # series on every page but Start (N141).
+    assert window.run_combo.isVisible() is (category == "geometry_facies")
+    assert not window.setup_series_label.isVisible()
+    assert window.status_header.line.isVisible() is (category != "start")
     if category == "phase_model":
         choices = window.phase_model_workspace.calibration_sidebar
         assert choices.get_selected() == ("calibration", "phase_model_training")
@@ -347,9 +350,11 @@ def test_series_run_selector_is_visible_for_every_category_except_start(
     )
     assert window.series_header.isVisible()
     assert window.run_combo.isVisible()
-    assert window.setup_series_label.isVisible() is (category != "calibration")
+    assert not window.setup_series_label.isVisible()
+    assert window.status_header.line.isVisible()
     window._select_row(("start", "series"))
     assert not window.series_header.isVisible()
+    assert not window.status_header.line.isVisible()
 
 
 def test_original_menus_and_dock_controls_survive_page_navigation(native_window):
@@ -739,7 +744,9 @@ def test_image_selection_is_reached_from_setup_for_selected_series(
     assert calls == []
     assert window.sidebar.get_selected() == ("image_selection", "plan")
     assert window.content_stack.currentWidget() is window.image_selection_workflow.panel
-    assert window.series_header.isVisible()
+    # A whole-series page: no run selector, the header line names the series.
+    assert not window.series_header.isVisible()
+    assert "Whole series" in window.status_header.line.text()
     assert not window.toolbar_builder.play_action.isEnabled()
     assert not window.toolbar_builder.wizard_action.isEnabled()
     qtbot.mouseClick(window.image_selection_workflow.edit_button, Qt.MouseButton.LeftButton)

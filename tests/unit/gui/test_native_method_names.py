@@ -1,7 +1,7 @@
 """The method names chosen in N141 (names A), and grouping that never reads them.
 
-The sidebar headers, the method radio buttons, the badge and the Calibration
-header line use the new names; the internal keys and series.toml stay. Local
+The sidebar headers, the method radio buttons, the badge and the header status
+line use the new names; the internal keys and series.toml stay. Local
 manifests only; no calculation.
 """
 
@@ -35,13 +35,14 @@ def test_sidebar_headers_use_the_new_names_and_explain_each_method(method_window
     window = method_window
     calibration = {widget.text(): widget for widget in _headers(window, "calibration")}
     analysis = {widget.text(): widget for widget in _headers(window, "analysis")}
-    assert set(calibration) == {METHOD_HEADERS["colour_path"], "Danger zone", METHOD_HEADERS["phase_model"]}
-    assert set(analysis) == {METHOD_HEADERS["colour_path"], METHOD_HEADERS["phase_model"], "Jobs"}
+    # Image normalisation and Use for this series sit in unnamed groups (N141).
+    assert set(calibration) == {"", METHOD_HEADERS["colour_path"], "Danger zone", METHOD_HEADERS["phase_model"]}
+    assert set(analysis) == {METHOD_HEADERS["colour_path"], METHOD_HEADERS["phase_model"]}
     for headers in (calibration, analysis):
         assert headers[METHOD_HEADERS["colour_path"]].toolTip() == METHOD_DESCRIPTIONS["colour_path"]
         assert headers[METHOD_HEADERS["phase_model"]].toolTip() == METHOD_DESCRIPTIONS["phase_model"]
     assert calibration["Danger zone"].toolTip() == ""
-    assert analysis["Jobs"].toolTip() == ""
+    assert all(header.toolTip() == "" for header in _headers(window, "calibration") if not header.text())
     texts = [header.text() for category in ("calibration", "analysis") for header in _headers(window, category)]
     assert not any("Colour path —" in text or "classification first" in text or text == "Original method"
                    for text in texts)
@@ -58,22 +59,31 @@ def test_grouping_reads_group_keys_not_header_text(method_window):
     after = {category: {method: list(widgets) for method, widgets in groups.items()}
              for category, groups in window._method_group_widgets.items()}
     assert after == before
+    rows = window.sidebar._sections["calibration"]._rows
     calibration = before["calibration"]
-    assert [key for key, row in window.sidebar._sections["calibration"]._rows.items()
-            if row in calibration["phase_model"]] == ["phase_model:training", "phase_model:mass_from_phase"]
-    assert window.sidebar._sections["calibration"]._rows["reset"] in calibration["colour_path"]
+
+    def keys(rows, widgets):
+        return [key for key, row in rows.items() if row in widgets]
+
+    assert keys(rows, calibration["first"]) == ["phase_model:normalisation"]
+    assert keys(rows, calibration["phase_model"]) == [
+        "phase_model:training", "phase_model:mass_from_phase", "phase_model:calibration_review"]
+    assert keys(rows, calibration["common"]) == ["method:use_for_series"]
+    assert rows["reset"] in calibration["colour_path"]
     analysis = before["analysis"]
-    assert [key for key, row in window.sidebar._sections["analysis"]._rows.items()
-            if row in analysis["common"]] == ["jobs:overview"]
+    assert keys(window.sidebar._sections["analysis"]._rows, analysis["phase_model"]) == [
+        "jobs:new_analysis", "jobs:overview", "mass_analysis:frozen", "mass_analysis:review"]
+    assert analysis["first"] == analysis["common"] == []
 
 
-def test_badge_and_calibration_line_name_the_chosen_method(method_window):
+def test_badge_and_header_line_name_the_chosen_method(method_window):
     window = method_window
     _phase_choice(_roots(window)["series-a"])
     window._refresh_method_state()
     assert window.method_badge.text().startswith("Method: phase-map method · model ")
     window._select_row(("calibration", "color"))
-    assert window.calibration_header.line.text().endswith(" · Phase-map method")
+    series = window.phase_model_workspace.series_selector.currentText()
+    assert window.status_header.line.text().startswith(f"{series} · Phase-map method · model ")
 
 
 def test_method_buttons_show_the_new_names_with_their_explanation(qtbot):

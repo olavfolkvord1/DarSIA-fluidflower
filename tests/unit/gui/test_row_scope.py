@@ -51,8 +51,10 @@ def context(series):
 @pytest.mark.parametrize(
     "action,item_id",
     [
+        ("phase_model", "normalisation"),
         ("phase_model", "training"),
         ("phase_model", "mass_from_phase"),
+        ("phase_model", "calibration_review"),
         ("phase_model", "selection_plan"),
         ("mass_analysis", "frozen"),
         ("mass_analysis", "review"),
@@ -67,6 +69,24 @@ def test_phase_rows_and_method_choice_are_series_not_selected_run(
     assert value.line == "Applies to: whole series AC (2 runs)"
     assert not value.run_selector_enabled
     assert "whole series" in value.note
+
+
+@pytest.mark.parametrize("item_id", ["overview", "new_analysis"])
+def test_jobs_pages_are_series_pages_that_perform_no_calculation(series, item_id):
+    value = scopes.row_scope(context(series), "jobs", item_id)
+    assert value.scope == "series" and not value.run_selector_enabled
+    assert value.line == "Applies to: whole series AC (2 runs)"
+    assert "performs no calculation" in value.note
+
+
+def test_scope_summary_names_the_whole_series_or_the_run_for_the_header_line(series, tmp_path):
+    ctx = context(series)
+    assert scopes.scope_summary(ctx, None) == ""
+    assert scopes.scope_summary(ctx, scopes.series_scope(ctx)) == "Whole series (2 runs)"
+    assert scopes.scope_summary(ctx, scopes.row_scope(ctx, "analysis", "cropping")) == "Run AC28 only"
+    assert scopes.scope_summary(ctx, scopes.row_scope(ctx, "calibration", "color")) == COMMON_LINE
+    unknown = scopes.load_scope_context(tmp_path / "missing", "x", series_label="X")
+    assert scopes.scope_summary(unknown, scopes.series_scope(unknown)) == "Whole series (run count unavailable)"
 
 
 @pytest.mark.parametrize("item_id", ["color", "mass", "default_mass", "mass_optuna"])

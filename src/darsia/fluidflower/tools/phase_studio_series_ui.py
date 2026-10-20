@@ -343,7 +343,8 @@ class SeriesMassWorkspace(QWidget):
         self._fullscreen_refresh = None
         self.views = QTabWidget(); layout.addWidget(self.views, 1)
         # Keep the figures readable in the embedded workspace. Its host pages
-        # scroll vertically when the available screen height is smaller.
+        # scroll vertically when the available screen height is smaller. The
+        # figures rescale to their tab and need no scroll area of their own.
         self.views.setMinimumHeight(700)
         self.photo = _FullscreenPixmap(QPixmap())
         self.photo.setMinimumSize(500, 300)
@@ -353,10 +354,9 @@ class SeriesMassWorkspace(QWidget):
         self._figure_keys = {}
         for title, widget in [('Photograph + concentration',self.photo),('Mass curves',self.curve),
                               ('Area and dilution',self.dilution_plot),('Overflow / free gas',self.overflow_plot)]:
-            area=QScrollArea();area.setWidgetResizable(True);area.setWidget(widget)
-            tab_index=self.views.addTab(area,title)
+            tab_index=self.views.addTab(widget,title)
             if widget is self.photo:
-                self.photo_area=area;self.photo_index=tab_index
+                self.photo_index=tab_index
             else:
                 self._figure_keys[tab_index]={self.curve:'mass_curve',self.dilution_plot:'dilution_curve',
                                               self.overflow_plot:'overflow_curve'}[widget]
@@ -367,12 +367,9 @@ class SeriesMassWorkspace(QWidget):
         self.views.addTab(self.comparison, 'Compare models at this image')
         self.mass_comparison_plot = _FullscreenPixmap(QPixmap())
         self.mass_comparison_plot.setText('Open this tab to compare injected, dissolved and free-gas mass for the saved calibrations.')
-        mass_comparison_area = QScrollArea(); mass_comparison_area.setWidgetResizable(True)
-        mass_comparison_area.setWidget(self.mass_comparison_plot)
-        self.mass_comparison_index = self.views.addTab(mass_comparison_area, 'Compare mass curves')
+        self.mass_comparison_index = self.views.addTab(self.mass_comparison_plot, 'Compare mass curves')
         self.local_diagnostics_plot=_FullscreenPixmap(QPixmap())
-        local_area=QScrollArea();local_area.setWidgetResizable(True);local_area.setWidget(self.local_diagnostics_plot)
-        self.local_diagnostics_index=self.views.addTab(local_area,'Local diagnostics')
+        self.local_diagnostics_index=self.views.addTab(self.local_diagnostics_plot,'Local diagnostics')
         self._figure_keys[self.local_diagnostics_index]='local_diagnostics_curve'
         self.views.setTabVisible(self.local_diagnostics_index,False)
         self.views.currentChanged.connect(self.show_mass_comparison)
@@ -1256,10 +1253,8 @@ class SeriesMassWorkspace(QWidget):
             except (OSError, ValueError, KeyError, ImportError) as error:
                 scale_note = f' · alternate scale unavailable: {error}'
         self.views.setTabText(self.photo_index,'Photograph + '+self.preview_field.currentText().lower())
-        # Reuse the existing display scale and viewport when switching fields
-        # or matching photographs between saved models; never load dense arrays.
-        bars=(self.photo_area.horizontalScrollBar(),self.photo_area.verticalScrollBar())
-        scroll=[bar.value() for bar in bars]
+        # Reuse the existing display scale when switching fields or matching
+        # photographs between saved models; never load dense arrays.
         pixmap=QPixmap(str(path)) if path else QPixmap()
         self._active_preview_path = path
         self.photo.setToolTip((str(path or '') + scale_note) if path else scale_note)
@@ -1268,7 +1263,6 @@ class SeriesMassWorkspace(QWidget):
             self.photo.setText('Saved field preview is unavailable.')
         else:
             self.photo.set_source_pixmap(pixmap)
-        for bar,value in zip(bars,scroll):bar.setValue(value)
         return ('Requested field is not saved for this image; showing concentration.' if selected<0 else '')
 
     def show_frame(self,index):

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -165,7 +166,16 @@ def import_saved_model(series_root, series_id, folder):
 
 
 class NativePhaseSteps(QWidget):
-    """One numbered native page, reusing the retained page's actual objects."""
+    """The Calibration pages around the retained page's actual objects.
+
+    One section shows at a time, chosen by its sidebar row (N141): Image
+    normalisation, Phase model (tabs Basis, Review and label, Train) and Use
+    for this series. ``groups`` and ``layouts`` keep the former step numbers
+    as keys (1, 2-4 and 6); the saved mass values of the former step 5 are the
+    Mass calibration row's own page.
+    """
+
+    SECTIONS = ("normalisation", "phase_model", "use")
 
     def __init__(
         self,
@@ -175,7 +185,7 @@ class NativePhaseSteps(QWidget):
         normalisation=None,
         method_panel=None,
         method_use=None,
-        mass_panel=None,
+        phase_review=None,
         actor_provider=getpass.getuser,
         training_routes=None,
     ):
@@ -186,7 +196,7 @@ class NativePhaseSteps(QWidget):
         self.training_routes = dict(training_routes or {})
         self.normalisation = normalisation
         self.method_panel, self.method_use = method_panel, method_use
-        self.mass_panel = mass_panel
+        self.phase_review = phase_review
         self._ready = False
         self._native_idle_status = None
         self._legacy_start_available = studio.start_button.isEnabled()
@@ -205,30 +215,36 @@ class NativePhaseSteps(QWidget):
         self._install_instance_policy()
         self.groups, self.layouts = {}, {}
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # The page's only scroll area; no section holds another one.
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         content = QWidget()
         page = QVBoxLayout(content)
-        for number, title in enumerate(
-            (
-                "Normalise images",
-                "Model basis",
-                "Review and label",
-                "Train",
-                "Mass calibration (phase model)",
-                "Use for this series",
-            ),
-            1,
-        ):
-            group = QGroupBox(f"{number}. {title}")
-            layout = QVBoxLayout(group)
-            self.groups[number], self.layouts[number] = group, layout
-            if number == 6:
-                group.setObjectName("nativePhaseUseStep")
-            page.addWidget(group)
-        page.addStretch(1)
+        self.groups[1] = QGroupBox("Image normalisation")
+        self.phase_tabs = QTabWidget()
+        for number, title in ((2, "Basis"), (3, "Review and label"), (4, "Train")):
+            self.groups[number] = QWidget()
+            self.phase_tabs.addTab(self.groups[number], title)
+        self.groups[6] = QGroupBox("Use for this series")
+        self.groups[6].setObjectName("nativePhaseUseStep")
+        for number, group in self.groups.items():
+            self.layouts[number] = QVBoxLayout(group)
+            if number != 1:
+                # Short pages keep their controls together at the top; the
+                # normalisation table takes the height it is given.
+                self.layouts[number].setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.sections = {
+            "normalisation": self.groups[1],
+            "phase_model": self.phase_tabs,
+            "use": self.groups[6],
+        }
+        for section in self.sections.values():
+            page.addWidget(section, 1)
         self.scroll.setWidget(content)
         outer.addWidget(self.scroll)
+        self.section = None
+        self.show_section("phase_model")
         self.normalisation_notice = QLabel(
             "Not done — the saved normalisation status step is not attached."
         )
@@ -245,12 +261,6 @@ class NativePhaseSteps(QWidget):
         self.review_selection_notice.setWordWrap(True)
         self.layouts[3].insertWidget(0, self.review_selection_notice)
         self._build_training()
-        if mass_panel is None:
-            self.layouts[5].addWidget(
-                QLabel("No saved phase-model mass calibration is referenced.")
-            )
-        else:
-            _move(mass_panel, self.layouts[5])
         self.saved_method_label = QLabel("Method: not chosen")
         self.saved_method_label.setTextFormat(Qt.TextFormat.PlainText)
         self.saved_method_label.setWordWrap(True)
@@ -394,7 +404,20 @@ class NativePhaseSteps(QWidget):
 
     def _build_review(self):
         self.studio.open_model_correction.setText("Review and label…")
-        _move(self.studio.open_model_correction, self.layouts[3])
+        row = QHBoxLayout()
+        self.layouts[3].addLayout(row)
+        _move(self.studio.open_model_correction, row)
+        # The former Analysis row "Phase review window" (mass_analysis:review)
+        # sits beside the review it opens; its row id stays routable (N141).
+        self.phase_review_button = QPushButton("Phase review window")
+        self.phase_review_button.setToolTip(
+            "Open the existing prepared model-correction review window; a loaded model with bound phase maps is required."
+        )
+        self.phase_review_button.setEnabled(self.phase_review is not None)
+        if self.phase_review is not None:
+            self.phase_review_button.clicked.connect(lambda: self.phase_review())
+        row.addWidget(self.phase_review_button)
+        row.addStretch(1)
         _move(self.studio.review_status, self.layouts[3])
         self.layouts[3].addWidget(
             QLabel(
@@ -476,6 +499,15 @@ class NativePhaseSteps(QWidget):
             if timer is not None:
                 timer.timeout.connect(self.refresh)
 
+    def show_section(self, name):
+        """Show the section of one sidebar row; the others stay built and hidden."""
+        if name not in self.sections:
+            raise ValueError(f"Unknown phase-model page section: {name}")
+        self.section = name
+        for key, widget in self.sections.items():
+            widget.setVisible(key == name)
+        self.scroll.verticalScrollBar().setValue(0)
+
     def attach_normalisation(self, widget):
         if self.normalisation is not None and self.normalisation is not widget:
             self.layouts[1].removeWidget(self.normalisation)
@@ -526,20 +558,6 @@ class NativePhaseSteps(QWidget):
         self.model_name.clear()
         self._original_update()
         self.refresh()
-        self.refresh_mass_values()
-
-    def refresh_mass_values(self):
-        if self.mass_panel is not None and self.method_panel is not None:
-            from darsia.fluidflower.mass_calibration_display import (
-                read_mass_calibration_display,
-            )
-
-            reference = self.method_panel.selection().mass_calibration
-            self.mass_panel.set_display(
-                read_mass_calibration_display(
-                    "phase_model", reference, series_root=self.series_root
-                )
-            )
 
     def refresh(self, *_args):
         if not hasattr(self, "groups") or not hasattr(self, "model_name"):
@@ -554,8 +572,9 @@ class NativePhaseSteps(QWidget):
         self.studio.open_model_correction.setText("Review and label…")
         # Saved versions, sessions and calibration values remain inspectable
         # while only the dependent actions are gated.
-        for number in range(2, 7):
-            self.groups[number].setEnabled(True)
+        for number, group in self.groups.items():
+            if number != 1:
+                group.setEnabled(True)
         for name, available in self._legacy_availability.items():
             getattr(self.studio, name).setEnabled(self._ready and available)
         self.import_button.setEnabled(self._ready)
@@ -598,7 +617,7 @@ class NativePhaseSteps(QWidget):
             self._native_idle_status,
         }:
             self._native_idle_status = (
-                "Not done — complete and save image normalisation in step 1. "
+                "Not done — complete and save Image normalisation first. "
                 "Saved models and sessions remain available for inspection."
                 if not self._ready
                 else self.training_note.text()
@@ -661,9 +680,7 @@ class NativePhaseSteps(QWidget):
         if self.method_use is not None and (
             self._ready or getattr(selection, "active", "") == "colour_path"
         ):
-            result = self.method_use(selection)
-            self.refresh_mass_values()
-            return result
+            return self.method_use(selection)
 
     def _import_model(self):
         if not self._ready or self.series_root is None:
