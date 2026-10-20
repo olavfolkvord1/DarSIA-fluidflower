@@ -20,6 +20,7 @@ from darsia.presets.workflows.results_folder import open_in_file_explorer
 # They get no status line rather than an invented "Not done".
 NO_STATUS_ROWS = {
     ("phase_model", "normalisation"),
+    ("phase_model", "overflow"),
     ("phase_model", "calibration_review"),
     ("method", "use_for_series"),
     ("jobs", "new_analysis"),

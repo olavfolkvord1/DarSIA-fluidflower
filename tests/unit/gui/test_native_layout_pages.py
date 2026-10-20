@@ -38,6 +38,7 @@ def _ancestors(widget):
 PHASE_CALIBRATION = [
     ("phase_model:normalisation", "Image normalisation"),
     ("phase_model:training", "Phase model"),
+    ("phase_model:overflow", "Free gas vs overflow"),
     ("phase_model:mass_from_phase", "Mass calibration"),
     ("phase_model:calibration_review", "Calibration review"),
 ]
@@ -97,6 +98,7 @@ def test_every_old_logical_row_id_still_resolves_to_its_row(method_window):
     ]
     new = [
         ("phase_model", "normalisation"),
+        ("phase_model", "overflow"),
         ("phase_model", "calibration_review"),
         ("method", "use_for_series"),
         ("jobs", "new_analysis"),

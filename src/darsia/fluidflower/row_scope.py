@@ -297,7 +297,7 @@ def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | No
         (
             action == "phase_model"
             and item_id
-            in {"normalisation", "training", "mass_from_phase", "calibration_review", "selection_plan"}
+            in {"normalisation", "training", "overflow", "mass_from_phase", "calibration_review", "selection_plan"}
         )
         or (action == "mass_analysis" and item_id in {"frozen", "review"})
         or (action == "method" and item_id == "use_for_series")

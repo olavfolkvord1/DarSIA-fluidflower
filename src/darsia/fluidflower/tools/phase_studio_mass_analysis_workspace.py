@@ -161,11 +161,27 @@ class MassAnalysisWorkspace(QWidget):
         layout.addLayout(row)
         self.status = QLabel("Loading model versions…")
         self.status.setWordWrap(True); layout.addWidget(self.status)
+        # Approve run (N141 spec 2.5, Part 2), shown in Calibration review only.
+        self.approval = QWidget()
+        approval = QHBoxLayout(self.approval)
+        approval.setContentsMargins(0, 0, 0, 0)
+        self.approval_label = QLabel()
+        self.approval_label.setWordWrap(True)
+        approval.addWidget(self.approval_label, 1)
+        self.approve_button = QPushButton("Approve run")
+        self.approve_button.setToolTip(
+            "Records the reviewer, time and calibration for this run in the series folder. "
+            "It never changes a result.")
+        self.approve_button.clicked.connect(self.approve_selected_run)
+        approval.addWidget(self.approve_button)
+        layout.addWidget(self.approval)
+        self.approval.hide()
 
         self.saved_results = SeriesMassWorkspace(self, selected_model=self._selected_model)
         self.saved_results.series.setCurrentIndex(
             self.saved_results.series.findData(self.series))
         layout.addWidget(self.saved_results, 1)
+        self.saved_results.view_experiment.currentIndexChanged.connect(self.refresh_approval)
         self.view = None
         app = QApplication.instance()
         if app is not None:
@@ -188,6 +204,67 @@ class MassAnalysisWorkspace(QWidget):
         if results:
             saved.export_toggle.setChecked(True)
         saved.export_body.setVisible(results and saved.export_toggle.isChecked())
+        self.refresh_approval()
+
+    def _approval_calibration(self):
+        """The mass calibration series.toml references: its path and SHA-256."""
+        from darsia.fluidflower.calibration_approvals import calibration_identity
+        from darsia.fluidflower.series_method import read_series_method
+
+        choice = read_series_method(self.project_root)
+        if choice.error:
+            raise ValueError(choice.error)
+        return calibration_identity(self.project_root, choice.mass_calibration)
+
+    def refresh_approval(self, *_args) -> None:
+        """Show whether the viewed run is approved for the current calibration."""
+        if self.view != "review":
+            self.approval.hide()
+            return
+        from darsia.fluidflower.calibration_approvals import read_run_approvals, run_approval
+
+        self.approval.show()
+        run = self.saved_results.view_experiment.currentData()
+        self.approve_button.setText(f"Approve {str(run).upper()}" if run else "Approve run")
+        self.approve_button.setEnabled(False)
+        try:
+            calibration = self._approval_calibration()
+            records = read_run_approvals(self.project_root)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.approval_label.setText(f"Approval unavailable: {error}")
+            return
+        sha = calibration["sha256"]
+        approved = {str(record.get("run", "")).casefold() for record in records
+                    if (record.get("calibration") or {}).get("sha256") == sha}
+        label = f"calibration {calibration['reference']} (SHA-256 {sha[:12]}…)"
+        if not run:
+            self.approval_label.setText(
+                f"Choose a run to approve. {len(approved)} run(s) approved for {label}.")
+            return
+        record = run_approval(records, run, sha)
+        if record is not None:
+            text = (f"{str(run).upper()}: approved by {record.get('reviewer')} at "
+                    f"{record.get('recorded_utc')} for {label}.")
+        else:
+            text = f"{str(run).upper()}: not approved for {label}."
+            self.approve_button.setEnabled(True)
+        self.approval_label.setText(
+            text + f" {len(approved)} run(s) approved for this calibration. Approval never changes a result.")
+
+    def approve_selected_run(self) -> None:
+        """Append one approval record for the viewed run; results stay as they are."""
+        from darsia.fluidflower.calibration_approvals import approve_run
+
+        run = self.saved_results.view_experiment.currentData()
+        if not run or self.view != "review":
+            return
+        try:
+            approve_run(self.project_root, run, self._approval_calibration(),
+                        result=self.saved_results.result_path)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.approval_label.setText(f"The approval was not recorded: {error}")
+            return
+        self.refresh_approval()
 
     def set_series(self, series: str, project_root: str | Path) -> None:
         self.series = str(series).casefold()
@@ -206,6 +283,7 @@ class MassAnalysisWorkspace(QWidget):
         self.saved_results.series.setCurrentIndex(
             self.saved_results.series.findData(self.series))
         self.refresh_models()
+        self.refresh_approval()
 
     def _series_selection_changed(self, _index: int) -> None:
         series = self.series_selector.currentData()

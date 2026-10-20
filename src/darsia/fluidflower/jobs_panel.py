@@ -206,6 +206,16 @@ def stored_not_finer(stored_mm, computed_mm):
     return stored_mm is not None and float(stored_mm) >= float(computed_mm)
 
 
+def stored_resolution_choices(computed_mm):
+    """The stored sizes New analysis offers: native and the storage grids.
+
+    None stands for native. A size finer than computed_mm is never offered.
+    """
+    from .storage_resolution import RESOLUTIONS_MM
+
+    return [step for step in (None, *RESOLUTIONS_MM) if stored_not_finer(step, computed_mm)]
+
+
 def read_plan_facts(plan, *, reader=None):
     """The adopted plan's runs, images, precision and bound storage request.
 
@@ -440,8 +450,17 @@ class NewAnalysisPage(QWidget):
         files = QFormLayout(self.files)
         self.computed_combo = computing_resolution_combo()
         files.addRow("Computed at", self.computed_combo)
+        stored_row = QHBoxLayout()
+        self.stored_combo = QComboBox()
+        self.stored_combo.setEnabled(False)
+        self.stored_combo.setToolTip(
+            "The adopted plan binds the stored size. Another size needs a new plan "
+            "revision for adoption, which New analysis cannot write yet."
+        )
+        stored_row.addWidget(self.stored_combo)
         self.stored_label = _label()
-        files.addRow("Stored at", self.stored_label)
+        stored_row.addWidget(self.stored_label, 1)
+        files.addRow("Stored at", stored_row)
         files.addRow("File profile", self.form.profile_combo)
         files.addRow(_label(LEAN_NOTE))
         files.addRow(self.form.estimate_label)
@@ -560,8 +579,22 @@ class NewAnalysisPage(QWidget):
             self._facts_pending = False
             self._read_facts()
 
+    def _show_stored_choices(self):
+        """Offer only stored sizes not finer than Computed at; select the plan's size."""
+        steps = stored_resolution_choices(self.computed_combo.currentData())
+        bound = set((self.facts or {}).get("storage_mm") or ())
+        with QSignalBlocker(self.stored_combo):
+            self.stored_combo.clear()
+            for step in steps:
+                self.stored_combo.addItem("native" if step is None else f"{step:g} mm", step)
+            index = self.stored_combo.findData(next(iter(bound))) if len(bound) == 1 else -1
+            if len(bound) == 1 and next(iter(bound)) is None:
+                index = 0 if steps and steps[0] is None else -1
+            self.stored_combo.setCurrentIndex(index)
+
     def _show_facts(self, *_):
         """Show the image selection, Stored at and Precision of the chosen plan."""
+        self._show_stored_choices()
         facts = self.facts
         if facts is None:
             if self.facts_error:

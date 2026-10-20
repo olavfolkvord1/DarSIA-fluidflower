@@ -1262,6 +1262,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._method_manifest_bytes = None
         self._saved_method = MethodSelection()
         self._method_line_parts = ["Method not chosen"]
+        # True only while All runs runs, after its one method confirmation (N141).
+        self._all_runs_confirmed = False
         self._method_panel_seed = MethodSelection()
         self._scope_base_help = {}
         self.scope_context = None
@@ -1341,6 +1343,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.mass_calibration_display = MassCalibrationDisplay()
         self._displayed_mass_method = None
         self.content_stack.addWidget(self.mass_calibration_display)
+        from darsia.fluidflower.mass_calibration_display import OverflowChoicePage
+
+        self.overflow_page = OverflowChoicePage()
+        self.content_stack.addWidget(self.overflow_page)
         self.geometry_workspace = SeriesGeometryWorkspace(
             series=series, initial_series=initial_series
         )
@@ -1414,6 +1420,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 phase_rows = [
                     _native_row(aliases, action, "Phase model", "phase_model", "training",
                                 "Choose, review and train a saved phase-model version."),
+                    _native_row(aliases, action, "Free gas vs overflow", "phase_model", "overflow",
+                                "How the series' mass calibration uses measured overflow: off or compare only; steering per run is not available yet."),
                     _native_row(aliases, action, "Mass calibration", "phase_model", "mass_from_phase",
                                 "Show the saved phase-model parameters and reported mass-balance error; calibration runs belong to Jobs."),
                     _native_row(aliases, action, "Calibration review", "phase_model", "calibration_review",
@@ -1518,6 +1526,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         from darsia.fluidflower.workflow_status_ui import NativeWorkflowStatus
 
         self.workflow_status = NativeWorkflowStatus(self)
+        from darsia.fluidflower.all_runs import NativeAllRuns
+
+        self.all_runs = NativeAllRuns(self)
+        self.content_stack.currentChanged.connect(lambda _index: self.all_runs.refresh())
 
         self.run_combo.activated.connect(self._run_chosen)
         self.run_combo.currentIndexChanged.connect(self._update_setup_action)
@@ -1668,6 +1680,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.rig_context.refresh()
         if getattr(self, "status_header", None) is not None:
             self.status_header.refresh()
+        if getattr(self, "all_runs", None) is not None:
+            self.all_runs.refresh()
 
     def _capture_method_groups(self) -> None:
         """Retain the existing row widgets, including the original Optuna row."""
@@ -1881,7 +1895,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
         original = self.analysis_tab.run_analysis
 
         def run_analysis(*args, **kwargs):
-            if not self._confirm_method_action(
+            # All runs asks once for its whole sequence, not once per run.
+            if not self._all_runs_confirmed and not self._confirm_method_action(
                 "colour_path", "Run original DarSIA analysis"
             ):
                 return None
@@ -2089,6 +2104,16 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 self.mass_analysis_page, lambda: self.show_jobs(start_analysis=True)
             )
         return self.mass_analysis_page
+
+    def _show_overflow_use(self) -> None:
+        """Free gas vs overflow: how the series' referenced calibration uses overflow."""
+        from darsia.fluidflower.mass_calibration_display import read_overflow_use
+
+        mode, explanation = read_overflow_use(
+            self._saved_method.mass_calibration or None, self._method_series_root()
+        )
+        self.overflow_page.set_use(mode, explanation)
+        self.content_stack.setCurrentWidget(self.overflow_page)
 
     def _show_mass_analysis_view(self, view: str) -> None:
         """Calibration review and Results and export share the saved-result page."""
@@ -2518,6 +2543,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
             and self.content_stack.currentWidget() is self.settings_scroll_area
         )
 
+    def _all_runs_running(self) -> bool:
+        """True while All runs starts the selected action run after run."""
+        return getattr(self, "all_runs", None) is not None and self.all_runs.sequence.running
+
     def _guard_custom_play(self) -> None:
         """A background workflow may finish after navigation to a custom page."""
         action = self.toolbar_builder.play_action
@@ -2529,6 +2558,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 getattr(self, "depth_workflow", None) is not None
                 and self.depth_workflow.sequence.running
             )
+            or self._all_runs_running()
         ):
             action.setEnabled(False)
 
@@ -2544,6 +2574,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 getattr(self, "depth_workflow", None) is not None
                 and self.depth_workflow.sequence.running
             )
+            and not self._all_runs_running()
             and self._sidebar_selection_enabled()
         )
 
@@ -2677,6 +2708,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                     target.setFocus()
             elif (action, item_id) == ("phase_model", "calibration_review"):
                 self._show_mass_analysis_view("review")
+            elif (action, item_id) == ("phase_model", "overflow"):
+                self._show_overflow_use()
             elif action in {"phase_model", "method"}:
                 workspace = self.phase_model_workspace
                 if item_id == "selection_plan":
@@ -2897,6 +2930,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         depth = getattr(self, "depth_workflow", None)
         if depth is not None and depth.sequence.running:
             depth.sequence.abort()
+            return
+        if self._all_runs_running():
+            self.all_runs.sequence.abort()
             return
         super().abort_selected_workflow()
 

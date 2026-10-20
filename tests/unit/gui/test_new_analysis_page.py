@@ -137,6 +137,31 @@ def test_stored_is_never_finer_than_computed():
     assert jobs.stored_at_text([None, 0.5]).startswith("Differs per run: native, 0.5 mm")
 
 
+def test_stored_choices_are_never_finer_than_computed():
+    assert jobs.stored_resolution_choices(None) == [None, 0.25, 0.5, 1.0, 2.0]
+    assert jobs.stored_resolution_choices(0.5) == [0.5, 1.0, 2.0]
+    assert jobs.stored_resolution_choices(1.0) == [1.0, 2.0]
+
+
+def test_stored_at_lists_allowed_sizes_with_the_plans_size_read_only(owner, tmp_path, qtbot):
+    _registered_plan(owner, tmp_path)
+    owner.show_view("new_analysis")
+    page = owner.new_analysis
+    qtbot.waitUntil(lambda: page.facts is not None, timeout=5000)
+    combo = page.stored_combo
+    assert not combo.isEnabled()
+    assert [combo.itemText(i) for i in range(combo.count())] == ["native", "0.25 mm", "0.5 mm", "1 mm", "2 mm"]
+    assert combo.currentText() == "native"
+    page.computed_combo.setCurrentIndex(page.computed_combo.findData(1.0))
+    assert [combo.itemText(i) for i in range(combo.count())] == ["1 mm", "2 mm"]
+    assert combo.currentIndex() == -1 and not page.stored_allowed()
+    page.facts = dict(FACTS, storage_mm=[2.0, 2.0])
+    page._show_facts()
+    assert combo.currentText() == "2 mm" and page.stored_allowed()
+    page.computed_combo.setCurrentIndex(0)
+    assert combo.currentText() == "2 mm"
+
+
 def test_read_plan_facts_uses_the_pipeline_reader_and_names_each_runs_storage():
     calls = []
 

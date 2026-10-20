@@ -446,3 +446,98 @@ class MassCalibrationDisplay(QWidget):
                 item.setToolTip(str(value))
                 self.parameters.setItem(index, column, item)
         self.parameters.resizeColumnsToContents()
+
+
+OVERFLOW_MODES = ("off", "compare", "constrain", "hard")
+
+
+def read_overflow_use(reference, series_root=None):
+    """How the referenced phase-model calibration used overflow: (mode, explanation).
+
+    mode is one of OVERFLOW_MODES as the calibration document records it, or
+    None when nothing is referenced or recorded. A frozen calibration with
+    overflow_in_objective = false is compare-only by its contract. Only the
+    explicit reference is read.
+    """
+    try:
+        path = _path(reference, series_root)
+        if path is None:
+            return None, "No phase-model mass calibration is referenced in series.toml."
+        saved = _json(path)
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        return None, f"The referenced calibration could not be read: {error}"
+    if saved.get("overflow_in_objective") is False:
+        return "compare", (
+            "The referenced calibration keeps overflow out of the fit "
+            "(overflow_in_objective = false): overflow is compared, not fitted."
+        )
+    mode = saved.get("overflow_mode") or _mapping(saved.get("calibration")).get("overflow_mode")
+    if mode in OVERFLOW_MODES:
+        return mode, f"The referenced calibration records overflow_mode = {mode}."
+    return None, "The referenced calibration does not record how it used overflow."
+
+
+class OverflowChoicePage(QWidget):
+    """Free gas vs overflow (N141 spec 2.3): the series calibration's overflow use.
+
+    Off and Compare only show what the referenced calibration does; a different
+    choice needs a new calibration. Steer per run is not available yet.
+    Constrain stays with the legacy comparison method, unchanged.
+    """
+
+    LABELS = {
+        "off": "Off",
+        "compare": "Compare only — shown in figures and tables, never fitted",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        title = QLabel("Free gas vs overflow")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
+        layout.addWidget(title)
+        self.buttons = QButtonGroup(self)
+        self.buttons.setExclusive(True)
+        self.choice = {}
+        for mode in ("off", "compare"):
+            button = QRadioButton(self.LABELS[mode])
+            button.setEnabled(False)
+            button.setToolTip("Set by the referenced mass calibration; a different choice needs a new calibration.")
+            self.buttons.addButton(button)
+            self.choice[mode] = button
+            layout.addWidget(button)
+        self.steer = QRadioButton("Steer per run — Not available yet")
+        self.steer.setEnabled(False)
+        self.steer.setToolTip(
+            "Would adjust each run's detected free gas towards that run's own overflow; not available yet."
+        )
+        self.buttons.addButton(self.steer)
+        layout.addWidget(self.steer)
+        self.detail = QLabel()
+        self.detail.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        note = QLabel(
+            "The Phase-map method never fits its calibration to overflow. The legacy "
+            "comparison method keeps its own 'constrain' choice, unchanged."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        self.mode = None
+
+    def set_use(self, mode, explanation) -> None:
+        """Show the calibration's overflow use; nothing here writes a setting."""
+        self.mode = mode if mode in OVERFLOW_MODES else None
+        self.buttons.setExclusive(False)
+        for button in (*self.choice.values(), self.steer):
+            button.setChecked(False)
+        if self.mode in self.choice:
+            self.choice[self.mode].setChecked(True)
+        self.buttons.setExclusive(True)
+        extra = ""
+        if self.mode in ("constrain", "hard"):
+            extra = " That is the legacy comparison method's constraint, not one of these choices."
+        self.detail.setText(explanation + extra)
