@@ -63,7 +63,7 @@ def portable_prepare_storage(local_storage, monkeypatch):
             self.add(config["mass"]["calibration"], "calibration", "mass.calibration")
             return dict(format=job_inputs.CATALOG_FORMAT, complete=True,
                 run=config["run"], configuration=reference,
-                inputs=list(self.entries.values()), payload_hashes_verified=False,
+                inputs=[self.entries[key] for key in sorted(self.entries)], payload_hashes_verified=False,
                 numerical_calls_started=False)
     monkeypatch.setattr(alias_job, "InputCatalog", TinyPreparationCatalog)
     monkeypatch.setattr(alias_job, "require_unc", lambda path: None)
