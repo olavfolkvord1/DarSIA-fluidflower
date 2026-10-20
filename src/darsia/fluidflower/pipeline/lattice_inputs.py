@@ -13,7 +13,7 @@ unchanged on lattice arrays:
 * the native centre becomes one fixed lattice box per run;
 * pixel-sized parameters come from ``physical_units.parameters_on_grid`` with
   the run's native pixels per cell, and the floor curve and zones reach the
-  lattice through the AC28-to-lattice homography inside the chain.
+  lattice through the reference-to-lattice homography inside the chain.
 
 No phase function is copied or changed here.
 """
@@ -110,7 +110,7 @@ def lattice_rules(parameters, *, pixels_per_cell, box):
 
     The geometry entries describe the lattice: its centre box, the native
     shape of that box and the matching canvas origin. ``floor_source_origin_xy``
-    keeps describing the frozen AC28 floor curve.
+    keeps describing the frozen reference floor curve.
     """
     from ..phase.physical_units import parameters_on_grid
     x, y, width, height = box
@@ -123,7 +123,7 @@ def lattice_rules(parameters, *, pixels_per_cell, box):
 
 
 def reference_to_lattice_native(lattice, reference_matrix, box):
-    """Homography from AC28 native coordinates to lattice-box coordinates.
+    """Homography from reference native coordinates to lattice-box coordinates.
 
     The chain transports the frozen floor curve and zones with this matrix;
     the box origin plays the role of the native centre origin.
@@ -164,7 +164,7 @@ class LatticeRun:
     """One run's lattice, rules, baseline, predecessor and per-frame coarsening.
 
     ``inputs`` is the run's ``series.SeriesInputs``. ``reference_matrix`` and
-    ``fields`` are N1's AC28-to-metre matrix and geometry field names.
+    ``fields`` are N1's reference-to-metre matrix and geometry field names.
     """
 
     def __init__(self, config, inputs, lattice, *, reference_matrix, fields):

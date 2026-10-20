@@ -27,12 +27,13 @@ PITCH = 0.00025
 ANGLE = 0.01
 EXTENT = (0.0, 0.145, 0.0, 0.183)
 PLUME = (slice(420, 600), slice(150, 400))
-FIELDS = dict(source_to_native="H_ac28_to_frame_native", original_domain_to_native="H_ac28_to_frame_native",
-              carried_homography_provenance="original_H_ac28_to_native")
+FIELDS = dict(source_to_native="H_reference_to_frame_native",
+              original_domain_to_native="H_reference_to_frame_native",
+              carried_homography_provenance="original_H_reference_to_native")
 
 
 def reference_matrix():
-    """AC28 native coordinates to metres: 0.25 mm pixels, rotated, rows running down."""
+    """Reference native coordinates to metres: 0.25 mm pixels, rotated, rows running down."""
     c, s = math.cos(ANGLE), math.sin(ANGLE)
     return np.array([[PITCH * c, PITCH * s, 0.012], [PITCH * s, -PITCH * c, 0.173], [0.0, 0.0, 1.0]])
 
@@ -153,7 +154,7 @@ def test_lattice_rules_convert_rule_sizes_and_describe_the_box(rule_parameters, 
     assert inputs.parameters["geometry"]["source_box_xywh"] == list(BOX)
 
 
-def test_the_reference_homography_maps_ac28_points_to_lattice_box_coordinates(lattice):
+def test_the_reference_homography_maps_reference_points_to_lattice_box_coordinates(lattice):
     box = (3, 4, 10, 10)
     matrix = li.reference_to_lattice_native(lattice, reference_matrix(), box)
     point = np.array([123.0, 77.0, 1.0])

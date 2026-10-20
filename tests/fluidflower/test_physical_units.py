@@ -1,8 +1,8 @@
 """Phase rule sizes in physical units: native DATA reproduced, lattice grids derived.
 
 The decisions come from the repository fixture of the frozen rule DATA. The
-other pixel-sized entries are the bound FF_AC values of the phase configuration
-(SHA-256 2e9821e0..., read on 20 Oct 2026); no NAS file is read here.
+other pixel-sized entries are the values of the bound production phase
+configuration (SHA-256 2e9821e0...); no NAS file is read here.
 """
 from copy import deepcopy
 import json

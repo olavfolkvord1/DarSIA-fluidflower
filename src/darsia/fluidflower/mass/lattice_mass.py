@@ -4,7 +4,7 @@ A lattice mass template replaces each grid-bound shared input of the run's
 native template by its lattice coarsening, written once per run:
 
 * the physical reference: facies by area majority over physical-domain pixels,
-  the domain mask, porosity and depth means, placed by N1's AC28-to-metre
+  the domain mask, porosity and depth means, placed by N1's reference-to-metre
   matrix (facies also through the measured physical correction, as N1 places
   them);
 * clear water: area mean over its supported pixels;
@@ -51,7 +51,7 @@ def raster_assignment(lattice, matrix, shape_hw):
 def physical_on_lattice(physical, reference_matrix, correction, lattice):
     """Coarsen N1's physical reference onto the lattice.
 
-    ``physical`` holds facies, domain, porosity and depth_m on the AC28 native
+    ``physical`` holds facies, domain, porosity and depth_m on the reference native
     grid. Facies are placed through ``correction`` as N1 transports them;
     porosity and depth are means over physical-domain pixels.
     """
@@ -77,7 +77,7 @@ def clear_water_on_lattice(clear_rgb, clear_valid, reference_to_grid, reference_
     """Coarsen clear-water RGB onto the lattice with its supported fraction.
 
     The clear-water array is indexed in the native coordinates of its own
-    frame; ``reference_to_grid`` maps AC28 native coordinates there.
+    frame; ``reference_to_grid`` maps reference native coordinates there.
     """
     rgb = np.asarray(clear_rgb, np.float32)
     valid = np.asarray(clear_valid, bool) & np.isfinite(rgb).all(-1) & (rgb > 0).all(-1)

@@ -45,13 +45,13 @@ def save(directory, name, value, kind):
 
 
 def mass_template(directory):
-    """A synthetic N1 template whose AC28 grid is the native centre of the canvas."""
+    """A synthetic N1 template whose reference grid is the native centre of the canvas."""
     shape = (BOX[3], BOX[2])
     facies = np.ones(shape, np.uint8)
     facies[:, shape[1] // 2:] = 2
     colors, signals = {}, {}
     bounds = dict(min_value_aq=0.0, max_value_aq=1.0, min_value_g=0.0, max_value_g=1.0)
-    for label in (0, 1, 2):  # facies 0 lies outside the physical reference, as in FF_AC
+    for label in (0, 1, 2):  # facies 0 lies outside the physical reference
         base = Path(directory) / ("color_" + str(label))
         path = darsia.ColorPath(colors=[np.array([1.0, 1.0, 1.0]), np.array([0.6, 0.9, 1.3])])
         darsia.ColorPathInterpolation(path, darsia.ColorMode.RELATIVE, [0.0, 1.0]).save(base)

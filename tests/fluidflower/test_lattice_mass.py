@@ -25,8 +25,9 @@ SHAPE = (96, 128)
 PITCH = 0.00025
 REFERENCE = np.array([[PITCH, 0.0, PITCH / 2], [0.0, -PITCH, 0.024 - PITCH / 2], [0.0, 0.0, 1.0]])
 EXTENT = (0.0, 0.032, 0.0, 0.024)
-FIELDS = dict(source_to_native="H_ac28_to_frame_native", original_domain_to_native="H_ac28_to_frame_native",
-              carried_homography_provenance="original_H_ac28_to_native")
+FIELDS = dict(source_to_native="H_reference_to_frame_native",
+              original_domain_to_native="H_reference_to_frame_native",
+              carried_homography_provenance="original_H_reference_to_native")
 
 
 def save(directory, name, value, kind):
