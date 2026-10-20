@@ -398,6 +398,10 @@ def _run_tasks(
                 from .phase_statistics import run_phase1
 
                 execute = run_phase1
+            elif pipeline == "n1-calibration-refit":
+                from .refit_runner import run_refit
+
+                execute = run_refit
             else:
                 raise ValueError("Unknown explicit task pipeline: " + str(pipeline))
             if io_binding is None:

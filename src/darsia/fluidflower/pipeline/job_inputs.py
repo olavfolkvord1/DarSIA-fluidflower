@@ -485,6 +485,15 @@ class InputCatalog:
                 for field in ("native_geometry", "geometry_certificate", "current_geometry"):
                     self.doc(request[field], "rig_model", "frame." + case + ".photo." + field)
                 self.add(request["saved_native_review"], "image", "frame." + case + ".photo.saved_native_review")
+        elif config.get("format") == "darsia-n1-refit-plan-v1":
+            # A refit consumes the baseline calibration and every fit-run statistics file.
+            from .refit_runner import validate_plan
+            validate_plan(config)
+            self.doc(config["baseline"]["calibration"], "calibration", "refit.baseline_calibration")
+            for run in sorted(config["statistics"]):
+                for frame in config["statistics"][run]:
+                    self.add(frame["statistics"], "calibration",
+                             "refit." + run + ".frame." + str(frame["frame_index"]) + ".statistics")
         else:
             raise ValueError("Unsupported role catalogue run format: " + str(config.get("format")))
         return {"format": CATALOG_FORMAT, "complete": True, "run": config["run"],
