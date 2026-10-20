@@ -80,8 +80,9 @@ REFERENCE_RELEASES = {
             logical_bytes=235180,
         ),
     ),
-    # N145 adds the font file of the second attempt: R3 starts again counting
-    # exactly this three-file inventory, verified on disk, and nothing else.
+    # N145 adds the font file of the second attempt. R3's third attempt
+    # (service 7fdd0fc9) stopped before its claim under this entry, which stays
+    # for that attempt's close; with four files on disk it cannot start.
     ("N134", "N136", "N139", "N142", "N145"): dict(
         records={
             "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
@@ -94,6 +95,25 @@ REFERENCE_RELEASES = {
         retained_cache=dict(
             inventory_sha256="96986702430169ac39fe43ea62195db66d36229cd287ddac6fe57f5e46890fce",
             logical_bytes=352770,
+        ),
+    ),
+    # R3 on the drift-fixed RAW positioning (Q159, N152). Codex re-minted the
+    # RAW binding, configurations and plan for it, and N154 names that plan.
+    # N152 adds the font file of the third attempt: R3 starts counting exactly
+    # this four-file inventory, verified on disk, and nothing else.
+    ("N134", "N139", "N142", "N145", "N152", "N154"): dict(
+        records={
+            "N134-OLAV-r3-inputs-into-a-new-ff-ac-folder-reference-build-once-fresh-cache-released-after-the-code-change": "olav",
+            "N139-OLAV-r3-starts-with-the-verified-117590-byte-retained-font-file-counted-file-and-old-approval-untouched": "olav",
+            "N142-OLAV-r3-close-failed-service-95c-count-both-font-files-235180-bytes-one-new-start": "olav",
+            "N145-OLAV-yes-q157-paired-model-staging-close-5229-count-three-font-files-one-new-start": "olav",
+            "N152-OLAV-yes-raw-drift-fix-first-close-7fdd-count-four-fonts-r3-on-fixed-code-standing-yes": "olav",
+            "N154-CLAUDE-r3-plan-a88d0950-drift-fix-repins-entitlement-65728995330B-four-fonts-pinned": "claude",
+        },
+        plan_sha256="a88d0950617b445a6ec93fae826d2b359a930857cc97bfe24d58b5bc746e2301",
+        retained_cache=dict(
+            inventory_sha256="5ab92bb37ce086192baeba8ffe0b86ef0a0777d3af22d1bf9f1bda89a6c74b51",
+            logical_bytes=470360,
         ),
     ),
 }
