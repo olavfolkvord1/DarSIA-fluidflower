@@ -176,6 +176,15 @@ class MassAnalysisWorkspace(QWidget):
         approval.addWidget(self.approve_button)
         layout.addWidget(self.approval)
         self.approval.hide()
+        # Build published dataset (N169), shown in Results and export only.
+        self.publish_button = QPushButton("Build published dataset…")
+        self.publish_button.setToolTip(
+            "Package this series and a finished production job as a published dataset record. "
+            "It checks first and writes only into a new or empty folder outside the series.")
+        self.publish_button.clicked.connect(self.build_published_dataset)
+        self.publish_dialog = None
+        layout.addWidget(self.publish_button)
+        self.publish_button.hide()
 
         self.saved_results = SeriesMassWorkspace(self, selected_model=self._selected_model)
         self.saved_results.series.setCurrentIndex(
@@ -197,7 +206,7 @@ class MassAnalysisWorkspace(QWidget):
         results = view == "results"
         saved = self.saved_results
         for widget in (saved.setup_toggle, saved.export_toggle,
-                       getattr(self, "native_start_analysis_button", None)):
+                       getattr(self, "native_start_analysis_button", None), self.publish_button):
             if widget is not None:
                 widget.setVisible(results)
         saved.setup_body.setVisible(results and saved.setup_toggle.isChecked())
@@ -205,6 +214,22 @@ class MassAnalysisWorkspace(QWidget):
             saved.export_toggle.setChecked(True)
         saved.export_body.setVisible(results and saved.export_toggle.isChecked())
         self.refresh_approval()
+
+    def build_published_dataset(self) -> None:
+        """Open Build published dataset for this series (one dialog at a time)."""
+        from darsia.fluidflower.published_dataset.build_dialog import BuildDatasetDialog
+
+        previous = self.publish_dialog
+        if previous is None or previous.series_root != self.project_root:
+            if previous is not None and previous.busy():
+                previous.raise_()
+                return
+            if previous is not None:
+                previous.close()
+                previous.deleteLater()
+            self.publish_dialog = BuildDatasetDialog(self.project_root, self)
+        self.publish_dialog.show()
+        self.publish_dialog.raise_()
 
     def _approval_calibration(self):
         """The mass calibration series.toml references: its path and SHA-256."""
