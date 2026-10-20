@@ -165,6 +165,10 @@ _BACKGROUND_TIP = (
     "between the reference photo and the chosen photo."
 )
 _BACKGROUND_SETTINGS = ("DarSIA", "FluidFlower layer painting")
+# The measured geometry index last used to place a map in all runs.
+_GEOMETRY_INDEX_KEY = "placement/geometry_index"
+# The runs last chosen to review first after the reference run.
+_FIRST_RUNS_KEY = "placement/first_runs"
 _BACKGROUND_CHOOSE = "choose"
 # Whether Draw follows the edges of shown polygons: the user's choice, kept in
 # the same settings and not in the painting session.
@@ -2722,6 +2726,71 @@ class _ProposalWorker(QObject):
         self.finished.emit(proposal)
 
 
+def _rgb(color: str) -> tuple[int, int, int]:
+    """(red, green, blue) of a #rrggbb colour; white when it is not one."""
+
+    value = str(color).lstrip("#")
+    try:
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except ValueError:
+        return 255, 255, 255
+
+
+class _PlacementWorker(QObject):
+    """Place an approved map version in all runs (a review folder only)."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, record, frame, options) -> None:
+        super().__init__()
+        self.record = dict(record)
+        self.frame = frame
+        self.options = dict(options)
+
+    @Slot()
+    def run(self) -> None:
+        from darsia.fluidflower import map_placement as mp
+
+        try:
+            self.progress.emit("Drawing the approved map at full resolution…")
+            session, proposal, corrections = lp.load_version(self.record)
+            labels, regions = lp.painted_label_map(
+                session, proposal, frame=self.frame, corrections=corrections
+            )
+            table = np.zeros(int(labels.max()) + 1, dtype=np.uint8)
+            for row in regions:
+                table[int(row["label_id"])] = int(row["layer_id"])
+            layers = table[labels]
+            del labels
+            colors = {row.layer_id: _rgb(row.color) for row in session.layers}
+            roles = {
+                row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
+            }
+            result = mp.place_map_in_runs(
+                self.options["destination"],
+                layers,
+                reference_run=session.run_id,
+                geometry_index=self.options["geometry_index"],
+                runs=self.options["runs"],
+                photo_loader=self.options["photo_loader"],
+                colors=colors,
+                roles=roles,
+                version={
+                    key: self.record.get(key)
+                    for key in ("name", "kind", "sha256", "created_utc", "folder")
+                }
+                | {"approval": self.options.get("approval")},
+                first_runs=self.options.get("first_runs") or (),
+                progress=self.progress.emit,
+            )
+        except Exception as error:  # noqa: BLE001 - reported to the user
+            self.failed.emit(f"{type(error).__name__}: {error}")
+            return
+        self.finished.emit(result)
+
+
 class _SaveWorker(QObject):
     progress = Signal(str)
     finished = Signal(object)
@@ -2863,6 +2932,11 @@ class LayerPainterView(QWidget):
         self._proposal_worker: _ProposalWorker | None = None
         self._save_thread: QThread | None = None
         self._save_worker: _SaveWorker | None = None
+        # Placing an approved map version in all runs (a review folder only).
+        self._placement_thread: QThread | None = None
+        self._placement_worker: _PlacementWorker | None = None
+        self.last_placement: dict[str, Any] | None = None
+        self._placement_dialog: QDialog | None = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -3169,6 +3243,13 @@ class LayerPainterView(QWidget):
         )
         self.approve_version_button.clicked.connect(self._approve_version_clicked)
         buttons.addWidget(self.approve_version_button)
+        self.place_version_button = QPushButton("Place in all runs…")
+        self.place_version_button.setToolTip(
+            "Place the selected approved version in every run through each run's "
+            "measured geometry and show the overlays; writes a review folder only"
+        )
+        self.place_version_button.clicked.connect(self._place_version_clicked)
+        buttons.addWidget(self.place_version_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         self.versions_table = QTableWidget(0, 5)
@@ -3628,7 +3709,7 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
-        for thread in (self._proposal_thread, self._save_thread):
+        for thread in (self._proposal_thread, self._save_thread, self._placement_thread):
             try:
                 if thread is not None and thread.isRunning():
                     return True
@@ -3639,7 +3720,7 @@ class LayerPainterView(QWidget):
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
-        for thread in (self._proposal_thread, self._save_thread):
+        for thread in (self._proposal_thread, self._save_thread, self._placement_thread):
             try:
                 if thread is not None and thread.isRunning():
                     thread.wait()
@@ -5430,6 +5511,7 @@ class LayerPainterView(QWidget):
             and not self.busy()
             and not self._map_approvals_error
         )
+        self.place_version_button.setEnabled(self._placeable(self._selected_version()))
         self._refresh_map_status()
 
     def _refresh_map_status(self) -> None:
@@ -5493,6 +5575,186 @@ class LayerPainterView(QWidget):
         self.approve_version_button.setEnabled(
             record is not None and not self.busy() and not self._map_approvals_error
         )
+        self.place_version_button.setEnabled(self._placeable(record))
+
+    def _placeable(self, record: Mapping[str, Any] | None) -> bool:
+        """Whether a version may be placed in all runs: it is approved."""
+
+        return (
+            record is not None
+            and not self.busy()
+            and not self._map_approvals_error
+            and lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
+            is not None
+        )
+
+    def _series_root(self) -> Path | None:
+        """The native series folder this project belongs to, or None."""
+
+        from darsia.fluidflower.series_geometry import native_series_link
+
+        root = native_series_link(self.project).get("series_root") if self.project else None
+        return Path(str(root)) if root else None
+
+    def _series_runs(self) -> list[str]:
+        """The registered runs of the series the geometry belongs to."""
+
+        from darsia.fluidflower.series_geometry import read_series_manifest
+
+        root = self._series_root()
+        if root is None:
+            return []
+        return [str(run) for run in (read_series_manifest(root).get("runs") or {}).get("ids") or []]
+
+    def _reference_photo_loader(self):
+        """Load a run's reference photograph, as its geometry names it, on its
+        camera grid (uint8 RGB); the file's size and SHA-256 are checked."""
+
+        from darsia.fluidflower.photograph_io import load_reduced_rgb8
+        from darsia.fluidflower.project import sha256_file
+
+        project = self.project
+
+        def load(run: str, geometry) -> np.ndarray:
+            image = dict(geometry.reference_image)
+            path = Path(str(image.get("path") or ""))
+            if not path.is_file():
+                raise FileNotFoundError(f"{run}: reference photograph not found: {path}")
+            if "size_bytes" in image and path.stat().st_size != int(image["size_bytes"]):
+                raise ValueError(f"{run}: the reference photograph changed size: {path}")
+            if image.get("sha256") and sha256_file(path) != image["sha256"]:
+                raise ValueError(f"{run}: the reference photograph changed: {path}")
+            camera_u = lp.photo_camera_u(project, run, path)
+            return load_reduced_rgb8(path, 1, camera_u=camera_u)
+
+        return load
+
+    def _place_version_clicked(self) -> None:
+        """Ask for the geometry index and the runs to review first, then place."""
+
+        record = self._selected_version()
+        if not self._placeable(record):
+            self.versions_note.setText("Approve the version before placing it in all runs.")
+            return
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        start = str(settings.value(_GEOMETRY_INDEX_KEY, "") or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Measured geometry of the runs (index.json)",
+            start,
+            "Geometry index (index.json);;JSON (*.json)",
+        )
+        if not path:
+            return
+        settings.setValue(_GEOMETRY_INDEX_KEY, path)
+        settings.sync()
+        try:
+            runs = self._series_runs()
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not read the series' runs", str(error))
+            return
+        first, accepted = QInputDialog.getText(
+            self,
+            "Place in all runs",
+            f"Place {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) in all "
+            f"{len(runs)} runs through each run's measured geometry?\n\nThis writes a new "
+            "review folder with each run's placed map and an overlay on its reference "
+            "photograph. It changes no map, geometry revision or run configuration. It "
+            "reads every run's reference photograph and takes a few minutes.\n\n"
+            "Runs to review first, after this run (optional, separated by commas):",
+            text=str(settings.value(_FIRST_RUNS_KEY, "") or ""),
+        )
+        if not accepted:
+            return
+        settings.setValue(_FIRST_RUNS_KEY, first.strip())
+        settings.sync()
+        self.place_version(
+            record,
+            path,
+            runs=runs,
+            first_runs=[part.strip() for part in first.split(",") if part.strip()],
+        )
+
+    def place_version(
+        self,
+        record: Mapping[str, Any],
+        geometry_index: Path | str,
+        *,
+        runs: Sequence[str] | None = None,
+        first_runs: Sequence[str] = (),
+        photo_loader: Callable[..., np.ndarray] | None = None,
+    ) -> bool:
+        """Start placing an approved version in all runs; False when it cannot
+        start (the note says why). ``first_runs`` are reviewed right after
+        this run. The review window opens when it is done."""
+
+        if not self._placeable(record) or self.session is None:
+            self.versions_note.setText("Approve the version before placing it in all runs.")
+            return False
+        from copy import deepcopy
+
+        approval = lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
+        thread = QThread(self)
+        worker = _PlacementWorker(
+            record,
+            # A copy: the frame stays editable while the map is placed.
+            deepcopy(self.current_frame()),
+            {
+                "destination": lp.painting_folder(self.project).parent / "map_placement",
+                "geometry_index": str(geometry_index),
+                "runs": list(runs if runs is not None else self._series_runs()),
+                "photo_loader": photo_loader or self._reference_photo_loader(),
+                "approval": approval,
+                "first_runs": list(first_runs),
+            },
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.versions_note.setText)
+        worker.finished.connect(self._placement_finished)
+        worker.failed.connect(self._placement_failed)
+        # Direct: quit from the worker thread, so that wait() in the GUI
+        # thread cannot block a queued quit.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(self._placement_thread_finished)
+        self._placement_thread, self._placement_worker = thread, worker
+        self.versions_note.setText("Placing the map in all runs…")
+        thread.start()
+        self._refresh_versions()
+        self.busy_changed.emit(True)
+        return True
+
+    def _placement_finished(self, result: object) -> None:
+        """Say where the placement went and open its review window."""
+
+        self.last_placement = dict(result)
+        placed = sum(1 for row in self.last_placement["runs"] if row.get("status") == "placed")
+        self.versions_note.setText(
+            f"Placed in {placed} of {len(self.last_placement['runs'])} runs: "
+            f"{self.last_placement['folder']}"
+        )
+        from darsia.fluidflower.map_placement_view import MapPlacementDialog
+
+        dialog = MapPlacementDialog(self.last_placement, self)
+        self._placement_dialog = dialog
+        dialog.show()
+
+    def _placement_failed(self, message: str) -> None:
+        """Say why the map was not placed."""
+
+        self.versions_note.setText(f"The map was not placed in all runs: {message}")
+
+    def _placement_thread_finished(self) -> None:
+        """Drop the finished worker and its thread here, in the GUI thread."""
+
+        thread = self._placement_thread
+        self._placement_thread = None
+        self._placement_worker = None
+        if thread is not None:
+            thread.deleteLater()
+        self._refresh_versions()
+        self.busy_changed.emit(self.busy())
 
     def _version_double_clicked(self, _item: QTableWidgetItem) -> None:
         self._restore_version_clicked()
