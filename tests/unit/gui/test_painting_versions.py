@@ -4,6 +4,8 @@ A synthetic 80 x 60 photograph and a project in a temporary folder; no real
 series is used.
 """
 
+import re
+
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 from darsia.fluidflower import layer_painting as lp
@@ -85,3 +87,16 @@ def test_the_buttons_ask_first(view, monkeypatch):
     monkeypatch.setattr(QMessageBox, "question", no)
     view.restore_version_button.click()
     assert len(asked) == 1 and len(view.versions) == 1
+
+
+def test_an_empty_name_gives_the_kind_of_map_and_the_time(view, monkeypatch):
+    _show(view, _proposal())
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("  ", True))
+    view.save_version_button.click()
+    _brush(view)
+    assert view.default_version_name().startswith("Edited map ")
+    record = view.save_version("")
+    names = [row["name"] for row in view.versions]
+    stamp = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}"
+    assert re.fullmatch(f"Proposal {stamp}", names[0])
+    assert re.fullmatch(f"Edited map {stamp}", names[1]) and record["name"] == names[1]

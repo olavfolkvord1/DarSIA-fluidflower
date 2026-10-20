@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from . import geometry_workspace_frame as workspace_frame
@@ -4488,16 +4489,24 @@ class LayerPainterView(QWidget):
         name, accepted = QInputDialog.getText(
             self,
             "Save version",
-            "Name of this version:",
-            text=f"Version {len(self.versions) + 1}",
+            "Name of this version (left empty: the kind of map and the time):",
+            text=self.default_version_name(),
         )
-        if accepted and name.strip():
+        if accepted:
             self.save_version(name)
 
-    def save_version(self, name: str) -> dict[str, Any] | None:
+    def default_version_name(self) -> str:
+        """The name a version gets when none is given: "Proposal" or "Edited map"
+        with the local date and time."""
+
+        kind = "Edited map" if self.corrections else "Proposal"
+        return f"{kind} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+    def save_version(self, name: str = "") -> dict[str, Any] | None:
         """Save the current map, the proposal with its corrections, as a version.
 
-        Returns the version's record, or None (the note says why).
+        An empty name gives the default name. Returns the version's record, or
+        None (the note says why).
         """
 
         problem = self._versions_unavailable()
@@ -4505,6 +4514,7 @@ class LayerPainterView(QWidget):
             self.versions_note.setText(problem)
             return None
         assert self.session is not None and self.proposal is not None
+        name = str(name).strip() or self.default_version_name()
         self.save_session()
         try:
             record = lp.save_version(
