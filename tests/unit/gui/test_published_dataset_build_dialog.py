@@ -61,6 +61,11 @@ def test_dialog_explains_missing_choices_and_simulator_resolution(qtbot, tmp_pat
     dialog.resolution_edit.setText("1")
     request = dialog.request()
     assert (request.record, request.simulator_resolution_mm, request.proof) == ("S", 1.0, None)
+    assert request.simulator_geometry is None and dialog.geometry_edit.isEnabled()
+    dialog.geometry_edit.setText(str(tmp_path / "geometry_request.json"))
+    assert dialog.request().simulator_geometry == tmp_path / "geometry_request.json"
+    dialog.record_combo.setCurrentIndex(dialog.record_combo.findData("R"))
+    assert not dialog.geometry_edit.isEnabled() and dialog.request().simulator_geometry is None
 
 
 def test_results_and_export_offers_the_action_only_in_its_view(qtbot, tmp_path, monkeypatch):

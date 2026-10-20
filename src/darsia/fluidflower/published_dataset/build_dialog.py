@@ -86,6 +86,12 @@ class BuildDatasetDialog(QDialog):
         self.resolution_edit = QLineEdit()
         self.resolution_edit.setPlaceholderText("Required for S; no default")
         form.addRow("Simulator resolution (mm)", self.resolution_edit)
+        self.geometry_edit = QLineEdit()
+        self.geometry_edit.setPlaceholderText("Optional for S: the completed porous domain")
+        self.geometry_button = QPushButton("Browse…")
+        self.geometry_button.clicked.connect(
+            lambda: self._choose_file(self.geometry_edit, "Simulator geometry request"))
+        form.addRow("Simulator geometry request", _path_row(self.geometry_edit, self.geometry_button))
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("A new or empty folder outside the series")
         output_button = QPushButton("Browse…")
@@ -128,8 +134,10 @@ class BuildDatasetDialog(QDialog):
         self._record_changed()
 
     def _record_changed(self, *_):
-        """Offer the simulator resolution only for an S record."""
-        self.resolution_edit.setEnabled(self.record_combo.currentData() == "S")
+        """Offer the simulator resolution and geometry only for an S record."""
+        simulator = self.record_combo.currentData() == "S"
+        for widget in (self.resolution_edit, self.geometry_edit, self.geometry_button):
+            widget.setEnabled(simulator)
 
     def _choose_folder(self, edit: QLineEdit, title: str):
         """Let the user pick a folder for ``edit``."""
@@ -169,7 +177,8 @@ class BuildDatasetDialog(QDialog):
                             output=Path(self.output_edit.text().strip()), title=self.title_edit.text().strip(),
                             proof=optional(self.proof_edit), known_variation=optional(self.variation_edit),
                             peak_memory_bytes=memory, peak_memory_basis=self.memory_basis_edit.text().strip(),
-                            simulator_resolution_mm=resolution)
+                            simulator_resolution_mm=resolution,
+                            simulator_geometry=optional(self.geometry_edit) if record == "S" else None)
 
     def start(self, *, check_only: bool) -> bool:
         """Start a check or a build in a worker thread; False when a field is invalid or one runs."""

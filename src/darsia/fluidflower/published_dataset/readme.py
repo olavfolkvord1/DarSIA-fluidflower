@@ -58,6 +58,11 @@ def render_readme(manifest: dict) -> str:
         ]
     else:
         lines += ["- `simulator_<run>.zip`: the run's coarse products, static fields and time series."]
+        if (manifest.get("simulator") or {}).get("geometry"):
+            lines += ["  It also holds `products/<run>/geometry/simulator_geometry.npz` and `.json`: the complete "
+                      "porous domain inside the inner frame, with the fixtures removed and the layers continued "
+                      "across them and to the walls, floor and sand surface. Every filled cell is flagged "
+                      "(fixture_filled, edge_filled); the analysis itself keeps the hidden sand hidden."]
     lines += [
         "",
         f"Size: {_gb(manifest['size'].get('bytes'))} in {manifest['size']['files']} files.",

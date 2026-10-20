@@ -65,6 +65,8 @@ class BuildRequest:
     record then needs ``proof_job``, the finished job of the run that proved the
     revision (its prepared tasks are published).
     ``simulator_resolution_mm`` is required for an S record; it has no default.
+    ``simulator_geometry`` is an optional simulator geometry request (N18) for
+    an S record; without it the record is built exactly as before.
     """
 
     series_root: Path
@@ -84,6 +86,7 @@ class BuildRequest:
     peak_memory_basis: str = ""
     expected_resolution_mm: float = 1.0
     simulator_resolution_mm: float | None = None
+    simulator_geometry: Path | None = None
     links: dict = field(default_factory=dict)
     rule: dict | None = None
     deny: tuple | None = None
@@ -465,6 +468,58 @@ def published_tasks(request: BuildRequest, job: FinishedJob, published: Publishe
     return files
 
 
+def simulator_geometry_members(request: BuildRequest, job: FinishedJob, published: Published, roots: dict,
+                               report: BuildReport) -> tuple[dict, dict | None]:
+    """Each run's completed simulator geometry (N18) as archive members, and the manifest section.
+
+    Only an S record with a simulator geometry request has them. The request
+    names the series' geometry revision, the fixture roles and polygons, and
+    the depth points (default: each run configuration's own).
+    """
+    if request.simulator_geometry is None:
+        return {}, None
+    from . import simulator_geometry as geometry
+
+    if request.record != "S":
+        report.refuse("A simulator geometry belongs to an S record")
+        return {}, None
+    try:
+        raw = Path(request.simulator_geometry).read_bytes()
+        wanted = geometry.load_request(request.simulator_geometry)
+        revision = json.loads(geometry.series_file(roots["series"], wanted["geometry"]).read_text(encoding="utf-8-sig"))
+        configuration = revision.get("configuration") or revision
+        width, height = float(configuration["width_m"]), float(configuration["height_m"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        report.refuse(f"The simulator geometry request is not usable: {error}")
+        return {}, None
+    roles = tuple(wanted.get("fixture_roles") or geometry.DEFAULT_FIXTURE_ROLES)
+    section = {"format": geometry.GEOMETRY_FORMAT, "request_sha256": _sha(raw),
+               "resolution_mm": request.simulator_resolution_mm, "fixture_roles": list(roles), "runs": {}}
+    members = {}
+    for run, config in zip(job.runs, published.configs):
+        own = ((wanted.get("runs") or {}).get(run) or {}).get("fixtures_m")
+        fixtures = dict(wanted.get("fixtures_m") or {}) if own is None else dict(own)
+        try:
+            facies, by_facies, table, source = geometry.run_geometry(revision, run)
+            points = geometry.depth_points_for(wanted, roots["series"], config)
+            npz, text, counts = geometry.export_geometry(
+                facies, by_facies, table, width_m=width, height_m=height, depth_points=points,
+                resolution_mm=request.simulator_resolution_mm, fixture_polygons_m=fixtures, fixture_roles=roles,
+                source=source)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            report.refuse(f"Run {run}: the simulator geometry could not be made ({error})")
+            continue
+        if counts["unfilled_cells"]:
+            report.warnings.append(f"Run {run}: {counts['unfilled_cells']} cell(s) of the porous domain have no "
+                                   "geometry (no defined cell in their column or row)")
+        base = f"{EXPECTED_FOLDER['S']}/{run}/geometry/{geometry.FILE_STEM}"
+        members[run] = [Member(base + ".npz", data=npz), Member(base + ".json", data=text)]
+        section["runs"][run] = {"npz": {"path": base + ".npz", "sha256": _sha(npz), "size_bytes": len(npz)},
+                                "json": {"path": base + ".json", "sha256": _sha(text), "size_bytes": len(text)},
+                                "counts": counts}
+    return members, section
+
+
 def run_configurations(job: FinishedJob, roots: dict, report: BuildReport) -> list[dict]:
     """The job's run configurations, read from the series folder, in run order."""
     configs = []
@@ -632,6 +687,7 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
             report.refuse(f"The input root {alias!r} has no folder on this machine")
     series_files = series_inputs(published.inputs_by_run, report)
     tasks = published_tasks(request, job, published, report) if request.record == "R" else {}
+    geometry_members, geometry_section = simulator_geometry_members(request, job, published, roots, report)
     check_tiers(request, frames, report)
     commit, proof = published.commit, published.proof
     pipeline = job.tasks[job.runs[0]].get("pipeline") or "native-phase-n1"
@@ -705,6 +761,8 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
         manifest["simulator"] = {"layer": layer, "resolution_mm": request.simulator_resolution_mm,
                                  "gate": "the products are the in-run stored layer itself, not a re-export",
                                  "runs": expected}
+        if geometry_section is not None:
+            manifest["simulator"]["geometry"] = geometry_section
     archives = {}
     if request.record == "R":
         generated = {PLAN_COPY: plan_bytes, ALIASES: alias_bindings(camera_roots),
@@ -726,7 +784,7 @@ def check_build(request: BuildRequest) -> tuple[BuildPlan | None, BuildReport]:
                          if item.root_alias == "series" and item.role == "protocol"}
             archives[simulator_archive_name(run)] = list(expected_members.get(run, ())) + [
                 Member(f"{folder}/{run}/timeseries/{relative}", roots["series"] / relative, item.sha256,
-                       item.size_bytes) for relative, item in sorted(protocols.items())]
+                       item.size_bytes) for relative, item in sorted(protocols.items())] + geometry_members.get(run, [])
     scanner = NameScanner((*machine_names(), *job.receipt_names()), deny=deny)
     name_scan(request, scanner, archives, roots, report)
     report.hits.extend(scanner.content(manifest_text(manifest).encode("utf-8"), file=MANIFEST, suffix=".json"))

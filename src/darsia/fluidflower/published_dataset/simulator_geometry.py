@@ -1,0 +1,537 @@
+"""The simulator geometry of a published S record: the complete porous domain inside the inner frame.
+
+The analysis keeps the sand behind fixtures hidden (N16). Only this published
+geometry is completed. Its source is the series' geometry (a rig-corrected
+facies map with region roles), together with explicit configuration:
+
+1. **Fixtures.** The fixture regions are removed from the map. They are the
+   regions with a fixture role (by default ``colorchecker``) and any fixture
+   polygons given in metres. The hidden sand is filled by continuing each
+   layer boundary across it:
+   - a boundary seen on both sides is interpolated linearly between them;
+   - a boundary seen on one side only keeps that side's height.
+2. **Edges.** The layers are extended to the inner walls, the floor and the
+   sand surface by edge replication (as Q43). An undefined cell takes the
+   facies of the nearest defined cell in its column, or, where its column has
+   none, in its row. Original cells are never changed.
+3. **Flags.** Every filled cell carries a flag: ``fixture_filled`` or
+   ``edge_filled``.
+4. **Grid.** The result is reported on the requested storage grid:
+   - majority facies and facies area fractions;
+   - porosity (pore volume over bulk volume), depth, pore volume and bulk
+     volume;
+   - the fill flags, as area fractions and as cell flags.
+
+   The facies table and the depth measurement points go with it as data.
+
+Depth follows the production rule: linear between the measured points inside
+their hull, nearest outside. Porosity comes from the facies table. Nothing
+here is imported by a production worker.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+import io
+import json
+import math
+from pathlib import Path, PureWindowsPath
+
+import numpy as np
+
+GEOMETRY_FORMAT = "darsia-simulator-geometry-v1"
+REQUEST_FORMAT = "darsia-simulator-geometry-request-v1"
+POROUS_ROLES = frozenset({"porous_medium", "seal"})
+WATER_ROLES = frozenset({"free_water"})
+FRAME_ROLES = frozenset({"frame"})
+DEFAULT_FIXTURE_ROLES = ("colorchecker",)
+RASTER_SHIFT = 8
+FILE_STEM = "simulator_geometry"
+
+
+@dataclass(frozen=True)
+class CompletedGeometry:
+    """The completed facies map on its canvas, with the domain and the fill flags (N18 steps 1-3)."""
+
+    facies: np.ndarray
+    domain: np.ndarray
+    original: np.ndarray
+    fixture_filled: np.ndarray
+    edge_filled: np.ndarray
+    unfilled: np.ndarray
+
+
+def canvas_coordinates(shape, width_m: float, height_m: float) -> tuple[np.ndarray, np.ndarray, float]:
+    """Cell-centre coordinates of a rig-corrected canvas (origin lower left, y up) and the cell area."""
+    rows, columns = (int(value) for value in shape)
+    if rows < 1 or columns < 1 or not width_m > 0 or not height_m > 0:
+        raise ValueError("A nonempty canvas with a positive width and height in metres is required")
+    dx, dy = float(width_m) / columns, float(height_m) / rows
+    x = (np.arange(columns, dtype=np.float64) + 0.5) * dx
+    y = float(height_m) - (np.arange(rows, dtype=np.float64) + 0.5) * dy
+    x_m, y_m = np.meshgrid(x, y)
+    return x_m, y_m, dx * dy
+
+
+def fixture_mask(shape, width_m: float, height_m: float, polygons_m, *, raster_shift: int = RASTER_SHIFT) -> np.ndarray:
+    """The canvas cells inside any fixture polygon given in metres (the existing fixed-point rasterizer)."""
+    from ..geometry.pixels import polygon_pixel_domain
+
+    rows, columns = (int(value) for value in shape)
+    if not polygons_m:
+        return np.zeros((rows, columns), bool)
+    dx, dy = float(width_m) / columns, float(height_m) / rows
+
+    def pixels(points):
+        """Metric polygon vertices as canvas pixel coordinates (column, row; centres on integers)."""
+        array = np.asarray(points, np.float64)
+        if array.ndim != 2 or array.shape[1] != 2 or len(array) < 3 or not np.isfinite(array).all():
+            raise ValueError("Every fixture polygon needs at least three finite x/y points in metres")
+        return np.column_stack((array[:, 0] / dx - 0.5, (float(height_m) - array[:, 1]) / dy - 0.5))
+
+    canvas = [[-0.5, -0.5], [columns - 0.5, -0.5], [columns - 0.5, rows - 0.5], [-0.5, rows - 0.5]]
+    _domain, _inside, fixtures = polygon_pixel_domain(
+        canvas, {str(name): pixels(points) for name, points in dict(polygons_m).items()}, [rows, columns],
+        native_origin_xy=(0.0, 0.0), raster_scale=float(2 ** raster_shift), raster_shift=raster_shift)
+    result = np.zeros((rows, columns), bool)
+    for mask in fixtures.values():
+        result |= mask
+    return result
+
+
+def porous_domain(porous, fixture, water, frame) -> np.ndarray:
+    """The complete porous domain: inside the frame, from the sand surface down to the floor.
+
+    In each column the domain starts below the free water at the top of the
+    interior (the sand surface). Where a column starts without free water, it
+    starts at its highest sand or fixture cell. It ends at the column's lowest
+    cell inside the frame (the floor). A column with neither water nor sand
+    takes the surface of the nearest column that has one. Free water below the
+    surface stays outside the domain.
+    """
+    porous, fixture, water, frame = (np.asarray(value, bool) for value in (porous, fixture, water, frame))
+    rows, columns = porous.shape
+    interior = ~frame
+    top = np.full(columns, -1, np.int64)
+    floor = np.full(columns, -1, np.int64)
+    solid = (porous | fixture) & interior
+    for column in range(columns):
+        inside = np.flatnonzero(interior[:, column])
+        if not inside.size:
+            continue
+        floor[column] = inside[-1]
+        start = inside[0]
+        run = 0
+        while start + run < rows and interior[start + run, column] and water[start + run, column]:
+            run += 1
+        if run:
+            top[column] = start + run
+        else:
+            filled = np.flatnonzero(solid[:, column])
+            if filled.size:
+                top[column] = filled[0]
+    known = np.flatnonzero(top >= 0)
+    if not known.size:
+        return np.zeros(porous.shape, bool)
+    missing = np.flatnonzero(top < 0)
+    if missing.size:
+        nearest = known[np.abs(known[None, :] - missing[:, None]).argmin(axis=1)]
+        top[missing] = top[nearest]
+    index = np.arange(rows)[:, None]
+    return interior & ~water & (index >= top[None, :]) & (index <= floor[None, :]) & (floor[None, :] >= 0)
+
+
+def _boundaries(facies, defined, y_m, column: int) -> list[tuple[float, int, int]]:
+    """A column's layer boundaries from top to bottom: (height, facies above, facies below)."""
+    rows = np.flatnonzero(defined[:, column])
+    values = facies[rows, column]
+    changes = np.flatnonzero(values[1:] != values[:-1])
+    return [(0.5 * (y_m[rows[i], column] + y_m[rows[i + 1], column]), int(values[i]), int(values[i + 1]))
+            for i in changes]
+
+
+def _match(left: list, right: list) -> list[tuple[int, int]]:
+    """Pair boundaries of the two sides that separate the same facies, in order (a longest common subsequence)."""
+    a, b = [(upper, lower) for _h, upper, lower in left], [(upper, lower) for _h, upper, lower in right]
+    table = np.zeros((len(a) + 1, len(b) + 1), np.int64)
+    for i in range(len(a) - 1, -1, -1):
+        for j in range(len(b) - 1, -1, -1):
+            table[i, j] = table[i + 1, j + 1] + 1 if a[i] == b[j] else max(table[i + 1, j], table[i, j + 1])
+    pairs, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            pairs.append((i, j))
+            i, j = i + 1, j + 1
+        elif table[i + 1, j] >= table[i, j + 1]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def continue_layers(facies, defined, hidden, y_m) -> tuple[np.ndarray, np.ndarray]:
+    """Fill hidden cells by continuing each layer boundary across the hidden region (N18 step 1).
+
+    ``defined`` marks the cells whose facies is known, ``hidden`` the cells to
+    fill and ``y_m`` the cell heights. Each connected hidden region is filled
+    from the nearest defined column on each side:
+    - boundaries that separate the same facies on both sides are paired in
+      order and interpolated linearly across the region;
+    - a boundary found on one side only keeps its height.
+
+    In each hidden column, a cell takes the facies above the region and
+    switches at every boundary above it. A region with no defined column on
+    either side stays unfilled. Returns the facies and the mask of filled cells.
+    """
+    from scipy import ndimage
+
+    labels = np.asarray(facies)
+    known = np.asarray(defined, bool)
+    targets = np.asarray(hidden, bool) & ~known
+    heights = np.asarray(y_m, np.float64)
+    result, filled = labels.copy(), np.zeros(labels.shape, bool)
+    regions, count = ndimage.label(targets, structure=np.ones((3, 3), bool))
+    columns_with_cells = known.any(axis=0)
+    for region in range(1, count + 1):
+        rows, columns = np.nonzero(regions == region)
+        first, last = int(columns.min()), int(columns.max())
+        left = next((c for c in range(first - 1, -1, -1) if columns_with_cells[c]), None)
+        right = next((c for c in range(last + 1, labels.shape[1]) if columns_with_cells[c]), None)
+        if left is None and right is None:
+            continue
+        sides = {side: _boundaries(labels, known, heights, side) for side in (left, right) if side is not None}
+        pairs = _match(sides[left], sides[right]) if left is not None and right is not None else []
+        for column in range(first, last + 1):
+            cells = rows[columns == column]
+            if not cells.size:
+                continue
+            lines = []
+            if left is not None and right is not None:
+                t = (column - left) / (right - left)
+                paired_left, paired_right = {i for i, _ in pairs}, {j for _, j in pairs}
+                lines += [((1 - t) * sides[left][i][0] + t * sides[right][j][0], sides[left][i][1],
+                           sides[left][i][2]) for i, j in pairs]
+                lines += [row for k, row in enumerate(sides[left]) if k not in paired_left]
+                lines += [row for k, row in enumerate(sides[right]) if k not in paired_right]
+            else:
+                lines += sides[left if left is not None else right]
+            lines.sort(key=lambda row: -row[0])
+            above = int(cells.min()) - 1
+            start = None
+            if above >= 0 and known[above, column]:
+                # The column's own cell above wins; only boundaries below it apply.
+                start = int(labels[above, column])
+                lines = [row for row in lines if row[0] < heights[above, column]]
+            side = left if right is None or (left is not None and column - left <= right - column) else right
+            donors = np.flatnonzero(known[:, side])
+            for row in cells:
+                crossed = [line for line in lines if line[0] > heights[row, column]]
+                if crossed:
+                    value = crossed[-1][2]
+                elif start is not None:
+                    value = start
+                elif lines:
+                    value = lines[0][1]
+                else:
+                    value = int(labels[donors[np.abs(donors - row).argmin()], side])
+                result[row, column] = value
+                filled[row, column] = True
+    return result, filled
+
+
+def replicate_edges(facies, donors, targets, x_m, y_m) -> tuple[np.ndarray, np.ndarray]:
+    """Fill target cells by edge replication (N18 step 2, as Q43): nearest donor in the column, then in the row.
+
+    This uses the existing column rule (``geometry.pixels.extend_column_geometry``).
+    The second pass runs on the transposed grid, so that a cell whose column
+    has no donor takes the nearest donor in its row. On a tie, the higher
+    cell, or the cell to the left, wins. Cells filled in the first pass may
+    donate in the second. Returns the facies and the mask of filled cells.
+    """
+    from ..geometry.pixels import extend_column_geometry
+
+    labels = np.asarray(facies)
+    source, wanted = np.asarray(donors, bool), np.asarray(targets, bool) & ~np.asarray(donors, bool)
+    domain = source | wanted
+    if not source.any() or not wanted.any():
+        return labels.copy(), np.zeros(labels.shape, bool)
+    table = {int(value): 1.0 for value in np.unique(labels[source])}
+    first = extend_column_geometry(labels, source, domain, y_m, porosity_by_facies=table, swi_by_facies={})
+    vertical = first.geometry_filled & wanted
+    stage = np.where(vertical, first.facies, labels)
+    second = extend_column_geometry(stage.T, (source | vertical).T, domain.T, -np.asarray(x_m, np.float64).T,
+                                    porosity_by_facies=table, swi_by_facies={})
+    horizontal = second.geometry_filled.T & wanted & ~vertical
+    result = np.where(horizontal, second.facies.T, stage)
+    return result, vertical | horizontal
+
+
+def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, fixture_polygons_m=None,
+                      fixture_roles=DEFAULT_FIXTURE_ROLES, raster_shift: int = RASTER_SHIFT) -> CompletedGeometry:
+    """Complete a rig-corrected facies map (N18 steps 1-3); ``roles`` maps each facies id to its role."""
+    labels = np.asarray(facies)
+    if labels.ndim != 2 or labels.dtype.kind not in "iu" or not all(labels.shape):
+        raise ValueError("The facies map must be a nonempty two-dimensional integer grid")
+    role = {int(key): str(value) for key, value in dict(roles).items()}
+
+    def has(names):
+        """Cells whose facies has one of the roles ``names``."""
+        ids = [key for key, value in role.items() if value in set(names)]
+        return np.isin(labels, ids) if ids else np.zeros(labels.shape, bool)
+
+    frame, water = has(FRAME_ROLES), has(WATER_ROLES)
+    fixture = (has(fixture_roles) | fixture_mask(labels.shape, width_m, height_m, fixture_polygons_m or {},
+                                                 raster_shift=raster_shift)) & ~frame
+    porous = has(POROUS_ROLES) & ~fixture
+    domain = porous_domain(porous, fixture, water, frame)
+    original = porous & domain
+    x_m, y_m, _area = canvas_coordinates(labels.shape, width_m, height_m)
+    hidden = fixture & domain
+    stage, fixture_filled = continue_layers(labels, original, hidden, y_m)
+    rest = domain & ~original & ~fixture_filled
+    result, replicated = replicate_edges(stage, original | fixture_filled, rest, x_m, y_m)
+    fixture_filled = fixture_filled | (replicated & hidden)
+    edge_filled = replicated & ~hidden
+    unfilled = domain & ~original & ~fixture_filled & ~edge_filled
+    return CompletedGeometry(np.where(domain, result, labels), domain, original, fixture_filled, edge_filled,
+                             unfilled)
+
+
+def covering_extent(width_m: float, height_m: float, resolution_mm: float) -> tuple[float, float, float, float]:
+    """The smallest storage-lattice extent from the origin that covers the canvas (exact decimal steps)."""
+    step = Decimal(str(resolution_mm)) / Decimal(1000)
+
+    def edge(value):
+        """The first lattice edge at or above ``value``."""
+        count = (Decimal(str(value)) / step).to_integral_value(rounding="ROUND_CEILING")
+        return float(count * step)
+
+    return 0.0, edge(width_m), 0.0, edge(height_m)
+
+
+def facies_table(properties: list, extra_rows=None) -> list[dict]:
+    """The facies table as published: porosity, permeability, Swi, grain size and source per facies id."""
+    extra = {int(row["facies_id"]): row for row in (extra_rows or ())}
+    rows = []
+    for item in properties:
+        facies_id = int(item["id"])
+        more = extra.get(facies_id, {})
+        rows.append({"facies_id": facies_id, "name": str(item.get("name") or f"Facies {facies_id}"),
+                     "analysis_role": item.get("analysis_role"), "porosity": item.get("porosity"),
+                     "permeability": item.get("permeability"),
+                     "permeability_unit": item.get("permeability_unit"), "swi": more.get("swi"),
+                     "grain_size": more.get("grain_size"), "source": more.get("source")})
+    return rows
+
+
+def read_property_columns(path) -> list[dict]:
+    """The optional Swi, grain size and source columns of a facies properties table (CSV)."""
+    import csv
+
+    if path is None or not str(path) or not Path(path).is_file():
+        return []
+    rows = []
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream):
+            columns = {str(key).strip().casefold(): value for key, value in row.items() if key is not None}
+            identity = columns.get("facies_id") or columns.get("id")
+            if identity in (None, ""):
+                continue
+
+            def number(name):
+                """A finite number from a column, or None."""
+                try:
+                    value = float(columns.get(name))
+                except (TypeError, ValueError):
+                    return None
+                return value if math.isfinite(value) else None
+
+            rows.append({"facies_id": int(float(identity)), "swi": number("swi"),
+                         "grain_size": number("grain_size") if number("grain_size") is not None
+                         else columns.get("grain_size") or None,
+                         "source": columns.get("source") or None})
+    return rows
+
+
+def grid_products(completed: CompletedGeometry, *, width_m: float, height_m: float, depth_points, table: list,
+                  resolution_mm: float, precision: str = "float32") -> tuple[dict, dict]:
+    """The completed geometry on the requested storage grid (N18 step 4): arrays and their grid metadata."""
+    from ..mass.n1_geometry import measured_geometry
+    from ..storage_resolution import aggregate_static, make_grid
+
+    x_m, y_m, area = canvas_coordinates(completed.facies.shape, width_m, height_m)
+    porous_ids = {row["facies_id"] for row in table if row.get("analysis_role") in POROUS_ROLES}
+    porosity = {row["facies_id"]: row["porosity"] for row in table
+                if row["facies_id"] in porous_ids and row.get("porosity") is not None}
+    swi = {row["facies_id"]: row["swi"] for row in table
+           if row["facies_id"] in porous_ids and row.get("swi") is not None}
+    facies = np.where(completed.domain, completed.facies, 0).astype(np.int64)
+    measured = measured_geometry(x_m, y_m, facies, depth_points, porosity_by_facies=porosity, swi_by_facies=swi)
+    cell = np.full(facies.shape, area, np.float64)
+    grid = make_grid(x_m, y_m, cell, include=completed.domain,
+                     extent_m=covering_extent(width_m, height_m, resolution_mm),
+                     storage_resolution_mm=resolution_mm, precision=precision)
+    dtype = np.dtype(precision)
+    ids, included = grid.cell_index[grid.included], grid.included
+    size = int(np.prod(grid.shape))
+
+    def total(value):
+        """The sum of a canvas field over each grid cell (domain cells only)."""
+        return np.bincount(ids, weights=np.asarray(value, np.float64)[included], minlength=size)
+
+    def per_area(numerator, denominator):
+        """A ratio per grid cell, NaN where the denominator is zero."""
+        out = np.full(size, np.nan, np.float64)
+        np.divide(numerator, denominator, out=out, where=denominator > 0)
+        return out.reshape(grid.shape).astype(dtype)
+
+    depth = np.where(completed.domain, measured["depth_m"], 0.0)
+    phi = np.where(completed.domain & np.isfinite(measured["porosity"]), measured["porosity"], 0.0)
+    domain_area = total(cell)
+    bulk = total(cell * depth)
+    pore = total(cell * depth * phi)
+    static = aggregate_static(grid, depth_m=depth, porosity=np.where(completed.domain, measured["porosity"], np.nan),
+                              facies=facies)
+    present = sorted(int(value) for value in np.unique(facies[completed.domain]))
+    fractions = np.stack([per_area(total(cell * (facies == value)), domain_area) for value in present]) if present \
+        else np.zeros((0, *grid.shape), dtype)
+    step = float(resolution_mm) / 1000.0
+    arrays = {
+        "facies_majority": static["facies_majority"].astype(np.int32),
+        "facies_majority_area_fraction": static["facies_majority_area_fraction"],
+        "facies_ids": np.asarray(present, np.int32),
+        "facies_area_fractions": fractions,
+        "porosity": per_area(pore, bulk),
+        "depth_m": per_area(bulk, domain_area),
+        "pore_volume_m3": pore.reshape(grid.shape).astype(dtype),
+        "bulk_volume_m3": bulk.reshape(grid.shape).astype(dtype),
+        "domain_area_m2": domain_area.reshape(grid.shape).astype(dtype),
+        "domain_area_fraction": (domain_area / (step * step)).reshape(grid.shape).astype(dtype),
+        "fixture_filled_area_fraction": per_area(total(cell * completed.fixture_filled), domain_area),
+        "edge_filled_area_fraction": per_area(total(cell * completed.edge_filled), domain_area),
+        "unfilled_area_fraction": per_area(total(cell * completed.unfilled), domain_area),
+        "depth_outside_hull_area_fraction": per_area(total(cell * measured["depth_nearest_outside_hull"]),
+                                                     domain_area),
+    }
+    for name in ("fixture_filled", "edge_filled", "unfilled"):
+        arrays[name] = np.nan_to_num(arrays[name + "_area_fraction"]) > 0
+    return arrays, grid.metadata()
+
+
+UNITS = {"facies_majority": "facies id", "facies_majority_area_fraction": "1", "facies_ids": "facies id",
+         "facies_area_fractions": "1 (one layer per facies id, same order)", "porosity": "1 (pore over bulk volume)",
+         "depth_m": "m", "pore_volume_m3": "m3", "bulk_volume_m3": "m3", "domain_area_m2": "m2",
+         "domain_area_fraction": "1 of the cell", "fixture_filled_area_fraction": "1 of the domain area",
+         "edge_filled_area_fraction": "1 of the domain area", "unfilled_area_fraction": "1 of the domain area",
+         "depth_outside_hull_area_fraction": "1 of the domain area", "fixture_filled": "flag",
+         "edge_filled": "flag", "unfilled": "flag"}
+
+
+def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_m: float, depth_points,
+                    resolution_mm: float, fixture_polygons_m=None, fixture_roles=DEFAULT_FIXTURE_ROLES,
+                    precision: str = "float32", source: dict | None = None) -> tuple[bytes, bytes, dict]:
+    """The simulator geometry of one run: the NPZ bytes, the JSON bytes and the counts (N18)."""
+    completed = complete_geometry(facies, roles, width_m=width_m, height_m=height_m,
+                                  fixture_polygons_m=fixture_polygons_m, fixture_roles=fixture_roles)
+    points = np.asarray(depth_points, np.float64)
+    arrays, grid = grid_products(completed, width_m=width_m, height_m=height_m, depth_points=points, table=table,
+                                 resolution_mm=resolution_mm, precision=precision)
+    counts = {"domain_cells": int(completed.domain.sum()), "original_cells": int(completed.original.sum()),
+              "fixture_filled_cells": int(completed.fixture_filled.sum()),
+              "edge_filled_cells": int(completed.edge_filled.sum()), "unfilled_cells": int(completed.unfilled.sum())}
+    stream = io.BytesIO()
+    np.savez_compressed(stream, **arrays)
+    document = {
+        "format": GEOMETRY_FORMAT,
+        "grid": grid,
+        "canvas": {"shape": list(completed.facies.shape), "width_m": float(width_m), "height_m": float(height_m),
+                   "coordinate_convention": "origin_lower_left_x_right_y_up"},
+        "method": {
+            "fixtures": "removed; each layer boundary continued across the hidden region (linear between its two "
+                        "sides, a one-sided boundary kept at its height)",
+            "edges": "edge replication to the walls, the floor and the sand surface: the nearest defined cell in "
+                     "the column, else in the row",
+            "fixture_roles": list(fixture_roles),
+            "fixture_polygons": sorted(str(name) for name in (fixture_polygons_m or {})),
+            "depth": "linear between the measured points inside their hull, nearest outside",
+            "porosity": "from the facies table; reported as pore volume over bulk volume",
+            "analysis_unchanged": "the analysis keeps the hidden sand hidden (N16); only this geometry is completed",
+        },
+        "counts": counts,
+        "arrays": {name: {"dtype": str(value.dtype), "shape": list(value.shape), "unit": UNITS[name]}
+                   for name, value in arrays.items()},
+        "facies_table": table,
+        "depth_points": [[float(x), float(y), float(d)] for x, y, d in points],
+        "source": source or {},
+    }
+    text = (json.dumps(document, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    return stream.getvalue(), text, counts
+
+
+def load_request(path) -> dict:
+    """A simulator geometry request: the geometry revision, the fixtures and the depth points to use.
+
+    Format ``darsia-simulator-geometry-request-v1`` (JSON)::
+
+        {"format": "darsia-simulator-geometry-request-v1",
+         "geometry": "<the geometry revision or configuration JSON, relative to the series folder>",
+         "fixture_roles": ["colorchecker"],
+         "fixtures_m": {"<name>": [[x, y], ...]},
+         "runs": {"<run>": {"fixtures_m": {...}}},
+         "depth_points": [[x, y, depth], ...] or "<a CSV with x, y, depth, relative to the series folder>"}
+
+    Only ``format`` and ``geometry`` are required. Without ``depth_points`` the
+    run configuration's own measured depth points are used.
+    """
+    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict) or value.get("format") != REQUEST_FORMAT:
+        raise ValueError(f"A simulator geometry request ({REQUEST_FORMAT}) is required")
+    unknown = set(value) - {"format", "geometry", "fixture_roles", "fixtures_m", "runs", "depth_points"}
+    if unknown or not isinstance(value.get("geometry"), str):
+        raise ValueError("The request names its geometry and only known fields")
+    return value
+
+
+def series_file(root, value: str) -> Path:
+    """A path named by a request, inside the series folder (a path that leaves it is refused)."""
+    from .layout import inside
+
+    return inside(root, str(value).replace("\\", "/"))
+
+
+def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict]:
+    """One run's facies map, roles by facies id, facies table and source identity from a geometry revision."""
+    from ..geometry_facies import _canonical_facies, _load_array, resolve_run_geometry_artifacts
+
+    configuration = dict(revision.get("configuration") or revision)
+    if configuration.get("coordinate_convention") != "origin_lower_left_x_right_y_up":
+        raise ValueError("The geometry must be rig-corrected with its origin at the lower left")
+    artifacts = resolve_run_geometry_artifacts(revision, run) if "artifacts" in revision else {
+        "scope": "series_reference", "labels_path": configuration.get("labels_path", "")}
+    labels_path = str(artifacts.get("labels_path") or configuration.get("labels_path") or "")
+    facies, properties = _canonical_facies(dict(configuration, labels_path=labels_path))
+    facies_path = str(artifacts.get("facies_path") or "")
+    if artifacts.get("scope") == "run_override" and facies_path:
+        facies = np.squeeze(_load_array(Path(facies_path))).astype(np.int64)
+    roles = {int(row["id"]): row["analysis_role"] for row in properties}
+    extra = read_property_columns(artifacts.get("facies_properties_path")
+                                  or (revision.get("artifacts") or {}).get("facies_properties_path"))
+    source = {"scope": artifacts.get("scope"), "labels": PureWindowsPath(labels_path).name,
+              "revision": revision.get("revision_id")}
+    return np.asarray(facies), roles, facies_table(properties, extra), source
+
+
+def depth_points_for(request: dict, series_root, config: dict) -> np.ndarray:
+    """The measured depth points of a run: the request's, else the run configuration's own."""
+    from ..mass.n1_pipeline import _depth_points
+
+    value = request.get("depth_points")
+    if value is None:
+        value = ((((config or {}).get("mass") or {}).get("template") or {}).get("shared") or {}).get("depth_points")
+    if value is None:
+        raise ValueError("No measured depth points: name them in the request or in the run configuration")
+    if isinstance(value, str):
+        value = {"path": value}
+    reader = type("Reader", (), {"path": staticmethod(lambda bound: series_file(series_root, bound["path"]))})
+    return _depth_points(value, reader)

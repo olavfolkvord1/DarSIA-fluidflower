@@ -52,6 +52,8 @@ def parser() -> argparse.ArgumentParser:
                        help="Resolution of the stored layer the expected results use (default 1)")
     build.add_argument("--simulator-resolution-mm", type=float,
                        help="Required for an S record; there is no default")
+    build.add_argument("--simulator-geometry", type=Path,
+                       help="An S record's simulator geometry request (the completed porous domain, N18)")
     build.add_argument("--link", type=_pair, action="append", default=[], metavar="KIND=DOI",
                        help="other_record, code or article")
     build.add_argument("--no-fingerprint", action="store_true",
@@ -73,7 +75,8 @@ def request_from(arguments) -> "BuildRequest":
         known_variation=arguments.known_variation, peak_memory_bytes=arguments.peak_memory_bytes,
         peak_memory_basis=arguments.peak_memory_basis,
         expected_resolution_mm=arguments.expected_resolution_mm,
-        simulator_resolution_mm=arguments.simulator_resolution_mm, links=dict(arguments.link),
+        simulator_resolution_mm=arguments.simulator_resolution_mm, simulator_geometry=arguments.simulator_geometry,
+        links=dict(arguments.link),
         fingerprint=not arguments.no_fingerprint)
 
 

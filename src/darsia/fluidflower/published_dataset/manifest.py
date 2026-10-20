@@ -92,6 +92,15 @@ def validate_manifest(document: dict) -> dict:
             cases = {frame["case_id"] for frame in frames}
             _require(set(expected[row["run"]].get("frames", {})) == cases,
                      f"run {row['run']}: expected results and frames differ")
+    geometry = (document.get("simulator") or {}).get("geometry")
+    if geometry is not None:
+        _require(identity["record"] == "S", "only an S record carries a simulator geometry")
+        for run, row in (geometry.get("runs") or {}).items():
+            for kind in ("npz", "json"):
+                item = row.get(kind) or {}
+                record_relative(item.get("path", ""))
+                _require(_SHA.fullmatch(str(item.get("sha256", ""))) is not None,
+                         f"run {run}: the simulator geometry {kind} has no SHA-256")
     validate_rule((document.get("reproducibility") or {}).get("other_machines") or {})
     _require(type(document.get("quick_check_valid")) is bool, "quick_check_valid must be true or false")
     for item in document.get("files") or ():

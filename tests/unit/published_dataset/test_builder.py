@@ -301,6 +301,42 @@ def test_simulator_record_needs_an_explicit_resolution(tmp_path):
                                            "products/r1/timeseries/protocols/injection.csv",
                                            *(f"products/r1/r1_f{i}/storage_stored_frame.npz" for i in (1, 2, 3))}
     assert load_manifest(record)["simulator"]["resolution_mm"] == 1.0
+    assert "geometry" not in load_manifest(record)["simulator"]  # Without a request: as before.
+
+
+def test_a_simulator_record_carries_the_completed_geometry_on_request(tmp_path):
+    from tests.unit.published_dataset.test_simulator_geometry import FIXTURE, FLAT_DEPTH, layered, write_revision
+
+    series = make_series(tmp_path)
+    write_revision(series.series / "geometry", layered())
+    wanted = tmp_path / "geometry_request.json"
+    wanted.write_text(json.dumps({"format": "darsia-simulator-geometry-request-v1",
+                                  "geometry": "geometry/geometry.json", "fixtures_m": FIXTURE,
+                                  "depth_points": FLAT_DEPTH}), encoding="utf-8")
+    refused = check_build(request(series, simulator_geometry=wanted))[1]
+    assert "A simulator geometry belongs to an S record" in refused.refusals
+    report = build_record(request(series, record="S", simulator_resolution_mm=1.0, simulator_geometry=wanted))
+    assert report.built, report.text()
+    record = series.root / "record"
+    manifest = load_manifest(record)
+    section = manifest["simulator"]["geometry"]
+    assert section["format"] == "darsia-simulator-geometry-v1" and section["fixture_roles"] == ["colorchecker"]
+    assert section["request_sha256"] == sha(wanted.read_bytes()) and set(section["runs"]) == {"r1", "r2"}
+    with zipfile.ZipFile(record / "simulator_r1.zip") as archive:
+        npz = archive.read("products/r1/geometry/simulator_geometry.npz")
+        document = json.loads(archive.read("products/r1/geometry/simulator_geometry.json"))
+    row = section["runs"]["r1"]
+    assert row["npz"] == {"path": "products/r1/geometry/simulator_geometry.npz", "sha256": sha(npz),
+                          "size_bytes": len(npz)}
+    assert row["counts"]["fixture_filled_cells"] > 0 and row["counts"]["unfilled_cells"] == 0
+    assert document["grid"]["resolution_mm"] == 1.0 and document["source"]["labels"] == "labels.npz"
+    assert "simulator_geometry.npz" in (record / "README.md").read_text(encoding="utf-8")
+    assert str(tmp_path) not in json.dumps(document)
+    wanted.write_text(json.dumps({"format": "darsia-simulator-geometry-request-v1",
+                                  "geometry": "geometry/missing.json"}), encoding="utf-8")
+    missing = check_build(request(series, record="S", simulator_resolution_mm=1.0, simulator_geometry=wanted,
+                                  output=tmp_path / "other"))[1]
+    assert any(item.startswith("The simulator geometry request is not usable") for item in missing.refusals)
 
 
 def test_another_series_or_an_unfinished_job_is_refused(tmp_path):

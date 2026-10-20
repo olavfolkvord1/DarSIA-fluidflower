@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -41,7 +42,8 @@ def test_manifest_checks_refuse_broken_documents(built):
             (lambda d: d["reproducibility"]["other_machines"].update(same_machine="close"), "bit-identical"),
             (lambda d: d["reproducibility"]["other_machines"]["masses"].update(relative=-1), "nonnegative"),
             (lambda d: d.update(quick_check_valid="yes"), "quick_check_valid"),
-            (lambda d: d["size"].update(files=100), "fewer than 100")):
+            (lambda d: d["size"].update(files=100), "fewer than 100"),
+            (lambda d: d.update(simulator={"geometry": {"runs": {}}}), "only an S record")):
         broken = deepcopy(document)
         change(broken)
         with pytest.raises(ValueError, match=message):
@@ -115,6 +117,11 @@ def test_request_from_arguments_and_the_gui_entry_point_dispatch(tmp_path, monke
                                       "--output", "o", "--simulator-resolution-mm", "1"])
     request = cli.request_from(parsed)
     assert (request.record, request.tier, request.simulator_resolution_mm, request.roots) == ("S", "S100", 1.0, None)
+    assert request.simulator_geometry is None
+    parsed = cli.parser().parse_args(["build", "--series", "s", "--job", "j", "--record", "S", "--tier", "S100",
+                                      "--output", "o", "--simulator-resolution-mm", "1",
+                                      "--simulator-geometry", "request.json"])
+    assert cli.request_from(parsed).simulator_geometry == Path("request.json")
     from darsia.gui import __main__ as gui_main
 
     seen = []
