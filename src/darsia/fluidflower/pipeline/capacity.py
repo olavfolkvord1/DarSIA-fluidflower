@@ -686,6 +686,9 @@ def estimate_run(task, config, profile, *, measurement, completion, layout=None,
 
 
 def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=None):
+    if task.get("pipeline") == "lattice-phase-n1":
+        from .lattice_capacity import lattice_estimate
+        return lattice_estimate(task, config)
     from ..storage_profile import declared_storage_profile
     if declared_storage_profile(task) == "lean":
         # The task's explicit choice binds its own estimate and writer identity;
