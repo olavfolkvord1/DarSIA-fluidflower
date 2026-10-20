@@ -310,9 +310,14 @@ def test_a_simulator_record_carries_the_completed_geometry_on_request(tmp_path):
     series = make_series(tmp_path)
     write_revision(series.series / "geometry", layered())
     wanted = tmp_path / "geometry_request.json"
-    wanted.write_text(json.dumps({"format": "darsia-simulator-geometry-request-v1",
-                                  "geometry": "geometry/geometry.json", "fixtures_m": FIXTURE,
-                                  "depth_points": FLAT_DEPTH}), encoding="utf-8")
+    base = {"format": "darsia-simulator-geometry-request-v1", "geometry": "geometry/geometry.json",
+            "inner_frame": "canvas", "sand_surface": "free_water", "depth_points": FLAT_DEPTH}
+    wanted.write_text(json.dumps(dict(base, runs={"r2": {"fixtures_m": {}}})), encoding="utf-8")
+    undeclared = check_build(request(series, record="S", simulator_resolution_mm=1.0, simulator_geometry=wanted))[1]
+    assert any(item.startswith("Run r1: the simulator geometry could not be made (No fixtures are declared")
+               for item in undeclared.refusals)
+    assert not any(item.startswith("Run r2") for item in undeclared.refusals)  # An explicit empty mapping.
+    wanted.write_text(json.dumps(dict(base, fixtures_m=FIXTURE)), encoding="utf-8")
     refused = check_build(request(series, simulator_geometry=wanted))[1]
     assert "A simulator geometry belongs to an S record" in refused.refusals
     report = build_record(request(series, record="S", simulator_resolution_mm=1.0, simulator_geometry=wanted))
@@ -330,10 +335,13 @@ def test_a_simulator_record_carries_the_completed_geometry_on_request(tmp_path):
                           "size_bytes": len(npz)}
     assert row["counts"]["fixture_filled_cells"] > 0 and row["counts"]["unfilled_cells"] == 0
     assert document["grid"]["resolution_mm"] == 1.0 and document["source"]["labels"] == "labels.npz"
+    assert document["method"]["inner_frame"] == "canvas" and document["method"]["sand_surface"] == "free_water"
+    assert {item["permeability_unit"] for item in document["facies_table"]
+            if item["analysis_role"] == "porous_medium"} == {"mD"}  # The series table states its unit.
+    assert any(line.startswith("Run r1: Facies 2 has no swi, grain_size, source") for line in report.warnings)
     assert "simulator_geometry.npz" in (record / "README.md").read_text(encoding="utf-8")
     assert str(tmp_path) not in json.dumps(document)
-    wanted.write_text(json.dumps({"format": "darsia-simulator-geometry-request-v1",
-                                  "geometry": "geometry/missing.json"}), encoding="utf-8")
+    wanted.write_text(json.dumps(dict(base, geometry="geometry/missing.json")), encoding="utf-8")
     missing = check_build(request(series, record="S", simulator_resolution_mm=1.0, simulator_geometry=wanted,
                                   output=tmp_path / "other"))[1]
     assert any(item.startswith("The simulator geometry request is not usable") for item in missing.refusals)

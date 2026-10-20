@@ -15,6 +15,7 @@ TABLE = [{"facies_id": key, "name": name, "analysis_role": "porous_medium", "por
           "permeability_unit": "D", "swi": None, "grain_size": None, "source": None}
          for key, name, phi in ((1, "Upper sand", 0.4), (2, "Middle sand", 0.3), (3, "Lower sand", 0.2))]
 FLAT_DEPTH = [[-1.0, -1.0, 0.01], [2.0, -1.0, 0.01], [0.5, 2.0, 0.01]]
+DECLARED = {"inner_frame": "canvas", "sand_surface": "free_water"}
 
 
 def layered(*, dip=True):
@@ -54,7 +55,10 @@ def test_the_domain_runs_from_the_sand_surface_to_the_floor():
     water[:3, :3] = True
     frame = np.zeros((10, 6), bool)
     frame[8:, :] = True
-    domain = geometry.porous_domain(porous, np.zeros((10, 6), bool), water, frame)
+    domain, counts = geometry.porous_domain(porous, np.zeros((10, 6), bool), water, frame,
+                                            sand_surface="free_water")
+    assert counts == {"surface_columns_below_free_water": 3, "surface_columns_at_highest_sand": 2,
+                      "surface_columns_from_neighbour": 1}
     assert domain[3:8, :3].all() and not domain[:3, :3].any()  # Below the free water, down to the floor.
     assert domain[3:8, 3].all() and not domain[:3, 3].any()  # No water: from its highest sand cell.
     assert domain[3:8, 4].all()  # No water and no sand: the nearest column's surface.
@@ -64,7 +68,8 @@ def test_the_domain_runs_from_the_sand_surface_to_the_floor():
 
 def test_flat_layers_continue_unchanged_across_a_fixture():
     facies = layered(dip=False)
-    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, fixture_polygons_m=FIXTURE)
+    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                           fixture_polygons_m=FIXTURE)
     hidden = geometry.fixture_mask((40, 60), WIDTH, HEIGHT, FIXTURE)
     assert np.array_equal(completed.facies, facies)
     assert np.array_equal(completed.fixture_filled, hidden) and not completed.edge_filled.any()
@@ -73,7 +78,8 @@ def test_flat_layers_continue_unchanged_across_a_fixture():
 
 def test_a_dipping_boundary_is_interpolated_between_its_two_sides():
     facies = layered()
-    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, fixture_polygons_m=FIXTURE)
+    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                           fixture_polygons_m=FIXTURE)
     hidden = completed.fixture_filled
     columns = np.flatnonzero(hidden.any(axis=0))
     left, right = columns.min() - 1, columns.max() + 1
@@ -91,6 +97,7 @@ def test_a_boundary_seen_on_one_side_only_keeps_its_height():
     facies[25:30, 40:] = 4  # A lens on the right side only: boundaries 2|4 and 4|3 exist there alone.
     hidden = {"chart": [(0.030, 0.005), (0.040, 0.005), (0.040, 0.030), (0.030, 0.030)]}
     completed = geometry.complete_geometry(facies, {**ROLES, 4: "porous_medium"}, width_m=WIDTH, height_m=HEIGHT,
+                                           **DECLARED,
                                            fixture_polygons_m=hidden)
     filled = completed.fixture_filled
     rows = {row: set(completed.facies[row][filled[row]]) for row in range(40) if filled[row].any()}
@@ -103,7 +110,8 @@ def test_a_boundary_seen_on_one_side_only_keeps_its_height():
 def test_a_fixture_at_the_wall_is_continued_from_its_one_side():
     facies = layered()
     wall = {"chart": [(0.050, 0.010), (0.0605, 0.010), (0.0605, 0.025), (0.050, 0.025)]}
-    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, fixture_polygons_m=wall)
+    completed = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                           fixture_polygons_m=wall)
     filled = completed.fixture_filled
     columns = np.flatnonzero(filled.any(axis=0))
     side = columns.min() - 1
@@ -120,7 +128,8 @@ def test_edges_are_replicated_to_the_walls_the_floor_and_the_sand_surface():
     facies[37:, :] = unknown  # A strip above the floor.
     facies[5:, :3] = unknown  # A strip at the left wall.
     roles = dict(ROLES)
-    completed = geometry.complete_geometry(facies, roles, width_m=WIDTH, height_m=HEIGHT)
+    completed = geometry.complete_geometry(facies, roles, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                           fixture_polygons_m={})
     assert not completed.fixture_filled.any() and not completed.unfilled.any()
     assert np.array_equal(completed.edge_filled, facies == unknown)
     assert np.array_equal(completed.facies[5:7, 3:], np.ones((2, 57), np.int64))  # From the sand below.
@@ -132,15 +141,17 @@ def test_edges_are_replicated_to_the_walls_the_floor_and_the_sand_surface():
 def test_a_fixture_role_in_the_map_is_removed_and_filled():
     facies = layered(dip=False)
     facies[20:28, 20:28] = 7
-    completed = geometry.complete_geometry(facies, {**ROLES, 7: "colorchecker"}, width_m=WIDTH, height_m=HEIGHT)
+    completed = geometry.complete_geometry(facies, {**ROLES, 7: "colorchecker"}, width_m=WIDTH, height_m=HEIGHT,
+                                           **DECLARED)
     assert completed.fixture_filled.sum() == 64 and np.array_equal(completed.facies, layered(dip=False))
 
 
 def test_grid_products_report_fractions_porosity_depth_and_volumes():
     facies = layered(dip=False)
-    npz, text, counts = geometry.export_geometry(facies, ROLES, TABLE, width_m=WIDTH, height_m=HEIGHT,
-                                                 depth_points=FLAT_DEPTH, resolution_mm=2.0,
-                                                 fixture_polygons_m=FIXTURE)
+    npz, text, counts, warnings = geometry.export_geometry(facies, ROLES, TABLE, width_m=WIDTH, height_m=HEIGHT,
+                                                           depth_points=FLAT_DEPTH, resolution_mm=2.0,
+                                                           fixture_polygons_m=FIXTURE, depth_source="request",
+                                                           **DECLARED)
     arrays = np.load(io.BytesIO(npz))
     assert arrays["porosity"].shape == (20, 30) and arrays["facies_ids"].tolist() == [1, 2, 3]
     cell = 0.002 ** 2
@@ -161,16 +172,22 @@ def test_grid_products_report_fractions_porosity_depth_and_volumes():
     document = json.loads(text)
     assert document["format"] == "darsia-simulator-geometry-v1" and document["counts"] == counts
     assert document["grid"]["shape"] == [20, 30] and document["grid"]["resolution_mm"] == 2.0
-    assert document["facies_table"] == TABLE and document["depth_points"] == FLAT_DEPTH
+    assert [row["porosity"] for row in document["facies_table"]] == [0.4, 0.3, 0.2]
+    assert document["depth_points"] == FLAT_DEPTH
     assert document["method"]["fixture_polygons"] == ["chart"]
+    assert document["method"]["fixtures_declared"] == "polygons in metres"
+    assert document["method"]["depth_points_source"] == "request" and document["warnings"] == warnings
+    assert warnings == [f"Facies {key} has no swi, grain_size, source in the series table; published as null"
+                        for key in (1, 2, 3)]
     assert set(document["arrays"]) == set(arrays.files)
 
 
 def test_porosity_is_pore_over_bulk_volume_where_depth_varies():
     facies = layered(dip=False)
     sloped = [[0.0, -1.0, 0.01], [0.0, 2.0, 0.01], [0.06, 0.5, 0.03], [0.06, -1.0, 0.03], [0.06, 2.0, 0.03]]
-    npz, _text, _counts = geometry.export_geometry(facies, ROLES, TABLE, width_m=WIDTH, height_m=HEIGHT,
-                                                   depth_points=sloped, resolution_mm=2.0)
+    npz, _text, _counts, _warnings = geometry.export_geometry(facies, ROLES, TABLE, width_m=WIDTH, height_m=HEIGHT,
+                                                              depth_points=sloped, resolution_mm=2.0,
+                                                              fixture_polygons_m={}, **DECLARED)
     arrays = np.load(io.BytesIO(npz))
     sand = arrays["domain_area_fraction"] > 0
     ratio = arrays["pore_volume_m3"][sand] / arrays["bulk_volume_m3"][sand]
@@ -226,6 +243,16 @@ def test_a_run_reads_its_own_or_the_series_geometry(tmp_path):
     revision = write_revision(tmp_path / "geometry", layered(), run_labels=other)
     facies, roles, table, source = geometry.run_geometry(revision, "r1")
     assert np.array_equal(facies, layered()) and roles[0] == "free_water" and roles[2] == "porous_medium"
+    unlabelled = layered()
+    unlabelled[35:, :3] = 42  # A label without a region: undefined, never facies 0 (free water here).
+    revision = write_revision(tmp_path / "geometry-2", unlabelled)
+    facies, roles, _table, _source = geometry.run_geometry(revision, "r1")
+    assert np.all(facies[35:, :3] == 4) and 4 not in roles
+    completed = geometry.complete_geometry(facies, roles, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                           fixture_polygons_m={})
+    assert completed.counts["edge_filled_cells_by_role"] == {"undefined": 15}
+    assert np.array_equal(completed.facies, layered())
+    revision = write_revision(tmp_path / "geometry", layered(), run_labels=other)
     assert source == {"scope": "series_reference", "labels": "labels.npz", "revision": "rev-1"}
     upper = next(row for row in table if row["facies_id"] == 1)
     assert upper["swi"] == 0.1 and upper["source"] == "sieve" and upper["permeability_unit"] == "mD"
@@ -254,7 +281,7 @@ def test_depth_points_come_from_the_request_or_the_run_configuration(tmp_path):
 def test_the_request_names_its_geometry_and_known_fields_only(tmp_path):
     path = tmp_path / "request.json"
     path.write_text(json.dumps({"format": geometry.REQUEST_FORMAT, "geometry": "geometry/geometry.json",
-                                "fixtures_m": FIXTURE}), encoding="utf-8")
+                                "fixtures_m": FIXTURE, **DECLARED}), encoding="utf-8")
     assert geometry.load_request(path)["geometry"] == "geometry/geometry.json"
     path.write_text(json.dumps({"format": geometry.REQUEST_FORMAT, "geometry": "g.json", "colour": 1}),
                     encoding="utf-8")
@@ -280,3 +307,88 @@ def test_replicate_edges_needs_donors_and_targets():
     none = np.zeros((4, 4), bool)
     result, filled = geometry.replicate_edges(facies, none, ~none, x, y)
     assert not filled.any() and np.array_equal(result, facies)
+
+
+def test_every_missing_declaration_refuses_with_its_reason():
+    facies = layered(dip=False)
+    with pytest.raises(ValueError, match="inner frame must be declared"):
+        geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, inner_frame="",
+                                   sand_surface="free_water", fixture_polygons_m={})
+    with pytest.raises(ValueError, match="no frame cell"):
+        geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, inner_frame="frame_role",
+                                   sand_surface="free_water", fixture_polygons_m={})
+    framed = facies.copy()
+    framed[-1, :] = 8
+    with pytest.raises(ValueError, match="frame cells"):
+        geometry.complete_geometry(framed, {**ROLES, 8: "frame"}, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                   fixture_polygons_m={})
+    dry = facies.copy()
+    dry[:5] = 1
+    with pytest.raises(ValueError, match="no free-water cell"):
+        geometry.complete_geometry(dry, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED, fixture_polygons_m={})
+    with pytest.raises(ValueError, match="sand surface must be one of"):
+        geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, inner_frame="canvas",
+                                   sand_surface="guess", fixture_polygons_m={})
+    with pytest.raises(ValueError, match="No fixtures are declared"):
+        geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED)
+    outside = {"chart": [(0.001, 0.0395), (0.005, 0.0395), (0.005, 0.0385), (0.001, 0.0385)]}  # In the water.
+    with pytest.raises(ValueError, match="covers no cell of the porous domain"):
+        geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                   fixture_polygons_m=outside)
+    zero = np.where(facies == 0, 5, facies)
+    zero[10:12, :] = 0
+    with pytest.raises(ValueError, match="Facies id 0 cannot be porous"):
+        geometry.complete_geometry(zero, {0: "porous_medium", 1: "porous_medium", 2: "porous_medium",
+                                          3: "porous_medium", 5: "free_water"}, width_m=WIDTH, height_m=HEIGHT,
+                                   **DECLARED, fixture_polygons_m={})
+    explicit = geometry.complete_geometry(facies, ROLES, width_m=WIDTH, height_m=HEIGHT, **DECLARED,
+                                          fixture_polygons_m={})
+    assert explicit.counts["fixture_filled_cells"] == 0 and explicit.counts["fixture_polygons"] == []
+
+
+def test_the_facies_table_must_carry_porosity_permeability_and_a_stated_unit():
+    facies = layered(dip=False)
+    options = dict(width_m=WIDTH, height_m=HEIGHT, depth_points=FLAT_DEPTH, resolution_mm=2.0,
+                   fixture_polygons_m={}, **DECLARED)
+    for change, message in ((dict(porosity=None), "no porosity"), (dict(porosity=1.5), "no porosity"),
+                            (dict(permeability=None), "no positive permeability"),
+                            (dict(permeability_unit="source_unit"), "not stated")):
+        table = [dict(row, **change) if row["facies_id"] == 2 else row for row in TABLE]
+        with pytest.raises(ValueError, match=message):
+            geometry.export_geometry(facies, ROLES, table, **options)
+    unstated = [dict(row, permeability_unit="source_unit") for row in TABLE]
+    _npz, text, _counts, _warnings = geometry.export_geometry(facies, ROLES, unstated, permeability_unit="D",
+                                                              **options)
+    assert {row["permeability_unit"] for row in json.loads(text)["facies_table"]} == {"D"}
+    with pytest.raises(ValueError, match="the table states D, the request mD"):
+        geometry.export_geometry(facies, ROLES, TABLE, permeability_unit="mD", **options)
+    unused = TABLE + [{"facies_id": 9, "name": "Unused", "analysis_role": "porous_medium", "porosity": None,
+                       "permeability": None, "permeability_unit": "", "swi": None, "grain_size": None,
+                       "source": None}]
+    geometry.export_geometry(facies, ROLES, unused, **options)  # A facies absent from the domain is not checked.
+
+
+def test_too_few_depth_points_and_unfilled_cells_refuse():
+    facies = layered(dip=False)
+    options = dict(width_m=WIDTH, height_m=HEIGHT, resolution_mm=2.0, fixture_polygons_m={}, **DECLARED)
+    for points in (FLAT_DEPTH[:2], [[0, 0, 0.01], [1, 0, 0.0], [0, 1, 0.01]]):
+        with pytest.raises(ValueError, match="three measured depth points"):
+            geometry.export_geometry(facies, ROLES, TABLE, depth_points=points, **options)
+    wide = {"band": [(-0.001, 0.012), (0.0615, 0.012), (0.0615, 0.022), (-0.001, 0.022)]}  # Wall to wall.
+    with pytest.raises(ValueError, match="have no geometry"):
+        geometry.export_geometry(facies, ROLES, TABLE, depth_points=FLAT_DEPTH,
+                                 **dict(options, fixture_polygons_m=wide))
+
+
+def test_the_request_must_declare_the_frame_and_the_surface(tmp_path):
+    path = tmp_path / "request.json"
+    base = {"format": geometry.REQUEST_FORMAT, "geometry": "g.json"}
+    path.write_text(json.dumps(base), encoding="utf-8")
+    with pytest.raises(ValueError, match="inner_frame"):
+        geometry.load_request(path)
+    path.write_text(json.dumps(dict(base, inner_frame="canvas")), encoding="utf-8")
+    with pytest.raises(ValueError, match="sand_surface"):
+        geometry.load_request(path)
+    path.write_text(json.dumps(dict(base, inner_frame="canvas", sand_surface="free_water",
+                                    permeability_unit="D")), encoding="utf-8")
+    assert geometry.load_request(path)["permeability_unit"] == "D"

@@ -473,8 +473,10 @@ def simulator_geometry_members(request: BuildRequest, job: FinishedJob, publishe
     """Each run's completed simulator geometry (N18) as archive members, and the manifest section.
 
     Only an S record with a simulator geometry request has them. The request
-    names the series' geometry revision, the fixture roles and polygons, and
-    the depth points (default: each run configuration's own).
+    names the series' geometry revision, the inner frame and sand surface, the
+    fixture roles and polygons, and the depth points (default: each run
+    configuration's own). A missing or unusable input refuses the record; it
+    is never inferred.
     """
     if request.simulator_geometry is None:
         return {}, None
@@ -498,20 +500,21 @@ def simulator_geometry_members(request: BuildRequest, job: FinishedJob, publishe
     members = {}
     for run, config in zip(job.runs, published.configs):
         own = ((wanted.get("runs") or {}).get(run) or {}).get("fixtures_m")
-        fixtures = dict(wanted.get("fixtures_m") or {}) if own is None else dict(own)
+        fixtures = own if own is not None else wanted.get("fixtures_m")
         try:
             facies, by_facies, table, source = geometry.run_geometry(revision, run)
             points = geometry.depth_points_for(wanted, roots["series"], config)
-            npz, text, counts = geometry.export_geometry(
+            npz, text, counts, warnings = geometry.export_geometry(
                 facies, by_facies, table, width_m=width, height_m=height, depth_points=points,
-                resolution_mm=request.simulator_resolution_mm, fixture_polygons_m=fixtures, fixture_roles=roles,
+                resolution_mm=request.simulator_resolution_mm, inner_frame=wanted["inner_frame"],
+                sand_surface=wanted["sand_surface"], fixture_polygons_m=fixtures, fixture_roles=roles,
+                permeability_unit=wanted.get("permeability_unit"),
+                depth_source="request" if wanted.get("depth_points") is not None else "run configuration",
                 source=source)
         except (OSError, ValueError, KeyError, TypeError) as error:
             report.refuse(f"Run {run}: the simulator geometry could not be made ({error})")
             continue
-        if counts["unfilled_cells"]:
-            report.warnings.append(f"Run {run}: {counts['unfilled_cells']} cell(s) of the porous domain have no "
-                                   "geometry (no defined cell in their column or row)")
+        report.warnings.extend(f"Run {run}: {line}" for line in warnings)
         base = f"{EXPECTED_FOLDER['S']}/{run}/geometry/{geometry.FILE_STEM}"
         members[run] = [Member(base + ".npz", data=npz), Member(base + ".json", data=text)]
         section["runs"][run] = {"npz": {"path": base + ".npz", "sha256": _sha(npz), "size_bytes": len(npz)},

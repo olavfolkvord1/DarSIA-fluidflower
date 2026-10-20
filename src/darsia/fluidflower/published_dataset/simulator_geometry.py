@@ -27,6 +27,18 @@ facies map with region roles), together with explicit configuration:
 Depth follows the production rule: linear between the measured points inside
 their hull, nearest outside. Porosity comes from the facies table. Nothing
 here is imported by a production worker.
+
+Missing inputs refuse the export with a clear message; nothing is inferred:
+- undeclared fixtures;
+- a fixture polygon that covers no sand;
+- an undeclared inner frame or sand surface;
+- a porous facies without porosity or permeability;
+- an unstated permeability unit;
+- missing depth points;
+- a cell that no rule can fill.
+
+The rule-based choices that remain are counted and reported: surface columns
+without free water, and gaps filled by edge replication by their role.
 """
 
 from __future__ import annotations
@@ -48,6 +60,11 @@ FRAME_ROLES = frozenset({"frame"})
 DEFAULT_FIXTURE_ROLES = ("colorchecker",)
 RASTER_SHIFT = 8
 FILE_STEM = "simulator_geometry"
+INNER_FRAMES = ("canvas", "frame_role")
+SAND_SURFACES = ("free_water", "highest_sand")
+UNDEFINED = "undefined"
+OPTIONAL_COLUMNS = ("swi", "grain_size", "source")
+UNSTATED_UNITS = frozenset({"", "source_unit"})
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,7 @@ class CompletedGeometry:
     fixture_filled: np.ndarray
     edge_filled: np.ndarray
     unfilled: np.ndarray
+    counts: dict
 
 
 def canvas_coordinates(shape, width_m: float, height_m: float) -> tuple[np.ndarray, np.ndarray, float]:
@@ -75,12 +93,21 @@ def canvas_coordinates(shape, width_m: float, height_m: float) -> tuple[np.ndarr
 
 
 def fixture_mask(shape, width_m: float, height_m: float, polygons_m, *, raster_shift: int = RASTER_SHIFT) -> np.ndarray:
-    """The canvas cells inside any fixture polygon given in metres (the existing fixed-point rasterizer)."""
+    """The canvas cells inside any fixture polygon given in metres (the union of ``fixture_masks``)."""
+    result = np.zeros(tuple(int(value) for value in shape), bool)
+    for mask in fixture_masks(shape, width_m, height_m, polygons_m, raster_shift=raster_shift).values():
+        result |= mask
+    return result
+
+
+def fixture_masks(shape, width_m: float, height_m: float, polygons_m, *,
+                  raster_shift: int = RASTER_SHIFT) -> dict[str, np.ndarray]:
+    """The canvas cells of each fixture polygon given in metres (the existing fixed-point rasterizer)."""
     from ..geometry.pixels import polygon_pixel_domain
 
     rows, columns = (int(value) for value in shape)
     if not polygons_m:
-        return np.zeros((rows, columns), bool)
+        return {}
     dx, dy = float(width_m) / columns, float(height_m) / rows
 
     def pixels(points):
@@ -94,28 +121,34 @@ def fixture_mask(shape, width_m: float, height_m: float, polygons_m, *, raster_s
     _domain, _inside, fixtures = polygon_pixel_domain(
         canvas, {str(name): pixels(points) for name, points in dict(polygons_m).items()}, [rows, columns],
         native_origin_xy=(0.0, 0.0), raster_scale=float(2 ** raster_shift), raster_shift=raster_shift)
-    result = np.zeros((rows, columns), bool)
-    for mask in fixtures.values():
-        result |= mask
-    return result
+    return fixtures
 
 
-def porous_domain(porous, fixture, water, frame) -> np.ndarray:
-    """The complete porous domain: inside the frame, from the sand surface down to the floor.
+def porous_domain(porous, fixture, water, frame, *, sand_surface: str) -> tuple[np.ndarray, dict]:
+    """The complete porous domain and how its surface was found, per column.
 
-    In each column the domain starts below the free water at the top of the
-    interior (the sand surface). Where a column starts without free water, it
-    starts at its highest sand or fixture cell. It ends at the column's lowest
-    cell inside the frame (the floor). A column with neither water nor sand
-    takes the surface of the nearest column that has one. Free water below the
-    surface stays outside the domain.
+    The domain lies inside the frame and runs from the sand surface down to
+    the column's lowest cell inside the frame (the floor).
+    - With ``sand_surface="free_water"``, the surface is below the free water
+      at the top of the interior. A column that starts without free water
+      starts at its highest sand or fixture cell.
+    - With ``"highest_sand"``, every column starts at its highest sand or
+      fixture cell.
+
+    A column with neither takes the surface of the nearest column that has
+    one. Free water below the surface stays outside the domain. The counts say
+    how many columns used each of the three rules.
     """
+    if sand_surface not in SAND_SURFACES:
+        raise ValueError(f"The sand surface must be one of {', '.join(SAND_SURFACES)}")
     porous, fixture, water, frame = (np.asarray(value, bool) for value in (porous, fixture, water, frame))
     rows, columns = porous.shape
     interior = ~frame
     top = np.full(columns, -1, np.int64)
     floor = np.full(columns, -1, np.int64)
     solid = (porous | fixture) & interior
+    counts = {"surface_columns_below_free_water": 0, "surface_columns_at_highest_sand": 0,
+              "surface_columns_from_neighbour": 0}
     for column in range(columns):
         inside = np.flatnonzero(interior[:, column])
         if not inside.size:
@@ -123,23 +156,28 @@ def porous_domain(porous, fixture, water, frame) -> np.ndarray:
         floor[column] = inside[-1]
         start = inside[0]
         run = 0
-        while start + run < rows and interior[start + run, column] and water[start + run, column]:
+        while (sand_surface == "free_water" and start + run < rows and interior[start + run, column]
+               and water[start + run, column]):
             run += 1
         if run:
             top[column] = start + run
+            counts["surface_columns_below_free_water"] += 1
         else:
             filled = np.flatnonzero(solid[:, column])
             if filled.size:
                 top[column] = filled[0]
+                counts["surface_columns_at_highest_sand"] += 1
     known = np.flatnonzero(top >= 0)
     if not known.size:
-        return np.zeros(porous.shape, bool)
-    missing = np.flatnonzero(top < 0)
+        return np.zeros(porous.shape, bool), counts
+    missing = np.flatnonzero((top < 0) & (floor >= 0))
     if missing.size:
         nearest = known[np.abs(known[None, :] - missing[:, None]).argmin(axis=1)]
         top[missing] = top[nearest]
+        counts["surface_columns_from_neighbour"] = int(missing.size)
     index = np.arange(rows)[:, None]
-    return interior & ~water & (index >= top[None, :]) & (index <= floor[None, :]) & (floor[None, :] >= 0)
+    domain = interior & ~water & (index >= top[None, :]) & (index <= floor[None, :]) & (floor[None, :] >= 0)
+    return domain, counts
 
 
 def _boundaries(facies, defined, y_m, column: int) -> list[tuple[float, int, int]]:
@@ -267,12 +305,28 @@ def replicate_edges(facies, donors, targets, x_m, y_m) -> tuple[np.ndarray, np.n
     return result, vertical | horizontal
 
 
-def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, fixture_polygons_m=None,
-                      fixture_roles=DEFAULT_FIXTURE_ROLES, raster_shift: int = RASTER_SHIFT) -> CompletedGeometry:
-    """Complete a rig-corrected facies map (N18 steps 1-3); ``roles`` maps each facies id to its role."""
+def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, inner_frame: str,
+                      sand_surface: str, fixture_polygons_m=None, fixture_roles=DEFAULT_FIXTURE_ROLES,
+                      raster_shift: int = RASTER_SHIFT) -> CompletedGeometry:
+    """Complete a rig-corrected facies map (N18 steps 1-3); ``roles`` maps each facies id to its role.
+
+    The inputs must be declared, and a missing one raises ValueError:
+    - ``inner_frame``: ``"canvas"`` (the canvas edges are the inner walls and
+      the floor) or ``"frame_role"`` (cells with the frame role lie outside);
+    - ``sand_surface``: see ``porous_domain``;
+    - ``fixture_polygons_m``: a mapping, possibly empty, or None when the map's
+      fixture-role regions are the fixtures. Each polygon must cover sand in
+      the domain.
+
+    Hidden sand is filled only by continuing its layers. Gaps (cells without a
+    porous role) are filled by edge replication and counted by their role.
+    Cells that no rule fills stay ``unfilled``.
+    """
     labels = np.asarray(facies)
     if labels.ndim != 2 or labels.dtype.kind not in "iu" or not all(labels.shape):
         raise ValueError("The facies map must be a nonempty two-dimensional integer grid")
+    if inner_frame not in INNER_FRAMES:
+        raise ValueError(f"The inner frame must be declared as one of {', '.join(INNER_FRAMES)}")
     role = {int(key): str(value) for key, value in dict(roles).items()}
 
     def has(names):
@@ -281,21 +335,45 @@ def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, f
         return np.isin(labels, ids) if ids else np.zeros(labels.shape, bool)
 
     frame, water = has(FRAME_ROLES), has(WATER_ROLES)
-    fixture = (has(fixture_roles) | fixture_mask(labels.shape, width_m, height_m, fixture_polygons_m or {},
-                                                 raster_shift=raster_shift)) & ~frame
+    if inner_frame == "frame_role" and not frame.any():
+        raise ValueError("The inner frame is declared by the frame role, but the map has no frame cell")
+    if inner_frame == "canvas" and frame.any():
+        raise ValueError("The map has frame cells; declare the inner frame as 'frame_role'")
+    if sand_surface == "free_water" and not water.any():
+        raise ValueError("The sand surface is declared by the free water, but the map has no free-water cell")
+    roled = has(fixture_roles)
+    if fixture_polygons_m is None and not roled.any():
+        raise ValueError("No fixtures are declared: give fixture polygons in metres, or an explicit empty mapping "
+                         "for a rig without fixtures")
+    polygons = fixture_masks(labels.shape, width_m, height_m, fixture_polygons_m or {}, raster_shift=raster_shift)
+    fixture = roled & ~frame
+    for mask in polygons.values():
+        fixture |= mask & ~frame
+    porous_ids = sorted(key for key, value in role.items() if value in POROUS_ROLES)
+    if 0 in porous_ids and np.any(labels == 0):
+        raise ValueError("Facies id 0 cannot be porous: the production depth and porosity rule skips it")
     porous = has(POROUS_ROLES) & ~fixture
-    domain = porous_domain(porous, fixture, water, frame)
+    domain, counts = porous_domain(porous, fixture, water, frame, sand_surface=sand_surface)
+    for name, mask in polygons.items():
+        if not (mask & domain).any():
+            raise ValueError(f"The fixture polygon {name!r} covers no cell of the porous domain")
     original = porous & domain
     x_m, y_m, _area = canvas_coordinates(labels.shape, width_m, height_m)
     hidden = fixture & domain
     stage, fixture_filled = continue_layers(labels, original, hidden, y_m)
-    rest = domain & ~original & ~fixture_filled
-    result, replicated = replicate_edges(stage, original | fixture_filled, rest, x_m, y_m)
-    fixture_filled = fixture_filled | (replicated & hidden)
-    edge_filled = replicated & ~hidden
+    gaps = domain & ~original & ~hidden
+    result, edge_filled = replicate_edges(stage, original | fixture_filled, gaps, x_m, y_m)
     unfilled = domain & ~original & ~fixture_filled & ~edge_filled
+    by_role = {}
+    for value in np.unique(labels[gaps]):
+        name = role.get(int(value), UNDEFINED)
+        by_role[name] = by_role.get(name, 0) + int(np.count_nonzero(gaps & (labels == value)))
+    counts = dict(counts, domain_cells=int(domain.sum()), original_cells=int(original.sum()),
+                  fixture_filled_cells=int(fixture_filled.sum()), edge_filled_cells=int(edge_filled.sum()),
+                  unfilled_cells=int(unfilled.sum()), edge_filled_cells_by_role=by_role,
+                  fixture_polygons=sorted(polygons), fixture_role_cells=int((roled & domain).sum()))
     return CompletedGeometry(np.where(domain, result, labels), domain, original, fixture_filled, edge_filled,
-                             unfilled)
+                             unfilled, counts)
 
 
 def covering_extent(width_m: float, height_m: float, resolution_mm: float) -> tuple[float, float, float, float]:
@@ -323,6 +401,43 @@ def facies_table(properties: list, extra_rows=None) -> list[dict]:
                      "permeability_unit": item.get("permeability_unit"), "swi": more.get("swi"),
                      "grain_size": more.get("grain_size"), "source": more.get("source")})
     return rows
+
+
+def table_problems(table: list, present_ids, *, permeability_unit: str | None = None) -> tuple[list, list, list]:
+    """Check the facies table for the facies present in the domain; return refusals, warnings and the table.
+
+    Every porous facies needs a porosity in (0, 1] and a positive
+    permeability. The permeability unit must be stated, in the table or by
+    ``permeability_unit``; an unstated unit refuses, and two different units
+    refuse. Missing Swi, grain size or source values are reported as warnings
+    and published as null. The returned table carries the stated unit.
+    """
+    refusals, warnings, rows = [], [], []
+    present = {int(value) for value in present_ids}
+    for row in table:
+        row = dict(row)
+        if row["facies_id"] in present and row.get("analysis_role") in POROUS_ROLES:
+            porosity, permeability = row.get("porosity"), row.get("permeability")
+            if porosity is None or not 0 < float(porosity) <= 1:
+                refusals.append(f"Facies {row['facies_id']} has no porosity in (0, 1] in the series table")
+            if permeability is None or not float(permeability) > 0:
+                refusals.append(f"Facies {row['facies_id']} has no positive permeability in the series table")
+            unit = str(row.get("permeability_unit") or "")
+            if unit in UNSTATED_UNITS:
+                if not permeability_unit:
+                    refusals.append(f"The permeability unit of facies {row['facies_id']} is not stated; state it "
+                                    "in the request (permeability_unit)")
+                unit = permeability_unit or unit
+            elif permeability_unit and permeability_unit != unit:
+                refusals.append(f"Facies {row['facies_id']}: the table states {unit}, the request "
+                                f"{permeability_unit}")
+            row["permeability_unit"] = unit
+            missing = [name for name in OPTIONAL_COLUMNS if row.get(name) is None]
+            if missing:
+                warnings.append(f"Facies {row['facies_id']} has no {', '.join(missing)} in the series table; "
+                                "published as null")
+        rows.append(row)
+    return sorted(set(refusals), key=refusals.index), warnings, rows
 
 
 def read_property_columns(path) -> list[dict]:
@@ -429,17 +544,43 @@ UNITS = {"facies_majority": "facies id", "facies_majority_area_fraction": "1", "
 
 
 def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_m: float, depth_points,
-                    resolution_mm: float, fixture_polygons_m=None, fixture_roles=DEFAULT_FIXTURE_ROLES,
-                    precision: str = "float32", source: dict | None = None) -> tuple[bytes, bytes, dict]:
-    """The simulator geometry of one run: the NPZ bytes, the JSON bytes and the counts (N18)."""
-    completed = complete_geometry(facies, roles, width_m=width_m, height_m=height_m,
-                                  fixture_polygons_m=fixture_polygons_m, fixture_roles=fixture_roles)
+                    resolution_mm: float, inner_frame: str, sand_surface: str, fixture_polygons_m=None,
+                    fixture_roles=DEFAULT_FIXTURE_ROLES, permeability_unit: str | None = None,
+                    depth_source: str = "", precision: str = "float32",
+                    source: dict | None = None) -> tuple[bytes, bytes, dict, list]:
+    """The simulator geometry of one run (N18): the NPZ bytes, the JSON bytes, the counts and the warnings.
+
+    A missing or unusable input raises ValueError with the reason, and nothing
+    is inferred in its place. That covers the declarations of
+    ``complete_geometry``, the facies table (``table_problems``), at least
+    three depth points with positive depths, and every cell of the domain
+    being filled.
+    """
+    completed = complete_geometry(facies, roles, width_m=width_m, height_m=height_m, inner_frame=inner_frame,
+                                  sand_surface=sand_surface, fixture_polygons_m=fixture_polygons_m,
+                                  fixture_roles=fixture_roles)
+    counts = completed.counts
+    if counts["unfilled_cells"]:
+        raise ValueError(f"{counts['unfilled_cells']} cell(s) of the porous domain have no geometry: a hidden "
+                         "region without a defined column on either side, or a gap without a donor")
+    present = np.unique(completed.facies[completed.domain])
+    refusals, warnings, table = table_problems(table, present, permeability_unit=permeability_unit)
+    if refusals:
+        raise ValueError("; ".join(refusals))
     points = np.asarray(depth_points, np.float64)
+    if points.ndim != 2 or points.shape[1:] != (3,) or len(points) < 3 or not np.isfinite(points).all() \
+            or np.any(points[:, 2] <= 0):
+        raise ValueError("At least three measured depth points (x, y, depth) with positive depths are required")
     arrays, grid = grid_products(completed, width_m=width_m, height_m=height_m, depth_points=points, table=table,
                                  resolution_mm=resolution_mm, precision=precision)
-    counts = {"domain_cells": int(completed.domain.sum()), "original_cells": int(completed.original.sum()),
-              "fixture_filled_cells": int(completed.fixture_filled.sum()),
-              "edge_filled_cells": int(completed.edge_filled.sum()), "unfilled_cells": int(completed.unfilled.sum())}
+    if counts["surface_columns_at_highest_sand"] and sand_surface == "free_water":
+        warnings.append(f"{counts['surface_columns_at_highest_sand']} column(s) start without free water; their "
+                        "sand surface is their highest sand cell")
+    if counts["surface_columns_from_neighbour"]:
+        warnings.append(f"{counts['surface_columns_from_neighbour']} column(s) have neither free water nor sand; "
+                        "their sand surface is the nearest column's")
+    for name, cells in sorted(counts["edge_filled_cells_by_role"].items()):
+        warnings.append(f"{cells} gap cell(s) with the role {name!r} filled by edge replication (edge_filled)")
     stream = io.BytesIO()
     np.savez_compressed(stream, **arrays)
     document = {
@@ -454,11 +595,17 @@ def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_
                      "the column, else in the row",
             "fixture_roles": list(fixture_roles),
             "fixture_polygons": sorted(str(name) for name in (fixture_polygons_m or {})),
+            "fixtures_declared": "fixture-role regions only" if fixture_polygons_m is None else (
+                "polygons in metres" if fixture_polygons_m else "none (explicitly)"),
+            "inner_frame": inner_frame,
+            "sand_surface": sand_surface,
             "depth": "linear between the measured points inside their hull, nearest outside",
+            "depth_points_source": depth_source,
             "porosity": "from the facies table; reported as pore volume over bulk volume",
             "analysis_unchanged": "the analysis keeps the hidden sand hidden (N16); only this geometry is completed",
         },
         "counts": counts,
+        "warnings": warnings,
         "arrays": {name: {"dtype": str(value.dtype), "shape": list(value.shape), "unit": UNITS[name]}
                    for name, value in arrays.items()},
         "facies_table": table,
@@ -466,7 +613,7 @@ def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_
         "source": source or {},
     }
     text = (json.dumps(document, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-    return stream.getvalue(), text, counts
+    return stream.getvalue(), text, counts, warnings
 
 
 def load_request(path) -> dict:
@@ -476,20 +623,31 @@ def load_request(path) -> dict:
 
         {"format": "darsia-simulator-geometry-request-v1",
          "geometry": "<the geometry revision or configuration JSON, relative to the series folder>",
+         "inner_frame": "canvas" or "frame_role",
+         "sand_surface": "free_water" or "highest_sand",
          "fixture_roles": ["colorchecker"],
          "fixtures_m": {"<name>": [[x, y], ...]},
          "runs": {"<run>": {"fixtures_m": {...}}},
+         "permeability_unit": "<the unit, when the series table does not state it>",
          "depth_points": [[x, y, depth], ...] or "<a CSV with x, y, depth, relative to the series folder>"}
 
-    Only ``format`` and ``geometry`` are required. Without ``depth_points`` the
-    run configuration's own measured depth points are used.
+    ``format``, ``geometry``, ``inner_frame`` and ``sand_surface`` are required.
+    The fixtures come from ``fixtures_m`` (a run's own entry replaces it, and an
+    empty mapping declares no fixtures) and from the fixture-role regions; a
+    run with neither refuses. Without ``depth_points`` the run configuration's
+    own measured depth points are used.
     """
     value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(value, dict) or value.get("format") != REQUEST_FORMAT:
         raise ValueError(f"A simulator geometry request ({REQUEST_FORMAT}) is required")
-    unknown = set(value) - {"format", "geometry", "fixture_roles", "fixtures_m", "runs", "depth_points"}
+    unknown = set(value) - {"format", "geometry", "inner_frame", "sand_surface", "fixture_roles", "fixtures_m",
+                            "runs", "depth_points", "permeability_unit"}
     if unknown or not isinstance(value.get("geometry"), str):
         raise ValueError("The request names its geometry and only known fields")
+    if value.get("inner_frame") not in INNER_FRAMES:
+        raise ValueError(f"The request must declare inner_frame as one of {', '.join(INNER_FRAMES)}")
+    if value.get("sand_surface") not in SAND_SURFACES:
+        raise ValueError(f"The request must declare sand_surface as one of {', '.join(SAND_SURFACES)}")
     return value
 
 
@@ -510,11 +668,16 @@ def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict
     artifacts = resolve_run_geometry_artifacts(revision, run) if "artifacts" in revision else {
         "scope": "series_reference", "labels_path": configuration.get("labels_path", "")}
     labels_path = str(artifacts.get("labels_path") or configuration.get("labels_path") or "")
+    if not labels_path:
+        raise ValueError(f"The geometry of run {run} has no label map")
     facies, properties = _canonical_facies(dict(configuration, labels_path=labels_path))
-    facies_path = str(artifacts.get("facies_path") or "")
-    if artifacts.get("scope") == "run_override" and facies_path:
-        facies = np.squeeze(_load_array(Path(facies_path))).astype(np.int64)
+    labels = np.squeeze(_load_array(Path(labels_path)))
+    known = [int(row["label_id"]) for row in configuration.get("regions") or ()]
+    undefined = ~np.isin(labels, known)
     roles = {int(row["id"]): row["analysis_role"] for row in properties}
+    if undefined.any():
+        # A label without a region is undefined, never facies 0 (which may be a real facies).
+        facies = np.where(undefined, max([*roles, 0]) + 1, facies)
     extra = read_property_columns(artifacts.get("facies_properties_path")
                                   or (revision.get("artifacts") or {}).get("facies_properties_path"))
     source = {"scope": artifacts.get("scope"), "labels": PureWindowsPath(labels_path).name,
