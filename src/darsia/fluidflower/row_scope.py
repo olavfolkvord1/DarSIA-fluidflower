@@ -302,6 +302,7 @@ def row_scope(context: ScopeContext, action: str, item_id: str) -> RowScope | No
         or (action == "mass_analysis" and item_id in {"frozen", "review"})
         or (action == "method" and item_id == "use_for_series")
         or (action == "image_selection" and item_id == "plan")
+        or (action == "overflow_data" and item_id == "runs")
     ):
         return series_scope(context)
     if action == "analysis" and item_id in {

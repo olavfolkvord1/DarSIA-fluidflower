@@ -121,6 +121,7 @@ def test_setup_is_one_ordered_list_with_original_action_keys(native_window):
     assert [label for label, _rows in section.groups] == [""]
     assert [row.label for row in section._rows.values()] == [
         "Protocols",
+        "Overflow data",
         "Image selection",
         "Rig corners and injection points",
         "Depth",

@@ -24,6 +24,7 @@ NO_STATUS_ROWS = {
     ("phase_model", "calibration_review"),
     ("method", "use_for_series"),
     ("jobs", "new_analysis"),
+    ("overflow_data", "runs"),
 }
 
 STATE_LABELS = {

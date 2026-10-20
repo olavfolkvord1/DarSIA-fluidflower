@@ -20,6 +20,7 @@ ROW_CATEGORIES = {
     "mass_analysis": "analysis",
     "jobs": "analysis",
     "image_selection": "setup",
+    "overflow_data": "setup",
 }
 
 

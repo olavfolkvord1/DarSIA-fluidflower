@@ -1245,6 +1245,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "Read the run protocol and produce the injection and timing records.",
         ),
         (
+            "Overflow data",
+            "overflow_data",
+            "runs",
+            "Show each run's overflow source (none, scale images or table), file and status as the series records them; opening this page writes nothing.",
+        ),
+        (
             "Image selection",
             "image_selection",
             "plan",
@@ -1393,6 +1399,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
 
         self.overflow_page = OverflowChoicePage()
         self.content_stack.addWidget(self.overflow_page)
+        from darsia.fluidflower.overflow_data_page import OverflowDataPage
+
+        self.overflow_data_page = OverflowDataPage()
+        self.content_stack.addWidget(self.overflow_data_page)
         self.geometry_workspace = SeriesGeometryWorkspace(
             series=series, initial_series=initial_series
         )
@@ -2867,6 +2877,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 )
                 if target is not None:
                     target.setFocus()
+            elif action == "overflow_data":
+                self.overflow_data_page.show_series(self._method_series_root())
+                self.content_stack.setCurrentWidget(self.overflow_data_page)
             elif (action, item_id) == ("phase_model", "calibration_review"):
                 self._show_mass_analysis_view("review")
             elif (action, item_id) == ("phase_model", "overflow"):
