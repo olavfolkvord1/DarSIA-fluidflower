@@ -18,6 +18,20 @@ from .policy import CachePolicyError
 from .windows import WindowsNamespace
 
 
+def worker_identity_epoch(pid):
+    """Return the process_create_time string the worker queue records for pid.
+
+    The queue's worker identity stores str(psutil.Process(pid).create_time()).
+    psutil divides the 100 ns FILETIME count as a C double, so for about one
+    process start in five its string differs by one rounding step from the
+    exact value that _owner() records for the same process. Compare a worker
+    identity only with this form, and bind the kernel identity separately and
+    exactly (pid, creation_filetime_100ns).
+    """
+    import psutil
+    return str(psutil.Process(pid).create_time())
+
+
 def bind_actual_worker_owner(owner, *, slot=None, generation=None, role=None):
     """Attach the existing semantic worker identity to its early native owner.
 
@@ -28,9 +42,8 @@ def bind_actual_worker_owner(owner, *, slot=None, generation=None, role=None):
     actual,_=_owner()
     expected_epoch=actual["process_create_time"]
     if lease.manifest.get("native_launch_context") is not None:
-        import psutil
         from .owned_process import current_native_membership
-        expected_epoch=str(psutil.Process(actual["pid"]).create_time())
+        expected_epoch=worker_identity_epoch(actual["pid"])
         if (any(actual.get(key)!=lease.owner.get(key)
                 for key in ("pid","creation_filetime_100ns"))
                 or current_native_membership()!=lease.manifest["native_launch_context"]

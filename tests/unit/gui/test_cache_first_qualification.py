@@ -1,6 +1,7 @@
 """Synthetic protocol cases; never a real cache profile or host admission."""
 from contextlib import contextmanager
 from copy import deepcopy
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -275,6 +276,8 @@ def test_first_claim_uses_existing_service_without_inventing_measured_zero_or_ne
     records=[]
     lease._record=lambda name,value:(records.append(deepcopy(value)) or pin(name))
     monkeypatch.setattr("darsia_cache.worker_adapter._owner",lambda:(lease.owner,{}))
+    monkeypatch.setattr("darsia_cache.worker_adapter.worker_identity_epoch",
+                        lambda pid:lease.owner["process_create_time"])
     claim=SimpleNamespace(token=task["attempt_id"],task=task)
     with lease.ledger.locked():state.remember_claim_locked(lease,claim)
     adapter.register_claim_allocation(claim,lease.ledger,{"token":claim.token},lease.owner,0,state.binding)
@@ -283,6 +286,98 @@ def test_first_claim_uses_existing_service_without_inventing_measured_zero_or_ne
     assert records[0]["service_reservation"]==lease.reservation
     assert records[0]["writer_coverage_sha256"] is None
     assert len(lease.ledger.documents)==3  # Launch proof, actual consumption and exact claim authority.
+
+
+# The Q197 worker process. Its 100 ns FILETIME count is odd and above 2**53, so
+# psutil's double division and the exact division give two epoch strings.
+Q197_TICKS=134369890719926969
+
+
+def q197_epochs():
+    """Return the exact _owner() epoch and the worker queue (psutil) epoch."""
+    since_1970=Q197_TICKS-116444736000000000
+    return str(since_1970/10**7),str(float(since_1970)/10000000.0)
+
+
+def q197_claim_TESTONLY(monkeypatch):
+    """A first claim whose live process is the Q197 one, ready to bind."""
+    state,_=protocol();lease=lease_for(state)
+    exact,_=q197_epochs()
+    lease.owner=dict(pid=12,process_create_time=exact,creation_filetime_100ns=str(Q197_TICKS))
+    adapter=WorkerCacheAdapter.__new__(WorkerCacheAdapter)
+    adapter.lease=lease;adapter.runtime=SimpleNamespace(backend="cpu",commit="c"*40)
+    adapter.profiles={};adapter.claims={}
+    task=task_for(state)
+    launch_for_claim_TESTONLY(state, lease, monkeypatch)
+    adapter.prepare_first_claim(task,None)
+    lease.reservation=dict(token="4"*32,pool="5"*64,sha256="6"*64)
+    lease._record=lambda name,value:pin(name)
+    monkeypatch.setattr("darsia_cache.worker_adapter._owner",lambda:(deepcopy(lease.owner),{}))
+    created={12:float(Q197_TICKS-116444736000000000)/10000000.0}
+    monkeypatch.setattr("psutil.Process",lambda pid:SimpleNamespace(create_time=lambda:created[pid]))
+    claim=SimpleNamespace(token=task["attempt_id"],task=task)
+    with lease.ledger.locked():state.remember_claim_locked(lease,claim)
+    return state,lease,adapter,claim
+
+
+def test_q197_claim_owner_in_the_worker_queue_epoch_form_binds_its_own_process(monkeypatch):
+    """Q197: the queue's psutil epoch and the exact epoch name the same live process."""
+    exact,queue=q197_epochs()
+    assert (exact,queue)==("1792515471.992697","1792515471.9926968")
+    state,lease,adapter,claim=q197_claim_TESTONLY(monkeypatch)
+    owner=dict(machine="main-cpu",pid=12,process_create_time=queue)
+    adapter.register_claim_allocation(claim,lease.ledger,{"token":claim.token},owner,0,state.binding)
+    assert adapter.claims[claim.token]["owner"]==owner
+
+
+@pytest.mark.parametrize("change",["pid","epoch","bootstrap_form","kernel_count"])
+def test_q197_claim_owner_check_stays_exact_for_any_other_process(monkeypatch,change):
+    """Another pid, epoch, epoch form or kernel FILETIME count is still refused."""
+    _,queue=q197_epochs()
+    state,lease,adapter,claim=q197_claim_TESTONLY(monkeypatch)
+    owner=dict(machine="main-cpu",pid=12,process_create_time=queue)
+    if change=="pid":
+        owner["pid"]=13
+    elif change=="epoch":
+        owner["process_create_time"]=str(float(Q197_TICKS+3-116444736000000000)/10000000.0)
+        assert owner["process_create_time"]!=queue
+    elif change=="bootstrap_form":
+        owner["process_create_time"]=lease.owner["process_create_time"]
+    else:
+        moved=dict(lease.owner,creation_filetime_100ns=str(Q197_TICKS+1))
+        monkeypatch.setattr("darsia_cache.worker_adapter._owner",lambda:(deepcopy(moved),{}))
+    with pytest.raises(CachePolicyError,match="owner binding differs"):
+        adapter.register_claim_allocation(claim,lease.ledger,{"token":claim.token},owner,0,state.binding)
+    assert claim.token not in adapter.claims
+
+
+def test_q197_only_the_live_claim_owner_may_close_its_zero_entitlement(monkeypatch):
+    """close_claim uses the same exact owner rule as the claim binding."""
+    _,queue=q197_epochs()
+    state,lease,adapter,claim=q197_claim_TESTONLY(monkeypatch)
+    owner=dict(machine="main-cpu",pid=12,process_create_time=queue)
+    adapter.register_claim_allocation(claim,lease.ledger,{"token":claim.token},owner,0,state.binding)
+    moved=dict(lease.owner,creation_filetime_100ns=str(Q197_TICKS+1))
+    monkeypatch.setattr("darsia_cache.worker_adapter._owner",lambda:(deepcopy(moved),{}))
+    with pytest.raises(CachePolicyError,match="actual live claim owner"):
+        adapter.close_claim(claim)
+
+
+@pytest.mark.skipif(os.name!="nt",reason="the kernel FILETIME count is read on Windows")
+def test_worker_identity_epoch_is_psutils_double_division_of_the_kernel_count():
+    """worker_identity_epoch is the queue form, a function of the kernel FILETIME count."""
+    import ctypes
+    from ctypes import wintypes
+    import psutil
+    from darsia_cache.adapters import worker_identity_epoch
+    kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+    kernel.GetCurrentProcess.restype=wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes=[wintypes.HANDLE,*([ctypes.POINTER(wintypes.FILETIME)]*4)]
+    times=[wintypes.FILETIME() for _ in range(4)]
+    assert kernel.GetProcessTimes(kernel.GetCurrentProcess(),*[ctypes.byref(t) for t in times])
+    since_1970=((times[0].dwHighDateTime<<32)|times[0].dwLowDateTime)-116444736000000000
+    assert worker_identity_epoch(os.getpid())==str(psutil.Process(os.getpid()).create_time())
+    assert worker_identity_epoch(os.getpid())==str(float(since_1970)/10000000.0)
 
 
 def test_q138_preclaim_failure_allows_only_a_new_released_request(monkeypatch):

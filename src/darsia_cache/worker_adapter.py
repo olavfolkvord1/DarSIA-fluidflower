@@ -11,7 +11,7 @@ import json
 from copy import deepcopy
 from pathlib import Path, PureWindowsPath
 
-from .adapters import require_same_startup_stores
+from .adapters import require_same_startup_stores, worker_identity_epoch
 from .bootstrap import _exact, _owner
 from .policy import CachePolicyError, _descriptor, _module_source_descriptor
 
@@ -323,6 +323,20 @@ class WorkerCacheAdapter:
                 coverage_sha256=_coverage_hash(profile["qualification"]), qualification_kind="physical-volume-bound")
         return True
 
+    def _is_current_claim_owner(self, owner):
+        """True only if a claim owner is this very process, compared exactly.
+
+        A claim owner is the queue's worker identity, whose epoch is the
+        worker_identity_epoch form. The current process must still be the lease
+        owner (pid, exact epoch and FILETIME count), and the claim owner's pid
+        and epoch must equal this process in the worker identity form.
+        """
+        actual, _ = _owner()
+        return (all(actual.get(k) == self.lease.owner.get(k)
+                    for k in ("pid", "process_create_time", "creation_filetime_100ns"))
+                and owner.get("pid") == actual["pid"]
+                and owner.get("process_create_time") == worker_identity_epoch(actual["pid"]))
+
     def register_claim_allocation(self, claim, ledger, reservation, owner, maximum, profile):
         """Bind a qualified zero entitlement; never allocate artificial scratch."""
         proof = self.profiles[claim.token]
@@ -331,12 +345,11 @@ class WorkerCacheAdapter:
             first.require_task(self.lease,claim.task)
             if proof.get("first_administration") is not True or profile!=first.binding:
                 raise CachePolicyError("First claim is not the exact released administrative binding")
-        actual, _ = _owner()
         if (ledger is not self.lease.ledger or maximum != 0
                 or claim.token != claim.task["attempt_id"]
                 or proof["task"] != claim.task or proof["binding"] != profile
                 or claim.token in self.claims
-                or any(owner[k] != actual[k] for k in ("pid", "process_create_time"))):
+                or not self._is_current_claim_owner(owner)):
             raise CachePolicyError("Actual claim/cache/service/owner binding differs")
         ledger.require_reservation(reservation, owner, 0)
         ledger.require_unbound_scope(claim.token)
@@ -362,8 +375,7 @@ class WorkerCacheAdapter:
             return row["closed"]
         if row["budget_closed"]:
             raise CachePolicyError("Zero entitlement closed but receipt incomplete; preserve evidence, no retry")
-        actual, _ = _owner()
-        if any(row["owner"][k] != actual[k] for k in ("pid", "process_create_time")):
+        if not self._is_current_claim_owner(row["owner"]):
             raise CachePolicyError("Only the actual live claim owner may close its zero entitlement")
         ledger = self.lease.ledger
         with ledger.locked():
