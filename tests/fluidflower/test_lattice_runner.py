@@ -253,9 +253,11 @@ def test_an_interrupted_run_resumes_from_its_committed_frame_exactly(lattice_wor
 def test_the_request_needs_a_computing_resolution_no_finer_than_stored(lattice_world):
     config = lattice_world["config"]
     assert lr.lattice_request(config, "float32")["computing_resolution_mm"] == 1.0
+    coarser = lr.lattice_request(dict(config, storage=dict(config["storage"], resolution_mm=2.0,
+                                                           extent_m=[0.0, 0.146, 0.0, 0.184])), "float32")
+    assert coarser["resolution_mm"] == 2.0 and coarser["computing_resolution_mm"] == 1.0
     for change, message in ((dict(resolution_mm=0.5), "cannot be finer"),
-                            (dict(resolution_mm=2.0, extent_m=[0.0, 0.146, 0.0, 0.184]),
-                             "coarser stored resolution is not available"),
+                            (dict(resolution_mm=2.0), "origin-zero metric lattice"),
                             (dict(resolution_mm="native"), "cannot be finer"),
                             (dict(computing_resolution_mm=0.25), "0.5 or 1 mm")):
         with pytest.raises(ValueError, match=message):

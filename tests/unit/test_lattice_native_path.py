@@ -19,7 +19,7 @@ from darsia.fluidflower.pipeline import alias_job, lattice_runner, worker
 
 LATTICE_MODULES = ("darsia.fluidflower.computing_lattice", "darsia.fluidflower.phase.physical_units",
                    "darsia.fluidflower.pipeline.lattice_inputs", "darsia.fluidflower.mass.lattice_mass",
-                   "darsia.fluidflower.pipeline.lattice_runner")
+                   "darsia.fluidflower.pipeline.lattice_runner", "darsia.fluidflower.lattice_storage")
 
 SCRIPT = r'''
 import json, sys

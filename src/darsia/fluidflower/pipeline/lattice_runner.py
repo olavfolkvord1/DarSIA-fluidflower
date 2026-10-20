@@ -13,6 +13,11 @@ unchanged ``phase.infer.infer_labels`` classifies the lattice,
 ``n1_pipeline._publish_frame`` publishes the frame. The manifest, every frame
 and the run result record the computing resolution and that coarse results
 are not validated against native computing.
+
+The request stores on the computing lattice, or at 1 or 2 mm over 0.5 or 1 mm
+computing. A coarser stored resolution keeps every lattice frame file and adds
+the frame's stored products, reduced from its lattice products by exact
+blocks (``lattice_storage``), to the frame's stage before the frame commit.
 """
 from __future__ import annotations
 
@@ -36,11 +41,13 @@ def lattice_request(config, precision):
     """Admit a run configuration's lattice request.
 
     The storage request must carry ``computing_resolution_mm`` and a coarse
-    extent. Its other fields pass the unchanged storage request check. Lattice
-    runs store on their computing lattice, so the stored resolution must equal
-    the computing resolution.
+    extent. Its other fields pass the unchanged storage request check. The
+    stored resolution equals the computing resolution or is an integer
+    multiple of it (1 or 2 mm over 0.5 or 1 mm); the extent lies on the stored
+    lattice, so both origin-zero lattices nest exactly.
     """
     from ..computing_lattice import computing_resolution_mm
+    from ..lattice_storage import block_factor
     from ..storage_outputs import parse_request
     storage = config.get("storage")
     if not isinstance(storage, dict) or RESOLUTION_KEY not in storage:
@@ -51,8 +58,7 @@ def lattice_request(config, precision):
     stored = request["resolution_mm"]
     if stored == "native" or float(stored) < computing:
         raise ValueError("The stored resolution cannot be finer than the computing resolution")
-    if float(stored) != computing:
-        raise ValueError("Lattice runs store on their computing lattice; a coarser stored resolution is not available")
+    block_factor(float(stored), computing)
     return dict(request, **{RESOLUTION_KEY: computing})
 
 
@@ -175,6 +181,15 @@ def validate_lattice_frame(spec, result, final_directory, config):
         raise ValueError("Mass source binding differs from the selected acquisition")
     if result["bindings"]["phase_sha256"] != product["phase"]["labels"]["sha256"]:
         raise ValueError("N1 consumed a different lattice phase output")
+    from ..computing_lattice import computing_lattice
+    from ..lattice_storage import stored_layer, verify_stored_entry
+    layer = stored_layer(request, computing_lattice(request["extent_m"], request[RESOLUTION_KEY]))
+    if layer is None:
+        if "stored" in product:
+            raise ValueError("A frame stored on its computing lattice has no coarser stored products")
+    else:
+        verify_stored_entry(product.get("stored"), layer, spec=spec, inventory=inventory, result=result,
+                            reader=reader, configuration_sha256=config["_configuration_sha256"])
     return product
 
 
@@ -228,6 +243,7 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
     """Admit, prepare, compute, publish and close one lattice run."""
     from darsia._opencv_runtime import scientific_thread, completed_frame, require_ipp_off
     from ..computing_lattice import computing_lattice
+    from ..lattice_storage import stored_layer, write_stored_frame
     from ..mass.lattice_mass import LatticeMass, lattice_record
     from ..mass.n1_pipeline import N1Pipeline, DataReader, _write_json, _publish_frame
     from ..mass.production_precision import PixelMath
@@ -249,6 +265,7 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
     if "gas_probability_storage" in config:
         raise ValueError("The gas-probability storage request encodes native-centre pixels; lattice runs omit it")
     lattice = computing_lattice(request["extent_m"], request[RESOLUTION_KEY])
+    layer = stored_layer(request, lattice)
     setting = run_setting(task, config)
     require_template_colour_coordinate(config, config["mass"]["template"])
     if backend not in {"cpu", "cuda"} or precision != task["precision"]:
@@ -285,7 +302,11 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
                      lattice=lattice.metadata(), validation=VALIDATION,
                      storage_profile=dict(setting, applies="lattice runs keep no native intermediates; "
                                                            "every profile stores the lattice layout")))
+    if layer is not None:
+        manifest["lattice"]["stored"] = layer.metadata()
     manifest_asset = _write_json(output / "manifest.json", manifest)
+    identity = dict(run=task["run"], job_id=task["job_id"], configuration=task["configuration"],
+                    code_commit=task["commit"], calibration_sha256=task["calibration_sha256"])
     records = list(prefix["records"])
     producers = list(prefix["frame_producers"])
     if backend == "cpu":
@@ -343,13 +364,19 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
                 mass_spec = mass.frame_spec(spec, stage, current=current, baseline=baseline, phase=phase,
                                             assignment=assignment, canvas_matrix=matrix,
                                             native_record=native["record"]["full"])
-                evaluated = mass.evaluate(mass_spec, mass.box_masks(assignment, assignment.source_shape))
+                capture = None if layer is None else {}
+                evaluated = mass.evaluate(mass_spec, mass.box_masks(assignment, assignment.source_shape),
+                                          output_capture=capture)
                 receipt = _write_json(stage / "lattice_frame.json", dict(
                     format=FRAME_FORMAT, case_id=spec["case_id"], pipeline=PIPELINE,
                     **{RESOLUTION_KEY: request[RESOLUTION_KEY]}, lattice=lattice.metadata(),
                     run_lattice_inputs=run_record, physical_units=units, mass_template=mass.config_asset,
                     native_record=_identity(native["record"]), native_intermediates="transient, not retained",
                     validation=VALIDATION))
+                # Stored products join the stage before the frame commit binds it.
+                stored = None if layer is None else write_stored_frame(
+                    stage, layer, identity=identity, spec=spec, inferred=inferred, phase=phase,
+                    capture=capture, evaluated=evaluated, validation=VALIDATION)
                 stage_binding = dict(
                     format=FRAME_FORMAT, complete=True, pipeline=PIPELINE, case_id=spec["case_id"],
                     configuration_sha256=task["configuration"]["sha256"], source=spec["source"],
@@ -357,6 +384,8 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
                     receipt=receipt, native=_identity(native["record"]), phase=phase,
                     files=_inventory(stage), numerical_phase_calls=1, validation=VALIDATION,
                     opencv_ipp=completed_frame(ipp_before, "run_lattice_series:" + spec["case_id"] + ":after"))
+                if stored is not None:
+                    stage_binding["stored"] = stored
                 evaluated["prediction"]["pipeline"] = stage_binding
                 stage_binding["opencv_ipp"]["mass_evaluation"] = mass.last_opencv_ipp
                 evaluated["opencv_ipp"] = stage_binding["opencv_ipp"]
@@ -368,7 +397,7 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
                 # Full commit precedes advancement and actual progress.
                 inputs.advance(frame)
                 lattice_run.advance(lattice_frame)
-                del frame, inferred, evaluated, native, lattice_frame, bundle, assignment
+                del frame, inferred, evaluated, native, lattice_frame, bundle, assignment, capture, stored
                 shutil.rmtree(transient)
                 if on_progress:
                     on_progress(dict(state="frame_completed", complete=True, run=task["run"],
@@ -390,6 +419,8 @@ def _run_lattice_series(task, output, backend, precision, on_progress, runtime):
                 elapsed_seconds=wall, lattice=lattice.metadata(), validation=VALIDATION,
                 **{RESOLUTION_KEY: request[RESOLUTION_KEY]},
                 opencv_ipp=require_ipp_off("run_lattice_series:completed"))
+            if layer is not None:
+                result["stored"] = layer.metadata()
             del mass
     finally:
         if inputs is not None:
