@@ -2,14 +2,15 @@
 
 An approval is one append-only record in the series folder: the run, the mass
 calibration that series.toml references (its path and SHA-256), the result
-viewed, the reviewer and the UTC time. Records are never rewritten. Approving
-a run has no effect on any result, calibration, plan or job.
+viewed, the reviewer and the UTC time. The reviewer is the series' reviewer
+setting (config/phase_model_studio_reviewer.json); without one the record
+names nobody, and the operating-system login is never used. Records are never
+rewritten. Approving a run has no effect on any result, calibration, plan or job.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import getpass
 import hashlib
 import json
 import os
@@ -69,15 +70,17 @@ def run_approval(records, run, calibration_sha256):
 def approve_run(series_root, run, calibration, *, result=None, reviewer=None, now=None, retry=None):
     """Append one approval record and return it; earlier records stay as they are.
 
-    The append is retried on a transient file error (N111) with the job
-    queue's retry helper, unless ``retry`` supplies another runner.
+    ``reviewer`` is the name from the series' reviewer setting; when it is
+    empty the record's reviewer is None. The append is retried on a transient
+    file error (N111) with the job queue's retry helper, unless ``retry``
+    supplies another runner.
     """
     record = {
         "format": APPROVAL_FORMAT,
         "run": str(run),
         "calibration": {"reference": str(calibration["reference"]), "sha256": str(calibration["sha256"])},
         "result": str(result) if result else None,
-        "reviewer": str(reviewer or getpass.getuser()),
+        "reviewer": str(reviewer).strip() or None if reviewer else None,
         "recorded_utc": (now or dt.datetime.now(dt.timezone.utc)).isoformat(),
     }
     line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")

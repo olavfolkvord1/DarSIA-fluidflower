@@ -170,8 +170,8 @@ class MassAnalysisWorkspace(QWidget):
         approval.addWidget(self.approval_label, 1)
         self.approve_button = QPushButton("Approve run")
         self.approve_button.setToolTip(
-            "Records the reviewer, time and calibration for this run in the series folder. "
-            "It never changes a result.")
+            "Records the series' reviewer setting (if any), the time and the calibration for "
+            "this run in the series folder. It never changes a result.")
         self.approve_button.clicked.connect(self.approve_selected_run)
         approval.addWidget(self.approve_button)
         layout.addWidget(self.approval)
@@ -243,8 +243,8 @@ class MassAnalysisWorkspace(QWidget):
             return
         record = run_approval(records, run, sha)
         if record is not None:
-            text = (f"{str(run).upper()}: approved by {record.get('reviewer')} at "
-                    f"{record.get('recorded_utc')} for {label}.")
+            by = f" by {record['reviewer']}" if record.get("reviewer") else ""
+            text = f"{str(run).upper()}: approved{by} at {record.get('recorded_utc')} for {label}."
         else:
             text = f"{str(run).upper()}: not approved for {label}."
             self.approve_button.setEnabled(True)
@@ -254,13 +254,16 @@ class MassAnalysisWorkspace(QWidget):
     def approve_selected_run(self) -> None:
         """Append one approval record for the viewed run; results stay as they are."""
         from darsia.fluidflower.calibration_approvals import approve_run
+        from darsia.fluidflower.reviewer_preferences import load_reviewer_name
 
         run = self.saved_results.view_experiment.currentData()
         if not run or self.view != "review":
             return
         try:
+            # The reviewer setting names the reviewer (N175); never the OS login.
             approve_run(self.project_root, run, self._approval_calibration(),
-                        result=self.saved_results.result_path)
+                        result=self.saved_results.result_path,
+                        reviewer=load_reviewer_name(self.project_root))
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.approval_label.setText(f"The approval was not recorded: {error}")
             return

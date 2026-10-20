@@ -77,6 +77,19 @@ def test_a_damaged_record_is_reported_not_read_as_unapproved(tmp_path):
         approvals.read_run_approvals(root)
 
 
+def test_without_a_reviewer_setting_the_record_names_nobody(tmp_path, monkeypatch):
+    import getpass
+
+    monkeypatch.setattr(getpass, "getuser", lambda: pytest.fail("The OS login is never recorded"))
+    root = _series(tmp_path)
+    calibration = approvals.calibration_identity(root, "fits/frozen.json")
+    for reviewer in (None, "", "   "):
+        record = approvals.approve_run(root, "ac28", calibration, reviewer=reviewer, retry=lambda action: action())
+        assert record["reviewer"] is None
+    assert approvals.approve_run(root, "ac28", calibration, reviewer=" Reviewer A ",
+                                 retry=lambda action: action())["reviewer"] == "Reviewer A"
+
+
 def test_the_append_uses_the_job_queue_transient_retry_by_default(tmp_path, monkeypatch):
     from darsia.fluidflower.pipeline import job_queue
 
