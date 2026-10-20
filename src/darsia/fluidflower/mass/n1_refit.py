@@ -39,6 +39,8 @@ class RefitRules:
     Times are hours after injection start. ``stage1_window_h`` is closed;
     stage 2 takes frames from ``stage2_start_h``. ``post_bin_edges_h`` split
     stage 2 into ``[start, e1]``, ``(e1, e2]``, ..., ``(last edge, end]``.
+    ``target_times_h``, when given, limits the fit to frames selected at
+    those exact target times (for example an earlier, coarser time grid).
     The anchor of each run is its frame nearest ``anchor_target_h`` within
     ``anchor_tolerance_h``.
     """
@@ -57,6 +59,7 @@ class RefitRules:
     beta_grid: dict
     require_frame_list_evidence: bool
     variant_f: dict
+    target_times_h: tuple | None = None
 
     @classmethod
     def from_plan(cls, plan):
@@ -79,6 +82,9 @@ class RefitRules:
                 or list(edges) != sorted(edges) or any(e <= float(rules["stage2_start_h"]) for e in edges)):
             raise ValueError("Stage windows and post-injection bins must be ordered")
         variant_f = dict(plan.get("variant_f", {"enabled": False}))
+        times = rules.get("target_times_h")
+        if times is not None and (not times or len(set(map(float, times))) != len(times)):
+            raise ValueError("Target times must be a non-empty list of distinct hours")
         return cls(fit_runs=fit, stage1_window_h=window, stage2_start_h=float(rules["stage2_start_h"]),
                    post_bin_edges_h=edges, width_limit=float(rules["width_limit"]),
                    anchor_target_h=float(rules["anchor_target_h"]),
@@ -87,7 +93,8 @@ class RefitRules:
                    beta_starts=tuple(float(v) for v in rules["beta_starts"]),
                    gain_grid=dict(rules["gain_grid"]), beta_grid=dict(rules["beta_grid"]),
                    require_frame_list_evidence=bool(rules["require_frame_list_evidence"]),
-                   variant_f=variant_f)
+                   variant_f=variant_f,
+                   target_times_h=None if times is None else tuple(float(value) for value in times))
 
     def require_variant_f_off(self):
         """Refuse variant F until its decisions and inputs exist."""
@@ -96,6 +103,8 @@ class RefitRules:
 
     def stage(self, target_h):
         """'stage1', 'stage2' or None for a selected target time."""
+        if self.target_times_h is not None and float(target_h) not in self.target_times_h:
+            return None
         low, high = self.stage1_window_h
         if low <= target_h <= high:
             return "stage1"

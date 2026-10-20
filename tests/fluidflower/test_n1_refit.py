@@ -150,6 +150,18 @@ def test_variant_f_is_refused_until_its_decisions_exist():
         n1_refit.fit_candidate(make_rows(["r1"]), rules)
 
 
+def test_target_times_limit_the_fit_to_an_earlier_time_grid():
+    runs = ["r1", "r2"]
+    times = STAGE1[::2] + STAGE2[:4]  # every second injection time, 0.5 to 2.25 h
+    rules = n1_refit.RefitRules.from_plan(make_plan(runs, target_times_h=times))
+    stages, decisions = n1_refit.select_frames(make_rows(runs), rules)
+    assert len(stages["stage1"]) == 2 * 8
+    assert {decision["selected_target_h"] for decision in decisions} == set(times)
+    for invalid in ([], [1.0, 1.0]):
+        with pytest.raises(ValueError, match="Target times"):
+            n1_refit.RefitRules.from_plan(make_plan(runs, target_times_h=invalid))
+
+
 def test_rules_need_ordered_windows_and_distinct_roles():
     with pytest.raises(ValueError, match="ordered"):
         n1_refit.RefitRules.from_plan(make_plan(["r1"], stage2_start_h=2.0))
