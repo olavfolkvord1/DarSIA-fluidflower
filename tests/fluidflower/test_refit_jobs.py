@@ -87,25 +87,75 @@ def test_the_job_has_a_refit_task_and_one_fold_per_fit_run(series):
                                      series_manifest=bound(series["root"] / "series.toml"))
 
 
-def test_the_worker_replay_admits_a_refit_task_and_the_fit_runs_under_it(series, monkeypatch):
+def run_under_replay(series, task):
+    """Admit a refit task with the worker's own replay and run it under that binding."""
     from darsia.fluidflower.pipeline.job_queue import LocalOutputBinding
     from darsia.fluidflower.pipeline.run_io import RunIOBinding
     from darsia.fluidflower.store_map import parse_store_map
-    prepared, _ = prepare(series, loro=False)
-    task = json.loads(Path(prepared["tasks"][0]["task"]["path"]).read_text(encoding="utf-8"))
-    task["attempt_id"] = "e" * 32  # the queue's claim gives each attempt its identity
+    task = dict(task, attempt_id="e" * 32)  # the queue's claim gives each attempt its identity
     stores = parse_store_map(('[machine]\nid = "Main"\n\n[stores.TEST]\n'
                               f"series = '{series['root']}'\nresults = '{series['tmp'] / 'out'}'\n").encode())
     rows = store_runtime.resolve_catalog(task, stores, "TEST")
     verified = store_runtime.verify_inputs(task, rows)
-    output = series["tmp"] / "out" / "refit-job1" / "refit" / ".attempts" / task["attempt_id"]
+    output = series["tmp"] / "out" / "refit-job1" / task["run"] / ".attempts" / task["attempt_id"]
     admission = job_filesystem.LocalFileAdmission(True, "NTFS", "unit results root", "unit",
                                                   checked_container=str(series["tmp"] / "out"))
     binding = RunIOBinding.replay(task, verified,
                                   LocalOutputBinding("Main", series["tmp"] / "out", output, admission),
                                   repository=REPOSITORY, admitted_commit=task["commit"])
     with binding.activate():
-        result = refit_runner.run_refit(task, output, "cpu", "float32")
+        return refit_runner.run_refit(task, output, "cpu", "float32")
+
+
+def test_the_worker_replay_admits_a_refit_task_and_the_fit_runs_under_it(series):
+    prepared, _ = prepare(series, loro=False)
+    task = json.loads(Path(prepared["tasks"][0]["task"]["path"]).read_text(encoding="utf-8"))
+    result = run_under_replay(series, task)
     assert result["complete"] and result["frozen_calibration"] is not None
     assert result["parameters"]["gain"] == pytest.approx(TRUE_GAIN, rel=1e-4)
     assert result["parameters"]["beta"] == pytest.approx(TRUE_BETA, rel=1e-3)
+
+
+def test_status_follows_each_task_and_reads_the_verified_frozen_result(series):
+    prepared, job_root = prepare(series, loro=False)
+    status = refit_jobs.refit_status(job_root)
+    assert status["tasks"]["refit"]["state"] == "waiting" and status["frozen_calibration"] is None
+    # A claim moves the queued task and records progress under its lease.
+    claimed = job_root / "claimed" / "main" / "refit.json"
+    claimed.parent.mkdir(parents=True)
+    (job_root / "queue" / "refit.json").rename(claimed)
+    for index, step in enumerate(("statistics_read", "stage1_grid")):
+        lease = job_root / "leases" / ("refit." + "e" * 32)
+        lease.mkdir(exist_ok=True)
+        (lease / f"progress_{index:08d}.json").write_text(json.dumps(dict(
+            written_unix_ns=index, event=dict(state="refit_progress", step=step))), encoding="utf-8")
+    status = refit_jobs.refit_status(job_root)
+    assert status["tasks"]["refit"]["state"] == "running" and status["tasks"]["refit"]["step"] == "stage1_grid"
+    # The queue publishes the worker's result as the run's completion.
+    task = json.loads(claimed.read_text(encoding="utf-8"))
+    result = run_under_replay(series, task)
+    published = job_root / "results" / "refit" / "completed.json"
+    published.write_text(json.dumps(result), encoding="utf-8")
+    status = refit_jobs.refit_status(job_root)
+    assert status["complete"] and status["parameters"] == result["parameters"]
+    document, frozen = refit_jobs.read_frozen_calibration(job_root)
+    assert frozen == result["frozen_calibration"] and document["parameters"] == result["parameters"]
+    Path(frozen["path"]).write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="changed after it was published"):
+        refit_jobs.read_frozen_calibration(job_root)
+
+
+def test_start_uses_the_jobs_page_launcher_and_refuses_other_jobs(series, monkeypatch, tmp_path):
+    from darsia.fluidflower import jobs_panel
+    _, job_root = prepare(series, loro=False)
+    calls = []
+    monkeypatch.setattr(jobs_panel, "launch_local_worker", lambda root, **kwargs: calls.append((root, kwargs)) or "ok")
+    assert refit_jobs.start_refit_job(job_root, machine="main", stores="stores.toml") == "ok"
+    assert calls[0][0] == job_root
+    assert {key: calls[0][1][key] for key in ("backend", "workers", "machine", "stores")} == \
+        dict(backend="cpu", workers=1, machine="main", stores="stores.toml")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "job.json").write_text(json.dumps(dict(pipeline="native-phase-n1")), encoding="utf-8")
+    with pytest.raises(ValueError, match="Not a refit job"):
+        refit_jobs.start_refit_job(other, machine="main")

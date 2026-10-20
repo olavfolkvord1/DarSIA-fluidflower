@@ -11,6 +11,14 @@ every statistics file before the fit reads it.
 
 Series values (run roles and rules) are arguments, read by the caller from the
 series' own configuration. Nothing here computes a fit.
+
+The API for a page that starts and follows a refit:
+
+* :func:`job_identity` and :func:`create_refit_job` create the queued job;
+* :func:`start_refit_job` starts workers exactly as the Jobs page's Start does;
+* :func:`refit_status` reports every task's state and latest step;
+* :func:`read_frozen_calibration` returns the published frozen calibration,
+  verified by its SHA-256.
 """
 from __future__ import annotations
 
@@ -204,3 +212,79 @@ def prepare_refit_job(execution, job_root, *, series_manifest, storage_profile=N
     prepared = [dict(run=task["run"], task=descriptor(queue.enqueue(task))) for task in tasks]
     return dict(complete=True, job=descriptor(root / "job.json"), tasks=prepared, pipeline=PIPELINE,
                 numerical_calls_started=False, created_utc=datetime.now(timezone.utc).isoformat())
+
+
+def start_refit_job(job_root, *, machine, stores=None, workers=1, python=None, cwd=None):
+    """Start CPU workers for a refit job exactly as the Jobs page's Start does.
+
+    It needs the GUI's Qt process support and returns the launch record of
+    ``jobs_panel.launch_local_worker``. The worker refuses a checkout other
+    than the job's commit.
+    """
+    import sys
+    from ..jobs_panel import launch_local_worker
+    _refit_job(job_root)
+    return launch_local_worker(job_root, backend="cpu", workers=workers, machine=machine,
+                               python=python or sys.executable, cwd=cwd, stores=stores)
+
+
+def _refit_job(job_root):
+    """The job.json of a refit job; any other job is refused."""
+    from .job_queue import read_json
+    from .refit_runner import PIPELINE
+    job = read_json(Path(job_root) / "job.json")
+    if job.get("pipeline") != PIPELINE:
+        raise ValueError("Not a refit job: " + str(job_root))
+    return job
+
+
+def refit_status(job_root):
+    """Each task's state and latest progress step, and the refit's result once published.
+
+    A task is 'waiting' while queued, 'running' once claimed, and 'completed'
+    or 'failed' when published. The latest step comes from the task's own
+    progress records, across attempts.
+    """
+    from .job_queue import name, read_json
+    root = Path(job_root)
+    job = _refit_job(root)
+    failed = {}
+    for path in sorted((root / "failed").glob("*.json")):
+        record = read_json(path)
+        failed[record.get("run")] = record
+    tasks = {}
+    for run in job["expected_runs"]:
+        completed = root / "results" / name(run) / "completed.json"
+        records = [read_json(path) for path in sorted(root.glob("leases/" + name(run) + ".*/progress_*.json"))]
+        latest = max(records, key=lambda record: record.get("written_unix_ns", 0))["event"] if records else None
+        if completed.exists():
+            state = "completed"
+        elif run in failed:
+            state = "failed"
+        elif (root / "queue" / (name(run) + ".json")).exists():
+            state = "waiting"
+        else:
+            state = "running"
+        result = read_json(completed) if completed.exists() else None
+        tasks[run] = dict(state=state, step=None if latest is None else latest.get("step"), latest_event=latest,
+                          parameters=None if result is None else result.get("parameters"),
+                          stop_required=None if result is None else result.get("stop_required"))
+    refit = tasks.get("refit", {})
+    frozen = None
+    if refit.get("state") == "completed":
+        frozen = read_json(root / "results" / "refit" / "completed.json").get("frozen_calibration")
+    return dict(job_root=str(root), tasks=tasks, complete=all(t["state"] == "completed" for t in tasks.values()),
+                failed=sorted(run for run, task in tasks.items() if task["state"] == "failed"),
+                parameters=refit.get("parameters"), stop_required=refit.get("stop_required"),
+                frozen_calibration=frozen)
+
+
+def read_frozen_calibration(job_root):
+    """The published frozen calibration of a refit job and its descriptor, verified by SHA-256."""
+    frozen = refit_status(job_root)["frozen_calibration"]
+    if frozen is None:
+        raise ValueError("No frozen calibration: the refit has not finished, was stopped by its grid check, or failed")
+    data = Path(frozen["path"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != frozen["sha256"] or len(data) != frozen["size_bytes"]:
+        raise ValueError("The frozen calibration changed after it was published")
+    return json.loads(data), dict(frozen)
