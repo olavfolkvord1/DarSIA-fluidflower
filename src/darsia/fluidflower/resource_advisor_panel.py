@@ -38,10 +38,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from .device_choice import DEFAULT_SHAPE, receipt_rows
 from .measurement_receipts import MeasurementRegistry
 
 GIB = 1024**3
 UNKNOWN = "Not recorded"
+GPU_SPEED_NOTE = (
+    "GPU speed: the mass kernel timed on this machine, median seconds per frame "
+    "including upload and download, beside the CPU path of the same stage. A job "
+    "with several GPUs uses the fastest one that can run it; an explicit device "
+    "always wins, and the backend is never switched automatically. The timings "
+    "are kept until a device or driver changes."
+)
 
 
 def _number(value, *, positive=False):
@@ -197,6 +205,10 @@ class ResourceAdvisorPanel(QWidget):
     compatibility. Missing facts remain unknown. ``workers_selected`` emits a
     dict only after the user clicks Use worker count. The owner may persist that
     UI choice; this component never writes job/scientific files.
+
+    The GPU speed table shows this machine's stored GPU benchmark receipt. Only
+    Measure GPU speed runs ``device_benchmark(precision, shape_rc)``, which
+    times the devices in child processes and stores the receipt.
     """
 
     workers_selected = Signal(object)
@@ -204,6 +216,7 @@ class ResourceAdvisorPanel(QWidget):
     hardware_inspection_failed = Signal(str)
     measurement_imported = Signal(object)
     measurement_import_failed = Signal(str)
+    gpu_speed_measured = Signal(object)
 
     def __init__(
         self,
@@ -212,15 +225,20 @@ class ResourceAdvisorPanel(QWidget):
         machines_provider=None,
         inventory_provider=None,
         measurement_registry=None,
+        device_receipt_path=None,
+        device_benchmark=None,
     ):
         super().__init__(parent)
         self.machines_provider, self.inventory_provider = (
             machines_provider,
             inventory_provider,
         )
+        self.device_receipt_path = device_receipt_path
+        self.device_benchmark = device_benchmark
         self.job, self.machines, self.series_label = {}, [], ""
         self._probe_thread = self._probe_worker = None
         self._history_thread = self._history_worker = None
+        self._gpu_thread = self._gpu_worker = None
         self.measurement_registry = measurement_registry or MeasurementRegistry(
             Path(
                 QStandardPaths.writableLocation(
@@ -316,6 +334,29 @@ class ResourceAdvisorPanel(QWidget):
         )
         self.history_table.horizontalHeader().setStretchLastSection(False)
         layout.addWidget(self.history_table)
+        layout.addWidget(self._label(GPU_SPEED_NOTE))
+        gpu_bar = QHBoxLayout()
+        self.measure_gpu_button = QPushButton("Measure GPU speed…")
+        self.measure_gpu_button.clicked.connect(self.measure_gpu_speed)
+        gpu_bar.addWidget(self.measure_gpu_button)
+        gpu_bar.addStretch()
+        layout.addLayout(gpu_bar)
+        self.gpu_table = self._table(
+            [
+                "Device",
+                "Driver",
+                "Precision",
+                "Frame (px)",
+                "Seconds per frame",
+                "Peak device memory",
+                "Fastest of its backend",
+                "Status",
+                "Measured",
+            ]
+        )
+        layout.addWidget(self.gpu_table)
+        self.gpu_label = self._label("")
+        layout.addWidget(self.gpu_label)
         self.probe_label = self._label(
             "No hardware inspection requested. Remote facts are supplied by the registered-machine provider; this panel never starts SSH."
         )
@@ -331,6 +372,7 @@ class ResourceAdvisorPanel(QWidget):
         self.suggested_button.clicked.connect(self._copy_recommendation)
         self.use_button.clicked.connect(self._choose_workers)
         self._refresh_advice()
+        self.refresh_device_measurements()
 
     @staticmethod
     def _label(text):
@@ -388,6 +430,7 @@ class ResourceAdvisorPanel(QWidget):
             # Do not leave another series/job's machine facts looking current.
             self.set_machines([])
             self.probe_label.setText(traceback.format_exc())
+        self.refresh_device_measurements()
 
     def set_machines(self, machines):
         rows = deepcopy(list(machines or []))
@@ -655,13 +698,132 @@ class ResourceAdvisorPanel(QWidget):
         self._history_thread = self._history_worker = None
         self.import_measurement_button.setEnabled(True)
 
+    def _gpu_receipt_path(self):
+        """Return the receipt file shown here: the given one, else this machine's."""
+        if self.device_receipt_path is not None:
+            return Path(self.device_receipt_path)
+        from .device_choice import default_receipt_path
+
+        return default_receipt_path()
+
+    def refresh_device_measurements(self, *_):
+        """Show the stored GPU benchmark receipt; nothing is measured."""
+        from .device_choice import load_receipt
+
+        receipt = load_receipt(self._gpu_receipt_path())
+        rows = receipt_rows(receipt)
+        self.gpu_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            seconds = row["seconds_per_frame"]
+            peak = _bytes(row["peak_device_bytes"])
+            values = [
+                row["device"],
+                row["driver"] or UNKNOWN,
+                row["precision"],
+                row["frame"],
+                f"{seconds:.4f}" if _number(seconds) else UNKNOWN,
+                "Host memory" if row["family"] == "cpu" else peak,
+                "Yes" if row["fastest"] else "",
+                row["status"],
+                row["recorded_utc"] or UNKNOWN,
+            ]
+            self._fill_row(self.gpu_table, index, values)
+        count = len((receipt or {}).get("devices") or [])
+        self.gpu_label.setText(
+            "No GPU speed measurement is stored on this machine yet."
+            if receipt is None
+            else f"Stored receipt for {count} GPU device(s); it is measured again "
+            "when the device list or a driver changes."
+        )
+        return receipt
+
+    def measure_gpu_speed(self, *_):
+        """Time every GPU and the CPU on the mass kernel now and store the receipt.
+
+        Uses the job's precision and frame size when known. The devices are
+        timed in short child processes; no job or worker is started.
+        """
+        if self._gpu_thread is not None:
+            return
+        precision = self.job.get("precision")
+        precision = precision if precision in {"float32", "float64"} else "float32"
+        shape = self.job.get("frame_shape_rc")
+        if not (
+            isinstance(shape, (list, tuple))
+            and len(shape) == 2
+            and all(type(value) is int and value > 0 for value in shape)
+        ):
+            shape = DEFAULT_SHAPE
+        shape = (int(shape[0]), int(shape[1]))
+        benchmark = self.device_benchmark
+        if benchmark is None:
+            from .device_choice import measure_and_store
+
+            path = self._gpu_receipt_path()
+
+            def benchmark(precision, shape):
+                return measure_and_store(
+                    precision=precision, shape=shape, receipt_path=path
+                )
+
+        self.gpu_label.setText(
+            f"Measuring every GPU and the CPU at {precision}, "
+            f"{shape[0]}x{shape[1]} px, each in a short child process; "
+            "no job is started."
+        )
+        self.measure_gpu_button.setEnabled(False)
+        thread = QThread(self)
+        worker = _InventoryWorker(lambda: benchmark(precision, shape))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._gpu_ready)
+        worker.failed.connect(self._gpu_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        # No deleteLater for the worker. Deleted in its own thread, it needs the
+        # GIL while Qt holds a signal-slot lock (the Python QThread's
+        # disconnectNotify), and a GUI thread that holds the GIL and waits for
+        # that lock deadlocks. _gpu_closed drops its Python owner after wait(),
+        # which frees it in the GUI thread.
+        thread.finished.connect(self._gpu_closed)
+        thread.finished.connect(thread.deleteLater)
+        self._gpu_thread, self._gpu_worker = thread, worker
+        thread.start()
+
+    @Slot(object)
+    def _gpu_ready(self, receipt):
+        """Show the new receipt, or say that it could not be stored."""
+        self.refresh_device_measurements()
+        error = receipt.get("store_error") if isinstance(receipt, dict) else ""
+        if error:
+            self.gpu_label.setText(f"Measured, but the receipt was not stored: {error}")
+        self.gpu_speed_measured.emit(deepcopy(receipt))
+
+    @Slot(str)
+    def _gpu_failed(self, text):
+        """Show why the GPU speed measurement failed."""
+        self.gpu_label.setText(text)
+
+    @Slot()
+    def _gpu_closed(self):
+        """Release the finished measurement thread and allow a new measurement."""
+        if self._gpu_thread is not None:
+            self._gpu_thread.wait()
+        self._gpu_thread = self._gpu_worker = None
+        self.measure_gpu_button.setEnabled(True)
+
     def can_close(self):
-        return self._probe_thread is None and self._history_thread is None
+        return (
+            self._probe_thread is None
+            and self._history_thread is None
+            and self._gpu_thread is None
+        )
 
     def closeEvent(self, event):
         if not self.can_close():
             self.probe_label.setText(
-                "Hardware inspection or measurement import is still finishing; close after it returns."
+                "Hardware inspection, measurement import or GPU speed measurement "
+                "is still finishing; close after it returns."
             )
             event.ignore()
             return

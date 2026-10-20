@@ -515,6 +515,14 @@ def recommend_resources(
     selected_backend = (
         str(selected_device["backend"]) if selected_device else "cpu-float64"
     )
+    device_fields = {"device_id": "", "device_name": "CPU"}
+    if selected_device is not None:
+        from darsia.fluidflower.device_choice import requested_device_resources
+
+        # Several devices are not named here: the worker measures them at job start.
+        device_fields = requested_device_resources(
+            {"accelerators": devices}, selected_backend
+        )
     accelerator_workers = 0
     if selected_device is not None:
         estimated = 6 * 1024**3 if module == "calibration" else 5 * 1024**3
@@ -552,8 +560,7 @@ def recommend_resources(
         "module": module,
         "selected_backend": selected_backend,
         "reference_backend": "cpu-float64",
-        "device_id": str(selected_device.get("device_id")) if selected_device else "",
-        "device_name": str(selected_device.get("name")) if selected_device else "CPU",
+        **device_fields,
         "accelerator_workers": accelerator_workers,
         "cpu_workers": cpu_workers,
         "preparation_workers": (

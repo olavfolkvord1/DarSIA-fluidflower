@@ -18,6 +18,87 @@ ACCELERATED_MASS_BACKENDS = (
     "metal-float32",
 )
 NONREFERENCE_MASS_BACKENDS = ("cpu-float32", *ACCELERATED_MASS_BACKENDS)
+DEVICE_ENVIRONMENT_VARIABLES = {
+    "cuda": "DARSIA_CUDA_DEVICE",
+    "opencl": "DARSIA_OPENCL_DEVICE",
+}
+
+
+def opencl_gpu_devices(cl: Any) -> list[tuple[Any, Any]]:
+    """Return every OpenCL GPU as ``(platform, device)`` in platform order.
+
+    The position in this list is the OpenCL device index that DarSIA records
+    and that ``device_id`` and ``DARSIA_OPENCL_DEVICE`` select.
+    """
+
+    return [
+        (platform, device)
+        for platform in cl.get_platforms()
+        for device in platform.get_devices(device_type=cl.device_type.GPU)
+    ]
+
+
+def opencl_supports_float64(device: Any) -> bool:
+    """Return whether an OpenCL device offers double precision (cl_khr_fp64)."""
+
+    return (
+        int(getattr(device, "double_fp_config", 0)) != 0
+        or "cl_khr_fp64" in str(device.extensions).split()
+    )
+
+
+def resolve_device_index(
+    *,
+    family: str,
+    requested: str,
+    count: int,
+    precision: str,
+    shape: tuple[int, ...],
+) -> tuple[int, dict[str, Any]]:
+    """Return the device index of one accelerator family and how it was chosen.
+
+    An explicit ``device_id`` wins, then the family's environment variable. One
+    device is used as before. With several devices the measured choice of
+    :mod:`darsia.fluidflower.device_choice` picks the fastest device that can
+    run the session, instead of silently taking index 0.
+    """
+
+    variable = DEVICE_ENVIRONMENT_VARIABLES[family]
+    if requested:
+        return int(requested), {"basis": "explicit", "source": "device_id"}
+    if os.environ.get(variable, ""):
+        return int(os.environ[variable]), {
+            "basis": "explicit",
+            "source": f"environment:{variable}",
+        }
+    if count == 1:
+        return 0, {"basis": "single_device"}
+    from .device_choice import choose_device
+
+    choice = choose_device(
+        family=family, precision=precision, shape=tuple(int(n) for n in shape)
+    )
+    return int(choice["device_id"]), choice
+
+
+def cuda_driver_version(cp: Any) -> str:
+    """Return the CUDA driver version that DarSIA records for a CUDA device."""
+
+    return f"CUDA driver API {int(cp.cuda.runtime.driverGetVersion())}"
+
+
+def _require_chosen_device(choice: dict[str, Any], name: str, driver: str) -> None:
+    """Refuse a session whose device is not the one the measured choice named."""
+
+    device = choice.get("device") or {}
+    if choice.get("basis") == "measured" and (
+        str(device.get("name")).strip() != name.strip()
+        or str(device.get("driver")).strip() != driver.strip()
+    ):
+        raise RuntimeError(
+            "The GPU device list changed between the measured choice and the "
+            f"session: chose {device.get('name')!r}, found {name!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -327,13 +408,23 @@ class CudaMassComputeSession(MassComputeSession):
             raise RuntimeError(
                 "CUDA mass analysis requested, but no CUDA device exists"
             )
-        device_id = int(self.device_id or os.environ.get("DARSIA_CUDA_DEVICE", "0"))
-        if not 0 <= device_id < int(cp.cuda.runtime.getDeviceCount()):
+        count = int(cp.cuda.runtime.getDeviceCount())
+        device_id, self.device_choice = resolve_device_index(
+            family="cuda",
+            requested=self.device_id,
+            count=count,
+            precision=self.dtype.name,
+            shape=self.shape,
+        )
+        if not 0 <= device_id < count:
             raise ValueError(f"CUDA device index is out of range: {device_id}")
         self.cp = cp
         self.device_index = device_id
         self.device = cp.cuda.Device(device_id)
         self.device.use()
+        _require_chosen_device(
+            self.device_choice, self._device_name(), self._device_driver()
+        )
         signature_type = "float32" if self.dtype == np.dtype(np.float32) else "float64"
         type_name = "float" if self.dtype == np.dtype(np.float32) else "double"
         input_signature = ", ".join(
@@ -437,16 +528,27 @@ class CudaMassComputeSession(MassComputeSession):
         host = [self.cp.asnumpy(array).reshape(self.shape) for array in outputs]
         return MassFrameResult(*host)
 
-    def provenance(self) -> dict[str, Any]:
+    def _device_name(self) -> str:
+        """Return the CUDA device name reported by the runtime."""
+
         properties = self.cp.cuda.runtime.getDeviceProperties(self.device_index)
         raw_name = properties.get("name", "CUDA device")
-        name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+        return raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+
+    def _device_driver(self) -> str:
+        """Return the CUDA driver version of this session's device."""
+
+        return cuda_driver_version(self.cp)
+
+    def provenance(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
             "runtime": "cupy-elementwise",
             "cupy": self.cp.__version__,
             "device_id": str(self.device_index),
-            "device_name": name,
+            "device_name": self._device_name(),
+            "device_driver": self._device_driver(),
+            "device_choice": dict(self.device_choice),
             "dtype": self.dtype.name,
             "fused_phase_mass_kernel": True,
         }
@@ -561,23 +663,28 @@ class OpenCLMassComputeSession(MassComputeSession):
             raise RuntimeError(
                 "OpenCL mass analysis requires the optional PyOpenCL dependency"
             ) from exc
-        devices: list[tuple[Any, Any]] = []
-        for platform in cl.get_platforms():
-            for device in platform.get_devices(device_type=cl.device_type.GPU):
-                devices.append((platform, device))
+        devices = opencl_gpu_devices(cl)
         if not devices:
             raise RuntimeError(
                 "OpenCL mass analysis requested, but no GPU device exists"
             )
-        device_id = int(self.device_id or os.environ.get("DARSIA_OPENCL_DEVICE", "0"))
+        device_id, self.device_choice = resolve_device_index(
+            family="opencl",
+            requested=self.device_id,
+            count=len(devices),
+            precision=self.dtype.name,
+            shape=self.shape,
+        )
         if not 0 <= device_id < len(devices):
             raise ValueError(f"OpenCL device index is out of range: {device_id}")
         self.cl = cl
         self.device_index = device_id
         self.platform, self.device = devices[device_id]
-        if self.dtype == np.dtype(np.float64) and not (
-            int(getattr(self.device, "double_fp_config", 0)) != 0
-            or "cl_khr_fp64" in str(self.device.extensions).split()
+        _require_chosen_device(
+            self.device_choice, str(self.device.name), str(self.device.driver_version)
+        )
+        if self.dtype == np.dtype(np.float64) and not opencl_supports_float64(
+            self.device
         ):
             raise RuntimeError(
                 f"OpenCL device {self.device.name!r} does not support float64"
@@ -708,6 +815,7 @@ class OpenCLMassComputeSession(MassComputeSession):
             "device_id": str(self.device_index),
             "device_name": str(self.device.name).strip(),
             "device_driver": str(self.device.driver_version),
+            "device_choice": dict(self.device_choice),
             "dtype": self.dtype.name,
             "fused_phase_mass_kernel": True,
         }
@@ -927,6 +1035,7 @@ def compare_mass_frame_results(
 
 __all__ = [
     "ACCELERATED_MASS_BACKENDS",
+    "DEVICE_ENVIRONMENT_VARIABLES",
     "MassComputeSession",
     "MassFrameResult",
     "MassKernelConfiguration",
@@ -934,4 +1043,8 @@ __all__ = [
     "NONREFERENCE_MASS_BACKENDS",
     "compare_mass_frame_results",
     "create_mass_compute_session",
+    "cuda_driver_version",
+    "opencl_gpu_devices",
+    "opencl_supports_float64",
+    "resolve_device_index",
 ]

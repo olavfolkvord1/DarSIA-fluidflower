@@ -25,6 +25,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from darsia.fluidflower.device_choice import (
+    backend_devices,
+    requested_device_resources,
+)
 from darsia.fluidflower.execution import (
     BACKEND_CONTRACTS,
     AdapterRegistry,
@@ -377,6 +381,17 @@ class ExecutionPage(QWidget):
         self.execution_backend.currentIndexChanged.connect(
             self._selected_backend_changed
         )
+        self.execution_device = QComboBox()
+        self.execution_device.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.execution_device.setMinimumContentsLength(14)
+        self.execution_device.setToolTip(
+            "Fastest: before the job starts, the worker times every device of this "
+            "backend on the mass kernel and uses the fastest one that can run the "
+            "job; the timings are kept per machine until a device or driver "
+            "changes. Choose a device to decide yourself."
+        )
         self.execution_priority = QSpinBox()
         self.execution_priority.setRange(0, 999)
         self.execution_priority.setValue(50)
@@ -390,7 +405,11 @@ class ExecutionPage(QWidget):
         task_layout.addWidget(QLabel("Adapter"), 0, 2)
         task_layout.addWidget(self.execution_adapter, 0, 3)
         task_layout.addWidget(QLabel("Backend"), 1, 0)
-        task_layout.addWidget(self.execution_backend, 1, 1)
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(self.execution_backend, 1)
+        backend_row.addWidget(QLabel("Device"))
+        backend_row.addWidget(self.execution_device, 1)
+        task_layout.addLayout(backend_row, 1, 1)
         task_layout.addWidget(QLabel("Worker processes"), 1, 2)
         task_layout.addWidget(self.execution_workers, 1, 3)
         task_layout.addWidget(QLabel("Priority"), 2, 0)
@@ -958,7 +977,43 @@ class ExecutionPage(QWidget):
                     max(1, int(recommendation.get("accelerator_workers") or 1)),
                 )
             )
+        self._refresh_device_choices()
         self._refresh_runtime_preflight()
+
+    def _refresh_device_choices(self) -> None:
+        """List the selected backend's devices for an explicit choice.
+
+        The first entry leaves the choice to the measurement at job start.
+        """
+
+        backend = str(self.execution_backend.currentData() or "")
+        current = str(self.execution_device.currentData() or "")
+        devices = (
+            []
+            if not backend or backend.startswith("cpu-")
+            else backend_devices(self.inventory, backend)
+        )
+        self.execution_device.blockSignals(True)
+        self.execution_device.clear()
+        if devices:
+            self.execution_device.addItem(
+                "Fastest, measured at job start" if len(devices) > 1 else "Only device",
+                "",
+            )
+            for device in devices:
+                self.execution_device.addItem(
+                    f"{device.get('device_id')}: {device.get('name') or backend}",
+                    str(device.get("device_id")),
+                )
+            self.execution_device.setCurrentIndex(
+                max(0, self.execution_device.findData(current))
+            )
+        else:
+            self.execution_device.addItem(
+                "CPU" if backend.startswith("cpu-") else "No device detected", ""
+            )
+        self.execution_device.setEnabled(len(devices) > 1)
+        self.execution_device.blockSignals(False)
 
     def _execution_queue_mode_changed(self) -> None:
         if self.execution_queue_mode.currentData() == "local":
@@ -1143,29 +1198,16 @@ class ExecutionPage(QWidget):
                 recommendation["preparation_workers"] = 1
                 recommendation["device_id"] = ""
                 recommendation["device_name"] = "CPU"
+                recommendation.pop("device_choice", None)
             else:
                 recommendation["accelerator_workers"] = self.execution_workers.value()
                 recommendation["preparation_workers"] = self.execution_workers.value()
-                selected_device = next(
-                    (
-                        device
-                        for device in self.inventory.get("accelerators") or []
-                        if backend
-                        in (
-                            device.get("supported_backends")
-                            if device.get("supported_backends") is not None
-                            else [device.get("backend")]
-                        )
-                    ),
-                    None,
-                )
-                if selected_device is None:
-                    raise ValueError(f"No device provides backend {backend}")
-                recommendation["device_id"] = str(
-                    selected_device.get("device_id") or "0"
-                )
-                recommendation["device_name"] = str(
-                    selected_device.get("name") or backend
+                recommendation.update(
+                    requested_device_resources(
+                        self.inventory,
+                        backend,
+                        str(self.execution_device.currentData() or ""),
+                    )
                 )
             recommendation.pop("content_sha256", None)
             task = task_for_current_plan(

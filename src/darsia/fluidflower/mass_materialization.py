@@ -496,6 +496,7 @@ def _materialize_run(
     numerical_dtype: str = "float64",
     backend_name: str = "cpu-float64",
     device_id: str = "",
+    device_choice: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_id = str(row["run_id"])
     run_root = staging / "runs" / _safe_identifier(run_id)
@@ -674,6 +675,15 @@ def _materialize_run(
             "fused_phase_mass_kernel": False,
         }
     )
+    if session is not None and device_choice is not None:
+        from .device_choice import verify_session_device
+
+        try:
+            verify_session_device(backend_execution, device_choice)
+        except RuntimeError:
+            session.close()
+            raise
+        backend_execution["device_choice"] = deepcopy(dict(device_choice))
     try:
         for output_index, source_index in enumerate(selected_indices):
             ipp_before = scientific_thread("mass-materialization:frame-before")
@@ -1003,6 +1013,7 @@ def materialize_mass_run(
     numerical_dtype: str = "float64",
     backend_name: str = "cpu-float64",
     device_id: str = "",
+    device_choice: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Public single-run entry point used by pilots and trusted adapters."""
 
@@ -1019,6 +1030,20 @@ def materialize_mass_run(
         numerical_dtype=numerical_dtype,
         backend_name=backend_name,
         device_id=device_id,
+        device_choice=device_choice,
+    )
+
+
+def analysis_shape_for_run(
+    manifest_path: Path,
+    row: Mapping[str, Any],
+    quality_profile: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Return the analysis grid of one mass-input run from its field indexes only."""
+
+    fields, _ = load_mass_input_products(manifest_path, row)
+    return resolve_analysis_shape(
+        fields["optical_acidification"].shape_rc, quality_profile
     )
 
 
@@ -1209,6 +1234,33 @@ class MassAnalysisAdapter:
                 run_results.append(dict(run_result))
             else:
                 missing_run_ids.append(run_id)
+        device_choice = None
+        if backend_name.startswith(("cuda-", "opencl-")) and run_ids:
+            # One device per job, chosen before its first run and kept on resume.
+            from .device_choice import resolve_job_device, task_device_request
+
+            requested, source = task_device_request(task)
+            device_choice = resolve_job_device(
+                backend=backend_name,
+                shape=analysis_shape_for_run(
+                    input_path, rows_by_id[run_ids[0]], quality_profile
+                ),
+                workers=workers,
+                explicit=requested,
+                explicit_source=source,
+                committed=[
+                    dict(row.get("backend_execution") or {}) for row in run_results
+                ],
+            )
+            device_id = str(device_choice["device_id"])
+            context.checkpoint(
+                {
+                    "stage": "device_chosen",
+                    "backend": backend_name,
+                    "device_id": device_id,
+                    "basis": device_choice["basis"],
+                }
+            )
 
         def materialize_chunk(run_id: str) -> tuple[str, dict[str, Any]]:
             chunk_id = f"mass-run-{_safe_identifier(run_id)}"
@@ -1226,6 +1278,7 @@ class MassAnalysisAdapter:
                 numerical_dtype=numerical_dtype,
                 backend_name=backend_name,
                 device_id=device_id,
+                device_choice=device_choice,
             )
             context.commit_chunk(
                 chunk_id,
@@ -1333,6 +1386,8 @@ class MassAnalysisAdapter:
                 ),
             },
         }
+        if device_choice is not None:
+            provenance["device_choice"] = deepcopy(device_choice)
         _atomic_json(provenance_path, provenance)
         result_manifest = {
             "schema": 1,
