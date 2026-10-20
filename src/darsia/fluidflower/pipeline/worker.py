@@ -390,6 +390,10 @@ def _run_tasks(
                 from .runner import run_series
 
                 execute = run_series
+            elif pipeline == "lattice-phase-n1":
+                from .lattice_runner import run_lattice_series
+
+                execute = run_lattice_series
             elif pipeline == "native-phase-statistics":
                 from .phase_statistics import run_phase1
 

@@ -109,6 +109,10 @@ def prepare_alias_job(series_path, job_root, *, expected_sha256, series_manifest
     job, original_tasks = series.series_tasks(
         value,configs,job_root=job_root,series_asset=original_series,
         shared_admission=transport)
+    # A run whose bound storage request asks for lattice computing gets the
+    # lattice pipeline; every other task stays exactly as prepared.
+    from .lattice_runner import lattice_task
+    original_tasks=[lattice_task(task,config) for task,config in zip(original_tasks,configs)]
     name(value["job_id"])
     version=storage.FORMAT_VERSIONS[profile]
     tasks=[]
