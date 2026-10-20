@@ -1,11 +1,12 @@
-"""All runs for the Direct colour method (N141 spec 2.6 and 3.4, Part 2).
+"""All runs for the Direct colour method (N141 spec 2.6 and 3.4, Part 2) and
+for Setup's Build run model and Full setup, which work on one run at a time.
 
 "All runs" runs a row's existing per-run action once for each registered run
 of the series, one after another: each run's own configuration is opened and
 the same tab action that Play starts is started on it. The first error stops
 the sequence, nothing is pooled between runs, and each run gets one result
-line. The strip above the row also shows the computing size that the run
-configuration's existing [corrections.resize] section sets.
+line. Above a Direct colour method row the strip also shows the computing
+size that the run configuration's existing [corrections.resize] section sets.
 """
 
 from __future__ import annotations
@@ -24,15 +25,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# The Direct colour method rows whose action runs on one run and may run on all.
-# Mass calibration runs belong to Jobs, and the danger zone is never repeated.
+# The Setup steps that work on the opened run's configuration: Build run model
+# and Full setup. Depth has its own two-stage page and is not repeated here.
+SETUP_ALL_RUNS_ROWS = frozenset({("setup", item) for item in ("rig", "all")})
+# The rows whose action runs on one run and may run on all: the Direct colour
+# method's and the Setup steps above. Mass calibration runs belong to Jobs,
+# and the danger zone is never repeated.
 ALL_RUNS_ROWS = frozenset(
     {("calibration", "color")}
     | {
         ("analysis", item)
         for item in ("cropping", "mass", "segmentation", "fingers", "thresholding", "volume")
     }
-)
+) | SETUP_ALL_RUNS_ROWS
 RESIZE_NOTE = (
     "A resize trades accuracy for speed. It is set in the preprocessing wizard, "
     "step 'Type & resize' ([corrections.resize])."
@@ -193,7 +198,8 @@ class AllRunsSequence(QObject):
 
 
 class NativeAllRuns:
-    """The strip above a Direct colour method row: computing size, This run, All runs."""
+    """The strip above a row that may run on all runs: This run, All runs, and
+    for a Direct colour method row the computing size."""
 
     def __init__(self, window, *, confirm=None):
         self.window = window
@@ -251,7 +257,7 @@ class NativeAllRuns:
         return [(combo.itemText(index), combo.itemData(index) or None) for index in range(combo.count())]
 
     def refresh(self) -> None:
-        """Show the strip on a Direct colour method row's settings page only."""
+        """Show the strip on the settings page of a row in ALL_RUNS_ROWS only."""
         window = self.window
         selected = window.sidebar.get_selected() if hasattr(window, "sidebar") else None
         shown = (
@@ -262,11 +268,15 @@ class NativeAllRuns:
         if not shown:
             return
         run = window.run_combo.currentText() if window.run_combo.currentIndex() >= 0 else ""
-        try:
-            size = resize_summary((window.config_dict or {}).get("corrections")) if window.config_file else "no run configuration open"
-        except (ValueError, TypeError, KeyError) as error:
-            size = f"invalid [corrections.resize]: {error}"
-        self.resize_label.setText(f"Computed at ({run.upper() or 'no run'}): {size}. {RESIZE_NOTE}")
+        # Setup steps compute no analysis, so no computing size is shown.
+        setup = selected in SETUP_ALL_RUNS_ROWS
+        self.resize_label.setVisible(not setup)
+        if not setup:
+            try:
+                size = resize_summary((window.config_dict or {}).get("corrections")) if window.config_file else "no run configuration open"
+            except (ValueError, TypeError, KeyError) as error:
+                size = f"invalid [corrections.resize]: {error}"
+            self.resize_label.setText(f"Computed at ({run.upper() or 'no run'}): {size}. {RESIZE_NOTE}")
         runs = [item for item in self._runs() if item[1]]
         busy = self.sequence.running or bool(window.process_runner.active)
         self.run_button.setText(f"Run {run.upper()}" if run else "Run this run")
@@ -286,13 +296,13 @@ class NativeAllRuns:
         if row not in ALL_RUNS_ROWS or self.sequence.running:
             return
         runs = self._runs()
-        sizes = runs_resize_summary(runs)
         label = window.action_label_for(*row) if hasattr(window, "action_label_for") else row[1]
         question = (
             f"Run '{label}' for all {sum(1 for _run, path in runs if path)} runs, one after another?\n"
-            "Each run uses its own configuration; the first error stops the sequence.\n"
-            f"Computed at: {sizes}."
+            "Each run uses its own configuration; the first error stops the sequence."
         )
+        if row not in SETUP_ALL_RUNS_ROWS:
+            question += f"\nComputed at: {runs_resize_summary(runs)}."
         if not self.confirm(question):
             return
         if row[0] == "analysis" and not window._confirm_method_action("colour_path", "Run original DarSIA analysis for all runs"):
