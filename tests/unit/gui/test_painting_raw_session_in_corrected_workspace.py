@@ -259,6 +259,9 @@ def test_a_wrapped_proposal_ready_still_runs_in_the_gui_thread(make_view, projec
 
     view._proposal_ready = wrapped
     view.propose()
+    # busy() follows the worker thread, which can stop before the GUI thread
+    # has run the queued finished slot; wait for the slot itself first.
+    qtbot.waitUntil(lambda: bool(seen), timeout=60000)
     qtbot.waitUntil(lambda: not view.busy(), timeout=60000)
     assert seen == [gui]
     assert view.proposal is not None

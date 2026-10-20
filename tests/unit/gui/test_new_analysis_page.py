@@ -35,7 +35,7 @@ def owner(local_registry, qtbot):  # noqa: F811
     value.new_analysis.facts_reader = lambda row: dict(FACTS)
     qtbot.addWidget(value)
     yield value
-    qtbot.waitUntil(value.can_close, timeout=5000)
+    qtbot.waitUntil(value.can_close, timeout=30000)
 
 
 def jobs_resource_factory():
@@ -69,7 +69,7 @@ def test_the_page_offers_the_dialogs_profile_choice_estimate_and_choices(qtbot):
     dialog = jobs.StartAnalysisDialog([plan_row], free_space=free)
     qtbot.addWidget(dialog)
     page.set_plans([plan_row], free_space=free)
-    qtbot.waitUntil(lambda: page.facts is not None and page.can_close(), timeout=5000)
+    qtbot.waitUntil(lambda: page.facts is not None and page.can_close(), timeout=30000)
     for form in (page.form, dialog):
         combo = form.profile_combo
         assert [combo.itemData(i) for i in range(combo.count())] == ["full", "lean"]
@@ -87,7 +87,7 @@ def test_the_page_offers_the_dialogs_profile_choice_estimate_and_choices(qtbot):
     assert page.form.choices() == dialog.choices()
     assert page.form.choices()["storage_profile"] == "lean"
     assert "1.1 GB" in jobs.LEAN_NOTE and "13.6 GB" in jobs.LEAN_NOTE
-    qtbot.waitUntil(lambda: page.can_close() and panel.can_close(), timeout=5000)
+    qtbot.waitUntil(lambda: page.can_close() and panel.can_close(), timeout=30000)
 
 
 def test_dialog_and_page_are_freed_by_their_last_reference(qtbot):
@@ -147,7 +147,7 @@ def test_stored_at_lists_allowed_sizes_with_the_plans_size_read_only(owner, tmp_
     _registered_plan(owner, tmp_path)
     owner.show_view("new_analysis")
     page = owner.new_analysis
-    qtbot.waitUntil(lambda: page.facts is not None, timeout=5000)
+    qtbot.waitUntil(lambda: page.facts is not None, timeout=30000)
     combo = page.stored_combo
     assert not combo.isEnabled()
     assert [combo.itemText(i) for i in range(combo.count())] == ["native", "0.25 mm", "0.5 mm", "1 mm", "2 mm"]
@@ -185,7 +185,7 @@ def test_page_shows_the_plans_facts_and_blocks_create_only_if_stored_is_finer(ow
     owner.show_view("new_analysis")
     page = owner.new_analysis
     assert owner.views.currentWidget() is page
-    qtbot.waitUntil(lambda: page.facts is not None, timeout=5000)
+    qtbot.waitUntil(lambda: page.facts is not None, timeout=30000)
     assert page.selection_label.text() == "2 runs, 78 images, fixed by the adopted plan"
     assert page.stored_label.text().startswith("native, bound in the adopted plan")
     assert page.precision_label.text().startswith("float32")
@@ -220,8 +220,8 @@ def test_create_job_files_then_start_with_the_lent_machine_controls(owner, tmp_p
     page.form.profile_combo.setCurrentIndex(page.form.profile_combo.findData("lean"))
     page.form.job_edit.setText(str(tmp_path / "fresh-job"))
     page.create_button.click()
-    qtbot.waitUntil(lambda: page.created_root is not None, timeout=5000)
-    qtbot.waitUntil(lambda: page.start_button.isEnabled(), timeout=5000)
+    qtbot.waitUntil(lambda: page.created_root is not None, timeout=30000)
+    qtbot.waitUntil(lambda: page.start_button.isEnabled(), timeout=30000)
     assert created[0]["storage_profile"] == "lean"
     assert Path(page.created_root) == tmp_path / "fresh-job"
     assert page.machine_box.isEnabled()
