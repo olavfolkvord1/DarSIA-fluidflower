@@ -215,7 +215,8 @@ class PaintingAnalysisBoxesController(QObject):
             return None
         preview = getattr(self.view, "run_preview", None)
         return (id(self.view.project), session.run_id, str(session.image_path),
-                tuple(image.image_size), str(getattr(preview, "_index", "")))
+                tuple(image.image_size), getattr(preview, "_geometry_selection", None),
+                str(getattr(preview, "_index", "")))
 
     def busy(self):
         return self._thread is not None
@@ -326,6 +327,8 @@ class PaintingAnalysisBoxesController(QObject):
             self.refresh()
             return False
         index, run = key[-1], session.run_id
+        selection = getattr(preview, "_geometry_selection", None)
+        index_error = str(getattr(preview, "_index_error", ""))
         provider = self.legacy_source_provider
 
         def load():
@@ -334,9 +337,13 @@ class PaintingAnalysisBoxesController(QObject):
             current = current if current.get("format") == domains.FORMAT else None
             models, geometry_binding, error = {}, None, ""
             try:
+                from .painting_frame_models import verify_frame_model_selection
+                if not index and index_error:
+                    raise ValueError(index_error)
                 if not index:
                     raise ValueError("No measured frame models are saved in user settings. "
                         "Use Box actions > Choose measured frame models to select the index once.")
+                verify_frame_model_selection(selection)
                 fresh = domains.new_configuration(project, index)
                 models, geometry_binding = read_preview_geometry(index)
                 if geometry_binding["geometry_index"] != fresh["geometry_index"]:
@@ -346,6 +353,7 @@ class PaintingAnalysisBoxesController(QObject):
                 report = domains.validate_configuration(project, current)
                 if current["geometry_index"] != fresh["geometry_index"] or not report["valid"]:
                     raise ValueError("Saved boxes bind another geometry revision or frame model; review that binding before editing.")
+                verify_frame_model_selection(selection)
             except OSError as exc:
                 error = ("Measured frame metadata cannot be read for " + index + ": " + str(exc) +
                          ". Use Box actions > Choose measured frame models to override the saved index.")

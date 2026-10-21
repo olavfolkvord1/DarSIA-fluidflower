@@ -3254,8 +3254,10 @@ class _PlacementWorker(QObject):
     @Slot()
     def run(self) -> None:
         from darsia.fluidflower import map_placement as mp
+        from .painting_frame_models import verify_frame_model_selection
 
         try:
+            verify_frame_model_selection(self.options.get("geometry_selection"))
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
@@ -3281,6 +3283,7 @@ class _PlacementWorker(QObject):
                 first_runs=self.options.get("first_runs") or (),
                 progress=self.progress.emit,
             )
+            verify_frame_model_selection(self.options.get("geometry_selection"))
         except Exception as error:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
@@ -7196,24 +7199,19 @@ class LayerPainterView(QWidget):
         return dialog
 
     def _place_version_clicked(self) -> None:
-        """Ask for the geometry index and the runs to review first, then place."""
+        """Use the shared frame models and ask which runs to review first."""
 
         record = self._selected_version()
         if not self._placeable(record):
             self.versions_note.setText("Approve the version before placing it in all runs.")
             return
-        settings = QSettings(*_BACKGROUND_SETTINGS)
-        start = str(settings.value(_GEOMETRY_INDEX_KEY, "") or "")
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Measured geometry of the runs (index.json)",
-            start,
-            "Geometry index (index.json);;JSON (*.json)",
-        )
-        if not path:
+        try:
+            selection = self.run_preview.geometry_selection()
+        except ValueError as error:
+            self.versions_note.setText(str(error))
             return
-        settings.setValue(_GEOMETRY_INDEX_KEY, path)
-        settings.sync()
+        path = selection.index_path
+        settings = QSettings(*_BACKGROUND_SETTINGS)
         try:
             runs = self._series_runs()
         except (OSError, ValueError) as error:
@@ -7261,6 +7259,20 @@ class LayerPainterView(QWidget):
             return False
         from copy import deepcopy
 
+        from .painting_frame_models import capture_frame_model_selection
+
+        # The normal button uses the same immutable choice as preview and boxes.
+        # Programmatic callers may still supply an explicit override.
+        try:
+            selected = self.run_preview.geometry_selection()
+        except ValueError:
+            selected = None
+        if selected is None or Path(selected.index_path) != Path(geometry_index):
+            try:
+                selected = capture_frame_model_selection(self.project, override_path=str(geometry_index))
+            except ValueError as error:
+                self.versions_note.setText(str(error))
+                return False
         approval = lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
         thread = QThread(self)
         worker = _PlacementWorker(
@@ -7270,6 +7282,7 @@ class LayerPainterView(QWidget):
             {
                 "destination": lp.painting_folder(self.project).parent / "map_placement",
                 "geometry_index": str(geometry_index),
+                "geometry_selection": selected,
                 "runs": list(runs if runs is not None else self._series_runs()),
                 "photo_loader": photo_loader or self._reference_photo_loader(),
                 "approval": approval,

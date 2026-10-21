@@ -14,6 +14,7 @@ from shiboken6 import isValid
 
 from . import layer_painting as lp
 from . import painting_run_preview as preview
+from . import painting_frame_models as frame_models
 
 _SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _INDEX = "placement/geometry_index"
@@ -35,6 +36,7 @@ class _PreviewWorker(QObject):
     @Slot()
     def run(self):
         try:
+            frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
             self.progress.emit("Preparing the reference drawing")
             record = self.options.get("record")
             session = self.session
@@ -47,12 +49,17 @@ class _PreviewWorker(QObject):
                 source = self.options["source"]
             session, layers = preview.preview_layers(session, self.proposal, self.corrections,
                                                      self.frame, source=source, record=record)
+            def partial(value):
+                frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
+                self.partial.emit((value, session))
+
             result = preview.prepare_preview(session, layers,
                 geometry_index=self.options["index"], target_run=self.options["run"],
                 config=self.options["config"], measure_offsets=True,
                 photo_loader=self.options["photo_loader"], source_name=self.options["name"],
                 on_progress=self.progress.emit,
-                on_preview=lambda value: self.partial.emit((value, session)))
+                on_preview=partial)
+            frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
         except Exception as error:  # reported in the preview, no write fallback
             self.error = f"{type(error).__name__}: {error}"
             self.failed.emit(self.error)
@@ -82,6 +89,8 @@ class PaintingRunPreview(QObject):
         settings = QSettings(*_SETTINGS)
         settings.sync()
         self._index = str(settings.value(_INDEX, "") or "")
+        self._geometry_selection = None
+        self._index_error = ""
         self.widget = QWidget()
         layout = QVBoxLayout(self.widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -188,7 +197,7 @@ class PaintingRunPreview(QObject):
                 getattr(session, "image_path", ""), tuple(getattr(session, "image_size", ()) or ()),
                 getattr(session, "image_stamp", ""), getattr(session, "updated_utc", ""),
                 id(getattr(self.view, "proposal", None)), str(self.runs.currentData() or "").casefold(),
-                self._index, source, version)
+                self._index, source, version, self._geometry_selection)
 
     def _accepts_result(self):
         return (self._alive() and not self.is_reference() and self._active_key == self._key()
@@ -260,20 +269,33 @@ class PaintingRunPreview(QObject):
         return session is None or str(self.runs.currentData() or "").casefold() == session.run_id.casefold()
 
     def ensure_saved_geometry_index(self):
-        """Fill an empty GUI selection from USER settings; preserve overrides.
-
-        Workers receive only the captured path and verify its metadata. This
-        method never opens a file picker or changes a box draft/settings value.
-        """
+        """Capture one series default or explicit USER override for all tools."""
         if not isValid(self) or self._disposed:
             return self._index
         if QThread.currentThread() != QObject.thread(self):
             raise RuntimeError("Frame-model settings must be read on the GUI thread.")
-        if not self._index:
+        current = self._geometry_selection
+        override = self._index if self._index and (current is None
+            or current.source == "user override" or current.index_path != self._index) else ""
+        if not self._index or (current is not None and current.source == "series display binding"):
             settings = QSettings(*_SETTINGS)
             settings.sync()
-            self._index = str(settings.value(_INDEX, "") or "")
+            override = str(settings.value(_INDEX, "") or "")
+        try:
+            selected = frame_models.capture_frame_model_selection(self.view.project, override_path=override)
+        except (AttributeError, TypeError, ValueError) as error:
+            self._geometry_selection, self._index = None, ""
+            self._index_error = str(error)
+        else:
+            self._geometry_selection, self._index = selected, selected.index_path
+            self._index_error = ""
         return self._index
+
+    def geometry_selection(self):
+        self.ensure_saved_geometry_index()
+        if self._geometry_selection is None:
+            raise ValueError(self._index_error or "Frame models are unavailable. Retry after reopening the series.")
+        return self._geometry_selection
 
     def refresh(self):
         self.ensure_saved_geometry_index()
@@ -349,6 +371,8 @@ class PaintingRunPreview(QObject):
                                              self._index, "Geometry index (index.json);;JSON (*.json)")
         if path:
             self._index = path
+            self._geometry_selection = frame_models.capture_frame_model_selection(self.view.project, override_path=path)
+            self._index_error = ""
             settings = QSettings(*_SETTINGS)
             settings.setValue(_INDEX, path)
             settings.sync()
@@ -358,6 +382,7 @@ class PaintingRunPreview(QObject):
     def request(self):
         if not self._alive() or self.is_reference():
             return
+        self.ensure_saved_geometry_index()
         key = self._key()
         if self.thread is not None:
             self._pending = key != self._active_key
@@ -385,7 +410,7 @@ class PaintingRunPreview(QObject):
         self.measurements.setRowCount(0)
         self.measurements.hide()
         if not self._index:
-            self._status("Choose Frame models once to preview the map automatically in each run. No approval is needed.")
+            self._status(self._index_error or "The series has no measured frame models. Use Frame models to set an override.")
             return
         session = self.view.session
         if session is None:
@@ -396,6 +421,7 @@ class PaintingRunPreview(QObject):
             if source == "map" and self.view._map_kind() == "manual map":
                 source = "manual"
             options = {"run": str(self.runs.currentData()), "index": self._index,
+                       "geometry_selection": self._geometry_selection,
                        "source": source, "record": deepcopy(record), "name": self.sources.currentText(),
                        "config": deepcopy(self.view._workspace_frame_config),
                        "photo_loader": self.view._reference_photo_loader()}
