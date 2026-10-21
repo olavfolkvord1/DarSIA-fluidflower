@@ -5,6 +5,7 @@ facts; no plan is adopted, no job is prepared and no worker starts.
 """
 
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PySide6.QtWidgets import QScrollArea
@@ -229,6 +230,7 @@ def test_create_job_files_then_start_with_the_lent_machine_controls(owner, tmp_p
     owner._creator = creator
     panel.start_selected_machine = lambda: started.append(panel.current["root"])
     owner.show_view("new_analysis")
+    qtbot.waitUntil(lambda: page.facts is not None and page.can_close(), timeout=30000)
     # The job toolbar lends the same machine, backend and workers objects.
     for widget in (panel.target_combo, panel.backend_combo, panel.workers_spin):
         assert page.target_layout.indexOf(widget) >= 0
@@ -268,3 +270,85 @@ def test_no_scroll_area_inside_another_on_either_view(owner, tmp_path, qtbot):
             assert not any(isinstance(parent, QScrollArea) for parent in _ancestors(area)), (view, area)
     with pytest.raises(ValueError):
         owner.show_view("elsewhere")
+
+
+@pytest.mark.parametrize("outcome", ["ready", "error"])
+def test_create_waits_for_selected_plan_facts_and_explains_a_failed_read(owner, tmp_path, qtbot, monkeypatch, outcome):
+    """Clicking Create during a blocked or failed read cannot call its producer."""
+    page, started, release, created = owner.new_analysis, Event(), Event(), []
+
+    def read(_row):
+        started.set()
+        if not release.wait(10):
+            raise RuntimeError("The private plan read was not released")
+        if outcome == "error":
+            raise OSError("The selected plan location is unavailable")
+        return dict(FACTS)
+
+    page.facts_reader = read
+    monkeypatch.setattr(owner.panel, "create_job", lambda **kwargs: created.append(kwargs))
+    _registered_plan(owner, tmp_path)
+    owner.show_view("new_analysis")
+    try:
+        qtbot.waitUntil(started.is_set, timeout=10000)
+        page.form.job_edit.setText(str(tmp_path / "fresh-job"))
+        assert not page.create_button.isEnabled()
+        assert "selected execution plan is read" in page.create_button.toolTip()
+        assert "Reading the adopted plan" in page.selection_label.text()
+        page.create_button.click()
+        assert not created
+    finally:
+        release.set()
+    qtbot.waitUntil(page.can_close, timeout=10000)
+    if outcome == "ready":
+        assert page.facts == FACTS and page.create_button.isEnabled()
+        page.create_button.click()
+        assert len(created) == 1 and created[0]["plan"] == page.form.plan_combo.currentData()
+    else:
+        assert page.facts is None and not page.create_button.isEnabled()
+        assert "selected plan location is unavailable" in page.create_button.toolTip()
+        assert "Not read: OSError" in page.selection_label.text()
+        page.create_button.click()
+        assert not created
+
+
+def test_previous_plan_completion_cannot_enable_create_for_the_new_selection(owner, tmp_path, qtbot):
+    """Retain one background reader while its old selection becomes stale."""
+    page = owner.new_analysis
+    first_started, second_started, release_first, release_second = (Event() for _ in range(4))
+    second = dict(path=str(tmp_path / "another-plan.toml"), sha256="b" * 64,
+                  size_bytes=11, label="Another saved plan")
+    chosen_facts = dict(FACTS, runs=["chosen-run"], frames=3, storage_mm=[None])
+
+    def read(row):
+        if row["path"] == second["path"]:
+            second_started.set()
+            if not release_second.wait(10):
+                raise RuntimeError("The selected private plan read was not released")
+            return chosen_facts
+        first_started.set()
+        if not release_first.wait(10):
+            raise RuntimeError("The former private plan read was not released")
+        return dict(FACTS)
+
+    page.facts_reader = read
+    _registered_plan(owner, tmp_path)
+    owner.show_view("new_analysis")
+    try:
+        qtbot.waitUntil(first_started.is_set, timeout=10000)
+        original = page.form.plan_combo.currentData()
+        page.set_plans([original, second])
+        page.form.plan_combo.setCurrentIndex(1)
+        page.form.job_edit.setText(str(tmp_path / "fresh-job"))
+        assert not page.create_button.isEnabled()
+        release_first.set()
+        qtbot.waitUntil(second_started.is_set, timeout=10000)
+        assert page.facts is None and not page.create_button.isEnabled()
+        assert "selected execution plan is read" in page.create_button.toolTip()
+        assert page.form.plan_combo.currentData() == second
+    finally:
+        release_first.set()
+        release_second.set()
+    qtbot.waitUntil(lambda: page.can_close() and page.facts is not None, timeout=10000)
+    assert page.facts == chosen_facts and page.create_button.isEnabled()
+    assert page.selection_label.text() == "1 runs, 3 images, fixed by the adopted plan"

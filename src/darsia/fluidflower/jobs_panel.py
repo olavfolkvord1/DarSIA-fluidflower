@@ -615,7 +615,9 @@ class NewAnalysisPage(QWidget):
     @Slot(object)
     def _facts_ready(self, result):
         """Show a read's facts unless another plan was chosen meanwhile."""
-        if result["key"] != self._facts_key:
+        plan = self.form.plan_combo.currentData() or {}
+        if (result["key"] != self._facts_key
+                or result["key"] != (plan.get("path"), plan.get("sha256"))):
             return
         self.facts, self.facts_error = result.get("facts"), result.get("error")
         self._show_facts()
@@ -687,11 +689,22 @@ class NewAnalysisPage(QWidget):
     def sync_actions(self):
         """Create needs the choices; Start needs the job created on this page."""
         panel = self.panel
+        plan = self.form.plan_combo.currentData() or {}
+        facts_ready = (self.facts is not None and self.facts_error is None
+            and self._facts_key == (plan.get("path"), plan.get("sha256")))
+        blocker = (self.facts or {}).get("route_blocker", "")
         self.create_button.setEnabled(
-            self.form.ready() and panel.create_button.isEnabled() and self.stored_allowed()
-            and not (self.facts or {}).get("route_blocker")
+            self.form.ready() and panel.create_button.isEnabled() and facts_ready
+            and self.stored_allowed() and not blocker
         )
-        self.create_button.setToolTip((self.facts or {}).get("route_blocker", ""))
+        if not blocker:
+            if self.facts_error:
+                blocker = "Could not read the selected execution plan: " + self.facts_error
+            elif plan and not facts_ready:
+                blocker = "Wait while the selected execution plan is read."
+            elif not plan:
+                blocker = "Choose a saved execution plan."
+        self.create_button.setToolTip(blocker)
         current = (panel.current or {}).get("root")
         own = bool(self.created_root and current and Path(current) == Path(self.created_root))
         self.machine_box.setEnabled(own)
