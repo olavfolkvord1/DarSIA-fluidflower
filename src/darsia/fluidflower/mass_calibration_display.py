@@ -2,7 +2,9 @@
 
 Only explicit paths and an optional, already bound current result are read.
 Nothing here fits a calibration, calculates a metric, changes parameters, starts
-jobs, discovers history, opens images/NPZ, or writes any file.
+jobs, discovers history, opens images/NPZ, or writes any file. The Phase-map
+method's page also shows the series' refit job (``refit_job_panel``), which is
+the one place on this page that creates and starts a job, and only on request.
 """
 
 from __future__ import annotations
@@ -20,9 +22,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QRadioButton,
+    QScrollArea,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -37,6 +42,15 @@ MAX_SIGNAL_FILES = 64
 MAX_DIRECTORY_ENTRIES = 256
 MAX_SIGNAL_ROWS = 128
 PRESSURE_COLUMNS = ("Run", "Source", "Pressure · temperature", "Time span", "Status", "In the fit")
+MODE_NOTICE = (
+    "Manual and automatic calibration runs will be available on the Jobs page. "
+    "This page shows saved values and reported errors."
+)
+REFIT_MODE_NOTICE = (
+    "Automatic: a refit job fits the gain and beta to the injected mass of the fit runs. "
+    "It is a job like any other (it also shows on the Jobs page); this page creates it, follows "
+    "it and shows its frozen result. Manual parameters are not available yet."
+)
 
 
 @dataclass(frozen=True)
@@ -392,10 +406,12 @@ def read_mass_calibration_display(
 
 
 class MassCalibrationDisplay(QWidget):
-    """Reusable read-only table; both future calculation modes stay disabled.
+    """Reusable read-only table; both calculation modes stay disabled by default.
 
     A page may also show each run's pressure and temperature source below it,
     from rows that ``pressure_source`` reads; the widget itself reads nothing.
+    The Phase-map method's page offers the series' refit job beside the saved
+    values (:meth:`set_refit_series`); Automatic is then the chosen mode.
     """
 
     def __init__(self, parent=None):
@@ -419,11 +435,16 @@ class MassCalibrationDisplay(QWidget):
             button.setEnabled(False)
             modes.addWidget(button)
         layout.addLayout(modes)
-        self.mode_notice = QLabel(
-            "Manual and automatic calibration runs will be available on the Jobs page. This page shows saved values and reported errors."
-        )
+        self.mode_notice = QLabel(MODE_NOTICE)
         self.mode_notice.setWordWrap(True)
         layout.addWidget(self.mode_notice)
+        # The saved values beside the refit job (N141 spec 2.4), in an adjustable
+        # splitter: the page grows in width, not in height.
+        self.columns = QSplitter(Qt.Orientation.Horizontal)
+        self.columns.setChildrenCollapsible(False)
+        saved = QWidget()
+        column = QVBoxLayout(saved)
+        column.setContentsMargins(0, 0, 0, 0)
         self.parameters = QTableWidget(0, 3)
         self.parameters.setHorizontalHeaderLabels(
             ("Parameter / metric", "Saved value", "Scope / source")
@@ -431,12 +452,12 @@ class MassCalibrationDisplay(QWidget):
         self.parameters.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.parameters.horizontalHeader().setStretchLastSection(True)
         self.parameters.verticalHeader().hide()
-        layout.addWidget(self.parameters, 1)
+        column.addWidget(self.parameters, 1)
         self.notes = QLabel()
         self.notes.setTextFormat(Qt.TextFormat.PlainText)
         self.notes.setWordWrap(True)
         self.notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.notes)
+        column.addWidget(self.notes)
         # Pressure and temperature per run (whole series). Hidden until a page
         # hands it rows; the read-only calibration dialog never does.
         self.pressure_box = QWidget()
@@ -456,14 +477,47 @@ class MassCalibrationDisplay(QWidget):
         self.pressure_notes.setWordWrap(True)
         self.pressure_notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         pressure.addWidget(self.pressure_notes)
-        layout.addWidget(self.pressure_box, 1)
+        column.addWidget(self.pressure_box, 1)
         self.pressure_box.hide()
+        self.columns.addWidget(saved)
+        from darsia.fluidflower.refit_job_panel import RefitJobPanel
+
+        self.refit_panel = RefitJobPanel()
+        # The refit column scrolls on its own when the window is short, so the
+        # page's minimum size, and the window's, stays as it was. It is the
+        # page's only scroll area.
+        self.refit_area = QScrollArea()
+        self.refit_area.setWidgetResizable(True)
+        self.refit_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.refit_area.setWidget(self.refit_panel)
+        self.refit_area.hide()
+        self.columns.addWidget(self.refit_area)
+        self.columns.setStretchFactor(0, 1)
+        self.columns.setStretchFactor(1, 1)
+        layout.addWidget(self.columns, 1)
         self.pressure_complete = True
         self._pressure_steps = None
         self._pressure_timer = QTimer(self)
         self._pressure_timer.setInterval(0)
         self._pressure_timer.timeout.connect(self._next_pressure_step)
         self.set_display(read_mass_calibration_display("", None))
+
+    def set_refit_series(self, series_root) -> None:
+        """Offer this series' refit job beside the saved values; None hides it.
+
+        The refit job is the automatic mode, so Automatic is shown chosen while
+        it is offered. Both buttons stay disabled: Manual is not available, so
+        there is nothing to switch to. The read-only calibration dialog never
+        calls this, so neither mode is chosen there.
+        """
+        offered = series_root is not None
+        self.refit_panel.set_series(series_root)
+        self.refit_area.setVisible(offered)
+        self.mode_buttons.setExclusive(False)
+        self.manual_button.setChecked(False)
+        self.automatic_button.setChecked(offered)
+        self.mode_buttons.setExclusive(True)
+        self.mode_notice.setText(REFIT_MODE_NOTICE if offered else MODE_NOTICE)
 
     def set_pressure_sources(self, sources) -> None:
         """Render read pressure rows (pressure_source.PressureSources); no I/O.

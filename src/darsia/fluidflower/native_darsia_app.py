@@ -1800,6 +1800,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.mass_calibration_display.follow_pressure_sources(
             None if root is None else iter_series_pressure_sources(
                 root, method=method, calibration=reference))
+        self.mass_calibration_display.set_refit_series(root if method == "phase_model" else None)
         self._displayed_mass_method = method
         self.content_stack.setCurrentWidget(self.mass_calibration_display)
 
