@@ -1,6 +1,8 @@
 """Actual private painting view: opt-in underlay, guards and immutable inputs."""
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 
 from darsia.fluidflower import layer_painting as lp
@@ -125,7 +127,7 @@ def test_stale_worker_never_publishes_after_drawing_changes_or_preview_closes(vi
 
 
 def test_adoption_worker_replays_real_saved_fixture_version_before_sink(view, qtbot, monkeypatch, tmp_path):
-    from darsia.fluidflower import map_adoption, raw_shape_basis_reader
+    from darsia.fluidflower import map_adoption, map_placement, raw_shape_basis_reader
     from darsia.fluidflower import series_layer_view as module
     controller = _fixture(view, complete=True)
     # Use the original immutable manual saver/reader, without performing adoption.
@@ -137,13 +139,17 @@ def test_adoption_worker_replays_real_saved_fixture_version_before_sink(view, qt
     # Keep this as real fixture replay before its already mocked sink, with
     # no claim that the synthetic index has scientific RAW-basis authority.
     seen, preflights = {}, []
-    index = tmp_path / "unused-index.json"
+    index = tmp_path / "legacy-index.json"
+    index.write_text(json.dumps(dict(format=map_placement.GEOMETRY_FORMAT,
+        runs={view.session.run_id: {}})), encoding="utf-8")
+    index_identity = dict(path=str(index.resolve()),
+        sha256=hashlib.sha256(index.read_bytes()).hexdigest(), size_bytes=index.stat().st_size)
     def preflight(path, runs):
         preflights.append((Path(path), list(runs)))
     def capture(destination, layers, **kwargs):
         assert preflights == [(index, [view.session.run_id, view.session.run_id])]
         seen.update(layers=layers, **kwargs)
-        return {"private": True}
+        return {"private": True, "geometry_index": index_identity}
     monkeypatch.setattr(raw_shape_basis_reader, "require_basis_index", preflight)
     monkeypatch.setattr(map_adoption, "prepare_adoption", capture)
     worker = module._AdoptionWorker(record, frame, dict(destination=tmp_path / "unused",

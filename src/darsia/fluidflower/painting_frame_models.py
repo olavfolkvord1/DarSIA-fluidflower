@@ -94,16 +94,20 @@ def read_adoption_cohort(index_path, registered_runs, reference_run):
     from .pipeline.job_inputs import _json_bytes
     from .map_placement import GEOMETRY_FORMAT
     path = Path(index_path).resolve()
-    before = path.stat()
-    with path.open('rb') as stream:
-        raw = stream.read(MAX_INDEX_BYTES + 1)
-    after = path.stat()
-    version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-    if len(raw) > MAX_INDEX_BYTES or version(before) != version(after):
-        raise ValueError('The selected geometry index changed or exceeds its metadata bound')
-    value = _json_bytes(raw)
+    reason = 'The rigs need their RAW basis before the map can be adopted'
+    try:
+        before = path.stat()
+        with path.open('rb') as stream:
+            raw = stream.read(MAX_INDEX_BYTES + 1)
+        after = path.stat()
+        version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if len(raw) > MAX_INDEX_BYTES or version(before) != version(after):
+            raise ValueError('The selected geometry index changed or exceeds its metadata bound')
+        value = _json_bytes(raw)
+    except (OSError, ValueError, UnicodeError) as error:
+        raise ValueError(reason + '. ' + str(error)) from error
     if not isinstance(value, Mapping) or value.get('format') != GEOMETRY_FORMAT:
-        raise ValueError('Select one measured geometry index for adoption')
+        raise ValueError(reason + '. Select one measured geometry index for adoption')
 
     def names(rows, label):
         """Compare explicit safe run identities without silently dropping duplicates."""

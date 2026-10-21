@@ -204,12 +204,12 @@ def test_gui_edits_mm_and_background_callback_stays_on_gui_thread(context, qtbot
     dialog.domain_table.item(0, 3).setText("899")
     assert dialog.domains[0]["bounds_mm"] == [100, 899, 40, 300]
     assert dialog.run_choice.count() == 3
-    gui = QThread.currentThread()
+    gui_ident = threading.get_ident()
     observed = []
     def work():
         time.sleep(.08)
-        return QThread.currentThread() is gui
-    dialog._background(work, lambda result: observed.append((result, QThread.currentThread() is gui)))
+        return threading.get_ident() == gui_ident
+    dialog._background(work, lambda result: observed.append((result, threading.get_ident() == gui_ident)))
     worker = dialog._worker
     qtbot.waitUntil(lambda: len(observed) == 1)
     assert observed == [(False, True)]

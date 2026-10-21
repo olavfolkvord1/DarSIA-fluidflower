@@ -7873,13 +7873,13 @@ class LayerPainterView(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.use_map_progress.setText)
-        worker.finished.connect(self._adoption_finished)
-        worker.failed.connect(self._adoption_failed)
+        worker.finished.connect(self._adoption_finished, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._adoption_failed, Qt.ConnectionType.QueuedConnection)
         # Direct: quit from the worker thread, so that wait() in the GUI
         # thread cannot block a queued quit.
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
-        thread.finished.connect(self._adoption_thread_finished)
+        thread.finished.connect(self._adoption_thread_finished, Qt.ConnectionType.QueuedConnection)
         self._adoption_thread, self._adoption_worker = thread, worker
         self.use_map_progress.setText("Checking the selected map for adoption…")
         thread.start()
@@ -7887,6 +7887,7 @@ class LayerPainterView(QWidget):
         self.busy_changed.emit(True)
         return True
 
+    @Slot(object)
     def _adoption_finished(self, result: object) -> None:
         """Say what the preparation holds and what an adoption still lacks."""
 
@@ -7915,6 +7916,7 @@ class LayerPainterView(QWidget):
         self._adoption_message = message
         message.show()
 
+    @Slot(str)
     def _adoption_failed(self, message: str) -> None:
         """Say why the adoption was not prepared."""
 
@@ -7923,6 +7925,7 @@ class LayerPainterView(QWidget):
         if controller is not None:
             controller.failed(message)
 
+    @Slot()
     def _adoption_thread_finished(self) -> None:
         """Drop the finished worker and its thread here, in the GUI thread."""
 

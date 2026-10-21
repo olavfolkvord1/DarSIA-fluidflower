@@ -1,6 +1,8 @@
 """Polygons-only painting routes stay explicit and preserve original defaults."""
 
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 import threading
 
@@ -56,7 +58,7 @@ def _version_row(view, record):
 
 @pytest.mark.parametrize("worker_name", ["_PlacementWorker", "_AdoptionWorker"])
 @pytest.mark.parametrize("new_method", [False, True])
-def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, monkeypatch, worker_name, new_method):
+def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, monkeypatch, tmp_path, worker_name, new_method):
     from darsia.fluidflower import map_adoption, map_placement, raw_shape_basis_reader
 
     session = deepcopy(view.session)
@@ -67,12 +69,17 @@ def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, mon
         record["proposal_method"] = polygons.METHOD
     # This metadata-routing case already mocks drawing and the operation sink;
     # isolate the new presence preflight explicitly, without claiming RAW proof.
+    index = tmp_path / "legacy-index.json"
+    index.write_text(json.dumps(dict(format=map_placement.GEOMETRY_FORMAT,
+        runs={session.run_id: {}})), encoding="utf-8")
+    index_identity = dict(path=str(index.resolve()),
+        sha256=hashlib.sha256(index.read_bytes()).hexdigest(), size_bytes=index.stat().st_size)
     preflights = []
     def preflight(index, runs):
         preflights.append((str(index), list(runs)))
     if worker_name == "_AdoptionWorker":
         monkeypatch.setattr(raw_shape_basis_reader, "require_basis_index", preflight)
-    expected = [("unused", [session.run_id, session.run_id])] if worker_name == "_AdoptionWorker" else []
+    expected = [(str(index), [session.run_id, session.run_id])] if worker_name == "_AdoptionWorker" else []
     loader = polygons if new_method else slv.lpm
     def version_layers(*args, **kwargs):
         assert preflights == expected  # The preflight precedes even the stub drawing.
@@ -84,11 +91,11 @@ def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, mon
     def capture(*args, **kwargs):
         assert preflights == expected
         calls.append(kwargs)
-        return {"prepared": True}
+        return {"prepared": True, "geometry_index": index_identity}
     monkeypatch.setattr(target, operation, capture)
     approval = {"sha256": record["sha256"]}
     worker = getattr(slv, worker_name)(record, view.current_frame(), {
-        "destination": "unused", "geometry_index": "unused", "runs": [session.run_id],
+        "destination": "unused", "geometry_index": index, "runs": [session.run_id],
         "photo_loader": lambda *_: None, "approval": approval})
     worker.failed.connect(failures.append)
     worker.run()
