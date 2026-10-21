@@ -369,6 +369,7 @@ class PreparedRun:
     frames: list
     sources: _Sources
     input_pins: list
+    phase_configuration: dict | None = None
 
 
 def _reference(job, run, config, sources, native, preparation, raw_binding, phase):
@@ -449,6 +450,12 @@ def prepare_run(job, run, stores, preparation):
         sources.input(raw_binding, "frame." + spec["case_id"] + ".native.raw_binding", "configuration")
     reference_index, reference, reference_photo, originals = _reference(
         job, run, config, sources, native, preparation, raw_binding, phase)
+    if _has_baseline_geometry(reference):
+        geometry = reference["full"]["binding"]["geometry"]
+        for bound in (geometry["frame_photo_top_keep"], phase["chain_assets"]["floor"]):
+            sources.original(bound, aliases=config.get("data_aliases", ()))
+            sources.protect(bound)
+            sources.path(bound)
     frames = []
     for index, spec in enumerate(config["frames"]):
         case = spec["case_id"]
@@ -497,7 +504,7 @@ def prepare_run(job, run, stores, preparation):
     sources.register(native_bound, native_bound["path"])
     return PreparedRun(run, configuration, native_bound, native, raw_binding,
         preparation, reference_index, reference, reference_photo, frames, sources,
-        [configuration, native_bound, *originals])
+        [configuration, native_bound, *originals], phase_configuration=config["phase"]["configuration"])
 
 
 def _stores(bound, series_root):
@@ -587,9 +594,71 @@ def _request(value):
     return request
 
 
+def _has_baseline_geometry(reference):
+    return "geometry" in (reference.get("full", {}).get("binding") or {})
+
+
+def _baseline_paths(review_root, run):
+    folder = Path(review_root) / "baseline_classes"
+    return folder / (run.casefold() + ".npz"), folder / (run.casefold() + ".json")
+
+
+def _baseline_provenance(prepared, classes):
+    from .raw_review_baseline_classes import CONTRACT
+    return dict(format=CONTRACT, run=prepared.run, display_only=True,
+        acquisition_manifest=prepared.reference_manifest, record_index=prepared.reference_index,
+        native_row=prepared.reference_record["native_row"],
+        phase_configuration=prepared.phase_configuration, classes=classes)
+
+
+def _write_baseline_classes(prepared, review_root):
+    from .raw_review_baseline_classes import write_baseline_rig_classes
+    if not _has_baseline_geometry(prepared.reference_record):
+        return None
+    classes_path, provenance_path = _baseline_paths(review_root, prepared.run)
+    phase = prepared.sources.json(prepared.phase_configuration)
+    classes = write_baseline_rig_classes(classes_path, prepared.reference_record, phase,
+        reader=prepared.sources)
+    _write(provenance_path, _baseline_provenance(prepared, classes))
+    prepared.sources.register(classes, classes_path)
+    return classes
+
+
+def _verify_baseline_classes(prepared, review_root, provenance):
+    """Read exact saved output and compare its masks with the original geometry; write nothing."""
+    import numpy as np
+    from .raw_review_baseline_classes import baseline_rig_classes
+    classes_path, provenance_path = _baseline_paths(review_root, prepared.run)
+    if _key(_bound(provenance)["path"]) != _key(provenance_path):
+        raise ValueError("Existing baseline class provenance is outside its expected output path")
+    value = _read(provenance)
+    classes = _bound(value.get("classes"))
+    if _key(classes["path"]) != _key(classes_path) or _pin(classes_path) != classes:
+        raise ValueError("Existing baseline classes differ from their pinned output path or bytes")
+    if not _same(value, _baseline_provenance(prepared, classes)):
+        raise ValueError("Existing baseline class provenance differs from its original sources")
+    expected = baseline_rig_classes(prepared.reference_record,
+        prepared.sources.json(prepared.phase_configuration), reader=prepared.sources)
+    with np.load(classes_path, allow_pickle=False) as arrays:
+        if (set(arrays.files) != set(expected)
+                or any(arrays[key].dtype != expected[key].dtype
+                       or not np.array_equal(arrays[key], expected[key]) for key in expected)):
+            raise ValueError("Existing baseline class arrays differ from their original geometry")
+    prepared.sources.register(classes, classes_path)
+    return classes
+
+
+def _change_status(prepared):
+    if not _has_baseline_geometry(prepared.reference_record):
+        return "Unavailable: the saved baseline has no own rig geometry; no later frame is substituted"
+    if not all(frame.get("rig_classes") for frame in prepared.frames):
+        return "Unavailable: current-frame rig classes are missing"
+    return "Available from the baseline's own source geometry and saved current-frame classes"
+
+
 def _verify_reuse(completed, request_bound, request, prepared_runs):
     from .raw_photographic_review import (validate_raw_review_manifest, raw_asset_descriptor,
-        raw_sources, _descriptor, ORIGINAL_MODE, RAW_DETAIL_MODE)
+        raw_sources, _descriptor, ORIGINAL_MODE, RAW_DETAIL_MODE, CHANGE_MODE)
     from .phase_saved_assets import VerifiedAssetReader
     if (completed.get("format") != COMPLETION_FORMAT or completed.get("complete") is not True
             or not _same(completed.get("request"), request_bound)
@@ -615,12 +684,21 @@ def _verify_reuse(completed, request_bound, request, prepared_runs):
         return {key: sources[key] for key in ("acquisition", "audit", "profile_id")}
 
     reader = VerifiedAssetReader()
+    baseline_outputs = completed.get("baseline_classes", {})
+    expected_baselines = {prepared.run for prepared in prepared_runs
+                          if _has_baseline_geometry(prepared.reference_record)}
+    if not isinstance(baseline_outputs, Mapping) or set(baseline_outputs) != expected_baselines:
+        raise ValueError("Existing RAW review must bind exactly its original baseline class outputs")
     for bound, prepared in zip(manifests, prepared_runs):
         expected_path = Path(request["output_root"]) / "native_frames" / prepared.run.casefold() / "manifest.json"
         if _key(_bound(bound)["path"]) != _key(expected_path):
             raise ValueError("Existing RAW review manifest is outside its expected output run folder")
         manifest = validate_raw_review_manifest(_read(bound), prepared.run)
+        classes = (_verify_baseline_classes(prepared, request["output_root"], baseline_outputs[prepared.run])
+                   if prepared.run in expected_baselines else None)
         modes = [ORIGINAL_MODE, *prepared.native_parameters["display_modes"]["modes"], RAW_DETAIL_MODE]
+        if classes and all(frame.get("rig_classes") for frame in prepared.frames):
+            modes.append(CHANGE_MODE)
         same_fields(manifest, dict(
             native_configuration=_descriptor(prepared.native_configuration, "Native configuration"),
             raw_binding=_descriptor(prepared.raw_binding, "RAW source binding"),
@@ -653,7 +731,10 @@ def _verify_reuse(completed, request_bound, request, prepared_runs):
             same_fields(entry, expected, "ordered frame source/geometry")
             same_fields(manifest, {key: list(sources[key]) for key in
                 ("phase_shape_hw", "native_shape_hw", "native_origin_xy", "content_box_xywh")}, "frame canvas")
-        if manifest["reference"].get("rig_classes"):
+        if classes:
+            same_fields(manifest["reference"], {"rig_classes": _descriptor(classes, "Rig classes")},
+                "baseline rig classes")
+        elif manifest["reference"].get("rig_classes"):
             raise ValueError("Existing RAW review has baseline rig classes absent from this post-run request")
         folder = expected_path.parent
         for entry in (manifest["reference"], *manifest["frames"]):
@@ -672,6 +753,9 @@ def render_run(prepared, review_root):
     from .raw_photographic_review import write_raw_review_root
     reference = _PhotoEntry(dict(acquisition_manifest=prepared.reference_manifest,
         record_index=prepared.reference_index), prepared.reference_photo)
+    classes = _write_baseline_classes(prepared, review_root)
+    if classes:
+        reference["rig_classes"] = classes
     token = configure_parameters(prepared.native_parameters)
     try:
         return write_raw_review_root(review_root, run=prepared.run,
@@ -741,7 +825,10 @@ def run_request(bound):
             review_root=str(root),
             original_job=request["job"], original_results_unchanged=True,
             scientific_worker_changed=False, adopted=False,
-            change_display="Baseline rig classes are not attached; Change remains unavailable until they are prepared",
+            baseline_classes={prepared.run: _pin(_baseline_paths(root, prepared.run)[1])
+                for prepared in prepared_runs if _has_baseline_geometry(prepared.reference_record)},
+            change_display="; ".join(prepared.run + ": " + _change_status(prepared)
+                for prepared in prepared_runs),
             gui_closed="Run this same saved request explicitly from the command line when the GUI was closed")
         _write(completed_path, result)
         return result

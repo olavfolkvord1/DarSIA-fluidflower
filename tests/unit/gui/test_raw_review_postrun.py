@@ -17,6 +17,7 @@ from darsia.fluidflower.pipeline.job_inputs import CATALOG_FORMAT, catalog_order
 from darsia.fluidflower.published_dataset.job_reader import Product
 from darsia.fluidflower.store_map import StoreMap, input_reference
 from ..test_raw_photographic_review import inputs, _write_json, _write_npy
+from ..test_raw_review_baseline_classes import source as baseline_source  # noqa: F401
 
 
 def _npz(path, **values):
@@ -190,12 +191,102 @@ def test_real_writer_is_called_once_with_original_raw_source_h_and_sparse_order(
     assert [row["frame_index"] for row in manifest["frames"]] == list(range(len(manifest["frames"])))
     assert manifest["reference"]["acquisition_manifest"] == data.preparation
     assert "change" not in manifest["modes"]
+    assert "no own rig geometry" in result["change_display"]
+    assert result["baseline_classes"] == {}
     for path, raw in before.items():
         assert Path(path).read_bytes() == raw
     first_renders = list(data.inputs["renders"])
     reused = post.run_request(bound)
     assert reused == result
     assert data.inputs["renders"] == first_renders
+
+
+@pytest.fixture
+def baseline_inputs(finished_inputs, baseline_source, monkeypatch):
+    """Add own source geometry at the prepared-input seam; use the real class helper/writer."""
+    from darsia.fluidflower import raw_photographic_review as review
+    data = finished_inputs
+    template_record, phase = deepcopy(baseline_source)
+    original_prepare = post.prepare_run
+    prepared = original_prepare(data.job, data.job.runs[0], data.stores, data.preparation)
+    record = deepcopy(prepared.reference_record)
+    full = record["full"]
+    shape, origin = full["phase_shape_hw"], full["native_origin_xy"]
+    row = template_record["full"]["binding"]["geometry"]
+    row.update(raw_source=dict(sha256=full["source_sha256"]), phase_shape_hw=shape,
+        native_origin_xy=origin, frame_photo_top_keep=_write_npy(data.series_root / "own_top.npy", np.ones(shape, bool)),
+        reference_rig=dict(polygon_reference_native=[origin, [origin[0]+shape[1]-1, origin[1]],
+            [origin[0]+shape[1]-1, origin[1]+shape[0]-1], [origin[0], origin[1]+shape[0]-1]]))
+    full["binding"]["geometry"] = row
+    gp = phase["parameters"]["geometry"]
+    gp.update(rig_origin_xy=origin, native_shape_hw=full["native_centre"]["native_shape_hw"],
+        source_box_xywh=[-origin[0], -origin[1], *reversed(full["native_centre"]["native_shape_hw"])],
+        floor_source_origin_xy=origin)
+    phase["chain_assets"]["floor"] = _write_npy(data.series_root / "own_floor.npy", np.full(shape[1], shape[0]-2.))
+    phase_bound = _write_json(data.series_root / "own_phase.json", phase)
+    manifest = json.loads(Path(data.preparation["path"]).read_bytes())
+    manifest["records"][prepared.reference_index] = record
+    reference_bound = _write_json(data.series_root / "own_preparation.json", manifest)
+    def prepare(*args):
+        value = original_prepare(*args)
+        for bound in (phase_bound, reference_bound, row["frame_photo_top_keep"], phase["chain_assets"]["floor"]):
+            value.sources.original(bound)
+        return replace(value, reference_record=record, reference_manifest=reference_bound,
+            phase_configuration=phase_bound)
+    monkeypatch.setattr(post, "prepare_run", prepare)
+    calls = []
+    def change(_sources, classes, **kwargs):
+        calls.append((classes, kwargs["frame_index"]))
+        return np.zeros((*shape, 3), np.uint8)
+    monkeypatch.setattr(review, "render_change_asset", change)
+    return data, calls
+
+
+def test_own_baseline_classes_enable_change_and_reuse_without_writes(baseline_inputs):
+    data, calls = baseline_inputs
+    bound = request(data)
+    result = post.run_request(bound)
+    run = data.job.runs[0]
+    manifest = json.loads(Path(result["manifests"][0]["path"]).read_bytes())
+    assert manifest["modes"][-1] == "change"
+    assert all("change" in row["assets"] for row in (manifest["reference"], *manifest["frames"]))
+    classes = manifest["reference"]["rig_classes"]
+    assert Path(classes["path"]) == data.output / "baseline_classes" / (run + ".npz")
+    assert calls[0] == (classes, None) and len(calls) == 1 + len(manifest["frames"])
+    before = {path: path.read_bytes() for path in data.output.rglob("*") if path.is_file()}
+    assert post.run_request(bound) == result
+    assert all(path.read_bytes() == raw for path, raw in before.items())
+    assert len(calls) == 1 + len(manifest["frames"])
+
+
+@pytest.mark.parametrize("tamper", ["arrays", "provenance", "path"])
+def test_reuse_rejects_rebound_baseline_output_tampering(baseline_inputs, tamper):
+    data, calls = baseline_inputs
+    bound = request(data)
+    result = post.run_request(bound)
+    run = data.job.runs[0]
+    provenance_bound = result["baseline_classes"][run]
+    provenance_path = Path(provenance_bound["path"])
+    provenance = json.loads(provenance_path.read_bytes())
+    if tamper == "arrays":
+        path = Path(provenance["classes"]["path"])
+        with np.load(path) as arrays:
+            values = {key: arrays[key].copy() for key in arrays.files}
+        values["modelled"][0, 0] ^= True
+        np.savez_compressed(path, **values)
+        provenance["classes"] = post._pin(path)
+    elif tamper == "provenance":
+        provenance["record_index"] += 1
+    else:
+        path = data.series_root / "outside_classes.npz"
+        path.write_bytes(Path(provenance["classes"]["path"]).read_bytes())
+        provenance["classes"] = post._pin(path)
+    result["baseline_classes"][run] = _write_json(provenance_path, provenance)
+    _write_json(data.output / "postrun_completed.json", result)
+    count = len(calls)
+    with pytest.raises(ValueError, match="baseline class"):
+        post.run_request(bound)
+    assert len(calls) == count
 
 
 def test_original_reference_current_h_is_not_used_as_photo_reference_h(finished_inputs):
