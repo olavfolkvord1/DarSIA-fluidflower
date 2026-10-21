@@ -79,7 +79,9 @@ class PaintingRunPreview(QObject):
         self._joining = False
         self.last_result = None
         self._last_session = None
-        self._index = str(QSettings(*_SETTINGS).value(_INDEX, "") or "")
+        settings = QSettings(*_SETTINGS)
+        settings.sync()
+        self._index = str(settings.value(_INDEX, "") or "")
         self.widget = QWidget()
         layout = QVBoxLayout(self.widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -257,7 +259,24 @@ class PaintingRunPreview(QObject):
         session = self.view.session
         return session is None or str(self.runs.currentData() or "").casefold() == session.run_id.casefold()
 
+    def ensure_saved_geometry_index(self):
+        """Fill an empty GUI selection from USER settings; preserve overrides.
+
+        Workers receive only the captured path and verify its metadata. This
+        method never opens a file picker or changes a box draft/settings value.
+        """
+        if not isValid(self) or self._disposed:
+            return self._index
+        if QThread.currentThread() != QObject.thread(self):
+            raise RuntimeError("Frame-model settings must be read on the GUI thread.")
+        if not self._index:
+            settings = QSettings(*_SETTINGS)
+            settings.sync()
+            self._index = str(settings.value(_INDEX, "") or "")
+        return self._index
+
     def refresh(self):
+        self.ensure_saved_geometry_index()
         session = self.view.session
         reference = session.run_id if session else ""
         old = str(self.runs.currentData() or reference)

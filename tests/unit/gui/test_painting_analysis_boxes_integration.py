@@ -1,6 +1,7 @@
 """Inline boxes on the actual painting view, with private photos/models/configs."""
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 import json
 from types import SimpleNamespace
 import threading
@@ -16,6 +17,7 @@ from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import metric_analysis_domains as domains
 from darsia.fluidflower import painting_analysis_box_sources as source_module
 from darsia.fluidflower import painting_run_preview_ui as preview_ui
+from darsia.fluidflower import series_layer_view as layer_ui
 from darsia.fluidflower.geometry_facies import GEOMETRY_REVISION_FORMAT
 from darsia.fluidflower.map_placement import GEOMETRY_FORMAT
 from darsia.fluidflower.series_geometry import SeriesRunInputs
@@ -36,11 +38,21 @@ class _Project:
 
 
 @pytest.fixture
-def context(qtbot, tmp_path, monkeypatch):
-    previous = QSettings.defaultFormat()
-    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path / "settings"))
-    QSettings(*preview_ui._SETTINGS).clear()
+def context(qtbot, tmp_path, monkeypatch, request):
+    settings_path = tmp_path / "private-user.ini"
+    gui_thread = threading.get_ident()
+    def private_settings(*args):
+        assert tuple(args) == preview_ui._SETTINGS
+        assert threading.get_ident() == gui_thread, "A worker accessed QSettings"
+        value = QSettings(str(settings_path), QSettings.Format.IniFormat)
+        value.setFallbacksEnabled(False)
+        assert Path(value.fileName()) == settings_path and not value.fallbacksEnabled()
+        return value
+    for module in (layer_ui, preview_ui):
+        monkeypatch.setattr(module, "QSettings", private_settings)
+    def forbidden_picker(*_args, **_kwargs):
+        pytest.fail("Known frame models must not require a file picker")
+    monkeypatch.setattr(preview_ui.QFileDialog, "getOpenFileName", forbidden_picker)
     registry = tmp_path / "registry.toml"
     registry.write_text("schema_version = 1\n", encoding="utf8")
     monkeypatch.setenv("DARSIA_SERIES_REGISTRY", str(registry))
@@ -76,8 +88,9 @@ def context(qtbot, tmp_path, monkeypatch):
         entries[run] = dict(reference_model=domains.descriptor(model))
     index = series / "index.json"
     index.write_text(json.dumps(dict(format=GEOMETRY_FORMAT, runs=entries)), encoding="utf8")
-    settings = QSettings(*preview_ui._SETTINGS)
-    settings.setValue(preview_ui._INDEX, str(index))
+    settings = private_settings(*preview_ui._SETTINGS)
+    if getattr(request, "param", None) != "late_index":
+        settings.setValue(preview_ui._INDEX, str(index))
     settings.sync()
     active = {"run": "run_a"}
     gui_thread, getter_threads = threading.get_ident(), []
@@ -91,17 +104,18 @@ def context(qtbot, tmp_path, monkeypatch):
     view.show()
     qtbot.waitExposed(view)
     qtbot.waitUntil(lambda: not view.busy() and not view.run_preview.busy(), timeout=10000)
-    assert view.analysis_boxes.draft is not None, view.analysis_boxes.note.text()
-    assert not view.analysis_boxes._binding_error, view.analysis_boxes.note.text()
+    if getattr(request, "param", None) != "late_index":
+        assert view.analysis_boxes.draft is not None, view.analysis_boxes.note.text()
+        assert not view.analysis_boxes._binding_error, view.analysis_boxes.note.text()
     value = SimpleNamespace(view=view, project=project, series=series, current=current, index=index,
-        references=references, photos=photos, active=active, getter_threads=getter_threads, gui_thread=gui_thread)
+        references=references, photos=photos, active=active, getter_threads=getter_threads,
+        gui_thread=gui_thread, user_settings=settings)
     yield value
     view.wait_for_workers()
     for timer in (view._save_timer, view._manual_timer, view._saturation_timer):
         timer.stop()
     view._dirty = False
     view.hide()
-    QSettings.setDefaultFormat(previous)
 
 
 def _row(controller, role):
@@ -366,3 +380,54 @@ def test_box_exit_on_other_photo_keeps_exact_photo_token_and_pan_without_drawing
     assert view.canvas.tool == "pan" and not view.canvas.paint_enabled
     assert _files(context) == before[0] and view.session.to_dict() == before[1]
     assert controller.draft.configuration() == before[2] and view._undo_stack == before[3]
+
+
+def test_saved_user_index_enables_draw_at_actual_view_start_without_picker(context):
+    assert context.view.run_preview._index == str(context.index)
+    assert context.view.analysis_boxes.draw_button.isEnabled()
+    assert context.view.analysis_boxes._context_key[-1] == str(context.index)
+
+
+@pytest.mark.parametrize("context", ["late_index"], indirect=True)
+def test_empty_cached_index_recovers_saved_user_choice_on_reference_reload_without_picker(context, qtbot):
+    view, boxes = context.view, context.view.analysis_boxes
+    assert view.run_preview._index == "" and not boxes.draw_button.isEnabled()
+    assert "user settings" in boxes.note.text() and "Box actions" in boxes.note.text()
+    before = _files(context)
+    context.user_settings.setValue(preview_ui._INDEX, str(context.index))
+    context.user_settings.sync()
+    view.reload()
+    _wait(context, qtbot)
+    assert view.run_preview._index == str(context.index)
+    assert boxes._context_key[-1] == str(context.index) and boxes.draw_button.isEnabled()
+    assert _files(context) == before
+
+
+def test_rechecking_settings_preserves_current_override_and_unsaved_box_draft(context, qtbot):
+    view, boxes = context.view, context.view.analysis_boxes
+    boxes.edit_button.click()
+    boxes.table.item(0, 3).setText("32.125")
+    assert boxes.dirty
+    before = deepcopy(boxes.draft.configuration()), len(boxes._undo)
+    alternative = context.series / "alternative-index.json"
+    alternative.write_bytes(context.index.read_bytes())
+    context.user_settings.setValue(preview_ui._INDEX, str(alternative))
+    context.user_settings.sync()
+    assert view.run_preview.ensure_saved_geometry_index() == str(context.index)
+    assert boxes.reload(preserve_draft=True)
+    _wait(context, qtbot)
+    assert view.run_preview._index == str(context.index)
+    assert boxes.draft.configuration() == before[0] and len(boxes._undo) == before[1]
+    assert boxes.dirty and boxes.draw_button.isEnabled()
+
+
+@pytest.mark.parametrize("context", ["late_index"], indirect=True)
+def test_missing_saved_index_names_missing_path_and_one_click_override(context, qtbot):
+    missing = context.series / "missing-index.json"
+    context.user_settings.setValue(preview_ui._INDEX, str(missing))
+    context.user_settings.sync()
+    context.view.reload()
+    _wait(context, qtbot)
+    assert not context.view.analysis_boxes.draw_button.isEnabled()
+    message = context.view.analysis_boxes.note.text()
+    assert str(missing) in message and "Box actions > Choose measured frame models" in message

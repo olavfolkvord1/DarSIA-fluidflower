@@ -315,6 +315,10 @@ class PaintingAnalysisBoxesController(QObject):
                     [value.clone() for value in self._undo], [value.clone() for value in self._redo],
                     deepcopy(self.legacy_conflicts), self._context_key)
         self.set_mode(None)
+        preview = getattr(self.view, "run_preview", None)
+        ensure_index = getattr(preview, "ensure_saved_geometry_index", None)
+        if callable(ensure_index):
+            ensure_index()
         key = self._key()
         project, session = self.view.project, getattr(self.view, "session", None)
         if key is None or session is None:
@@ -331,7 +335,8 @@ class PaintingAnalysisBoxesController(QObject):
             models, geometry_binding, error = {}, None, ""
             try:
                 if not index:
-                    raise ValueError("Choose the measured frame models to draw on this photograph.")
+                    raise ValueError("No measured frame models are saved in user settings. "
+                        "Use Box actions > Choose measured frame models to select the index once.")
                 fresh = domains.new_configuration(project, index)
                 models, geometry_binding = read_preview_geometry(index)
                 if geometry_binding["geometry_index"] != fresh["geometry_index"]:
@@ -341,7 +346,10 @@ class PaintingAnalysisBoxesController(QObject):
                 report = domains.validate_configuration(project, current)
                 if current["geometry_index"] != fresh["geometry_index"] or not report["valid"]:
                     raise ValueError("Saved boxes bind another geometry revision or frame model; review that binding before editing.")
-            except (OSError, ValueError, KeyError) as exc:
+            except OSError as exc:
+                error = ("Measured frame metadata cannot be read for " + index + ": " + str(exc) +
+                         ". Use Box actions > Choose measured frame models to override the saved index.")
+            except (ValueError, KeyError) as exc:
                 error = str(exc)
             legacy = provider(project, run) if provider is not None else None
             return current, models, store, legacy, error, geometry_binding
