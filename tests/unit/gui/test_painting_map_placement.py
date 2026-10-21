@@ -192,3 +192,44 @@ def test_the_button_asks_for_the_geometry_and_the_runs_to_review_first(
     view.place_version_button.click()
     assert started == [{"runs": ["ac52", "ac53"], "first_runs": ["ac53", "ac60"]}]
     assert settings.value("placement/first_runs") == "ac53 , ac60"
+
+
+def test_prepare_adoption_writes_each_runs_label_grid_map_and_adopts_nothing(view, qtbot, tmp_path):
+    assert view.prepare_adoption_button.text() == "Prepare adoption…"
+    _show(view, _proposal())
+    record = view.save_version("Map A")
+    view.versions_table.selectRow(0)
+    assert not view.prepare_adoption_button.isEnabled()
+    view.approve_version(record)
+    view.versions_table.selectRow(0)
+    assert view.prepare_adoption_button.isEnabled()
+    index = _index(tmp_path / "geometry")
+    # Each run's label grid: its camera grid without the top 5 rows.
+    for run in ("ac52", "ac53"):
+        path = tmp_path / "geometry" / run / "reference_model.json"
+        model = json.loads(path.read_text(encoding="utf-8"))
+        model["baseline_native_grid"] = {
+            "shape_hw": [55, 80],
+            "H_baseline_camera_u_to_rig_corrected_native": [[1, 0, 0], [0, 1, -5], [0, 0, 1]],
+        }
+        path.write_text(json.dumps(model), encoding="utf-8")
+    painting_before = _files(lp.painting_folder(view.project))
+
+    def current(run):
+        return {"metadata": {"run": run}, "shape_hw": [55, 80], "source": {"path": f"{run}.npz"}}
+
+    assert view.prepare_adoption_of(record, index, runs=["ac52", "ac53"], current_labels=current)
+    qtbot.waitUntil(lambda: view.last_adoption is not None and not view.busy(), timeout=30000)
+    result = view.last_adoption
+    assert [row["status"] for row in result["runs"]] == ["prepared", "prepared"]
+    assert Path(result["folder"]).parent == lp.painting_folder(view.project).parent / "map_adoption"
+    with np.load(Path(result["folder"]) / "ac53" / "labels.npz", allow_pickle=True) as saved:
+        assert saved["array"].shape == (55, 80) and saved["metadata"].item() == {"run": "ac53"}
+        # AC53 sees the rig 3 px further right: fine sand ends 3 px later.
+        assert saved["array"][20, 41] == 2 and saved["array"][20, 43] == 3
+    text = view._adoption_message.text()
+    assert "Prepared 2 of 2 runs" in text and "Nothing is adopted" in text
+    assert "No facies id for" in text
+    assert result["adopted"] is False
+    assert _files(lp.painting_folder(view.project)) == painting_before
+    view._adoption_message.close()

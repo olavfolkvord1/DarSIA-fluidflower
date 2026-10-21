@@ -2726,6 +2726,66 @@ class _ProposalWorker(QObject):
         self.finished.emit(proposal)
 
 
+def _approved_map_layers(record, frame):
+    """The session of a saved version and its full-resolution layer ids
+    (uint8, 0 outside the map) on the reference run's photograph."""
+
+    session, proposal, corrections = lp.load_version(record)
+    labels, regions = lp.painted_label_map(
+        session, proposal, frame=frame, corrections=corrections
+    )
+    table = np.zeros(int(labels.max()) + 1, dtype=np.uint8)
+    for row in regions:
+        table[int(row["label_id"])] = int(row["layer_id"])
+    return session, table[labels]
+
+
+class _AdoptionWorker(QObject):
+    """Prepare the adoption of an approved map version on every run's label
+    grid (a preparation folder only; nothing is adopted)."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, record, frame, options) -> None:
+        super().__init__()
+        self.record = dict(record)
+        self.frame = frame
+        self.options = dict(options)
+
+    @Slot()
+    def run(self) -> None:
+        from darsia.fluidflower import map_adoption as ma
+
+        try:
+            self.progress.emit("Drawing the approved map at full resolution…")
+            session, layers = _approved_map_layers(self.record, self.frame)
+            result = ma.prepare_adoption(
+                self.options["destination"],
+                layers,
+                reference_run=session.run_id,
+                geometry_index=self.options["geometry_index"],
+                runs=self.options["runs"],
+                roles={
+                    row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
+                },
+                names={row.layer_id: row.name for row in session.layers},
+                facies={row.layer_id: row.facies for row in session.layers},
+                version={
+                    key: self.record.get(key)
+                    for key in ("name", "kind", "sha256", "created_utc", "folder")
+                }
+                | {"approval": self.options.get("approval")},
+                current_labels=self.options.get("current_labels"),
+                progress=self.progress.emit,
+            )
+        except Exception as error:  # noqa: BLE001 - reported to the user
+            self.failed.emit(f"{type(error).__name__}: {error}")
+            return
+        self.finished.emit(result)
+
+
 class _PlacementWorker(QObject):
     """Place an approved map version in all runs (a review folder only)."""
 
@@ -2745,15 +2805,7 @@ class _PlacementWorker(QObject):
 
         try:
             self.progress.emit("Drawing the approved map at full resolution…")
-            session, proposal, corrections = lp.load_version(self.record)
-            labels, regions = lp.painted_label_map(
-                session, proposal, frame=self.frame, corrections=corrections
-            )
-            table = np.zeros(int(labels.max()) + 1, dtype=np.uint8)
-            for row in regions:
-                table[int(row["label_id"])] = int(row["layer_id"])
-            layers = table[labels]
-            del labels
+            session, layers = _approved_map_layers(self.record, self.frame)
             roles = {
                 row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
             }
@@ -2928,6 +2980,11 @@ class LayerPainterView(QWidget):
         self.last_placement: dict[str, Any] | None = None
         self._placement_dialog: QDialog | None = None
         self._geometry_dialog: QDialog | None = None
+        # Preparing an approved version's adoption (a preparation folder only).
+        self._adoption_thread: QThread | None = None
+        self._adoption_worker: _AdoptionWorker | None = None
+        self.last_adoption: dict[str, Any] | None = None
+        self._adoption_message: QMessageBox | None = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -3268,6 +3325,13 @@ class LayerPainterView(QWidget):
         )
         self.open_placement_button.clicked.connect(self._open_placement_clicked)
         placement.addWidget(self.open_placement_button)
+        self.prepare_adoption_button = QPushButton("Prepare adoption…")
+        self.prepare_adoption_button.setToolTip(
+            "Carry the selected approved version to every run's rig-corrected label "
+            "grid and write a preparation folder; nothing is adopted"
+        )
+        self.prepare_adoption_button.clicked.connect(self._prepare_adoption_clicked)
+        placement.addWidget(self.prepare_adoption_button)
         placement.addStretch(1)
         layout.addLayout(placement)
         self.versions_table = QTableWidget(0, 5)
@@ -3727,7 +3791,12 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
-        for thread in (self._proposal_thread, self._save_thread, self._placement_thread):
+        for thread in (
+            self._proposal_thread,
+            self._save_thread,
+            self._placement_thread,
+            self._adoption_thread,
+        ):
             try:
                 if thread is not None and thread.isRunning():
                     return True
@@ -3738,7 +3807,12 @@ class LayerPainterView(QWidget):
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
-        for thread in (self._proposal_thread, self._save_thread, self._placement_thread):
+        for thread in (
+            self._proposal_thread,
+            self._save_thread,
+            self._placement_thread,
+            self._adoption_thread,
+        ):
             try:
                 if thread is not None and thread.isRunning():
                     thread.wait()
@@ -5530,6 +5604,7 @@ class LayerPainterView(QWidget):
             and not self._map_approvals_error
         )
         self.place_version_button.setEnabled(self._placeable(self._selected_version()))
+        self.prepare_adoption_button.setEnabled(self._placeable(self._selected_version()))
         self._refresh_map_status()
 
     def _refresh_map_status(self) -> None:
@@ -5594,6 +5669,7 @@ class LayerPainterView(QWidget):
             record is not None and not self.busy() and not self._map_approvals_error
         )
         self.place_version_button.setEnabled(self._placeable(record))
+        self.prepare_adoption_button.setEnabled(self._placeable(record))
 
     def _placeable(self, record: Mapping[str, Any] | None) -> bool:
         """Whether a version may be placed in all runs: it is approved."""
@@ -5829,6 +5905,155 @@ class LayerPainterView(QWidget):
         self._placement_dialog = dialog
         dialog.show()
         return dialog
+
+    def _current_label_fields(self):
+        """Each run's current corrected label field, from the current geometry
+        revision: its DarSIA metadata, grid shape and file binding; None for a
+        run without one."""
+
+        from darsia.fluidflower.geometry_facies import GeometryRevisionStore, _darsia_metadata
+
+        try:
+            current = GeometryRevisionStore(self.project).current()
+            runs = dict(
+                ((current.get("configuration") or {}).get("frame_binding") or {}).get("runs") or {}
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            runs = {}
+
+        def lookup(run: str) -> dict[str, Any] | None:
+            row = ((runs.get(run) or {}).get("fields") or {}).get("labels")
+            if not isinstance(row, Mapping) or not row.get("path"):
+                return None
+            return {
+                "metadata": _darsia_metadata(Path(str(row["path"]))),
+                "shape_hw": list(row.get("shape") or []),
+                "source": {key: row.get(key) for key in ("path", "sha256", "size_bytes")},
+            }
+
+        return lookup
+
+    def _prepare_adoption_clicked(self) -> None:
+        """Ask for the geometry index, then prepare the adoption of the version."""
+
+        record = self._selected_version()
+        if not self._placeable(record):
+            self.versions_note.setText("Approve the version before preparing its adoption.")
+            return
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Measured geometry of the runs (index.json)",
+            str(settings.value(_GEOMETRY_INDEX_KEY, "") or ""),
+            "Geometry index (index.json);;JSON (*.json)",
+        )
+        if not path:
+            return
+        settings.setValue(_GEOMETRY_INDEX_KEY, path)
+        settings.sync()
+        try:
+            runs = self._series_runs()
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not read the series' runs", str(error))
+            return
+        answer = QMessageBox.question(
+            self,
+            "Prepare adoption",
+            f"Carry {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) to the "
+            f"rig-corrected label grid of all {len(runs)} runs, through each run's measured "
+            "geometry and baseline native grid? This writes a new preparation folder with "
+            "each run's map and its provenance. Nothing is adopted: no geometry revision, "
+            "map or run configuration changes, and the facies ids wait for the facies table "
+            "of the map.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.prepare_adoption_of(record, path, runs=runs)
+
+    def prepare_adoption_of(
+        self,
+        record: Mapping[str, Any],
+        geometry_index: Path | str,
+        *,
+        runs: Sequence[str] | None = None,
+        current_labels: Callable[[str], Mapping[str, Any] | None] | None = None,
+    ) -> bool:
+        """Start preparing an approved version's adoption on every run's label
+        grid; False when it cannot start (the note says why)."""
+
+        if not self._placeable(record) or self.session is None:
+            self.versions_note.setText("Approve the version before preparing its adoption.")
+            return False
+        from copy import deepcopy
+
+        thread = QThread(self)
+        worker = _AdoptionWorker(
+            record,
+            # A copy: the frame stays editable while the adoption is prepared.
+            deepcopy(self.current_frame()),
+            {
+                "destination": lp.painting_folder(self.project).parent / "map_adoption",
+                "geometry_index": str(geometry_index),
+                "runs": list(runs if runs is not None else self._series_runs()),
+                "approval": lp.map_approval(self.map_approvals, str(record.get("sha256") or "")),
+                "current_labels": current_labels or self._current_label_fields(),
+            },
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.versions_note.setText)
+        worker.finished.connect(self._adoption_finished)
+        worker.failed.connect(self._adoption_failed)
+        # Direct: quit from the worker thread, so that wait() in the GUI
+        # thread cannot block a queued quit.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(self._adoption_thread_finished)
+        self._adoption_thread, self._adoption_worker = thread, worker
+        self.versions_note.setText("Preparing the adoption…")
+        thread.start()
+        self._refresh_versions()
+        self.busy_changed.emit(True)
+        return True
+
+    def _adoption_finished(self, result: object) -> None:
+        """Say what the preparation holds and what an adoption still lacks."""
+
+        self.last_adoption = dict(result)
+        rows = self.last_adoption["runs"]
+        prepared = sum(1 for row in rows if row.get("status") == "prepared")
+        text = (
+            f"Prepared {prepared} of {len(rows)} runs on their rig-corrected label grid. "
+            "Nothing is adopted."
+        )
+        blockers = list(self.last_adoption.get("blockers") or [])
+        detail = text + (
+            "\n\nStill missing:\n" + "\n".join(f"- {line}" for line in blockers)
+            if blockers
+            else ""
+        ) + f"\n\nFolder: {self.last_adoption['folder']}"
+        self.versions_note.setText(f"{text} {self.last_adoption['folder']}")
+        message = QMessageBox(self)
+        message.setWindowTitle("Adoption prepared")
+        message.setText(detail)
+        message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._adoption_message = message
+        message.show()
+
+    def _adoption_failed(self, message: str) -> None:
+        """Say why the adoption was not prepared."""
+
+        self.versions_note.setText(f"The adoption was not prepared: {message}")
+
+    def _adoption_thread_finished(self) -> None:
+        """Drop the finished worker and its thread here, in the GUI thread."""
+
+        thread = self._adoption_thread
+        self._adoption_thread = None
+        self._adoption_worker = None
+        if thread is not None:
+            thread.deleteLater()
+        self._refresh_versions()
+        self.busy_changed.emit(self.busy())
 
     def _placement_failed(self, message: str) -> None:
         """Say why the map was not placed."""
