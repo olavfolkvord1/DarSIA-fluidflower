@@ -84,6 +84,9 @@ class MetricBoxCanvas(AnalysisDomainImageView):
             item, original, _, _ = self._edit
             self._edit = None
             rect, bounds = item.rect(), self.pixmap_item.boundingRect()
+            if rect == original:
+                event.accept()
+                return
             if rect.width() > 0 and rect.height() > 0 and bounds.width() > 0:
                 self.rectangle_edited.emit(str(item.data(0)), [rect.left()/bounds.width(),
                     rect.top()/bounds.height(), rect.right()/bounds.width(), rect.bottom()/bounds.height()])
@@ -160,7 +163,10 @@ class MetricAnalysisDomainDialog(AnalysisDomainDialog):
             return
         old = self.domains[item.row()]
         try:
-            values = [float(self.domain_table.item(item.row(), c).text().replace(",", ".")) for c in range(2, 6)]
+            # Display rounding must not change unedited physical coordinates.
+            values = list(old["bounds_mm"])
+            if 2 <= item.column() <= 5:
+                values[item.column()-2] = float(item.text().replace(",", "."))
             legacy = deepcopy(old.get("legacy_import"))
             if legacy and values != old["bounds_mm"]:
                 legacy["unmodified"] = False

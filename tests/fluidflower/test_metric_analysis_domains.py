@@ -250,3 +250,26 @@ def test_canvas_drag_moves_and_corner_drag_resizes_without_editing_other_boxes(c
     assert resized[1] > changed[1] and resized[2] < changed[2]
     assert dialog.domains[0]["role"] == "box1"
     dialog.close()
+
+
+def test_name_role_and_enable_edits_preserve_all_coordinate_bits(context, qtbot):
+    from PySide6.QtCore import Qt
+    from darsia.fluidflower.metric_analysis_domains_ui import MetricAnalysisDomainDialog
+    project, _, config, models = context
+    coordinates = [100.12345678901234, 500.98765432109876, 40.12345678901234, 300.98765432109876]
+    config["domains"] = [data.box("first", coordinates, role="box1")]
+    dialog = MetricAnalysisDomainDialog(project, config, models=models)
+    qtbot.addWidget(dialog)
+    dialog.domain_table.item(0, 1).setText("renamed")
+    dialog.domain_table.item(0, 6).setText("box2")
+    dialog.domain_table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert [x.hex() for x in dialog.domains[0]["bounds_mm"]] == [x.hex() for x in coordinates]
+    dialog.show(); qtbot.wait(20); dialog.domain_canvas.fit_image(); dialog._set_mode("edit")
+    item = dialog.domain_canvas._domain_items[dialog.domains[0]["domain_id"]]
+    centre = dialog.domain_canvas.mapFromScene(item.rect().center())
+    qtbot.mouseClick(dialog.domain_canvas.viewport(), Qt.MouseButton.LeftButton, pos=centre)
+    assert [x.hex() for x in dialog.domains[0]["bounds_mm"]] == [x.hex() for x in coordinates]
+    dialog.domain_table.item(0, 2).setText("101")
+    assert dialog.domains[0]["bounds_mm"][0] == 101
+    assert [x.hex() for x in dialog.domains[0]["bounds_mm"][1:]] == [x.hex() for x in coordinates[1:]]
+    dialog.close()
