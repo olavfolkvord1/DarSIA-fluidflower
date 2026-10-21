@@ -572,6 +572,8 @@ class PhaseModelComparisonDialog(QDialog):
 
     def __init__(self, entries, selected_root="", parent=None, *, embedded=False):
         super().__init__(parent)
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.embedded = embedded
         if embedded:
             self.setWindowFlags(Qt.WindowType.Widget)

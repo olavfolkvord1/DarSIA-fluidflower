@@ -4,16 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import QApplication, QAbstractSpinBox, QComboBox, QWidget
 
 
 class ComboBoxWheelGuard(QObject):
     """Prevent passive page scrolling from changing editable controls."""
-
-    def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._armed_spin_box: QAbstractSpinBox | None = None
 
     @staticmethod
     def _combo_box(widget: Any) -> QComboBox | None:
@@ -34,9 +30,8 @@ class ComboBoxWheelGuard(QObject):
         return None
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.MouseButtonPress:
-            self._armed_spin_box = self._spin_box(watched)
-            return super().eventFilter(watched, event)
+        if event.type() in (QEvent.Type.Polish, QEvent.Type.Show):
+            self.prepare_control(watched)
         if event.type() != QEvent.Type.Wheel:
             return super().eventFilter(watched, event)
         combo = self._combo_box(watched)
@@ -48,24 +43,44 @@ class ComboBoxWheelGuard(QObject):
                 and (watched is popup or popup.isAncestorOf(watched))
             ):
                 return super().eventFilter(watched, event)
-            event.ignore()
-            return True
+            if not self._has_control_focus(combo):
+                event.ignore()
+                return True
         spin_box = self._spin_box(watched)
-        if spin_box is not None and spin_box is not self._armed_spin_box:
+        if spin_box is not None and not self._has_control_focus(spin_box):
             event.ignore()
             return True
         return super().eventFilter(watched, event)
 
+    @staticmethod
+    def _has_control_focus(control: QWidget) -> bool:
+        focus = QApplication.focusWidget()
+        return control.hasFocus() or (focus is not None and control.isAncestorOf(focus))
 
-def install_interaction_safety(app: QApplication) -> ComboBoxWheelGuard:
+    @staticmethod
+    def prepare_control(widget: QObject) -> None:
+        if isinstance(widget, (QComboBox, QAbstractSpinBox)):
+            # WheelFocus would let the very scroll being guarded acquire focus.
+            # Click and keyboard focus, including an editable child, remain valid.
+            widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+
+def install_interaction_safety(app: QApplication | None = None) -> ComboBoxWheelGuard:
     """Install and retain the global input guard for one application instance."""
 
+    if app is None:
+        app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("A QApplication is required before installing input guards")
     existing = getattr(app, "_fluidflower_combo_wheel_guard", None)
     if isinstance(existing, ComboBoxWheelGuard):
-        return existing
-    guard = ComboBoxWheelGuard(app)
-    app.installEventFilter(guard)
-    app._fluidflower_combo_wheel_guard = guard  # type: ignore[attr-defined]
+        guard = existing
+    else:
+        guard = ComboBoxWheelGuard(app)
+        app.installEventFilter(guard)
+        app._fluidflower_combo_wheel_guard = guard  # type: ignore[attr-defined]
+    for widget in app.allWidgets():
+        guard.prepare_control(widget)
     return guard
 
 

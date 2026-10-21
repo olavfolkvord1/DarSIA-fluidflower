@@ -4035,6 +4035,7 @@ class LayerPainterView(QWidget):
         layout.addWidget(self.map_status)
         self.export_problems = QLabel()
         self.export_problems.setWordWrap(True)
+        self.export_problems.linkActivated.connect(self._open_round5_step)
         layout.addWidget(self.export_problems)
         row = QHBoxLayout()
         self.export_button = QPushButton("Save and export to native Setup…")
@@ -7086,7 +7087,7 @@ class LayerPainterView(QWidget):
         self.place_version_button.setEnabled(self._placeable(self._selected_version()))
         self.prepare_adoption_button.setEnabled(self._placeable(self._selected_version()))
         self.adopt_button.setEnabled(not self.busy() and not self._map_approvals_error and native_ready)
-        self._refresh_map_status()
+        self._version_selected()
         if hasattr(self, "version_actions"):
             self.version_actions.refresh()
         if hasattr(self, "run_preview"):
@@ -7102,6 +7103,18 @@ class LayerPainterView(QWidget):
             label.setText(
                 f"Map approvals could not be read: {self._map_approvals_error}"
             )
+            return
+        manual = self._selected_manual_version()
+        if manual is not None:
+            version, approval = manual
+            name = version.get("display_name") or version.get("name")
+            if approval is not None:
+                label.setText(f"Map to save: {name}, {self._approval_text(approval)} "
+                              f"(SHA-256 {str(version['sha256'])[:12]}…). "
+                              "This selected approval counts for the round-5 route in step 3.")
+            else:
+                label.setText(f"Map selected: {name}, not approved. Approve this saved manual-map "
+                              "version in step 3 before transferring it or preparing adoption.")
             return
         if self.session is None or self.proposal is None:
             label.setText("")
@@ -7140,6 +7153,57 @@ class LayerPainterView(QWidget):
                 "step 3 and approve it there before saving the revision."
             )
 
+    def _selected_manual_version(self):
+        """The explicit saved identity used by round 5, separate from drafts.
+
+        Reading an existing approval here never hashes a proposal or redraws a
+        manual map. The actual transfer/adoption route keeps its own checks.
+        """
+        version = self._selected_version()
+        if version is None or not lpm.is_manual_version(version):
+            return None
+        approval = None
+        if not self._map_approvals_error and not version.get("history_error"):
+            approval = next((row for row in reversed(self.map_approvals)
+                if row.get("sha256") == version.get("sha256")
+                and row.get("version") == Path(version["folder"]).name), None)
+        return version, approval
+
+    def _refresh_manual_export_route(self) -> bool:
+        """Replace the older export warning only for the selected manual map."""
+        if not hasattr(self, "export_button"):
+            return False
+        manual = self._selected_manual_version()
+        self.export_button.setVisible(manual is None)
+        if manual is None:
+            return False
+        _version, approval = manual
+        if self._map_approvals_error or _version.get("history_error"):
+            self.step_export.set_status("Approval history cannot be read", "warn")
+            detail = "The approval history cannot be read; refresh it before continuing."
+        elif approval is None:
+            self.step_export.set_status("Approve the selected manual map in step 3", "warn")
+            detail = "Approve the selected saved manual-map version in step 3."
+        else:
+            self.step_export.set_status("Approved manual map: continue in step 3", "done")
+            detail = "The selected approved manual map uses the round-5 route in step 3."
+        self.export_problems.setText(detail + " Transfer map to all runs → Review placement → "
+            "Prepare adoption → Adopt. <a href='round5'>Open step 3</a>. "
+            "The older native Setup export is hidden for this route.")
+        self.export_problems.setStyleSheet("")
+        self.export_button.setEnabled(False)
+        return True
+
+    def _open_round5_step(self, _link=None) -> None:
+        self.step_propose.set_expanded(True)
+        self.versions_table.setFocus()
+        parent = self.versions_table.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                parent.ensureWidgetVisible(self.versions_table)
+                break
+            parent = parent.parentWidget()
+
     def _selected_version(self) -> dict[str, Any] | None:
         table = getattr(self, "versions_table", None)
         if table is None:
@@ -7154,8 +7218,12 @@ class LayerPainterView(QWidget):
         if record is not None:
             text = f"{record.get('name')}: SHA-256 {record.get('sha256')}"
             approval = lp.map_approval(self.map_approvals, str(record.get("sha256")))
+            if lpm.is_manual_version(record):
+                approval = self._selected_manual_version()[1]
             if approval is not None:
                 text += f" · {self._approval_text(approval)}"
+                if lpm.is_manual_version(record):
+                    text += " · this selected approval counts for round 5"
             gaps = self._version_gaps(record)
             if gaps:
                 text += f" · {gaps}"
@@ -7172,6 +7240,9 @@ class LayerPainterView(QWidget):
         )
         self.place_version_button.setEnabled(self._placeable(record))
         self.prepare_adoption_button.setEnabled(self._placeable(record))
+        self._refresh_map_status()
+        if not self._refresh_manual_export_route() and self.session is not None:
+            self._refresh_legacy_export_status()
         if hasattr(self, "version_actions"):
             self.version_actions.refresh()
 
@@ -9260,6 +9331,25 @@ class LayerPainterView(QWidget):
 
     # ------------------------------------------------------------ status
 
+    def _refresh_legacy_export_status(self) -> None:
+        """The existing native Setup status; round 5 does not use this gate."""
+        if not hasattr(self, "export_problems"):
+            return
+        problems = self.export_problems_now()
+        if self._save_thread is not None:
+            self.step_export.set_status("Working…", "warn")
+        elif problems:
+            self.step_export.set_status("Missing input", "warn")
+        elif self.last_export is not None and not self._export_stale:
+            self.step_export.set_status("Exported", "done")
+        else:
+            self.step_export.set_status("Ready to export", "done")
+        self.export_problems.setText(" ".join(problems))
+        self.export_problems.setStyleSheet(
+            f"color: {_state_color(self, 'warn').name()};" if problems else ""
+        )
+        self.export_button.setEnabled(not self.busy() and not problems)
+
     def _refresh_status(self) -> None:
         self._refresh_fill_region()
         self._sync_analysis_boxes()
@@ -9324,20 +9414,8 @@ class LayerPainterView(QWidget):
         self._refresh_corrections()
         self._refresh_versions()
 
-        problems = self.export_problems_now()
-        if self._save_thread is not None:
-            self.step_export.set_status("Working…", "warn")
-        elif problems:
-            self.step_export.set_status("Missing input", "warn")
-        elif self.last_export is not None and not self._export_stale:
-            self.step_export.set_status("Exported", "done")
-        else:
-            self.step_export.set_status("Ready to export", "done")
-        self.export_problems.setText(" ".join(problems))
-        self.export_problems.setStyleSheet(
-            f"color: {_state_color(self, 'warn').name()};" if problems else ""
-        )
-        self.export_button.setEnabled(not busy and not problems)
+        if not self._refresh_manual_export_route():
+            self._refresh_legacy_export_status()
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             self.propose_button.setEnabled(False)
             self.rig_panel.setEnabled(False)

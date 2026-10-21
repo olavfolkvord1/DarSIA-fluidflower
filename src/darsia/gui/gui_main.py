@@ -26,6 +26,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.setWindowTitle("DarSIA")
         self.showMaximized()
 

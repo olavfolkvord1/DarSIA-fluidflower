@@ -35,6 +35,8 @@ class PreparedResultLookup(QThread):
 class StudioMassWindow(QMainWindow):
     def __init__(self, request, cache_root, parent=None):
         super().__init__(parent)
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.request = json.loads(json.dumps(request, default=str))
         from darsia.fluidflower.tools.phase_studio_mass_cache import DEFAULT_MASS_POLICY

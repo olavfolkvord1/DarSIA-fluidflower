@@ -14,6 +14,8 @@ class PhaseModelStudioWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.setWindowTitle("DarSIA · Phase Model Studio")
         self.resize(1450, 920)
         self.setMinimumSize(1000, 680)

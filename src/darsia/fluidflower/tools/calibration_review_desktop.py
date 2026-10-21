@@ -3064,6 +3064,8 @@ class CalibrationReviewWindow(ReviewImageAssets, QMainWindow):
         on_back: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.app_model = app_model
         self.store = store
         self.workspace = workspace
@@ -5651,6 +5653,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         on_back: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.app_model = app_model
         self.store = store
         if workspace.review_surface == "blind_gas_validation":
@@ -11526,6 +11530,8 @@ class ReviewHubWindow(QMainWindow):
         use_opengl: bool,
     ) -> None:
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.args = args
         self.workspaces = dict(workspaces)
         self.use_opengl = use_opengl

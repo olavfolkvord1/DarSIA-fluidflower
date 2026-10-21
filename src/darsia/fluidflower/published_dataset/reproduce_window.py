@@ -65,6 +65,8 @@ class ReproduceWindow(QWidget):
     def __init__(self, *, runner_factory=None, installed=None, fingerprint=None, machine=None, inventory=None):
         """Lay out the steps; ``runner_factory`` etc. replace the real machine in tests."""
         super().__init__()
+        from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+        install_interaction_safety()
         self.setWindowTitle("Reproduce a published dataset")
         self.runner_factory, self.installed, self.fingerprint = runner_factory, installed, fingerprint
         self.machine, self.inventory = machine, inventory
