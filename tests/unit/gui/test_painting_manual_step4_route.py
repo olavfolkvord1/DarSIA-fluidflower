@@ -4,10 +4,13 @@ No actual series, placement, export, approval withdrawal or adoption is run.
 The existing manual renderer works only on the 80x60 private fixture.
 """
 from pathlib import Path
+from types import SimpleNamespace
+import pytest
 from PySide6.QtCore import Qt
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import layer_painting_manual as manual
+from darsia.fluidflower import series_layer_view as view_module
 
 from .test_painting_corrections import _proposal, _show, view  # noqa: F401
 from .test_painting_manual_map import LEFT, RIGHT, MIDDLE, _drawn
@@ -58,10 +61,23 @@ def test_approved_manual_without_proposal_uses_saved_identity_and_round5_route(v
     assert view._placement_thread is None and view._adoption_thread is None and view._save_thread is None
 
 
-def test_multiple_approved_same_content_versions_show_the_selected_literal_approval(view, qtbot):
+def test_multiple_approved_same_content_versions_show_the_selected_literal_approval(view, qtbot, monkeypatch, tmp_path):
     first = _saved_manual(view, qtbot, "Earlier approved map")
     first_approval = manual.approve_manual_version(first, now="2026-01-01T01:00:00Z")
     second = view.save_version("Later approved map")
+    assert first["sha256"] == second["sha256"] and first["folder"] != second["folder"]
+    view.versions = view._read_versions(view.session.run_id)
+    view._read_approvals(view.session.run_id)
+    view._refresh_versions()
+    _select(view, second)
+    assert view._approval_for_version(second) is None
+    assert "Later approved map, not approved" in view.map_status.text()
+    assert view.versions_table.item(view.versions_table.currentRow(), 5).text() == "Not approved"
+    assert not view.place_version_button.isEnabled() and not view.prepare_adoption_button.isEnabled()
+    assert not view.place_version(second, tmp_path / "unread-index.json", runs=[view.session.run_id])
+    assert not view.prepare_adoption_of(second, tmp_path / "unread-index.json", runs=[view.session.run_id])
+    assert view._placement_thread is None and view._adoption_thread is None
+    assert lp.read_map_approvals(view.project, view.session.run_id) == [first_approval]
     second_approval = manual.approve_manual_version(second, now="2026-01-01T02:00:00Z")
     assert first["sha256"] == second["sha256"] and first["folder"] != second["folder"]
     view.versions = view._read_versions(view.session.run_id)
@@ -72,6 +88,27 @@ def test_multiple_approved_same_content_versions_show_the_selected_literal_appro
     assert "this selected approval counts" in view.versions_note.text()
     _select(view, second)
     assert "Later approved map, approved 2026-01-01 02:00 UTC" in view.map_status.text()
+    assert lp.read_map_approvals(view.project, view.session.run_id) == [first_approval, second_approval]
+    assert view._approval_for_version(second) == second_approval
+    assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
+    # Capture the GUI handoff before either real worker is constructed/started.
+    # Geometry is only a synthetic selector here; no placement proof is claimed.
+    index = tmp_path / "selection-only.json"
+    monkeypatch.setattr(view.run_preview, "geometry_selection", lambda: SimpleNamespace(index_path=str(index)))
+    captured = []
+    class HandoffCaptured(Exception):
+        pass
+    def capture(record, frame, options):
+        captured.append(options["approval"])
+        raise HandoffCaptured()
+    monkeypatch.setattr(view_module, "_PlacementWorker", capture)
+    monkeypatch.setattr(view_module, "_AdoptionWorker", capture)
+    with pytest.raises(HandoffCaptured):
+        view.place_version(second, index, runs=[view.session.run_id], photo_loader=lambda *args: None)
+    with pytest.raises(HandoffCaptured):
+        view.prepare_adoption_of(second, index, runs=[view.session.run_id], current_labels=lambda run: None)
+    assert captured == [second_approval, second_approval]
+    assert view._placement_thread is None and view._adoption_thread is None
     assert lp.read_map_approvals(view.project, view.session.run_id) == [first_approval, second_approval]
 
 

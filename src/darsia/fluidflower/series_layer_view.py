@@ -102,6 +102,7 @@ from darsia.fluidflower import layer_painting_manual as lpm
 from darsia.fluidflower import painting_layer_priority as layer_priority
 from darsia.fluidflower import layer_painting_polygons_only as lpp
 from darsia.fluidflower import layer_painting_version_archive as lpv
+from darsia.fluidflower import painting_facies_approval as facies_approval
 from darsia.fluidflower.painting_native_cache import ASYNC_PIXELS, NativeProposalCache
 from darsia.fluidflower.layer_painting_join import (
     JoinEdgesError, JoinPreview, join_to_neighbour,
@@ -161,8 +162,9 @@ _CORRECTION_TOOLS = frozenset({"correct", "restore", "lasso", "fill"})
 _DRAWING_TOOLS = frozenset({"polygon", "edit", "paint", "erase"}) | _CORRECTION_TOOLS
 # Outline of the corrected areas on the proposal (RGBA).
 _CORRECTED_EDGE = (255, 196, 0, 255)
-# Polygons, strokes and corrections, as kept for undo and redo.
-_Snapshot = tuple[list[lp.Polygon], list[lp.Stroke], list[lp.Correction], tuple[int, ...]]
+# Polygons, strokes, corrections and priority, as kept for undo and redo.
+# An optional fifth field holds the facies property rows and permeability unit.
+_Snapshot = tuple
 # Column of the layer table whose box shows or hides a layer (display only).
 _SHOW_COLUMN = 4
 _TOP_COLUMN = 5
@@ -3959,6 +3961,9 @@ class LayerPainterView(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(self.versions_note)
+        self.facies_version_note = QLabel()
+        self.facies_version_note.setWordWrap(True)
+        layout.addWidget(self.facies_version_note)
         from .painting_versions_ui import PaintingVersionsActions
         self.version_actions = PaintingVersionsActions(self, layout)
         return widget
@@ -3975,7 +3980,7 @@ class LayerPainterView(QWidget):
                 "everything outside the rig frame is added as a facies of its own."
             )
         )
-        self.facies_table = QTableWidget(0, 5)
+        self.facies_table = QTableWidget(0, 6)
         self.facies_table.verticalHeader().setVisible(False)
         self.facies_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -3991,10 +3996,10 @@ class LayerPainterView(QWidget):
         header = self.facies_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4):
+        for column in (2, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.facies_table.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.facies_table.itemChanged.connect(self._facies_item_changed)
         self.facies_table.itemSelectionChanged.connect(self._facies_selection_changed)
@@ -4026,6 +4031,13 @@ class LayerPainterView(QWidget):
         unit_row.addWidget(self.unit)
         unit_row.addStretch(1)
         layout.addLayout(unit_row)
+        self.undo_facies_button = QPushButton("Undo last facies change")
+        self.undo_facies_button.setToolTip("Restore one role, porosity, permeability or unit edit; the saved approval stays unchanged")
+        self.undo_facies_button.clicked.connect(self._undo_facies_change)
+        layout.addWidget(self.undo_facies_button)
+        self.facies_approval_note = QLabel()
+        self.facies_approval_note.setWordWrap(True)
+        layout.addWidget(self.facies_approval_note)
         # Whether the map to be saved is the approved version (step 3).
         self.map_status = QLabel()
         self.map_status.setWordWrap(True)
@@ -6295,6 +6307,12 @@ class LayerPainterView(QWidget):
         self.session.strokes = [
             lp.Stroke(row.layer_id, row.radius_px, list(row.points)) for row in strokes
         ]
+        if len(snapshot) > 4:
+            rows, unit = snapshot[4]
+            for name, role, porosity, permeability in rows:
+                if name in self.session.facies:
+                    self.session.facies[name] = lp.FaciesEntry(role, porosity, permeability)
+            self.session.permeability_unit = unit
 
     def _push_undo(self) -> None:
         if self.session is None:
@@ -6638,7 +6656,8 @@ class LayerPainterView(QWidget):
             return
         if not self._undo_stack:
             return
-        current, snapshot = self._snapshot(), self._undo_stack.pop()
+        snapshot = self._undo_stack.pop()
+        current = self._facies_snapshot() if len(snapshot) > 4 else self._snapshot()
         if snapshot[0] != current[0]:
             self.canvas.clear_selection()  # the polygons change
         self._redo_stack.append(current)
@@ -6654,7 +6673,8 @@ class LayerPainterView(QWidget):
             return
         if self.session is None or not self._redo_stack or not self.run_preview.is_reference():
             return
-        current, snapshot = self._snapshot(), self._redo_stack.pop()
+        snapshot = self._redo_stack.pop()
+        current = self._facies_snapshot() if len(snapshot) > 4 else self._snapshot()
         if snapshot[0] != current[0]:
             self.canvas.clear_selection()  # the polygons change
         self._undo_stack.append(current)
@@ -6667,7 +6687,7 @@ class LayerPainterView(QWidget):
         A change of the corrections alone does not write the session.
         """
 
-        priority_changed = before[3:] != after[3:]
+        priority_changed = before[3:4] != after[3:4]
         if priority_changed:
             self._manual_display = None
         if before[:2] != after[:2] or priority_changed:
@@ -6677,6 +6697,9 @@ class LayerPainterView(QWidget):
             self._schedule_manual_map()
         if before[2] != after[2]:
             self._after_correction_change()
+        if before[4:] != after[4:]:
+            self._sync_settings()
+            self._facies_changed()
 
     # ------------------------------------------------------- corrections
 
@@ -7039,7 +7062,7 @@ class LayerPainterView(QWidget):
             if lpm.is_manual_version(record):
                 kind = "manual map (gaps)" if record.get("uncovered_pixels") else "manual map"
             saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
-            approval = lp.map_approval(self.map_approvals, digest)
+            approval = self._approval_for_version(record)
             approved = (
                 str(approval.get("approved_utc") or "")[:16].replace("T", " ")
                 if approval
@@ -7153,6 +7176,21 @@ class LayerPainterView(QWidget):
                 "step 3 and approve it there before saving the revision."
             )
 
+    def _approval_for_version(self, record):
+        """Return only the literal saved version's readable existing approval."""
+        if record is None or self._map_approvals_error or record.get("history_error"):
+            return None
+        folder = Path(str(record.get("folder") or ""))
+        files = record.get("files")
+        if not record.get("folder") or not isinstance(files, Mapping):
+            return None
+        return next((row for row in reversed(self.map_approvals)
+            if row.get("sha256") == record.get("sha256")
+            and row.get("version") == folder.name
+            and str(row.get("kind") or "") == str(record.get("kind") or "")
+            and row.get("run_id") == record.get("run_id")
+            and row.get("files") == files), None)
+
     def _selected_manual_version(self):
         """The explicit saved identity used by round 5, separate from drafts.
 
@@ -7162,12 +7200,7 @@ class LayerPainterView(QWidget):
         version = self._selected_version()
         if version is None or not lpm.is_manual_version(version):
             return None
-        approval = None
-        if not self._map_approvals_error and not version.get("history_error"):
-            approval = next((row for row in reversed(self.map_approvals)
-                if row.get("sha256") == version.get("sha256")
-                and row.get("version") == Path(version["folder"]).name), None)
-        return version, approval
+        return version, self._approval_for_version(version)
 
     def _refresh_manual_export_route(self) -> bool:
         """Replace the older export warning only for the selected manual map."""
@@ -7195,6 +7228,7 @@ class LayerPainterView(QWidget):
         return True
 
     def _open_round5_step(self, _link=None) -> None:
+        """Open the saved-version step for the selected manual-map route."""
         self.step_propose.set_expanded(True)
         self.versions_table.setFocus()
         parent = self.versions_table.parentWidget()
@@ -7217,7 +7251,7 @@ class LayerPainterView(QWidget):
         record = self._selected_version()
         if record is not None:
             text = f"{record.get('name')}: SHA-256 {record.get('sha256')}"
-            approval = lp.map_approval(self.map_approvals, str(record.get("sha256")))
+            approval = self._approval_for_version(record)
             if lpm.is_manual_version(record):
                 approval = self._selected_manual_version()[1]
             if approval is not None:
@@ -7245,6 +7279,7 @@ class LayerPainterView(QWidget):
             self._refresh_legacy_export_status()
         if hasattr(self, "version_actions"):
             self.version_actions.refresh()
+        self._refresh_facies_approval()
 
     @staticmethod
     def _version_gaps(record: Mapping[str, Any]) -> str:
@@ -7273,8 +7308,7 @@ class LayerPainterView(QWidget):
             and not self.busy()
             and not self._map_approvals_error
             and not record.get("history_error")
-            and lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
-            is not None
+            and self._approval_for_version(record) is not None
         )
 
     def _series_root(self) -> Path | None:
@@ -7434,7 +7468,7 @@ class LayerPainterView(QWidget):
             except ValueError as error:
                 self.versions_note.setText(str(error))
                 return False
-        approval = lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
+        approval = self._approval_for_version(record)
         thread = QThread(self)
         worker = _PlacementWorker(
             record,
@@ -7656,7 +7690,7 @@ class LayerPainterView(QWidget):
                 "destination": lp.painting_folder(self.project).parent / "map_adoption",
                 "geometry_index": str(geometry_index),
                 "runs": list(runs if runs is not None else self._series_runs()),
-                "approval": lp.map_approval(self.map_approvals, str(record.get("sha256") or "")),
+                "approval": self._approval_for_version(record),
                 "current_labels": current_labels or self._current_label_fields(),
             },
         )
@@ -8737,7 +8771,7 @@ class LayerPainterView(QWidget):
         try:
             unit = str(self.unit.currentData() or "darcy")
             table.setHorizontalHeaderLabels(
-                ["Facies", "Layers", "Role", "Porosity", f"Perm. [{unit}]"]
+                ["Facies", "Layers", "Role", "Porosity", f"Perm. [{unit}]", "Approval comparison"]
             )
             for column, tip in (
                 (3, "Porosity [-], between 0 and 1"),
@@ -8854,6 +8888,7 @@ class LayerPainterView(QWidget):
         _fit_table_height(table, max_rows=10)
         self._sync_facies_visibility()
         self._facies_selection_changed()
+        self._refresh_facies_approval()
         self._refresh_status()
 
     def _layers_text(self, facies: str) -> str:
@@ -8933,6 +8968,94 @@ class LayerPainterView(QWidget):
         except RuntimeError:
             return
         self.set_facies_role(facies, role)
+
+    def _facies_state(self) -> tuple:
+        """Capture the current facies properties and unit for one undo step."""
+        if self.session is None:
+            return (), ""
+        return (tuple((name, value.role, value.porosity, value.permeability)
+                      for name, value in self.session.facies.items()), self.session.permeability_unit)
+
+    def _facies_snapshot(self) -> _Snapshot:
+        """Append facies state only to commands that actually edit properties."""
+        return self._snapshot() + (self._facies_state(),)
+
+    def _remember_facies_change(self, before: _Snapshot) -> bool:
+        """Remember one changed property command without creating no-op entries."""
+        if before[4] == self._facies_state():
+            return False
+        self._undo_stack.append(before)
+        del self._undo_stack[:-_UNDO_LIMIT]
+        self._redo_stack = []
+        return True
+
+    def _undo_facies_change(self) -> None:
+        """Undo the latest facies command while preserving the saved approval."""
+        if (self.session is None or not self.run_preview.is_reference() or self.busy()
+                or not self._undo_stack or len(self._undo_stack[-1]) < 5
+                or self._undo_stack[-1][4] == self._facies_state()):
+            return
+        current, previous = self._facies_snapshot(), self._undo_stack.pop()
+        self._redo_stack.append(current)
+        self._restore(previous)
+        self._after_restore(current, previous)
+
+    def _refresh_facies_approval(self) -> None:
+        """Show current draft differences from the literal selected approval."""
+        label = getattr(self, "facies_approval_note", None)
+        if label is None:
+            return
+        reference, changed, error = None, {}, ""
+        record = self._selected_version()
+        approval = self._approval_for_version(record)
+        if self.session is not None and record and lpm.is_manual_version(record) and approval and not self._map_approvals_error and not record.get("history_error"):
+            try:
+                key = facies_approval.metadata_key(record, approval)
+                cache = getattr(self, "_facies_approval_cache", None)
+                if cache is None or cache[0] != key:
+                    cache = key, facies_approval.approved_reference(record, approval)
+                    self._facies_approval_cache = cache
+                reference = cache[1]
+                if reference["run_id"] != self.session.run_id:
+                    raise ValueError("The selected approved session belongs to another run")
+                changed = facies_approval.differences(self.session, reference)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                error = str(exc)
+        if error:
+            text = "Facies comparison with the selected approved version is unavailable: " + error
+        elif reference is None:
+            text = "Select an approved manual-map version to compare the current facies."
+        elif changed:
+            details = "; ".join(f"{name} ({', '.join(fields)})" for name, fields in changed.items())
+            text = (f"Current session differs from {reference['name']} (approved): {details}. "
+                    "Undo the change, or save and approve a new version if it is intended. The saved approval is unchanged.")
+        else:
+            text = f"Current facies match {reference['name']} (approved)."
+        label.setText(text)
+        label.setStyleSheet(f"color: {_state_color(self, 'warn').name()};" if changed or error else "")
+        self.facies_version_note.setText(text if changed or error else "")
+        self.facies_version_note.setVisible(bool(changed or error))
+        self.facies_version_note.setStyleSheet(label.styleSheet())
+        table = self.facies_table
+        blocked = table.blockSignals(True)
+        try:
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                name = "" if item is None else str(item.data(Qt.ItemDataRole.UserRole) or "")
+                fields = changed.get(name, [])
+                note = (f"changed since {reference['name']} (approved)" if fields else
+                        "Comparison unavailable" if error else "")
+                state = QTableWidgetItem(note)
+                state.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                state.setToolTip(text if fields or error else "Role, porosity, permeability and unit match the selected approved session" if reference else text)
+                if fields or error:
+                    state.setForeground(_state_color(self, "warn"))
+                table.setItem(row, 5, state)
+        finally:
+            table.blockSignals(blocked)
+        self.undo_facies_button.setEnabled(bool(self.session and self.run_preview.is_reference()
+            and not self.busy() and self._undo_stack and len(self._undo_stack[-1]) > 4
+            and self._undo_stack[-1][4] != self._facies_state()))
 
     def _facies_changed(self) -> None:
         self._mark_dirty()
@@ -9023,7 +9146,9 @@ class LayerPainterView(QWidget):
             return
         if self.session.facies[facies].role == role:
             return
+        before = self._facies_snapshot()
         self.session.set_facies(facies, role=role)
+        self._remember_facies_change(before)
         self._facies_changed()
 
     def set_facies_properties(
@@ -9035,7 +9160,9 @@ class LayerPainterView(QWidget):
     ) -> None:
         if self.session is None:
             return
+        before = self._facies_snapshot()
         self.session.set_facies(facies, porosity=porosity, permeability=permeability)
+        self._remember_facies_change(before)
         self._mark_dirty()
         self._refresh_facies_table()
 
@@ -9054,10 +9181,12 @@ class LayerPainterView(QWidget):
         if item.column() not in (3, 4):
             return
         value = _parse_number(item.text())
+        before = self._facies_snapshot()
         if item.column() == 3:
             self.session.set_facies(facies, porosity=value)
         else:
             self.session.set_facies(facies, permeability=value)
+        self._remember_facies_change(before)
         self._mark_dirty()
         QTimer.singleShot(0, self._refresh_facies_table)
 
@@ -9071,7 +9200,12 @@ class LayerPainterView(QWidget):
     def _unit_changed(self, _index: int) -> None:
         if self.session is None or self._loading:
             return
-        self.session.permeability_unit = str(self.unit.currentData() or "darcy")
+        unit = str(self.unit.currentData() or "darcy")
+        if self.session.permeability_unit == unit:
+            return
+        before = self._facies_snapshot()
+        self.session.permeability_unit = unit
+        self._remember_facies_change(before)
         self._mark_dirty()
         self._refresh_facies_table()
 
