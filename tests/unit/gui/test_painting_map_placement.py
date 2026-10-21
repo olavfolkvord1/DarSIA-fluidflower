@@ -1,6 +1,6 @@
 """Layer painting tab: placing the approved map in all runs, for review.
 
-"Place in all runs…" in the Versions box takes the selected approved version,
+"Transfer map to all runs…" below Versions takes the selected approved version,
 places it in every run through each run's measured geometry and opens the
 review window: the runs in review order with their offsets and checks, and
 each run's overlay. It writes a new review folder only. A synthetic 80 x 60
@@ -81,7 +81,7 @@ def _files(folder):
 
 
 def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_path, monkeypatch):
-    assert view.place_version_button.text() == "Place in all runs…"
+    assert view.place_version_button.text() == "Transfer map to all runs…"
     _show(view, _proposal())
     record = view.save_version("Map A")
     view.versions_table.selectRow(0)
@@ -120,6 +120,11 @@ def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_p
     assert reference[30, 10] == 2 and reference[30, 60] == 3
     assert np.array_equal(shifted[:, 3:], reference[:, :-3])
     assert "Placed in 2 of 3 runs" in view.versions_note.text()
+    assert record["sha256"] in view.versions_note.text()
+    assert view._approval_for_version(record) == result["map_version"]["approval"]
+    view._refresh_versions()
+    assert "Placed in 2 of 3 runs" in view.versions_note.text()
+    assert record["sha256"] in view.versions_note.text()
     # The review window lists the runs with their offsets and shows the overlays.
     dialog = view._placement_dialog
     assert isinstance(dialog, MapPlacementDialog) and dialog.isVisible()
@@ -145,12 +150,16 @@ def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_p
     # Nothing in the painting folder changed: no map, session, version or approval.
     assert _files(lp.painting_folder(view.project)) == painting_before
     dialog.close()
-    # The review opens again from its folder, without placing anew.
-    monkeypatch.setattr(
-        QFileDialog, "getOpenFileName",
-        lambda *args, **kwargs: (str(Path(result["folder"]) / "index.json"), ""),
-    )
+    # The saved-transfer chooser reopens the exact completed folder, without a picker or placement.
+    def no_picker(*args, **kwargs):
+        raise AssertionError("Saved transfer review must not use a path picker")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", no_picker)
     view.open_placement_button.click()
+    chooser = view._saved_transfers_dialog
+    qtbot.waitUntil(lambda: not chooser.busy(), timeout=5000)
+    assert len(chooser.rows) == 1
+    assert chooser.rows[chooser.list.currentRow()]["folder"] == result["folder"]
+    chooser.open_button.click()
     again = view._placement_dialog
     assert again is not dialog and again.isVisible() and again.table.rowCount() == 3
     again.close()
@@ -194,7 +203,7 @@ def test_the_button_reuses_shared_geometry_and_asks_for_runs_to_review_first(
     monkeypatch.setattr(view, "place_version", lambda *args, **kwargs: started.append(kwargs))
     view.place_version_button.click()
     title, label, text = asked[0]
-    assert title == "Place in all runs" and "in all 2 runs" in label and record["sha256"][:12] in label
+    assert title == "Transfer map to all runs" and "in all 2 runs" in label and record["sha256"][:12] in label
     assert "changes no map, geometry revision or run configuration" in label
     assert started == [] and text == ""
     # The shared geometry is unchanged; review order is saved only after acceptance.
@@ -206,7 +215,7 @@ def test_the_button_reuses_shared_geometry_and_asks_for_runs_to_review_first(
 
 
 def test_prepare_adoption_writes_each_runs_label_grid_map_and_adopts_nothing(view, qtbot, tmp_path):
-    assert view.prepare_adoption_button.text() == "Prepare adoption…"
+    assert view.prepare_adoption_button.text() == "Check the series revision…"
     _show(view, _proposal())
     record = view.save_version("Map A")
     view.versions_table.selectRow(0)

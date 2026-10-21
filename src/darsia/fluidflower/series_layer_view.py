@@ -3026,8 +3026,9 @@ class StepSection(QFrame):
     """A numbered step with a header that folds its content."""
 
     def __init__(
-        self, number: int, title: str, content: QWidget, *, expanded: bool = True
+        self, number: int | None, title: str, content: QWidget, *, expanded: bool = True
     ) -> None:
+        """Build one foldable step and its status header."""
         super().__init__()
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(self)
@@ -3038,7 +3039,7 @@ class StepSection(QFrame):
         self.toggle.setCheckable(True)
         self.toggle.setAutoRaise(True)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.toggle.setText(f"{number}   {title}")
+        self.toggle.setText(f"{number}   {title}" if number is not None else title)
         font = self.toggle.font()
         font.setBold(True)
         self.toggle.setFont(font)
@@ -3382,6 +3383,7 @@ class LayerPainterView(QWidget):
         run_inputs: Callable[[], Sequence[SeriesRunInputs]] | None = None,
         set_reference: Callable[[str], Any] | None = None,
     ) -> None:
+        """Build the painting editor and its explicit saved-version workflow."""
         super().__init__(parent)
         self.setObjectName("seriesLayerView")
         self.project = project
@@ -3493,6 +3495,7 @@ class LayerPainterView(QWidget):
         self.last_adoption: dict[str, Any] | None = None
         self._adoption_message: QMessageBox | None = None
         self._adoption_dialog: QDialog | None = None
+        self._saved_transfers_dialog: QDialog | None = None
         # The manual map (the polygons as drawn, at full resolution) and the
         # proposal's full-resolution map it is compared with, each with the
         # key of what it was drawn from; display data, saved only as a version.
@@ -3635,17 +3638,15 @@ class LayerPainterView(QWidget):
             1, "Rig frame and injection points", frame_step, expanded=False
         )
         self.step_paint = StepSection(2, "Mark layers", self._build_paint_step())
-        self.step_propose = StepSection(
-            3, "Propose boundaries", self._build_propose_step()
-        )
-        self.step_export = StepSection(
-            4, "Facies and export", self._build_export_step()
-        )
+        self.step_facies = StepSection(3, "Facies", self._build_export_step())
+        self.step_propose = StepSection(4, "Versions", self._build_propose_step())
+        self.step_use_map = StepSection(5, "Use the map in the series", self._build_use_map_step(), expanded=False)
         for section in (
             self.step_frame,
             self.step_paint,
+            self.step_facies,
             self.step_propose,
-            self.step_export,
+            self.step_use_map,
         ):
             layout.addWidget(section)
         layout.addStretch(1)
@@ -3660,7 +3661,7 @@ class LayerPainterView(QWidget):
                 "Choose a layer and draw it with Draw (L): left click adds a "
                 "point, right click or Enter closes the polygon. Rough outlines "
                 "are enough; the boundaries are placed within the snap distance "
-                "(step 3). Draw only adds new polygons and never moves a point "
+                "(step 4). Draw only adds new polygons and never moves a point "
                 "that is already there. With Follow edges, a click near a point "
                 "or edge of a shown polygon snaps onto it, and between two such "
                 "clicks the new polygon follows that polygon's outline (Tab: the "
@@ -3884,53 +3885,21 @@ class LayerPainterView(QWidget):
         )
         self.save_version_button.clicked.connect(self._save_version_clicked)
         buttons.addWidget(self.save_version_button)
-        self.restore_version_button = QPushButton("Restore…")
+        self.restore_version_button = QPushButton("Restore version…")
         self.restore_version_button.setToolTip(
             "Make the selected version the current map (double-click works too)"
         )
         self.restore_version_button.clicked.connect(self._restore_version_clicked)
         buttons.addWidget(self.restore_version_button)
-        self.approve_version_button = QPushButton("Approve…")
+        self.approve_version_button = QPushButton("Approve version…")
         self.approve_version_button.setToolTip(
             "Approve the selected version as this run's map: records its SHA-256, "
             "the reviewer and the time; changes no map, proposal or geometry"
         )
         self.approve_version_button.clicked.connect(self._approve_version_clicked)
         buttons.addWidget(self.approve_version_button)
-        self.place_version_button = QPushButton("Place in all runs…")
-        self.place_version_button.setToolTip(
-            "Place the selected approved version in every run through each run's "
-            "measured geometry and show the overlays; writes a review folder only"
-        )
-        self.place_version_button.clicked.connect(self._place_version_clicked)
         buttons.addStretch(1)
         layout.addLayout(buttons)
-        # Placement in all runs: its own row, so the box does not get wider.
-        placement = QHBoxLayout()
-        placement.addWidget(self.place_version_button)
-        self.open_placement_button = QPushButton("Open placement review…")
-        self.open_placement_button.setToolTip(
-            "Open an earlier placement of a map in all runs: its runs, checks and "
-            "overlays; read only"
-        )
-        self.open_placement_button.clicked.connect(self._open_placement_clicked)
-        placement.addWidget(self.open_placement_button)
-        self.prepare_adoption_button = QPushButton("Prepare adoption…")
-        self.prepare_adoption_button.setToolTip(
-            "Carry the selected approved version to every run's rig-corrected label "
-            "grid and write a preparation folder; nothing is adopted"
-        )
-        self.prepare_adoption_button.clicked.connect(self._prepare_adoption_clicked)
-        placement.addWidget(self.prepare_adoption_button)
-        self.adopt_button = QPushButton("Adopt…")
-        self.adopt_button.setToolTip(
-            "Give a prepared map its facies table and save it as a new geometry revision; "
-            "the current revision stays"
-        )
-        self.adopt_button.clicked.connect(self._adopt_clicked)
-        placement.addWidget(self.adopt_button)
-        placement.addStretch(1)
-        layout.addLayout(placement)
         self.versions_table = QTableWidget(0, 6)
         self.versions_table.setHorizontalHeaderLabels(
             ["Name", "Kind", "Settings", "Saved UTC", "SHA-256", "State"]
@@ -3966,6 +3935,49 @@ class LayerPainterView(QWidget):
         layout.addWidget(self.facies_version_note)
         from .painting_versions_ui import PaintingVersionsActions
         self.version_actions = PaintingVersionsActions(self, layout)
+        return widget
+
+    def _build_use_map_step(self) -> QWidget:
+        """Build the ordered actions for the selected saved series map."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.map_status = QLabel("Select an approved saved version in step 4.")
+        self.map_status.setWordWrap(True)
+        self.map_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.map_status)
+        self.use_map_reasons = {}
+        choices = (
+            ("place_version_button", "Transfer map to all runs…", self._place_version_clicked,
+             "Transfers the approved map from the reference run to each run's own photo through its measured frame model, "
+             "and logs the fit per run. About 4 minutes."),
+            ("open_placement_button", "Review the transfer…", self._open_placement_clicked,
+             "Open a saved transfer summary and compare the map with each run's photograph. Read only."),
+            ("prepare_adoption_button", "Check the series revision…", self._prepare_adoption_clicked,
+             "A dry run: prepares and checks the new geometry for every run. It records a preparation; the series' geometry stays unchanged."),
+            ("adopt_button", "Adopt as the series' sand map…", self._adopt_clicked,
+             "Review the prepared checks, then explicitly record the approved version as a new series geometry revision. The adoption is logged."),
+        )
+        for number, (name, text, callback, explanation) in enumerate(choices, 1):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{number}."))
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            button.setToolTip(explanation)
+            setattr(self, name, button)
+            row.addWidget(button)
+            row.addStretch(1)
+            layout.addLayout(row)
+            label = _note(explanation)
+            layout.addWidget(label)
+            reason = QLabel()
+            reason.setWordWrap(True)
+            layout.addWidget(reason)
+            self.use_map_reasons[button] = reason
+        self.setup_pointer = _note("5. In Setup: Apply to all runs, then Build run model. These remain separate, explicit steps after adoption.")
+        layout.addWidget(self.setup_pointer)
+        self.step_export = StepSection(None, "Advanced: older native Setup export", self._build_legacy_export_step(), expanded=False)
+        layout.addWidget(self.step_export)
         return widget
 
     def _build_export_step(self) -> QWidget:
@@ -4038,13 +4050,14 @@ class LayerPainterView(QWidget):
         self.facies_approval_note = QLabel()
         self.facies_approval_note.setWordWrap(True)
         layout.addWidget(self.facies_approval_note)
-        # Whether the map to be saved is the approved version (step 3).
-        self.map_status = QLabel()
-        self.map_status.setWordWrap(True)
-        self.map_status.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        layout.addWidget(self.map_status)
+        return widget
+
+    def _build_legacy_export_step(self) -> QWidget:
+        """Build the optional older Setup export controls below the series route."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(_note("Older native Setup export route. The numbered series-map route above uses the selected saved version."))
         self.export_problems = QLabel()
         self.export_problems.setWordWrap(True)
         self.export_problems.linkActivated.connect(self._open_round5_step)
@@ -4072,7 +4085,7 @@ class LayerPainterView(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(self.export_status)
-        self.open_export_button = QPushButton("Open export folder")
+        self.open_export_button = QPushButton("Open older native Setup export")
         self.open_export_button.clicked.connect(self._open_export_folder)
         open_row = QHBoxLayout()
         open_row.addWidget(self.open_export_button)
@@ -4482,6 +4495,9 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
+        chooser = getattr(self, "_saved_transfers_dialog", None)
+        if chooser is not None and chooser.busy():
+            return True
         other = getattr(self, "other_frames", None)
         if other is not None and other.busy():
             return True
@@ -4517,6 +4533,9 @@ class LayerPainterView(QWidget):
                 if controller is not None:
                     while controller.busy():
                         controller.wait_for_workers()
+            chooser = getattr(self, "_saved_transfers_dialog", None)
+            if chooser is not None:
+                chooser.wait_for_workers()
             self.run_preview.wait()
             self._native_async.wait()
             dialog_thread = getattr(self._adoption_dialog, "_thread", None)
@@ -6748,7 +6767,7 @@ class LayerPainterView(QWidget):
             self.image.image_size
         ):
             return (
-                "Propose the boundaries first (step 3); corrections are drawn on "
+                "Propose the boundaries first (step 4); corrections are drawn on "
                 "the proposal."
             )
         if lpp.is_polygons_only(self.proposal) and not self.proposal_current():
@@ -7111,13 +7130,14 @@ class LayerPainterView(QWidget):
         self.prepare_adoption_button.setEnabled(self._placeable(self._selected_version()))
         self.adopt_button.setEnabled(not self.busy() and not self._map_approvals_error and native_ready)
         self._version_selected()
+        self._refresh_use_map()
         if hasattr(self, "version_actions"):
             self.version_actions.refresh()
         if hasattr(self, "run_preview"):
             self.run_preview._refresh_sources()
 
     def _refresh_map_status(self) -> None:
-        """Say in step 4 whether the map to be saved is the approved version."""
+        """Name the selected saved identity used by the series-map route."""
 
         label = getattr(self, "map_status", None)
         if label is None:
@@ -7132,12 +7152,12 @@ class LayerPainterView(QWidget):
             version, approval = manual
             name = version.get("display_name") or version.get("name")
             if approval is not None:
-                label.setText(f"Map to save: {name}, {self._approval_text(approval)} "
+                label.setText(f"Using {name} ({self._approval_text(approval)}) "
                               f"(SHA-256 {str(version['sha256'])[:12]}…). "
-                              "This selected approval counts for the round-5 route in step 3.")
+                              "This selected approval counts for the series-map route in step 5.")
             else:
                 label.setText(f"Map selected: {name}, not approved. Approve this saved manual-map "
-                              "version in step 3 before transferring it or preparing adoption.")
+                              "version in step 4 before transferring it or checking the series revision.")
             return
         if self.session is None or self.proposal is None:
             label.setText("")
@@ -7168,12 +7188,12 @@ class LayerPainterView(QWidget):
         elif version is not None:
             label.setText(
                 f"Map to save: the saved version {version.get('name')} (SHA-256 "
-                f"{digest[:12]}…), not approved. Approve it in step 3, Versions."
+                f"{digest[:12]}…), not approved. Approve it in step 4, Versions."
             )
         else:
             label.setText(
                 "Map to save: not saved as a version. Save it as a version in "
-                "step 3 and approve it there before saving the revision."
+                "step 4 and approve it there before using it in the series."
             )
 
     def _approval_for_version(self, record):
@@ -7215,26 +7235,26 @@ class LayerPainterView(QWidget):
             self.step_export.set_status("Approval history cannot be read", "warn")
             detail = "The approval history cannot be read; refresh it before continuing."
         elif approval is None:
-            self.step_export.set_status("Approve the selected manual map in step 3", "warn")
-            detail = "Approve the selected saved manual-map version in step 3."
+            self.step_export.set_status("Approve the selected manual map in step 4", "warn")
+            detail = "Approve the selected saved manual-map version in step 4."
         else:
-            self.step_export.set_status("Approved manual map: continue in step 3", "done")
-            detail = "The selected approved manual map uses the round-5 route in step 3."
+            self.step_export.set_status("Approved manual map: use step 5", "done")
+            detail = "The selected approved manual map uses the numbered route in step 5."
         self.export_problems.setText(detail + " Transfer map to all runs → Review placement → "
-            "Prepare adoption → Adopt. <a href='round5'>Open step 3</a>. "
+            "Check the series revision → Adopt as the series' sand map. <a href='round5'>Open step 5</a>. "
             "The older native Setup export is hidden for this route.")
         self.export_problems.setStyleSheet("")
         self.export_button.setEnabled(False)
         return True
 
     def _open_round5_step(self, _link=None) -> None:
-        """Open the saved-version step for the selected manual-map route."""
-        self.step_propose.set_expanded(True)
-        self.versions_table.setFocus()
-        parent = self.versions_table.parentWidget()
+        """Open the series-map actions for the selected saved manual map."""
+        self.step_use_map.set_expanded(True)
+        self.place_version_button.setFocus()
+        parent = self.place_version_button.parentWidget()
         while parent is not None:
             if isinstance(parent, QScrollArea):
-                parent.ensureWidgetVisible(self.versions_table)
+                parent.ensureWidgetVisible(self.place_version_button)
                 break
             parent = parent.parentWidget()
 
@@ -7261,6 +7281,17 @@ class LayerPainterView(QWidget):
             gaps = self._version_gaps(record)
             if gaps:
                 text += f" · {gaps}"
+            placement = self.last_placement or {}
+            version = placement.get("map_version") if isinstance(placement, Mapping) else None
+            rows = placement.get("runs") if isinstance(placement, Mapping) else None
+            if (not self.busy() and approval is not None and isinstance(version, Mapping)
+                    and version.get("folder") == record.get("folder")
+                    and all(version.get(key) == record.get(key) for key in ("name", "kind", "sha256"))
+                    and version.get("approval") == approval and isinstance(rows, list)
+                    and all(isinstance(row, Mapping) for row in rows)
+                    and isinstance(placement.get("folder"), str)):
+                placed = sum(row.get("status") == "placed" for row in rows)
+                text += f" · Placed in {placed} of {len(rows)} runs: {placement['folder']}"
             self.versions_note.setText(text)
         self.restore_version_button.setEnabled(record is not None and not self.busy())
         native_ready = True
@@ -7275,11 +7306,66 @@ class LayerPainterView(QWidget):
         self.place_version_button.setEnabled(self._placeable(record))
         self.prepare_adoption_button.setEnabled(self._placeable(record))
         self._refresh_map_status()
+        self._refresh_use_map()
         if not self._refresh_manual_export_route() and self.session is not None:
             self._refresh_legacy_export_status()
         if hasattr(self, "version_actions"):
             self.version_actions.refresh()
         self._refresh_facies_approval()
+
+    def _refresh_use_map(self) -> None:
+        """Refresh action readiness from the literal selected version approval."""
+        if not hasattr(self, "use_map_reasons"):
+            return
+        record = self._selected_version()
+        approval = self._approval_for_version(record)
+        if self._map_approvals_error or (record is not None and record.get("history_error")):
+            problem = "The approval history could not be read; refresh it before continuing."
+        elif record is None:
+            problem = "Choose a saved map version in step 4."
+        elif record.get("kind") == lpv.DRAWING_KIND:
+            problem = "This is a drawing. Save a manual map or a proposal version in step 4."
+        elif self._version_gaps(record):
+            problem = self._version_gaps(record)
+        elif approval is None:
+            problem = "Approve this saved version in step 4."
+        elif self.busy():
+            problem = "Wait for the current operation to finish."
+        elif not self._placeable(record):
+            problem = "Wait for the checked native map before continuing."
+        else:
+            problem = ""
+        for button in (self.place_version_button, self.prepare_adoption_button, self.adopt_button):
+            button.setEnabled(not problem)
+            self.use_map_reasons[button].setText(problem)
+        self.open_placement_button.setEnabled(not self.busy())
+        self.use_map_reasons[self.open_placement_button].setText(
+            "Wait for the current operation to finish." if self.busy() else "")
+        if record is not None and approval is not None:
+            name = record.get("display_name") or record.get("name")
+            self.map_status.setText(f"Using {name} ({self._approval_text(approval)}), "
+                                    f"SHA-256 {record['sha256'][:12]}…. This selected version counts.")
+        elif not lpm.is_manual_version(record or {}):
+            self.map_status.setText(problem)
+        def matches(value):
+            version = (value or {}).get("map_version") or {}
+            return bool(record and version.get("sha256") == record.get("sha256")
+                        and (version.get("folder") == record.get("folder") or
+                             (version.get("approval") or {}).get("version") == Path(record["folder"]).name))
+        transferred = matches(self.last_placement)
+        reviewed = transferred and getattr(self, "_reviewed_transfer", None) == self.last_placement.get("folder")
+        prepared = matches(self.last_adoption)
+        next_action = (self.place_version_button if not transferred else self.open_placement_button if not reviewed
+                       else self.prepare_adoption_button if not prepared else self.adopt_button)
+        for button in self.use_map_reasons:
+            primary = button is next_action and button.isEnabled() and not problem
+            button.setDefault(primary)
+            button.setProperty("seriesMapNext", primary)
+            button.setStyleSheet("font-weight: bold; border: 2px solid palette(highlight);" if primary else "")
+        if hasattr(self, "step_use_map"):
+            self.step_use_map.set_status(problem or ("Ready to use the selected version" if not prepared
+                                                    else "Revision check prepared; review before adoption"),
+                                         "warn" if problem else "done")
 
     @staticmethod
     def _version_gaps(record: Mapping[str, Any]) -> str:
@@ -7414,8 +7500,8 @@ class LayerPainterView(QWidget):
             return
         first, accepted = QInputDialog.getText(
             self,
-            "Place in all runs",
-            f"Place {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) in all "
+            "Transfer map to all runs",
+            f"Transfer {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) in all "
             f"{len(runs)} runs through each run's measured geometry?\n\nThis writes a new "
             "review folder with each run's placed map and an overlay on its reference "
             "photograph. It changes no map, geometry revision or run configuration. It "
@@ -7515,19 +7601,41 @@ class LayerPainterView(QWidget):
         dialog = MapPlacementDialog(self.last_placement, self)
         self._placement_dialog = dialog
         dialog.show()
+        self._reviewed_transfer = self.last_placement["folder"]
+        self._refresh_use_map()
 
     def _open_placement_clicked(self) -> None:
-        """Choose an earlier placement's index.json and open its review window."""
-
-        start = lp.painting_folder(self.project).parent / "map_placement" if self.project else Path()
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Placement review (index.json)",
-            str(start),
-            "Placement review (index.json);;JSON (*.json)",
-        )
-        if path:
-            self.open_placement(Path(path).parent)
+        """List the project's saved transfers; no path picker is involved."""
+        existing = self._saved_transfers_dialog
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        if self.busy() or self.project is None:
+            self.versions_note.setText("Wait for the current operation before opening the transfer list.")
+            return
+        from .painting_saved_transfers_ui import SavedTransferChooser
+        preferred = self._selected_version()
+        if self._approval_for_version(preferred) is None:
+            preferred = next((version for row in reversed(self.map_approvals) for version in self.versions
+                if self._approval_for_version(version) == row), None)
+        project_root = Path(self.project.root)
+        root = lp.painting_folder(self.project).parent / "map_placement"
+        dialog = SavedTransferChooser(root, preferred, self)
+        def chosen(folder):
+            if self.project is None or Path(self.project.root) != project_root:
+                self.versions_note.setText("The project changed; open its current transfer list again.")
+                return
+            self.open_placement(folder)
+        dialog.transfer_selected.connect(chosen)
+        def loading_changed(_loading):
+            self._refresh_versions()
+            self.busy_changed.emit(self.busy())
+        dialog.loading_changed.connect(loading_changed)
+        self._saved_transfers_dialog = dialog
+        dialog.show()
+        self._refresh_versions()
+        self.busy_changed.emit(self.busy())
 
     def open_placement(self, folder: Path | str) -> QDialog | None:
         """Open the review window of a placement folder; None when it cannot be
@@ -7541,9 +7649,12 @@ class LayerPainterView(QWidget):
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Could not open the placement review", str(error))
             return None
+        self.last_placement = dict(placement)
         dialog = MapPlacementDialog(placement, self)
         self._placement_dialog = dialog
         dialog.show()
+        self._reviewed_transfer = placement["folder"]
+        self._refresh_use_map()
         return dialog
 
     def _current_label_fields(self):
@@ -7589,11 +7700,18 @@ class LayerPainterView(QWidget):
     def _adopt_clicked(self) -> None:
         """Choose a preparation's index.json and open its adoption window."""
 
+        selected = self._selected_version()
+        version = (self.last_adoption or {}).get("map_version") or {}
+        if (selected is not None and version.get("sha256") == selected.get("sha256")
+                and (version.get("folder") == selected.get("folder") or
+                     (version.get("approval") or {}).get("version") == Path(selected["folder"]).name)):
+            self.open_adoption(self.last_adoption["folder"])
+            return
         root = lp.painting_folder(self.project).parent / "map_adoption" if self.project else Path()
         start = Path(self.last_adoption["folder"]) if self.last_adoption else root
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Adoption preparation (index.json)",
+            "Saved series revision check (index.json)",
             str(start),
             "Adoption preparation (index.json);;JSON (*.json)",
         )
@@ -7653,7 +7771,7 @@ class LayerPainterView(QWidget):
             return
         answer = QMessageBox.question(
             self,
-            "Prepare adoption",
+            "Check the series revision",
             f"Carry {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) to the "
             f"rig-corrected label grid of all {len(runs)} runs, through each run's measured "
             "geometry and baseline native grid? This writes a new preparation folder with "
@@ -7900,6 +8018,13 @@ class LayerPainterView(QWidget):
             return None
         self._read_approvals(str(record.get("run_id") or ""))
         self._refresh_versions()
+        for row in range(self.versions_table.rowCount()):
+            if self.versions_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == record.get("folder"):
+                self.versions_table.selectRow(row)
+                break
+        self.step_propose.set_expanded(False)
+        self.step_use_map.set_expanded(True)
+        self._refresh_use_map()
         self.versions_note.setText(
             f"{approval['name']}: SHA-256 {approval['sha256']} · "
             f"{self._approval_text(approval)}"
@@ -8173,7 +8298,7 @@ class LayerPainterView(QWidget):
             self.show_proposal.setChecked(True)
         self._render_proposal()
         self._refresh_facies_table()
-        self.step_export.set_expanded(True)
+        self.step_propose.set_expanded(True)
         self._schedule_manual_map()
 
     @Slot(str)

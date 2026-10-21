@@ -1,8 +1,8 @@
 """Layer painting tab: approving a saved version as the run's map.
 
 The Versions box approves the selected version: the record names its SHA-256,
-the series' reviewer setting and the time, and nothing else changes. Step 4
-says whether the map to be saved is the approved version. A synthetic 80 x 60
+the series' reviewer setting and the time, and nothing else changes. Step 5
+names the selected saved version and its literal approval. A synthetic 80 x 60
 photograph and a project in a temporary folder; no real series is used.
 """
 
@@ -25,14 +25,14 @@ def _brush(view):
 
 
 def test_approve_records_the_version_and_step_4_names_the_approved_map(view):
-    assert view.approve_version_button.text() == "Approve…"
+    assert view.approve_version_button.text() == "Approve version…"
     assert view.versions_table.horizontalHeaderItem(5).text() == "State"
     _show(view, _proposal())
     assert not view.approve_version_button.isEnabled()
-    assert "not saved as a version" in view.map_status.text()
+    assert "Choose a saved map version in step 4" in view.map_status.text()
     record = view.save_version("Map A")
-    assert "the saved version Map A" in view.map_status.text()
-    assert "not approved" in view.map_status.text()
+    view.versions_table.selectRow(0)
+    assert "Approve this saved version in step 4" in view.map_status.text()
     save_reviewer_name(view.project.root, "Test reviewer")
     approval = view.approve_version(record)
     assert approval["sha256"] == record["sha256"] and approval["reviewer"] == "Test reviewer"
@@ -41,14 +41,14 @@ def test_approve_records_the_version_and_step_4_names_the_approved_map(view):
     assert state.text() == "Approved " + approval["approved_utc"][:16].replace("T", " ") + " UTC"
     assert approval["approved_utc"] in state.toolTip()
     assert approval["reviewer"] in state.toolTip()
-    assert "the approved version Map A" in view.map_status.text()
+    assert "Using Map A (approved" in view.map_status.text()
     assert "by Test reviewer" in view.map_status.text()
     assert "by Test reviewer" in view.versions_note.text()
-    # Another map is not the approved one, until it is that version again.
+    # Draft edits do not replace the explicitly selected immutable version.
     _brush(view)
-    assert "not saved as a version" in view.map_status.text()
+    assert "Using Map A (approved" in view.map_status.text()
     view.restore_version(record)
-    assert "the approved version Map A" in view.map_status.text()
+    assert "Using Map A (approved" in view.map_status.text()
     # Approving changed nothing of the map.
     assert view.corrections == [] and view.proposal is not None
 

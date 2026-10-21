@@ -60,6 +60,11 @@ def test_actual_role_control_marks_changed_row_and_step4_and_undo_keeps_saved_ap
     name, record, approval, immutable = approved
     assert "match V7 (approved)" in view.facies_approval_note.text()
     assert view.facies_version_note.isHidden()
+    # The re-ordered page retains both facies editing and selected-version notices.
+    assert view.step_facies.content.isAncestorOf(view.facies_table)
+    assert view.step_facies.content.isAncestorOf(view.unit)
+    assert view.step_facies.content.isAncestorOf(view.undo_facies_button)
+    assert view.step_propose.content.isAncestorOf(view.facies_version_note)
     before_marks = view._snapshot()
     role = view.facies_table.cellWidget(_row(view, name), 2)
     role.setCurrentIndex(role.findData("excluded"))

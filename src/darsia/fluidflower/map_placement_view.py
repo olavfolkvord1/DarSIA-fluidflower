@@ -14,8 +14,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QDesktopServices, QImage, QPainter, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -126,6 +126,7 @@ class OverlayView(QGraphicsView):
     """A photograph at full resolution: wheel to zoom, drag to move."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        """Build the OverlayView display and controls."""
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
         self.item = QGraphicsPixmapItem()
@@ -179,14 +180,21 @@ class MapPlacementDialog(QDialog):
     """Review a map placed in all runs: the runs, their checks, their overlays."""
 
     def __init__(self, placement: Mapping[str, Any], parent: QWidget | None = None) -> None:
+        """Build a read-only placement summary for the saved map version."""
         super().__init__(parent)
         self.placement = dict(placement)
         self.folder = Path(str(self.placement["folder"]))
         self.layers = dict(self.placement.get("layers") or {})
-        self.setWindowTitle("Map placed in all runs")
         self.resize(1500, 900)
         layout = QVBoxLayout(self)
         version = dict(self.placement.get("map_version") or {})
+        name = str(version.get("name") or "saved map")
+        reference = str(self.placement.get("reference_run") or "reference run").upper()
+        self.setWindowTitle(f"Sand map placement summary – {name} in all runs")
+        self.lead = QLabel(f"Summary of how the approved sand map ({name} from {reference}) fits each run's "
+                           "photograph. Read only: nothing is adopted or changed.")
+        self.lead.setWordWrap(True)
+        layout.addWidget(self.lead)
         note = QLabel(
             f"Map {version.get('name') or ''} (SHA-256 {str(version.get('sha256') or '')[:12]}…) "
             f"from {str(self.placement.get('reference_run') or '').upper()}, placed in each run "
@@ -196,15 +204,36 @@ class MapPlacementDialog(QDialog):
             "from the lower towards the higher layer id; the change is the difference from the "
             "reference run's own offset for the same pair. Gaps: pixels inside the map that it "
             "does not cover. Water pockets: free water apart from the main free water. "
-            f"Folder: {self.folder}"
         )
         note.setWordWrap(True)
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(note)
+        column_notes = {
+            1: "No geometry means this run is not among the analysed runs.",
+            2: "Shift is camera displacement, compensated by the measured frame model.",
+            3: f"Typical offset change is the boundary fit compared with {reference}; near 0 is good.",
+            4: f"Pairs changed counts boundaries that moved more than {LARGE_CHANGE_MM:g} mm, "
+               f"with at least {MIN_SAMPLES} measured samples.",
+        }
+        self.column_legend = QLabel(" ".join(column_notes.values()))
+        self.column_legend.setWordWrap(True)
+        layout.addWidget(self.column_legend)
+        project = getattr(parent, "project", None)
+        if project is not None:
+            try:
+                location = self.folder.relative_to(Path(project.root))
+            except ValueError:
+                location = None
+            if location is not None:
+                label = QLabel(f"Saved placement: {location.as_posix()}")
+                label.setWordWrap(True)
+                layout.addWidget(label)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         side = QSplitter(Qt.Orientation.Vertical)
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(list(_COLUMNS))
+        for column, tooltip in column_notes.items():
+            self.table.horizontalHeaderItem(column).setToolTip(tooltip)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -216,7 +245,10 @@ class MapPlacementDialog(QDialog):
         self.table.setRowCount(len(self.rows))
         for number, row in enumerate(self.rows):
             for column, value in enumerate(_cells(row)):
-                self.table.setItem(number, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column in column_notes:
+                    item.setToolTip(column_notes[column])
+                self.table.setItem(number, column, item)
         self.table.itemSelectionChanged.connect(self._selected)
         side.addWidget(self.table)
         self.details = QPlainTextEdit()
@@ -244,11 +276,8 @@ class MapPlacementDialog(QDialog):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        self.open_button = buttons.addButton("Open folder", QDialogButtonBox.ButtonRole.ActionRole)
-        self.open_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder)))
-        )
-        self.fit_button = buttons.addButton("Fit", QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("Close summary")
+        self.fit_button = buttons.addButton("Show whole photo", QDialogButtonBox.ButtonRole.ActionRole)
         self.fit_button.clicked.connect(self.view.fit)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

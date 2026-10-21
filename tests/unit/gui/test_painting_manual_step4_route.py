@@ -45,17 +45,17 @@ def test_approved_manual_without_proposal_uses_saved_identity_and_round5_route(v
         AssertionError("Selected manual status must not hash the proposal")))
     history_before = lp.approvals_path(view.project, view.session.run_id).read_bytes()
     view._refresh_status()
-    assert "Map to save: Selected map, approved" in view.map_status.text()
+    assert "Using Selected map (approved" in view.map_status.text()
     assert record["sha256"][:12] in view.map_status.text()
     assert "not saved as a version" not in view.map_status.text()
     assert "Missing input" not in view.step_export.status.text()
-    assert "round-5 route" in view.export_problems.text()
+    assert "numbered route" in view.export_problems.text()
     assert not view.export_button.isVisibleTo(view)
     assert not view.export_button.isEnabled()
     before = {p: p.read_bytes() for p in Path(record["folder"]).iterdir()}
-    view.step_propose.set_expanded(False)
+    view.step_use_map.set_expanded(False)
     view.export_problems.linkActivated.emit("round5")
-    assert view.step_propose.is_expanded()
+    assert view.step_use_map.is_expanded()
     assert before == {p: p.read_bytes() for p in Path(record["folder"]).iterdir()}
     assert lp.approvals_path(view.project, view.session.run_id).read_bytes() == history_before
     assert view._placement_thread is None and view._adoption_thread is None and view._save_thread is None
@@ -84,10 +84,10 @@ def test_multiple_approved_same_content_versions_show_the_selected_literal_appro
     view._read_approvals(view.session.run_id)
     view._refresh_versions()
     _select(view, first)
-    assert "Earlier approved map, approved 2026-01-01 01:00 UTC" in view.map_status.text()
+    assert "Using Earlier approved map (approved 2026-01-01 01:00 UTC" in view.map_status.text()
     assert "this selected approval counts" in view.versions_note.text()
     _select(view, second)
-    assert "Later approved map, approved 2026-01-01 02:00 UTC" in view.map_status.text()
+    assert "Using Later approved map (approved 2026-01-01 02:00 UTC" in view.map_status.text()
     assert lp.read_map_approvals(view.project, view.session.run_id) == [first_approval, second_approval]
     assert view._approval_for_version(second) == second_approval
     assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
@@ -117,7 +117,7 @@ def test_unapproved_saved_manual_names_the_exact_missing_approval_and_click(view
     view._refresh_status()
     assert "Selected map, not approved" in view.map_status.text()
     assert "Approve the selected manual map" in view.step_export.status.text()
-    assert "Open step 3" in view.export_problems.text()
+    assert "Open step 5" in view.export_problems.text()
     assert "not saved as a version" not in view.map_status.text()
     assert not view.export_button.isVisibleTo(view)
 
@@ -129,6 +129,7 @@ def test_selecting_a_proposal_after_manual_restores_the_existing_legacy_status(v
     view.map_shown.setCurrentIndex(view.map_shown.findText("Proposal"))
     proposal = view.save_version("Proposal draft")
     _select(view, proposal)
+    view.step_export.set_expanded(True)
     assert view.export_button.isVisibleTo(view)
     assert "round-5 route" not in view.export_problems.text()
     assert "Approved manual map" not in view.step_export.status.text()
@@ -137,7 +138,9 @@ def test_selecting_a_proposal_after_manual_restores_the_existing_legacy_status(v
 def test_legacy_unsaved_proposal_keeps_its_existing_status(view):
     _show(view, _proposal())
     view._refresh_status()
-    assert "not saved as a version" in view.map_status.text()
+    assert "Choose a saved map version in step 4" in view.map_status.text()
+    view.step_use_map.set_expanded(True)
+    view.step_export.set_expanded(True)
     assert view.export_button.isVisibleTo(view)
     assert view.export_problems.text() == " ".join(view.export_problems_now())
 

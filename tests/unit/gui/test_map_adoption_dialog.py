@@ -90,7 +90,7 @@ def test_a_revision_that_does_not_validate_is_said_and_not_saved(qtbot, register
 
 
 def test_the_painting_tab_opens_the_adoption_window(view, monkeypatch, tmp_path):
-    assert view.adopt_button.text() == "Adopt…"
+    assert view.adopt_button.text() == "Adopt as the series' sand map…"
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[1]))
     assert view.open_adoption(tmp_path) is None
