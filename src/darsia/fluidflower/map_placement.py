@@ -54,7 +54,8 @@ OFFSET_SPACING_MM = 0.5
 class RunGeometry:
     """One run's measured geometry: metric rig millimetres to its camera grid.
 
-    ``model`` is the whole reference model as read, for display.
+    ``model`` is the whole reference model as read and ``entry`` the run's
+    row of the index (with its optional ``frame_data`` binding), for display.
     """
 
     run_id: str
@@ -63,6 +64,7 @@ class RunGeometry:
     shape_hw: tuple[int, int] | None
     source: str
     model: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    entry: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -159,6 +161,7 @@ def read_run_geometry(index_path: Path | str) -> dict[str, RunGeometry]:
             shape_hw=(int(shape[0]), int(shape[1])) if shape else None,
             source=str(model_path),
             model=model,
+            entry=entry,
         )
     if not result:
         raise ValueError(f"{index_path} lists no runs")

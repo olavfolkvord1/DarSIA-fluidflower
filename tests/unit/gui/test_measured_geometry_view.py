@@ -71,6 +71,40 @@ def _index(folder):
     return path
 
 
+def test_frame_data_bound_by_the_index_is_found_in_its_own_folder(tmp_path):
+    index = _index(tmp_path / "geometry")
+    frames = tmp_path / "frame_data"
+    (frames / "run2" / "frames").mkdir(parents=True)
+    (frames / "run2" / "areas").mkdir()
+    (frames / "run2" / "frames" / "f1.json").write_text("{}", encoding="utf-8")
+    (frames / "run2" / "frames" / "f2.json").write_text("{}", encoding="utf-8")
+    np.save(frames / "run2" / "areas" / "f2.npy", np.ones((6, 8), dtype=np.float32))
+    frame_index = frames / "index.json"
+    frame_index.write_text(json.dumps({"format": "frame data", "run": "run2"}), encoding="utf-8")
+    data = json.loads(index.read_text(encoding="utf-8"))
+    data["runs"]["run2"]["frame_data"] = {
+        "path": str(frame_index),
+        "sha256": hashlib.sha256(frame_index.read_bytes()).hexdigest(),
+        "size_bytes": frame_index.stat().st_size,
+    }
+    index.write_text(json.dumps(data), encoding="utf-8")
+    geometry = mp.read_run_geometry(index)
+    files = mgv.model_files(geometry["run2"])
+    assert [path.name for path in files["frames"]] == ["f1.json", "f2.json"]
+    assert [path.name for path in files["areas"]] == ["f2.npy"]
+    # Without a binding, the folder beside the reference model.
+    assert [path.name for path in mgv.model_files(geometry["run1"])["frames"]] == ["case1.json"]
+    frame_index.write_text("{}", encoding="utf-8")
+    try:
+        mgv.model_files(geometry["run2"])
+    except ValueError as error:
+        assert "frame data index changed" in str(error)
+    else:
+        raise AssertionError("a changed frame data index was read")
+    # The table says so instead of failing.
+    assert mgv._cells(geometry["run2"])[-2:] == ("unreadable", "unreadable")
+
+
 def _pixel(dialog, x, y):
     color = dialog.view.item.pixmap().toImage().pixelColor(x, y)
     return color.red(), color.green(), color.blue()

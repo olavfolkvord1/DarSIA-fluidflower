@@ -60,9 +60,23 @@ _COLUMNS = (
 
 
 def model_files(geometry: RunGeometry) -> dict[str, list[Path]]:
-    """The per-frame models and the pixel-area maps beside a run's model."""
+    """A run's per-frame models and pixel-area maps: in the folder of the
+    frame data its index row binds (``frame_data``, checked by size and
+    SHA-256), or else beside its reference model."""
+
+    from darsia.fluidflower.project import sha256_file
 
     folder = Path(geometry.source).parent
+    bound = geometry.entry.get("frame_data")
+    if isinstance(bound, Mapping) and bound.get("path"):
+        index = Path(str(bound["path"]))
+        if not index.is_file():
+            raise FileNotFoundError(f"{geometry.run_id}: the frame data index is missing: {index}")
+        if "size_bytes" in bound and index.stat().st_size != int(bound["size_bytes"]):
+            raise ValueError(f"{geometry.run_id}: the frame data index changed (size)")
+        if bound.get("sha256") and sha256_file(index) != bound["sha256"]:
+            raise ValueError(f"{geometry.run_id}: the frame data index changed (SHA-256)")
+        folder = index.parent / geometry.run_id
     return {
         "frames": sorted((folder / "frames").glob("*.json")),
         "areas": sorted((folder / "areas").glob("*.npy")),
@@ -163,7 +177,11 @@ def _cells(geometry: RunGeometry) -> tuple[str, ...]:
 
     model = geometry.model
     shape = geometry.shape_hw
-    files = model_files(geometry)
+    try:
+        files = model_files(geometry)
+        frames, areas = str(len(files["frames"])), str(len(files["areas"]))
+    except (OSError, ValueError):
+        frames = areas = "unreadable"
     width = measured_width_mm(geometry)
     offset = model.get("optical_offset_mm")
     factor = model.get("area_factor")
@@ -176,8 +194,8 @@ def _cells(geometry: RunGeometry) -> tuple[str, ...]:
         f"{float(offset):g}" if offset is not None else "",
         f"{float(factor):.4f}" if factor is not None else "",
         f"{spacing[0]:.4f} / {spacing[1]:.4f}" if spacing else "",
-        str(len(files["frames"])),
-        str(len(files["areas"])),
+        frames,
+        areas,
     )
 
 
@@ -283,7 +301,12 @@ class MeasuredGeometryDialog(QDialog):
         geometry = self.geometries[run]
         self.current = run
         self.area_choice.clear()
-        for path in model_files(geometry)["areas"]:
+        try:
+            areas = model_files(geometry)["areas"]
+        except (OSError, ValueError) as error:
+            areas = []
+            self.status.setText(f"{run.upper()}: the frame data cannot be read: {error}")
+        for path in areas:
             self.area_choice.addItem(path.stem, str(path))
         self.area_button.setEnabled(self.area_choice.count() > 0)
         shape = geometry.shape_hw or (background.shape[:2] if background is not None else None)
