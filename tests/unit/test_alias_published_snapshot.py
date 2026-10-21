@@ -149,7 +149,8 @@ def test_forged_original_producer_field_is_not_accepted_by_matching_records(tmp_
     with pytest.raises(ValueError,match="original|Original|Indexed"):
         snapshots._producer_inventory(index,products,data.result["records"][0],producer,
             data.current.task,data.job,current_attempt=snapshots._pure(data.current.output),
-            current_token=data.current.token,owners={data.current.token:"Main"})
+            current_token=data.current.token,owners={data.current.token:"Main"},
+            metadata=snapshots._SnapshotMetadata(index,_root,products))
 
 
 def test_foreign_attempt_path_is_refused_before_any_foreign_local_read(tmp_path,monkeypatch):
@@ -167,7 +168,8 @@ def test_foreign_attempt_path_is_refused_before_any_foreign_local_read(tmp_path,
     with pytest.raises(ValueError,match="genuine attempt lineage"):
         snapshots._producer_inventory(index,products,data.result["records"][0],producer,
             data.current.task,data.job,current_attempt=snapshots._pure(data.current.output),
-            current_token=data.current.token,owners={data.current.token:"Main"})
+            current_token=data.current.token,owners={data.current.token:"Main"},
+            metadata=snapshots._SnapshotMetadata(index,_root,products))
 
 
 def test_moved_shared_root_and_missing_original_outputs_still_show_exact_completion(tmp_path,monkeypatch):
