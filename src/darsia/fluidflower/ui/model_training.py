@@ -534,7 +534,7 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.validation_error_output = bytearray()
         self.review_sessions: list[dict[str, object]] = []
         self.visible_review_sessions: list[dict[str, object]] = []
-        self._review_sessions_loading = True
+        self._review_sessions_loading = False
         self.model_history: list[dict[str, object]] = []
         self.visible_model_history: list[dict[str, object]] = []
         self._model_filter_settings = QSettings("DarSIA", "DarSIA Phase Model Studio")
@@ -1229,13 +1229,15 @@ class SharedPhaseModelTrainingPage(QWidget):
         recent.setFrameShape(QFrame.Shape.StyledPanel)
         recent_layout = QGridLayout(recent)
         recent_layout.addWidget(QLabel("Saved review sessions"), 0, 0, 1, 3)
+        self.saved_sessions_status = _secondary("")
+        recent_layout.addWidget(self.saved_sessions_status, 1, 0, 1, 3)
         self.saved_sessions = QComboBox()
         self.saved_sessions.setMinimumContentsLength(58)
         self.saved_sessions.currentIndexChanged.connect(self._session_changed)
         recent_layout.addWidget(self.saved_sessions, 2, 0, 1, 2)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self._refresh_review_sessions)
-        recent_layout.addWidget(refresh, 2, 2)
+        self.refresh_review_sessions_button = QPushButton("Refresh saved review sessions")
+        self.refresh_review_sessions_button.clicked.connect(self._refresh_review_sessions)
+        recent_layout.addWidget(self.refresh_review_sessions_button, 2, 2)
         self.session_summary = _secondary("No local review session found.")
         recent_layout.addWidget(self.session_summary, 3, 0, 1, 3)
         self.resume_session_button = QPushButton("Resume selected session")
@@ -3137,6 +3139,11 @@ class SharedPhaseModelTrainingPage(QWidget):
         return sessions
 
     def _start_review_session_discovery(self) -> None:
+        if self._review_sessions_loading:
+            return
+        self._review_sessions_loading = True
+        self.refresh_review_sessions_button.setEnabled(False)
+        self.saved_sessions_status.setText("Loading saved review sessions in the background…")
         extra_roots = tuple(self._transfer_review_roots)
 
         def discover() -> None:
@@ -3156,12 +3163,19 @@ class SharedPhaseModelTrainingPage(QWidget):
     def _apply_async_review_sessions(self, result: object) -> None:
         sessions, error = result
         self._review_sessions_loading = False
+        self.refresh_review_sessions_button.setEnabled(True)
         if error is None:
             self._install_review_sessions(sessions)
+            self.saved_sessions_status.setText("Saved review sessions are up to date.")
             self.catalog_loading_status.setText(
                 self._catalog_notice("Saved reviews loaded; checking model versions in the background…")
             )
         else:
+            retained = " Previously loaded sessions are still available." if self.review_sessions else ""
+            self.saved_sessions_status.setText(
+                f"Could not load saved review sessions: {error}.{retained} "
+                "Select Refresh saved review sessions to try again."
+            )
             self.catalog_loading_status.setText(
                 self._catalog_notice(f"Could not load saved reviews: {error}. Model versions are still being checked.")
             )
@@ -3172,9 +3186,7 @@ class SharedPhaseModelTrainingPage(QWidget):
             self._request_async_model_refresh(bindings_only=True)
 
     def _refresh_review_sessions(self) -> None:
-        self._install_review_sessions(
-            self._discover_review_session_entries(tuple(self._transfer_review_roots))
-        )
+        self._start_review_session_discovery()
 
     @staticmethod
     def _session_reviewer_id(session: Mapping[str, object]) -> str:
