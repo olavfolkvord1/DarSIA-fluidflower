@@ -1784,6 +1784,25 @@ class JobsPanel(QWidget):
             self.backend_combo.setCurrentIndex(
                 max(0, self.backend_combo.findData(choice["backend"]))
             )
+            feedback = (
+                f"Applied {self.workers_spin.value()} worker(s) using "
+                f"{self.backend_combo.currentText()} to the job controls. "
+                "Start selected machine starts the workers."
+            )
+        elif not matches:
+            feedback = (
+                "Worker count not applied: this machine has no registered launch target "
+                "for this job. Choose or add a machine in Jobs. No worker was started."
+            )
+        else:
+            feedback = (
+                "Worker count not applied: this machine has multiple registered launch "
+                "targets. Choose the exact target in Jobs. No worker was started."
+            )
+        self.progress_label.setText(feedback)
+        selection_label = getattr(self.resource_panel, "selection_label", None)
+        if selection_label is not None:
+            selection_label.setText(feedback)
         self.workers_selected.emit(deepcopy(choice))
 
     def attach_new_analysis(self, page):

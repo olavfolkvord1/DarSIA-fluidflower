@@ -622,8 +622,8 @@ class ResourceAdvisorPanel(QWidget):
             return
         count = self.workers_spin.value()
         self.selection_label.setText(
-            f"Applied {count} worker(s) to the job controls. "
-            "Start selected machine starts the workers."
+            f"Selected {count} worker(s). "
+            "Jobs confirms whether its controls were updated. No worker was started."
         )
         self.workers_selected.emit(
             dict(

@@ -5,11 +5,16 @@ tabs fill the right. Sources are collapsible. No scroll area sits inside
 another. The same widgets and actions as before; real Qt, no job is started.
 """
 
+import pytest
+
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QScrollArea, QSplitter, QWidget
 
 from darsia.fluidflower.resource_advisor_panel import ResourceAdvisorPanel
+from darsia.fluidflower.measurement_receipts import MeasurementRegistry
 from darsia.fluidflower.store_map_ui import StoreAvailabilityPanel, StoreSettingsDialog
+from darsia.fluidflower.ui.theme import apply_application_theme
 
 from .test_native_jobs_owner import local_registry, snapshot, ui  # noqa: F401
 
@@ -149,3 +154,88 @@ def test_store_details_and_preview_have_no_height_cap(qtbot, tmp_path):
     qtbot.addWidget(dialog)
     assert dialog.preview.maximumHeight() == UNCAPPED
     assert isinstance(dialog, QWidget)
+
+
+def test_standalone_resource_choice_reports_selection_without_claiming_application(qtbot, tmp_path):
+    """A standalone advisor emits the selection without claiming an owner applied it."""
+    resources = ResourceAdvisorPanel(measurement_registry=MeasurementRegistry(tmp_path / "measurements"))
+    qtbot.addWidget(resources)
+    resources.set_context({"precision": "float32"}, machines_provider=lambda: [
+        dict(machine="unregistered", inventory={}, history=[])])
+    resources.workers_spin.setValue(5)
+    choices = []
+    resources.workers_selected.connect(choices.append)
+    resources.show()
+    qtbot.mouseClick(resources.use_button, Qt.MouseButton.LeftButton)
+    assert resources.selection_label.text().startswith("Selected 5 worker(s)")
+    assert resources.selection_label.wordWrap()
+    assert "Applied" not in resources.selection_label.text()
+    assert "No worker was started" in resources.selection_label.text()
+    assert len(choices) == 1 and choices[0]["workers"] == 5
+    assert choices[0]["starts_job"] is False
+    assert not resources.measurement_registry.root.exists()
+
+
+@pytest.mark.parametrize("matches", [0, 1, 2], ids=["missing", "applied", "ambiguous"])
+def test_resource_choice_feedback_follows_actual_target_matches(qtbot, local_registry, tmp_path, matches, record_property):
+    """The actual owner reports application or refusal while forwarding the unchanged choice."""
+    def forbidden(*_args, **_kwargs):
+        """Reject any accidental producer, worker launch or hardware inspection."""
+        pytest.fail("Resource selection must not start work")
+
+    owner = ui.NativeJobsWorkspace(
+        registry=local_registry, local_machine="local", reader=snapshot,
+        measurement_registry=MeasurementRegistry(tmp_path / "measurements"),
+        inventory_provider=forbidden, job_creator=forbidden,
+        local_launcher=forbidden, remote_launcher=forbidden,
+        resource_factory=ResourceAdvisorPanel,
+    )
+    qtbot.addWidget(owner, before_close_func=lambda widget: qtbot.waitUntil(widget.can_close, timeout=10000))
+    owner.setFont(QFont("Segoe UI", 10))
+    apply_application_theme(owner)
+    panel, resources = owner.panel, owner.resources
+    qtbot.waitUntil(panel.can_close)
+    selected = dict(panel.target_combo.currentData())
+    chosen = panel.local_machine if matches else panel.local_machine + "-history"
+    if matches == 2:
+        panel.target_combo.addItem("Alternative saved target", dict(selected, key="alternative"))
+    panel.workers_spin.setMaximum(2)
+    before = (panel.target_combo.currentIndex(), panel.workers_spin.value(), panel.backend_combo.currentData())
+    resources.set_context({"precision": "float32"}, machines_provider=lambda: [
+        dict(machine=chosen, inventory={}, history=[])])
+    resources.workers_spin.setValue(5)
+    resources.backend_combo.setCurrentIndex(resources.backend_combo.findData("cuda"))
+    choices, forwarded = [], []
+    resources.workers_selected.connect(choices.append)
+    panel.workers_selected.connect(forwarded.append)
+    owner.resize(1280, 1000)
+    owner.show()
+    panel.detail_tabs.setCurrentWidget(panel.resource_page)
+    qtbot.mouseClick(resources.use_button, Qt.MouseButton.LeftButton)
+    qtbot.wait(20)
+    assert len(choices) == 1 and forwarded == choices
+    assert forwarded[0]["workers"] == 5 and forwarded[0]["starts_job"] is False
+    feedback = resources.selection_label.text()
+    assert panel.progress_label.text() == feedback
+    assert resources.selection_label.wordWrap() and resources.reason_label.wordWrap()
+    assert owner.width() == 1280 and owner.height() == 1000
+    assert owner.minimumSizeHint().width() <= 1280
+    for label in (resources.selection_label, resources.reason_label):
+        assert 0 <= label.mapTo(owner, label.rect().topLeft()).x()
+        assert label.mapTo(owner, label.rect().bottomRight()).x() < owner.width()
+    assert not resources.selection_label.visibleRegion().isEmpty()
+    if matches == 1:
+        assert panel.target_combo.currentData() == selected
+        assert panel.workers_spin.value() == 2 and panel.backend_combo.currentData() == "cuda"
+        assert "Applied 2 worker(s) using CUDA" in feedback
+        assert "Applied 5" not in feedback
+        screenshot = tmp_path / "resource_worker_count_applied.png"
+        assert owner.grab().save(str(screenshot))
+        record_property("resource_feedback_screenshot", str(screenshot))
+    else:
+        assert (panel.target_combo.currentIndex(), panel.workers_spin.value(), panel.backend_combo.currentData()) == before
+        assert "Worker count not applied" in feedback
+        assert ("no registered launch target" if matches == 0 else "multiple registered launch targets") in feedback
+    assert not local_registry.root.exists() and not resources.measurement_registry.root.exists()
+    qtbot.waitUntil(owner.can_close, timeout=10000)
+    assert owner.close() and not owner.isVisible()
