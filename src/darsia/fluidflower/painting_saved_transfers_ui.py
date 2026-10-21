@@ -157,7 +157,10 @@ class SavedTransferChooser(QDialog):
             version = row["version"]
             name = version.get("name") or "Saved map"
             when = row["created_utc"][:16].replace("T", " ")
-            self.list.addItem(f"{name} – {when} UTC")
+            from .layer_painting import approval_withdrawal
+            withdrawn = approval_withdrawal(getattr(self.parent(), "map_approvals", []), version.get("approval"))
+            suffix = " · approval withdrawn " + withdrawn["recorded_utc"] if withdrawn else ""
+            self.list.addItem(f"{name} – {when} UTC" + suffix)
             self.list.item(index).setToolTip(f"Map SHA-256: {version.get('sha256') or 'not recorded'}")
             if (self.preferred.get("folder") and version.get("sha256") == self.preferred.get("sha256")
                     and (version.get("folder") == self.preferred.get("folder") or

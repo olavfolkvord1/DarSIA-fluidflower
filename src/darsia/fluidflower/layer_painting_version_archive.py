@@ -109,7 +109,7 @@ def _event(project, record, action, **extra):
         version=Path(record["folder"]).name, version_sha256=record["sha256"],
         version_record_sha256=lp._file_sha256(Path(record["folder"]) / "version.json"),
         **extra)
-    # No top-level sha256: the unchanged map_approval() must never treat an
+    # No top-level sha256: map_approval() must never treat an
     # archive, rename, note or restore event as an approval.
     line = (json.dumps(row, ensure_ascii=False, allow_nan=False, sort_keys=True) + "\n").encode("utf8")
     path = _safe(lp.approvals_path(project, record["run_id"]))
@@ -288,14 +288,80 @@ def _reference_metadata(project, reference_files):
         yield "referenced by placement or adoption", _json(_safe(path)), str(path)
 
 
+
+def _exact_cites(value, record):
+    """Match a literal saved folder/version, independently of same-map aliases."""
+    if isinstance(value, dict):
+        if value.get("sha256") == record["sha256"] and (
+                value.get("folder") == record["folder"]
+                or value.get("version") == Path(record["folder"]).name):
+            return True
+        return any(_exact_cites(item, record) for item in value.values())
+    if isinstance(value, list):
+        return any(_exact_cites(item, record) for item in value)
+    return False
+
+
+def _adopted_cites(value, record):
+    """Join adopted revisions to their retained, SHA-bound preparation metadata."""
+    if _exact_cites(value, record):
+        return True
+    config = value.get("configuration", value)
+    if not isinstance(config, dict):
+        raise ValueError("An adopted revision has unreadable configuration metadata")
+    links = [(config.get("provenance") or {}).get("preparation"),
+             (config.get("painted_adoption_table") or {}).get("preparation")]
+    bound = [row for row in links if isinstance(row, dict) and row.get("path") and row.get("sha256")]
+    for row in bound:
+        path = _safe(Path(row["path"]))
+        if lp._file_sha256(path) != row["sha256"]:
+            raise ValueError("An adopted revision's preparation metadata changed")
+        if _exact_cites(_json(path), record):
+            return True
+    # Older records may lack literal folder provenance. Keep their existing
+    # conservative protection rather than treating an unknown identity as free.
+    return not bound and _cites(value, record["sha256"])
+
+
+def withdrawal_context(project, run_id, selected, *, reference_files=()):
+    """Read actual approval and all saved adoption proofs before confirmation."""
+    record = _checked(project, run_id, selected, content=False)
+    approval = lp.map_approval(_events(project, run_id), record["sha256"],
+                               version=Path(record["folder"]).name)
+    if approval is None or approval.get("files") != record["files"]:
+        raise ValueError("This exact saved version has no active approval to withdraw")
+    placements = []
+    for state, value, path in _reference_metadata(project, reference_files):
+        if state == "adopted" and _adopted_cites(value, record):
+            raise ValueError("This version was adopted for the series; adopt another version first.")
+        if state == "placed" and _exact_cites(value, record):
+            placements.append(path)
+    return dict(record=record, approval=approval, placements=placements)
+
+
+def withdraw_approval(project, run_id, selected):
+    """Append one withdrawal; change no saved version, placement or old log line."""
+    with _action_lock(project, run_id):
+        context = withdrawal_context(project, run_id, selected)
+        return _event(project, context["record"], "approval_withdrawn",
+            withdrawn_approval=context["approval"], withdrawn_placements=context["placements"])
+
+
 def archive_blockers(project, run_id, record, *, reference_files=()):
     """Actual package proofs, independent of the version table's cached status."""
     record = _checked(project, run_id, record)
     reasons = []
-    if lp.map_approval(_events(project, run_id), record["sha256"]) is not None:
+    events = _events(project, run_id)
+    literal = Path(record["folder"]).name
+    if lp.map_approval(events, record["sha256"], version=literal) is not None:
         reasons.append("This map SHA-256 is approved and cannot be archived")
+    withdrawn = lp.map_approval_withdrawal(events, record["sha256"], version=literal)
     for state, value, path in _reference_metadata(project, reference_files):
         if _cites(value, record["sha256"]):
+            if withdrawn and state in {"placed", "prepared for adoption"}:
+                continue
+            if withdrawn and state == "adopted" and not _adopted_cites(value, record):
+                continue
             reasons.append(f"This version is {state}: {path}")
     return reasons
 
@@ -318,7 +384,7 @@ def _move(project, run_id, selected, *, restore, reference_files):
         _event(project, record, action + "_intent", source_folder=str(source), destination_folder=str(target))
         # Recheck the actual approval log immediately before the move. The GUI
         # serializes approve/place/adopt and version actions while this runs.
-        if not restore and lp.map_approval(_events(project, run_id), record["sha256"]) is not None:
+        if not restore and lp.map_approval(_events(project, run_id), record["sha256"], version=Path(record["folder"]).name) is not None:
             raise ValueError("This map became approved and cannot be archived")
         _child(source, deleted if restore else versions, exists=True)
         _child(target, root, exists=False)
@@ -481,12 +547,18 @@ def list_version_metadata(project, run_id, *, deleted=False, reference_files=())
         if "proposal.npz" in row["files"] and method is None:
             with np.load(folder / "proposal.npz", allow_pickle=False) as archive:
                 method = json.loads(str(archive["meta"])).get("method", lp.PROPOSAL_METHOD)
-        approval = lp.map_approval(events, row["sha256"])
+        approval = lp.map_approval(events, row["sha256"], version=folder.name)
+        withdrawn = lp.map_approval_withdrawal(events, row["sha256"], version=folder.name)
         states = [state for state, value, _path in references if _cites(value, row["sha256"])]
+        placed = [value for state, value, _path in references if state == "placed" and _exact_cites(value, row)]
+        placement_withdrawn = bool(placed) and all(lp.approval_withdrawal(events,
+            (value.get("map_version") or {}).get("approval")) for value in placed)
         row.update(settings=settings, proposal_method=method,
             approved=None if history_error else approval is not None,
             history_error=history_error, approval_known=not bool(history_error),
             placed="placed" in states, adopted="adopted" in states,
+            approval_withdrawn_utc=(withdrawn.get("recorded_utc") if withdrawn and approval is None else None),
+            placement_withdrawn=placement_withdrawn,
             protection_reasons=states)
         rows.append(row)
     return sorted(rows, key=lambda row: (str(row.get("created_utc", "")), row["folder"]))

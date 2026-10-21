@@ -2503,12 +2503,43 @@ def read_map_approvals(
 
 
 def map_approval(
-    approvals: Sequence[Mapping[str, Any]], sha256: str
+    approvals: Sequence[Mapping[str, Any]], sha256: str, *, version: str | None = None
 ) -> dict[str, Any] | None:
-    """The latest approval of the map with this SHA-256 (``map_digest``), or None."""
+    """The latest active approval, with optional literal saved-version scope.
 
-    matches = [row for row in approvals if sha256 and row.get("sha256") == sha256]
-    return dict(matches[-1]) if matches else None
+    A withdrawal cancels only the exact approval named by its append-only
+    event. Another same-content version or a subsequent approval is unchanged.
+    Histories without withdrawal events retain their original latest result.
+    """
+    active = {}
+    for position, row in enumerate(approvals):
+        if version is not None and row.get("version") != version:
+            continue
+        key = (row.get("run_id"), row.get("version"))
+        if row.get("event") == "approval_withdrawn":
+            prior = active.get(key)
+            if (prior is not None and row.get("version_sha256") == sha256
+                    and row.get("withdrawn_approval") == prior[1]):
+                del active[key]
+        elif not row.get("event") and sha256 and row.get("sha256") == sha256:
+            active[key] = (position, row)
+    return dict(max(active.values(), key=lambda item: item[0])[1]) if active else None
+
+
+def map_approval_withdrawal(approvals, sha256, *, version):
+    """Latest retained withdrawal of this exact saved version for GUI display."""
+    rows = [row for row in approvals if row.get("event") == "approval_withdrawn"
+            and row.get("version_sha256") == sha256 and row.get("version") == version]
+    return dict(rows[-1]) if rows else None
+
+
+def approval_withdrawal(approvals, approval):
+    """Whether a saved placement's particular original approval was withdrawn."""
+    if not isinstance(approval, Mapping):
+        return None
+    rows = [row for row in approvals if row.get("event") == "approval_withdrawn"
+            and row.get("withdrawn_approval") == approval]
+    return dict(rows[-1]) if rows else None
 
 
 def approve_version(

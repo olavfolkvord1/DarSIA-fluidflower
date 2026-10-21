@@ -24,6 +24,7 @@ class PaintingVersionsActions(QObject):
             (("save_drawing", "Save drawing…", self.save_drawing),
              ("load_drawing", "Load drawing…", self.load_drawing)),
             (("rename", "Rename…", self.rename), ("note", "Note…", self.note),
+             ("withdraw", "Withdraw approval…", self.withdraw),
              ("archive", "Delete version…", self.archive),
              ("restore_deleted", "Restore deleted version…", self.restore_deleted)),
         ):
@@ -49,7 +50,8 @@ class PaintingVersionsActions(QObject):
         for key, button in self.buttons.items():
             button.setEnabled(available and (
                 key in {"save_drawing", "load_drawing", "restore_deleted"} or selected is not None
-            ) and (key in {"save_drawing", "load_drawing"} or self.history_available()))
+            ) and (key in {"save_drawing", "load_drawing"} or self.history_available())
+                and (key != "withdraw" or self.view._approval_for_version(selected) is not None))
 
     def history_available(self):
         return not (getattr(self.view, "_map_approvals_error", "")
@@ -61,6 +63,9 @@ class PaintingVersionsActions(QObject):
             view.versions = view._read_versions(view.session.run_id)
             view._read_approvals(view.session.run_id)
         view._refresh_versions()
+        dialog = getattr(view, "_placement_dialog", None)
+        if dialog is not None and hasattr(dialog, "refresh_approval_state"):
+            dialog.refresh_approval_state(view.map_approvals)
         if message:
             view.versions_note.setText(message)
 
@@ -156,6 +161,28 @@ class PaintingVersionsActions(QObject):
             return
         self.reload("The note was recorded; the content SHA and approval are unchanged.")
 
+    def withdraw(self):
+        """Confirm once, then append the withdrawal through the existing log writer."""
+        view, record = self.view, self._record()
+        if record is None:
+            return False
+        try:
+            context = versions.withdrawal_context(view.project, view.session.run_id, record)
+            placement = ("\nIts logged placement(s) will be marked approval withdrawn; their saved evidence stays."
+                         if context["placements"] else "")
+            answer = QMessageBox.question(view, "Withdraw approval",
+                f"Withdraw approval of {self.name(record)} ({record['kind']})?\n"
+                f"SHA-256 {record['sha256']}" + placement
+                + "\nThe approval history and saved version remain unchanged; a withdrawal is appended.")
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            versions.withdraw_approval(view.project, view.session.run_id, record)
+        except (OSError, ValueError, KeyError) as error:
+            self._failure(error)
+            return False
+        self.reload("Approval withdrawn. The saved version and earlier approval history are retained.")
+        return True
+
     def archive(self):
         view, record = self.view, self._record()
         if record is None:
@@ -209,13 +236,15 @@ class PaintingVersionsActions(QObject):
         for text, callback in (
             ("Use this version", view._restore_version_clicked),
             ("Rename…", self.rename), ("Note…", self.note),
+            ("Withdraw approval…", self.withdraw),
             ("Delete version…", self.archive),
             ("Restore deleted version…", self.restore_deleted),
         ):
             action = menu.addAction(text)
             action.setEnabled(self.available() and (
                 text == "Restore deleted version…" or view._selected_version() is not None)
-                and (text == "Use this version" or self.history_available()))
+                and (text == "Use this version" or self.history_available())
+                and (text != "Withdraw approval…" or self.view._approval_for_version(view._selected_version()) is not None))
             action.triggered.connect(callback)
         self.menu = menu
         menu.popup(view.versions_table.viewport().mapToGlobal(position))

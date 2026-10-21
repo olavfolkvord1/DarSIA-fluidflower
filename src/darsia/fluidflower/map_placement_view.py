@@ -193,6 +193,8 @@ class MapPlacementDialog(QDialog):
         self.setWindowTitle(f"Sand map placement summary – {name} in all runs")
         self.lead = QLabel(f"Summary of how the approved sand map ({name} from {reference}) fits each run's "
                            "photograph. Read only: nothing is adopted or changed.")
+        self._approval_lead = self.lead.text()
+        self.refresh_approval_state(getattr(parent, "map_approvals", []))
         self.lead.setWordWrap(True)
         layout.addWidget(self.lead)
         note = QLabel(
@@ -283,6 +285,15 @@ class MapPlacementDialog(QDialog):
         layout.addWidget(buttons)
         if self.rows:
             self.table.selectRow(0)
+
+    def refresh_approval_state(self, approvals):
+        """Mark withdrawn approval from cached log DATA; change no placement bytes."""
+        from .layer_painting import approval_withdrawal
+        version = self.placement.get("map_version") or {}
+        withdrawn = approval_withdrawal(approvals, version.get("approval"))
+        self.lead.setText(self._approval_lead + (
+            " Approval withdrawn " + withdrawn["recorded_utc"] + "; retained placement evidence only."
+            if withdrawn else ""))
 
     def show_run(self, number: int) -> bool:
         """Show the overlay and layer offsets of the run in row ``number``;

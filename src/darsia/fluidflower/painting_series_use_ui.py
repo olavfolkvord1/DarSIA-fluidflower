@@ -124,6 +124,8 @@ def progress_text(record, approval, result):
         count = sum(row.get("status") == "placed" for row in rows)
         lines.append(f"Transferred: {count} of {len(rows)} runs, {transfer.get('created_utc') or 'time not recorded'}; "
                      "each run's camera-photo grid (this record does not establish a RAW-basis transfer).")
+        if record.get("placement_withdrawn"):
+            lines.append("Transfer approval withdrawn; the saved placement remains available for review.")
     else:
         lines.append("Transferred: no record for this saved version.")
     preparation = result.get("preparation")

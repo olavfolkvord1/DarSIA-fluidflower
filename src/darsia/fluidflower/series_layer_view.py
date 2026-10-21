@@ -7163,6 +7163,10 @@ class LayerPainterView(QWidget):
             )
             from .painting_versions_ui import settings_text
             state = f"Approved {approved} UTC" if approval else "Not approved"
+            if approval is None and record.get("approval_withdrawn_utc"):
+                state = "approval withdrawn " + str(record["approval_withdrawn_utc"])
+            if record.get("placement_withdrawn"):
+                state += " · Placement approval withdrawn"
             if record.get("kind") == lpv.DRAWING_KIND:
                 state = "Drawing only"
             elif record.get("uncovered_pixels"):
@@ -7278,12 +7282,9 @@ class LayerPainterView(QWidget):
         files = record.get("files")
         if not record.get("folder") or not isinstance(files, Mapping):
             return None
-        return next((row for row in reversed(self.map_approvals)
-            if row.get("sha256") == record.get("sha256")
-            and row.get("version") == folder.name
-            and str(row.get("kind") or "") == str(record.get("kind") or "")
-            and row.get("run_id") == record.get("run_id")
-            and row.get("files") == files), None)
+        row = lp.map_approval(self.map_approvals, record.get("sha256"), version=folder.name)
+        return row if (row is not None and str(row.get("kind") or "") == str(record.get("kind") or "")
+            and row.get("run_id") == record.get("run_id") and row.get("files") == files) else None
 
     def _selected_manual_version(self):
         """The explicit saved identity used by round 5, separate from drafts.
