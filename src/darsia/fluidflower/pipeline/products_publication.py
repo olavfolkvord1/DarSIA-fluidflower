@@ -234,7 +234,10 @@ def _target(root, relative):
     destination = root.joinpath(*_relative(relative).split("/"))
     _no_links(destination)
     from .job_queue import retry_transient
-    retry_transient(lambda: destination.parent.mkdir(parents=True, exist_ok=True))
+    from .series_setup_sink import current_writer
+    writer = current_writer()
+    retry_transient(lambda: destination.parent.mkdir(parents=True, exist_ok=True)
+                    if writer is None else writer.mkdir(destination.parent, parents=True, exist_ok=True))
     _no_links(destination.parent)
     if not destination.parent.resolve().is_relative_to(root.resolve()):
         raise ValueError("Publication target escapes its fresh root")
@@ -252,13 +255,17 @@ def _copy_pending(source, expected, destination):
         raise ValueError("Product byte count differs: " + str(source))
     temporary = destination.with_name("." + destination.name + "." + uuid.uuid4().hex + ".partial")
     digest = hashlib.sha256()
-    with source.open("rb") as reader, temporary.open("xb") as writer:
+    from .series_setup_sink import current_writer
+    sink = current_writer()
+    output = temporary.open("xb") if sink is None else sink.open_exclusive(temporary)
+    with source.open("rb") as reader, output as writer:
         opened = os.fstat(reader.fileno())
         for block in iter(lambda: reader.read(1024 * 1024), b""):
             digest.update(block)
             writer.write(block)
         writer.flush()
-        os.fsync(writer.fileno())
+        if sink is None:
+            os.fsync(writer.fileno())
         after = os.fstat(reader.fileno())
     if (_stamp(before) != _stamp(opened) or _stamp(opened) != _stamp(after)
             or _stamp(source.stat()) != _stamp(after)
@@ -280,8 +287,16 @@ def _copy(source, expected, destination):
     if os.name == "nt":
         rename(temporary, destination)
     else:
-        os.link(temporary, destination)  # Never replace an existing target.
-        temporary.unlink()  # Only this successful extra link is removed.
+        from .series_setup_sink import current_writer
+        sink = current_writer()
+        if sink is None:
+            os.link(temporary, destination)  # Never replace an existing target.
+            temporary.unlink()  # Only this successful extra link is removed.
+        else:
+            def publish_link(source, target):
+                os.link(source, target)
+                source.unlink()
+            sink.rename(temporary, destination, rename_operation=publish_link)
     return dict(relative_path=destination.name, **expected)
 
 

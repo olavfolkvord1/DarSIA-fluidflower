@@ -123,6 +123,15 @@ def _windows_rename(source: Path, destination: Path) -> None:
 
 
 def rename(source: Path, destination: Path) -> None:
+    """Keep original atomic moves inside any explicit Setup writer scope."""
+    from .series_setup_sink import current_writer
+    writer = current_writer()
+    if writer is None:
+        return _rename_without_setup(source, destination)
+    return writer.rename(source, destination, rename_operation=_rename_without_setup)
+
+
+def _rename_without_setup(source: Path, destination: Path) -> None:
     """Atomic move; briefly let concurrent Windows metadata readers close.
 
     A transient error is retried (N111). When a retry finds the source gone and
@@ -178,25 +187,42 @@ def _publish_bytes(path: Path, data: bytes, *, create_parents: bool) -> None:
     # Unscoped full/legacy calls retain their original behavior and bytes.
     from .io_ops import check_metadata_bytes
     check_metadata_bytes(path, data)
+    from .series_setup_sink import current_writer
+    setup_writer = current_writer()
     interrupted = []
 
     def publish():
         if create_parents:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if setup_writer is None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                setup_writer.mkdir(path.parent, parents=True, exist_ok=True)
         # Temporary IO names must not consume the semantic attempt/frame UUID
         # stream (the original full writer's identity sequence is preserved).
         from secrets import token_hex
         temporary = path.with_name(f".{path.name}.{token_hex(16)}.partial")
-        with temporary.open("xb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
+        if setup_writer is None:
+            with temporary.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        else:
+            register = getattr(setup_writer, "register_temporary", None)
+            if register is not None:
+                register(path, temporary)
+            setup_writer.write_bytes(temporary, data)
         try:
             if os.name == "nt":
                 rename(temporary, path)  # Windows refuses an existing destination.
             else:
-                os.link(temporary, path)  # POSIX rename would replace a file.
-                temporary.unlink()  # Only the successful extra hardlink is removed.
+                if setup_writer is None:
+                    os.link(temporary, path)  # POSIX rename would replace a file.
+                    temporary.unlink()  # Only the successful extra hardlink is removed.
+                else:
+                    def publish_link(source, destination):
+                        os.link(source, destination)
+                        source.unlink()
+                    setup_writer.rename(temporary, path, rename_operation=publish_link)
         except FileExistsError:
             try:
                 same = bool(interrupted) and path.read_bytes() == data
@@ -206,6 +232,16 @@ def _publish_bytes(path: Path, data: bytes, *, create_parents: bool) -> None:
                 raise
 
     retry_transient(publish, on_retry=lambda attempt, delay, error: interrupted.append(error))
+
+
+def _ensure_directory(path: Path, *, parents=True, exist_ok=True) -> None:
+    """Keep original mkdir semantics inside an active Setup output domain."""
+    from .series_setup_sink import current_writer
+    writer = current_writer()
+    if writer is None:
+        path.mkdir(parents=parents, exist_ok=exist_ok)
+    else:
+        writer.mkdir(path, parents=parents, exist_ok=exist_ok)
 
 
 def _create_directory(path: Path, *, parents: bool = False) -> None:
@@ -218,7 +254,12 @@ def _create_directory(path: Path, *, parents: bool = False) -> None:
 
     def create():
         try:
-            path.mkdir(parents=parents)
+            from .series_setup_sink import current_writer
+            writer = current_writer()
+            if writer is None:
+                path.mkdir(parents=parents)
+            else:
+                writer.mkdir(path, parents=parents)
         except FileExistsError:
             if not (interrupted and path.is_dir() and not any(path.iterdir())):
                 raise
@@ -267,6 +308,9 @@ def validate_task(task: dict) -> None:
     if task.get("pipeline") == "native-phase-statistics":
         from .phase1_protocol import validate_phase1_task
         validate_phase1_task(task)
+    elif task.get("pipeline") == "series-setup":
+        from .series_setup_protocol import validate_setup_task
+        validate_setup_task(task)
     else:
         for key, length in (("commit", 40), ("calibration_sha256", 64)):
             if not re.fullmatch(f"[0-9a-f]{{{length}}}", task.get(key, "")):
@@ -500,7 +544,7 @@ class JobQueue:
         self._progress_lock = threading.Lock()
         self.on_error = on_error
         for directory in ("queue", "claimed", "leases", "decisions", "publishing", "reclaimed", "results", "done", "failed", "logs"):
-            retry_transient(lambda path=self.root / directory: path.mkdir(parents=True, exist_ok=True))
+            retry_transient(lambda path=self.root / directory: _ensure_directory(path))
 
     def _server(self, machine=None):
         if self._server_clock is None:
@@ -569,7 +613,8 @@ class JobQueue:
                 raise ValueError("Task is outside job.json expected_runs")
 
     def claim(self, machine: str, backend: str, owner: dict, *, availability=None,
-              output_factory=None, publication_factory=None, exclude_runs=()) -> Claim | None:
+              output_factory=None, publication_factory=None, exclude_runs=(),
+              claim_controls=None) -> Claim | None:
         """Atomically claim one backend-compatible run and bind a fresh attempt lease to its owner."""
         machine = name(machine)
         if isinstance(exclude_runs, (str, bytes)):
@@ -631,69 +676,79 @@ class JobQueue:
                         or [row.uses for row in rows] !=
                            [tuple(item["uses"]) for item in task["input_catalog"]["inputs"]]):
                     raise ValueError("Availability must bind the exact ordered role catalogue; boolean admission is forbidden")
-            run, token = name(task["run"]), task["attempt_id"]
-            if pending.name != run + ".json" or not re.fullmatch(r"[0-9a-f]{32}", token):
-                raise ValueError("Queue filename or attempt identity differs")
-            claimed = self.root / "claimed" / machine / pending.name
-            retry_transient(lambda: claimed.parent.mkdir(parents=True, exist_ok=True))
-            try:
-                if claimed.exists():
+            from contextlib import nullcontext
+            if task.get("pipeline") == "series-setup" and not callable(claim_controls):
+                raise RuntimeError("Setup needs its finite admitted claim-control scope")
+            control_scope = nullcontext() if claim_controls is None else claim_controls(task, machine)
+            with control_scope:
+                run, token = name(task["run"]), task["attempt_id"]
+                if pending.name != run + ".json" or not re.fullmatch(r"[0-9a-f]{32}", token):
+                    raise ValueError("Queue filename or attempt identity differs")
+                claimed = self.root / "claimed" / machine / pending.name
+                from .series_setup_sink import current_writer
+                writer = current_writer()
+                retry_transient(lambda: claimed.parent.mkdir(parents=True, exist_ok=True)
+                    if writer is None else writer.mkdir(claimed.parent, parents=True, exist_ok=True))
+                try:
+                    if claimed.exists():
+                        continue
+                    rename(pending, claimed)
+                except FileNotFoundError:
                     continue
-                rename(pending, claimed)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                if not transient_os_error(error):
-                    raise
-                self._transient("claim", pending, error)  # Try the next task (N111).
-                continue
-            # Bind the generation actually renamed, not a pre-rename read.
-            task = read_json(claimed)
-            validate_task(task)
-            self._validate_output(task)
-            token = task["attempt_id"]
-            if alias and task != before_task:
-                # A different generation won while availability was inspected.
-                # Never pair stale rows with the generation actually renamed.
-                rename(claimed, pending)
-                continue
-            if task.get("backend", "any") not in {"any", backend}:
-                rename(claimed, pending)
-                continue
-            lease = self.root / "leases" / (run + "." + token)
-            try:
-                _create_directory(lease)
-            except FileExistsError:
-                # This generation already has a lease (live, published or
-                # retired in place); a second queue file of it is set aside.
-                rename(claimed, claimed.with_name(f"{run}.duplicate.{uuid.uuid4().hex}.json"))
-                continue
-            output_reference = None
-            if alias:
-                binding = output_factory(deepcopy(task), token)
-                output, output_reference = self._admit_output(binding, task, machine, token)
-            else:
-                output = self.root / "results" / run / ".attempts" / token
-            _create_directory(output, parents=True)
-            marker = lease / "claimed.json"
-            write_immutable(marker, dict(run=run, attempt_id=token, machine_id=machine,
-                                        event="actual_claim_bound"), create_parents=False)
-            from .server_clock import file_mtime_ns
-            metadata = dict(task=task, machine=machine, token=token, actual_owner=owner,
-                            claimed_unix_ns=file_mtime_ns(marker), claimed_utc=utc(),
-                            lease_clock_basis="shared-filesystem-mtime")
-            if alias:
-                metadata.update(format="darsia-alias-lease-owner-v1",
-                                claimed=_own_reference(self.root, claimed), output=output_reference)
-            else:
-                metadata.update(claimed_path=str(claimed), output_path=str(output))
-            write_immutable(lease / "owner.json", metadata, create_parents=False)
-            claim = Claim(task, machine, token, claimed, lease, output, rows,
-                          publication_factory if alias else None, binding if alias else None)
-            if read_json(claimed) != task:
-                raise LeaseLost("Queue generation changed during claim")
-            self.assert_owner(claim)
-            return claim
+                except OSError as error:
+                    if not transient_os_error(error):
+                        raise
+                    self._transient("claim", pending, error)  # Try the next task (N111).
+                    continue
+                # Bind the generation actually renamed, not a pre-rename read.
+                task = read_json(claimed)
+                validate_task(task)
+                self._validate_output(task)
+                token = task["attempt_id"]
+                if alias and task != before_task:
+                    # A different generation won while availability was inspected.
+                    # Never pair stale rows with the generation actually renamed.
+                    rename(claimed, pending)
+                    continue
+                if task.get("backend", "any") not in {"any", backend}:
+                    rename(claimed, pending)
+                    continue
+                lease = self.root / "leases" / (run + "." + token)
+                try:
+                    _create_directory(lease)
+                except FileExistsError:
+                    # This generation already has a lease (live, published or
+                    # retired in place); a second queue file of it is set aside.
+                    if task.get("pipeline") == "series-setup":
+                        raise LeaseLost("Duplicate Setup generation retained at its original claimed path")
+                    rename(claimed, claimed.with_name(f"{run}.duplicate.{uuid.uuid4().hex}.json"))
+                    continue
+                output_reference = None
+                if alias:
+                    binding = output_factory(deepcopy(task), token)
+                    output, output_reference = self._admit_output(binding, task, machine, token)
+                else:
+                    output = self.root / "results" / run / ".attempts" / token
+                _create_directory(output, parents=True)
+                marker = lease / "claimed.json"
+                write_immutable(marker, dict(run=run, attempt_id=token, machine_id=machine,
+                                            event="actual_claim_bound"), create_parents=False)
+                from .server_clock import file_mtime_ns
+                metadata = dict(task=task, machine=machine, token=token, actual_owner=owner,
+                                claimed_unix_ns=file_mtime_ns(marker), claimed_utc=utc(),
+                                lease_clock_basis="shared-filesystem-mtime")
+                if alias:
+                    metadata.update(format="darsia-alias-lease-owner-v1",
+                                    claimed=_own_reference(self.root, claimed), output=output_reference)
+                else:
+                    metadata.update(claimed_path=str(claimed), output_path=str(output))
+                write_immutable(lease / "owner.json", metadata, create_parents=False)
+                claim = Claim(task, machine, token, claimed, lease, output, rows,
+                              publication_factory if alias else None, binding if alias else None)
+                if read_json(claimed) != task:
+                    raise LeaseLost("Queue generation changed during claim")
+                self.assert_owner(claim)
+                return claim
         return None
 
     def _admit_output(self, binding, task, machine, token):
@@ -723,7 +778,7 @@ class JobQueue:
             run = "invalid-" + hashlib.sha256(pending.name.encode()).hexdigest()[:24]
         token = uuid.uuid4().hex
         archived = self.root / "claimed" / machine / f"{run}.invalid.{token}.json"
-        retry_transient(lambda: archived.parent.mkdir(parents=True, exist_ok=True))
+        retry_transient(lambda: _ensure_directory(archived.parent))
         try:
             rename(pending, archived)
         except FileNotFoundError:
@@ -978,7 +1033,7 @@ class JobQueue:
                 # also when an earlier reclaim pass stopped after its decision.
                 # A lease that exists stays in place and is only marked.
                 archive = self.root / "reclaimed" / run / token
-                retry_transient(lambda: archive.mkdir(parents=True, exist_ok=True))
+                retry_transient(lambda: _ensure_directory(archive))
                 if lease.exists():
                     self._retire_lease(run, token)
                 rename(claimed, archive / "task.json")
@@ -1071,7 +1126,7 @@ class JobQueue:
     def _retire_lease(self, run, token):
         """Mark a reclaimed or rejected lease in place; never move it. Returns its archive."""
         archive = self.root / "reclaimed" / run / token
-        retry_transient(lambda: archive.mkdir(parents=True, exist_ok=True))
+        retry_transient(lambda: _ensure_directory(archive))
         marker = archive / "lease.json"
         if not (archive / "lease").is_dir() and not marker.exists():
             try:

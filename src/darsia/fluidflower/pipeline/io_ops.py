@@ -132,7 +132,10 @@ def publish_file(path, writer, *, reuse_identical=False, expected_sha256=None):
     is accepted only after its actual bytes match the newly serialized bytes.
     """
     path = Path(path)
-    retry_transient(lambda: path.parent.mkdir(parents=True, exist_ok=True))
+    from .series_setup_sink import current_writer
+    setup_writer = current_writer()
+    retry_transient(lambda: path.parent.mkdir(parents=True, exist_ok=True)
+        if setup_writer is None else setup_writer.mkdir(path.parent, parents=True, exist_ok=True))
     try:
         retry_transient(path.stat)
     except FileNotFoundError as error:
@@ -147,11 +150,19 @@ def publish_file(path, writer, *, reuse_identical=False, expected_sha256=None):
     def serialize():
         from darsia_cache.publication_paths import partial_name
         temporary = path.with_name(partial_name(path.name, token_hex(16)))
-        with temporary.open("xb") as stream:
-            limit = metadata_limit(path)
-            writer(stream if limit is None else _CeilingStream(stream, limit))
-            stream.flush()
-            os.fsync(stream.fileno())
+        if setup_writer is None:
+            with temporary.open("xb") as stream:
+                limit = metadata_limit(path)
+                writer(stream if limit is None else _CeilingStream(stream, limit))
+                stream.flush()
+                os.fsync(stream.fileno())
+        else:
+            register = getattr(setup_writer, "register_temporary", None)
+            if register is not None:
+                register(path, temporary)
+            with setup_writer.open_exclusive(temporary) as stream:
+                limit = metadata_limit(path)
+                writer(stream if limit is None else _CeilingStream(stream, limit))
         return temporary
 
     temporary = serialize()
