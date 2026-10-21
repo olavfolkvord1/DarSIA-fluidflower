@@ -3461,6 +3461,10 @@ class LayerPainterView(QWidget):
         from darsia.fluidflower.painting_run_preview_ui import PaintingRunPreview
         self.run_preview = PaintingRunPreview(self, self._build_canvas_column(), LayerCanvas,
             run_inputs=run_inputs, set_reference=set_reference)
+        self.run_preview.runs.currentIndexChanged.connect(self._fill_region_context_changed)
+        self.busy_changed.connect(self._refresh_fill_region)
+        self.rig_panel.mark_corners.toggled.connect(self._refresh_fill_region)
+        self.rig_panel.place_point.toggled.connect(self._refresh_fill_region)
         splitter.addWidget(self.run_preview.widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -3700,8 +3704,10 @@ class LayerPainterView(QWidget):
         )
         self.detail.currentIndexChanged.connect(self._settings_changed)
         snap_row.addWidget(self.detail)
-        snap_row.addSpacing(10)
-        snap_row.addWidget(QLabel("Method"))
+        snap_row.addStretch(1)
+        layout.addLayout(snap_row)
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Method"))
         self.proposal_method = QComboBox()
         self.proposal_method.addItem("Classifier", lp.PROPOSAL_METHOD)
         self.proposal_method.addItem("Polygons only", lpp.METHOD)
@@ -3711,19 +3717,21 @@ class LayerPainterView(QWidget):
             "Unassigned pixels stay magenta until corrected; approval and export require no gaps."
         )
         self.proposal_method.currentIndexChanged.connect(self._proposal_method_changed)
-        snap_row.addWidget(self.proposal_method)
-        snap_row.addSpacing(10)
+        method_row.addWidget(self.proposal_method)
+        method_row.addStretch(1)
+        layout.addLayout(method_row)
+        shared_row = QHBoxLayout()
         shared_label = QLabel("Classifier may move shared edges")
         shared_label.setToolTip(_MOVE_SHARED_TIP)
-        snap_row.addWidget(shared_label)
+        shared_row.addWidget(shared_label)
         self.move_shared_edges = QComboBox()
         self.move_shared_edges.addItem("Yes", True)
         self.move_shared_edges.addItem("No", False)
         self.move_shared_edges.setToolTip(_MOVE_SHARED_TIP)
         self.move_shared_edges.currentIndexChanged.connect(self._settings_changed)
-        snap_row.addWidget(self.move_shared_edges)
-        snap_row.addStretch(1)
-        layout.addLayout(snap_row)
+        shared_row.addWidget(self.move_shared_edges)
+        shared_row.addStretch(1)
+        layout.addLayout(shared_row)
         self.proposal_summary = QLabel()
         self.proposal_summary.setWordWrap(True)
         layout.addWidget(self.proposal_summary)
@@ -4026,6 +4034,19 @@ class LayerPainterView(QWidget):
         tools.addWidget(fit)
         layout.addLayout(tools)
         layout.addLayout(self._build_correction_tools())
+        from .painting_fill_region_tool import FillRegionTool
+        self.fill_region_tool = FillRegionTool(self)
+        self.fill_region_tool.button.toggled.connect(self._fill_region_tool_toggled)
+        self.fill_region_tool.cut_button.toggled.connect(self._fill_region_tool_toggled)
+        region_tools = QHBoxLayout()
+        for button in (self.fill_region_tool.button, self.fill_region_tool.cut_button,
+                       self.fill_region_tool.clear_cut_button):
+            region_tools.addWidget(button)
+        self.fill_region_tool.note.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        region_tools.addWidget(self.fill_region_tool.note, 1)
+        layout.addLayout(region_tools)
 
         display = QHBoxLayout()
         display.addWidget(QLabel("Show"))
@@ -4360,6 +4381,7 @@ class LayerPainterView(QWidget):
     def reload(self) -> None:
         """Load the session, photograph and proposal of the reference run."""
 
+        self._reset_fill_region()
         self.save_session()
         # Which layers are hidden is a display choice for the session shown.
         self._clear_background()
@@ -4376,6 +4398,7 @@ class LayerPainterView(QWidget):
             self.propose_status.setText(f"Could not read the workspace coordinate frame: {error}")
             self.propose_button.setEnabled(False)
             self.export_button.setEnabled(False)
+            self._refresh_fill_region()
             return
         if (
             workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
@@ -4494,6 +4517,7 @@ class LayerPainterView(QWidget):
         finally:
             self._loading = False
             self.run_preview.refresh()
+            self._refresh_fill_region()
 
     def _load_reference_photo(self, reference: SeriesRunInputs) -> None:
         assert reference.baseline_image is not None
@@ -4607,6 +4631,8 @@ class LayerPainterView(QWidget):
     def _show_reference(self, *, reset_view: bool) -> None:
         if self.image is None or self._reference_token is None:
             return
+        if self._other_photo is not None:
+            self._reset_fill_region()
         enhanced = self.enhance.isChecked()
         token = self._reference_token
         display = self._enhanced if enhanced else self._plain
@@ -4620,6 +4646,8 @@ class LayerPainterView(QWidget):
                 if stretched
                 else self._background_detail_plain
             )
+        if self.canvas.preview is not token:
+            self._reset_fill_region()
         assert display is not None
         saturation = self.saturation.value() / 100.0
         display = photo_with_saturation(display, saturation)
@@ -4642,6 +4670,7 @@ class LayerPainterView(QWidget):
         self._render_marks()
         self._render_proposal()
         self._display_changed()
+        self._refresh_fill_region()
 
     def show_reference_photo(self) -> None:
         self._show_reference(reset_view=False)
@@ -4668,6 +4697,7 @@ class LayerPainterView(QWidget):
         display = lp.enhance_contrast(rgb) if self.enhance.isChecked() else plain
         display = photo_with_saturation(display, self.saturation.value() / 100.0)
         token = {"baseline": plain, "path": str(path), "raw_size": (width, height)}
+        self._reset_fill_region()
         self.canvas.set_photo(display, (width, height), token=token, reset_view=True)
         self.canvas.paint_enabled = False
         self.canvas.set_overlays_visible(False, False)
@@ -4676,6 +4706,7 @@ class LayerPainterView(QWidget):
             f"Showing {Path(path).name}. Painting works on the reference photo."
         )
         self.photo_note_row.show()
+        self._refresh_fill_region()
         return True
 
     # ----------------------------------------------------- background photo
@@ -5053,10 +5084,42 @@ class LayerPainterView(QWidget):
         self._dirty = False
 
     def hideEvent(self, event: Any) -> None:
+        self._reset_fill_region()
         self.save_session()
         super().hideEvent(event)
 
+    def closeEvent(self, event: Any) -> None:
+        self._reset_fill_region()
+        super().closeEvent(event)
+
     # ------------------------------------------------------------- tools
+
+    def _reset_fill_region(self) -> None:
+        tool = getattr(self, "fill_region_tool", None)
+        if tool is not None and (tool.active or tool.cut_line or tool._draft):
+            tool.deactivate()
+
+    def _fill_region_context_changed(self, *_args: Any) -> None:
+        self._reset_fill_region()
+        self._refresh_fill_region()
+
+    def _fill_region_tool_toggled(self, checked: bool) -> None:
+        if checked:
+            self.brush_size.setEnabled(False)
+            self.brush_label.setEnabled(False)
+
+    def _refresh_fill_region(self, *_args: Any) -> None:
+        tool = getattr(self, "fill_region_tool", None)
+        if tool is None or not tool._alive():
+            return
+        problem = tool._problem()
+        previous = getattr(self, "_fill_region_problem", "")
+        tool.refresh()
+        if problem:
+            tool.note.setText(problem)
+        elif previous or not tool.note.text():
+            tool.note.setText("Fill an uncovered region as a polygon; a cut can divide the region first.")
+        self._fill_region_problem = problem
 
     def set_tool(self, tool: str) -> None:
         if tool in _DRAWING_TOOLS and self._other_photo is not None:
@@ -7583,6 +7646,7 @@ class LayerPainterView(QWidget):
             self._show_reference(reset_view=False)
 
     def _frame_changed(self) -> None:
+        self._reset_fill_region()
         self._update_enhanced()
         if self._other_photo is None and self.enhance.isChecked():
             self._show_reference(reset_view=False)
@@ -8546,6 +8610,7 @@ class LayerPainterView(QWidget):
     # ------------------------------------------------------------ status
 
     def _refresh_status(self) -> None:
+        self._refresh_fill_region()
         session = self.session
         frame = self.current_frame()
         points = self.rig_panel.current_points()

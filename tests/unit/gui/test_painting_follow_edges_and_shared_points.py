@@ -488,10 +488,12 @@ def test_the_choice_whether_the_classifier_may_move_shared_edges(make_view):
     box = view.move_shared_edges
     assert [box.itemText(index) for index in range(box.count())] == ["Yes", "No"]
     assert box.currentText() == "Yes" and view.session.move_shared_edges
-    # Beside Detail, in step 3.
+    # The shared-edge choice has its own short row in step 3, so the
+    # sidebar remains readable when the painting canvas takes most of the view.
     detail = view.detail.mapTo(view, QPoint(0, view.detail.height() // 2))
     choice = box.mapTo(view, QPoint(0, box.height() // 2))
-    assert abs(detail.y() - choice.y()) <= 2 and choice.x() > detail.x()
+    assert choice.y() > detail.y()
+    assert view.step_propose.content.isAncestorOf(box)
     assert "exactly on the shared edge" in box.toolTip()
     session_file = lp.session_path(view.project, "ac52")
     box.setCurrentIndex(1)
