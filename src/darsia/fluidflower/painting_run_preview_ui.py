@@ -76,6 +76,7 @@ class PaintingRunPreview(QObject):
         self._retry_attempts = 0
         self._joining = False
         self.last_result = None
+        self._last_session = None
         self._index = str(QSettings(*_SETTINGS).value(_INDEX, "") or "")
         self.widget = QWidget()
         layout = QVBoxLayout(self.widget)
@@ -104,6 +105,10 @@ class PaintingRunPreview(QObject):
         self.note.setTextFormat(Qt.TextFormat.PlainText)
         self.note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.note)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
         self.measurements = QTableWidget(0, 7)
         self.measurements.setHorizontalHeaderLabels(["Layers", "Median mm", "P10 mm", "P90 mm", "Δ reference mm", "Samples", "Status"])
         self.measurements.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -126,9 +131,6 @@ class PaintingRunPreview(QObject):
         self.status_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         overlay_layout.addWidget(self.status_text)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
-        overlay_layout.addWidget(self.progress_bar)
         overlay_layout.addStretch(1)
         self.status_overlay.hide()
         self._viewport.installEventFilter(self)
@@ -166,11 +168,13 @@ class PaintingRunPreview(QObject):
 
     def _alive(self):
         return (not self._disposed and isValid(self) and isValid(self.view)
-                and isValid(self.canvas) and isValid(self._viewport) and isValid(self.widget))
+                and isValid(self.canvas) and isValid(self._viewport) and isValid(self.widget)
+                and isValid(self.progress_bar))
 
     def _invalidate(self, *_args):
         self._disposed = True
         self._waiting_key = None
+        self._last_session = None
 
     def _key(self):
         session = self.view.session
@@ -191,7 +195,7 @@ class PaintingRunPreview(QObject):
             return
         self._stage = str(message)
         self._loading_status = loading
-        self.progress_bar.setVisible(loading)
+        self.progress_bar.setVisible(loading and not self.is_reference())
         self._elapsed(force=True)
         shown = self.last_result is not None and self._result_key == self._key()
         self.status_overlay.setGeometry(self._viewport.rect())
@@ -308,6 +312,7 @@ class PaintingRunPreview(QObject):
             self._pending = False
             self._elapsed_timer.stop()
             self._loading_status = False
+            self.progress_bar.hide()
             self.status_overlay.hide()
             self.note.setText("Reference run: editable. Viewing other runs keeps this drawing on its own photograph.")
         else:
@@ -351,6 +356,7 @@ class PaintingRunPreview(QObject):
         self._pending = False
         self.canvas.clear_photo()
         self.last_result = None
+        self._last_session = None
         self._result_key = None
         self.measurements.setRowCount(0)
         self.measurements.hide()
@@ -414,6 +420,7 @@ class PaintingRunPreview(QObject):
             self._failed(f"Could not display the preview: {type(error).__name__}: {error}")
             return
         self.last_result = result
+        self._last_session = session
         self._result_key = self._active_key
         self.status_overlay.hide()
         if partial:
@@ -421,27 +428,12 @@ class PaintingRunPreview(QObject):
         else:
             self._elapsed_timer.stop()
             self._loading_status = False
+            self.progress_bar.hide()
 
     def _render_result(self, result, session):
         self.canvas.set_photo(result.photo, (result.photo.shape[1], result.photo.shape[0]),
                               token={"path": result.photo_path, "run_id": result.run_id}, reset_view=True)
-        rgba = np.zeros((*result.layers.shape, 4), dtype=np.uint8)
-        style = getattr(self.view, "display_layer_styles", None)
-        if callable(style):
-            colors, hidden = style(session)
-        else:
-            colors, hidden = {layer.layer_id: QColor(layer.color) for layer in session.layers}, frozenset()
-        for layer in session.layers:
-            if layer.layer_id in hidden:
-                continue
-            color = QColor(colors.get(layer.layer_id, layer.color))
-            rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
-        # A gap stays a gap, including edge-replicated pixels the source does
-        # not reach. The overlay never turns those pixels into a decided layer.
-        gaps = result.uncovered | (result.layers == lp.OUTSIDE)
-        rgba[gaps] = (255, 0, 255, 95)
-        self.canvas.set_proposal(rgba)
-        self.canvas.set_overlays_visible(False, True)
+        self._render_overlay(result, session)
         offsets = result.measurements.get("layer_offsets") or {}
         rows = offsets.get("boundaries") or []
         self.measurements.setRowCount(len(rows))
@@ -460,6 +452,43 @@ class PaintingRunPreview(QObject):
                           f"Displacement: median {shift.get('median_px', '—')} px, maximum {shift.get('max_px', '—')} px. "
                           f"Uncovered: {checks.get('uncovered_pixels', '—')} px; water pockets: {checks.get('water_pocket_pixels', '—')} px. "
                           "Boundary offsets use the placement review's descriptive method.")
+
+    def _render_overlay(self, result, session):
+        """Recolour the cached categorical display without reloading its photo."""
+        rgba = np.zeros((*result.layers.shape, 4), dtype=np.uint8)
+        style = getattr(self.view, "display_layer_styles", None)
+        if callable(style):
+            colors, hidden = style(session)
+        else:
+            colors, hidden = {layer.layer_id: QColor(layer.color) for layer in session.layers}, frozenset()
+        for layer in session.layers:
+            if layer.layer_id in hidden:
+                continue
+            color = QColor(colors.get(layer.layer_id, layer.color))
+            rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
+        # A gap stays a gap, including edge-replicated pixels the source does
+        # not reach. The overlay never turns those pixels into a decided layer.
+        gaps = result.uncovered | (result.layers == lp.OUTSIDE)
+        rgba[gaps] = (255, 0, 255, 95)
+        self.canvas.set_proposal(rgba)
+        self.canvas.set_overlays_visible(False, True)
+
+    @Slot()
+    def redraw_display(self):
+        """Update only the current cached overlay; retain progress, errors and zoom."""
+        if not self._alive() or self.is_reference() or self._pending:
+            return
+        result, session = self.last_result, self._last_session
+        if result is None or session is None or self._result_key != self._key():
+            return
+        if (result.run_id != str(self.runs.currentData() or "").casefold()
+                or self.view.session is None or result.source_run != self.view.session.run_id.casefold()):
+            return
+        try:
+            self._render_overlay(result, session)
+        except Exception as error:
+            self._status(self.note.text() + f" Display colours unavailable: {type(error).__name__}: {error}",
+                         loading=self._loading_status)
 
     @Slot(str)
     def _failed(self, message):
@@ -495,6 +524,7 @@ class PaintingRunPreview(QObject):
             return
         self._elapsed_timer.stop()
         self._loading_status = False
+        self.progress_bar.hide()
         self.sources.setEnabled(True)
         self.reference_button.setEnabled(not self.is_reference() and self.set_reference is not None)
         if not self._joining and (self._pending or (not self.is_reference() and self._active_key != self._key())):
@@ -507,6 +537,8 @@ class PaintingRunPreview(QObject):
         self._active_key = None
         self._elapsed_timer.stop()
         self._loading_status = False
+        if isValid(self.progress_bar):
+            self.progress_bar.hide()
         self._joining = True
         try:
             if self.thread is not None:
