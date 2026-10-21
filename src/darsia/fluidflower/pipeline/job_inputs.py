@@ -455,7 +455,10 @@ class InputCatalog:
 
     def collect(self, config_descriptor, config):
         self.add(config_descriptor, "configuration", "run.configuration")
-        if config.get("format") == "darsia-n1-run-v1":
+        if config.get("format") == "darsia-series-setup-operation-v1":
+            from .series_setup_inputs import catalogue_setup_inputs
+            self.setup_controls = catalogue_setup_inputs(self, config)
+        elif config.get("format") == "darsia-n1-run-v1":
             self.mass(config, config["frames"], standalone=True)
         elif config.get("format") == "darsia-native-phase-n1-run-v1":
             phase, native = self.phase(config)

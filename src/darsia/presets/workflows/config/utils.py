@@ -149,7 +149,11 @@ def _config_path(value: Any, config: Path | list[Path] | None) -> Path:
     DarSIA's working-directory meaning. Other values are returned as Paths.
     """
     path = Path(value)
-    if config is None or not _is_relative_path(value) or _in_alias_job_worker():
+    run_io = sys.modules.get("darsia.fluidflower.pipeline.run_io")
+    binding = None if run_io is None else run_io.current_binding()
+    original_setup = getattr(binding, "series_setup_original_reader", False) is True
+    if (config is None or not _is_relative_path(value)
+            or _in_alias_job_worker() and not original_setup):
         return path
     root = _series_root(config)
     return path if root is None else root / path

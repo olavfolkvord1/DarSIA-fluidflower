@@ -197,6 +197,9 @@ class RunIOBinding:
         self.configuration = deepcopy(config)
         self.configuration_descriptor = dict(path=str(row.path),
             sha256=row.reference["sha256"], size_bytes=row.reference["bytes"])
+        if config.get("format") == "darsia-series-setup-operation-v1":
+            from .series_setup_run_io import replay_setup_controls
+            return replay_setup_controls(self)
         # Read the original TOML only as raw admitted input. Its historical
         # absolute descriptors are never rewritten or copied into job metadata.
         original_series = verified.for_use("run.execution_series")
