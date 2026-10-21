@@ -1386,6 +1386,7 @@ class JobsPanel(QWidget):
 
     @staticmethod
     def _raw_review_eligible(data):
+        """Require verified completion and declared preparations for every source run."""
         facts = (data or {}).get("job_facts") or {}
         preparations = (data or {}).get("raw_review_preparations")
         runs = facts.get("expected_runs") or ()
@@ -1408,6 +1409,7 @@ class JobsPanel(QWidget):
 
 
     def _queue_raw_review(self, root, *, interactive, preparations=None):
+        """Queue one review preparation with a snapshot of its declared inputs."""
         if root in self._raw_review_queued:
             return
         if preparations is None:
@@ -1422,6 +1424,7 @@ class JobsPanel(QWidget):
 
 
     def _start_raw_review(self):
+        """Start the next queued review operation on a finite background thread."""
         if self._raw_review_thread is not None or not self._raw_review_pending:
             return
         task = self._raw_review_pending.pop(0)
@@ -1466,12 +1469,14 @@ class JobsPanel(QWidget):
 
     @Slot(object)
     def _raw_review_ready(self, value):
+        """Display the completed operation's result for its original job."""
         self._raw_review_results[value["root"]] = value["text"]
         self._show_raw_review_state()
 
 
     @Slot()
     def _raw_review_closed(self):
+        """Retire the finished thread before releasing its job and starting another."""
         if self._raw_review_thread is not None:
             self._raw_review_thread.wait()
         self._raw_review_thread = self._raw_review_worker = None
@@ -1485,6 +1490,7 @@ class JobsPanel(QWidget):
 
     @Slot()
     def prepare_raw_review(self):
+        """Queue the selected eligible job or explain which input is missing."""
         if not self._raw_review_eligible(self.current):
             self.raw_review_status.setText((self.current or {}).get("raw_review_reason") or
                 "RAW review needs a verified completed run and this series' declared RAW acquisition preparations.")
@@ -1493,6 +1499,7 @@ class JobsPanel(QWidget):
 
 
     def _show_raw_review_state(self):
+        """Refresh review actions and explain eligibility or operation progress."""
         root = (self.current or {}).get("root")
         eligible = self._raw_review_eligible(self.current)
         reason = (self.current or {}).get("raw_review_reason") or (
@@ -1552,6 +1559,7 @@ class JobsPanel(QWidget):
 
     @Slot(object)
     def _raw_review_registration_ready(self, value):
+        """Report registration and refresh model metadata after a successful binding."""
         self._raw_review_ready(value)
         if value.get("complete") and value.get("binding"):
             self.raw_review_registered.emit(value["binding"])

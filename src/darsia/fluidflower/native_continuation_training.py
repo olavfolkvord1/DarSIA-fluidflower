@@ -12,6 +12,7 @@ class NativeContinuationTraining:
     """One page's continuation readiness, request launch and honest completion."""
 
     def __init__(self, steps):
+        """Attach readiness, launch and completion hooks to the training page."""
         self.steps, self.studio = steps, steps.studio
         self.ready, self.reason = False, "Choose an indexed saved model as the training basis."
         self._cache_key = None
@@ -68,6 +69,7 @@ class NativeContinuationTraining:
         return self.reason
 
     def start(self):
+        """Freeze compatible evidence and launch a continuation job from saved weights."""
         from .phase_workflow import parse_training_bundles
         self.refresh()
         if not self.ready:
@@ -86,6 +88,7 @@ class NativeContinuationTraining:
             "Continuing the saved model as a new CPU candidate; independent validation remains required.")
 
     def finished(self, exit_code, exit_status):
+        """Report completion and index successful continuation candidates."""
         request = dict(self.studio.training_request or {})
         if (int(exit_code) != 0
                 or (request.get("continuation") or {}).get("contract") != continuation.CONTRACT):

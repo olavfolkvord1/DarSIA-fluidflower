@@ -19,6 +19,7 @@ CONTRACT = "darsia-raw-baseline-display-classes-v1"
 
 
 def _array(reader, descriptor):
+    """Read a verified array or copy the named array from a closed archive."""
     value = reader.array(descriptor)
     if isinstance(value, np.lib.npyio.NpzFile):
         with value as archive:

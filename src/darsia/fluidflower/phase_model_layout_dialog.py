@@ -12,22 +12,27 @@ class _Files(QAbstractTableModel):
     columns = ("Original", "Destination", "Bytes", "SHA-256", "Action")
 
     def __init__(self, rows=(), parent=None, *, series_root=None):
+        """Retain the preview rows and their optional display-path origin."""
         super().__init__(parent)
         self.rows = list(rows)
         self.series_root = Path(series_root) if series_root is not None else None
 
     def rowCount(self, parent=QModelIndex()):
+        """Expose only top-level file rows."""
         return 0 if parent.isValid() else len(self.rows)
 
     def columnCount(self, parent=QModelIndex()):
+        """Expose the fixed preview columns for top-level rows."""
         return 0 if parent.isValid() else len(self.columns)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        """Label horizontal preview columns and defer other header roles."""
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
             return self.columns[section]
         return super().headerData(section, orientation, role)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        """Show compact paths while retaining complete identities in tooltips."""
         if not index.isValid() or role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
             return None
         row = self.rows[index.row()]
@@ -46,6 +51,7 @@ class PhaseModelLayoutDialog(QDialog):
     locations_changed = Signal()
 
     def __init__(self, series_root, parent=None, *, planner=None, copier=None):
+        """Build the explicit preview, quiescence and copy controls."""
         super().__init__(parent)
         self.series_root = Path(series_root)
         self._planner, self._copier = planner, copier
@@ -97,6 +103,7 @@ class PhaseModelLayoutDialog(QDialog):
         layout.addLayout(row)
 
     def _choose_session(self):
+        """Add a chosen external session and invalidate the previous preview."""
         path = QFileDialog.getExistingDirectory(self, "Choose the folder containing review_session.json")
         if path and path not in self.sessions:
             self.sessions.append(path)
@@ -105,6 +112,7 @@ class PhaseModelLayoutDialog(QDialog):
             self.summary.setText("External session added. Preview again to verify its selected-series scope and exact files.")
 
     def _start(self, operation, function):
+        """Run one filesystem operation outside the GUI thread."""
         from .jobs_panel import _CallWorker
         if self._thread is not None:
             return
@@ -123,12 +131,14 @@ class PhaseModelLayoutDialog(QDialog):
         self._thread.start()
 
     def _controls(self, enabled):
+        """Enable copying only for a preview with confirmed writer quiescence."""
         self.add_session.setEnabled(enabled)
         self.preview.setEnabled(enabled)
         self.quiescent.setEnabled(enabled)
         self.copy.setEnabled(enabled and self.plan is not None and self.quiescent.isChecked())
 
     def preview_files(self):
+        """Read exact source identities without copying any files."""
         from .phase_model_layout import preview_layout
         self.plan = None
         self.quiescent.setChecked(False)
@@ -138,6 +148,7 @@ class PhaseModelLayoutDialog(QDialog):
         self._start("preview", lambda: planner(self.series_root, external_sessions=sessions))
 
     def copy_files(self):
+        """Apply the reviewed plan after explicit writer-quiescence confirmation."""
         from .phase_model_layout import apply_layout
         if self.plan is None:
             self.summary.setText("Preview the exact files before copying.")
@@ -152,6 +163,7 @@ class PhaseModelLayoutDialog(QDialog):
 
     @Slot(object)
     def _ready(self, value):
+        """Display the preview or announce a verified storage cutover."""
         if self._operation == "preview":
             self.plan = value
             self.table.setModel(_Files(value["files"], self.table, series_root=self.series_root))
@@ -167,6 +179,7 @@ class PhaseModelLayoutDialog(QDialog):
 
     @Slot(str)
     def _failed(self, error):
+        """Explain the failure while retaining originals and partial copies."""
         self.plan = None
         self.quiescent.setChecked(False)
         # _CallWorker emits a traceback; show its final exception in plain words.
@@ -176,6 +189,7 @@ class PhaseModelLayoutDialog(QDialog):
 
     @Slot()
     def _closed(self):
+        """Release the finished worker and restore the available controls."""
         if self._thread is not None:
             self._thread.wait()
         self._thread = self._worker = None
@@ -183,15 +197,18 @@ class PhaseModelLayoutDialog(QDialog):
         self._controls(True)
 
     def can_close(self):
+        """Report whether all filesystem work has finished."""
         return self._thread is None
 
     def reject(self):
+        """Defer dismissal until the active filesystem operation returns."""
         if self.can_close():
             super().reject()
         else:
             self.summary.setText("The current file operation is still finishing. Close after it returns.")
 
     def closeEvent(self, event):
+        """Keep the dialog open while a valid operation is still finishing."""
         if not self.can_close():
             self.summary.setText("The current file operation is still finishing. Close after it returns.")
             event.ignore()

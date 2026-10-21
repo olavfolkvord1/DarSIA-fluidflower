@@ -2171,11 +2171,13 @@ class NativeFluidFlowerMainWindow(MainWindow):
         return self.jobs_workspace
 
     def _selected_jobs_review_model(self):
+        """Return the exact model currently selected for production review."""
         page = getattr(self.phase_model_workspace, "studio_page", None)
         studio = getattr(page, "studio", None)
         return studio._selected_validation_model() if studio is not None else None
 
     def _jobs_review_registered(self, _binding):
+        """Refresh model bindings after a production review is registered."""
         page = getattr(self.phase_model_workspace, "studio_page", None)
         studio = getattr(page, "studio", None)
         if studio is not None:

@@ -30,15 +30,18 @@ _LAYOUT = {
 
 
 def _key(path):
+    """Normalise an absolute path for location comparisons."""
     return os.path.normcase(os.path.abspath(path))
 
 
 def _digest(value):
+    """Hash the deterministic JSON representation of a plan."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
 def _pin(path):
+    """Record exact bytes and timestamps while detecting concurrent changes."""
     path = Path(path)
     before = path.stat()
     sha = hashlib.sha256()
@@ -54,6 +57,7 @@ def _pin(path):
 
 
 def _verify(bound, path=None, *, timestamps=False):
+    """Check a planned source or copy against its recorded identity."""
     current = _pin(bound["path"] if path is None else path)
     keys = ("sha256", "size_bytes", "mtime_ns") if timestamps else ("sha256", "size_bytes")
     if any(current[key] != bound[key] for key in keys):
@@ -62,6 +66,7 @@ def _verify(bound, path=None, *, timestamps=False):
 
 
 def _json(path):
+    """Read bounded metadata through the strict JSON decoder."""
     from .pipeline.job_inputs import _json_bytes, MAX_METADATA_BYTES
     if Path(path).stat().st_size > MAX_METADATA_BYTES:
         raise ValueError("Layout metadata exceeds its size limit")
@@ -69,6 +74,7 @@ def _json(path):
 
 
 def _write(path, value):
+    """Create and flush a fresh metadata file without replacing existing bytes."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -131,6 +137,7 @@ def _new_manifest(raw):
 
 
 def _manifest_series(settings):
+    """Resolve the explicitly declared workspace identity to its canonical key."""
     from .series_paths import series_key
     series = (settings.get("series") or {}).get("id") or settings.get("dataset") or settings.get("series_id")
     if not isinstance(series, str) or not series.strip():
@@ -139,6 +146,7 @@ def _manifest_series(settings):
 
 
 def _external_session(path, series):
+    """Validate an external session's scope and original save-root routing."""
     from .review_storage import resolve_review_path
     root = resolve_review_path(path)
     session = _json(root / "review_session.json")
@@ -297,12 +305,14 @@ def preview_layout(series_root, *, external_sessions=(), model_roots=None):
 
 
 def _verify_trees(plan, *, excluding=()):
+    """Refuse changed source inventories before or during copying."""
     for tree in plan["trees"]:
         if _inventory(tree["source"], excluding=excluding) != tree["files"]:
             raise ValueError("A source tree changed after the dry run: " + tree["source"])
 
 
 def _safe_target(path, phase_root):
+    """Keep destinations inside the selected folder without traversing links."""
     path, phase_root = Path(os.path.abspath(path)), Path(os.path.abspath(phase_root))
     if not path.is_relative_to(phase_root):
         raise ValueError("A layout destination leaves the selected PhaseModel folder")
@@ -374,6 +384,7 @@ def apply_layout(plan, *, writers_quiescent=False):
 
 
 def _copy_locked(plan, receipt_root, completed, digest, lock):
+    """Copy verified bytes and switch storage paths while holding the ledger lock."""
     from .phase_model_library import source_identity
     from .phase_review_retractions import load_retractions
     from .review_storage import review_aliases

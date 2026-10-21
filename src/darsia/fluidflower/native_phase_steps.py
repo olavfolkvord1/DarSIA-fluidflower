@@ -849,10 +849,12 @@ class NativePhaseSteps(QWidget):
             return self.method_use(selection)
 
     def can_close(self):
+        """Report whether the storage dialog has finished its filesystem work."""
         dialog = getattr(self, "_layout_dialog", None)
         return dialog is None or dialog.can_close()
 
     def _organise_phase_files(self):
+        """Open the explicit file preview for the selected workspace."""
         if self.series_root is None or not str(self.series_id or "").strip():
             return
         from .phase_model_layout_dialog import PhaseModelLayoutDialog
@@ -866,6 +868,7 @@ class NativePhaseSteps(QWidget):
         self._layout_dialog.show()
 
     def _phase_locations_changed(self, original_root):
+        """Refresh copied paths while retaining the exact selected model."""
         # A background copy retains its original series even if the user opens
         # another one. Never apply that series' model preference to the new page.
         if self.series_root != original_root:

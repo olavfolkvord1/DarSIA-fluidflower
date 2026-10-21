@@ -1979,38 +1979,48 @@ class WrappingControlLayout(QLayout):
     """Keep photographic options readable as the review pane gets narrower."""
 
     def __init__(self) -> None:
+        """Create a compact layout that places controls at their requested sizes."""
         super().__init__()
         self._items = []
         self.setContentsMargins(0, 0, 0, 0)
         self.setSpacing(6)
 
     def addItem(self, item) -> None:
+        """Append a control and invalidate the cached layout geometry."""
         self._items.append(item)
         self.invalidate()
 
     def count(self) -> int:
+        """Return the number of managed layout items."""
         return len(self._items)
 
     def itemAt(self, index):
+        """Return the indexed item without removing it, or None outside the layout."""
         return self._items[index] if 0 <= index < len(self._items) else None
 
     def takeAt(self, index):
+        """Remove and return the indexed item when it exists."""
         return self._items.pop(index) if 0 <= index < len(self._items) else None
 
     def expandingDirections(self):
+        """Keep control sizes independent of spare horizontal or vertical space."""
         return Qt.Orientation(0)
 
     def hasHeightForWidth(self) -> bool:
+        """Tell Qt that wrapping determines the layout height."""
         return True
 
     def heightForWidth(self, width: int) -> int:
+        """Measure the required wrapped height without moving controls."""
         return self._arrange(QRect(0, 0, width, 0))
 
     def setGeometry(self, rectangle) -> None:
+        """Apply the available rectangle and place each wrapped control."""
         super().setGeometry(rectangle)
         self._arrange(rectangle, place=True)
 
     def minimumSize(self):
+        """Require enough space for the largest visible control and layout margins."""
         size = QSize(0, 0)
         for item in self._items:
             if not item.isEmpty():
@@ -2019,9 +2029,11 @@ class WrappingControlLayout(QLayout):
         return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
 
     def sizeHint(self):
+        """Use the minimum control footprint as the layout's preferred size."""
         return self.minimumSize()
 
     def _arrange(self, rectangle, *, place=False) -> int:
+        """Measure or place visible controls in rows without shrinking their labels."""
         margins = self.contentsMargins()
         left, top = rectangle.x() + margins.left(), rectangle.y() + margins.top()
         right = rectangle.right() - margins.right() + 1

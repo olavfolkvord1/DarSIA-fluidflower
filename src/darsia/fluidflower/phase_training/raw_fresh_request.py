@@ -39,6 +39,7 @@ PHYSICAL_BINDING_KEYS = ("reference_context_path", "reference_context_sha256",
 
 
 def _descriptor(value):
+    """Validate an asset descriptor while preserving its bound metadata."""
     if (not isinstance(value, Mapping) or not isinstance(value.get("path"), str)
             or not isinstance(value.get("sha256"), str) or len(value["sha256"]) != 64):
         raise ValueError("An exact input path and SHA-256 are required")
@@ -109,6 +110,7 @@ def inspect_physical_context(source, native_configuration, *, reader=None):
 
 
 def _verify_photometry_inputs(value, reader):
+    """Check recorded scientific input declarations and their bound source files."""
     if not isinstance(value, Mapping):
         raise ValueError("The supplied parent has no saved input-photometry block")
     if value.get("display_jpeg_is_training_input") is not False or value.get("full_native_resolution") is not True:
@@ -119,6 +121,7 @@ def _verify_photometry_inputs(value, reader):
 
 
 def _verify_raw_jobs(manifest, *, reader):
+    """Check RAW manifest identities and the declared photographic support."""
     result = []
     for job in manifest.get("jobs") or ():
         run = str(job.get("run") or "").casefold()
@@ -280,6 +283,7 @@ def prepare_request(*, output_root: Path, parent_request: Mapping, bundles: Sequ
 
 
 def main(argv=None):
+    """Freeze a verified preparation specification and report the saved request."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--spec-sha256", required=True)

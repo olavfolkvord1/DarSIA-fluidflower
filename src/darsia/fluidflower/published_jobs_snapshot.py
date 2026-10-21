@@ -286,6 +286,7 @@ class _SnapshotMetadata:
     """Strict shared metadata reused only during one terminal snapshot."""
 
     def __init__(self, index, root, products):
+        """Index published metadata paths and create one bounded snapshot cache."""
         self.index = _bound(index)
         self.root = Path(root)
         self.by_path = {}
@@ -298,9 +299,11 @@ class _SnapshotMetadata:
         self.index_stamp = _stamp(_file(self.index["path"]).stat())
 
     def matches(self, path):
+        """Return every indexed product bound to the exact original path."""
         return self.by_path.get(path, ())
 
     def read(self, key):
+        """Read a verified metadata copy and reuse its bytes within this snapshot."""
         row = self.products[_relative(key)]
         copy = row.get("metadata_copy")
         if copy is None:
@@ -329,6 +332,7 @@ class _SnapshotMetadata:
         return bound, raw
 
     def finish(self):
+        """Recheck the index and all consumed metadata before accepting the snapshot."""
         # Rehash, do not trust stat alone: same-size/mtime edits must fail too.
         _verified_bytes(self.index["path"], self.index, limit=MAX_INDEX_BYTES)
         if _stamp(_file(self.index["path"]).stat()) != self.index_stamp:

@@ -67,21 +67,25 @@ def install_readers():
 
 
 def _file(path):
+    """Return the current file's byte descriptor without modifying it."""
     from .raw_review_postrun import _pin
     return _pin(path)
 
 
 def _read(bound):
+    """Read saved JSON only after verifying its complete byte descriptor."""
     from .raw_review_postrun import _read
     return _read(bound)
 
 
 def _write(path, value):
+    """Create new durable JSON metadata through the shared exclusive writer."""
     from .raw_review_postrun import _write
     return _write(path, value)
 
 
 def _assets(value):
+    """Yield declared file descriptors from nested mappings and sequences."""
     if isinstance(value, Mapping):
         if "path" in value and "sha256" in value:
             yield value
@@ -283,6 +287,7 @@ def validated_job(job):
 
 
 def review_candidate(selection_dir, job):
+    """Build a review candidate from verified RAW and published-label provenance."""
     from .tools.calibration_pairwise_review import Candidate
     record, run, raw = validated_job(job)
     root = Path(record["source_model_root"])

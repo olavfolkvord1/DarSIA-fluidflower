@@ -27,6 +27,7 @@ RUNTIME_SETTINGS = frozenset({"stage_workers", "extraction_workers", "opencv_thr
 
 
 def _signature(region):
+    """Identify reviewed evidence by content while allowing bound assets to relocate."""
     def content_identity(value):
         if isinstance(value, Mapping):
             # Freezing a dependency may copy its unchanged bytes to a new
@@ -149,6 +150,7 @@ def continue_head(parent: DualPhaseSignalModel, features, owners, regions, *, he
 
 
 def _bundles(document, reader):
+    """Verify and resolve frozen decision and manifest pairs from a request."""
     from .trainer import ReviewBundle
     result = []
     for row in document["bundles"]:
@@ -248,6 +250,7 @@ def prepare_request(*, parent_entry: Mapping, output_parent: Path, cache_parent:
 
 
 def build_command(request):
+    """Return the interpreter command for the prepared continuation producer."""
     from ..phase_workflow import phase_python_executable
     return [phase_python_executable(), "-B", "-m", __name__, "--request", request["request_path"]]
 
@@ -372,6 +375,7 @@ def train(request_path: Path):
 
 
 def main():
+    """Run the continuation producer for the explicitly selected request file."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", type=Path, required=True)
     args = parser.parse_args()

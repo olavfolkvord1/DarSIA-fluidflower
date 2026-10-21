@@ -27,10 +27,12 @@ class ReviewInputsMissing(ValueError):
 
 
 def _key(path):
+    """Normalize a recorded path for case-insensitive comparisons."""
     return ntpath.normcase(ntpath.normpath(str(path)))
 
 
 def _same(left, right):
+    """Compare saved values with the existing JSON equality rules."""
     from .pipeline.staged_data import _same_json
     return _same_json(left, right)
 
@@ -51,6 +53,7 @@ def _pin(path):
 
 
 def _bound(value):
+    """Require a complete saved path, SHA-256 digest and byte count."""
     if (not isinstance(value, Mapping) or not isinstance(value.get("path"), str)
             or re.fullmatch(r"[0-9a-f]{64}", value.get("sha256", "")) is None
             or type(value.get("size_bytes")) is not int or value["size_bytes"] < 0):
@@ -59,6 +62,7 @@ def _bound(value):
 
 
 def _read(value):
+    """Read size-bounded JSON only after verifying its pinned bytes."""
     from .pipeline.job_inputs import _json_bytes, MAX_METADATA_BYTES
     value = _bound(value)
     if _pin(value["path"]) != value:
@@ -72,6 +76,7 @@ def _read(value):
 
 
 def _write(path, value):
+    """Create a new durable JSON file and return its byte descriptor."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False,
@@ -132,6 +137,7 @@ def _completion_pins(job):
 
 
 def _finished(job_root):
+    """Require verified final publications and closed completion for every run."""
     from .jobs_metadata import JobSnapshotReader
     from .published_dataset.job_reader import FinishedJob
     root = Path(job_root)
@@ -151,6 +157,7 @@ class _Sources:
     """Read only named catalogue inputs and exact indexed producer products."""
 
     def __init__(self, job, run, stores):
+        """Validate the input catalogue and initialize explicit source bindings."""
         from .pipeline.job_inputs import validate_catalog
         self.job, self.run, self.stores = job, run, stores
         self.task = job.tasks[run]
@@ -161,6 +168,7 @@ class _Sources:
         self._protected_source_ids = set()
 
     def register(self, original, physical):
+        """Bind a saved descriptor to one physical path without identity conflicts."""
         original = dict(original)
         if re.fullmatch(r"[0-9a-f]{64}", original.get("sha256", "")) is None:
             raise ValueError("A producer asset needs its original SHA-256")
@@ -185,6 +193,7 @@ class _Sources:
         return dict(original, path=str(physical))
 
     def input(self, original, use, role):
+        """Resolve one exact catalogue input with the required use and role."""
         from .pipeline.store_runtime import _available_input
         rows = [row for row in self.catalog["inputs"] if use in row["uses"]]
         if len(rows) != 1:
@@ -197,6 +206,7 @@ class _Sources:
         return self.register(dict(original, size_bytes=ref["bytes"]), path)
 
     def configuration(self):
+        """Resolve and read the exact configuration recorded in the task catalogue."""
         rows = [row for row in self.catalog["inputs"] if "run.configuration" in row["uses"]]
         if len(rows) != 1 or rows[0]["reference"] != self.task["configuration"]:
             raise ValueError("The run configuration differs from its original catalogue")
@@ -208,6 +218,7 @@ class _Sources:
         return bound, self.json(bound)
 
     def product(self, original):
+        """Resolve one indexed published product matching the saved descriptor."""
         rows = [row for row in self.job.products[self.run].values()
                 if _key(row.local_path) == _key(original["path"])
                 and row.sha256 == original.get("sha256")
@@ -238,6 +249,7 @@ class _Sources:
         return self.register(original, Path(physical["path"]))
 
     def path(self, value):
+        """Return an admitted source path after checking its recorded byte identity."""
         identity = (_key(value["path"]), value["sha256"])
         path = self.locations.get(identity)
         if path is None:
@@ -255,6 +267,7 @@ class _Sources:
         return path
 
     def json(self, value):
+        """Read bounded JSON from a verified source binding."""
         from .pipeline.job_inputs import _json_bytes, MAX_METADATA_BYTES
         path = self.path(value)
         if path.stat().st_size > MAX_METADATA_BYTES:
@@ -262,6 +275,7 @@ class _Sources:
         return _json_bytes(path.read_bytes())
 
     def array(self, value):
+        """Open a verified array read-only without loading pickled objects."""
         import numpy as np
         return np.load(self.path(value), allow_pickle=False, mmap_mode="r")
 
@@ -285,6 +299,7 @@ class _Sources:
 
     @staticmethod
     def _check_bytes(path, bound):
+        """Rehash a source and require its original digest and byte count."""
         actual = _pin(path)
         if (actual["sha256"] != bound["sha256"]
                 or "size_bytes" in bound and actual["size_bytes"] != bound["size_bytes"]):
@@ -305,6 +320,7 @@ class _Sources:
                 raise ValueError("An original consumed RAW review source changed its byte count")
 
     def full(self, full, *, input_prefix=None):
+        """Admit and protect the exact centre and ring assets consumed by display."""
         centre = full["native_centre"]
         items = [(centre["log_linear_rgb"], ".centre.log"),
                  (centre["valid_mask"], ".centre.valid")]
@@ -328,14 +344,17 @@ class _Sources:
 class _PhotoEntry(dict):
     """Keep per-frame support transient instead of holding every frame's raster."""
     def __init__(self, value, photo):
+        """Retain frame metadata and a lazy photographic support loader."""
         super().__init__(value)
         self.photo = photo
 
     def __getitem__(self, key):
+        """Materialize photographic support only when that entry is requested."""
         return self.photo() if key == "photo_support" else super().__getitem__(key)
 
 
 def _photo_factory(sources, roles, native, shape, aliases=()):
+    """Bind a lazy support projection to its original photo proof and transform."""
     from .native import support
     import numpy as np
     photo = roles.get("photo_sand_reference")
@@ -357,6 +376,7 @@ def _photo_factory(sources, roles, native, shape, aliases=()):
 
 @dataclass
 class PreparedRun:
+    """Hold verified source bindings and inputs needed to render one review run."""
     run: str
     configuration: dict
     native_configuration: dict
@@ -508,6 +528,7 @@ def prepare_run(job, run, stores, preparation):
 
 
 def _stores(bound, series_root):
+    """Read the explicitly selected store map after verifying its saved bytes."""
     from .store_map import read_store_map
     _read_store_bytes = _bound(bound)
     if _pin(_read_store_bytes["path"]) != _read_store_bytes:
@@ -579,6 +600,7 @@ def attach_request(request):
 
 
 def _request(value):
+    """Verify request structure and unchanged original job completion records."""
     request = _read(value)
     required = {"format", "job_root", "job", "series_id", "completion", "series_root", "stores",
                 "preparations", "configurations", "output_root", "old_results_unchanged", "adopted"}
@@ -595,15 +617,18 @@ def _request(value):
 
 
 def _has_baseline_geometry(reference):
+    """Report whether the saved reference retains its own geometry binding."""
     return "geometry" in (reference.get("full", {}).get("binding") or {})
 
 
 def _baseline_paths(review_root, run):
+    """Return the class archive and provenance output paths for one run."""
     folder = Path(review_root) / "baseline_classes"
     return folder / (run.casefold() + ".npz"), folder / (run.casefold() + ".json")
 
 
 def _baseline_provenance(prepared, classes):
+    """Describe display-only classes and their exact baseline source bindings."""
     from .raw_review_baseline_classes import CONTRACT
     return dict(format=CONTRACT, run=prepared.run, display_only=True,
         acquisition_manifest=prepared.reference_manifest, record_index=prepared.reference_index,
@@ -612,6 +637,7 @@ def _baseline_provenance(prepared, classes):
 
 
 def _write_baseline_classes(prepared, review_root):
+    """Write baseline classes and provenance when original geometry is bound."""
     from .raw_review_baseline_classes import write_baseline_rig_classes
     if not _has_baseline_geometry(prepared.reference_record):
         return None
@@ -649,6 +675,7 @@ def _verify_baseline_classes(prepared, review_root, provenance):
 
 
 def _change_status(prepared):
+    """Explain whether the saved geometry classes support Change display."""
     if not _has_baseline_geometry(prepared.reference_record):
         return "Unavailable: the saved baseline has no own rig geometry; no later frame is substituted"
     if not all(frame.get("rig_classes") for frame in prepared.frames):
@@ -657,6 +684,7 @@ def _change_status(prepared):
 
 
 def _verify_reuse(completed, request_bound, request, prepared_runs):
+    """Verify existing review outputs against the original pinned request."""
     from .raw_photographic_review import (validate_raw_review_manifest, raw_asset_descriptor,
         raw_sources, _descriptor, ORIGINAL_MODE, RAW_DETAIL_MODE, CHANGE_MODE)
     from .phase_saved_assets import VerifiedAssetReader
