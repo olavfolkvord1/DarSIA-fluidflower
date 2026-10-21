@@ -2482,21 +2482,87 @@ class LayerCanvas(QGraphicsView):
 
 
 class _JoinEdgesDialog(QDialog):
-    """Preview the old and shared stretches on the photograph before applying."""
+    """Preview the old and shared stretches on the photograph before applying.
+
+    Every joinable stretch is listed with its length and a check box, all
+    checked at first; only the checked ones are joined, and the preview
+    follows each change at once. A refused join is explained in plain words
+    and its point is ringed in red on the canvas (raw coordinates only in
+    the tooltips). A distance at or below the chosen one that is checked to
+    work is then offered as one button; that search runs in a worker thread,
+    which is freed here in the GUI thread after wait(), never by deleteLater
+    in its own thread.
+    """
+
+    # The offered distance is a whole multiple of this (mm).
+    TOLERANCE_MM = 0.05
+    # Radius of the red ring at a refused point, in screen pixels.
+    RING_PX = 12.0
+    # The checked stretch nearest to the ring is marked in the list, and any
+    # other at most this many raw pixels farther from it.
+    AT_RING_PX = 0.5
+    _INPUTS = ("Selected polygon", "Neighbour polygon")
+
+    class _DistanceSearch(QObject):
+        """Find a distance that is checked to work, for one request, in its own thread."""
+
+        finished = Signal(object)
+
+        def __init__(self, request, pixels_per_mm, decimals):
+            """One request: (generation, points, neighbour, distance px, tolerance px)."""
+            super().__init__()
+            self.request = request
+            self.pixels_per_mm = pixels_per_mm
+            self.decimals = decimals
+            self.stop = False
+
+        @Slot()
+        def run(self):
+            """Emit (generation, mm or None); the mm is checked as the dialog will use it."""
+            from darsia.fluidflower.layer_painting_join import verified_working_distance
+
+            generation, points, other, distance_px, tolerance_px = self.request
+            offer = None
+            try:
+                found = verified_working_distance(
+                    points, other, distance_px, tolerance_px, cancelled=lambda: self.stop
+                )
+                if found is not None and not self.stop:
+                    # The spin box keeps its decimals and the dialog joins at
+                    # value * pixels per mm: check exactly that distance too.
+                    mm = float(f"{found / self.pixels_per_mm:.{self.decimals}f}")
+                    preview = join_to_neighbour(points, other, mm * self.pixels_per_mm)
+                    offer = mm if preview.stretches else None
+            except JoinEdgesError:
+                offer = None
+            finally:
+                self.finished.emit((generation, offer))
 
     def __init__(self, parent, canvas, points, neighbours, pixels_per_mm):
         super().__init__(parent)
+        from PySide6.QtWidgets import QListWidget
+
         self.setWindowTitle("Join to neighbour's edge")
         self.canvas = canvas
         self.points = points
         self.neighbours = neighbours
         self.pixels_per_mm = pixels_per_mm
         self.preview: JoinPreview | None = None
+        self.error: JoinEdgesError | None = None
+        # The joinable stretches at the chosen neighbour and distance.
+        self.stretches: tuple = ()
+        self.offered_mm: float | None = None
+        self._no_smaller = False
+        self._generation = 0
+        self._thread = self._worker = self._pending = None
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "The selected polygon follows the neighbour's outline within the distance.\n"
-            "The neighbour keeps its outline. Orange: old stretches; cyan: shared edge."
-        ))
+        intro = QLabel(
+            "The selected polygon follows the neighbour's outline within the distance; "
+            "the neighbour keeps its outline. Orange: old stretches; cyan: shared edge. "
+            "Only the checked stretches are joined."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
         row = QHBoxLayout()
         row.addWidget(QLabel("Neighbour"))
         self.neighbour = QComboBox()
@@ -2514,6 +2580,28 @@ class _JoinEdgesDialog(QDialog):
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+        offer = QHBoxLayout()
+        self.use_button = QPushButton()
+        self.use_button.setAutoDefault(False)
+        self.use_button.setToolTip(
+            "A distance at or below the chosen one that was checked to give a valid "
+            "join. It is not necessarily the largest distance that works."
+        )
+        self.use_button.clicked.connect(self._use_offered)
+        self.use_button.hide()
+        offer.addWidget(self.use_button)
+        offer.addStretch(1)
+        layout.addLayout(offer)
+        layout.addWidget(QLabel("Stretches to join"))
+        self.stretch_list = QListWidget()
+        self.stretch_list.setToolTip(
+            "Uncheck a stretch to keep its old outline. "
+            "Select one to show it on the photograph."
+        )
+        self.stretch_list.setMaximumHeight(9 * self.fontMetrics().height())
+        self.stretch_list.itemChanged.connect(self._stretch_checked)
+        self.stretch_list.currentRowChanged.connect(self._show_current)
+        layout.addWidget(self.stretch_list)
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
         )
@@ -2522,16 +2610,18 @@ class _JoinEdgesDialog(QDialog):
         layout.addWidget(self.buttons)
         self.old_item = QGraphicsPathItem()
         self.new_item = QGraphicsPathItem()
+        self.current_item = QGraphicsPathItem()
         self.error_item = QGraphicsPathItem()
-        for item, color, style in (
-            (self.old_item, "#ff9900", Qt.PenStyle.DashLine),
-            (self.new_item, "#00ffff", Qt.PenStyle.SolidLine),
-            (self.error_item, "#ff3333", Qt.PenStyle.SolidLine),
+        for item, color, style, width, z in (
+            (self.current_item, QColor(255, 255, 255, 170), Qt.PenStyle.SolidLine, 9.0, 39.0),
+            (self.old_item, QColor("#ff9900"), Qt.PenStyle.DashLine, 3.0, 40.0),
+            (self.new_item, QColor("#00ffff"), Qt.PenStyle.SolidLine, 3.0, 40.0),
+            (self.error_item, QColor("#ff3333"), Qt.PenStyle.SolidLine, 3.0, 41.0),
         ):
-            pen = QPen(QColor(color), 3.0, style)
+            pen = QPen(color, width, style)
             pen.setCosmetic(True)
             item.setPen(pen)
-            item.setZValue(40.0)
+            item.setZValue(z)
             canvas.scene().addItem(item)
         self.neighbour.currentIndexChanged.connect(self.refresh_preview)
         self.distance.valueChanged.connect(self.refresh_preview)
@@ -2547,46 +2637,277 @@ class _JoinEdgesDialog(QDialog):
                     path.lineTo(self.canvas.raw_to_scene(*point))
         return path
 
+    def _other(self):
+        """The outline of the chosen neighbour."""
+        return self.neighbours[self.neighbour.currentIndex()][2]
+
+    def _distance_px(self):
+        """The chosen distance in raw pixels."""
+        return self.distance.value() * self.pixels_per_mm
+
+    def checked_stretches(self) -> list[int]:
+        """The numbers (0, 1, ...) of the checked stretches, in list order."""
+        return [
+            row for row in range(self.stretch_list.count())
+            if self.stretch_list.item(row).checkState() == Qt.CheckState.Checked
+        ]
+
     def refresh_preview(self, *_args):
-        self.preview = None
-        self.old_item.setPath(QPainterPath())
-        self.new_item.setPath(QPainterPath())
-        self.error_item.setPath(QPainterPath())
+        """List the stretches at this neighbour and distance, all checked, and preview."""
+        from darsia.fluidflower.layer_painting_join import join_stretches
+
+        self._stop_search()
+        other, distance_px = self._other(), self._distance_px()
         try:
-            other = self.neighbours[self.neighbour.currentIndex()][2]
-            self.preview = join_to_neighbour(
-                self.points, other, self.distance.value() * self.pixels_per_mm
+            self.preview = join_to_neighbour(self.points, other, distance_px)
+            self.error = None
+            self.stretches = self.preview.stretches
+        except JoinEdgesError as error:
+            self.preview, self.error = None, error
+            try:
+                # A refused join still lists its stretches, so some can be unchecked.
+                self.stretches = join_stretches(self.points, other, distance_px)
+            except JoinEdgesError:
+                self.stretches = ()
+        self._fill_list()
+        self._show()
+        # A smaller distance cannot mend a refused input polygon.
+        if self.error is not None and self.error.outline not in self._INPUTS:
+            self._start_search()
+
+    def _fill_list(self):
+        """One checked row per joinable stretch, with its length in mm."""
+        from PySide6.QtWidgets import QListWidgetItem
+
+        self.stretch_list.blockSignals(True)
+        self.stretch_list.clear()
+        for stretch in self.stretches:
+            item = QListWidgetItem()
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
             )
-            self.old_item.setPath(self._path([row.before for row in self.preview.stretches]))
-            self.new_item.setPath(self._path([row.after for row in self.preview.stretches]))
+            item.setCheckState(Qt.CheckState.Checked)
+            self.stretch_list.addItem(item)
+        self.stretch_list.blockSignals(False)
+        self.current_item.setPath(QPainterPath())
+
+    def _stretch_checked(self, _item):
+        """A check box changed: preview the checked stretches at once."""
+        self._update_preview()
+
+    def _update_preview(self):
+        """Preview the checked stretches; all checked is the default join."""
+        checked = self.checked_stretches()
+        include = None if len(checked) == len(self.stretches) else checked
+        try:
+            self.preview = join_to_neighbour(
+                self.points, self._other(), self._distance_px(), include=include
+            )
+            self.error = None
+        except JoinEdgesError as error:
+            self.preview, self.error = None, error
+        self._show()
+
+    def _show(self):
+        """Draw the stretches and any ring, say what Apply does and enable it."""
+        checked = self.checked_stretches()
+        shown = (
+            self.preview.stretches if self.preview is not None
+            else [self.stretches[number] for number in checked]
+        )
+        self.old_item.setPath(self._path([row.before for row in shown]))
+        self.new_item.setPath(self._path([row.after for row in shown]))
+        self.error_item.setPath(QPainterPath())
+        self.error_item.setToolTip("")
+        self.summary.setToolTip("")
+        at_ring = set()
+        if self.error is not None:
+            self.summary.setText(
+                self._plain_refusal(self.error)
+                + (" No smaller distance was found that works." if self._no_smaller else "")
+            )
+            self.summary.setToolTip(str(self.error))
+            if self.error.location is not None:
+                at_ring = self._ring(self.error.location, checked)
+        elif self.preview.stretches:
             count = len(self.preview.stretches)
             length = self.preview.length_px / self.pixels_per_mm
             self.summary.setText(
                 f"{count} stretch{'es' if count != 1 else ''}, {length:.2f} mm of old outline. "
-                + ("Apply changes both polygons in one undo step."
-                   if count else "No stretch can be joined at this distance.")
-                + ("\nLengths: " + "; ".join(
-                    f"{number}: {stretch.length_px / self.pixels_per_mm:.2f} mm"
-                    for number, stretch in enumerate(self.preview.stretches, 1)
-                ) if count else "")
+                "Apply changes both polygons in one undo step."
             )
-        except JoinEdgesError as error:
-            self.summary.setText(str(error))
-            if error.location is not None:
-                point = self.canvas.raw_to_scene(*error.location)
-                size = 7.0 / max(abs(self.canvas.transform().m11()), 1.0e-6)
-                path = QPainterPath()
-                path.moveTo(point.x() - size, point.y() - size)
-                path.lineTo(point.x() + size, point.y() + size)
-                path.moveTo(point.x() - size, point.y() + size)
-                path.lineTo(point.x() + size, point.y() - size)
-                self.error_item.setPath(path)
+        elif self.stretches and not checked:
+            self.summary.setText("No stretch is checked. Check a stretch to join it.")
+        else:
+            self.summary.setText("No stretch can be joined at this distance.")
+        self.stretch_list.blockSignals(True)
+        for number, stretch in enumerate(self.stretches):
+            self.stretch_list.item(number).setText(
+                f"Stretch {number + 1}: {stretch.length_px / self.pixels_per_mm:.2f} mm"
+                + (" (at the red ring)" if number in at_ring else "")
+            )
+        self.stretch_list.blockSignals(False)
         self.buttons.button(QDialogButtonBox.StandardButton.Apply).setEnabled(
             self.preview is not None and bool(self.preview.stretches)
         )
 
+    def _ring(self, location, checked):
+        """Ring a refused raw point on the canvas; return the checked stretches nearest to it.
+
+        Only stretches within the join distance of the point count, so a
+        refusal elsewhere marks none.
+        """
+        from shapely.geometry import LineString, Point
+
+        point = self.canvas.raw_to_scene(*location)
+        radius = self.RING_PX / max(abs(self.canvas.transform().m11()), 1.0e-6)
+        path = QPainterPath()
+        path.addEllipse(point, radius, radius)
+        self.error_item.setPath(path)
+        self.error_item.setToolTip(f"Raw row {location[0]:.2f}, column {location[1]:.2f}")
+        self.canvas.ensureVisible(
+            QRectF(point.x() - radius, point.y() - radius, 2.0 * radius, 2.0 * radius)
+        )
+        where = Point(location)
+        reach = {
+            number: min(
+                LineString(points).distance(where)
+                for points in (self.stretches[number].before, self.stretches[number].after)
+                if len(points) > 1
+            )
+            for number in checked
+            if len(self.stretches[number].before) > 1 or len(self.stretches[number].after) > 1
+        }
+        if not reach or min(reach.values()) > self._distance_px() + self.AT_RING_PX:
+            return set()
+        nearest = min(reach.values())
+        return {
+            number for number, value in reach.items()
+            if value <= nearest + self.AT_RING_PX
+        }
+
+    @staticmethod
+    def _plain_refusal(error):
+        """The refusal in plain words; its raw coordinates stay in the tooltips."""
+        crosses = "Self-intersection" in (error.reason or "")
+        marked = " at the marked point" if error.location is not None else ""
+        if error.outline == "Joined polygon":
+            problem = "would cross itself" if crosses else "would not be a valid outline"
+            return (
+                f"The joined outline {problem}{marked}. Use a smaller distance, uncheck "
+                "the stretch there, or join from the other polygon."
+            )
+        if error.outline == "Neighbour polygon after endpoint insertion":
+            return (
+                f"The neighbour's outline would not stay valid{marked}. Use a smaller "
+                "distance, or join from the other polygon."
+            )
+        if error.outline in _JoinEdgesDialog._INPUTS:
+            problem = "crosses itself" if crosses else "is not a valid outline"
+            if error.outline == "Selected polygon":
+                return (
+                    f"The selected polygon {problem}{marked}. "
+                    "Correct its outline before joining."
+                )
+            return (
+                f"This neighbour {problem}{marked}. "
+                "Correct its outline, or choose another neighbour."
+            )
+        return str(error)
+
+    def _show_current(self, row):
+        """Highlight the old outline of the selected stretch on the canvas."""
+        if 0 <= row < len(self.stretches):
+            self.current_item.setPath(self._path([self.stretches[row].before]))
+        else:
+            self.current_item.setPath(QPainterPath())
+
+    def _stop_search(self):
+        """Drop the offer and stop a running search; its thread ends after one more join."""
+        self._generation += 1
+        self._pending = None
+        if self._worker is not None:
+            self._worker.stop = True
+        self.offered_mm = None
+        self._no_smaller = False
+        self.use_button.hide()
+
+    def _start_search(self):
+        """Search a working distance below the chosen one, off the GUI thread."""
+        self._pending = (
+            self._generation,
+            list(self.points),
+            list(self._other()),
+            self._distance_px(),
+            self.TOLERANCE_MM * self.pixels_per_mm,
+        )
+        self.use_button.setText("Finding a distance that works…")
+        self.use_button.setEnabled(False)
+        self.use_button.show()
+        if self._thread is None:
+            self._run_pending()
+
+    def _run_pending(self):
+        """Start the latest search request in its own thread (0008 rule)."""
+        request, self._pending = self._pending, None
+        if request is None:
+            return
+        thread = QThread(self)
+        worker = self._DistanceSearch(request, self.pixels_per_mm, self.distance.decimals())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Direct: quit from the worker thread, so that wait() in the GUI
+        # thread cannot block a queued quit.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.finished.connect(self._search_finished)
+        thread.finished.connect(self._thread_finished)
+        self._thread, self._worker = thread, worker
+        thread.start()
+
+    def _search_finished(self, result):
+        """Offer the distance found for the current request; older results are dropped."""
+        generation, offer = result
+        if generation != self._generation:
+            return
+        if offer is None:
+            self.use_button.hide()
+            self._no_smaller = True
+            self._show()
+            return
+        self.offered_mm = offer
+        self.use_button.setText(f"Use {offer:.2f} mm")
+        self.use_button.setEnabled(True)
+        self.use_button.show()
+
+    def _thread_finished(self):
+        """Free the finished search here, then start a request that waited for it."""
+        thread = self._thread
+        if thread is not None:
+            # After wait() the worker is freed here, in the GUI thread.
+            thread.wait()
+        self._thread = self._worker = None
+        if thread is not None:
+            thread.deleteLater()
+        self._run_pending()
+
+    def _use_offered(self):
+        """Take the offered distance; the preview follows."""
+        if self.offered_mm is not None:
+            self.distance.setValue(self.offered_mm)
+
     def clear_preview(self, *_args):
-        for item in (self.old_item, self.new_item, self.error_item):
+        """Remove the preview and the ring from the canvas, and end a running search."""
+        self._stop_search()
+        thread = self._thread
+        if thread is not None:
+            # A stopped search returns after at most one more join.
+            thread.wait()
+            # After wait() the worker is freed here, in the GUI thread.
+            self._thread = self._worker = None
+            thread.deleteLater()
+        for item in (self.old_item, self.new_item, self.current_item, self.error_item):
             if item.scene() is not None:
                 item.scene().removeItem(item)
 
