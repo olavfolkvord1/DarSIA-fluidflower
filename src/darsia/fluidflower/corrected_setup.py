@@ -25,13 +25,59 @@ from darsia.fluidflower.series_geometry import (
     NATIVE_SETUP_EXPORT_FORMAT, NATIVE_LABEL_COLORS, geometry_package_root,
     native_color_index, native_series_link, _storage_path,
 )
-from darsia.fluidflower.setup_geometry_apply import ReadBinding, _exclusive
+from darsia.fluidflower.setup_geometry_apply import ReadBinding, _exclusive as _original_exclusive
 from darsia.fluidflower.setup_rig import _require_exact_grid
 
 FORMAT = NATIVE_SETUP_EXPORT_FORMAT
 LIMIT = 1024 * 1024
 NAMES = {"labels": "native_labels.npz", "facies": "native_facies.npz"}
 EXPORT_FILES = {*NAMES.values(), "facies_properties.csv", "native_setup.toml", "colored_labels.png"}
+
+
+def _exclusive(path, data):
+    """Keep the original writer unless an admitted Setup operation is active."""
+    from .pipeline.series_setup_sink import current_sink
+    sink = current_sink()
+    if sink is None:
+        return _original_exclusive(path, data)
+    return sink.write_bytes(path, data)
+
+
+def _copy_output(source, destination):
+    """Bound an explicit Setup copy while retaining the default byte copier."""
+    from .pipeline.series_setup_sink import current_sink
+    sink = current_sink()
+    if sink is None:
+        return shutil.copyfile(source, destination)
+    return sink.copy_file(source, destination)
+
+
+def _mkdir_output(path, *, parents=False, exist_ok=False):
+    """Check a positive Setup output domain before creating a directory."""
+    from .pipeline.series_setup_sink import current_sink
+    sink = current_sink()
+    if sink is None:
+        return path.mkdir(parents=parents, exist_ok=exist_ok)
+    return sink.mkdir(path, parents=parents, exist_ok=exist_ok)
+
+
+def _move_output(source, destination, *, replace=False):
+    """Preserve the original rename/CAS boundary and the whole byte ceiling."""
+    from .pipeline.series_setup_sink import current_sink
+    sink = current_sink()
+    if sink is None:
+        return (os.replace if replace else os.rename)(source, destination)
+    return sink.rename(source, destination, replace=replace)
+
+
+def _save_output_png(image, path):
+    """Use the original PNG serializer through a capped stream when active."""
+    from .pipeline.series_setup_sink import current_sink
+    sink = current_sink()
+    if sink is None:
+        return image.save(path)
+    with sink.open_exclusive(path) as stream:
+        return image.save(stream, format="PNG")
 
 
 def _small(path):
@@ -503,6 +549,10 @@ def _configuration_bundle(series, run, configuration, *, destination=None, recei
     if common is not None and any(_same(common, item) for rows in bundles.values() for item in rows):
         raise ValueError("The common configuration is ambiguous with a selected-run bundle.")
     common_binding = _descriptor(common) if common is not None and common.is_file() else None
+    if (receipt is not None and common_binding is not None
+            and common_binding != (receipt.get("binding") or {}).get("common_configuration")):
+        from .painted_setup_apply import original_common_binding
+        common_binding = original_common_binding(common, receipt, destination)
     result = dict(series_root=str(series), series_manifest=_descriptor(manifest_path),
                   configuration_bundles=bundles, common_configuration=common_binding)
     if dual is not None:
@@ -567,6 +617,8 @@ def _apply_completion(destination, receipt):
     if (record.get("state") != "complete" or record.get("run_id") != receipt["run_id"]
             or record.get("revision_id") != receipt["revision_id"]):
         raise ValueError("The preserved corrected Apply record is not complete for this run.")
+    from .painted_setup_apply import completion_context, is_common_target, verify_applied_postimage
+    facies_context = completion_context(value, claim_value, record, receipt=receipt)
     files = value.get("configurations")
     if not isinstance(files, list) or not files or len(files) != len(record.get("files") or []):
         raise ValueError("The corrected Apply completion has no exact configuration bundle.")
@@ -576,10 +628,14 @@ def _apply_completion(destination, receipt):
                 or old.get("before_sha256") != row["before"]["sha256"]
                 or old.get("after_sha256") != row["after"]["sha256"]
                 or not _same(row["before"]["path"], Path(attempt["path"]).parent / f"{index:02d}-before.toml")
-                or not any(_same(row["after"]["path"], p) for p in receipt["binding"]["configuration_bundles"][receipt["run_id"]])):
+                or not (any(_same(row["after"]["path"], p) for p in receipt["binding"]["configuration_bundles"][receipt["run_id"]])
+                        or facies_context is not None and is_common_target(row["after"]["path"], receipt))):
             raise ValueError("The corrected Apply completion does not bind its actual before/after files.")
         _verified(row["before"])
         _verified(row["after"])
+        if facies_context is not None:
+            verify_applied_postimage(_small(row["before"]["path"]), _small(row["after"]["path"]),
+                facies_context, receipt=receipt, target=row["after"]["path"])
     return value
 
 
@@ -598,13 +654,22 @@ def _original_configuration_bytes(configuration, destination, receipt=None):
     raise ValueError(f"Corrected setup source identity mismatch: {configuration['path']}")
 
 
-def _verify_immutable_export_inputs(receipt):
+def _verify_immutable_export_inputs(receipt, *, common_after=None):
     """Source data that Apply never modifies; configuration targets are separate."""
     data = receipt["binding"]
     for item in (*data["sources"].values(), data["properties"], data["configured_depth_source"], data["series_manifest"]):
         _verified(item)
     if data.get("common_configuration") is not None:
-        _verified(data["common_configuration"])
+        if common_after is not None:
+            if _small(data["common_configuration"]["path"]) != common_after:
+                raise RuntimeError("The common configuration differs from this transaction's expected-after bytes")
+        else:
+            try:
+                _verified(data["common_configuration"])
+            except ValueError:
+                from .painted_setup_apply import original_common_binding
+                destination = Path(receipt["files"][NAMES["labels"]]["path"]).parent
+                original_common_binding(data["common_configuration"]["path"], receipt, destination)
     if data.get("dual_configuration_binding") is not None:
         _verified(data["configuration"])
         dual = data["dual_configuration_binding"]
@@ -737,7 +802,11 @@ def require_corrected_export_for_build(paths):
         raise ValueError("Apply this run's bound corrected export before Build run model.")
     for path in actual_paths:
         if common is not None and _same(path, common["path"]):
-            _verified(common)
+            if completion.get("facies_rebuild") is None:
+                _verified(common)
+            else:
+                from .painted_setup_apply import original_common_binding
+                original_common_binding(path, receipt, destination)
         elif not any(_same(path, row["after"]["path"]) for row in completion["configurations"]):
             raise ValueError("The selected run configuration is not an actual completed Apply target.")
     if registered is not None:
@@ -842,16 +911,16 @@ def export_corrected_setup(project, *, reference, actor=""):
         if _small(current_path) != before:
             raise RuntimeError("The workspace revision changed during corrected export.")
         return CorrectedSetupExport(revision, run, destination, text, current_path, before, receipt, True)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_output(destination.parent, parents=True, exist_ok=True)
     staging = destination.with_name(f".{run}.{uuid.uuid4().hex}.tmp")
-    staging.mkdir()
+    _mkdir_output(staging)
     # Failed staging is intentionally preserved. No existing export is removed.
     for name, output_name in NAMES.items():
-        shutil.copyfile(sources[name]["path"], staging / output_name)
+        _copy_output(sources[name]["path"], staging / output_name)
         copied = _descriptor(staging / output_name)
         if copied["sha256"] != sources[name]["sha256"]:
             raise RuntimeError("Corrected raster copy changed bytes.")
-    shutil.copyfile(properties["path"], staging / "facies_properties.csv")
+    _copy_output(properties["path"], staging / "facies_properties.csv")
     if _descriptor(staging / "facies_properties.csv")["sha256"] != properties["sha256"]:
         raise RuntimeError("Original facies property table copy changed bytes.")
     _exclusive(staging / "native_setup.toml", text.encode("utf-8"))
@@ -860,7 +929,7 @@ def export_corrected_setup(project, *, reference, actor=""):
     labels = _load_array(Path(sources["labels"]["path"]))
     color_index = native_color_index(labels)
     palette = np.asarray([(255, 255, 255)] + [rgb for _name, rgb in NATIVE_LABEL_COLORS], dtype=np.uint8)
-    Image.fromarray(palette[color_index]).save(staging / "colored_labels.png")
+    _save_output_png(Image.fromarray(palette[color_index]), staging / "colored_labels.png")
     files = {}
     for name in sorted(EXPORT_FILES):
         files[name] = {**_descriptor(staging / name), "path": str(destination / name)}
@@ -885,7 +954,7 @@ def export_corrected_setup(project, *, reference, actor=""):
                                             project_root=project.root, revision=revision)
         if any(binding.get(key) != value for key, value in final_bundle.items()):
             raise RuntimeError("The current dual configuration bundle changed during corrected export.")
-    os.rename(staging, destination)
+    _move_output(staging, destination)
     return CorrectedSetupExport(revision, run, destination, text, current_path, before, receipt)
 
 
@@ -931,8 +1000,17 @@ def corrected_config_bytes(before: bytes, replacements: dict) -> bytes:
     return after
 
 
-def apply_corrected_selected_run(project, export: CorrectedSetupExport):
-    """Explicit selected-run CAS only; no common config/crop/registration/Build."""
+def apply_corrected_selected_run(project, export: CorrectedSetupExport, *, rebuild_facies_by_name=False,
+                                 raw_setup_settings=None):
+    """Selected-run CAS, with an explicit adopted-name rebuild before Build.
+
+    The default changes only the original four pointers. The positive rebuild
+    also updates the bound common inputs on the display-reference transaction.
+    Explicit RAW settings share that transaction for selected-run targets only.
+    Neither path runs registration, Build, calibration or adoption.
+    """
+    if raw_setup_settings is not None and not rebuild_facies_by_name:
+        raise ValueError("RAW Setup settings require the explicit by-name configuration rebuild")
     root = Path(native_series_link(project)["series_root"])
     manifest_path = root / "series.toml"
     manifest_bytes = _small(manifest_path)
@@ -947,13 +1025,25 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
         raise RuntimeError("The corrected export receipt changed; no setup was applied.")
     current = json.loads(export.current_bytes)
     config = current["configuration"]
+    facies_context = None
+    if rebuild_facies_by_name:
+        from .painted_setup_apply import context_for_current, raw_settings_for_run, require_raw_output
+        if raw_setup_settings is not None:
+            raw_setup_settings = raw_settings_for_run(raw_setup_settings, run_id=export.run_id)
+            require_raw_output(raw_setup_settings, actual_receipt)
+        facies_context = context_for_current(current, raw_setup_settings=raw_setup_settings)
     if "painted_adoption_table" in config:
         bound_inputs = actual_receipt.get("binding") or {}
         checked_paths = list((bound_inputs.get("configuration_bundles") or {}).get(export.run_id) or [])
         common_input = bound_inputs.get("common_configuration")
         if common_input is not None:
             checked_paths.append(common_input["path"])
-        _require_painted_facies_documents(config, checked_paths)
+        if facies_context is None:
+            _require_painted_facies_documents(config, checked_paths)
+        else:
+            from .painted_setup_apply import require_rebuilt_inputs
+            require_rebuilt_inputs(config, checked_paths, facies_context, revision_id=export.revision_id,
+                                   receipt=actual_receipt)
     _export_root, expected_destination, display, planned = _canonical_location(
         project.root, config, export.revision_id, export.run_id
     )
@@ -994,18 +1084,31 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
     for row in (*export.receipt["binding"]["sources"].values(), binding["properties"], binding["series_manifest"]):
         _verified(row)
     if binding.get("common_configuration") is not None:
-        _verified(binding["common_configuration"])
+        from .painted_setup_apply import original_common_binding
+        original_common_binding(binding["common_configuration"]["path"], export.receipt, export.destination)
     expected_bundle = _configuration_bundle(root, export.run_id, configuration, destination=export.destination, receipt=export.receipt,
                                            project_root=project.root, revision=export.revision_id)
     if any(binding.get(key) != value for key, value in expected_bundle.items()):
         raise ValueError("The selected run's declared configuration bundle changed.")
     completed = _apply_completion(export.destination, export.receipt)
     if completed is not None:
+        completed_raw = (completed.get("facies_rebuild") or {}).get("raw_setup_settings")
+        if not _typed_equal(completed_raw, raw_setup_settings):
+            raise ValueError("The completed application differs from the requested RAW Setup settings")
         # Pure revalidation/reuse: no new UUID, timestamp, write or replacement.
         if registered is not None:
             from .geometry_raster_sources import verify_registered_sources
             verify_registered_sources(registered)
         return Path(completed["attempt_receipt"]["path"])
+    camera_before = None
+    if raw_setup_settings is not None:
+        from .rig_raw_input import profile_parameters
+        require_raw_output(raw_setup_settings, actual_receipt, fresh=True)
+        camera = raw_setup_settings["raw_camera"]
+        camera_before = _small(camera["configuration"])
+        if hashlib.sha256(camera_before).hexdigest() != camera["sha256"]:
+            raise ValueError("The RAW Setup camera differs from its exact profile bytes")
+        profile_parameters(camera)
     dual = binding.get("dual_configuration_binding")
     if dual is not None:
         targets = [Path(row["path"]) for row in dual["apply_configurations"]]
@@ -1022,28 +1125,57 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
             targets.append(partial)
         if merged is not None and merged.is_file() and not any(_same(merged, p) for p in targets):
             targets.append(merged)
+    if facies_context is not None and binding.get("common_configuration") is not None:
+        from .painted_setup_apply import rebuild_bytes
+        common_path = Path(binding["common_configuration"]["path"])
+        common_before = _small(common_path)
+        common_after, _ = rebuild_bytes(common_before, facies_context, revision_id=export.revision_id,
+                                        is_common=True)
+        if common_after != common_before:
+            if export.run_id != display:
+                raise ValueError("Apply the display-reference run's by-name configurations first")
+            if not any(_same(common_path, path) for path in targets):
+                targets.insert(0, common_path)
     for path in targets:
         if not path.resolve().is_relative_to(root.resolve()):
             raise ValueError("Corrected setup target is outside the selected series.")
     bindings = [ReadBinding(manifest_path, manifest_bytes), ReadBinding(export.current_json, export.current_bytes), ReadBinding(receipt_path, _small(receipt_path))]
+    if facies_context is not None:
+        for bound in (facies_context["revision"], facies_context["parent_csv"]):
+            path = Path(bound["path"])
+            _verified(bound)
+            bindings.append(ReadBinding(path, _small(path)))
+    if camera_before is not None:
+        bindings.append(ReadBinding(Path(raw_setup_settings["raw_camera"]["configuration"]), camera_before))
     changes = []
     for path in targets:
         before = _small(path)
         bindings.append(ReadBinding(path, before))
-        changes.append((path, before, corrected_config_bytes(before, export.receipt["binding"]["replacements"])))
+        if facies_context is None:
+            after = corrected_config_bytes(before, export.receipt["binding"]["replacements"])
+        else:
+            from .painted_setup_apply import rebuild_bytes, is_common_target
+            common = is_common_target(path, export.receipt)
+            replacements = None if common else binding["replacements"]
+            after, _ = rebuild_bytes(before, facies_context, revision_id=export.revision_id,
+                                      replacements=replacements, is_common=common)
+        changes.append((path, before, after))
     for item in bindings:
         item.require_unchanged()
     attempt = export.destination / ("apply-" + uuid.uuid4().hex)
-    attempt.mkdir()
+    _mkdir_output(attempt)
     _exclusive(export.destination / "apply-claim.json", (json.dumps(dict(
         format="darsia-corrected-setup-apply-claim-v1", run_id=export.run_id,
         revision_id=export.revision_id, attempt_directory=str(attempt),
         export=_descriptor(receipt_path), input_binding=binding,
+        **({"facies_rebuild": facies_context} if facies_context is not None else {}),
     ), ensure_ascii=False, indent=2)+"\n").encode())
     files, staged = [], []
     receipt = dict(format="darsia-corrected-setup-apply-v1", run_id=export.run_id,
                    revision_id=export.revision_id, created_utc=utc_now(), state="prepared", files=files,
                    crop_changed=False, depth_pointer_changed=False, registration_run=False, Build_run=False)
+    if facies_context is not None:
+        receipt["facies_rebuild"] = facies_context
     try:
         for i, (path, before, after) in enumerate(changes):
             _exclusive(attempt / f"{i:02d}-before.toml", before)
@@ -1056,11 +1188,17 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
             for item in bindings:
                 if str(item.path) not in applied:
                     item.require_unchanged()
-            os.replace(temporary, path)
+            _move_output(temporary, path, replace=True)
             applied.add(str(path))
             files[i]["state"] = "applied"
         _verify_export_files(export.receipt, export.destination)
-        _verify_immutable_export_inputs(export.receipt)
+        if facies_context is None:
+            _verify_immutable_export_inputs(export.receipt)
+        else:
+            from .painted_setup_apply import is_common_target
+            common_after = next((after for path, _before, after in changes
+                                 if is_common_target(path, export.receipt)), None)
+            _verify_immutable_export_inputs(export.receipt, common_after=common_after)
         if registered is not None:
             from .geometry_raster_sources import verify_registered_sources
             verify_registered_sources(registered)
@@ -1091,5 +1229,7 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
                                                      sha256=hashlib.sha256(before).hexdigest(), size_bytes=len(before)),
                                          after=dict(path=str(path), sha256=hashlib.sha256(after).hexdigest(), size_bytes=len(after)))
                                     for index, (path, before, after) in enumerate(changes)])
+    if facies_context is not None:
+        complete["facies_rebuild"] = facies_context
     _exclusive(export.destination / "apply-complete.json", (json.dumps(complete, ensure_ascii=False, indent=2)+"\n").encode())
     return attempt / "receipt.json"
