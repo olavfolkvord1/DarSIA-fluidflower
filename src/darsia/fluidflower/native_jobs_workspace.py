@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -80,8 +81,11 @@ class NativeJobsWorkspace(QWidget):
         self.association_note.setWordWrap(True)
         self.association_note.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.association_note)
-        self.jobs_view = QWidget()
-        jobs_layout = QVBoxLayout(self.jobs_view)
+        self.jobs_view = QScrollArea()
+        self.jobs_view.setWidgetResizable(True)
+        jobs_body = QWidget()
+        self.jobs_view.setWidget(jobs_body)
+        jobs_layout = QVBoxLayout(jobs_body)
         jobs_layout.setContentsMargins(0, 0, 0, 0)
         # Where jobs and plans come from, collapsed so the job list gets the page (N141).
         self.sources = QGroupBox("Sources")

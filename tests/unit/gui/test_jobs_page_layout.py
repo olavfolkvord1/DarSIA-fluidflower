@@ -5,11 +5,14 @@ tabs fill the right. Sources are collapsible. No scroll area sits inside
 another. The same widgets and actions as before; real Qt, no job is started.
 """
 
+import json
+
 import pytest
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QScrollArea, QSplitter, QWidget
+from PySide6.QtWidgets import (QScrollArea, QSplitter, QStyle, QStyleOptionComboBox,
+    QStyleOptionSpinBox, QWidget)
 
 from darsia.fluidflower.resource_advisor_panel import ResourceAdvisorPanel
 from darsia.fluidflower.measurement_receipts import MeasurementRegistry
@@ -236,6 +239,113 @@ def test_resource_choice_feedback_follows_actual_target_matches(qtbot, local_reg
         assert (panel.target_combo.currentIndex(), panel.workers_spin.value(), panel.backend_combo.currentData()) == before
         assert "Worker count not applied" in feedback
         assert ("no registered launch target" if matches == 0 else "multiple registered launch targets") in feedback
+    assert not local_registry.root.exists() and not resources.measurement_registry.root.exists()
+    qtbot.waitUntil(owner.can_close, timeout=10000)
+    assert owner.close() and not owner.isVisible()
+
+
+@pytest.mark.parametrize("matches", [True, False], ids=["applied", "missing"])
+def test_themed_owner_resource_fields_and_borrowing_fit_1280_by_800(qtbot, local_registry, tmp_path, matches, record_property):
+    """Keep actual worker controls and feedback reachable while both owner pages fit."""
+    def forbidden(*_args, **_kwargs):
+        """Refuse any producer, worker launch or hardware inspection during layout proof."""
+        pytest.fail("Changing resource tabs must not start work")
+
+    owner = ui.NativeJobsWorkspace(
+        registry=local_registry, local_machine="local", reader=snapshot,
+        measurement_registry=MeasurementRegistry(tmp_path / "measurements"),
+        inventory_provider=forbidden, job_creator=forbidden,
+        local_launcher=forbidden, remote_launcher=forbidden,
+        resource_factory=ResourceAdvisorPanel,
+    )
+    qtbot.addWidget(owner, before_close_func=lambda widget: qtbot.waitUntil(widget.can_close, timeout=10000))
+    owner.setFont(QFont("Segoe UI", 10))
+    apply_application_theme(owner)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "series.toml").write_text('schema_version=1\nseries_id="campaign"\n', encoding="utf-8")
+    owner.set_series("campaign", project, series_label="Copy")
+    qtbot.waitUntil(owner.can_close, timeout=10000)
+    panel, resources, page = owner.panel, owner.resources, owner.new_analysis
+    chosen = panel.local_machine if matches else panel.local_machine + "-history"
+    resources.set_context({"precision": "float32"}, machines_provider=lambda: [
+        dict(machine=chosen, inventory={}, history=[])])
+    resources.workers_spin.setValue(3)
+    owner.resize(1280, 800)
+    owner.show()
+    panel.detail_tabs.setCurrentWidget(panel.resource_page)
+    assert [resources.details_tabs.tabText(index) for index in range(resources.details_tabs.count())] == [
+        "Hardware", "Measurements", "GPU speed"]
+    assert resources.details_tabs.currentIndex() == 0
+    qtbot.wait(20)
+    owner.jobs_view.ensureWidgetVisible(resources.use_button, 0, 0)
+    qtbot.wait(20)
+    qtbot.mouseClick(resources.use_button, Qt.MouseButton.LeftButton)
+    qtbot.wait(20)
+    feedback = resources.selection_label.text()
+    assert ("Applied 3 worker(s)" if matches else "Worker count not applied") in feedback
+    diagnostics = {}
+    for stage in ("jobs", "new_analysis", "jobs_returned"):
+        if stage == "new_analysis":
+            owner.show_view("new_analysis")
+            assert page.machine_box.isAncestorOf(resources)
+            for widget in (panel.target_combo, panel.backend_combo, panel.workers_spin):
+                assert page.target_layout.indexOf(widget) >= 0
+        elif stage == "jobs_returned":
+            owner.show_view("jobs")
+            assert panel.resource_slot.indexOf(resources) >= 0
+            for index, widget in enumerate((panel.target_combo, panel.backend_combo, panel.workers_spin)):
+                assert panel._controls.indexOf(widget) == index
+        qtbot.wait(20)
+        active_scroll = page.scroll if stage == "new_analysis" else owner.jobs_view
+        active_scroll.ensureWidgetVisible(resources.selection_label, 0, 0)
+        qtbot.wait(20)
+        diagnostics[stage] = dict(owner=list(owner.minimumSizeHint().toTuple()),
+            views=list(owner.views.minimumSizeHint().toTuple()), jobs=list(owner.jobs_view.minimumSizeHint().toTuple()),
+            jobs_body=list(owner.jobs_view.widget().minimumSizeHint().toTuple()),
+            jobs_body_height=owner.jobs_view.widget().height(), viewport_height=active_scroll.viewport().height(),
+            new_analysis=list(page.minimumSizeHint().toTuple()), resources=list(resources.minimumSizeHint().toTuple()),
+            details=list(resources.details_tabs.minimumSizeHint().toTuple()),
+            resource_height=resources.height(), resource_layout_height=resources.layout().geometry().height(),
+            detail_height=resources.details_tabs.height(),
+            page_height=resources.details_tabs.currentWidget().height(),
+            page_layout_height=resources.details_tabs.currentWidget().layout().geometry().height(), controls={})
+        for name in ("machine_combo", "backend_combo", "threads_spin", "workers_spin"):
+            control = getattr(resources, name)
+            combo = name.endswith("combo")
+            option = QStyleOptionComboBox() if combo else QStyleOptionSpinBox()
+            control.initStyleOption(option)
+            style = control.style()
+            content_type = QStyle.ContentsType.CT_ComboBox if combo else QStyle.ContentsType.CT_SpinBox
+            font_height = control.fontMetrics().height()
+            styled_height = style.sizeFromContents(content_type, option, QSize(1, font_height), control).height()
+            frame = style.pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, option, control)
+            required_height = max(control.minimumSizeHint().height(), font_height + 2 * frame, styled_height)
+            diagnostics[stage]["controls"][name] = dict(height=control.height(),
+                size_hint=list(control.sizeHint().toTuple()), minimum_hint=list(control.minimumSizeHint().toTuple()),
+                font_height=font_height, styled_height=styled_height, required_height=required_height,
+                fully_visible=control.visibleRegion().contains(control.rect()),
+                parent_height=control.parentWidget().height(),
+                parent_layout_height=control.parentWidget().layout().geometry().height())
+        record_property("resource_fields_layout_minima_" + stage, json.dumps(diagnostics[stage], sort_keys=True))
+        screenshot = tmp_path / ("resource_fields_" + ("applied_" if matches else "missing_") + stage + ".png")
+        assert owner.grab().save(str(screenshot))
+        record_property("resource_fields_layout_screenshot_" + stage, str(screenshot))
+        assert owner.width() == 1280 and owner.height() == 800, diagnostics
+        assert owner.minimumSizeHint().width() <= 1280 and owner.minimumSizeHint().height() <= 800, diagnostics
+        for area in owner.findChildren(QScrollArea):
+            assert not any(isinstance(parent, QScrollArea) for parent in _ancestors(area, None))
+        for label in (resources.selection_label, resources.reason_label):
+            assert label.isVisible() and label.visibleRegion().contains(label.rect()), diagnostics
+            assert 0 <= label.mapTo(owner, label.rect().topLeft()).y()
+            assert label.mapTo(owner, label.rect().bottomRight()).y() < owner.height()
+        for name, metrics in diagnostics[stage]["controls"].items():
+            control = getattr(resources, name)
+            assert metrics["height"] >= metrics["required_height"], diagnostics
+            assert control.isVisible() and metrics["fully_visible"], diagnostics
+            assert 0 <= control.mapTo(owner, control.rect().topLeft()).y()
+            assert control.mapTo(owner, control.rect().bottomRight()).y() < owner.height()
+        assert resources.selection_label.text() == feedback
     assert not local_registry.root.exists() and not resources.measurement_registry.root.exists()
     qtbot.waitUntil(owner.can_close, timeout=10000)
     assert owner.close() and not owner.isVisible()
