@@ -26,6 +26,7 @@ NO_STATUS_ROWS = {
     ("method", "use_for_series"),
     ("jobs", "new_analysis"),
     ("overflow_data", "runs"),
+    ("jobs", "production_results"),
 }
 
 STATE_LABELS = {

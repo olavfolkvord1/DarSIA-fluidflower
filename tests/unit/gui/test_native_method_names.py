@@ -73,7 +73,8 @@ def test_grouping_reads_group_keys_not_header_text(method_window):
     assert rows["reset"] in calibration["colour_path"]
     analysis = before["analysis"]
     assert keys(window.sidebar._sections["analysis"]._rows, analysis["phase_model"]) == [
-        "jobs:new_analysis", "jobs:overview", "mass_analysis:frozen", "mass_analysis:review"]
+        "jobs:new_analysis", "jobs:overview", "mass_analysis:frozen", "jobs:production_results",
+        "mass_analysis:review"]
     assert analysis["first"] == analysis["common"] == []
 
 

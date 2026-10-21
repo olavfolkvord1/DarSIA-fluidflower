@@ -1513,6 +1513,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                                 "fa5s.tasks"),
                     _native_row(aliases, action, "Results and export", "mass_analysis", "frozen",
                                 "Browse the finished results per run for the chosen model and calibration, and export them; opening this page starts no calculation."),
+                    _native_row(aliases, action, "Production results", "jobs", "production_results",
+                                "Open a finished production job read-only: every run's frames, maps and mass curves, and a film of a run; opening this page starts no calculation."),
                     # A button on Phase model > Review and label; the row stays routable, hidden.
                     _native_row(aliases, action, "Phase review window", "mass_analysis", "review",
                                 "Open the existing prepared model-correction review window; a loaded model with bound phase maps is required."),
@@ -2409,6 +2411,16 @@ class NativeFluidFlowerMainWindow(MainWindow):
             self.content_stack.addWidget(page)
         return page
 
+    def ensure_production_results(self) -> QWidget:
+        """The Production results page of finished production jobs (created once)."""
+        page = getattr(self, "production_results_page", None)
+        if page is None:
+            from darsia.fluidflower.production_results_view import ProductionResultsPage
+
+            page = self.production_results_page = ProductionResultsPage()
+            self.content_stack.addWidget(page)
+        return page
+
     def _show_dataset_analysis(self) -> bool:
         """Show New analysis for a published dataset series; False for other series."""
         root = self.dataset_series_root()
@@ -2924,6 +2936,8 @@ class NativeFluidFlowerMainWindow(MainWindow):
                 if workspace.series_id:
                     workspace.ensure_studio()
                 workspace._show_selected_studio_mode()
+            elif (action, item_id) == ("jobs", "production_results"):
+                self.content_stack.setCurrentWidget(self.ensure_production_results())
             elif action == "jobs":
                 jobs = self.ensure_jobs()
                 if item_id == "new_analysis":

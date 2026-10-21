@@ -54,6 +54,7 @@ PHASE_ANALYSIS = [
     ("jobs:new_analysis", "New analysis"),
     ("jobs:overview", "Jobs"),
     ("mass_analysis:frozen", "Results and export"),
+    ("jobs:production_results", "Production results"),
 ]
 COLOUR_ANALYSIS = ["cropping", "mass", "segmentation", "fingers", "thresholding", "volume"]
 
@@ -66,8 +67,8 @@ def test_sidebar_structure_names_and_order_follow_the_chosen_method(method_windo
         PHASE_CALIBRATION[:1] + PHASE_CALIBRATION[1:] + COLOUR_CALIBRATION + USE
     )
     analysis = _visible(window, "analysis")
-    assert analysis[:3] == PHASE_ANALYSIS
-    assert [row for row, _label in analysis[3:]] == COLOUR_ANALYSIS
+    assert analysis[:len(PHASE_ANALYSIS)] == PHASE_ANALYSIS
+    assert [row for row, _label in analysis[len(PHASE_ANALYSIS):]] == COLOUR_ANALYSIS
     save_series_method(
         _roots(window)["series-a"],
         MethodSelection(active="colour_path", colour_calibration="colour"),
