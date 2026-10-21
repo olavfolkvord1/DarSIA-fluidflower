@@ -108,3 +108,49 @@ def test_a_saved_model_cannot_change_behind_its_sha_binding(tmp_path):
     path.write_text('{"value": 2}', encoding="utf-8")
     with pytest.raises(ValueError, match="binding"):
         geometry.read_bound_json(bound)
+
+
+def bridged_model(tmp_path, *, displacement=0.2, accepted=True, baseline_sha=None):
+    baseline = {"path": "baseline.arw", "sha256": "a" * 64, "size_bytes": 20}
+    photograph = {"path": "model.arw", "sha256": "e" * 64, "size_bytes": 21}
+    transport = np.eye(3); transport[0, 2] = displacement
+    bridge = geometry.write_new_json(tmp_path / "bridge.json", {
+        "accepted": accepted, "required": True,
+        "baseline_raw": {**baseline, "sha256": baseline_sha or baseline["sha256"]},
+        "model_raw": photograph, "H_baseline_u_to_model_u": transport.tolist(),
+        "maximum_displacement_px": abs(displacement), "displacement_limit_px": 0.5,
+    })
+    native_to_u = [[1, 0, 57], [0, 1, 0], [0, 0, 1]]
+    native = geometry.write_new_json(tmp_path / "native.json", {
+        "shape_hw": [70, 100], "H_rig_corrected_native_to_baseline_camera_u": native_to_u,
+        "renderer": {"raw_acquisition": baseline, "camera_u_wh": [100, 80],
+                     "native_shape_hw": [70, 100], "native_to_camera_u_h": native_to_u},
+    })
+    return geometry.reference_model(
+        "example", {"H_camera_to_mm": [[0.2, 0, -10], [0, -0.2, 20], [0, 0, 1]],
+                    "sand_area_factor14": 1.034, "explicit_certificate": {}},
+        reference_image=baseline, model_photograph=photograph,
+        baseline_to_model=bridge, baseline_native_renderer=native,
+        camera_profile={"camera_wh": [100, 80]}, source_model={}, edge_review={},
+        baseline_configuration={},
+    )
+
+
+def test_different_photograph_uses_measured_baseline_bridge_and_separate_native_grid(tmp_path):
+    value = bridged_model(tmp_path)
+    np.testing.assert_allclose(project(value["H_camera_u_to_metric_mm"], [40, 25]), [-1.96, 15])
+    assert value["reference_image"]["sha256"] != value["model_photograph"]["sha256"]
+    native = value["baseline_native_grid"]
+    assert native["shape_hw"] == [70, 100] and value["shape_hw"] == [80, 100]
+    np.testing.assert_allclose(project(native["H_baseline_camera_u_to_rig_corrected_native"], [70, 25]), [13, 25])
+    assert value["area_factor"] == 1.034 and not value["new_fit"]
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    ({"accepted": False}, "not passed"),
+    ({"displacement": 0.5001}, "exceeds"),
+    ({"baseline_sha": "f" * 64}, "another acquisition"),
+])
+def test_unaccepted_large_or_wrong_acquisition_bridge_is_refused(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        bridged_model(tmp_path, **kwargs)

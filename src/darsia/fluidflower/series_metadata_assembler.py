@@ -48,9 +48,18 @@ def _required_roles(spec):
     if not isinstance(spec["source"].get("source_binding"), Mapping) or not spec["source"]["source_binding"]:
         raise ValueError("Missing supplied native/phase acquisition source binding.")
     native = spec["native_task"]
-    for field in ("kind", "geometry", "parent_frame_index", "parent_reference", "processor"):
+    for field in ("kind", "geometry", "processor"):
         if field not in native:
             raise ValueError("Missing supplied native role: " + field)
+    if native["kind"] == "raw_rig":
+        # The existing RAW ABI has no JPEG-parent fields. The worker and the
+        # original run validator require precisely these three task keys.
+        if set(native) != {"kind", "geometry", "processor"} or set(native["processor"]) != {"raw_binding"}:
+            raise ValueError("RAW native roles require only geometry and the explicit RAW binding")
+    else:
+        for field in ("parent_frame_index", "parent_reference"):
+            if field not in native:
+                raise ValueError("Missing supplied native role: " + field)
     phase = spec["phase_roles"]
     for field in ("area", "current_h", "reference_to_current_h", "static",
                   "retained_source_cache", "encoding_contract", "light_epoch_id"):

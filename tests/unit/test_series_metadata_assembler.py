@@ -46,6 +46,39 @@ def _data():
     return previous, selected, records
 
 
+def _raw_data():
+    previous, selected, records = _data()
+    for frame in [*previous["frames"], *records]:
+        frame["native_task"] = {"kind": "raw_rig", "geometry": _binding(1),
+                                "processor": {"raw_binding": _binding(0)}}
+        frame["phase_roles"]["retained_source_cache"] = None
+        frame["phase_roles"]["encoding_contract"] = None
+    return previous, selected, records
+
+
+def test_real_raw_task_abi_has_no_jpeg_parent_fields_and_preserves_existing_roles():
+    previous, selected, records = _raw_data()
+    before = deepcopy((previous, selected, records))
+    result, receipt = assemble_run_metadata(previous, selected, records)
+    assert result["ordered_case_ids"] == ["run1_f1", "run1_f2", "run1_f3"]
+    for generated, supplied in zip(result["frames"], records):
+        assert generated["native_task"] == supplied["native_task"]
+        assert set(generated["native_task"]) == {"kind", "geometry", "processor"}
+    assert not receipt["roles_invented"]
+    assert (previous, selected, records) == before
+
+
+@pytest.mark.parametrize("change", ["parent_field", "missing_raw_binding"])
+def test_raw_role_validation_does_not_accept_a_jpeg_parent_or_a_missing_binding(change):
+    previous, selected, records = _raw_data()
+    if change == "parent_field":
+        records[1]["native_task"]["parent_frame_index"] = 1
+    else:
+        records[1]["native_task"]["processor"] = {"native_manifest": _binding(0)}
+    with pytest.raises(ValueError, match="RAW native roles"):
+        assemble_run_metadata(previous, selected, records)
+
+
 def test_typed_mapper_inserts_supplied_roles_without_changing_original_roles_or_inputs():
     previous, selected, records = _data()
     snapshot = deepcopy((previous, selected, records))

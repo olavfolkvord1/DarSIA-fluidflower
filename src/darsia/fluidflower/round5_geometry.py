@@ -65,18 +65,45 @@ def write_new_json(path, value):
 
 
 def reference_model(run, frame, *, reference_image, camera_profile, source_model,
-                    edge_review, baseline_configuration):
+                    edge_review, baseline_configuration, model_photograph=None,
+                    baseline_to_model=None, baseline_native_renderer=None):
     """Bind a saved model to the registered run's actual reference photograph."""
     if not run or not reference_image.get("sha256"):
         raise ValueError("A run and bound reference photograph are required")
-    h = matrix(frame["H_camera_to_mm"])
+    saved_h = matrix(frame["H_camera_to_mm"])
+    h = saved_h.copy()
+    photograph = reference_image if model_photograph is None else model_photograph
+    different = photograph["sha256"] != reference_image["sha256"]
+    if different and baseline_to_model is None:
+        raise ValueError("A different model photograph needs its measured baseline registration")
+    if baseline_to_model is not None:
+        bridge = read_bound_json(baseline_to_model)
+        if bridge.get("accepted") is not True:
+            raise ValueError("The baseline registration has not passed its displacement gate")
+        if different:
+            if (bridge["baseline_raw"]["sha256"] != reference_image["sha256"]
+                    or bridge["model_raw"]["sha256"] != photograph["sha256"]):
+                raise ValueError("The baseline registration binds another acquisition")
+        elif bridge.get("exact_same_RAW_sha256") != reference_image["sha256"]:
+            raise ValueError("Identity registration needs the exact same RAW acquisition")
+        transport = matrix(bridge["H_baseline_u_to_model_u"])
+        if (not np.array_equal(transport[:2, :2], np.eye(2))
+                or not np.array_equal(transport[2], [0, 0, 1])):
+            raise ValueError("The production drift bridge must remain a translation")
+        displacement = float(np.linalg.norm(transport[:2, 2]))
+        limit = float(bridge.get("displacement_limit_px", 0.5))
+        if limit != 0.5 or displacement > limit:
+            raise ValueError("The baseline registration exceeds the authorised displacement gate")
+        if not math.isclose(displacement, float(bridge["maximum_displacement_px"]), abs_tol=1e-9):
+            raise ValueError("The baseline displacement differs from its recorded transform")
+        h = saved_h @ transport
     width, height = camera_profile["camera_wh"]
     if min(width, height) < 1:
         raise ValueError("The camera-U grid must have positive dimensions")
     factor = float(frame["sand_area_factor14"])
     if not math.isfinite(factor) or factor <= 0:
         raise ValueError("The saved optical area factor must be finite and positive")
-    return {
+    result = {
         "format": FORMAT, "run": run, "run_id": run,
         "reference_image": deepcopy(reference_image),
         "baseline_configuration": deepcopy(baseline_configuration),
@@ -98,6 +125,28 @@ def reference_model(run, frame, *, reference_image, camera_profile, source_model
         "new_fit": False, "adopted": False,
         "frame_rows_complete": False, "area_arrays_complete": False,
     }
+    result.update(model_photograph=deepcopy(photograph),
+                  H_model_photograph_u_to_metric_mm=saved_h.tolist(),
+                  baseline_to_model_registration=deepcopy(baseline_to_model))
+    if baseline_native_renderer is not None:
+        native = read_bound_json(baseline_native_renderer)
+        certificate = native["renderer"]
+        if (certificate["raw_acquisition"]["sha256"] != reference_image["sha256"]
+                or certificate["camera_u_wh"] != [width, height]
+                or certificate["native_shape_hw"] != native["shape_hw"]):
+            raise ValueError("The native renderer has another baseline or grid")
+        to_u = matrix(native["H_rig_corrected_native_to_baseline_camera_u"])
+        if not np.array_equal(to_u, matrix(certificate["native_to_camera_u_h"])):
+            raise ValueError("The native grid matrix differs from its production certificate")
+        result["baseline_native_grid"] = {
+            "renderer": deepcopy(baseline_native_renderer),
+            "shape_hw": list(native["shape_hw"]),
+            "H_rig_corrected_native_to_baseline_camera_u": to_u.tolist(),
+            "H_baseline_camera_u_to_rig_corrected_native": np.linalg.inv(to_u).tolist(),
+            "legacy_dimensions_m": [0.49, 0.9],
+            "physical_metric_is_separate": True,
+        }
+    return result
 
 
 def label_placement(reference, target):
@@ -167,7 +216,8 @@ def frame_area(row, *, metric_matrix, area_factor, geometry_parameters):
 
 
 def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mapping,
-                          output: Path):
+                          output: Path, observations: Mapping | None = None,
+                          allow_incomplete=False):
     """Write real per-run reference files and an early, explicitly partial index.
 
     ``plan`` binds the saved joint models, the twelve saved replacement-bottom
@@ -185,10 +235,16 @@ def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mappi
         raise ValueError("Exactly the current 39 registered reference runs are required")
     planned = {row["run"]: row for row in plan["runs"]}
     rows = {}
+    pending = {}
     for run in order:
         acquisition = planned[run]["RAW"]
         actual_reference = descriptor(references[run]["path"])
-        if any(actual_reference[key] != acquisition[key] for key in ("sha256", "size_bytes")):
+        observation = None if observations is None else observations.get(run)
+        different = any(actual_reference[key] != acquisition[key] for key in ("sha256", "size_bytes"))
+        if observations is not None and observation is None and allow_incomplete:
+            pending[run] = "Native/baseline registration is not complete; no model substituted"
+            continue
+        if different and observation is None:
             raise ValueError(f"{run}: saved model and registered reference image differ")
         source = pins.get("q108_model_" + run, pins["actual_joint_result"])
         if "q108_model_" + run in pins:
@@ -201,16 +257,21 @@ def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mappi
         value = reference_model(run, frame, reference_image=actual_reference,
                                 camera_profile=profiles[run], source_model=source,
                                 edge_review=pins["current_confirmed39_ledger"],
-                                baseline_configuration=references[run]["configuration"])
+                                baseline_configuration=references[run]["configuration"],
+                                model_photograph=acquisition,
+                                baseline_to_model=None if observation is None else observation["bridge"],
+                                baseline_native_renderer=None if observation is None else observation["native_renderer"])
         bound = write_new_json(output / run / "reference_model.json", value)
         rows[run] = {"run": run, "reference_model": bound}
     index = {
-        "format": FORMAT, "state": "REFERENCE_MODELS_COMPLETE_FRAME_ROWS_PENDING",
-        "complete": False, "reference_models_complete": True,
+        "format": FORMAT, "state": ("REFERENCE_MODELS_COMPLETE_FRAME_ROWS_PENDING" if not pending
+                                     else "PARTIAL_REFERENCE_MODELS_REGISTRATION_PENDING"),
+        "complete": False, "reference_models_complete": not pending,
         "frame_rows_complete": False, "area_arrays_complete": False,
         "run_order": order, "runs": rows, "run_count": len(rows),
         "metric_unit": "mm", "grid": "camera_u", "adopted": False,
         "source_joint": pins["actual_joint_result"],
         "source_current_edges": pins["current_confirmed39_ledger"],
+        "pending_runs": pending,
     }
     return write_new_json(output / "index.json", index)
