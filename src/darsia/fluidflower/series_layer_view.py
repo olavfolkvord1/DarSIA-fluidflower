@@ -17,6 +17,7 @@ The full geometry-and-facies page remains available as the advanced view.
 from __future__ import annotations
 
 import hashlib
+from html import escape
 import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -216,12 +217,22 @@ _MOVE_SHARED_TIP = (
 # How saturated the photograph is shown, in percent: the user's choice, kept
 # with the background choice and not in the painting session.
 _SATURATION_KEY = "display/saturation"
+_COLOR_MODE_KEY = "display/color_mode"
 _SATURATION_TIP = (
     "Colour saturation of the photograph shown, from 0 % (grey) to 100 % (its "
     "own colours). Grey can make layer boundaries easier to trace. Display "
     "only: the proposal, the session and the export always use the photograph "
     "itself."
 )
+
+
+def _facies_color(name: str) -> QColor:
+    """A stable display colour, independent of layer order and saved colours."""
+    digest = hashlib.sha256(name.encode("utf8")).digest()
+    return QColor.fromHsv(int.from_bytes(digest[:2], "big") % 360,
+                         180 + digest[2] % 45, 205 + digest[3] % 40)
+
+
 # The manual map: the polygons exactly as drawn, without a classifier.
 _MANUAL = lpm.MANUAL_MAP_KIND
 _MAP_SHOWN_TIP = (
@@ -3320,7 +3331,10 @@ class LayerPainterView(QWidget):
         # shown, never saved and never part of the proposal.
         self._hidden_layers: set[int] = set()
         self._hidden_session: lp.PaintingSession | None = None
+        self._color_mode = self._stored_color_mode()
+        self._highlight_facies: str | None = None
         self._layer_table_menu_widget: QMenu | None = None
+        self._facies_table_menu_widget: QMenu | None = None
         self._dirty = False
         self._export_stale = True
         self._export_key = ""
@@ -3812,6 +3826,8 @@ class LayerPainterView(QWidget):
         )
         self.facies_table.itemChanged.connect(self._facies_item_changed)
         self.facies_table.itemSelectionChanged.connect(self._facies_selection_changed)
+        self.facies_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.facies_table.customContextMenuRequested.connect(self._facies_table_menu)
         layout.addWidget(self.facies_table)
         facies_buttons = QHBoxLayout()
         self.add_facies_button = QPushButton("Add facies")
@@ -4042,6 +4058,12 @@ class LayerPainterView(QWidget):
         layout.addLayout(display)
         layout.addLayout(photo)
         layout.addLayout(self._build_map_choice())
+        self.facies_legend = QLabel()
+        self.facies_legend.setTextFormat(Qt.TextFormat.RichText)
+        self.facies_legend.setWordWrap(True)
+        self.facies_legend.setToolTip("Facies display colours; the saved layer colours and map stay unchanged")
+        self.facies_legend.hide()
+        layout.addWidget(self.facies_legend)
         self.manual_status = QLabel()
         self.manual_status.setWordWrap(True)
         self.manual_status.setTextInteractionFlags(
@@ -4074,6 +4096,20 @@ class LayerPainterView(QWidget):
         )
         self.show_differences.toggled.connect(self._differences_toggled)
         row.addWidget(self.show_differences)
+        row.addSpacing(12)
+        row.addWidget(QLabel("Colours"))
+        self.color_mode = QComboBox()
+        self.color_mode.addItem("By layer", "layer")
+        self.color_mode.addItem("By facies", "facies")
+        self.color_mode.setCurrentIndex(self.color_mode.findData(self._color_mode))
+        self.color_mode.setToolTip("Colour the marks and map by layer or by facies; display only")
+        self.color_mode.currentIndexChanged.connect(self._color_mode_changed)
+        row.addWidget(self.color_mode)
+        self.clear_highlight_button = QToolButton()
+        self.clear_highlight_button.setText("Clear facies highlight")
+        self.clear_highlight_button.clicked.connect(lambda: self.highlight_facies(None))
+        self.clear_highlight_button.hide()
+        row.addWidget(self.clear_highlight_button)
         row.addStretch(1)
         return row
 
@@ -5009,7 +5045,66 @@ class LayerPainterView(QWidget):
     def _layer_colors(self) -> dict[int, QColor]:
         if self.session is None:
             return {}
-        return {row.layer_id: QColor(row.color) for row in self.session.layers}
+        if self._color_mode == "layer" and self._highlight_facies is None:
+            return {row.layer_id: QColor(row.color) for row in self.session.layers}
+        return {row.layer_id: (
+            QColor("#999999") if self._highlight_facies is not None and row.facies != self._highlight_facies
+            else _facies_color(row.facies)) for row in self.session.layers}
+
+    def _stored_color_mode(self) -> str:
+        mode = QSettings(*_BACKGROUND_SETTINGS).value(_COLOR_MODE_KEY, "layer")
+        return "facies" if mode == "facies" else "layer"
+
+    def set_color_mode(self, mode: str) -> None:
+        """Choose display colours without changing any saved map data."""
+        if mode not in {"layer", "facies"}:
+            raise ValueError("Choose layer or facies display colours")
+        self.color_mode.setCurrentIndex(self.color_mode.findData(mode))
+
+    def _color_mode_changed(self, _index: int) -> None:
+        self._color_mode = str(self.color_mode.currentData())
+        QSettings(*_BACKGROUND_SETTINGS).setValue(_COLOR_MODE_KEY, self._color_mode)
+        self._refresh_display_colors()
+
+    def _refresh_display_colors(self) -> None:
+        self._refresh_layers()
+        self._refresh_facies_table()
+        self._render_marks()
+        self._render_proposal()
+
+    def _refresh_facies_legend(self) -> None:
+        if not hasattr(self, "facies_legend"):
+            return
+        session = self.session
+        visible = session is not None and (self._color_mode == "facies" or self._highlight_facies is not None)
+        self.facies_legend.setVisible(visible)
+        self.clear_highlight_button.setVisible(self._highlight_facies is not None)
+        if not visible:
+            self.facies_legend.clear()
+            return
+        colors = self._layer_colors()
+        entries = []
+        for name in session.facies_order():
+            members = session.layers_in_facies(name)
+            if members:
+                color = colors[members[0].layer_id].name()
+                hidden = " (hidden)" if all(row.layer_id in self._hidden_layers for row in members) else ""
+                entries.append(f'<span style="color:{color}">■</span> {escape(name)}{hidden}')
+        prefix = f"Highlight: {escape(self._highlight_facies)} · " if self._highlight_facies is not None else "Facies: "
+        self.facies_legend.setText(prefix + " &nbsp; ".join(entries))
+
+    def show_only_facies(self, facies: str) -> None:
+        if self.session is None or not self.session.layers_in_facies(facies):
+            return
+        self._set_hidden_layers(row.layer_id for row in self.session.layers if row.facies != facies)
+
+    def highlight_facies(self, facies: str | None) -> None:
+        """Highlight a facies while retaining every existing hidden-layer choice."""
+        if facies is not None and (self.session is None or not self.session.layers_in_facies(facies)):
+            return
+        if facies != self._highlight_facies:
+            self._highlight_facies = facies
+            self._refresh_display_colors()
 
     def _refresh_layers(self) -> None:
         table = self.layer_table
@@ -5019,16 +5114,20 @@ class LayerPainterView(QWidget):
             current = self.canvas.layer_id
             session = self.session
             layers = session.layers if session is not None else []
+            colors = self._layer_colors()
             strokes = session.stroke_counts() if session is not None else {}
             polygons = session.polygon_counts() if session is not None else {}
             table.setRowCount(len(layers))
             selected_row = -1
             for row, layer in enumerate(layers):
                 swatch = QTableWidgetItem()
-                swatch.setBackground(QColor(layer.color))
+                swatch.setBackground(colors[layer.layer_id])
                 # Not selectable, so that the selection does not hide the color.
                 swatch.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                swatch.setToolTip("Double-click to change the color")
+                swatch.setToolTip(
+                    "Double-click to change the color" if self._color_mode == "layer" and self._highlight_facies is None
+                    else "Display colour; double-click to change this layer's colour for By layer"
+                )
                 swatch.setData(Qt.ItemDataRole.UserRole, layer.layer_id)
                 table.setItem(row, 0, swatch)
                 name = QTableWidgetItem(layer.name)
@@ -5076,12 +5175,13 @@ class LayerPainterView(QWidget):
         finally:
             table.blockSignals(False)
         _fit_table_height(table)
+        self._refresh_facies_legend()
 
     def _use_layer(self, layer_id: int) -> None:
         layer = self.session.layer(layer_id) if self.session is not None else None
         if layer is None:
             return
-        self.canvas.set_layer(layer.layer_id, QColor(layer.color))
+        self.canvas.set_layer(layer.layer_id, self._layer_colors()[layer.layer_id])
 
     def selected_layer_id(self) -> int | None:
         rows = {index.row() for index in self.layer_table.selectedIndexes()}
@@ -5163,7 +5263,7 @@ class LayerPainterView(QWidget):
         except ValueError as error:
             QMessageBox.information(self, "Cannot add a layer", str(error))
             return
-        self.canvas.set_layer(layer.layer_id, QColor(layer.color))
+        self.canvas.set_layer(layer.layer_id, self._layer_colors()[layer.layer_id])
         self._refresh_layers()
         self._refresh_facies_table()
         self._mark_dirty()
@@ -5288,6 +5388,7 @@ class LayerPainterView(QWidget):
             self.canvas.set_hidden_layers(hidden)
             self._render_proposal()
         self._sync_show_column()
+        self._refresh_facies_legend()
 
     def _prune_hidden_layers(self) -> None:
         """Hidden layers belong to the session shown: another session (another
@@ -5297,12 +5398,16 @@ class LayerPainterView(QWidget):
         session = self.session
         if session is not self._hidden_session:
             self._hidden_session = session
+            self._highlight_facies = None
             hidden: set[int] = set()
             self.canvas.clear_selection()
         elif session is None:
             hidden = set()
         else:
             hidden = self._hidden_layers & {row.layer_id for row in session.layers}
+        if (self._highlight_facies is not None
+                and (session is None or not session.layers_in_facies(self._highlight_facies))):
+            self._highlight_facies = None
         if hidden != self._hidden_layers:
             self._hidden_layers = hidden
             self.canvas.set_hidden_layers(hidden)
@@ -5355,6 +5460,7 @@ class LayerPainterView(QWidget):
                     layer_id
                 )
             )
+        self._add_facies_display_actions(menu, layer.facies if layer is not None else None)
         every = menu.addAction("Show all layers")
         every.setEnabled(bool(self._hidden_layers))
         every.triggered.connect(lambda _checked=False: self.show_all_layers())
@@ -5374,6 +5480,33 @@ class LayerPainterView(QWidget):
             )
         self._layer_table_menu_widget = menu
         menu.popup(self.layer_table.viewport().mapToGlobal(position))
+
+    def _add_facies_display_actions(self, menu: QMenu, facies: str | None) -> None:
+        members = self.session.layers_in_facies(facies) if self.session is not None and facies is not None else []
+        only = menu.addAction("Show only this facies")
+        only.setEnabled(bool(members))
+        focus = menu.addAction("Highlight this facies")
+        focus.setEnabled(bool(members))
+        if members:
+            only.triggered.connect(lambda _checked=False, name=facies: self.show_only_facies(name))
+            focus.triggered.connect(lambda _checked=False, name=facies: self.highlight_facies(name))
+        clear = menu.addAction("Clear facies highlight")
+        clear.setEnabled(self._highlight_facies is not None)
+        clear.triggered.connect(lambda _checked=False: self.highlight_facies(None))
+
+    def _facies_table_menu(self, position: QPoint) -> None:
+        if self.session is None:
+            return
+        row = self.facies_table.indexAt(position).row()
+        item = self.facies_table.item(row, 0) if row >= 0 else None
+        facies = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+        menu = QMenu(self)
+        self._add_facies_display_actions(menu, facies)
+        every = menu.addAction("Show all layers")
+        every.setEnabled(bool(self._hidden_layers))
+        every.triggered.connect(lambda _checked=False: self.show_all_layers())
+        self._facies_table_menu_widget = menu
+        menu.popup(self.facies_table.viewport().mapToGlobal(position))
 
     def _ask_layer_snap(self, layer_id: int) -> None:
         """Ask for one layer's own snap distance and set it."""
@@ -6970,8 +7103,9 @@ class LayerPainterView(QWidget):
         table = np.zeros((256, 4), dtype=np.uint8)
         table[lp.OUTSIDE] = (0, 0, 0, 110)
         assert self.session is not None
+        colors = self._layer_colors()
         for layer in self.session.layers:
-            color = QColor(layer.color)
+            color = colors[layer.layer_id]
             table[layer.layer_id] = (color.red(), color.green(), color.blue(), alpha)
         # Hidden layers are fully transparent (display only).
         hidden = np.zeros(256, dtype=bool)
@@ -6981,13 +7115,22 @@ class LayerPainterView(QWidget):
         table[hidden] = 0
         rgba = table[classes]
         shown = ~hidden[classes]
+        boundary_classes = classes
+        if self._color_mode == "facies" or self._highlight_facies is not None:
+            groups = np.arange(256, dtype=np.int16) + 256
+            names = {name: number for number, name in enumerate(self.session.facies_order())}
+            for layer in self.session.layers:
+                groups[layer.layer_id] = names[layer.facies]
+            boundary_classes = groups[classes]
         # A boundary pixel is drawn where it touches a shown layer (or the area
         # outside the rig frame); between hidden layers there is none.
         boundary = np.zeros(classes.shape, dtype=bool)
-        boundary[:, 1:] |= (classes[:, 1:] != classes[:, :-1]) & (
+        boundary[:, 1:] |= ((boundary_classes[:, 1:] != boundary_classes[:, :-1])
+                            | (shown[:, 1:] != shown[:, :-1])) & (
             shown[:, 1:] | shown[:, :-1]
         )
-        boundary[1:, :] |= (classes[1:, :] != classes[:-1, :]) & (
+        boundary[1:, :] |= ((boundary_classes[1:, :] != boundary_classes[:-1, :])
+                            | (shown[1:, :] != shown[:-1, :])) & (
             shown[1:, :] | shown[:-1, :]
         )
         rgba[boundary] = (255, 255, 255, 235)
@@ -7439,6 +7582,7 @@ class LayerPainterView(QWidget):
             return
         session = self.session
         names = session.facies_order() if session is not None else []
+        colors = self._layer_colors()
         selected = self.selected_facies()
         table = self.facies_table
         table.blockSignals(True)
@@ -7462,7 +7606,7 @@ class LayerPainterView(QWidget):
                 entry = session.facies.get(name, lp.FaciesEntry())
                 members = session.layers_in_facies(name)
                 item = QTableWidgetItem(
-                    _swatch(members[0].color) if members else QIcon(), name
+                    _swatch(colors[members[0].layer_id].name()) if members else QIcon(), name
                 )
                 item.setData(Qt.ItemDataRole.UserRole, name)
                 item.setFlags(
@@ -7593,9 +7737,10 @@ class LayerPainterView(QWidget):
         menu.clear()
         if self.session is None:
             return
+        colors = self._layer_colors()
         for layer in self.session.layers:
             box = QCheckBox(layer.name)
-            box.setIcon(_swatch(layer.color))
+            box.setIcon(_swatch(colors[layer.layer_id].name()))
             box.setChecked(layer.facies == facies)
             if layer.facies != facies and layer.facies != layer.name:
                 box.setText(f"{layer.name}   (now in {layer.facies})")
@@ -7645,6 +7790,8 @@ class LayerPainterView(QWidget):
         else:
             QTimer.singleShot(0, self._refresh_facies_table)
         self._refresh_layers()
+        self._render_marks()
+        self._render_proposal()
 
     def set_layer_in_facies(self, layer_id: int, facies: str, member: bool) -> None:
         """Tick or untick a layer in a facies' layer list."""

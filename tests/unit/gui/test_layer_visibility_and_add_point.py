@@ -345,6 +345,9 @@ def test_layer_table_menu_shows_only_one_layer_or_all_layers(view):
     }
     assert list(actions) == [
         "Show only this layer",
+        "Show only this facies",
+        "Highlight this facies",
+        "Clear facies highlight",
         "Show all layers",
         "",  # separator
         "Snap distance of this layer…",
