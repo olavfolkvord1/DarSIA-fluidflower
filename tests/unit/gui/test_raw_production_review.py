@@ -176,7 +176,7 @@ def test_registered_source_or_published_label_changes_are_refused(published):
 
 
 def test_actual_review_window_shows_registered_raw_photo_and_published_overlay(published, qtbot, monkeypatch, tmp_path, record_property):
-    from PySide6.QtCore import QThreadPool, QTimer
+    from PySide6.QtCore import QThreadPool, QTimer, Qt
     from darsia.fluidflower import phase_workflow
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setenv("DARSIA_PHASE_DISPLAY_CACHE", str(tmp_path / "display"))
@@ -184,17 +184,18 @@ def test_actual_review_window_shows_registered_raw_photo_and_published_overlay(p
     from darsia.fluidflower.tools import calibration_pairwise_review as review
     from darsia.fluidflower.tools import calibration_review_desktop as desktop
     data = published
+    original = {path: path.read_bytes() for path in data.data.series_root.rglob("*") if path.is_file()}
     binding = registration.register_review(data.completion, data.model)
     combined = Path(binding["combined_root"])
     inventory = review.discover_review_inventory(combined)
     decisions = tmp_path / "sessions/current"
-    store = review.ReviewStore(decisions, inventory.pairs, read_only=True)
+    store = review.ReviewStore(decisions, inventory.pairs)
     app_model = review.ReviewApp(inventory, store)
     workspace = desktop.ReviewWorkspace(key="current_comparison", title="Published RAW review",
         short_label="Published phase labels", description="Private synthetic source and published labels",
         campaign_id=binding["campaign_id"], ffac_root=combined, ffum_root=combined,
         combined_root=combined, decision_dir=decisions, review_surface="open_correction",
-        single_model=True, target_model_id=data.model.name, read_only=True,
+        single_model=True, target_model_id=data.model.name, read_only=False,
         selected_candidates=binding["selected_candidates"])
     window = desktop.workspace_window_class(workspace)(app_model, store, tmp_path / "viewer-cache", workspace,
         reviewer_name="reviewer", use_opengl=False)
@@ -221,6 +222,49 @@ def test_actual_review_window_shows_registered_raw_photo_and_published_overlay(p
     assert viewer.base_item.sceneTransform() == viewer.overlay_item.sceneTransform()
     assert viewer.base_item.sceneBoundingRect() == viewer.overlay_item.sceneBoundingRect()
     assert max(viewer.base_item.pixmap().toImage().pixelColor(8, 6).getRgb()[:3]) > 64
+    assert window.width() == 1280
+    options = window.image_controls_layout
+    visible_items = [options.itemAt(index) for index in range(options.count())
+                     if not options.itemAt(index).isEmpty()]
+    assert len({item.geometry().y() for item in visible_items}) > 1
+    for item in visible_items:
+        assert item.geometry().width() >= item.sizeHint().width()
+        assert options.geometry().contains(item.geometry())
+        assert "Â" not in getattr(item.widget(), "text", lambda: "")()
+    assert "Â" not in window.run_list.item(0).text()
+    assert "·" in window.run_list.item(0).text()
+    assert "Â" not in window.frame_label.text()
+    assert "Â" not in desktop.FrameTimelineLabel.frame_text(0, 2, baseline=True)
+    assert "Â" not in desktop.FrameTimelineLabel.frame_text(0, 2, reference=True)
+    decision_pane = window.decision_scroll
+    assert decision_pane.widget().width() == decision_pane.viewport().width()
+    assert decision_pane.horizontalScrollBar().maximum() == 0
+    assert not decision_pane.horizontalScrollBar().isVisible()
+    assert window.next_unreviewed.width() >= window.next_unreviewed.sizeHint().width()
+    for control in (window.next_unreviewed, *window.flag_boxes["A"].values()):
+        assert decision_pane.widget().rect().contains(control.geometry())
+        assert control.width() >= control.sizeHint().width()
+    for key, label in window.FLAG_LABELS:
+        assert " ".join(window.flag_boxes["A"][key].text().split()) == label
+    assert window.verdict.isEnabled() and window.verdict.currentData() == ""
+    qtbot.keyClick(window.verdict, Qt.Key.Key_Down)
+    assert window.verdict.currentData() == "acceptable"
+    decision_pane.ensureWidgetVisible(window.save_now)
+    qtbot.waitUntil(lambda: decision_pane.viewport().rect().contains(
+        window.save_now.mapTo(decision_pane.viewport(), window.save_now.rect().center())))
+    qtbot.mouseClick(window.save_now, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._comparison_save_task is None and not window.save_dirty
+                   and bool(window._comparison_saved_records.get(window.current_run)), timeout=20000)
+    finish(window)
+    saved = review.ReviewStore(decisions, inventory.pairs).decisions()[window.current_run]
+    assert saved["run"] == inventory.pairs[0].run and saved["reviewer"] == "reviewer"
+    assert saved["candidate_a"]["candidate_id"] == inventory.pairs[0].candidate_a.candidate_id
+    assert len(saved["frame_choices"]) == 1
+    assert saved["frame_choices"][0]["frame_index"] == 0
+    assert saved["frame_choices"][0]["choice"] == "acceptable"
+    assert saved["frame_choices"][0]["reviewer"] == "reviewer"
+    assert all(path.read_bytes() == raw for path, raw in original.items())
+    decision_pane.verticalScrollBar().setValue(0)
     screenshot = tmp_path / "registered_raw_production_review.png"
     assert window.grab().save(str(screenshot))
     record_property("actual_review_window_screenshot", str(screenshot))

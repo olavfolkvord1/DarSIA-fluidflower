@@ -39,6 +39,7 @@ try:
         QObject,
         QEvent,
         QPointF,
+        QRect,
         QRectF,
         QRunnable,
         QSize,
@@ -85,6 +86,7 @@ try:
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QLayout,
         QListWidget,
         QListWidgetItem,
         QMainWindow,
@@ -1045,7 +1047,7 @@ class ReviewImageAssets:
     def _add_brightness_control(self, layout) -> None:
         self.display_mode = "natural"
         self.brightness = QPushButton(DISPLAY_MODE_LABELS[self.display_mode])
-        self.brightness.setToolTip("Cycle natural â†’ lift Ã—4.3 â†’ lift Ã—7.1 â†’ change (flat field). Photographic display only; model input and RAW detail stay unchanged.")
+        self.brightness.setToolTip("Cycle natural -> lift x4.3 -> lift x7.1 -> change (flat field). Photographic display only; model input and RAW detail stay unchanged.")
         self.brightness.setEnabled(False)
         self.brightness.clicked.connect(self._cycle_brightness)
         layout.addWidget(self.brightness)
@@ -1973,6 +1975,70 @@ class SmallComponentCache(QObject):
         self.result_ready.emit(key, result, error)
 
 
+class WrappingControlLayout(QLayout):
+    """Keep photographic options readable as the review pane gets narrower."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(6)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+        self.invalidate()
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._arrange(QRect(0, 0, width, 0))
+
+    def setGeometry(self, rectangle) -> None:
+        super().setGeometry(rectangle)
+        self._arrange(rectangle, place=True)
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            if not item.isEmpty():
+                size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def _arrange(self, rectangle, *, place=False) -> int:
+        margins = self.contentsMargins()
+        left, top = rectangle.x() + margins.left(), rectangle.y() + margins.top()
+        right = rectangle.right() - margins.right() + 1
+        x, y, row_height = left, top, 0
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            size = item.sizeHint().expandedTo(item.minimumSize())
+            if x > left and x + size.width() > right:
+                x, y, row_height = left, y + row_height + self.spacing(), 0
+            if place:
+                item.setGeometry(QRect(x, y, size.width(), size.height()))
+            x += size.width() + self.spacing()
+            row_height = max(row_height, size.height())
+        return y + row_height + margins.bottom() - rectangle.y()
+
+
 class FrameTimelineLabel(QLabel):
     """Keep playback controls stationary when the frame description changes."""
 
@@ -1987,11 +2053,11 @@ class FrameTimelineLabel(QLabel):
     def frame_text(index: int, count: int, elapsed: float | None = None,
                    *, reference: bool = False, baseline: bool = False) -> str:
         if reference:
-            return "Pre-injection reference Â· before injection"
+            return "Pre-injection reference · before injection"
         if baseline:
-            return f"Pre-injection baseline Â· Frame 1 / {count} Â· negative control"
+            return f"Pre-injection baseline · Frame 1 / {count} · negative control"
         return (f"Frame {index + 1} / {count}"
-                + (f" Â· {elapsed:.2f} h" if elapsed is not None else ""))
+                + (f" · {elapsed:.2f} h" if elapsed is not None else ""))
 
     def set_timeline(self, frame_count: int, elapsed_hours: Sequence[float]) -> None:
         self._frame_count = int(frame_count)
@@ -6282,6 +6348,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         run_layout.addWidget(self.run_sort)
         self.run_list = QListWidget()
         self.run_list.setMinimumWidth(180)
+        self.run_list.setWordWrap(True)
+        self.run_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.run_list.currentItemChanged.connect(self._run_changed)
         run_layout.addWidget(self.run_list, 1)
         refresh = QPushButton("Refresh experiments")
@@ -6509,7 +6577,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         vertical.setSizes([245, 720])
         comparison_layout.addWidget(vertical, 1)
 
-        image_controls = QHBoxLayout()
+        image_controls = WrappingControlLayout()
+        self.image_controls_layout = image_controls
         self.contours = QPushButton("Phase map: ON")
         self.contours.setCheckable(True)
         self.contours.setChecked(True)
@@ -6565,7 +6634,11 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         image_controls.addWidget(self.show_l1_neighbourhood)
         self.layer_label = QLabel("Layer")
         self.layer_label.setEnabled(False)
-        image_controls.addWidget(self.layer_label)
+        layer_controls = QWidget()
+        self.layer_controls_widget = layer_controls
+        layer_controls_row = QHBoxLayout(layer_controls)
+        layer_controls_row.setContentsMargins(0, 0, 0, 0)
+        layer_controls_row.addWidget(self.layer_label)
         self.contour_filter = QComboBox()
         self.contour_filter.addItem("All predicted phases", "all")
         self.contour_filter.addItem("Free CO2 only", "gas")
@@ -6585,7 +6658,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         )
         self.contour_filter.setEnabled(False)
         self.contour_filter.currentIndexChanged.connect(self._request_overlays)
-        image_controls.addWidget(self.contour_filter)
+        layer_controls_row.addWidget(self.contour_filter)
+        image_controls.addWidget(layer_controls)
         self.physics_layer = QComboBox()
         self.physics_layer.addItem("Optical", "optical")
         self.physics_layer.addItem("Physics-corrected", "physics")
@@ -6660,8 +6734,11 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             "Show the corrected pre-injection image aligned to the currently selected frame."
         )
         self.reference.toggled.connect(self._reference_toggled)
-        image_controls.addSpacing(10)
-        image_controls.addWidget(QLabel("Opacity"))
+        opacity_controls = QWidget()
+        self.opacity_controls_widget = opacity_controls
+        opacity_controls_row = QHBoxLayout(opacity_controls)
+        opacity_controls_row.setContentsMargins(0, 0, 0, 0)
+        opacity_controls_row.addWidget(QLabel("Opacity"))
         self.contour_opacity = QSlider(Qt.Orientation.Horizontal)
         self.contour_opacity.setRange(20, 100)
         self.contour_opacity.setValue(50)
@@ -6670,12 +6747,12 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             "Adjust phase-map opacity while keeping the corrected image visible beneath it."
         )
         self.contour_opacity.valueChanged.connect(self._contour_opacity_changed)
-        image_controls.addWidget(self.contour_opacity)
+        opacity_controls_row.addWidget(self.contour_opacity)
         self.contour_opacity_label = QLabel("50%")
         self.contour_opacity_label.setMinimumWidth(38)
-        image_controls.addWidget(self.contour_opacity_label)
+        opacity_controls_row.addWidget(self.contour_opacity_label)
+        image_controls.addWidget(opacity_controls)
         self._contour_opacity_changed(self.contour_opacity.value())
-        image_controls.addStretch(1)
         comparison_layout.addLayout(image_controls)
         from darsia.fluidflower.ui.optical_cleanup import OpticalCleanup
         self.optical_cleanup = OpticalCleanup(self)
@@ -6843,6 +6920,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         decision_scroll = QScrollArea()
         self.decision_scroll = decision_scroll
         decision_scroll.setWidgetResizable(True)
+        decision_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         decision_scroll.setMinimumWidth(330)
         decision_scroll.setMaximumWidth(420)
         decision_panel = QWidget()
@@ -6860,6 +6938,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         self.decision_help = decision_help
         decision_layout.addWidget(decision_help)
         self.verdict = QComboBox()
+        self.verdict.setMinimumContentsLength(20)
+        self.verdict.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._configure_verdict_options("pair")
         self.verdict.currentIndexChanged.connect(self._frame_verdict_changed)
         decision_layout.addWidget(self.verdict)
@@ -6912,6 +6992,17 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
                     decision_layout.addWidget(issue_section)
                     physical_heading_added = True
                 option = QRadioButton(label)
+                # Leave room for pane margins, the radio indicator and vertical scrolling.
+                text_width = decision_scroll.minimumWidth() - 70
+                lines = [""]
+                for word in label.split():
+                    text = (lines[-1] + " " + word).strip()
+                    if lines[-1] and option.fontMetrics().horizontalAdvance(text) > text_width:
+                        lines.append(word)
+                    else:
+                        lines[-1] = text
+                option.setText("\n".join(lines))
+                option.setAccessibleName(label)
                 if key in review.CANDIDATE_ISSUE_HELP:
                     option.setToolTip(review.CANDIDATE_ISSUE_HELP[key])
                 option.setProperty("issue_key", key)
@@ -6925,7 +7016,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
                 category_group.addButton(option)
                 self.flag_boxes[side][key] = option
                 decision_layout.addWidget(option)
-            draw_actions = QHBoxLayout()
+            draw_actions = WrappingControlLayout()
             for mode, label in (
                 ("box", f"Draw {side} box"),
                 ("freehand", f"Draw {side} freehand"),
@@ -7022,6 +7113,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         history_layout.addWidget(self.withdraw_history)
         history_layout.addWidget(QLabel("New classification for the selected historical box"))
         self.history_classification = QComboBox()
+        self.history_classification.setMinimumContentsLength(20)
+        self.history_classification.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.history_classification.addItem("Choose a new classificationâ€¦", "")
         for key, label in self.ISSUE_CATEGORY_LABELS:
             self.history_classification.addItem(label, key)
@@ -7057,6 +7150,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         self.save_now.clicked.connect(self._save_now)
         decision_layout.addWidget(self.save_now)
         decision_layout.addStretch(1)
+        for label in decision_panel.findChildren(QLabel):
+            label.setWordWrap(True)
         decision_scroll.setWidget(decision_panel)
         outer.addWidget(decision_scroll)
         outer.setSizes([185, 1380, 350])
@@ -7354,7 +7449,8 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         for side in ("A", "B"):
             self.panel_control_rows[side].setVisible(split)
         self.contours.setVisible(not split and not self._blind_gas_locked)
-        for widget in (self.phase_map_only, self.layer_label, self.contour_filter,
+        for widget in (self.phase_map_only, self.layer_controls_widget, self.opacity_controls_widget,
+                       self.layer_label, self.contour_filter,
                        self.physics_layer, self.contour_opacity,
                        self.contour_opacity_label, self.highlight_small):
             widget.setVisible(not split and not self._blind_gas_locked)
@@ -7679,9 +7775,9 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             if total:
                 status = f"{reviewed}/{total} frames"
                 if complete:
-                    status += " Â· complete"
+                    status += " · complete"
                 elif row.get("reviewed") and not reviewed:
-                    status += " Â· legacy run verdict"
+                    status += " · legacy run verdict"
             else:
                 status = "saved" if row.get("reviewed") else "ready"
             annotation_count = len((decisions.get(run) or {}).get("annotations") or [])
@@ -7691,16 +7787,16 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             elif getattr(self, "_review_history_data", None) is not None:
                 historical_count = len((self._review_history_data.get("by_run", {}).get(run) or {}).get("annotations") or [])
                 every_model = annotation_count + historical_count
-                status += f" Â· {annotation_count} active boxes Â· {historical_count} historical"
+                status += f" · {annotation_count} active boxes · {historical_count} historical"
             else:
-                status += f" Â· {annotation_count} boxes Â· {every_model} across all models"
+                status += f" · {annotation_count} boxes · {every_model} across all models"
             if area_sort:
                 phase, side, _direction = area_sort.groups()
                 area = (self._run_area_peaks.get(run) or {}).get(side)
                 value = None if area is None else area.get(phase)
-                phase_name = "free COâ‚‚" if phase == "gas" else "aqueous COâ‚‚"
-                status += (f" Â· peak {phase_name} {value:.1f}% of porous area"
-                           if value is not None else " Â· peak area unavailable")
+                phase_name = "free CO2" if phase == "gas" else "aqueous CO2"
+                status += (f" · peak {phase_name} {value:.1f}% of porous area"
+                           if value is not None else " · peak area unavailable")
             entries.append((run, dataset, status, every_model))
         if order == "boxes":
             entries.sort(key=lambda entry: (-entry[3], self._run_number(entry[0])))
@@ -7713,7 +7809,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         else:
             entries.sort(key=lambda entry: self._run_number(entry[0]))
         for run, dataset, status, _every_model in entries:
-            item = QListWidgetItem(f"{dataset} Â· {run.upper()}\n{status}")
+            item = QListWidgetItem(f"{dataset} · {run.upper()}\n{status}")
             item.setData(Qt.ItemDataRole.UserRole, run)
             self.run_list.addItem(item)
             if run == selected:
@@ -8480,7 +8576,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             control.setEnabled(False)
             control.setText("Context additions: OFF")
             control.setToolTip("Studio reviews the archived optical prediction. Context and local-search additions are excluded.")
-            self.mass_analysis_button.setText("Concentration + mass Â· archived model")
+            self.mass_analysis_button.setText("Concentration + mass · archived model")
             self.mass_analysis_button.setToolTip("This calculation uses the archived model's fixed supported phase maps, not the optical review layer or cleanup preview.")
             return
         unified = any(getattr(self.current_pair_object.candidate(side), "phase_support_format", "")
@@ -11472,7 +11568,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
             self._set_save_status("pending", "Protected locally Â· newer changes queued")
             self.save_timer.start(0 if self._comparison_closing else 50)
         else:
-            self._set_save_status("saved", "All changes saved Â· NAS synced")
+            self._set_save_status("saved", "All changes saved · NAS synced")
             if self._comparison_closing:
                 QTimer.singleShot(0, self.close)
 
