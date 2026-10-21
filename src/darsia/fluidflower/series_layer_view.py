@@ -3229,9 +3229,12 @@ class _AdoptionWorker(QObject):
         try:
             from darsia.fluidflower import map_adoption as ma
             from .raw_shape_basis_reader import require_basis_index
+            from .painting_frame_models import read_adoption_cohort, verify_adoption_cohort
 
+            cohort = read_adoption_cohort(self.options["geometry_index"], self.options["runs"], self.record["run_id"])
+            self.progress.emit(cohort['summary'])
             require_basis_index(self.options["geometry_index"],
-                                [self.record["run_id"], *self.options["runs"]])
+                                [self.record["run_id"], *cohort["runs"]])
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
@@ -3241,12 +3244,13 @@ class _AdoptionWorker(QObject):
                 underlay = version_fixture_underlay(self.record, frame=self.frame)
                 if underlay is not None:
                     fixture_options = dict(fixture_underlay=underlay, fixture_frame=self.frame)
+            verify_adoption_cohort(cohort)
             result = ma.prepare_adoption(
                 self.options["destination"],
                 layers,
                 reference_run=session.run_id,
                 geometry_index=self.options["geometry_index"],
-                runs=self.options["runs"],
+                runs=cohort["runs"],
                 roles={
                     row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
                 },
@@ -3265,6 +3269,10 @@ class _AdoptionWorker(QObject):
                 painting_frame=self.frame,
                 painting_project=self.options.get("project"),
             )
+            verify_adoption_cohort(cohort)
+            if any(result['geometry_index'].get(key) != val for key, val in cohort['geometry_index'].items()):
+                raise ValueError('The preparation used another adoption cohort index')
+            result = dict(result, gui_adoption_cohort=cohort)
         except Exception as error:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(error).__name__}: {error}")
             return

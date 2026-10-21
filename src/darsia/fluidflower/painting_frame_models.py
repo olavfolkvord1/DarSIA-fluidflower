@@ -82,3 +82,73 @@ def verify_frame_model_selection(selection):
     if (version(before) != version(after) or len(raw) != selection.size_bytes
             or hashlib.sha256(raw).hexdigest() != selection.sha256):
         raise ValueError("The series frame-model index changed. Retry after its display binding is corrected.")
+
+
+def read_adoption_cohort(index_path, registered_runs, reference_run):
+    """Read only selected index metadata in the GUI worker, never model arrays.
+
+    An explicit complete ordered cohort is authoritative for this GUI action.
+    A legacy index without any cohort header retains the all-registered route.
+    Partial declarations, intersections and inferred exclusions are refused.
+    """
+    from .pipeline.job_inputs import _json_bytes
+    from .map_placement import GEOMETRY_FORMAT
+    path = Path(index_path).resolve()
+    before = path.stat()
+    with path.open('rb') as stream:
+        raw = stream.read(MAX_INDEX_BYTES + 1)
+    after = path.stat()
+    version = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if len(raw) > MAX_INDEX_BYTES or version(before) != version(after):
+        raise ValueError('The selected geometry index changed or exceeds its metadata bound')
+    value = _json_bytes(raw)
+    if not isinstance(value, Mapping) or value.get('format') != GEOMETRY_FORMAT:
+        raise ValueError('Select one measured geometry index for adoption')
+
+    def names(rows, label):
+        """Compare explicit safe run identities without silently dropping duplicates."""
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise ValueError(label + ' must be an explicit nonempty ordered cohort')
+        if any(not isinstance(run, str) or re.fullmatch(r'[a-z0-9][a-z0-9_-]*', run.casefold()) is None for run in rows):
+            raise ValueError(label + ' contains an invalid run identity')
+        result = [run.casefold() for run in rows]
+        if len(result) != len(set(result)):
+            raise ValueError(label + ' contains duplicate runs')
+        return result
+
+    registered = names(list(registered_runs), 'Registered runs')
+    explicit = any(key in value for key in ('run_order', 'run_count'))
+    if explicit:
+        if not {'run_order', 'run_count', 'runs'} <= value.keys():
+            raise ValueError('The selected index cohort header is incomplete')
+        selected = names(value['run_order'], 'Selected index run_order')
+        entries = value['runs']
+        if not isinstance(entries, Mapping):
+            raise ValueError('The selected index cohort needs its explicit run mapping')
+        declared = names(list(entries), 'Selected index runs')
+        if (type(value['run_count']) is not int or value['run_count'] != len(selected)
+                or set(declared) != set(selected) or len(declared) != len(selected)
+                or value.get('reference_models_complete') is not True
+                or value.get('pending_runs')):
+            raise ValueError('The selected index cohort header is inconsistent or incomplete')
+        if not set(selected) <= set(registered):
+            raise ValueError('The selected index cohort contains foreign unregistered runs')
+    else:
+        selected = list(registered)
+    if str(reference_run).casefold() not in selected:
+        raise ValueError('The selected index cohort does not include the map reference run')
+    remaining = [run for run in registered if run not in set(selected)]
+    summary = (f'Adoption scope: {len(selected)} of {len(registered)} registered runs. '
+               + (f'{len(remaining)} remain outside this adoption: ' + ', '.join(remaining) + '.'
+                  if remaining else 'No registered runs remain outside this adoption.'))
+    return dict(runs=selected, registered=registered, remaining=remaining, summary=summary,
+        explicit=explicit, geometry_index=dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw)))
+
+
+def verify_adoption_cohort(cohort):
+    """Recheck the captured metadata identity before/after the existing preparation."""
+    from .project import sha256_file
+    bound = cohort['geometry_index']
+    path = Path(bound['path'])
+    if path.stat().st_size != bound['size_bytes'] or sha256_file(path) != bound['sha256']:
+        raise ValueError('The selected adoption cohort index changed; retry the action')

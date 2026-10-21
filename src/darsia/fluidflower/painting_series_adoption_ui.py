@@ -148,7 +148,8 @@ class SeriesAdoptionController(QObject):
         try:
             dialog = AdoptionDialog(self.view.project, self.preparation['folder'],
                 actor=self.view._reviewer() or default_actor(), parent=self.view,
-                automatic_only=True)
+                automatic_only=True,
+                adoption_scope_note=(self.preparation.get('gui_adoption_cohort') or {}).get('summary', ''))
             dialog.check_button.hide()
             dialog.save_button.hide()
             dialog.operation_retired.connect(self._dialog_retired)

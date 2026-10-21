@@ -113,6 +113,7 @@ class AdoptionDialog(QDialog):
         actor: str,
         parent: QWidget | None = None,
         automatic_only: bool = False,
+        adoption_scope_note: str = "",
     ) -> None:
         """Show the preparation table, validation result and explicit revision-save controls."""
         super().__init__(parent)
@@ -121,6 +122,7 @@ class AdoptionDialog(QDialog):
         self.project = project
         self.folder = Path(folder)
         self.actor = str(actor)
+        self.adoption_scope_note = str(adoption_scope_note)
         self.preparation = ma.read_preparation(self.folder)
         self.current = GeometryRevisionStore(project).current()
         self.automatic = "painting_facies" in self.preparation
@@ -158,7 +160,7 @@ class AdoptionDialog(QDialog):
         if self.automatic:
             from .painted_adoption_table import frame_basis_text
             instruction += frame_basis_text(self.preparation["painting_facies"]) + " Check verifies these bindings. "
-        note = QLabel(
+        note = QLabel(self.adoption_scope_note + ("\n\n" if self.adoption_scope_note else "") +
             f"Map {version.get('name') or ''} (SHA-256 {str(version.get('sha256') or '')[:12]}…), "
             f"prepared on the label grid of {len(prepared)} of "
             f"{len(self.preparation.get('runs') or [])} runs. " + instruction + "'Check' builds the "
@@ -323,6 +325,7 @@ class AdoptionDialog(QDialog):
         answer = QMessageBox.question(
             self,
             "Save revision",
+            self.adoption_scope_note + ("\n\n" if self.adoption_scope_note else "") +
             "Append a new geometry revision that adopts this map in every prepared run? The "
             "current revision stays in the history. Run configurations do not change until "
             "Apply geometry to Setup." + frame_note,
