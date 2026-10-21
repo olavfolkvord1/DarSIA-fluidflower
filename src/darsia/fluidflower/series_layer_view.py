@@ -3430,6 +3430,7 @@ class LayerPainterView(QWidget):
         self._analysis_boxes_preview_items = []
         self._analysis_boxes_preview_key = None
         self.measured_edges = None
+        self.other_frames = None
         self._measured_edges_reload_pending = False
         self._measured_edges_syncing = False
         self._waiting_for_workers = False
@@ -3543,6 +3544,10 @@ class LayerPainterView(QWidget):
         self.run_preview.geometry_button.clicked.connect(self._measured_edges_context_changed)
         self.rig_panel.mark_corners.toggled.connect(self._refresh_measured_edges)
         self.rig_panel.place_point.toggled.connect(self._refresh_measured_edges)
+        from .painting_other_frames_ui import PaintingOtherFramesController
+        self.other_frames = PaintingOtherFramesController(self)
+        self.step_frame.content.layout().addWidget(self.other_frames.widget)
+        self.other_frames.busy_changed.connect(self._other_frames_busy_changed)
         for button in (self.analysis_boxes.draw_button, self.analysis_boxes.edit_button):
             button.toggled.connect(self._analysis_boxes_tool_changed)
         self.run_preview.display_changed.connect(self._sync_analysis_boxes)
@@ -4446,6 +4451,9 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
+        other = getattr(self, "other_frames", None)
+        if other is not None and other.busy():
+            return True
         measured = getattr(self, "measured_edges", None)
         if measured is not None and measured.busy():
             return True
@@ -4474,7 +4482,7 @@ class LayerPainterView(QWidget):
         previous = self._waiting_for_workers
         self._waiting_for_workers = True
         try:
-            for controller in (self.analysis_boxes, self.measured_edges):
+            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames):
                 if controller is not None:
                     while controller.busy():
                         controller.wait_for_workers()
@@ -5241,15 +5249,17 @@ class LayerPainterView(QWidget):
     def can_close(self) -> bool:
         boxes = getattr(self, "analysis_boxes", None)
         measured = getattr(self, "measured_edges", None)
+        other = getattr(self, "other_frames", None)
         return (not self.busy() and not self.run_preview.busy()
                 and (boxes is None or boxes.can_close())
-                and (measured is None or measured.can_close()))
+                and (measured is None or measured.can_close())
+                and (other is None or other.can_close()))
 
     def eventFilter(self, watched, event):
         if self._analysis_boxes_closed or not isValid(self):
             return False
         if watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close:
-            for controller in (self.analysis_boxes, self.measured_edges):
+            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames):
                 if controller is not None and not controller.can_close():
                     event.ignore()
                     controller.note.setText("Wait for the current metadata operation before closing.")
@@ -5332,9 +5342,15 @@ class LayerPainterView(QWidget):
 
     def _measured_edges_context_changed(self, *_args):
         self._measured_edges_reload_pending = True
+        other = getattr(self, "other_frames", None)
+        if other is not None:
+            other.context_changed()
         self._refresh_measured_edges()
 
     def _refresh_measured_edges(self, *_args):
+        other = getattr(self, "other_frames", None)
+        if other is not None:
+            other.refresh()
         measured = getattr(self, "measured_edges", None)
         if (measured is None or self._measured_edges_syncing or not measured._alive()):
             return
@@ -5352,6 +5368,12 @@ class LayerPainterView(QWidget):
     def _measured_edges_busy_changed(self, *_args):
         measured = getattr(self, "measured_edges", None)
         if measured is not None and measured._alive():
+            self._refresh_status()
+            self.busy_changed.emit(self.busy())
+
+    def _other_frames_busy_changed(self, *_args):
+        other = getattr(self, "other_frames", None)
+        if other is not None and other._alive():
             self._refresh_status()
             self.busy_changed.emit(self.busy())
 
@@ -8377,14 +8399,25 @@ class LayerPainterView(QWidget):
             current = self._compare_inputs_key()
             if not current or self._compare_key != current:
                 layers = None
-        key = (id(manual), id(layers), height, width)
+        live_key = self._manual_inputs_key()
+        live = bool(live_key and self._manual_key == live_key)
+        key = (id(manual), id(layers), height, width, live_key, live)
         if self._manual_display is not None and self._manual_display["key"] == key:
             return self._manual_display
+        classes = cv2.resize(manual.classes, (width, height), interpolation=cv2.INTER_NEAREST)
+        extra_pixels, coverage_reason = 0, ""
+        if live:
+            from .painting_drawing_coverage import add_explicit_outside
+            try:
+                classes, extra_pixels = add_explicit_outside(
+                    self.session, self.current_frame(), classes)
+            except ValueError as error:
+                coverage_reason = str(error)
         display: dict[str, Any] = {
             "key": key,
-            "classes": cv2.resize(
-                manual.classes, (width, height), interpolation=cv2.INTER_NEAREST
-            ),
+            "classes": classes,
+            "extra_drawing_pixels": extra_pixels,
+            "coverage_reason": coverage_reason,
             "uncovered": _any_pixel(manual.uncovered(), (width, height)),
             "edge": _any_pixel(manual.edge_filled, (width, height)),
             "uncovered_pixels": manual.uncovered_pixels(),
@@ -8481,6 +8514,11 @@ class LayerPainterView(QWidget):
                 )
             else:
                 parts.append("Manual map: every pixel inside the rig frame has a layer.")
+            if display.get("extra_drawing_pixels"):
+                parts.append("Explicit polygons outside the rig frame are shown as drawing context and kept in the live placement preview. "
+                             "Saved manual versions keep their original frame-limited map. Drawing cannot cover areas outside this photo.")
+            if display.get("coverage_reason"):
+                parts.append("Extra drawing context unavailable: " + display["coverage_reason"])
             filled = display["edge_filled_pixels"]
             if filled:
                 parts.append(

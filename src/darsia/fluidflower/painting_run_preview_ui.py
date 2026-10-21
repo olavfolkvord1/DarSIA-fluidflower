@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import time
 
 import numpy as np
@@ -16,6 +17,7 @@ from . import layer_painting as lp
 from . import painting_run_preview as preview
 from . import painting_frame_models as frame_models
 from . import painting_preview_frame_domain as frame_domain
+from . import painting_drawing_coverage as drawing_coverage
 
 _SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _INDEX = "placement/geometry_index"
@@ -65,8 +67,27 @@ class _PreviewWorker(QObject):
                     source_name = "Current manual map (the proposal is out of date)"
             session, layers = preview.preview_layers(session, self.proposal, self.corrections,
                                                      self.frame, source=source, record=record)
-            def partial(value):
+            # Only the live drawing/manual convenience route has extra photo
+            # coverage. Explicit saved maps and proposals keep their exact arrays.
+            live_drawing = self.options.get("record") is None and (
+                source in {"manual", "drawing"} or self.proposal is None)
+            added = 0
+            if live_drawing:
+                layers, added = drawing_coverage.add_explicit_outside(
+                    session, self.frame, layers, drawing=source != "manual")
+
+            def display_metadata(value):
                 value = frame_domain.attach_frame_domain(value, session, self.frame, layers)
+                if live_drawing:
+                    measurements = dict(value.measurements)
+                    measurements[drawing_coverage.KEY] = dict(
+                        display_only=True, explicit_outside_pixels=added,
+                        stored_version_unchanged=True)
+                    value = replace(value, measurements=measurements)
+                return value
+
+            def partial(value):
+                value = display_metadata(value)
                 frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
                 self.partial.emit((value, session))
 
@@ -76,7 +97,7 @@ class _PreviewWorker(QObject):
                 photo_loader=self.options["photo_loader"], source_name=source_name,
                 on_progress=self.progress.emit,
                 on_preview=partial)
-            result = frame_domain.attach_frame_domain(result, session, self.frame, layers)
+            result = display_metadata(result)
             frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
         except Exception as error:  # reported in the preview, no write fallback
             self.error = _plain_error(error)
@@ -517,11 +538,16 @@ class PaintingRunPreview(QObject):
         shift = result.measurements.get("offset_px") or {}
         checks = result.measurements.get("checks") or {}
         domain = result.measurements.get(frame_domain.KEY) or {}
+        current_coverage = result.measurements.get(drawing_coverage.KEY) or {}
         if domain.get("status") == "available":
             gap_note = (f"Inside-frame uncovered: {domain['inside_uncovered_pixels']:,} px "
-                        f"({domain['inside_uncovered_cm2']:.4g} cm²). Outside the rig frame is transparent. ")
+                        f"({domain['inside_uncovered_cm2']:.4g} cm²). ")
+            gap_note += ("Explicit drawing outside that frame is shown as context; the gap statistics keep the placed reference-frame domain. "
+                         if current_coverage else "Outside the rig frame is transparent. ")
         else:
             gap_note = "Inside-frame gaps unavailable: " + str(domain.get("reason") or "The reference rig frame is not bound.") + " "
+        if current_coverage:
+            gap_note += "Areas outside the reference photo cannot be covered by extending polygons inside it. Saved manual versions keep their original map. "
         self.note.setText(f"{result.run_id}: {result.source_name} from {result.source_run}, placed through the saved frame models. "
                           "Read only · no approval, placement receipt or adoption is created. Magenta: uncovered inside the placed reference rig frame. "
                           f"Displacement: median {shift.get('median_px', '—')} px, maximum {shift.get('max_px', '—')} px. "
@@ -548,7 +574,12 @@ class PaintingRunPreview(QObject):
             inside, gaps = domain["display_inside"], domain["display_gaps"]
             if inside.shape != result.layers.shape or gaps.shape != result.layers.shape:
                 raise ValueError("The displayed drawing-frame masks belong to another photograph grid.")
-            rgba[~inside] = (0, 0, 0, 0)
+            if result.measurements.get(drawing_coverage.KEY):
+                # Only actual live drawing coverage may remain as context.
+                # Edge replication beyond the source photo is never coverage.
+                rgba[~inside & (result.uncovered | (result.layers == lp.OUTSIDE))] = (0, 0, 0, 0)
+            else:
+                rgba[~inside] = (0, 0, 0, 0)
             # A hidden facies cannot hide a genuinely uncovered pixel.
             rgba[gaps] = (255, 0, 255, 95)
         else:
