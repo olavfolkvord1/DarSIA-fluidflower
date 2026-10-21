@@ -3231,6 +3231,13 @@ class _AdoptionWorker(QObject):
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
+            fixture_options = {}
+            if any(session.facies_of(row.layer_id).role == "colorchecker" for row in session.layers):
+                from .layer_painting_fixtures import version_fixture_underlay
+                underlay = version_fixture_underlay(self.record, frame=self.frame)
+                if underlay is not None:
+                    layers = underlay.analysis_layers
+                    fixture_options = dict(fixture_underlay=underlay, fixture_frame=self.frame)
             result = ma.prepare_adoption(
                 self.options["destination"],
                 layers,
@@ -3250,6 +3257,7 @@ class _AdoptionWorker(QObject):
                 | {"approval": self.options.get("approval")},
                 current_labels=self.options.get("current_labels"),
                 progress=self.progress.emit,
+                **fixture_options,
             )
         except Exception as error:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -3569,6 +3577,10 @@ class LayerPainterView(QWidget):
         self.other_frames = PaintingOtherFramesController(self)
         self.step_frame.content.layout().addWidget(self.other_frames.widget)
         self.other_frames.busy_changed.connect(self._other_frames_busy_changed)
+        from .painting_fixture_preview import PaintingFixturePreview
+        self.fixture_preview = PaintingFixturePreview(self)
+        self.run_preview.widget.layout().addWidget(self.fixture_preview.widget)
+        self.fixture_preview.busy_changed.connect(self._fixture_preview_busy_changed)
         for button in (self.analysis_boxes.draw_button, self.analysis_boxes.edit_button):
             button.toggled.connect(self._analysis_boxes_tool_changed)
         self.run_preview.display_changed.connect(self._sync_analysis_boxes)
@@ -4498,6 +4510,9 @@ class LayerPainterView(QWidget):
         chooser = getattr(self, "_saved_transfers_dialog", None)
         if chooser is not None and chooser.busy():
             return True
+        fixture = getattr(self, "fixture_preview", None)
+        if fixture is not None and fixture.busy():
+            return True
         other = getattr(self, "other_frames", None)
         if other is not None and other.busy():
             return True
@@ -4529,7 +4544,8 @@ class LayerPainterView(QWidget):
         previous = self._waiting_for_workers
         self._waiting_for_workers = True
         try:
-            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames):
+            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames,
+                               getattr(self, "fixture_preview", None)):
                 if controller is not None:
                     while controller.busy():
                         controller.wait_for_workers()
@@ -5309,7 +5325,8 @@ class LayerPainterView(QWidget):
         if self._analysis_boxes_closed or not isValid(self):
             return False
         if watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close:
-            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames):
+            for controller in (self.analysis_boxes, self.measured_edges, self.other_frames,
+                               getattr(self, "fixture_preview", None)):
                 if controller is not None and not controller.can_close():
                     event.ignore()
                     controller.note.setText("Wait for the current metadata operation before closing.")
@@ -5418,6 +5435,13 @@ class LayerPainterView(QWidget):
     def _measured_edges_busy_changed(self, *_args):
         measured = getattr(self, "measured_edges", None)
         if measured is not None and measured._alive():
+            self._refresh_status()
+            self.busy_changed.emit(self.busy())
+
+    def _fixture_preview_busy_changed(self, *_args):
+        """Publish fixture-preview activity through the host lifecycle guard."""
+        fixture = getattr(self, "fixture_preview", None)
+        if fixture is not None and fixture._alive():
             self._refresh_status()
             self.busy_changed.emit(self.busy())
 
@@ -9610,6 +9634,9 @@ class LayerPainterView(QWidget):
         self.export_button.setEnabled(not self.busy() and not problems)
 
     def _refresh_status(self) -> None:
+        fixture = getattr(self, "fixture_preview", None)
+        if fixture is not None:
+            fixture.refresh()
         self._refresh_fill_region()
         self._sync_analysis_boxes()
         self._refresh_measured_edges()
