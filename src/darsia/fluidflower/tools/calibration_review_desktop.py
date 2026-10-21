@@ -6791,11 +6791,15 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         comparison_layout.addWidget(self.annotation_visibility_widget)
 
         self.guide_controls_widget = QWidget()
-        guide_controls = QHBoxLayout(self.guide_controls_widget)
+        guide_controls = WrappingControlLayout()
+        self.guide_controls_widget.setLayout(guide_controls)
         guide_controls.setContentsMargins(0, 0, 0, 0)
         guide_controls.addWidget(QLabel("Fixed reference guides"))
         self.reference_guide_name = QLineEdit()
         self.reference_guide_name.setPlaceholderText("Optional guide name")
+        self.reference_guide_name.setMinimumWidth(
+            self.reference_guide_name.fontMetrics().horizontalAdvance(
+                self.reference_guide_name.placeholderText()) + 20)
         self.reference_guide_name.setMaximumWidth(210)
         self.reference_guide_name.setToolTip(
             "Name the next line. If left blank, the app assigns H1, V1, and so on."
@@ -6821,20 +6825,23 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
         )
         self.issue_draw_group.addButton(self.vertical_guide)
         guide_controls.addWidget(self.vertical_guide)
-        guide_controls.addWidget(QLabel("Saved"))
+        saved_guides = QWidget()
+        saved_guides_row = QHBoxLayout(saved_guides)
+        saved_guides_row.setContentsMargins(0, 0, 0, 0)
+        saved_guides_row.addWidget(QLabel("Saved"))
         self.reference_guide_list = QComboBox()
         self.reference_guide_list.setMinimumWidth(230)
         self.reference_guide_list.setToolTip(
             "Named guides stored for this experiment and shown at the same position on every frame."
         )
-        guide_controls.addWidget(self.reference_guide_list)
+        saved_guides_row.addWidget(self.reference_guide_list)
+        guide_controls.addWidget(saved_guides)
         self.delete_reference_guide = QPushButton("Delete selected")
         self.delete_reference_guide.setEnabled(False)
         self.delete_reference_guide.clicked.connect(
             self._delete_selected_reference_guide
         )
         guide_controls.addWidget(self.delete_reference_guide)
-        guide_controls.addStretch(1)
         comparison_layout.addWidget(self.guide_controls_widget)
 
         contour_legend = QLabel(
@@ -10080,7 +10087,7 @@ class BlindModelComparisonWindow(ReviewImageAssets, QMainWindow):
                 prefix = "Horizontal" if orientation == "horizontal" else "Vertical"
                 position = 100.0 * float(guide.get("position") or 0.0)
                 self.reference_guide_list.addItem(
-                    f"{prefix} Â· {guide.get('label') or 'Reference'} Â· {position:.1f}%",
+                    f"{prefix} · {guide.get('label') or 'Reference'} · {position:.1f}%",
                     str(guide.get("id") or ""),
                 )
         index = self.reference_guide_list.findData(current_id)

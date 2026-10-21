@@ -246,6 +246,17 @@ def test_actual_review_window_shows_registered_raw_photo_and_published_overlay(p
         assert control.width() >= control.sizeHint().width()
     for key, label in window.FLAG_LABELS:
         assert " ".join(window.flag_boxes["A"][key].text().split()) == label
+    qtbot.keyClicks(window.reference_guide_name, "Reference level")
+    qtbot.mouseClick(window.horizontal_guide, Qt.MouseButton.LeftButton)
+    guide_point = viewer.mapFromScene(viewer.graphics_scene.sceneRect().center())
+    assert viewer.viewport().rect().contains(guide_point)
+    expected_position = viewer.mapToScene(guide_point).y() / viewer.graphics_scene.sceneRect().height()
+    qtbot.mouseClick(viewer.viewport(), Qt.MouseButton.LeftButton, pos=guide_point)
+    assert len(window.reference_guides) == 1
+    guide = dict(window.reference_guides[0])
+    assert guide["label"] == "Reference level" and guide["orientation"] == "horizontal"
+    assert guide["position"] == pytest.approx(expected_position)
+    qtbot.mouseClick(window.pan_images, Qt.MouseButton.LeftButton)
     assert window.verdict.isEnabled() and window.verdict.currentData() == ""
     qtbot.keyClick(window.verdict, Qt.Key.Key_Down)
     assert window.verdict.currentData() == "acceptable"
@@ -263,8 +274,23 @@ def test_actual_review_window_shows_registered_raw_photo_and_published_overlay(p
     assert saved["frame_choices"][0]["frame_index"] == 0
     assert saved["frame_choices"][0]["choice"] == "acceptable"
     assert saved["frame_choices"][0]["reviewer"] == "reviewer"
+    assert saved["reference_guides"] == [guide]
     assert all(path.read_bytes() == raw for path, raw in original.items())
     decision_pane.verticalScrollBar().setValue(0)
+    guide_options = window.guide_controls_widget.layout()
+    guide_items = [guide_options.itemAt(index) for index in range(guide_options.count())
+                   if not guide_options.itemAt(index).isEmpty()]
+    assert len({item.geometry().y() for item in guide_items}) > 1
+    for item in guide_items:
+        assert item.geometry().width() >= item.sizeHint().width()
+        assert guide_options.geometry().contains(item.geometry())
+    for control in (window.reference_guide_name, window.horizontal_guide, window.vertical_guide,
+                    window.reference_guide_list, window.delete_reference_guide):
+        assert control.width() >= control.sizeHint().width()
+    assert window.reference_guide_name.width() >= window.reference_guide_name.fontMetrics().horizontalAdvance(
+        window.reference_guide_name.placeholderText()) + 12
+    assert "Reference level" in window.reference_guide_list.currentText()
+    assert "Â" not in window.reference_guide_list.currentText()
     screenshot = tmp_path / "registered_raw_production_review.png"
     assert window.grab().save(str(screenshot))
     record_property("actual_review_window_screenshot", str(screenshot))
