@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import layer_painting as lp
+from . import painting_layer_priority as priority
 
 KEY = "current_drawing_photo_coverage"
 
@@ -43,7 +44,7 @@ def add_explicit_outside(session, frame, layers, *, drawing=False):
     outside = ~lp.frame_mask(frame, layers.shape, scale)
     if not np.any(outside):
         return result, 0
-    explicit = lp.rasterize_polygons(session.polygons, layers.shape, scale)
+    explicit = priority.rasterize_polygons(session, layers.shape, scale)
     if drawing:
         strokes = lp.rasterize_strokes(session.strokes, layers.shape, scale)
         explicit[strokes != lp.OUTSIDE] = strokes[strokes != lp.OUTSIDE]

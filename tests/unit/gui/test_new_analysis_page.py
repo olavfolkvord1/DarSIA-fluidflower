@@ -50,7 +50,7 @@ def owner(local_registry, qtbot):  # noqa: F811
         resource_factory=jobs_resource_factory(),
     )
     value.new_analysis.facts_reader = lambda row: dict(FACTS)
-    qtbot.addWidget(value)
+    qtbot.addWidget(value, before_close_func=lambda widget: qtbot.waitUntil(widget.can_close, timeout=30000))
     yield value
     qtbot.waitUntil(value.can_close, timeout=30000)
 

@@ -99,6 +99,7 @@ from PySide6.QtWidgets import (
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import layer_painting_manual as lpm
+from darsia.fluidflower import painting_layer_priority as layer_priority
 from darsia.fluidflower import layer_painting_polygons_only as lpp
 from darsia.fluidflower import layer_painting_version_archive as lpv
 from darsia.fluidflower.painting_native_cache import ASYNC_PIXELS, NativeProposalCache
@@ -161,9 +162,11 @@ _DRAWING_TOOLS = frozenset({"polygon", "edit", "paint", "erase"}) | _CORRECTION_
 # Outline of the corrected areas on the proposal (RGBA).
 _CORRECTED_EDGE = (255, 196, 0, 255)
 # Polygons, strokes and corrections, as kept for undo and redo.
-_Snapshot = tuple[list[lp.Polygon], list[lp.Stroke], list[lp.Correction]]
+_Snapshot = tuple[list[lp.Polygon], list[lp.Stroke], list[lp.Correction], tuple[int, ...]]
 # Column of the layer table whose box shows or hides a layer (display only).
 _SHOW_COLUMN = 4
+_TOP_COLUMN = 5
+_TOP_TIP = "Always on top in the drawing and manual map. Keeps the polygons underneath unchanged; uses Manual map while enabled."
 _SHOW_TIP = "Show or hide this layer in the photograph (display only)"
 _FACIES_SHOW_TIP = (
     "Show or hide this facies' marks, strokes and map colours in either colour mode "
@@ -1150,14 +1153,16 @@ class LayerCanvas(QGraphicsView):
             )
 
     def render_polygons(
-        self, polygons: Sequence[lp.Polygon], colors: Mapping[int, QColor]
+        self, polygons: Sequence[lp.Polygon], colors: Mapping[int, QColor],
+        *, always_on_top: Iterable[int] = (),
     ) -> None:
-        """Draw the polygons; larger ones below smaller ones."""
+        """Draw the polygons; explicit priority lies above the usual area order."""
 
         for item in self._polygon_items:
             self.scene().removeItem(item)
         self._polygon_items = []
         self._polygons = list(polygons)
+        self._always_on_top = frozenset(always_on_top)
         self._polygon_colors = dict(colors)
         drag = self._drag
         if drag is not None and any(
@@ -1184,7 +1189,8 @@ class LayerCanvas(QGraphicsView):
                 )
                 # Smaller polygons win where layers overlap, so they lie on top.
                 rank = sum(1 for other in areas if other > areas[index])
-                item.setZValue(8.0 + min(rank, 999) * 1.0e-3)
+                base = 11.0 if polygon.layer_id in self._always_on_top else 8.0
+                item.setZValue(base + min(rank, 999) * 1.0e-3)
                 item.setVisible(
                     self._marks_visible and polygon.layer_id not in self._hidden_layers
                 )
@@ -1319,7 +1325,9 @@ class LayerCanvas(QGraphicsView):
         ]
         if not hits:
             return None
-        return min(hits, key=lambda index: self._polygons[index].area())
+        return min(hits, key=lambda index: (
+            self._polygons[index].layer_id not in self._always_on_top,
+            self._polygons[index].area()))
 
     def _hit_edge(self, position: QPointF) -> int | None:
         """The shown polygon with an edge within the point-hit distance of a
@@ -3675,13 +3683,14 @@ class LayerPainterView(QWidget):
                 "indicator was added; the proposal still uses the reference photo."
             )
         )
-        self.layer_table = QTableWidget(0, 5)
+        self.layer_table = QTableWidget(0, 6)
         self.layer_table.setHorizontalHeaderLabels(
-            ["", "Layer", "Polygons", "Strokes", "Show"]
+            ["", "Layer", "Polygons", "Strokes", "Show", "Top"]
         )
         show_header = self.layer_table.horizontalHeaderItem(_SHOW_COLUMN)
         if show_header is not None:
             show_header.setToolTip(_SHOW_TIP)
+        self.layer_table.horizontalHeaderItem(_TOP_COLUMN).setToolTip(_TOP_TIP)
         self.layer_table.verticalHeader().setVisible(False)
         self.layer_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -3702,6 +3711,7 @@ class LayerPainterView(QWidget):
         header.setSectionResizeMode(
             _SHOW_COLUMN, QHeaderView.ResizeMode.ResizeToContents
         )
+        header.setSectionResizeMode(_TOP_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
         self.layer_table.itemSelectionChanged.connect(self._layer_selected)
         self.layer_table.itemChanged.connect(self._layer_item_changed)
         self.layer_table.cellDoubleClicked.connect(self._layer_double_clicked)
@@ -5712,6 +5722,7 @@ class LayerPainterView(QWidget):
             self._refresh_display_colors()
 
     def _refresh_layers(self) -> None:
+        self._sync_layer_priority()
         table = self.layer_table
         self._prune_hidden_layers()
         table.blockSignals(True)
@@ -5770,6 +5781,15 @@ class LayerPainterView(QWidget):
                 )
                 shown.setToolTip(_SHOW_TIP + (" Its facies is switched off." if layer.facies in self._hidden_facies else ""))
                 table.setItem(row, _SHOW_COLUMN, shown)
+                top = QTableWidgetItem()
+                top.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                             | Qt.ItemFlag.ItemIsUserCheckable)
+                top.setCheckState(Qt.CheckState.Checked if layer.always_on_top else Qt.CheckState.Unchecked)
+                reason = self._manual_unavailable()
+                if reason:
+                    top.setFlags(Qt.ItemFlag.ItemIsSelectable)
+                top.setToolTip(reason or _TOP_TIP)
+                table.setItem(row, _TOP_COLUMN, top)
                 if layer.layer_id == current:
                     selected_row = row
             if selected_row < 0 and layers:
@@ -5812,6 +5832,11 @@ class LayerPainterView(QWidget):
 
     def _layer_item_changed(self, item: QTableWidgetItem) -> None:
         if self.session is None:
+            return
+        if item.column() == _TOP_COLUMN:
+            if item.row() < len(self.session.layers):
+                self.set_layer_always_on_top(self.session.layers[item.row()].layer_id,
+                    item.checkState() == Qt.CheckState.Checked)
             return
         if item.column() == _SHOW_COLUMN:
             if item.row() < len(self.session.layers):
@@ -5956,6 +5981,50 @@ class LayerPainterView(QWidget):
 
     def layer_visible(self, layer_id: int) -> bool:
         return int(layer_id) not in self.hidden_layers
+
+    def _sync_layer_priority(self) -> None:
+        marked = layer_priority.layer_ids(self.session) if self.session is not None else ()
+        box = getattr(self, "map_shown", None)
+        if box is None:
+            return
+        if marked and workspace_frame.frame_kind(self._workspace_frame_config) != "rig-corrected":
+            box.blockSignals(True)
+            box.setCurrentIndex(box.findData(_MANUAL))
+            box.blockSignals(False)
+            self.show_proposal.setText(self._overlay_text())
+        # Proposal arrays retain their own scientific identity. Priority uses
+        # the explicitly selected manual map rather than decorating a proposal.
+        proposal_item = box.model().item(box.findData("proposal"))
+        if proposal_item is not None:
+            proposal_item.setEnabled(not marked)
+        box.setToolTip(_TOP_TIP if marked else _MAP_SHOWN_TIP)
+
+    def set_layer_always_on_top(self, layer_id: int, enabled: bool) -> None:
+        """Set persistent manual-map priority in one undo step; keep all points."""
+        if self.session is None or not self.run_preview.is_reference():
+            return
+        layer = self.session.layer(layer_id)
+        if layer is None or layer.always_on_top == bool(enabled):
+            return
+        if enabled and self._manual_unavailable():
+            self.canvas_hint.setText(self._manual_unavailable())
+            self._refresh_layers()
+            return
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None:
+            if boxes.busy():
+                self.canvas_hint.setText("Wait for the analysis-box operation before changing layer priority.")
+                self._refresh_layers()
+                return
+            boxes.set_mode(None)
+        self.layer_table.setFocus()
+        self._push_undo()
+        layer.always_on_top = bool(enabled)
+        self._manual_display = None
+        self._after_mark_change()
+        self._render_proposal()
+        self._schedule_manual_map()
+        self.run_preview.refresh()
 
     def set_layer_visible(self, layer_id: int, visible: bool) -> None:
         """Show or hide a layer in the photograph.
@@ -6209,11 +6278,15 @@ class LayerPainterView(QWidget):
             ],
             # Corrections are never changed once drawn: the list is enough.
             list(self.corrections),
+            layer_priority.layer_ids(self.session),
         )
 
     def _restore(self, snapshot: _Snapshot) -> None:
         assert self.session is not None
-        polygons, strokes, corrections = snapshot
+        polygons, strokes, corrections = snapshot[:3]
+        marked = frozenset(snapshot[3]) if len(snapshot) > 3 else frozenset()
+        for layer in self.session.layers:
+            layer.always_on_top = layer.layer_id in marked
         self.corrections = list(corrections)
         self.session.polygons = [
             lp.Polygon(row.layer_id, list(row.points)) for row in polygons
@@ -6593,8 +6666,14 @@ class LayerPainterView(QWidget):
         A change of the corrections alone does not write the session.
         """
 
-        if before[:2] != after[:2]:
+        priority_changed = before[3:] != after[3:]
+        if priority_changed:
+            self._manual_display = None
+        if before[:2] != after[:2] or priority_changed:
             self._after_mark_change()
+        if priority_changed:
+            self._render_proposal()
+            self._schedule_manual_map()
         if before[2] != after[2]:
             self._after_correction_change()
 
@@ -7840,7 +7919,8 @@ class LayerPainterView(QWidget):
         if self.session is None:
             self.canvas.render_polygons([], {})
             return
-        self.canvas.render_polygons(self.session.polygons, self._layer_colors())
+        self.canvas.render_polygons(self.session.polygons, self._layer_colors(),
+                                    always_on_top=layer_priority.layer_ids(self.session))
 
     def _render_marks(self) -> None:
         if self.session is None:
@@ -7849,7 +7929,8 @@ class LayerPainterView(QWidget):
             return
         colors = self._layer_colors()
         self.canvas.render_strokes(self.session.strokes, colors)
-        self.canvas.render_polygons(self.session.polygons, colors)
+        self.canvas.render_polygons(self.session.polygons, colors,
+                                    always_on_top=layer_priority.layer_ids(self.session))
 
     def _render_strokes(self) -> None:
         """Former name of :meth:`_render_marks`."""
@@ -8191,6 +8272,9 @@ class LayerPainterView(QWidget):
     def _map_kind(self) -> str:
         """The map shown and saved as a version: the proposal or the manual map."""
 
+        if (self.session is not None and layer_priority.layer_ids(self.session)
+                and workspace_frame.frame_kind(self._workspace_frame_config) != "rig-corrected"):
+            return _MANUAL
         box = getattr(self, "map_shown", None)
         return str(box.currentData() or "proposal") if box is not None else "proposal"
 
@@ -8231,6 +8315,9 @@ class LayerPainterView(QWidget):
             list(self.image.image_size),
             frame.to_dict() if frame is not None else None,
         ]
+        marked = layer_priority.layer_ids(self.session)
+        if marked:
+            payload.append({"always_on_top": marked})
         text = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -8468,6 +8555,7 @@ class LayerPainterView(QWidget):
     def _map_shown_changed(self, _index: int) -> None:
         """Show the other map; the manual map is drawn when it is out of date."""
 
+        self._sync_layer_priority()
         self.show_proposal.setText(self._overlay_text())
         if not self.show_proposal.isChecked():
             self.show_proposal.setChecked(True)
@@ -8940,6 +9028,9 @@ class LayerPainterView(QWidget):
         return self._new_map_digest
 
     def export_problems_now(self) -> list[str]:
+        if self.session is not None and layer_priority.layer_ids(self.session):
+            return ["Always on top uses the manual map. Save and approve a manual-map version; "
+                    "proposal export does not include this priority."]
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             return ["Corrected-frame production export and Build run model are not qualified yet."]
         if self._raw_session_frame:
@@ -8982,6 +9073,9 @@ class LayerPainterView(QWidget):
         )
 
     def save_and_export(self) -> None:
+        if self.session is not None and layer_priority.layer_ids(self.session):
+            self.export_status.setText(self.export_problems_now()[0])
+            return
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             self.export_status.setText("Corrected-frame production export and Build run model are not qualified yet.")
             return

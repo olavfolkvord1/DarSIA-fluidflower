@@ -112,6 +112,9 @@ def drawing_layers(session, frame):
     # Erase strokes remove previous strokes, as in the drawing canvas; they
     # do not erase polygons beneath that independent marks layer.
     layers[strokes != 0] = strokes[strokes != 0]
+    from .painting_layer_priority import apply_priority
+
+    layers = apply_priority(session, layers, (1., 1.))
     layers[~lp.frame_mask(frame, shape, (1., 1.))] = lp.OUTSIDE
     return layers
 

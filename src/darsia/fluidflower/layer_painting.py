@@ -158,6 +158,7 @@ class PaintedLayer:
     color: str
     facies: str
     snap_mm: float | None = None
+    always_on_top: bool = False  # Manual-map/display priority; classifier rules are unchanged.
 
 
 @dataclass
@@ -631,6 +632,7 @@ class PaintingSession:
                     "color": row.color,
                     "facies": row.facies,
                     **({} if row.snap_mm is None else {"snap_mm": row.snap_mm}),
+                    **({"always_on_top": True} if row.always_on_top else {}),
                 }
                 for row in self.layers
             ],
@@ -707,6 +709,7 @@ class PaintingSession:
                     None
                     if layer_snap is None
                     else float(min(max(layer_snap, 0.0), MAX_SNAP_MM)),
+                    always_on_top=row.get("always_on_top") is True,
                 )
             )
         for name, row in dict(payload.get("facies") or {}).items():

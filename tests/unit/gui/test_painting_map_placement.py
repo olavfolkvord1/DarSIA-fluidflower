@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import map_placement as mp
+from darsia.fluidflower import painting_run_preview_ui as preview_ui
 from darsia.fluidflower import series_layer_view as view_module
 from darsia.fluidflower.map_placement_view import MapPlacementDialog
 
@@ -159,7 +160,7 @@ def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_p
     assert warnings == ["Could not open the placement review"]
 
 
-def test_the_button_asks_for_the_geometry_and_the_runs_to_review_first(
+def test_the_button_reuses_shared_geometry_and_asks_for_runs_to_review_first(
     view, monkeypatch, tmp_path
 ):
     _show(view, _proposal())
@@ -168,11 +169,21 @@ def test_the_button_asks_for_the_geometry_and_the_runs_to_review_first(
     view.versions_table.selectRow(0)
     settings = view_module.QSettings(str(tmp_path / "settings.ini"), view_module.QSettings.Format.IniFormat)
     monkeypatch.setattr(view_module, "QSettings", lambda *args: settings)
+    monkeypatch.setattr(preview_ui, "QSettings", lambda *args: settings)
     index = _index(tmp_path / "geometry")
+    assert index.is_absolute() and index.is_file()
+    settings.setValue("placement/geometry_index", str(index))
+    settings.sync()
+    view.run_preview._index = ""
+    view.run_preview._geometry_selection = None
+    selection = view.run_preview.geometry_selection()
+    assert selection.index_path == str(index) and selection.source == "user override"
     monkeypatch.setattr(view, "_series_runs", lambda: ["ac52", "ac53"])
-    monkeypatch.setattr(
-        QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(index), "")
-    )
+
+    def choose_again(*args, **kwargs):
+        raise AssertionError("Placement must reuse the shared frame models without another file chooser")
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", choose_again)
     asked, started = [], []
 
     def ask(_parent, title, label, *args, **kwargs):
@@ -186,7 +197,7 @@ def test_the_button_asks_for_the_geometry_and_the_runs_to_review_first(
     assert title == "Place in all runs" and "in all 2 runs" in label and record["sha256"][:12] in label
     assert "changes no map, geometry revision or run configuration" in label
     assert started == [] and text == ""
-    # The geometry index is remembered; the runs to review first after an accepted answer.
+    # The shared geometry is unchanged; review order is saved only after acceptance.
     assert settings.value("placement/geometry_index") == str(index)
     monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: (" ac53 , ac60 ", True))
     view.place_version_button.click()

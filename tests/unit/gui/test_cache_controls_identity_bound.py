@@ -26,6 +26,7 @@ import pytest
 
 from darsia_cache import control, windows
 from darsia_cache.policy import CachePolicy, CachePolicyError
+from ._cache_owned_retirement import OwnedRetirements
 from darsia_cache.windows import (
     _API, WindowsNamespace, CacheCleanupIncomplete, CacheHandleCloseIncomplete,
     CacheWriteIncomplete,
@@ -40,6 +41,19 @@ def _evidence(root, name, document):
     folder.mkdir(exist_ok=True)
     with (folder / name).open("x", encoding="utf-8") as stream:
         json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
+
+
+@pytest.fixture
+def owned_retirements(tmp_path):
+    """Only this test's spawned owners; close every duplicated handle on failure."""
+    witnesses = OwnedRetirements()
+    try:
+        yield witnesses
+    finally:
+        try:
+            witnesses.close()
+        finally:
+            _evidence(tmp_path, "native-owner-retirement.json", witnesses.document())
 
 
 def _root_identity(path):
@@ -162,20 +176,28 @@ def _lifecycle_actor(base, token, outcome, result):
             scratch.close_handles()
 
 
-def _completed_actor(base, token, outcome):
+def _completed_actor(base, token, outcome, retirements):
     context = mp.get_context("spawn")
     result = context.Queue()
     actor = context.Process(target=_lifecycle_actor, args=(str(base), token, outcome, result))
     actor.start()
     try:
+        witness = retirements.capture(actor)  # Own the exact kernel object now.
         row = result.get(timeout=45)
+        assert witness.bind(row["owner"])
         actor.join(45)
-        assert not actor.is_alive() and actor.exitcode == 0 and "error" not in row
-        assert _epoch_absent(row["owner"])
+        exitcode = actor.exitcode
+        assert not actor.is_alive() and exitcode == 0 and "error" not in row
+        actor.close()
+        assert retirements.verify(row["owner"])
         return row
     finally:
         result.close()
         result.join_thread()
+        if not actor._closed:
+            actor.join(45)  # Failure cleanup of this fixture's child only.
+            if not actor.is_alive():
+                actor.close()
 
 
 def _valid_publication(manifest, publication):
@@ -189,14 +211,11 @@ def _valid_publication(manifest, publication):
     return len(raw) == publication["size_bytes"] and hashlib.sha256(raw).hexdigest() == publication["sha256"]
 
 
-def _verified_retirement(manifest, proof):
-    return manifest["owner"] == proof["owner"] and _epoch_absent(proof["owner"])
-
-
-def _close_reservation(ledger, row):
+def _close_reservation(ledger, row, retirements):
     with ledger.locked():
         ledger.close(row["reservation"], owner=row["owner"],
-            verify_no_further_writes=lambda original: original["owner"] == row["owner"] and _epoch_absent(row["owner"]))
+            verify_no_further_writes=lambda original: original["owner"] == row["owner"]
+                and retirements.verify(row["owner"]))
 
 
 def _reopen(ledger, row):
@@ -218,6 +237,87 @@ def _reserve_actor(base, token, barrier, result):
     except BaseException:
         result.put(dict(error=traceback.format_exc(), owner=owner))
         raise
+
+
+def _retirement_gate_actor(gate, result):
+    result.put(_owner_now())
+    if not gate.wait(45):
+        raise RuntimeError("Test parent did not release its own gated child")
+
+
+def test_owned_native_retirement_refuses_live_unknown_changed_and_closed_identity(
+        owned_retirements, monkeypatch):
+    context = mp.get_context("spawn")
+    gate, result = context.Event(), context.Queue()
+    actor = context.Process(target=_retirement_gate_actor, args=(gate, result))
+    actor.start()
+    try:
+        witness = owned_retirements.capture(actor)
+        owner = result.get(timeout=45)
+        assert owner["pid"] == actor.pid and witness.bind(owner)
+        assert owned_retirements.verify(owner) is False
+        assert witness.events[-1]["native"]["wait_zero_result"] == 258
+        assert _epoch_absent(owner) is False  # A live exact epoch is not absent.
+        assert owned_retirements.verify(None) is False
+        assert witness.retired({**owner, "pid": owner["pid"] + 1}) is False
+        assert witness.retired({**owner, "process_create_time": str(
+            Decimal(owner["process_create_time"]) + 1)}) is False
+
+        gate.set()  # Natural exit, no terminate, sleep, or absence polling.
+        actor.join(45)
+        exitcode = actor.exitcode
+        assert not actor.is_alive() and exitcode == 0
+        actor.close()
+        assert owned_retirements.verify(owner) is True
+        native = witness.events[-1]["native"]
+        assert native["wait_zero_result"] == 0 and native["exitcode"] == 0
+        assert native["creation_filetime_100ns"] == witness.birth["creation_filetime_100ns"]
+        assert native["exit_filetime_100ns"] >= native["creation_filetime_100ns"] > 0
+        assert owned_retirements.verified_retirement({"owner": owner}, {"owner": owner}) is True
+        assert owned_retirements.verified_retirement(
+            {"owner": {**owner, "pid": owner["pid"] + 1}}, {"owner": owner}) is False
+
+        actual_snapshot = witness.api.snapshot
+        def changed_creation(handle):
+            state = actual_snapshot(handle)
+            state["creation_filetime_100ns"] += 1
+            return state
+        with monkeypatch.context() as patch:
+            patch.setattr(witness.api, "snapshot", changed_creation)
+            assert owned_retirements.verify(owner) is False  # Exact native pin, even 100ns.
+        def denied(handle):
+            raise PermissionError("Synthetic unknown native status")
+        with monkeypatch.context() as patch:
+            patch.setattr(witness.api, "snapshot", denied)
+            assert owned_retirements.verify(owner) is False
+        witness.close()
+        assert owned_retirements.verify(owner) is False
+    finally:
+        gate.set()
+        if not actor._closed:
+            actor.join(45)
+            if not actor.is_alive():
+                actor.close()
+        result.close()
+        result.join_thread()
+
+
+@pytest.mark.parametrize("observation, absent", [
+    ("same", False), ("access-denied", False), ("invalid", False),
+    ("absent", True), ("different", True),
+])
+def test_strict_epoch_absence_keeps_same_epoch_and_unknown_refused(monkeypatch, observation, absent):
+    owner = dict(pid=123, process_create_time="100.0")
+    def observed_process(pid):
+        assert pid == owner["pid"]
+        if observation == "access-denied":
+            raise psutil.AccessDenied(pid)
+        if observation == "absent":
+            raise psutil.NoSuchProcess(pid)
+        value = {"same": 100.0, "different": 101.0, "invalid": float("nan")}[observation]
+        return SimpleNamespace(create_time=lambda: value)
+    monkeypatch.setattr(psutil, "Process", observed_process)
+    assert _epoch_absent(owner) is absent
 
 
 def test_only_declared_owned_objects_removed(owned):
@@ -527,38 +627,50 @@ def test_same_parent_regular_file_replacement_preserves_both_objects(owned):
     assert original.read_bytes() == retained.read_bytes() == b"declared owned bytes"
 
 
-def test_real_two_process_quota_reservations_count_remaining_once(tmp_path):
+def test_real_two_process_quota_reservations_count_remaining_once(tmp_path, owned_retirements):
     base = tmp_path / "quota"
     ledger = _synthetic_ledger(base, quota=128)
     context = mp.get_context("spawn")
     barrier, result = context.Barrier(2), context.Queue()
     actors = [context.Process(target=_reserve_actor, args=(str(base), token, barrier, result))
               for token in ("1" * 32, "2" * 32)]
+    witnesses = {}
     try:
         for actor in actors:
             actor.start()
+            witnesses[actor.pid] = owned_retirements.capture(actor)
         records = [result.get(timeout=45) for _ in actors]
         for actor in actors:
+            row = next(row for row in records if row["owner"]["pid"] == actor.pid)
+            assert witnesses[actor.pid].bind(row["owner"])
             actor.join(45)
-            assert not actor.is_alive() and actor.exitcode == 0
-        assert all("error" not in row and _epoch_absent(row["owner"]) for row in records)
+            exitcode = actor.exitcode
+            assert not actor.is_alive() and exitcode == 0
+            actor.close()
+        assert all("error" not in row and owned_retirements.verify(row["owner"])
+                   for row in records)
         assert sum(row["admitted"] for row in records) == 1
         winner = next(row for row in records if row["admitted"])
         with ledger.locked():
             assert ledger.remaining({winner["reservation"]["token"]: 0}) == 80
-        _close_reservation(ledger, winner)
+        _close_reservation(ledger, winner, owned_retirements)
         with ledger.locked():
             assert ledger.remaining({}) == 0
     finally:
         result.close()
         result.join_thread()
+        for actor in actors:
+            if actor._popen is not None and not actor._closed:
+                actor.join(45)
+                if not actor.is_alive():
+                    actor.close()
 
 
-def test_success_requires_publication_and_retirement_preserves_durable_outputs_and_receipts(tmp_path):
+def test_success_requires_publication_and_retirement_preserves_durable_outputs_and_receipts(tmp_path, owned_retirements):
     base = tmp_path / "success"
-    row = _completed_actor(base, "3" * 32, "success")
+    row = _completed_actor(base, "3" * 32, "success", owned_retirements)
     ledger = _synthetic_ledger(base)
-    _close_reservation(ledger, row)
+    _close_reservation(ledger, row, owned_retirements)
     item = _reopen(ledger, row)
     output = Path(row["publication"]["path"])
     expected = output.read_bytes()
@@ -568,10 +680,10 @@ def test_success_requires_publication_and_retirement_preserves_durable_outputs_a
                 verify_retirement=lambda manifest, proof: False, verify_publication=_valid_publication)
         with pytest.raises(CachePolicyError, match="publication"):
             item.cleanup(now_utc=row["utc"], retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=lambda manifest, proof: False)
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=lambda manifest, proof: False)
         assert item.root.exists() and output.read_bytes() == expected
         cleaned = item.cleanup(now_utc=row["utc"], retirement=row,
-            verify_retirement=_verified_retirement, verify_publication=_valid_publication)
+            verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication)
         assert cleaned["complete"] and not item.root.exists()
         assert cleaned["removed_logical_bytes"] == len(b"synthetic diagnostic only")
     finally:
@@ -582,17 +694,17 @@ def test_success_requires_publication_and_retirement_preserves_durable_outputs_a
 
 
 @pytest.mark.parametrize("trigger", ["48h", "verified-success"])
-def test_failed_scope_retention_and_verified_same_gate_success(tmp_path, trigger):
+def test_failed_scope_retention_and_verified_same_gate_success(tmp_path, trigger, owned_retirements):
     base = tmp_path / "retention"
-    row = _completed_actor(base, "4" * 32, "failed")
+    row = _completed_actor(base, "4" * 32, "failed", owned_retirements)
     ledger = _synthetic_ledger(base)
-    _close_reservation(ledger, row)
+    _close_reservation(ledger, row, owned_retirements)
     when = datetime.fromisoformat(row["utc"])
     item = _reopen(ledger, row)
     try:
         with pytest.raises(CachePolicyError, match="retained"):
             item.cleanup(now_utc=(when + timedelta(hours=47)).isoformat(), retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=_valid_publication)
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication)
         assert (item.root / "diagnostic.txt").read_bytes() == b"synthetic diagnostic only"
     finally:
         item.close_handles()
@@ -606,29 +718,29 @@ def test_failed_scope_retention_and_verified_same_gate_success(tmp_path, trigger
                 item.cleanup(now_utc=(when + timedelta(hours=48)).isoformat(), retirement=row,
                     verify_retirement=lambda manifest, proof: False, verify_publication=_valid_publication)
             result = item.cleanup(now_utc=(when + timedelta(hours=48)).isoformat(), retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=_valid_publication)
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication)
         finally:
             item.close_handles()
     else:
-        success = _completed_actor(base, "5" * 32, "success")
-        _close_reservation(ledger, success)
+        success = _completed_actor(base, "5" * 32, "success", owned_retirements)
+        _close_reservation(ledger, success, owned_retirements)
         now = max(datetime.fromisoformat(success["utc"]), when) + timedelta(seconds=1)
         proof = dict(complete=True, logical_gate="synthetic-same-gate", utc=success["utc"], actual=success)
         item = _reopen(ledger, row)
         try:
             with pytest.raises(CachePolicyError, match="verified"):
                 item.cleanup(now_utc=now.isoformat(), retirement=row,
-                    verify_retirement=_verified_retirement, verify_publication=_valid_publication,
+                    verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication,
                     same_gate_success=proof)
             with pytest.raises(CachePolicyError):
                 item.cleanup(now_utc=now.isoformat(), retirement=row,
-                    verify_retirement=_verified_retirement, verify_publication=_valid_publication,
+                    verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication,
                     same_gate_success={**proof, "logical_gate": "unrelated"},
                     verify_same_gate_success=lambda manifest, proposed: True)
             result = item.cleanup(now_utc=now.isoformat(), retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=_valid_publication,
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication,
                 same_gate_success=proof, verify_same_gate_success=lambda manifest, proposed:
-                    proposed["actual"] == success and _epoch_absent(success["owner"])
+                    proposed["actual"] == success and owned_retirements.verify(success["owner"])
                     and _valid_publication({**manifest, "token": success["token"],
                         "root": str(base / "cache/tests/current" / success["token"])}, success["publication"]))
         finally:
@@ -638,11 +750,11 @@ def test_failed_scope_retention_and_verified_same_gate_success(tmp_path, trigger
     assert Path(row["publication"]["path"]).read_bytes() == b"synthetic diagnostic only"
 
 
-def test_foreign_file_refuses_before_any_owned_removal(tmp_path):
+def test_foreign_file_refuses_before_any_owned_removal(tmp_path, owned_retirements):
     base = tmp_path / "foreign"
-    row = _completed_actor(base, "6" * 32, "success")
+    row = _completed_actor(base, "6" * 32, "success", owned_retirements)
     ledger = _synthetic_ledger(base)
-    _close_reservation(ledger, row)
+    _close_reservation(ledger, row, owned_retirements)
     scope = base / "cache/tests/current" / row["token"]
     foreign = scope / "foreign.bin"
     foreign.write_bytes(b"preserve foreign")
@@ -650,7 +762,7 @@ def test_foreign_file_refuses_before_any_owned_removal(tmp_path):
     try:
         with pytest.raises(CacheCleanupIncomplete) as refusal:
             item.cleanup(now_utc=row["utc"], retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=_valid_publication)
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication)
         assert refusal.value.removed_owned == ()
         assert foreign.read_bytes() == b"preserve foreign"
         assert (scope / "diagnostic.txt").read_bytes() == b"synthetic diagnostic only"
@@ -675,21 +787,21 @@ def test_undeclared_and_oversized_writes_refuse_before_file_creation(tmp_path):
         item.close_handles()  # No success/retirement/cleanup is fabricated.
 
 
-def test_sequential_gates_reuse_test_parent_with_fresh_token_children(tmp_path):
+def test_sequential_gates_reuse_test_parent_with_fresh_token_children(tmp_path, owned_retirements):
     base = tmp_path / "reuse"
     ledger = _synthetic_ledger(base)
     parent = base / "cache/tests/current"
     before = _root_identity(parent)
     paths = []
     for token in ("8" * 32, "9" * 32):
-        row = _completed_actor(base, token, "success")
-        _close_reservation(ledger, row)
+        row = _completed_actor(base, token, "success", owned_retirements)
+        _close_reservation(ledger, row, owned_retirements)
         item = _reopen(ledger, row)
         try:
             assert item.root == parent / token and item.root.parent == parent
             assert all(not old.exists() for old in paths)
             result = item.cleanup(now_utc=row["utc"], retirement=row,
-                verify_retirement=_verified_retirement, verify_publication=_valid_publication)
+                verify_retirement=owned_retirements.verified_retirement, verify_publication=_valid_publication)
             assert result["complete"] and not item.root.exists()
             paths.append(item.root)
         finally:

@@ -25,7 +25,7 @@ def _chooser(view, qtbot, monkeypatch):
                                     SimpleNamespace(run_id="target_a"), SimpleNamespace(run_id="target_b")]
     controller._index = ""
     controller.refresh()
-    controller._index = "index.json"
+    controller._index = str(view.project.root / "preview-geometry-index.json")
     monkeypatch.setattr(ui.preview, "preview_layers", lambda session, *args, **kwargs:
                         (session, np.full((60, 80), 2, np.uint8)))
     return controller

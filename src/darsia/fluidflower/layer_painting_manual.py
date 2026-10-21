@@ -2,7 +2,8 @@
 
 A manual map is a saved version of its own kind, ``manual map``: the session's
 polygons rasterised at the photograph's full resolution, without a classifier.
-Where polygons of different layers overlap the smaller one wins. The
+Where polygons of different layers overlap the smaller one wins, unless a
+layer has explicit Always on top priority. The
 proposal's frame-edge fill gives the strip along the rig-frame edge that no
 polygon reaches the nearest polygon's layer. Every other pixel inside the rig
 frame that no polygon covers stays uncovered and is counted; a map with such
@@ -125,8 +126,10 @@ def manual_map(
 ) -> ManualMap:
     """The session's polygons as a map at the photograph's full resolution.
 
-    Each pixel takes the layer of the smallest polygon that covers it, exactly
-    as drawn: no classifier and no snap distance are used, and strokes are
+    Each pixel takes the layer of the smallest polygon that covers it; an
+    explicitly marked Always on top layer wins over ordinary layers, keeping
+    the same smaller-polygon rule among marked layers. The polygons are drawn
+    exactly as given: no classifier and no snap distance are used, and strokes are
     left out (they guide the proposal). Pixels outside the rig frame are
     ``OUTSIDE``. Inside it, the proposal's frame-edge fill
     (``session.edge_fill_mm``) gives the pixels along the frame edge that no
@@ -145,7 +148,9 @@ def manual_map(
     scale = (1.0, 1.0)
     lp._progress(progress, "Drawing the polygons at full resolution…")
     inside = lp.frame_mask(frame, shape, scale)
-    classes = lp.rasterize_polygons(session.polygons, shape, scale)
+    from .painting_layer_priority import rasterize_polygons
+
+    classes = rasterize_polygons(session, shape, scale)
     classes[~inside] = lp.OUTSIDE
     edge_filled = np.zeros(shape, dtype=bool)
     edge_px = lp.snap_pixels(session.edge_fill_mm, frame, scale, (width, height))

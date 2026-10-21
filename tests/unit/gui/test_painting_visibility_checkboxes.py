@@ -62,7 +62,8 @@ def test_legend_and_facies_table_expose_named_checkbox_and_swatch_in_layer_mode(
         icon = box.icon().pixmap(14, 14).toImage()
         assert icon.pixelColor(7, 7).name() == slv._facies_color(name).name()
         assert "display only" in box.toolTip()
-    assert view.layer_table.columnCount() == 5
+    assert view.layer_table.columnCount() == 6
+    assert view.layer_table.horizontalHeaderItem(5).text() == "Top"
     assert all(view.layer_table.item(row, 4).checkState() == Qt.CheckState.Checked
                for row in range(view.layer_table.rowCount()))
 

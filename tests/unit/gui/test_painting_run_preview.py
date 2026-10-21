@@ -115,7 +115,7 @@ def test_worker_uses_exact_snapshot_and_retires_in_gui_thread(view, qtbot, monke
                           np.zeros(values.shape, bool), "target.png", session.run_id, "Current drawing")
     monkeypatch.setattr(ui.preview, "preview_layers", layers)
     monkeypatch.setattr(ui.preview, "prepare_preview", prepare)
-    controller._index = "index.json"
+    controller._index = str(view.project.root / "preview-geometry-index.json")
     controller.runs.setCurrentIndex(controller.runs.findData("ac53"))
     worker = controller.worker
     assert worker is not None

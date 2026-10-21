@@ -231,13 +231,14 @@ def _check_box_center(table, item):
 def test_show_column_hides_a_layer_on_the_canvas_only(view):
     view.set_tool("edit")  # point handles are shown by the Edit tool (0002)
     table = view.layer_table
-    assert table.columnCount() == 5
-    assert [table.horizontalHeaderItem(column).text() for column in range(5)] == [
+    assert table.columnCount() == 6
+    assert [table.horizontalHeaderItem(column).text() for column in range(6)] == [
         "",
         "Layer",
         "Polygons",
         "Strokes",
         "Show",
+        "Top",
     ]
     for row in range(table.rowCount()):
         item = table.item(row, 4)
