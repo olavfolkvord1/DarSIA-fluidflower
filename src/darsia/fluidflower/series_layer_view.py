@@ -739,6 +739,7 @@ class LayerCanvas(QGraphicsView):
         self._right_press: QPointF | None = None
         self._right_dragged = False
         self._user_zoomed = False
+        self._photo_scrollbar_policies = None
         self._marks_visible = True
         self._polygon_fill = True
         self._polygons: list[lp.Polygon] = []
@@ -852,9 +853,18 @@ class LayerCanvas(QGraphicsView):
             self._stroke_image.fill(Qt.GlobalColor.transparent)
             self.stroke_item.setPixmap(QPixmap())
             self.proposal_item.setPixmap(QPixmap())
-        self.scene().setSceneRect(QRectF(0.0, 0.0, float(width), float(height)))
+        if self._photo_scrollbar_policies is None:
+            self._photo_scrollbar_policies = (
+                self.horizontalScrollBarPolicy(), self.verticalScrollBarPolicy()
+            )
+            # A photo plus half a viewport of margin always needs both bars.
+            # Keeping their geometry stable also prevents Fit/resize feedback.
+            self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         if reset_view:
             self.fit_image()
+        else:
+            self._update_pan_margins()
         self.refresh_detail()
 
     def _set_detail(self, detail: np.ndarray | None) -> None:
@@ -924,6 +934,34 @@ class LayerCanvas(QGraphicsView):
         self.preview = None
         self.paint_enabled = False
         self.cursor_item.hide()
+        self.scene().setSceneRect(QRectF())
+        if self._photo_scrollbar_policies is not None:
+            horizontal, vertical = self._photo_scrollbar_policies
+            self._photo_scrollbar_policies = None
+            self.setHorizontalScrollBarPolicy(horizontal)
+            self.setVerticalScrollBarPolicy(vertical)
+
+    def _update_pan_margins(self) -> None:
+        """Scene-only room to centre any photograph edge at the current zoom.
+
+        The photograph and every mark retain their existing scene coordinates.
+        The extra two screen pixels allow for integer scrollbar rounding.
+        """
+        if self._display_shape is None or self.pixmap_item.pixmap().isNull():
+            return
+        viewport = self.viewport().rect()
+        visible = self.mapToScene(viewport).boundingRect()
+        if visible.width() <= 0.0 or visible.height() <= 0.0:
+            return
+        centre = self.mapToScene(viewport.center())
+        origin = self.mapToScene(QPoint(0, 0))
+        rounding = self.mapToScene(QPoint(2, 2)) - origin
+        margin_x = visible.width() * 0.5 + abs(rounding.x())
+        margin_y = visible.height() * 0.5 + abs(rounding.y())
+        self.scene().setSceneRect(self.pixmap_item.boundingRect().adjusted(
+            -margin_x, -margin_y, margin_x, margin_y
+        ))
+        self.centerOn(centre)
 
     def fit_image(self) -> None:
         if self.pixmap_item.pixmap().isNull():
@@ -931,6 +969,7 @@ class LayerCanvas(QGraphicsView):
         self.resetTransform()
         self.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
         self._user_zoomed = False
+        self._update_pan_margins()
         self.refresh_detail()
         self._update_cursor()
 
@@ -2308,6 +2347,7 @@ class LayerCanvas(QGraphicsView):
         factor = 1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2
         self.scale(factor, factor)
         self._user_zoomed = True
+        self._update_pan_margins()
         self.refresh_detail()
         self._update_cursor(self.mapToScene(event.position().toPoint()))
 
@@ -2315,6 +2355,8 @@ class LayerCanvas(QGraphicsView):
         super().resizeEvent(event)
         if not self._user_zoomed:
             self.fit_image()
+        else:
+            self._update_pan_margins()
 
     def mousePressEvent(self, event: Any) -> None:
         self.setFocus(Qt.FocusReason.MouseFocusReason)
