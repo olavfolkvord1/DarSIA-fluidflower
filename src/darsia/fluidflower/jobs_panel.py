@@ -1014,6 +1014,7 @@ class JobsPanel(QWidget):
         control_reader=None,
         control_publisher=None,
         local_stores_path_provider=None,
+        raw_review_runner=None,
     ):
         super().__init__(parent)
         self.jobs_provider, self.plans_provider, self.machines_provider = (
@@ -1054,6 +1055,14 @@ class JobsPanel(QWidget):
         self._resume_after_control = None
         self.new_analysis = None
         self._target_borrower = None
+        self._raw_review_runner = raw_review_runner
+        self._raw_review_seen = {}
+        self._raw_review_observed = set()
+        self._raw_review_queued = set()
+        self._raw_review_pending = []
+        self._raw_review_results = {}
+        self._raw_review_thread = self._raw_review_worker = None
+        self._raw_review_active = None
         layout = QVBoxLayout(self)
         self.context_label = _label("Jobs — no series selected")
         layout.addWidget(self.context_label)
@@ -1096,6 +1105,14 @@ class JobsPanel(QWidget):
         # Read-only: an existing job keeps the profile stored in its job.json.
         self.profile_label = _label("Storage profile: no job selected.")
         detail_layout.addWidget(self.profile_label)
+        self.raw_review_button = QPushButton("Prepare RAW review…")
+        self.raw_review_button.clicked.connect(self.prepare_raw_review)
+        self.raw_review_status = _label(
+            "RAW review is prepared after a completed run of this series, using its saved RAW acquisition preparations."
+        )
+        self.raw_review_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        files_layout.insertWidget(0, self.raw_review_button)
+        files_layout.insertWidget(1, self.raw_review_status)
         controls = QHBoxLayout()
         self.backend_combo, self.workers_spin = QComboBox(), QSpinBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -1246,6 +1263,7 @@ class JobsPanel(QWidget):
         if not self.registrations:
             return
         rows, generation = deepcopy(self.registrations), self._generation
+        series_root = self.series_root
 
         def read_all():
             result = []
@@ -1253,6 +1271,14 @@ class JobsPanel(QWidget):
                 try:
                     snapshot = dict(self.reader(row))
                     snapshot["control"] = self._read_control_snapshot(row["root"])
+                    from .raw_review_postrun import declared_preparations
+                    facts = snapshot.get("job_facts") or {}
+                    try:
+                        snapshot["raw_review_preparations"] = declared_preparations(
+                            series_root, expected_series=facts.get("series_id"),
+                            runs=facts.get("expected_runs") or ())
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        snapshot["raw_review_reason"] = "RAW review is unavailable: " + str(error)
                     result.append(snapshot)
                 except Exception:
                     result.append(
@@ -1329,6 +1355,129 @@ class JobsPanel(QWidget):
             if self.snapshots:
                 self.job_table.selectRow(index)
         self._selection_changed()
+        self._observe_raw_review_completion()
+
+    @staticmethod
+    def _raw_review_eligible(data):
+        facts = (data or {}).get("job_facts") or {}
+        preparations = (data or {}).get("raw_review_preparations")
+        runs = facts.get("expected_runs") or ()
+        return bool(data and data.get("complete") is True and not data.get("errors")
+            and facts.get("format") == "darsia-alias-job-v1"
+            and isinstance(preparations, dict) and runs and set(preparations) == set(runs)
+            and facts.get("pipeline") in (None, "native-phase-n1"))
+
+
+    def _observe_raw_review_completion(self):
+        """Observe actual transitions; never start an old complete job on navigation."""
+        for data in self.snapshots:
+            root = data["root"]
+            complete = self._raw_review_eligible(data)
+            was_complete = self._raw_review_seen.get(root)
+            self._raw_review_seen[root] = complete
+            if was_complete is False and complete and root not in self._raw_review_observed:
+                self._raw_review_observed.add(root)
+                self._queue_raw_review(root, interactive=False)
+
+
+    def _queue_raw_review(self, root, *, interactive, preparations=None):
+        if root in self._raw_review_queued:
+            return
+        if preparations is None:
+            snapshot = next((row for row in self.snapshots if row["root"] == root), None)
+            snapshot = snapshot or (self.current if (self.current or {}).get("root") == root else {})
+            declared = (snapshot or {}).get("raw_review_preparations") or {}
+            preparations = tuple(deepcopy(list(declared.values())))
+        self._raw_review_queued.add(root)
+        self._raw_review_pending.append(dict(root=root, interactive=interactive,
+            preparations=preparations, series_root=self.series_root))
+        self._start_raw_review()
+
+
+    def _start_raw_review(self):
+        if self._raw_review_thread is not None or not self._raw_review_pending:
+            return
+        task = self._raw_review_pending.pop(0)
+        self._raw_review_active = task
+        try:
+            stores = self.local_stores_path_provider() if self.local_stores_path_provider else None
+        except Exception as error:
+            self._raw_review_results[task["root"]] = "RAW review was not prepared: " + str(error)
+            self._raw_review_queued.discard(task["root"])
+            self._raw_review_active = None
+            self._show_raw_review_state()
+            self._start_raw_review()
+            return
+        runner = self._raw_review_runner
+        def run():
+            from .raw_review_postrun import (ReviewInputsMissing, prepare_and_run, default_output)
+            try:
+                if runner is not None:
+                    result = runner(task["root"], preparations=task["preparations"],
+                        stores_path=stores, series_root=task["series_root"])
+                else:
+                    if stores is None or task["series_root"] is None:
+                        raise ValueError("Choose this machine's registered local store map and this job's series first")
+                    result = prepare_and_run(task["root"], stores, task["preparations"],
+                        series_root=task["series_root"],
+                        output_root=default_output(task["root"], task["series_root"]))
+                location = result.get("review_root")
+                return dict(root=task["root"], complete=True, result=result,
+                    text=("RAW photographs are ready" + (" at " + str(location) if location else "")
+                          + ". The original production result is unchanged."))
+            except ReviewInputsMissing as error:
+                return dict(root=task["root"], complete=False, inputs_missing=True,
+                    interactive=task["interactive"], text=str(error))
+            except Exception as error:
+                return dict(root=task["root"], complete=False,
+                    text="RAW review was not prepared: " + str(error) + ". Existing files are preserved; there is no automatic retry.")
+        self._raw_review_results[task["root"]] = "Preparing the finished job's RAW review; production results remain unchanged."
+        self._raw_review_thread, self._raw_review_worker = self._start_call(
+            run, self._raw_review_ready, self._raw_review_closed)
+        self._show_raw_review_state()
+
+
+    @Slot(object)
+    def _raw_review_ready(self, value):
+        self._raw_review_results[value["root"]] = value["text"]
+        self._show_raw_review_state()
+
+
+    @Slot()
+    def _raw_review_closed(self):
+        if self._raw_review_thread is not None:
+            self._raw_review_thread.wait()
+        self._raw_review_thread = self._raw_review_worker = None
+        finished = self._raw_review_active
+        self._raw_review_active = None
+        if finished is not None:
+            self._raw_review_queued.discard(finished["root"])
+        self._show_raw_review_state()
+        self._start_raw_review()
+
+
+    @Slot()
+    def prepare_raw_review(self):
+        if not self._raw_review_eligible(self.current):
+            self.raw_review_status.setText((self.current or {}).get("raw_review_reason") or
+                "RAW review needs a verified completed run and this series' declared RAW acquisition preparations.")
+            return
+        self._queue_raw_review(self.current["root"], interactive=True)
+
+
+    def _show_raw_review_state(self):
+        root = (self.current or {}).get("root")
+        eligible = self._raw_review_eligible(self.current)
+        reason = (self.current or {}).get("raw_review_reason") or (
+            "This action needs a completed run with verified final publications and this series' declared RAW acquisition preparations.")
+        self.raw_review_button.setEnabled(eligible and root not in self._raw_review_queued)
+        self.raw_review_button.setToolTip(
+            "Use the original RAW acquisition preparations to prepare this finished job's review images."
+            if eligible else reason)
+        self.raw_review_status.setText(self._raw_review_results.get(root,
+            "Choose Prepare RAW review for an already completed job. With the GUI closed, run the same saved post-run request explicitly."
+            if eligible else reason))
+
 
     @Slot()
     def _read_closed(self):
@@ -1399,6 +1548,7 @@ class JobsPanel(QWidget):
     def _show_snapshot(self, data):
         old_root = (self.current or {}).get("root")
         self.current = data
+        self._show_raw_review_state()
         if (data or {}).get("root") != old_root:
             self.capacity_label.setText("Expected space not checked. The worker checks fresh free space before claiming a run.")
         self.profile_label.setText(self._profile_text(data))
@@ -2285,6 +2435,8 @@ class JobsPanel(QWidget):
             and self._create_thread is None
             and self._capacity_thread is None
             and self._control_thread is None
+            and self._raw_review_thread is None
+            and not self._raw_review_pending
             and not self._control_pending
             and (self.resource_panel is None or self.resource_panel.can_close())
             and (self.new_analysis is None or self.new_analysis.can_close())
@@ -2302,7 +2454,7 @@ class JobsPanel(QWidget):
     def closeEvent(self, event):
         if not self.can_close():
             self.progress_label.setText(
-                "A metadata read/create or hardware inspection is still finishing; close after it returns."
+                "A metadata read/create, hardware inspection or RAW review preparation is still finishing; close after it returns."
             )
             event.ignore()
             return
