@@ -515,7 +515,7 @@ class NewAnalysisPage(QWidget):
         row = QHBoxLayout()
         self.create_button = QPushButton("Create job files")
         self.create_button.clicked.connect(self.create)
-        self.start_button = QPushButton("Start")
+        self.start_button = QPushButton("Start workers for this job")
         self.start_button.clicked.connect(self.start)
         row.addWidget(self.create_button)
         row.addWidget(self.start_button)
@@ -1119,6 +1119,13 @@ class JobsPanel(QWidget):
         self.backend_combo.addItem("CUDA", "cuda")
         self.workers_spin.setRange(1, 256)
         self.target_combo = QComboBox()
+        self.target_combo.setMinimumContentsLength(16)
+        self.target_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.target_combo.setToolTip("Machine on which to start this job's workers")
+        self.backend_combo.setToolTip("Computation backend for the selected machine")
+        self.workers_spin.setToolTip("Number of workers to start on the selected machine")
         self.target_combo.currentIndexChanged.connect(self._target_changed)
         self.start_button, self.add_machine_button = QPushButton(
             "Start selected machine"
@@ -1129,26 +1136,31 @@ class JobsPanel(QWidget):
         controls.addWidget(self.backend_combo)
         controls.addWidget(self.workers_spin)
         controls.addWidget(self.start_button)
+        controls.addWidget(self.add_machine_button)
+        control_actions = QHBoxLayout()
         self.pause_button, self.resume_button, self.stop_button = (
-            QPushButton("Pause after current frame"),
-            QPushButton("Resume"),
-            QPushButton("Stop"),
+            QPushButton("Pause job after current frame"),
+            QPushButton("Resume job"),
+            QPushButton("Stop job after current frame"),
         )
         for button in (self.pause_button, self.resume_button, self.stop_button):
             button.setEnabled(False)
             button.setToolTip(CONTROL_BOUNDARY)
-            controls.addWidget(button)
+            control_actions.addWidget(button)
         self.pause_button.clicked.connect(self.pause_job)
         self.resume_button.clicked.connect(self.resume_job)
         self.stop_button.clicked.connect(self.stop_job)
-        controls.addWidget(self.add_machine_button)
         self.declare_stopped_button = QPushButton("Declare previous service stopped…")
         self.declare_stopped_button.clicked.connect(
             self.declare_previous_service_stopped
         )
-        controls.addWidget(self.declare_stopped_button)
         self._controls = controls
         detail_layout.addLayout(controls)
+        detail_layout.addLayout(control_actions)
+        declaration = QHBoxLayout()
+        declaration.addWidget(self.declare_stopped_button)
+        declaration.addStretch()
+        detail_layout.addLayout(declaration)
         self.launch_state_label = _label("No launch request for the selected target.")
         detail_layout.addWidget(self.launch_state_label)
         self.control_state_label = _label("Control unavailable: no job selected.")
@@ -1172,7 +1184,8 @@ class JobsPanel(QWidget):
         )
         progress_layout.addWidget(self.worker_table, 1)
         self.resource_slot = QVBoxLayout()
-        progress_layout.addLayout(self.resource_slot)
+        self.resource_page = QWidget()
+        self.resource_page.setLayout(self.resource_slot)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumBlockCount(2500)
@@ -1261,6 +1274,10 @@ class JobsPanel(QWidget):
             self._refresh_pending = True
             return
         if not self.registrations:
+            self.progress_label.setText(
+                "No jobs registered for this series. Open an existing job in Sources "
+                "or use Start analysis to create job files."
+            )
             return
         rows, generation = deepcopy(self.registrations), self._generation
         series_root = self.series_root
@@ -1355,6 +1372,7 @@ class JobsPanel(QWidget):
             if self.snapshots:
                 self.job_table.selectRow(index)
         self._selection_changed()
+
         self._observe_raw_review_completion()
 
     @staticmethod
@@ -1677,10 +1695,8 @@ class JobsPanel(QWidget):
         if self.resource_panel is not None:
             raise ValueError("Resource panel already connected")
         self.resource_panel = panel
-        self.resource_scroll_area = QScrollArea(self)
-        self.resource_scroll_area.setWidgetResizable(True)
-        self.resource_scroll_area.setWidget(panel)
-        self.resource_slot.addWidget(self.resource_scroll_area)
+        self.resource_slot.addWidget(panel)
+        self.detail_tabs.addTab(self.resource_page, "Resources")
         panel.workers_selected.connect(self._resource_choice)
         self._show_snapshot(self.current)
 
@@ -1733,7 +1749,7 @@ class JobsPanel(QWidget):
         """Lend the machine, backend and workers choice and the resource advisor.
 
         With a page they move to its Where section; with None they return to
-        the job toolbar and the Progress tab. The same objects and signals
+        the job toolbar and the Resources tab. The same objects and signals
         move; nothing is copied.
         """
         if page is self._target_borrower:
@@ -1751,9 +1767,9 @@ class JobsPanel(QWidget):
             hidden = self.resource_panel.isHidden()
             if page is None:
                 self._target_borrower.resource_layout.removeWidget(self.resource_panel)
-                self.resource_scroll_area.setWidget(self.resource_panel)
+                self.resource_slot.addWidget(self.resource_panel)
             else:
-                self.resource_scroll_area.takeWidget()
+                self.resource_slot.removeWidget(self.resource_panel)
                 page.resource_layout.addWidget(self.resource_panel)
             self.resource_panel.setHidden(hidden)
         self._target_borrower = page

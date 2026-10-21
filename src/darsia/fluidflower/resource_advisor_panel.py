@@ -30,11 +30,11 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QLayout,
     QPushButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -264,9 +264,16 @@ class ResourceAdvisorPanel(QWidget):
         )
         self._advice = {"workers": None}
         layout = QVBoxLayout(self)
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.context_label = self._label("No job selected")
         layout.addWidget(self.context_label)
+        self.details_tabs = QTabWidget()
+        hardware, measurements, gpu = QWidget(), QWidget(), QWidget()
+        hardware_layout = QVBoxLayout(hardware)
+        measurements_layout = QVBoxLayout(measurements)
+        gpu_layout = QVBoxLayout(gpu)
+        self.details_tabs.addTab(hardware, "Hardware")
+        self.details_tabs.addTab(measurements, "Measurements")
+        self.details_tabs.addTab(gpu, "GPU speed")
         bar = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh saved machine facts")
         self.inspect_button = QPushButton("Inspect this machine…")
@@ -276,9 +283,8 @@ class ResourceAdvisorPanel(QWidget):
         self.import_measurement_button.clicked.connect(self.choose_measurement_receipt)
         bar.addWidget(self.refresh_button)
         bar.addWidget(self.inspect_button)
-        bar.addWidget(self.import_measurement_button)
         bar.addStretch()
-        layout.addLayout(bar)
+        hardware_layout.addLayout(bar)
         self.hardware_table = self._table(
             [
                 "Machine",
@@ -289,8 +295,7 @@ class ResourceAdvisorPanel(QWidget):
                 "Recorded",
             ]
         )
-        self.hardware_table.setMaximumHeight(170)
-        layout.addWidget(self.hardware_table)
+        hardware_layout.addWidget(self.hardware_table, 1)
         grid = QGridLayout()
         self.machine_combo, self.backend_combo = QComboBox(), QComboBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -310,7 +315,11 @@ class ResourceAdvisorPanel(QWidget):
             grid.addWidget(widget, 1, column)
         layout.addLayout(grid)
         self.policy_budget = QCheckBox(
-            "Use policy budget: 20 GiB host RAM per worker; 40 GiB host RAM reserve (not measured RSS)"
+            "Use policy budget for worker recommendation"
+        )
+        self.policy_budget.setToolTip(
+            "20 GiB host RAM per worker; 40 GiB host RAM reserve. "
+            "This policy budget is not measured RSS or device VRAM."
         )
         layout.addWidget(self.policy_budget)
         self.advice_label, self.reason_label = self._label(
@@ -326,7 +335,10 @@ class ResourceAdvisorPanel(QWidget):
         buttons.addWidget(self.use_button)
         buttons.addStretch()
         layout.addLayout(buttons)
-        layout.addWidget(
+        self.selection_label = self._label("")
+        layout.addWidget(self.selection_label)
+        measurements_layout.addWidget(self.import_measurement_button)
+        measurements_layout.addWidget(
             self._label(
                 "Historical measurements — their own precision, backend, threads and pipeline; not a current-job speed prediction"
             )
@@ -348,14 +360,14 @@ class ResourceAdvisorPanel(QWidget):
             ]
         )
         self.history_table.horizontalHeader().setStretchLastSection(False)
-        layout.addWidget(self.history_table)
-        layout.addWidget(self._label(GPU_SPEED_NOTE))
+        measurements_layout.addWidget(self.history_table, 1)
+        gpu_layout.addWidget(self._label(GPU_SPEED_NOTE))
         gpu_bar = QHBoxLayout()
         self.measure_gpu_button = QPushButton("Measure GPU speed…")
         self.measure_gpu_button.clicked.connect(self.measure_gpu_speed)
         gpu_bar.addWidget(self.measure_gpu_button)
         gpu_bar.addStretch()
-        layout.addLayout(gpu_bar)
+        gpu_layout.addLayout(gpu_bar)
         self.gpu_table = self._table(
             [
                 "Device",
@@ -369,17 +381,18 @@ class ResourceAdvisorPanel(QWidget):
                 "Measured",
             ]
         )
-        layout.addWidget(self.gpu_table)
+        gpu_layout.addWidget(self.gpu_table, 1)
         self.gpu_label = self._label("")
-        layout.addWidget(self.gpu_label)
+        gpu_layout.addWidget(self.gpu_label)
         self.probe_label = self._label(
             "No hardware inspection requested. Remote facts are supplied by the registered-machine provider; this panel never starts SSH."
         )
-        layout.addWidget(self.probe_label)
+        hardware_layout.addWidget(self.probe_label)
         self.measurement_label = self._label(
             "Load an original completed.json or trial summary explicitly. Only recorded metadata is read; missing memory and timing subdivisions stay unknown."
         )
-        layout.addWidget(self.measurement_label)
+        measurements_layout.addWidget(self.measurement_label)
+        layout.addWidget(self.details_tabs, 1)
         self.machine_combo.currentIndexChanged.connect(self._machine_changed)
         self.backend_combo.currentIndexChanged.connect(self._refresh_advice)
         self.threads_spin.valueChanged.connect(self._refresh_advice)
@@ -404,7 +417,7 @@ class ResourceAdvisorPanel(QWidget):
         table.setWordWrap(False)
         table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        # Keep one multiline source/SHA record readable inside the scroll pane.
+        # Keep one multiline source/SHA record readable on its page.
         table.setMinimumHeight(
             table.horizontalHeader().sizeHint().height()
             + 3 * table.fontMetrics().lineSpacing()
@@ -418,6 +431,7 @@ class ResourceAdvisorPanel(QWidget):
         return table
 
     def set_context(self, job=None, *, series_label="", machines_provider=None):
+        self.selection_label.clear()
         self.job = deepcopy(dict(job or {}))
         self.series_label = str(series_label)
         if machines_provider is not None:
@@ -441,6 +455,10 @@ class ResourceAdvisorPanel(QWidget):
                 else self.machines
             )
             self.set_machines(self.measurement_registry.merge_machines(rows))
+            self.probe_label.setText(
+                f"Loaded {len(self.machines)} saved machine snapshot(s). "
+                "No hardware inspection or worker was started."
+            )
         except Exception:
             # Do not leave another series/job's machine facts looking current.
             self.set_machines([])
@@ -594,11 +612,19 @@ class ResourceAdvisorPanel(QWidget):
         value = self._advice.get("workers")
         if type(value) is int and value > 0:
             self.workers_spin.setValue(min(value, self.workers_spin.maximum()))
+            self.selection_label.setText(
+                f"Copied {self.workers_spin.value()} worker(s) into the editable count. "
+                "Use worker count applies it to the job controls."
+            )
 
     def _choose_workers(self):
         if not self.use_button.isEnabled():
             return
         count = self.workers_spin.value()
+        self.selection_label.setText(
+            f"Applied {count} worker(s) to the job controls. "
+            "Start selected machine starts the workers."
+        )
         self.workers_selected.emit(
             dict(
                 machine=self.machine_combo.currentData(),

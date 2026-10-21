@@ -247,7 +247,7 @@ def test_create_job_files_then_start_with_the_lent_machine_controls(owner, tmp_p
     owner.show_view("jobs")
     for index, widget in enumerate((panel.target_combo, panel.backend_combo, panel.workers_spin)):
         assert panel._controls.indexOf(widget) == index
-    assert panel.resource_scroll_area.widget() is panel.resource_panel
+    assert panel.resource_slot.indexOf(panel.resource_panel) >= 0
 
 
 def test_start_analysis_asks_for_the_page_instead_of_a_dialog(owner, tmp_path, qtbot, monkeypatch):
