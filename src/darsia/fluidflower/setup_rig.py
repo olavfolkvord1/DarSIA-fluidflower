@@ -88,15 +88,17 @@ def corrected_rig_class(cls: type[Rig]) -> type[Rig]:
     return CorrectedFrameRig
 
 
-def setup_rig(cls: type[Rig], path: Path | list[Path], show: bool = False) -> None:
-    """Use the original dispatcher and unchanged setup order for both frames."""
+def setup_rig(cls: type[Rig], path: Path | list[Path], show: bool = False,
+              *, raw_build_request: dict | None = None) -> None:
+    """Keep frame dispatch and forward an explicit RAW request to the original setup."""
     frame = configured_frame(path)
     if frame == "rig-corrected":
         from darsia.fluidflower.corrected_setup import require_corrected_export_for_build
 
         require_corrected_export_for_build(path)
     selected_class = cls if frame == "raw" else corrected_rig_class(cls)
-    return _original_setup_rig(selected_class, path, show)
+    return _original_setup_rig(selected_class, path, show,
+        **({"raw_build_request": raw_build_request} if raw_build_request is not None else {}))
 
 
 def main() -> None:

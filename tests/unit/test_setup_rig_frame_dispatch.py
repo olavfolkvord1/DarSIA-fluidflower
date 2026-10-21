@@ -41,6 +41,54 @@ def test_raw_dispatch_uses_exact_original_class_and_arguments(tmp_path, monkeypa
     assert calls == [(dispatch.Rig, path, True)]
 
 
+@pytest.mark.parametrize("frame", [None, "raw", "rig-corrected"])
+def test_explicit_raw_request_reaches_original_setup_without_changing_frame_guards(
+    tmp_path, monkeypatch, frame
+):
+    """Forward the exact descriptor after the existing corrected-frame admission."""
+    from darsia.fluidflower import corrected_setup
+
+    path = _config(tmp_path, frame=frame)
+    request = dict(path="C:/synthetic/request.json", sha256="a" * 64, size_bytes=17)
+    before = dict(request)
+    events = []
+    result = object()
+
+    def admitted(actual):
+        """Record the original corrected export check before setup dispatch."""
+        assert actual is path
+        events.append("admitted")
+
+    def original(cls, actual, show, *, raw_build_request):
+        """Observe the original callable receiving the unchanged request descriptor."""
+        assert actual is path and show is True and raw_build_request is request
+        assert cls is dispatch.Rig if frame != "rig-corrected" else issubclass(cls, dispatch.Rig)
+        events.append("setup")
+        return result
+
+    monkeypatch.setattr(corrected_setup, "require_corrected_export_for_build", admitted)
+    monkeypatch.setattr(dispatch, "_original_setup_rig", original)
+    assert dispatch.setup_rig(dispatch.Rig, path, True, raw_build_request=request) is result
+    assert events == (["admitted", "setup"] if frame == "rig-corrected" else ["setup"])
+    assert request == before
+
+
+def test_explicit_raw_request_does_not_bypass_corrected_export_refusal(tmp_path, monkeypatch):
+    """A request descriptor cannot replace the original corrected-frame check."""
+    from darsia.fluidflower import corrected_setup
+
+    path = _config(tmp_path, frame="rig-corrected")
+
+    def refused(actual):
+        """Stop at the existing export check without reaching the original builder."""
+        raise ValueError("Synthetic corrected export refusal")
+
+    monkeypatch.setattr(corrected_setup, "require_corrected_export_for_build", refused)
+    monkeypatch.setattr(dispatch, "_original_setup_rig", lambda *args, **kwargs: pytest.fail("Setup reached"))
+    with pytest.raises(ValueError, match="corrected export refusal"):
+        dispatch.setup_rig(dispatch.Rig, path, raw_build_request=dict(path="C:/synthetic/request.json"))
+
+
 def test_corrected_dispatch_inherits_original_setup_and_keeps_original_depth_call(
     tmp_path, monkeypatch
 ):
