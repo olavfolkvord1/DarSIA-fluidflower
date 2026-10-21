@@ -416,14 +416,16 @@ def place_map_in_runs(
     roles: Mapping[int, str],
     version: Mapping[str, Any],
     names: Mapping[int, str] | None = None,
+    facies: Mapping[int, str] | None = None,
     first_runs: Sequence[str] = (),
     measure_offsets: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Place the map in every run and write a new review folder.
 
-    ``layers`` is the map's layer ids on the reference run's grid; ``roles``
-    and ``names`` give each layer id's role and name; ``photo_loader(run,
+    ``layers`` is the map's layer ids on the reference run's grid; ``roles``,
+    ``names`` and ``facies`` give each layer id's role, name and facies
+    name; ``photo_loader(run,
     geometry)`` returns that run's reference photograph as uint8 RGB on its
     grid; ``version`` names the approved map version (name, sha256,
     approval); ``first_runs`` are shown right after the reference run. The
@@ -506,7 +508,11 @@ def place_map_in_runs(
         "reference_run": reference_key,
         "map_version": dict(version),
         "layers": {
-            str(int(layer)): {"name": str((names or {}).get(layer, "")), "role": str(role)}
+            str(int(layer)): {
+                "name": str((names or {}).get(layer, "")),
+                "role": str(role),
+                "facies": str((facies or {}).get(layer, "")),
+            }
             for layer, role in sorted(roles.items())
         },
         "overlay_legend": [

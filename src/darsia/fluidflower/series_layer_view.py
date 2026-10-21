@@ -2766,6 +2766,7 @@ class _PlacementWorker(QObject):
                 photo_loader=self.options["photo_loader"],
                 roles=roles,
                 names={row.layer_id: row.name for row in session.layers},
+                facies={row.layer_id: row.facies for row in session.layers},
                 version={
                     key: self.record.get(key)
                     for key in ("name", "kind", "sha256", "created_utc", "folder")

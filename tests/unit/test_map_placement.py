@@ -206,7 +206,7 @@ def test_a_placement_writes_a_new_review_folder_only(tmp_path):
     assert result["runs"][1]["checks"]["uncovered_pixels"] == 3 * 40
     assert result["runs"][0]["offset_px"]["max_px"] == 0.0
     assert result["runs"][1]["offset_px"] == {"median_px": 3.0, "max_px": 3.0}
-    assert result["layers"]["3"] == {"name": "Coarse sand", "role": "porous_medium"}
+    assert result["layers"]["3"] == {"name": "Coarse sand", "role": "porous_medium", "facies": ""}
     assert [row["label"] for row in result["overlay_legend"]] == [
         label for label, _color in mp.OVERLAY_LEGEND
     ]
