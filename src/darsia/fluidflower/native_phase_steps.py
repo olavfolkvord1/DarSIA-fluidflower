@@ -186,6 +186,7 @@ class NativePhaseSteps(QWidget):
         method_panel=None,
         method_use=None,
         phase_review=None,
+        run_provider=None,
         actor_provider=getpass.getuser,
         training_routes=None,
     ):
@@ -197,6 +198,7 @@ class NativePhaseSteps(QWidget):
         self.normalisation = normalisation
         self.method_panel, self.method_use = method_panel, method_use
         self.phase_review = phase_review
+        self.run_provider = run_provider
         self._ready = False
         self._native_idle_status = None
         self._legacy_start_available = studio.start_button.isEnabled()
@@ -315,9 +317,7 @@ class NativePhaseSteps(QWidget):
             return result
 
         studio._update_action_states = update
-        studio._launch_review = lambda *a, **k: self._guarded(
-            self._original_review, *a, **k
-        )
+        studio._launch_review = self._launch_review
         for name in (
             "_resume_selected_session",
             "_open_selected_experiment",
@@ -415,7 +415,7 @@ class NativePhaseSteps(QWidget):
         )
         self.phase_review_button.setEnabled(self.phase_review is not None)
         if self.phase_review is not None:
-            self.phase_review_button.clicked.connect(lambda: self.phase_review())
+            self.phase_review_button.clicked.connect(self._open_phase_review)
         row.addWidget(self.phase_review_button)
         row.addStretch(1)
         _move(self.studio.review_status, self.layouts[3])
@@ -424,6 +424,103 @@ class NativePhaseSteps(QWidget):
                 "Saved model maps and drawing tools open in the established review window. No map is recalculated by this page layout."
             )
         )
+        self.review_route_button = QPushButton("Choose a model in Basis…")
+        self.review_route_button.clicked.connect(self._open_review_requirement)
+        self.layouts[3].addWidget(self.review_route_button)
+
+    def review_launch_reason(self):
+        """Present the existing launch requirements for this exact selection."""
+        studio = self.studio
+        getter = getattr(studio, "_selected_validation_model", None)
+        model = getter() if callable(getter) else None
+        run = str(self.run_provider() or "").strip() if callable(self.run_provider) else ""
+        scope = "Series " + (self.series_id or "not selected")
+        scope += " · run " + (run or "not selected")
+        if model:
+            scope += " · model " + str(model.get("model_id") or model.get("root") or "not identified")
+        else:
+            scope += " · model not selected"
+        missing = []
+        if not self._ready:
+            missing.append("complete and save Image normalisation")
+        if not model:
+            missing.append("Choose a review collection after choosing a model in Basis")
+        elif model.get("validation_binding_loading"):
+            missing.append("the selected model's saved phase maps are still being checked")
+        elif model.get("validation_collection_error"):
+            missing.append("saved phase maps could not be verified: " + str(model["validation_collection_error"]))
+        elif not isinstance(model.get("validation_binding"), dict):
+            missing.append("no verified saved phase maps are bound to this model")
+        if not missing and not self._legacy_availability.get("open_model_correction", False):
+            reason = getattr(studio, "_review_launch_block_reason", None)
+            missing.append(reason(model) if callable(reason) else "the existing review launch is unavailable")
+        return (scope + ": " + "; ".join(missing) + ".") if missing else ""
+
+    def review_selection_text(self):
+        """Describe the series collection without restricting it to a hidden run selector."""
+        reason = self.review_launch_reason()
+        if reason:
+            return reason
+        model = self.studio._selected_validation_model()
+        binding = model.get("validation_binding") or {}
+        candidates = binding.get("selected_candidates")
+        runs = ", ".join(sorted(map(str, candidates))) if isinstance(candidates, dict) and candidates else "the verified saved collection"
+        run = str(self.run_provider() or "").strip() if callable(self.run_provider) else ""
+        return ("Saved phase maps are ready for model " + str(model.get("model_id") or model.get("root"))
+            + " in series " + (self.series_id or "not selected") + ". Available runs: " + runs
+            + (". Current run selection: " + run if run else "") + ".")
+
+    def show_review_requirement(self):
+        """Keep a failed open visible beside the review action."""
+        reason = self.review_launch_reason()
+        if not reason:
+            reason = "The prepared phase review could not be opened; check the selected model's saved phase-map binding."
+        self.studio.review_status.setText(reason)
+        self.review_selection_notice.setText(reason)
+        self.show_section("phase_model")
+        self.phase_tabs.setCurrentWidget(self.groups[3])
+        self.scroll.ensureWidgetVisible(self.review_selection_notice)
+        return reason
+
+    def _open_phase_review(self):
+        try:
+            if self.phase_review is None:
+                self.show_review_requirement()
+                return
+            # The retained callback owns admission and opening. A plain reason
+            # remains visible even if it reports a missing dependency itself.
+            if self.review_launch_reason():
+                self.show_review_requirement()
+            self.phase_review()
+        except Exception as error:
+            message = "Could not open phase review: " + str(error)
+            self.studio.review_status.setText(message)
+            self.review_selection_notice.setText(message)
+            QMessageBox.warning(self, "Could not open phase review", message)
+
+    def _open_review_requirement(self):
+        """Navigate or recheck saved metadata; never generate new phase maps."""
+        studio = self.studio
+        getter = getattr(studio, "_selected_validation_model", None)
+        model = getter() if callable(getter) else None
+        if not self._ready:
+            self.show_section("normalisation")
+            self.scroll.ensureWidgetVisible(self.normalisation or self.normalisation_notice)
+        elif not model:
+            self.show_section("phase_model")
+            self.phase_tabs.setCurrentWidget(self.groups[2])
+            studio.validation_model.setFocus()
+        else:
+            refresh = getattr(studio, "_request_async_model_refresh", None)
+            try:
+                if callable(refresh):
+                    refresh(bindings_only=True)
+                self.show_review_requirement()
+            except Exception as error:
+                message = "Could not check saved phase maps: " + str(error)
+                studio.review_status.setText(message)
+                self.review_selection_notice.setText(message)
+                QMessageBox.warning(self, "Could not check saved phase maps", message)
 
     def _build_training(self):
         studio = self.studio
@@ -578,6 +675,8 @@ class NativePhaseSteps(QWidget):
         for name, available in self._legacy_availability.items():
             getattr(self.studio, name).setEnabled(self._ready and available)
         self.import_button.setEnabled(self._ready)
+        self.import_button.setToolTip("Import an existing saved model." if self._ready
+            else "Complete and save Image normalisation before importing a model.")
         if self.method_panel is not None:
             self.method_panel._update_controls()
         mode = "existing" if self.existing_basis.isChecked() else "scratch"
@@ -611,6 +710,7 @@ class NativePhaseSteps(QWidget):
             and training_available
         )
         self.model_name.setEnabled(idle)
+        self._refresh_control_reasons()
         if idle and self.studio.status.text() in {
             "",
             "Add reviewed evidence and enter a researcher name.",
@@ -624,6 +724,46 @@ class NativePhaseSteps(QWidget):
             )
             self.studio.status.setText(self._native_idle_status)
 
+    def _refresh_control_reasons(self):
+        """Explain disabled actions without weakening their existing gates."""
+        studio = self.studio
+        reason = self.review_launch_reason()
+        selection = self.review_selection_text()
+        studio.open_model_correction.setToolTip(selection)
+        self.phase_review_button.setToolTip("This page has no phase-review window attached."
+            if self.phase_review is None else selection)
+        self.review_selection_notice.setText(selection)
+        getter = getattr(studio, "_selected_validation_model", None)
+        model = getter() if callable(getter) else None
+        self.review_route_button.setVisible(bool(reason))
+        self.review_route_button.setText("Open Image normalisation…" if not self._ready else
+            "Choose a model in Basis…" if not model else "Find saved phase maps…")
+        self.review_route_button.setToolTip("Recheck saved model and map metadata; no phase maps are recalculated."
+            if self._ready and model else "Open the step that supplies the missing requirement.")
+        studio.validation_model.setToolTip("Choose the existing model used as the review and training basis."
+            if self.existing_basis.isChecked() else "Choose Build on an existing model to select a saved basis.")
+        if not studio.resume_session_button.isEnabled():
+            studio.resume_session_button.setToolTip("Complete and save Image normalisation first."
+                if not self._ready else "Select an available saved review session to resume.")
+        else:
+            studio.resume_session_button.setToolTip("Resume the selected saved review session.")
+        evidence = getattr(studio, "add_session_evidence", None)
+        if evidence is not None:
+            evidence.setToolTip("Add the selected session's saved evidence to the training inputs."
+                if evidence.isEnabled() else "Select a saved review session with an available decisions file.")
+        training = []
+        if not self._ready:
+            training.append("complete and save Image normalisation")
+        if not self.model_name.text().strip():
+            training.append("name the new model version")
+        if not studio.start_button.isEnabled():
+            training.append(self.training_note.text())
+        studio.start_button.setToolTip("; ".join(training) if training else "Train the named new model version using the admitted route.")
+        self.model_name.setToolTip("A running training job uses this name; wait for it to finish."
+            if not self.model_name.isEnabled() else "Enter the name for the new model version.")
+        studio.stop_button.setToolTip("Stop the current training job through its existing control."
+            if studio.stop_button.isEnabled() else "No training job is running.")
+
     def _guarded(self, callback, *args, **kwargs):
         if not self._ready:
             self.studio.review_status.setText(
@@ -631,6 +771,20 @@ class NativePhaseSteps(QWidget):
             )
             return None
         return callback(*args, **kwargs)
+
+    def _launch_review(self, *args, **kwargs):
+        try:
+            getter = getattr(self.studio, "_selected_validation_model", None)
+            if callable(getter) and self.review_launch_reason():
+                self.show_review_requirement()
+                return None
+            return self._guarded(self._original_review, *args, **kwargs)
+        except Exception as error:
+            message = "Could not open phase review: " + str(error)
+            self.studio.review_status.setText(message)
+            self.review_selection_notice.setText(message)
+            QMessageBox.warning(self, "Could not open phase review", message)
+            return None
 
     def train(self, *_args):
         if not self._ready:

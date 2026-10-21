@@ -2104,7 +2104,15 @@ class LayerCanvas(QGraphicsView):
                 "Esc to cancel."
             )
             return False
-        polygon = lp.Polygon(int(self.layer_id), list(self._draft))
+        points = list(self._draft)
+        # The implicit last-to-first edge follows the same shown outline as
+        # two explicit snapped clicks. Free endpoints and Follow off stay free.
+        if (self.follow_edges and self._clicks
+                and self._clicks[0].snapped and self._clicks[-1].snapped):
+            ways = self._ways_between(self._clicks[-1].point, self._clicks[0].point)
+            if ways:
+                points.extend(ways[0])
+        polygon = lp.Polygon(int(self.layer_id), points)
         if polygon.area() < 1.0:
             self.notice.emit("The polygon encloses no area.")
             return False
@@ -6280,41 +6288,36 @@ class LayerPainterView(QWidget):
     def _polygons_edited(
         self, changes: Mapping[int, Sequence[tuple[float, float]]]
     ) -> list[int]:
-        """Give one or more polygons new points, as one change to undo.
+        """Validate and apply the whole shared edit as one undoable change.
 
-        A polygon whose new points are not valid (fewer than three, or no
-        area) keeps its points and the hint line says why; the others still
-        change. Returns the indices of the polygons that changed.
+        A refused neighbour keeps every member at its original geometry, so
+        moving a shared point cannot split an edge through a partial edit.
         """
-
         if self.session is None:
             return []
-        snapshot = self._snapshot()
-        applied: list[int] = []
-        problems: list[str] = []
-        for index, points in sorted(dict(changes).items()):
-            index = int(index)
-            if not 0 <= index < len(self.session.polygons):
-                continue
-            layer_id = self.session.polygons[index].layer_id
-            try:
-                self.session.replace_polygon(index, lp.Polygon(layer_id, list(points)))
-            except ValueError as error:
-                problems.append(str(error))
-                continue
-            applied.append(index)
-        if not applied:
-            if problems:
-                self._canvas_notice(problems[0])
-                self._render_marks()
+        prepared: dict[int, lp.Polygon] = {}
+        try:
+            for index, points in sorted(dict(changes).items()):
+                index = int(index)
+                if not 0 <= index < len(self.session.polygons):
+                    raise ValueError("The selected polygon changed; select its points again.")
+                polygon = lp.Polygon(self.session.polygons[index].layer_id, list(points))
+                self.session._check_polygon(polygon)
+                prepared[index] = polygon
+        except ValueError as error:
+            self._canvas_notice(str(error))
+            self._render_marks()
             return []
+        if not prepared:
+            return []
+        snapshot = self._snapshot()
+        for index, polygon in prepared.items():
+            self.session.replace_polygon(index, polygon)
         self._undo_stack.append(snapshot)
         del self._undo_stack[:-_UNDO_LIMIT]
         self._redo_stack = []
         self._after_mark_change()
-        if problems:
-            self._canvas_notice(problems[0])
-        return applied
+        return list(prepared)
 
     def delete_polygon(self, index: int) -> None:
         if self.session is None or not 0 <= index < len(self.session.polygons):

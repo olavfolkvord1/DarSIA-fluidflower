@@ -609,6 +609,13 @@ class NormalisationStep(QWidget):
         self.reference.setEnabled(usable and self.override.isChecked())
         self.override.setEnabled(usable)
         self.save_button.setEnabled(usable and self.allow_save)
+        missing = ("Choose an experimental series first." if not self.series_root or not self.series_id
+            else "Open saved v5 results for this series, then reload the saved status.")
+        self.override.setToolTip("Choose a different saved reference for this series." if usable else missing)
+        self.reference.setToolTip(missing if not usable else
+            "Enable Override automatic reference to choose a different saved reference."
+            if not self.override.isChecked() else "Choose a saved reference.")
+        self.save_button.setToolTip("Save the selected reference for this series." if usable else missing)
         if not self.allow_save:
             self.save_button.setToolTip(
                 "Read-only preview; no series manifest is changed."

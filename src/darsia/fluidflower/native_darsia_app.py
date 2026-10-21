@@ -1445,6 +1445,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
             "method_panel": self.method_panel,
             "method_use": self._save_method_choice,
             "phase_review": self._open_existing_phase_review,
+            "run_provider": lambda: self.run_combo.currentText() if self.run_combo.currentIndex() >= 0 else "",
         }
         self.content_stack.addWidget(self.phase_model_workspace)
         self.depth_workflow = NativeDepthWorkflow(self)
@@ -1597,6 +1598,7 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.run_combo.activated.connect(self._run_chosen)
         self.run_combo.currentIndexChanged.connect(self._update_setup_action)
         self.run_combo.currentIndexChanged.connect(self._refresh_scope_display)
+        self.run_combo.currentIndexChanged.connect(self._refresh_phase_review_requirements)
         from darsia.fluidflower.reference_open_guard import ReferenceOpenGuard
 
         self.reference_open_guard = ReferenceOpenGuard(self)
@@ -2000,19 +2002,42 @@ class NativeFluidFlowerMainWindow(MainWindow):
         saved._native_method_guard = True
 
     def _open_existing_phase_review(self) -> None:
-        studio = getattr(self.phase_model_workspace.studio_page, "studio", None)
+        page = self.phase_model_workspace.studio_page
+        studio = getattr(page, "studio", None)
+        steps = getattr(page, "native_steps", None)
+        if steps is not None and steps.review_launch_reason():
+            if hasattr(self, "content_stack"):
+                self.content_stack.setCurrentWidget(self.phase_model_workspace)
+            steps.show_review_requirement()
+            return
         if (
             studio is not None
-            and getattr(studio, "_active_model_series", None)
-            == self.phase_model_workspace.series_id
+            and str(getattr(studio, "_active_model_series", "") or "").casefold().replace("_", "").replace("-", "")
+            == str(self.phase_model_workspace.series_id).casefold().replace("_", "").replace("-", "")
         ):
             selected = studio._selected_validation_model() or {}
             if isinstance(selected.get("validation_binding"), dict):
-                studio._launch_review("open_correction")
+                try:
+                    studio._launch_review("open_correction")
+                except Exception as error:
+                    message = "Could not open phase review: " + str(error)
+                    studio.review_status.setText(message)
+                    QMessageBox.warning(self, "Could not open phase review", message)
                 return
-        self.print_log(
-            "Open a phase model with prepared review images under Calibration before opening its phase review window."
-        )
+        if steps is not None:
+            if hasattr(self, "content_stack"):
+                self.content_stack.setCurrentWidget(self.phase_model_workspace)
+            steps.show_review_requirement()
+        else:
+            QMessageBox.information(self, "Phase review needs a saved model",
+                "Open Phase model, choose a model in Basis, and bind its saved phase maps for the selected run.")
+
+    def _refresh_phase_review_requirements(self, *_args):
+        workspace = getattr(self, "phase_model_workspace", None)
+        page = getattr(workspace, "studio_page", None)
+        steps = getattr(page, "native_steps", None)
+        if steps is not None:
+            steps.refresh()
 
     def _series_for_path(self, path: str) -> str:
         return self.home_page.series_registry.series_by_path.get(
