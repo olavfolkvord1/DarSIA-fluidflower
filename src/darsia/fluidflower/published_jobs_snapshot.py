@@ -431,6 +431,9 @@ def _producer_inventory(index, products, record, producer, task, job, *,
 
 
 def _terminal(root, run_root, base_task, job, done, reader):
+    if base_task.get("pipeline") == "series-setup":
+        from .pipeline.series_setup_results import setup_terminal
+        return setup_terminal(root, base_task, job, done, reader)
     if base_task.get("pipeline") == "native-phase-statistics":
         return _phase1_terminal(root, base_task, job, done, reader)
     if base_task.get("pipeline") == "n1-calibration-refit":
@@ -538,6 +541,9 @@ def _failed_publication(root, base_task, failure_path, reader):
 
 
 def published_snapshot(registration,job,ui,*,reader):
+    if job.get("pipeline") == "series-setup":
+        from .pipeline.series_setup_results import setup_snapshot
+        return setup_snapshot(registration, job, ui, reader=reader)
     root=Path(registration["root"]);rows=[];workers=[];machines={};errors=[];all_times=[]
     for run in job["expected_runs"]:
         row=dict(run=run,state="Not queued",committed=0,total=None,machine="Not reported",

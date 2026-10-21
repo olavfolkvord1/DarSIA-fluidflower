@@ -351,6 +351,9 @@ def job_metadata_reference(job_root, path):
 
 def prepared_snapshot(registration, job, ui, *, reader):
     """Show only immutable J2 metadata. No input resolution or runtime inference."""
+    if job.get("pipeline") == "series-setup":
+        from .series_setup_results import prepared_setup_snapshot
+        return prepared_setup_snapshot(registration, job, ui, reader=reader)
     from .job_queue import read_json, validate_task
     from ..job_launch_state import read_launch_requests
     root=Path(registration["root"])
