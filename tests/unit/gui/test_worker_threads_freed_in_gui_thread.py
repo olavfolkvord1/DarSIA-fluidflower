@@ -193,3 +193,24 @@ def test_a_discovery_worker_is_never_handed_to_delete_later(
     watcher = _watcher(worker)
     del worker  # The last reference: the worker is freed here, in the GUI thread.
     assert _deleted(watcher)
+
+
+def test_saved_transfer_reader_is_released_in_gui_after_native_thread_retirement(
+    qtbot, tmp_path, monkeypatch
+):
+    """Keep a real finite reader alive until its GUI owner drops the last ref."""
+    from darsia.fluidflower import painting_saved_transfers_ui as ui
+
+    requested = []
+    monkeypatch.setattr(ui._Read, "deleteLater", lambda self: requested.append(self))
+    chooser = ui.SavedTransferChooser(tmp_path)
+    qtbot.addWidget(chooser, before_close_func=lambda owned: owned.wait_for_workers())
+    worker = chooser._worker
+    qtbot.waitUntil(lambda: chooser._thread is None, timeout=5000)
+    assert chooser._worker is None and not chooser.busy()
+    assert requested == [], "The finite reader must be released by its GUI owner"
+    assert isValid(worker), "Native retirement must not destroy a retained worker"
+    assert worker.thread() is QCoreApplication.instance().thread()
+    watcher = _watcher(worker)
+    del worker  # The last reference is deliberately released on the GUI thread.
+    assert _deleted(watcher)

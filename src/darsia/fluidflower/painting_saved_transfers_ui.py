@@ -178,7 +178,7 @@ class SavedTransferChooser(QDialog):
         thread, worker = self._thread, self._worker
         thread.wait()
         self._thread = self._worker = None
-        worker.deleteLater()
+        del worker
         thread.deleteLater()
         self.open_button.setEnabled(self.list.currentRow() >= 0)
         self.loading_changed.emit(False)
