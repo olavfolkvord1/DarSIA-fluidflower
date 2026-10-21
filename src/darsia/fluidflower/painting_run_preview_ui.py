@@ -15,6 +15,7 @@ from shiboken6 import isValid
 from . import layer_painting as lp
 from . import painting_run_preview as preview
 from . import painting_frame_models as frame_models
+from . import painting_preview_frame_domain as frame_domain
 
 _SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _INDEX = "placement/geometry_index"
@@ -65,6 +66,7 @@ class _PreviewWorker(QObject):
             session, layers = preview.preview_layers(session, self.proposal, self.corrections,
                                                      self.frame, source=source, record=record)
             def partial(value):
+                value = frame_domain.attach_frame_domain(value, session, self.frame, layers)
                 frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
                 self.partial.emit((value, session))
 
@@ -74,6 +76,7 @@ class _PreviewWorker(QObject):
                 photo_loader=self.options["photo_loader"], source_name=source_name,
                 on_progress=self.progress.emit,
                 on_preview=partial)
+            result = frame_domain.attach_frame_domain(result, session, self.frame, layers)
             frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
         except Exception as error:  # reported in the preview, no write fallback
             self.error = _plain_error(error)
@@ -513,10 +516,16 @@ class PaintingRunPreview(QObject):
         self.measurements.setVisible(bool(rows))
         shift = result.measurements.get("offset_px") or {}
         checks = result.measurements.get("checks") or {}
+        domain = result.measurements.get(frame_domain.KEY) or {}
+        if domain.get("status") == "available":
+            gap_note = (f"Inside-frame uncovered: {domain['inside_uncovered_pixels']:,} px "
+                        f"({domain['inside_uncovered_cm2']:.4g} cm²). Outside the rig frame is transparent. ")
+        else:
+            gap_note = "Inside-frame gaps unavailable: " + str(domain.get("reason") or "The reference rig frame is not bound.") + " "
         self.note.setText(f"{result.run_id}: {result.source_name} from {result.source_run}, placed through the saved frame models. "
-                          "Read only · no approval, placement receipt or adoption is created. Magenta: unassigned or uncovered. "
+                          "Read only · no approval, placement receipt or adoption is created. Magenta: uncovered inside the placed reference rig frame. "
                           f"Displacement: median {shift.get('median_px', '—')} px, maximum {shift.get('max_px', '—')} px. "
-                          f"Uncovered: {checks.get('uncovered_pixels', '—')} px; water pockets: {checks.get('water_pocket_pixels', '—')} px. "
+                          + gap_note + f"Water pockets: {checks.get('water_pocket_pixels', '—')} px. "
                           "Boundary offsets use the placement review's descriptive method.")
 
     def _render_overlay(self, result, session):
@@ -534,8 +543,17 @@ class PaintingRunPreview(QObject):
             rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
         # A gap stays a gap, including edge-replicated pixels the source does
         # not reach. The overlay never turns those pixels into a decided layer.
-        gaps = result.uncovered | (result.layers == lp.OUTSIDE)
-        rgba[gaps] = (255, 0, 255, 95)
+        domain = result.measurements.get(frame_domain.KEY) or {}
+        if domain.get("status") == "available":
+            inside, gaps = domain["display_inside"], domain["display_gaps"]
+            if inside.shape != result.layers.shape or gaps.shape != result.layers.shape:
+                raise ValueError("The displayed drawing-frame masks belong to another photograph grid.")
+            rgba[~inside] = (0, 0, 0, 0)
+            # A hidden facies cannot hide a genuinely uncovered pixel.
+            rgba[gaps] = (255, 0, 255, 95)
+        else:
+            # Unknown frame authority never becomes an all-photograph rig.
+            rgba[result.uncovered | (result.layers == lp.OUTSIDE)] = (0, 0, 0, 0)
         self.canvas.set_proposal(rgba)
         self.canvas.set_overlays_visible(False, True)
 
