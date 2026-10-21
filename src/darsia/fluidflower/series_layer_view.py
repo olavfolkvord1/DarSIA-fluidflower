@@ -3426,6 +3426,10 @@ class LayerPainterView(QWidget):
         self._analysis_boxes_window = None
         self._analysis_boxes_preview_items = []
         self._analysis_boxes_preview_key = None
+        self.measured_edges = None
+        self._measured_edges_reload_pending = False
+        self._measured_edges_syncing = False
+        self._waiting_for_workers = False
         self._facies_menu_open = False
         self._facies_refresh_pending = False
         self._facies_buttons: dict[str, QToolButton] = {}
@@ -3528,6 +3532,14 @@ class LayerPainterView(QWidget):
         self.analysis_boxes.changed.connect(self._analysis_boxes_changed)
         self.analysis_boxes.saved.connect(self._analysis_boxes_changed)
         self.analysis_boxes.busy_changed.connect(self._analysis_boxes_busy_changed)
+        from .painting_measured_edges_ui import PaintingMeasuredEdgesController
+        self.measured_edges = PaintingMeasuredEdgesController(self)
+        self.step_frame.content.layout().addWidget(self.measured_edges.widget)
+        self.measured_edges.busy_changed.connect(self._measured_edges_busy_changed)
+        self.busy_changed.connect(self._refresh_measured_edges)
+        self.run_preview.geometry_button.clicked.connect(self._measured_edges_context_changed)
+        self.rig_panel.mark_corners.toggled.connect(self._refresh_measured_edges)
+        self.rig_panel.place_point.toggled.connect(self._refresh_measured_edges)
         for button in (self.analysis_boxes.draw_button, self.analysis_boxes.edit_button):
             button.toggled.connect(self._analysis_boxes_tool_changed)
         self.run_preview.display_changed.connect(self._sync_analysis_boxes)
@@ -4431,6 +4443,9 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
+        measured = getattr(self, "measured_edges", None)
+        if measured is not None and measured.busy():
+            return True
         boxes = getattr(self, "analysis_boxes", None)
         if boxes is not None and boxes.busy():
             return True
@@ -4453,30 +4468,35 @@ class LayerPainterView(QWidget):
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
-        boxes = getattr(self, "analysis_boxes", None)
-        if boxes is not None:
-            while boxes.busy():
-                boxes.wait_for_workers()
-        self.run_preview.wait()
-        self._native_async.wait()
-        dialog_thread = getattr(self._adoption_dialog, "_thread", None)
-        for thread in (
-            self._proposal_thread,
-            self._save_thread,
-            self._placement_thread,
-            self._adoption_thread,
-            dialog_thread,
-            self._manual_thread,
-        ):
-            try:
-                if thread is not None and thread.isRunning():
-                    thread.wait()
-            except RuntimeError:  # already deleted
-                continue
+        previous = self._waiting_for_workers
+        self._waiting_for_workers = True
         try:
-            self.save_session()
-        except RuntimeError:  # the view is being deleted
-            pass
+            for controller in (self.analysis_boxes, self.measured_edges):
+                if controller is not None:
+                    while controller.busy():
+                        controller.wait_for_workers()
+            self.run_preview.wait()
+            self._native_async.wait()
+            dialog_thread = getattr(self._adoption_dialog, "_thread", None)
+            for thread in (
+                self._proposal_thread,
+                self._save_thread,
+                self._placement_thread,
+                self._adoption_thread,
+                dialog_thread,
+                self._manual_thread,
+            ):
+                try:
+                    if thread is not None and thread.isRunning():
+                        thread.wait()
+                except RuntimeError:  # already deleted
+                    continue
+            try:
+                self.save_session()
+            except RuntimeError:  # the view is being deleted
+                pass
+        finally:
+            self._waiting_for_workers = previous
 
     def reload(self) -> None:
         """Load the session, photograph and proposal of the reference run."""
@@ -4621,6 +4641,7 @@ class LayerPainterView(QWidget):
             self.run_preview.refresh()
             self._refresh_fill_region()
             self._sync_analysis_boxes()
+            self._measured_edges_context_changed()
 
     def _load_reference_photo(self, reference: SeriesRunInputs) -> None:
         assert reference.baseline_image is not None
@@ -4811,6 +4832,7 @@ class LayerPainterView(QWidget):
         self.photo_note_row.show()
         self._refresh_fill_region()
         self._sync_analysis_boxes()
+        self._refresh_measured_edges()
         return True
 
     # ----------------------------------------------------- background photo
@@ -5199,7 +5221,7 @@ class LayerPainterView(QWidget):
     def closeEvent(self, event: Any) -> None:
         if not self.can_close():
             event.ignore()
-            self._canvas_notice("Wait for the current painting or analysis-box operation before closing.")
+            self._canvas_notice("Wait for the current painting or metadata operation before closing.")
             return
         self._reset_fill_region()
         super().closeEvent(event)
@@ -5217,18 +5239,20 @@ class LayerPainterView(QWidget):
 
     def can_close(self) -> bool:
         boxes = getattr(self, "analysis_boxes", None)
+        measured = getattr(self, "measured_edges", None)
         return (not self.busy() and not self.run_preview.busy()
-                and (boxes is None or boxes.can_close()))
+                and (boxes is None or boxes.can_close())
+                and (measured is None or measured.can_close()))
 
     def eventFilter(self, watched, event):
         if self._analysis_boxes_closed or not isValid(self):
             return False
-        boxes = getattr(self, "analysis_boxes", None)
-        if (watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close
-                and boxes is not None and not boxes.can_close()):
-            event.ignore()
-            boxes.note.setText("Wait for the current analysis-box operation before closing.")
-            return True
+        if watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close:
+            for controller in (self.analysis_boxes, self.measured_edges):
+                if controller is not None and not controller.can_close():
+                    event.ignore()
+                    controller.note.setText("Wait for the current metadata operation before closing.")
+                    return True
         return super().eventFilter(watched, event)
 
     def _invalidate_analysis_boxes(self, *_args):
@@ -5249,7 +5273,7 @@ class LayerPainterView(QWidget):
 
     def _sync_analysis_boxes(self, *_args, force=False):
         boxes = getattr(self, "analysis_boxes", None)
-        if (self._analysis_boxes_closed or self._analysis_boxes_syncing or boxes is None
+        if (self._waiting_for_workers or self._analysis_boxes_closed or self._analysis_boxes_syncing or boxes is None
                 or not boxes._alive()):
             return
         self._analysis_boxes_syncing = True
@@ -5316,6 +5340,31 @@ class LayerPainterView(QWidget):
         if not self._analysis_boxes_closed and isValid(self):
             self._refresh_status()
             self._refresh_analysis_box_preview()
+
+    def _measured_edges_context_changed(self, *_args):
+        self._measured_edges_reload_pending = True
+        self._refresh_measured_edges()
+
+    def _refresh_measured_edges(self, *_args):
+        measured = getattr(self, "measured_edges", None)
+        if (measured is None or self._measured_edges_syncing or not measured._alive()):
+            return
+        self._measured_edges_syncing = True
+        try:
+            measured.refresh()
+            if (self._measured_edges_reload_pending and not self._loading
+                    and not self._waiting_for_workers and not self.busy()
+                    and not self.run_preview.busy()):
+                self._measured_edges_reload_pending = False
+                measured.context_changed()
+        finally:
+            self._measured_edges_syncing = False
+
+    def _measured_edges_busy_changed(self, *_args):
+        measured = getattr(self, "measured_edges", None)
+        if measured is not None and measured._alive():
+            self._refresh_status()
+            self.busy_changed.emit(self.busy())
 
     def _analysis_boxes_tool_changed(self, *_args):
         if self._analysis_boxes_closed or not isValid(self):
@@ -8083,6 +8132,7 @@ class LayerPainterView(QWidget):
         if sender in (self.opacity, self.show_uncertain):
             self._render_proposal()
         self._sync_analysis_boxes()
+        self._refresh_measured_edges()
 
     def _update_polygon_fill(self) -> None:
         """Outlines only where the proposal or the manual map already colours
@@ -9079,6 +9129,7 @@ class LayerPainterView(QWidget):
     def _refresh_status(self) -> None:
         self._refresh_fill_region()
         self._sync_analysis_boxes()
+        self._refresh_measured_edges()
         session = self.session
         frame = self.current_frame()
         points = self.rig_panel.current_points()
