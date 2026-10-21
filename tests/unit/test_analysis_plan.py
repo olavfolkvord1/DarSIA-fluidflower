@@ -139,6 +139,23 @@ def test_missing_component_size_uses_root_admission_and_original_catalog_stat(ph
         plans.phase1_configuration(original, precision="float32")
 
 
+def test_parent_area_sizes_are_taken_from_their_own_catalog_entries(phase1_data):
+    from darsia.fluidflower.pipeline.job_inputs import InputCatalog
+    original = _original(phase1_data)
+    frame = original["frames"][0]
+    frame["source"]["studio_anchor"] = True
+    frame["phase_roles"]["area"] = dict(role="measured_parent", factor=1.03,
+        historical=dict(path="//unit-only/share/historical.npy", sha256="a" * 64),
+        measured=dict(path="//unit-only/share/measured.npy", sha256="b" * 64))
+    def file_stat(path):
+        return SimpleNamespace(st_mode=stat.S_IFREG, st_size=47 if "historical" in path else 53)
+    catalog = InputCatalog({"data": "//unit-only/share"}, file_stat=file_stat)
+    result = plans.phase1_configuration(original, precision="float32", role_catalog=catalog)
+    area = result["frames"][0]["phase_roles"]["area"]
+    assert area["historical"]["size_bytes"] == 47
+    assert area["measured"]["size_bytes"] == 53
+
+
 def test_legacy_array_alias_is_normalized_without_losing_hints_or_changing_identity(phase1_data):
     original = _original(phase1_data)
     original["data_aliases"] = [dict(logical=dict(path="//unit-only/share/old.npy",

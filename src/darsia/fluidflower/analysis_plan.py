@@ -144,10 +144,18 @@ def phase1_configuration(original, *, precision, atmosphere=None, frame_data=Non
         from .pipeline.job_inputs import InputCatalog
         if type(role_catalog) is not InputCatalog:
             raise ValueError("Missing input sizes require the real rooted input catalogue")
+    def complete_size(bound, use, label):
+        if "size_bytes" not in bound:
+            if role_catalog is None:
+                raise ValueError(label + " size requires the rooted input catalogue")
+            reference = role_catalog.add(bound, "rig_model", use)
+            bound["size_bytes"] = reference["bytes"]
     for frame in candidate["frames"]:
+        use = "plan." + candidate["run"] + "." + frame["case_id"]
         area = frame["phase_roles"]["area"]
         for field in ("historical", "measured"):
             if field in area:
+                complete_size(area[field], use + ".area." + field, "Physical-area input")
                 hints = {key: area[field].pop(key) for key in ("dtype", "shape_hw")
                          if key in area[field]}
                 if hints:
@@ -160,12 +168,7 @@ def phase1_configuration(original, *, precision, atmosphere=None, frame_data=Non
         # The staged contract requires that count. Obtain it through original
         # root admission and stat, never a guessed archive size or another frame.
         bound = frame["phase_roles"]["static"]["components"]
-        if "size_bytes" not in bound:
-            if role_catalog is None:
-                raise ValueError("Static component size requires the rooted input catalogue")
-            reference = role_catalog.add(bound, "rig_model",
-                "plan." + candidate["run"] + "." + frame["case_id"] + ".static_components")
-            bound["size_bytes"] = reference["bytes"]
+        complete_size(bound, use + ".static_components", "Static component")
     validate_phase1_run(candidate)
     return candidate
 
