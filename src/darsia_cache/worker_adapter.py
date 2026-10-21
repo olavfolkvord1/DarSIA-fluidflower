@@ -48,7 +48,11 @@ class WorkerCacheAdapter:
         self.namespace_admission = self.lease.admission
         self.profiles, self.claims = {}, {}
         first=getattr(self.lease,"first_qualification",None)
-        if first is not None and first.reference_build:
+        setup=getattr(runtime,"job",{}).get("pipeline")=="series-setup"
+        if setup:
+            from darsia.fluidflower.pipeline.series_setup_protocol import validate_setup_job
+            validate_setup_job(runtime.job)
+        if first is not None and first.reference_build and not setup:
             from .first_qualification import ReferencePublicationFence
             original_factory=runtime.factory
             def reference_factory(claim):
