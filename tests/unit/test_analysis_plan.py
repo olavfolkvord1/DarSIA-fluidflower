@@ -233,6 +233,14 @@ def test_gas_probability_is_the_existing_explicit_native_request(phase1_data):
     assert result["storage"]["resolution_mm"] == "native"
 
 
+def test_provisional_pressure_cannot_be_sealed_as_a_plan_before_its_decision(tmp_path, phase1_data):
+    phase1_data["statistics"]["atmosphere_series"] = dict(provisional_gap_default=True)
+    target = tmp_path / "prepared"
+    with pytest.raises(ValueError, match="provisional pressure gaps"):
+        plans.write_phase1_plan(target, [phase1_data], job_id="testonly", job=_job(), resources=_resources(phase1_data))
+    assert not target.exists()
+
+
 def test_phase2_requires_a_verified_completion_and_never_invents_one(tmp_path, phase1_data):
     closure = _closure(tmp_path / "synthetic", phase1_data)
     job = dict(_job(), calibration_sha256=closure["calibration"]["sha256"])

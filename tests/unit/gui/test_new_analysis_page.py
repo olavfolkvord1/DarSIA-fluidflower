@@ -17,6 +17,23 @@ from .test_native_jobs_owner import job, local_registry, plan, series, snapshot 
 FACTS = dict(runs=["ac52", "ac53"], frames=78, precision="float32", storage_mm=[None, None])
 
 
+def test_positive_phase1_facts_force_full_and_disable_create_for_the_actual_route_blocker(qtbot):
+    panel = jobs.JobsPanel()
+    qtbot.addWidget(panel)
+    page = jobs.NewAnalysisPage(panel)
+    qtbot.addWidget(page)
+    page.facts = dict(runs=["run-one"], frames=2, precision="float32", storage_mm=[None],
+        pipeline="native-phase-statistics", gas_probability=True, running_pressure_runs=["run-one"],
+        route_blocker="The selected profile has another commit")
+    page._show_facts()
+    assert page.form.profile_combo.currentData() == "full"
+    assert not page.form.profile_combo.isEnabled()
+    assert not page.create_button.isEnabled()
+    assert "another commit" in page.create_button.toolTip()
+    assert "statistics" in page.pipeline_label.text() and "float32" in page.probability_label.text()
+    assert "1 runs" in page.pressure_label.text()
+
+
 @pytest.fixture
 def owner(local_registry, qtbot):  # noqa: F811
     def forbidden(*a, **k):

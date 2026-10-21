@@ -256,6 +256,9 @@ def _write_plan(folder, configurations, *, pipeline, job_id, job, resources):
         raise ValueError("Supply the resources for every ordered run")
     for config in configurations:
         validator(config)
+        atmosphere = (config["statistics"] if pipeline == PHASE1 else config).get("atmosphere_series", {})
+        if atmosphere.get("provisional_gap_default") is True:
+            raise ValueError(config["run"] + ": provisional pressure gaps await an explicit decision")
         choice = resources[config["run"]]
         _resources(choice)
         if config["precision"] != job["precision"]:

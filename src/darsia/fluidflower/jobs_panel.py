@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 
 from .job_control import publish_control, read_control
 from .jobs_metadata import JobSnapshotReader, create_job_from_plan
+from .staged_jobs import create_analysis_job
 from .storage_profile import (
     DEFAULT_STORAGE_PROFILE,
     ESTIMATE_LABEL,
@@ -224,7 +225,7 @@ def read_plan_facts(plan, *, reader=None):
     value per run: None for native, else the stored cell size in millimetres.
     """
     if reader is None:
-        from .pipeline.series import read_series as reader
+        from .staged_jobs import read_execution_plan as reader
     from .storage_resolution import resolution_mm
 
     value, configurations, _bound = reader(
@@ -239,12 +240,24 @@ def read_plan_facts(plan, *, reader=None):
             else None
         )
     job = value.get("job") or {}
-    return dict(
+    facts = dict(
         runs=[config.get("run") for config in configurations],
         frames=sum(len(config.get("frames") or ()) for config in configurations),
         precision=job.get("precision"),
         storage_mm=storage,
     )
+    if value.get("pipeline") == "native-phase-statistics":
+        from .staged_jobs import phase1_route_blocker
+        facts.update(pipeline=value["pipeline"], route_blocker=phase1_route_blocker(),
+            gas_probability=all("gas_probability_storage" in config for config in configurations),
+            running_pressure_runs=[config["run"] for config in configurations
+                if "atmosphere_series" in config["statistics"]],
+            phase_configuration=[config["phase"]["configuration"] for config in configurations],
+            native_configuration=[config["native"]["configuration"] for config in configurations])
+    elif value.get("pipeline") == "n1":
+        facts.update(pipeline="n1", running_pressure_runs=[config["run"] for config in configurations
+            if "atmosphere_series" in config], gas_probability=False, route_blocker="")
+    return facts
 
 
 def stored_at_text(storage_mm):
@@ -442,8 +455,17 @@ class NewAnalysisPage(QWidget):
         plan_row.addWidget(self.form.import_button)
         what.addRow("Saved execution plan", plan_row)
         what.addRow(self.form.binding_label)
+        self.prepare_plan_button = QPushButton("Prepare a new analysis plan…")
+        self.prepare_plan_button.clicked.connect(self.prepare_plan)
+        what.addRow(self.prepare_plan_button)
         self.selection_label = _label()
         what.addRow("Image selection", self.selection_label)
+        self.pipeline_label = _label()
+        what.addRow("Analysis stage", self.pipeline_label)
+        self.pressure_label = _label()
+        what.addRow("Running pressure", self.pressure_label)
+        self.probability_label = _label()
+        what.addRow("Gas probability", self.probability_label)
         layout.addWidget(self.what)
 
         self.files = QGroupBox("Resolution and files")
@@ -514,6 +536,20 @@ class NewAnalysisPage(QWidget):
         """Series and method as Calibration recorded them (read-only)."""
         self.method_label.setText(method_text or "Not known yet.")
 
+    def prepare_plan(self):
+        from .analysis_preparation_ui import AnalysisPreparationDialog
+        dialog = AnalysisPreparationDialog(self.panel, self)
+        dialog.adopted.connect(self._prepared_adopted)
+        dialog.exec()
+        dialog.deleteLater()
+
+    @Slot(object)
+    def _prepared_adopted(self, bound):
+        row = dict(bound, label=Path(bound["path"]).name)
+        self.form._imported.append(row)
+        self.form.plan_combo.addItem(row["label"], row)
+        self.form.plan_combo.setCurrentIndex(self.form.plan_combo.count() - 1)
+
     def set_plans(self, plans, *, free_space=None):
         """Offer the adopted plans and the known free space, then read the plan."""
         self.form.set_plans(plans, free_space=free_space)
@@ -550,10 +586,19 @@ class NewAnalysisPage(QWidget):
             self._facts_pending = True
             return
         key, reader = self._facts_key, self.facts_reader
+        series_root = self.panel.series_root
+        provider = self.panel.local_stores_path_provider
+        stores_path = provider() if provider is not None else None
 
         def read():
             try:
-                return dict(key=key, facts=reader(plan))
+                facts = reader(plan)
+                if facts.get("pipeline") in {"native-phase-statistics", "n1"} and not facts.get("route_blocker"):
+                    from .staged_jobs import inspect_staged_resources
+                    admission = inspect_staged_resources(plan, series_root=series_root, stores_path=stores_path)
+                    facts["resource_admission"] = admission
+                    facts["route_blocker"] = "" if admission["ready"] else admission["reason"]
+                return dict(key=key, facts=facts)
             except Exception as error:
                 return dict(key=key, error=f"{type(error).__name__}: {error}")
 
@@ -596,6 +641,21 @@ class NewAnalysisPage(QWidget):
         """Show the image selection, Stored at and Precision of the chosen plan."""
         self._show_stored_choices()
         facts = self.facts
+        phase1 = (facts or {}).get("pipeline") == "native-phase-statistics"
+        phase2 = (facts or {}).get("pipeline") == "n1"
+        self.form.profile_combo.setEnabled(not (phase1 or phase2))
+        if phase1 or phase2:
+            self.form.profile_combo.setCurrentIndex(self.form.profile_combo.findData("full"))
+        self.form.profile_combo.setToolTip("Full is required for this staged route." if phase1 or phase2 else "")
+        self.pipeline_label.setText("Native images, phase maps and statistics" if phase1
+                                    else "Mass from completed phase-one products" if phase2
+                                    else "As bound by the selected execution plan")
+        pressure_runs = (facts or {}).get("running_pressure_runs", [])
+        self.pressure_label.setText(
+            f"Bound running values for {len(pressure_runs)} runs" if pressure_runs else "As bound by the execution plan")
+        self.probability_label.setText(
+            ("Stored: exact float32 decision values" if facts.get("gas_probability") else "Not requested")
+            if phase1 else "As bound by the execution plan")
         if facts is None:
             if self.facts_error:
                 text = "Not read: " + self.facts_error
@@ -623,7 +683,9 @@ class NewAnalysisPage(QWidget):
         panel = self.panel
         self.create_button.setEnabled(
             self.form.ready() and panel.create_button.isEnabled() and self.stored_allowed()
+            and not (self.facts or {}).get("route_blocker")
         )
+        self.create_button.setToolTip((self.facts or {}).get("route_blocker", ""))
         current = (panel.current or {}).get("root")
         own = bool(self.created_root and current and Path(current) == Path(self.created_root))
         self.machine_box.setEnabled(own)
@@ -960,7 +1022,7 @@ class JobsPanel(QWidget):
             machines_provider,
         )
         self.reader = reader or JobSnapshotReader()
-        self.job_creator = job_creator or create_job_from_plan
+        self.job_creator = job_creator or create_analysis_job
         self.local_launcher = local_launcher or launch_local_worker
         self.local_stores_path_provider = local_stores_path_provider
         self.remote_launcher = remote_launcher or launch_remote_worker
@@ -1578,6 +1640,8 @@ class JobsPanel(QWidget):
         }
         if storage_profile is not None:
             kwargs["storage_profile"] = storage_profile
+        if self.job_creator is create_analysis_job and self.local_stores_path_provider is not None:
+            kwargs["stores_path"] = self.local_stores_path_provider()
         generation = self._generation
         self._create_thread, self._create_worker = self._start_call(
             lambda: {
