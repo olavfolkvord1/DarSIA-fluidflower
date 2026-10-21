@@ -219,7 +219,7 @@ class MetricAnalysisDomainDialog(AnalysisDomainDialog):
         worker.finished.connect(self._background_done)
         worker.failed.connect(self._background_failed)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._background_closed)
         thread.start()
 
     @Slot(object)
@@ -230,6 +230,14 @@ class MetricAnalysisDomainDialog(AnalysisDomainDialog):
     @Slot(str)
     def _background_failed(self, message):
         self.domain_reference_status.setText(message)
+
+    @Slot()
+    def _background_closed(self):
+        thread = self._thread
+        if thread is not None:
+            thread.wait()
+            self._thread = self._worker = self._completion = None
+            thread.deleteLater()
 
     def _load_reference(self, *, show_errors=True):
         if self._run not in self.models or self.photo_loader is None:
@@ -355,7 +363,6 @@ class NativeMetricBoxesWorkflow(QObject):
         worker.finished.connect(self._ready)
         worker.failed.connect(self._failed)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._finished)
         thread.start()
 
@@ -379,4 +386,9 @@ class NativeMetricBoxesWorkflow(QObject):
 
     @Slot()
     def _finished(self):
+        thread = self._thread
+        if thread is not None:
+            thread.wait()
+            self._thread = self._worker = None
+            thread.deleteLater()
         self.button.setEnabled(True)

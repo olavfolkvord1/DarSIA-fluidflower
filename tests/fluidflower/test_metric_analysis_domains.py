@@ -192,7 +192,8 @@ def test_preview_and_overlay_do_not_change_scientific_inputs(context):
 
 
 def test_gui_edits_mm_and_background_callback_stays_on_gui_thread(context, qtbot):
-    from PySide6.QtCore import QThread
+    from PySide6.QtCore import QCoreApplication, QEvent, QObject, QThread
+    from shiboken6 import isValid
     from darsia.fluidflower.metric_analysis_domains_ui import MetricAnalysisDomainDialog
     project, _, config, models = context
     config["domains"] = [data.box("first", [100, 500, 40, 300], role="box1")]
@@ -209,9 +210,16 @@ def test_gui_edits_mm_and_background_callback_stays_on_gui_thread(context, qtbot
         time.sleep(.08)
         return QThread.currentThread() is gui
     dialog._background(work, lambda result: observed.append((result, QThread.currentThread() is gui)))
+    worker = dialog._worker
     qtbot.waitUntil(lambda: len(observed) == 1)
     assert observed == [(False, True)]
-    qtbot.waitUntil(lambda: not dialog._thread.isRunning())
+    qtbot.waitUntil(lambda: dialog._thread is None)
+    assert dialog._worker is None and isValid(worker)
+    watcher = QObject()
+    worker.destroyed.connect(watcher.deleteLater)
+    del worker  # The owner and this final reference release it in the GUI thread.
+    QCoreApplication.sendPostedEvents(watcher, QEvent.Type.DeferredDelete)
+    assert not isValid(watcher)
     dialog.close()
 
 
