@@ -222,10 +222,10 @@ class MetricAnalysisDomainDialog(AnalysisDomainDialog):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         self._completion = done
-        worker.finished.connect(self._background_done)
-        worker.failed.connect(self._background_failed)
+        worker.finished.connect(self._background_done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._background_failed, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit)
-        thread.finished.connect(self._background_closed)
+        thread.finished.connect(self._background_closed, Qt.ConnectionType.QueuedConnection)
         thread.start()
 
     @Slot(object)

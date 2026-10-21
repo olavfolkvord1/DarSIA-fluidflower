@@ -131,7 +131,9 @@ def test_selecting_a_proposal_after_manual_restores_the_existing_legacy_status(v
     proposal = view.save_version("Proposal draft")
     _select(view, proposal)
     view.step_export.set_expanded(True)
-    assert view.export_button.isVisibleTo(view)
+    # N407 keeps the old API/status objects, with the obsolete section hidden.
+    assert not view.step_export.isVisibleTo(view)
+    assert not view.export_button.isVisibleTo(view)
     assert "round-5 route" not in view.export_problems.text()
     assert "Approved manual map" not in view.step_export.status.text()
 
@@ -142,7 +144,9 @@ def test_legacy_unsaved_proposal_keeps_its_existing_status(view):
     assert "Choose a saved map version in step 4" in view.map_status.text()
     view.step_use_map.set_expanded(True)
     view.step_export.set_expanded(True)
-    assert view.export_button.isVisibleTo(view)
+    # N407 keeps the old API/status objects, with the obsolete section hidden.
+    assert not view.step_export.isVisibleTo(view)
+    assert not view.export_button.isVisibleTo(view)
     assert view.export_problems.text() == " ".join(view.export_problems_now())
 
 
