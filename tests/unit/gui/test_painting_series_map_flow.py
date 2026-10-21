@@ -168,6 +168,7 @@ def test_adopt_button_does_not_fall_back_to_legacy_dialog_for_known_check(view, 
     def no_picker(*_args, **_kwargs):
         raise AssertionError("The known selected check must open without another path chooser")
     monkeypatch.setattr(QFileDialog, "getOpenFileName", no_picker)
+    view._series_adopt_action = None
     view._adopt_clicked()
     assert opened == []
     assert "automatic adoption backend" in view.use_map_progress.text()
