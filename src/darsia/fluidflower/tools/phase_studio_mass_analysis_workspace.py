@@ -15,6 +15,8 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
+from darsia.fluidflower.calibration_review_runs import (
+    CalibrationReviewRunList, SliderPlayer, insert_after, review_run_rows)
 from darsia.fluidflower.model_display import friendly_model_name
 from darsia.fluidflower.series_paths import configured_series, model_versions_folder
 from darsia.fluidflower.phase_model_history import (
@@ -100,7 +102,8 @@ class MassAnalysisWorkspace(QWidget):
     export buttons and any Start analysis action. The page is the one scroll
     area: the viewer's tabs fill the remaining height and their figures rescale
     without scroll areas of their own. The page scrolls only where the
-    retained controls are wider or taller than the window.
+    retained controls are wider or taller than the window. In Calibration
+    review a list of every run of the series sits beside that scroll area.
     """
 
     VIEW_TITLES = {"review": "Calibration review", "results": "Results and export"}
@@ -121,10 +124,17 @@ class MassAnalysisWorkspace(QWidget):
         self._catalog_lookup = None
         self._background_lookups: list[QThread] = []
 
-        outer = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
+        # Calibration review's run list (N141 spec 2.5): every run, beside the
+        # one scroll area rather than inside it.
+        self.run_list = CalibrationReviewRunList(self)
+        self.run_list.run_selected.connect(self._view_listed_run)
+        self.run_list.hide()
+        self._run_rows = None
+        outer.addWidget(self.run_list)
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
-        outer.addWidget(self.scroll)
+        outer.addWidget(self.scroll, 1)
         content = QWidget(self.scroll)
         self.scroll.setWidget(content)
         layout = QVBoxLayout(content)
@@ -198,11 +208,58 @@ class MassAnalysisWorkspace(QWidget):
             self.saved_results.series.findData(self.series))
         layout.addWidget(self.saved_results, 1)
         self.saved_results.view_experiment.currentIndexChanged.connect(self.refresh_approval)
+        self._follow_viewed_run()
         self.view = None
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_lookups)
         self.refresh_models()
+
+    def _follow_viewed_run(self) -> None:
+        """Add Play beside the image slider and keep the run list on the viewed run."""
+        saved, experiments = self.saved_results, self.saved_results.view_experiment
+        self.play_button = QPushButton("Play")
+        self.play_button.setToolTip("Step through this result's images; stops at the last one.")
+        # Beside "Previous", so it stays in view when the wide viewer row scrolls.
+        insert_after(saved.previous_image, self.play_button)
+        self.player = SliderPlayer(saved.slider, self.play_button, parent=self)
+        experiments.currentIndexChanged.connect(self.player.stop)
+        experiments.currentIndexChanged.connect(self._sync_run_list)
+        model = experiments.model()
+        for signal in (model.rowsInserted, model.rowsRemoved, model.modelReset):
+            signal.connect(self._sync_run_list)
+        load_result = saved.load_result
+
+        def load_result_and_follow(path):
+            before = experiments.currentData()
+            load_result(path)
+            if experiments.currentData() != before:
+                self.refresh_approval()  # The result switched runs without a signal.
+            self._sync_run_list()
+
+        saved.load_result = load_result_and_follow
+
+    def _sync_run_list(self, *_args) -> None:
+        """Mark the viewed run, and which runs have a saved result, in the run list."""
+        experiments = self.saved_results.view_experiment
+        self.run_list.set_available(
+            [experiments.itemData(index) for index in range(experiments.count())])
+        self.run_list.select_run(experiments.currentData())
+
+    def _view_listed_run(self, run: str) -> None:
+        """View the run chosen in the run list through the Experiment selector."""
+        experiments = self.saved_results.view_experiment
+        for index in range(experiments.count()):
+            if str(experiments.itemData(index)).casefold() == str(run).casefold():
+                experiments.setCurrentIndex(index)
+                return
+
+    def _refresh_run_list(self) -> None:
+        """Every run with its role and review status; read once per display."""
+        if self._run_rows is None:
+            self._run_rows = review_run_rows(self.project_root)
+            self.run_list.set_rows(self._run_rows)
+        self._sync_run_list()
 
     def show_view(self, view: str) -> None:
         """Show the page as Calibration review ("review") or Results and export ("results")."""
@@ -210,6 +267,8 @@ class MassAnalysisWorkspace(QWidget):
             raise ValueError(f"Unknown mass-analysis view: {view}")
         self.view = view
         self.title.setText(self.VIEW_TITLES[view])
+        self.run_list.setVisible(view == "review")
+        self._run_rows = None
         results = view == "results"
         saved = self.saved_results
         for widget in (saved.setup_toggle, saved.export_toggle,
@@ -283,6 +342,7 @@ class MassAnalysisWorkspace(QWidget):
         from darsia.fluidflower.calibration_approvals import read_run_approvals, run_approval
 
         self._show_pressure_line()
+        self._refresh_run_list()
         self.approval.show()
         run = self.saved_results.view_experiment.currentData()
         self.approve_button.setText(f"Approve {str(run).upper()}" if run else "Approve run")
@@ -327,6 +387,7 @@ class MassAnalysisWorkspace(QWidget):
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.approval_label.setText(f"The approval was not recorded: {error}")
             return
+        self._run_rows = None
         self.refresh_approval()
 
     def set_series(self, series: str, project_root: str | Path) -> None:
@@ -346,7 +407,7 @@ class MassAnalysisWorkspace(QWidget):
         self.saved_results.series.setCurrentIndex(
             self.saved_results.series.findData(self.series))
         self.refresh_models()
-        self._pressure_choices = None
+        self._pressure_choices = self._run_rows = None
         self.refresh_approval()
 
     def _series_selection_changed(self, _index: int) -> None:
