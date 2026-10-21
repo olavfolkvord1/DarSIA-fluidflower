@@ -609,7 +609,8 @@ def _spatial_grid(image):
 
 
 @retry_io
-def _parent_grid(pins, document, workspace_binding, run):
+def _parent_grid(pins, document, workspace_binding, run, *, request=None,
+                 parent_configuration_lineage=None):
     """Prove this exact run's four original fields keep the new spatial basis."""
     import darsia
     from .geometry_workspace_frame import selected_fields
@@ -621,7 +622,18 @@ def _parent_grid(pins, document, workspace_binding, run):
     record = (config["frame_binding"]["runs"] or {}).get(run) or {}
     configuration = {k: record.get("configuration", {}).get(k) for k in _IDENTITY_KEYS}
     _identity(configuration)
-    if sum(_same(configuration, x) for x in document["inputs"]["configuration_files"]) != 1:
+    lineage_audit = None
+    if (parent_configuration_lineage is not None
+            and sum(_same(configuration, x) for x in document["inputs"]["configuration_files"]) == 0):
+        from .raw_shape_configuration_lineage import _require_shape_configuration_lineage
+        lineage_audit = _require_shape_configuration_lineage(
+            pins, run=run, parent_configuration=configuration,
+            producer_configuration_files=document["inputs"]["configuration_files"],
+            request=request, proof=parent_configuration_lineage)
+        if not isinstance(lineage_audit, dict) or not lineage_audit:
+            raise ValueError("Shape-basis configuration lineage did not return its verified bindings")
+    if (sum(_same(configuration, x) for x in document["inputs"]["configuration_files"]) != 1
+            and lineage_audit is None):
         raise ValueError("Shape-basis original config chain does not contain this workspace's bound run")
     new = document["corrected_baseline"]["grid"]
     expected = dict(space_dim=new["metadata"]["space_dim"], indexing=new["indexing"],
@@ -639,18 +651,37 @@ def _parent_grid(pins, document, workspace_binding, run):
             raise ValueError(f"{run}: RAW shape basis and original {name} full grid differ; STOP, no migration")
         if name == "shape_corrected_baseline" and (image.scalar or image.img.ndim != 3 or image.img.shape[-1] != 3 or getattr(image, "color_space", None) != "RGB"):
             raise ValueError("The original corrected baseline lacks explicit RGB grid orientation")
-        if name != "shape_corrected_baseline" and (not image.scalar or image.img.ndim != 2):
+        if name != "shape_corrected_baseline" and (image.series or image.img.ndim != image.space_dim):
             raise ValueError("The original categorical/depth field lacks its scalar grid")
         if name == "labels":
             label_fields = dict(metadata=image.metadata(), shape_hw=list(image.img.shape), source=binding)
         sources[name] = binding
         del image
+    if lineage_audit is not None:
+        return label_fields, dict(workspace_revision=deepcopy(workspace_binding), configuration=configuration,
+                                 fields=sources, spatial_grid=expected, old_new_pixel_equality_claimed=False,
+                                 configuration_lineage=lineage_audit)
     return label_fields, dict(workspace_revision=deepcopy(workspace_binding), configuration=configuration,
                              fields=sources, spatial_grid=expected, old_new_pixel_equality_claimed=False)
 
 
+def _released_parent_lineage(pins, authority, explicit):
+    """Carry a new release's pinned proof through existing reader callers."""
+    released = pins.documents[_key(authority["root_release"]["path"])]
+    if "parent_configuration_lineage" not in released:
+        return explicit
+    binding = _identity(released["parent_configuration_lineage"])
+    proof = pins.add(binding, metadata=True, copyable=True)
+    if not isinstance(proof, dict):
+        raise ValueError("Released parent configuration lineage must be one explicit document")
+    if explicit is not None and not _same(explicit, proof):
+        raise ValueError("Explicit parent configuration lineage differs from the bound release")
+    return proof
+
+
 def read_shape_basis(certificate, *, run_id, authority, parent_workspace,
-                     reference_image=None, camera_profile=None, aliases=(), folder=None):
+                     reference_image=None, camera_profile=None, aliases=(), folder=None,
+                     parent_configuration_lineage=None):
     """Admit only the externally released operation and compatible parent grid.
 
     Registration and RAW decoding are not repeated. The producer's replay and
@@ -676,6 +707,7 @@ def read_shape_basis(certificate, *, run_id, authority, parent_workspace,
     try:
         started = _time(document["producer"]["started_utc"], "Shape-basis start")
         _authority(pins, authority, document["inputs"]["operation_request"], document["renderer_implementation"], started)
+        parent_configuration_lineage = _released_parent_lineage(pins, authority, parent_configuration_lineage)
         request = _request(pins, document, run_id)
         destination, _ = _owned_outputs(pins, document, request, certificate)
         parameters = _camera(pins, document, request, run_id, reference_image, camera_profile)
@@ -685,7 +717,12 @@ def read_shape_basis(certificate, *, run_id, authority, parent_workspace,
         if consistency != dict(required=False, basis_certificate=None, byte_exact_verified=False,
                 mismatch_policy="STOP; no automatic placement or adoption changes"):
             raise ValueError("Shape-basis certificate claims another full-build consistency role")
-        labels, compatibility = _parent_grid(pins, document, parent_workspace, run_id)
+        if parent_configuration_lineage is None:
+            labels, compatibility = _parent_grid(pins, document, parent_workspace, run_id)
+        else:
+            labels, compatibility = _parent_grid(
+                pins, document, parent_workspace, run_id, request=request,
+                parent_configuration_lineage=parent_configuration_lineage)
     except (KeyError, TypeError, AttributeError, IndexError, OverflowError,
             OSError, zipfile.BadZipFile, EOFError, UnicodeError) as error:
         raise ValueError("Malformed or incomplete RAW shape-basis closure") from error
