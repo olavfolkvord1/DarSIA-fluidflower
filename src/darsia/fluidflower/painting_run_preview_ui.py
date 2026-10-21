@@ -62,6 +62,8 @@ class _PreviewWorker(QObject):
 
 
 class PaintingRunPreview(QObject):
+    display_changed = Signal()
+
     def __init__(self, view, editable_column, canvas_class, *, run_inputs=None, set_reference=None):
         super().__init__(view)
         self.view, self.run_inputs, self.set_reference = view, run_inputs, set_reference
@@ -317,6 +319,7 @@ class PaintingRunPreview(QObject):
             self.note.setText("Reference run: editable. Viewing other runs keeps this drawing on its own photograph.")
         else:
             self.request()
+        self.display_changed.emit()
 
     def _source_changed(self, *_args):
         if not self.is_reference():
@@ -331,6 +334,7 @@ class PaintingRunPreview(QObject):
             settings.setValue(_INDEX, path)
             settings.sync()
             self.request()
+            self.display_changed.emit()
 
     def request(self):
         if not self._alive() or self.is_reference():
@@ -358,6 +362,7 @@ class PaintingRunPreview(QObject):
         self.last_result = None
         self._last_session = None
         self._result_key = None
+        self.display_changed.emit()
         self.measurements.setRowCount(0)
         self.measurements.hide()
         if not self._index:
@@ -429,6 +434,7 @@ class PaintingRunPreview(QObject):
             self._elapsed_timer.stop()
             self._loading_status = False
             self.progress_bar.hide()
+        self.display_changed.emit()
 
     def _render_result(self, result, session):
         self.canvas.set_photo(result.photo, (result.photo.shape[1], result.photo.shape[0]),
@@ -496,6 +502,7 @@ class PaintingRunPreview(QObject):
             retained = self.last_result is not None and self._result_key == self._active_key
             self._status(("Photo and placed map retained; preview update unavailable: " if retained
                           else "Preview unavailable: ") + message)
+            self.display_changed.emit()
 
     @Slot()
     def _retired(self):
@@ -530,6 +537,8 @@ class PaintingRunPreview(QObject):
         if not self._joining and (self._pending or (not self.is_reference() and self._active_key != self._key())):
             self._pending = False
             self.request()
+        if not self._joining:
+            self.display_changed.emit()
 
     def wait(self):
         self._cancel_waiting()

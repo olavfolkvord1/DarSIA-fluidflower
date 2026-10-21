@@ -5,6 +5,7 @@ and adoption remain separate operations with their existing approval gates.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -27,6 +28,60 @@ class RunPreview:
     source_run: str
     source_name: str
     measurements: dict = field(default_factory=dict)
+    native_shape_hw: tuple[int, int] | None = None
+    display_shape_hw: tuple[int, int] | None = None
+    H_native_to_display: tuple[tuple[float, ...], ...] | None = None
+    geometry_binding: dict | None = None
+
+
+def read_preview_geometry(index_path):
+    """Read measured models with their exact file and transform identities.
+
+    This is a metadata-worker operation. The preliminary index read discovers
+    files to pin before the existing geometry reader runs. Both the index and
+    every model are rechecked afterwards; no geometry is inferred or changed.
+    """
+    from .metric_analysis_domains import descriptor
+
+    def bounded_descriptor(path):
+        if Path(path).stat().st_size > placement.MAX_JSON_BYTES:
+            raise ValueError("The measured geometry metadata exceeds the existing JSON size limit")
+        return descriptor(path)
+
+    index_path = Path(index_path).resolve()
+    before = bounded_descriptor(index_path)
+    index = placement._read_json(index_path)
+    if index.get("format") != placement.GEOMETRY_FORMAT:
+        raise ValueError("The selected file is not a measured geometry index")
+    runs = index.get("runs")
+    if isinstance(runs, dict):
+        entries = [dict(value, run_id=key) for key, value in runs.items()]
+    elif isinstance(runs, list):
+        entries = [dict(value) for value in runs]
+    else:
+        raise ValueError("The geometry index needs explicit measured run entries")
+    pinned = {}
+    for entry in entries:
+        run = str(entry.get("run_id") or entry.get("run") or "").strip().casefold()
+        if not run or run in pinned:
+            raise ValueError("The geometry index must name each measured run exactly once")
+        path = placement._model_path(index_path, run, entry.get("reference_model"))
+        pinned[run] = (bounded_descriptor(path), entry)
+    models = placement.read_run_geometry(index_path)
+    if set(models) != set(pinned) or bounded_descriptor(index_path) != before:
+        raise ValueError("The geometry index changed while reading the preview models")
+    identity = {}
+    for run, model in models.items():
+        bound, entry = pinned[run]
+        if bounded_descriptor(model.source) != bound or model.entry != entry:
+            raise ValueError("A measured model changed while reading the preview geometry")
+        identity[run] = dict(model=deepcopy(bound), entry=deepcopy(entry),
+            reference_image=deepcopy(model.reference_image),
+            shape_hw=None if model.shape_hw is None else list(model.shape_hw),
+            metric_to_grid=model.metric_to_grid.tolist())
+    if bounded_descriptor(index_path) != before:
+        raise ValueError("The geometry index changed while reading the preview models")
+    return models, dict(geometry_index=before, models=identity)
 
 
 def _same_path(left, right):
@@ -105,7 +160,7 @@ def prepare_preview(session, layers, *, geometry_index, target_run, config,
             on_progress(message)
 
     progress("Reading measured frame models")
-    models = placement.read_run_geometry(geometry_index)
+    models, geometry_binding = read_preview_geometry(geometry_index)
     source_run, target_run = session.run_id.casefold(), str(target_run).casefold()
     if source_run not in models or target_run not in models:
         raise ValueError("The geometry index needs exact models for both selected runs")
@@ -141,8 +196,14 @@ def prepare_preview(session, layers, *, geometry_index, target_run, config,
             shown_layers = cv2.resize(placed, size, interpolation=cv2.INTER_NEAREST)
             shown_uncovered = cv2.resize(uncovered.astype(np.uint8), size,
                                         interpolation=cv2.INTER_NEAREST).astype(bool)
+        sx, sy = size[0] / target_shape[1], size[1] / target_shape[0]
+        display_transform = ((sx, 0., (sx-1.)/2.), (0., sy, (sy-1.)/2.), (0., 0., 1.))
         return RunPreview(target_run, shown_photo, shown_layers, shown_uncovered,
-                          str(path), source_run, source_name, values)
+                          str(path), source_run, source_name, values,
+                          native_shape_hw=tuple(target_shape),
+                          display_shape_hw=tuple(shown_photo.shape[:2]),
+                          H_native_to_display=display_transform,
+                          geometry_binding=deepcopy(geometry_binding))
 
     if measure_offsets and on_preview is not None:
         # A shallow copy prevents adding the later measurement to an already

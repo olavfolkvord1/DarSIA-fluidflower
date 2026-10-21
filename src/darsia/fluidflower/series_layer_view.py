@@ -29,6 +29,7 @@ from . import geometry_workspace_frame as workspace_frame
 from typing import Any
 
 import numpy as np
+from shiboken6 import isValid
 from PySide6.QtCore import (
     QEvent,
     QObject,
@@ -3417,6 +3418,14 @@ class LayerPainterView(QWidget):
         self._export_stale = True
         self._export_key = ""
         self._loading = False
+        self.analysis_boxes = None
+        self._analysis_boxes_load_key = None
+        self._analysis_boxes_reload_pending = False
+        self._analysis_boxes_syncing = False
+        self._analysis_boxes_closed = False
+        self._analysis_boxes_window = None
+        self._analysis_boxes_preview_items = []
+        self._analysis_boxes_preview_key = None
         self._facies_menu_open = False
         self._facies_refresh_pending = False
         self._facies_buttons: dict[str, QToolButton] = {}
@@ -3513,10 +3522,26 @@ class LayerPainterView(QWidget):
         # reference and the read-only placed photograph.
         self.run_preview.widget.layout().insertWidget(2, self.facies_visibility)
         self.display_styles_changed.connect(self.run_preview.redraw_display)
+        from .painting_analysis_boxes_ui import PaintingAnalysisBoxesController
+        self.analysis_boxes = PaintingAnalysisBoxesController(self)
+        self.steps_scroll.widget().layout().insertWidget(3, self.analysis_boxes.widget)
+        self.analysis_boxes.changed.connect(self._analysis_boxes_changed)
+        self.analysis_boxes.saved.connect(self._analysis_boxes_changed)
+        self.analysis_boxes.busy_changed.connect(self._analysis_boxes_busy_changed)
+        for button in (self.analysis_boxes.draw_button, self.analysis_boxes.edit_button):
+            button.toggled.connect(self._analysis_boxes_tool_changed)
+        self.run_preview.display_changed.connect(self._sync_analysis_boxes)
+        self.run_preview.widget.destroyed.connect(self._invalidate_analysis_boxes)
+        self.run_preview.canvas.destroyed.connect(self._invalidate_analysis_boxes)
+        self.run_preview.geometry_button.clicked.connect(lambda: self._sync_analysis_boxes(force=True))
+        self.destroyed.connect(self._invalidate_analysis_boxes)
         self.run_preview.runs.currentIndexChanged.connect(self._fill_region_context_changed)
         self.busy_changed.connect(self._refresh_fill_region)
+        self.busy_changed.connect(self._sync_analysis_boxes)
         self.rig_panel.mark_corners.toggled.connect(self._refresh_fill_region)
         self.rig_panel.place_point.toggled.connect(self._refresh_fill_region)
+        self.rig_panel.mark_corners.toggled.connect(self._sync_analysis_boxes)
+        self.rig_panel.place_point.toggled.connect(self._sync_analysis_boxes)
         splitter.addWidget(self.run_preview.widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -3529,6 +3554,7 @@ class LayerPainterView(QWidget):
         application = QApplication.instance()
         if application is not None:
             application.aboutToQuit.connect(self.wait_for_workers)
+            application.focusChanged.connect(self._refresh_analysis_box_undo)
         self.reload()
 
     # ------------------------------------------------------------ layout
@@ -4405,6 +4431,9 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None and boxes.busy():
+            return True
         if self._native_async.busy():
             return True
         for thread in (
@@ -4424,6 +4453,10 @@ class LayerPainterView(QWidget):
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None:
+            while boxes.busy():
+                boxes.wait_for_workers()
         self.run_preview.wait()
         self._native_async.wait()
         dialog_thread = getattr(self._adoption_dialog, "_thread", None)
@@ -4449,6 +4482,7 @@ class LayerPainterView(QWidget):
         """Load the session, photograph and proposal of the reference run."""
 
         self._reset_fill_region()
+        self._analysis_boxes_load_key = None
         self.save_session()
         # Which layers are hidden is a display choice for the session shown.
         self._clear_background()
@@ -4586,6 +4620,7 @@ class LayerPainterView(QWidget):
             self._loading = False
             self.run_preview.refresh()
             self._refresh_fill_region()
+            self._sync_analysis_boxes()
 
     def _load_reference_photo(self, reference: SeriesRunInputs) -> None:
         assert reference.baseline_image is not None
@@ -4775,6 +4810,7 @@ class LayerPainterView(QWidget):
         )
         self.photo_note_row.show()
         self._refresh_fill_region()
+        self._sync_analysis_boxes()
         return True
 
     # ----------------------------------------------------- background photo
@@ -5153,12 +5189,236 @@ class LayerPainterView(QWidget):
 
     def hideEvent(self, event: Any) -> None:
         self._reset_fill_region()
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None:
+            boxes.set_mode(None)
+        self._show_separate_box_button(True)
         self.save_session()
         super().hideEvent(event)
 
     def closeEvent(self, event: Any) -> None:
+        if not self.can_close():
+            event.ignore()
+            self._canvas_notice("Wait for the current painting or analysis-box operation before closing.")
+            return
         self._reset_fill_region()
         super().closeEvent(event)
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        window = self.window()
+        if window is not self and window is not self._analysis_boxes_window:
+            if self._analysis_boxes_window is not None and isValid(self._analysis_boxes_window):
+                self._analysis_boxes_window.removeEventFilter(self)
+            self._analysis_boxes_window = window
+            window.installEventFilter(self)
+        self._show_separate_box_button(False)
+        self._sync_analysis_boxes()
+
+    def can_close(self) -> bool:
+        boxes = getattr(self, "analysis_boxes", None)
+        return (not self.busy() and not self.run_preview.busy()
+                and (boxes is None or boxes.can_close()))
+
+    def eventFilter(self, watched, event):
+        if self._analysis_boxes_closed or not isValid(self):
+            return False
+        boxes = getattr(self, "analysis_boxes", None)
+        if (watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close
+                and boxes is not None and not boxes.can_close()):
+            event.ignore()
+            boxes.note.setText("Wait for the current analysis-box operation before closing.")
+            return True
+        return super().eventFilter(watched, event)
+
+    def _invalidate_analysis_boxes(self, *_args):
+        # Destruction invalidation performs no Qt access.
+        self._analysis_boxes_closed = True
+        self._analysis_boxes_preview_items = []
+
+    def _show_separate_box_button(self, visible):
+        boxes = getattr(self, "analysis_boxes", None)
+        if self._analysis_boxes_closed or boxes is None or not boxes._alive():
+            return
+        workflow = getattr(self.window(), "metric_boxes_workflow", None)
+        workspace = getattr(workflow, "workspace", None)
+        button = getattr(workflow, "button", None)
+        if (button is not None and isValid(button) and workspace is not None
+                and getattr(workspace, "simple_view", None) is self):
+            button.setVisible(bool(visible))
+
+    def _sync_analysis_boxes(self, *_args, force=False):
+        boxes = getattr(self, "analysis_boxes", None)
+        if (self._analysis_boxes_closed or self._analysis_boxes_syncing or boxes is None
+                or not boxes._alive()):
+            return
+        self._analysis_boxes_syncing = True
+        try:
+            boxes.refresh()
+            self._refresh_analysis_box_preview()
+            self._show_separate_box_button(not self.isVisible())
+            if self._loading or self.session is None or self.image is None:
+                return
+            reference = self.reference()  # GUI getter: capture before starting the worker.
+            if reference is None or reference.run_id.casefold() != self.session.run_id.casefold():
+                return
+            from .series_geometry import native_series_link
+            linked = bool(native_series_link(self.project).get("series_root"))
+            if not linked and not force:
+                return
+            frame = self.current_frame()
+            frame_key = None if frame is None else (
+                tuple(sorted(frame.corners.items())), frame.width_m, frame.height_m)
+            packet_binding = getattr(self.run_preview.last_result, "geometry_binding", None)
+            packet_models = packet_binding.get("models") if isinstance(packet_binding, dict) else None
+            packet_source = None if not isinstance(packet_binding, dict) else (
+                packet_binding.get("geometry_index"),
+                packet_models.get(self.session.run_id.casefold()) if isinstance(packet_models, dict) else None)
+            key = (boxes._key(), str(reference.config_path), frame_key,
+                   json.dumps(self._workspace_frame_config, sort_keys=True, default=str),
+                   json.dumps(packet_source, sort_keys=True, default=str))
+            if not force and key == self._analysis_boxes_load_key:
+                return
+            if boxes.busy() or self.busy() or self.run_preview.busy():
+                self._analysis_boxes_reload_pending = True
+                return
+            expected_run, config_path = reference.run_id.casefold(), Path(reference.config_path)
+            if linked:
+                from .painting_analysis_box_sources import load_legacy_box_source
+                def original_source(project, run):
+                    if str(run).casefold() != expected_run:
+                        raise ValueError("The captured original-box reference run changed")
+                    return load_legacy_box_source(project, run, reference_config_path=config_path)
+                boxes.legacy_source_provider = original_source
+            else:
+                boxes.legacy_source_provider = None
+            self._analysis_boxes_load_key = key
+            self._analysis_boxes_reload_pending = False
+            boxes.reload(preserve_draft=True)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            boxes._operation_error = str(error)
+            boxes.refresh()
+        finally:
+            self._analysis_boxes_syncing = False
+            self._refresh_analysis_box_undo()
+
+    def _analysis_boxes_busy_changed(self, *_args):
+        if self._analysis_boxes_closed or not isValid(self):
+            return
+        self._refresh_status()
+        self._sync_analysis_boxes(force=self._analysis_boxes_reload_pending)
+        self.busy_changed.emit(self.busy())
+        if (not self.busy() and not self.run_preview.busy() and not self.run_preview.is_reference()
+                and self.run_preview.last_result is None):
+            self.run_preview.request()
+
+    def _analysis_boxes_changed(self, *_args):
+        if not self._analysis_boxes_closed and isValid(self):
+            self._refresh_status()
+            self._refresh_analysis_box_preview()
+
+    def _analysis_boxes_tool_changed(self, *_args):
+        if self._analysis_boxes_closed or not isValid(self):
+            return
+        active = self.analysis_boxes.mode is not None
+        self.follow_edges.setEnabled(not active)
+        self.join_edge_button.setEnabled(not active)
+        if active:
+            self.brush_size.setEnabled(False)
+            self.brush_label.setEnabled(False)
+        self._refresh_analysis_box_undo()
+
+    def _analysis_boxes_owns_undo(self):
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is None or not boxes._alive():
+            return False
+        focus = QApplication.focusWidget()
+        return boxes.mode is not None or (focus is not None and (focus is boxes.widget or boxes.widget.isAncestorOf(focus)))
+
+    def _refresh_analysis_box_undo(self, *_args):
+        boxes = getattr(self, "analysis_boxes", None)
+        if (self._analysis_boxes_closed or not isValid(self) or boxes is None
+                or not boxes._alive() or not hasattr(self, "undo_button")):
+            return
+        owned = self._analysis_boxes_owns_undo()
+        self.undo_button.setEnabled(not boxes.busy() and (boxes.undo_button.isEnabled() if owned else bool(self._undo_stack)))
+        self.redo_button.setEnabled(not boxes.busy() and (boxes.redo_button.isEnabled() if owned else bool(self._redo_stack)))
+        self.undo_button.setToolTip("Undo the last analysis-box edit (Ctrl+Z)" if owned
+                                   else "Undo the last change to the polygons or strokes (Ctrl+Z)")
+        self.redo_button.setToolTip("Redo the last analysis-box edit (Ctrl+Y)" if owned else "Redo (Ctrl+Y)")
+
+    def _refresh_analysis_box_preview(self):
+        boxes = getattr(self, "analysis_boxes", None)
+        if self._analysis_boxes_closed or boxes is None or not boxes._alive():
+            return
+        preview = self.run_preview
+        if not isValid(preview.canvas):
+            self._analysis_boxes_preview_items = []
+            return
+        result = preview.last_result
+        valid = (not preview.is_reference() and result is not None and boxes.draft is not None
+                 and not boxes._binding_error and self.session is not None
+                 and result.run_id == str(preview.runs.currentData() or "").casefold()
+                 and result.source_run == self.session.run_id.casefold()
+                 and tuple(preview.canvas.raw_size or ()) == (result.photo.shape[1], result.photo.shape[0])
+                 and str((preview.canvas.preview or {}).get("path", "")) == result.photo_path)
+        model = boxes.models.get(result.run_id) if valid else None
+        if model is not None:
+            problem = boxes.preview_geometry_problem(getattr(result, "geometry_binding", None),
+                source_run=result.source_run, target_run=result.run_id)
+            if problem:
+                boxes._operation_error = problem
+                boxes.note.setText(problem)
+                model = None
+        transform = None
+        if model is not None:
+            native_shape = getattr(result, "native_shape_hw", None)
+            display_shape = getattr(result, "display_shape_hw", None)
+            try:
+                transform = np.asarray(getattr(result, "H_native_to_display", None), np.float64)
+            except (TypeError, ValueError):
+                transform = np.asarray(())
+            if (native_shape is None or tuple(native_shape) != tuple(model.shape_hw or ())
+                    or display_shape is None or tuple(display_shape) != tuple(result.photo.shape[:2])
+                    or transform.shape != (3, 3) or not np.isfinite(transform).all()):
+                model = None
+            else:
+                sy, sx = display_shape[0]/native_shape[0], display_shape[1]/native_shape[1]
+                expected = np.asarray(((sx, 0., (sx-1.)/2.), (0., sy, (sy-1.)/2.), (0., 0., 1.)))
+                if not np.array_equal(transform, expected):
+                    model = None
+        configuration = boxes.draft.configuration() if valid and model is not None else None
+        key = None if configuration is None else (id(result), id(model), json.dumps(configuration, sort_keys=True))
+        if key == self._analysis_boxes_preview_key:
+            return
+        self._analysis_boxes_preview_key = key
+        for item in self._analysis_boxes_preview_items:
+            if isValid(item) and item.scene() is not None:
+                item.scene().removeItem(item)
+        self._analysis_boxes_preview_items = []
+        if configuration is None:
+            return
+        try:
+            outlines = boxes.passive_outlines(model, photo_path=result.photo_path,
+                shape=result.native_shape_hw, workspace_config=self._workspace_frame_config)
+        except (OSError, ValueError, KeyError):
+            return  # No projection is inferred from matching dimensions alone.
+        for outline in outlines:
+            path = QPainterPath()
+            for number, point in enumerate(outline["points_rc"]):
+                mapped = transform @ np.asarray((point[1], point[0], 1.))
+                value = preview.canvas.raw_to_scene(float(mapped[1]), float(mapped[0]))
+                path.moveTo(value) if number == 0 else path.lineTo(value)
+            path.closeSubpath()
+            item = QGraphicsPathItem(path)
+            pen = QPen(QColor("#ffd200" if outline["role"] == "box1" else "#00ffff"), 2.)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            item.setPen(pen)
+            item.setZValue(30.)
+            item.setToolTip(outline["name"] + " · analysis-box preview, read only")
+            preview.canvas.scene().addItem(item)
+            self._analysis_boxes_preview_items.append(item)
 
     # ------------------------------------------------------------- tools
 
@@ -5190,6 +5450,9 @@ class LayerPainterView(QWidget):
         self._fill_region_problem = problem
 
     def set_tool(self, tool: str) -> None:
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None and boxes.mode is not None:
+            boxes.set_mode(None, restore_tool=False)
         if tool in _DRAWING_TOOLS and self._other_photo is not None:
             self.show_reference_photo()
         if tool in _CORRECTION_TOOLS and not self.corrections_available():
@@ -6225,6 +6488,12 @@ class LayerPainterView(QWidget):
             self.canvas_hint.setText(_CANVAS_HINT)
 
     def undo(self) -> None:
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None and boxes.busy():
+            return
+        if self._analysis_boxes_owns_undo():
+            boxes.undo()
+            return
         if self.session is None or not self.run_preview.is_reference():
             return
         if self.canvas.drafting():
@@ -6240,6 +6509,12 @@ class LayerPainterView(QWidget):
         self._after_restore(current, snapshot)
 
     def redo(self) -> None:
+        boxes = getattr(self, "analysis_boxes", None)
+        if boxes is not None and boxes.busy():
+            return
+        if self._analysis_boxes_owns_undo():
+            boxes.redo()
+            return
         if self.session is None or not self._redo_stack or not self.run_preview.is_reference():
             return
         current, snapshot = self._snapshot(), self._redo_stack.pop()
@@ -7807,6 +8082,7 @@ class LayerPainterView(QWidget):
         sender = self.sender()
         if sender in (self.opacity, self.show_uncertain):
             self._render_proposal()
+        self._sync_analysis_boxes()
 
     def _update_polygon_fill(self) -> None:
         """Outlines only where the proposal or the manual map already colours
@@ -8802,6 +9078,7 @@ class LayerPainterView(QWidget):
 
     def _refresh_status(self) -> None:
         self._refresh_fill_region()
+        self._sync_analysis_boxes()
         session = self.session
         frame = self.current_frame()
         points = self.rig_panel.current_points()
@@ -8840,6 +9117,7 @@ class LayerPainterView(QWidget):
         )
         self.undo_button.setEnabled(bool(self._undo_stack))
         self.redo_button.setEnabled(bool(self._redo_stack))
+        self._refresh_analysis_box_undo()
 
         busy = self.busy()
         native = self._large_native_result() if self._native_async_required() else None

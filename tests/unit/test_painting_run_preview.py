@@ -82,6 +82,33 @@ def _prepare(index, session, layers, **kwargs):
                                    **kwargs)
 
 
+def test_exact_native_and_display_grid_proof_is_additive_and_keeps_preview_products(tmp_path):
+    index, session, _models_read, _photos = _models(tmp_path)
+    rows, cols = np.indices(SHAPE)
+    layers = (2 + ((rows // 4 + cols // 4) % 2)).astype(np.uint8)
+    before = layers.copy(), deepcopy(session.to_dict()), _files(tmp_path)
+    full = _prepare(index, session, layers, display_limit=1000)
+    reduced = _prepare(index, session, layers, display_limit=16)
+    assert full.native_shape_hw == SHAPE and full.display_shape_hw == SHAPE
+    assert full.H_native_to_display == ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.))
+    assert np.array_equal(full.layers, layers)
+    assert not full.uncovered.any()
+    assert np.array_equal(full.photo, np.full((*SHAPE, 3), 160, np.uint8))
+    assert reduced.native_shape_hw == SHAPE and reduced.display_shape_hw == (12, 16)
+    assert reduced.H_native_to_display == ((.5, 0., -.25), (0., .5, -.25), (0., 0., 1.))
+    assert np.array_equal(reduced.layers, layers[::2, ::2])
+    assert np.array_equal(reduced.photo, np.full((12, 16, 3), 160, np.uint8))
+    assert not reduced.uncovered.any()
+    assert reduced.photo_path == full.photo_path and reduced.source_run == full.source_run
+    assert reduced.measurements == full.measurements
+    legacy = preview.RunPreview("target", full.photo, full.layers, full.uncovered,
+                                full.photo_path, "source", "Drawing")
+    assert legacy.native_shape_hw is None and legacy.display_shape_hw is None
+    assert legacy.H_native_to_display is None
+    assert np.array_equal(layers, before[0]) and session.to_dict() == before[1]
+    assert _files(tmp_path) == before[2]
+
+
 def test_early_preview_precedes_optional_reference_loading_and_preserves_exact_result(tmp_path):
     target_h = np.array([[1., 0., 3.], [0., 1., 2.], [0., 0., 1.]])
     index, session, _models_read, _photos = _models(tmp_path, target_matrix=target_h)
@@ -338,3 +365,55 @@ def test_native_grid_is_placed_before_display_reduction(tmp_path):
     assert result.photo.shape == (12, 16, 3) and result.layers.shape == (12, 16)
     assert np.array_equal(result.layers, layers[::2, ::2])
     assert not result.uncovered.any()
+
+
+def test_geometry_packet_binds_index_bytes_models_and_used_homographies(tmp_path):
+    index, session, models, _photos = _models(tmp_path)
+    result = _prepare(index, session, np.full(SHAPE, 2, np.uint8))
+    binding = result.geometry_binding
+    assert binding["geometry_index"] == _descriptor(index)
+    for run in ("source", "target"):
+        row = binding["models"][run]
+        assert row["model"] == _descriptor(tmp_path / (run + "-model.json"))
+        assert row["reference_image"] == models[run]["reference_image"]
+        assert row["shape_hw"] == list(SHAPE)
+        assert row["metric_to_grid"] == models[run]["H_metric_mm_to_camera_u"]
+    assert result.native_shape_hw == SHAPE and result.display_shape_hw == SHAPE
+
+
+@pytest.mark.parametrize("changed", ["index", "source", "target"])
+def test_geometry_snapshot_refuses_changes_during_existing_reader(tmp_path, monkeypatch, changed):
+    index, _session, _models_read, _photos = _models(tmp_path)
+    original = placement.read_run_geometry
+    def changed_after_read(path):
+        models = original(path)
+        if changed == "index":
+            document = json.loads(index.read_text())
+            document["display_note"] = "changed during the read"
+            _write_json(index, document)
+        else:
+            model = tmp_path / (changed + "-model.json")
+            document = json.loads(model.read_text())
+            document["H_metric_mm_to_camera_u"][0][2] = 3.
+            _write_json(model, document)
+        return models
+    monkeypatch.setattr(placement, "read_run_geometry", changed_after_read)
+    with pytest.raises(ValueError, match="changed"):
+        preview.read_preview_geometry(index)
+
+
+def test_early_and_final_packets_have_independent_identical_geometry_proof(tmp_path, monkeypatch):
+    index, session, _models_read, _photos = _models(tmp_path)
+    packets = []
+    monkeypatch.setattr(placement, "layer_offsets", lambda *args: {"boundaries": []})
+    monkeypatch.setattr(placement, "add_changes_from_reference", lambda *args: None)
+    result = _prepare(index, session, np.full(SHAPE, 2, np.uint8), measure_offsets=True,
+                      on_preview=packets.append, display_limit=16)
+    assert len(packets) == 1
+    early = packets[0]
+    assert early.geometry_binding == result.geometry_binding
+    assert early.geometry_binding is not result.geometry_binding
+    assert early.H_native_to_display == result.H_native_to_display
+    assert early.native_shape_hw == result.native_shape_hw == SHAPE
+    early.geometry_binding["models"]["source"]["metric_to_grid"][0][2] = 999.
+    assert result.geometry_binding["models"]["source"]["metric_to_grid"][0][2] == 0.
