@@ -59,7 +59,7 @@ def view(qtbot, tmp_path, monkeypatch):
         "ac52", config, baseline_image=baseline, width_m=0.9, height_m=0.49
     )
     widget = LayerPainterView(_Project(tmp_path / "project"), lambda: reference)
-    qtbot.addWidget(widget)
+    qtbot.addWidget(widget, before_close_func=lambda owned: owned.wait_for_workers())
     widget.resize(1400, 900)
     widget.show()
     qtbot.waitExposed(widget)

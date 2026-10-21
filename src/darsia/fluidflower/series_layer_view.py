@@ -3504,6 +3504,8 @@ class LayerPainterView(QWidget):
         self._adoption_message: QMessageBox | None = None
         self._adoption_dialog: QDialog | None = None
         self._saved_transfers_dialog: QDialog | None = None
+        # Installed only by the separately reviewed automatic RAW adoption UI.
+        self._series_adopt_action = None
         # The manual map (the polygons as drawn, at full resolution) and the
         # proposal's full-resolution map it is compared with, each with the
         # key of what it was drawn from; display data, saved only as a version.
@@ -3911,7 +3913,6 @@ class LayerPainterView(QWidget):
         self.approve_version_button.clicked.connect(self._approve_version_clicked)
         buttons.addWidget(self.approve_version_button)
         buttons.addStretch(1)
-        layout.addLayout(buttons)
         self.versions_table = QTableWidget(0, 6)
         self.versions_table.setHorizontalHeaderLabels(
             ["Name", "Kind", "Settings", "Saved UTC", "SHA-256", "State"]
@@ -3936,6 +3937,7 @@ class LayerPainterView(QWidget):
         self.versions_table.itemSelectionChanged.connect(self._version_selected)
         self.versions_table.itemDoubleClicked.connect(self._version_double_clicked)
         layout.addWidget(self.versions_table)
+        layout.addLayout(buttons)
         self.versions_note = QLabel()
         self.versions_note.setWordWrap(True)
         self.versions_note.setTextInteractionFlags(
@@ -3958,17 +3960,19 @@ class LayerPainterView(QWidget):
         self.map_status.setWordWrap(True)
         self.map_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.map_status)
+        from .painting_series_use_ui import SeriesUseStatus
+        self.series_use_status = SeriesUseStatus(self)
+        self.series_use_status.changed.connect(self._refresh_use_map)
+        layout.addWidget(self.series_use_status.label)
         self.use_map_reasons = {}
         choices = (
             ("place_version_button", "Transfer map to all runs…", self._place_version_clicked,
              "Transfers the approved map from the reference run to each run's own photo through its measured frame model, "
-             "and logs the fit per run. About 4 minutes."),
+             "and logs the fit per run. Duration depends on the run count and photographs."),
             ("open_placement_button", "Review the transfer…", self._open_placement_clicked,
              "Open a saved transfer summary and compare the map with each run's photograph. Read only."),
-            ("prepare_adoption_button", "Check the series revision…", self._prepare_adoption_clicked,
-             "A dry run: prepares and checks the new geometry for every run. It records a preparation; the series' geometry stays unchanged."),
             ("adopt_button", "Adopt as the series' sand map…", self._adopt_clicked,
-             "Review the prepared checks, then explicitly record the approved version as a new series geometry revision. The adoption is logged."),
+             "Check the selected map, review the result and give the final confirmation before recording a new series revision."),
         )
         for number, (name, text, callback, explanation) in enumerate(choices, 1):
             row = QHBoxLayout()
@@ -3986,10 +3990,25 @@ class LayerPainterView(QWidget):
             reason.setWordWrap(True)
             layout.addWidget(reason)
             self.use_map_reasons[button] = reason
-        self.setup_pointer = _note("5. In Setup: Apply to all runs, then Build run model. These remain separate, explicit steps after adoption.")
-        layout.addWidget(self.setup_pointer)
+            if name == "place_version_button":
+                self.use_map_progress = QLabel()
+                self.use_map_progress.setWordWrap(True)
+                self.use_map_progress.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                layout.addWidget(self.use_map_progress)
+        # Compatibility for older programmatic callers; there is one visible
+        # check/adopt action, not a second check button.
+        self.prepare_adoption_button = self.adopt_button
+        self.apply_build_button = QPushButton("Apply to all runs and Build run models")
+        self.apply_build_button.setEnabled(False)
+        self.apply_build_button.setToolTip("Unavailable until the existing RAW route-2 Apply and Build job is ready.")
+        layout.addWidget(self.apply_build_button)
+        self.apply_build_reason = _note("Apply and Build are unavailable: the RAW route-2 backend is not ready. Nothing has been applied or built by this tab.")
+        layout.addWidget(self.apply_build_reason)
+        # Preserve the older programmatic export API and its status objects,
+        # while removing the obsolete route from the painting tab entirely.
         self.step_export = StepSection(None, "Advanced: older native Setup export", self._build_legacy_export_step(), expanded=False)
-        layout.addWidget(self.step_export)
+        self.step_export.setParent(self)
+        self.step_export.hide()
         return widget
 
     def _build_export_step(self) -> QWidget:
@@ -4552,6 +4571,9 @@ class LayerPainterView(QWidget):
             chooser = getattr(self, "_saved_transfers_dialog", None)
             if chooser is not None:
                 chooser.wait_for_workers()
+            status = getattr(self, "series_use_status", None)
+            if status is not None:
+                status.wait_for_workers()
             self.run_preview.wait()
             self._native_async.wait()
             dialog_thread = getattr(self._adoption_dialog, "_thread", None)
@@ -5316,7 +5338,9 @@ class LayerPainterView(QWidget):
         boxes = getattr(self, "analysis_boxes", None)
         measured = getattr(self, "measured_edges", None)
         other = getattr(self, "other_frames", None)
+        status = getattr(self, "series_use_status", None)
         return (not self.busy() and not self.run_preview.busy()
+                and (status is None or not status.busy())
                 and (boxes is None or boxes.can_close())
                 and (measured is None or measured.can_close())
                 and (other is None or other.can_close()))
@@ -5325,6 +5349,11 @@ class LayerPainterView(QWidget):
         if self._analysis_boxes_closed or not isValid(self):
             return False
         if watched is self._analysis_boxes_window and event.type() == QEvent.Type.Close:
+            status = getattr(self, "series_use_status", None)
+            if status is not None and status.busy():
+                event.ignore()
+                status.label.setText("Wait for the current finite status read before closing.")
+                return True
             for controller in (self.analysis_boxes, self.measured_edges, self.other_frames,
                                getattr(self, "fixture_preview", None)):
                 if controller is not None and not controller.can_close():
@@ -7359,9 +7388,13 @@ class LayerPainterView(QWidget):
             problem = "Wait for the checked native map before continuing."
         else:
             problem = ""
-        for button in (self.place_version_button, self.prepare_adoption_button, self.adopt_button):
+        for button in (self.place_version_button, self.adopt_button):
             button.setEnabled(not problem)
             self.use_map_reasons[button].setText(problem)
+        route_problem = "The rigs need their RAW basis and the automatic adoption backend before the map can be adopted."
+        if self._series_adopt_action is None:
+            self.adopt_button.setEnabled(False)
+            self.use_map_reasons[self.adopt_button].setText(problem or route_problem)
         self.open_placement_button.setEnabled(not self.busy())
         self.use_map_reasons[self.open_placement_button].setText(
             "Wait for the current operation to finish." if self.busy() else "")
@@ -7380,7 +7413,7 @@ class LayerPainterView(QWidget):
         reviewed = transferred and getattr(self, "_reviewed_transfer", None) == self.last_placement.get("folder")
         prepared = matches(self.last_adoption)
         next_action = (self.place_version_button if not transferred else self.open_placement_button if not reviewed
-                       else self.prepare_adoption_button if not prepared else self.adopt_button)
+                       else self.adopt_button)
         for button in self.use_map_reasons:
             primary = button is next_action and button.isEnabled() and not problem
             button.setDefault(primary)
@@ -7390,6 +7423,11 @@ class LayerPainterView(QWidget):
             self.step_use_map.set_status(problem or ("Ready to use the selected version" if not prepared
                                                     else "Revision check prepared; review before adoption"),
                                          "warn" if problem else "done")
+        if self.project is not None:
+            self.series_use_status.refresh(lp.painting_folder(self.project).parent,
+                Path(self.project.root) / "overrides/geometry_facies/current.json", record, approval)
+        else:
+            self.series_use_status.refresh(None, None, record, approval)
 
     @staticmethod
     def _version_gaps(record: Mapping[str, Any]) -> str:
@@ -7596,7 +7634,7 @@ class LayerPainterView(QWidget):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(self.versions_note.setText)
+        worker.progress.connect(self.use_map_progress.setText)
         worker.finished.connect(self._placement_finished)
         worker.failed.connect(self._placement_failed)
         # Direct: quit from the worker thread, so that wait() in the GUI
@@ -7605,7 +7643,7 @@ class LayerPainterView(QWidget):
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         thread.finished.connect(self._placement_thread_finished)
         self._placement_thread, self._placement_worker = thread, worker
-        self.versions_note.setText("Placing the map in all runs…")
+        self.use_map_progress.setText("Transferring the map to all runs…")
         thread.start()
         self._refresh_versions()
         self.busy_changed.emit(True)
@@ -7616,7 +7654,7 @@ class LayerPainterView(QWidget):
 
         self.last_placement = dict(result)
         placed = sum(1 for row in self.last_placement["runs"] if row.get("status") == "placed")
-        self.versions_note.setText(
+        self.use_map_progress.setText(
             f"Placed in {placed} of {len(self.last_placement['runs'])} runs: "
             f"{self.last_placement['folder']}"
         )
@@ -7626,6 +7664,7 @@ class LayerPainterView(QWidget):
         self._placement_dialog = dialog
         dialog.show()
         self._reviewed_transfer = self.last_placement["folder"]
+        self.series_use_status.invalidate()
         self._refresh_use_map()
 
     def _open_placement_clicked(self) -> None:
@@ -7722,25 +7761,30 @@ class LayerPainterView(QWidget):
         return lookup
 
     def _adopt_clicked(self) -> None:
-        """Choose a preparation's index.json and open its adoption window."""
+        """Use one automatic check/adopt route and its latest literal preparation.
 
-        selected = self._selected_version()
-        version = (self.last_adoption or {}).get("map_version") or {}
-        if (selected is not None and version.get("sha256") == selected.get("sha256")
-                and (version.get("folder") == selected.get("folder") or
-                     (version.get("approval") or {}).get("version") == Path(selected["folder"]).name)):
-            self.open_adoption(self.last_adoption["folder"])
+        The separately reviewed backend installs this action. The older manual
+        facies-ID dialog is not a fallback for the series-map button.
+        """
+        record = self._selected_version()
+        if self._series_adopt_action is None:
+            self.use_map_progress.setText("The rigs need their RAW basis and the automatic adoption backend before the map can be adopted.")
             return
-        root = lp.painting_folder(self.project).parent / "map_adoption" if self.project else Path()
-        start = Path(self.last_adoption["folder"]) if self.last_adoption else root
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Saved series revision check (index.json)",
-            str(start),
-            "Adoption preparation (index.json);;JSON (*.json)",
-        )
-        if path:
-            self.open_adoption(Path(path).parent)
+        if not self._placeable(record):
+            self.use_map_progress.setText("Choose and approve this saved version in step 4 before adoption.")
+            return
+        try:
+            selection = self.run_preview.geometry_selection()
+        except ValueError as error:
+            self.use_map_progress.setText(str(error))
+            return
+        from .painting_series_use_ui import matches_version
+        prepared = self.series_use_status.result.get("preparation")
+        if not matches_version(prepared, record):
+            prepared = None
+        # The actual controller retains the existing dry-run checks and final
+        # human confirmation; neither metadata display nor this seam adopts.
+        self._series_adopt_action(record, selection, prepared)
 
     def open_adoption(self, folder: Path | str) -> QDialog | None:
         """Open the adoption window of a preparation folder; None when it
@@ -7771,40 +7815,8 @@ class LayerPainterView(QWidget):
         return dialog
 
     def _prepare_adoption_clicked(self) -> None:
-        """Ask for the geometry index, then prepare the adoption of the version."""
-
-        record = self._selected_version()
-        if not self._placeable(record):
-            self.versions_note.setText("Approve the version before preparing its adoption.")
-            return
-        settings = QSettings(*_BACKGROUND_SETTINGS)
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Measured geometry of the runs (index.json)",
-            str(settings.value(_GEOMETRY_INDEX_KEY, "") or ""),
-            "Geometry index (index.json);;JSON (*.json)",
-        )
-        if not path:
-            return
-        settings.setValue(_GEOMETRY_INDEX_KEY, path)
-        settings.sync()
-        try:
-            runs = self._series_runs()
-        except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "Could not read the series' runs", str(error))
-            return
-        answer = QMessageBox.question(
-            self,
-            "Check the series revision",
-            f"Carry {record.get('name')} (SHA-256 {str(record.get('sha256'))[:12]}…) to the "
-            f"rig-corrected label grid of all {len(runs)} runs, through each run's measured "
-            "geometry and baseline native grid? This writes a new preparation folder with "
-            "each run's map and its provenance. Nothing is adopted: no geometry revision, "
-            "map or run configuration changes, and the facies ids wait for the facies table "
-            "of the map.",
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.prepare_adoption_of(record, path, runs=runs)
+        """Retain old programmatic entry points as the same single GUI action."""
+        self._adopt_clicked()
 
     def prepare_adoption_of(
         self,
@@ -7838,7 +7850,7 @@ class LayerPainterView(QWidget):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(self.versions_note.setText)
+        worker.progress.connect(self.use_map_progress.setText)
         worker.finished.connect(self._adoption_finished)
         worker.failed.connect(self._adoption_failed)
         # Direct: quit from the worker thread, so that wait() in the GUI
@@ -7847,7 +7859,7 @@ class LayerPainterView(QWidget):
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         thread.finished.connect(self._adoption_thread_finished)
         self._adoption_thread, self._adoption_worker = thread, worker
-        self.versions_note.setText("Preparing the adoption…")
+        self.use_map_progress.setText("Checking the selected map for adoption…")
         thread.start()
         self._refresh_versions()
         self.busy_changed.emit(True)
@@ -7869,7 +7881,8 @@ class LayerPainterView(QWidget):
             if blockers
             else ""
         ) + f"\n\nFolder: {self.last_adoption['folder']}"
-        self.versions_note.setText(f"{text} {self.last_adoption['folder']}")
+        self.use_map_progress.setText(f"{text} {self.last_adoption['folder']}")
+        self.series_use_status.invalidate()
         message = QMessageBox(self)
         message.setWindowTitle("Adoption prepared")
         message.setText(detail)
@@ -7880,12 +7893,14 @@ class LayerPainterView(QWidget):
     def _adoption_failed(self, message: str) -> None:
         """Say why the adoption was not prepared."""
 
-        self.versions_note.setText(f"The adoption was not prepared: {message}")
+        self.use_map_progress.setText(f"The adoption was not prepared: {message}")
 
     def _adoption_thread_finished(self) -> None:
         """Drop the finished worker and its thread here, in the GUI thread."""
 
-        thread = self._adoption_thread
+        thread, worker = self._adoption_thread, self._adoption_worker
+        if thread is not None:
+            thread.wait()
         self._adoption_thread = None
         self._adoption_worker = None
         if thread is not None:
@@ -7896,12 +7911,14 @@ class LayerPainterView(QWidget):
     def _placement_failed(self, message: str) -> None:
         """Say why the map was not placed."""
 
-        self.versions_note.setText(f"The map was not placed in all runs: {message}")
+        self.use_map_progress.setText(f"The map was not transferred to all runs: {message}")
 
     def _placement_thread_finished(self) -> None:
         """Drop the finished worker and its thread here, in the GUI thread."""
 
-        thread = self._placement_thread
+        thread, worker = self._placement_thread, self._placement_worker
+        if thread is not None:
+            thread.wait()
         self._placement_thread = None
         self._placement_worker = None
         if thread is not None:

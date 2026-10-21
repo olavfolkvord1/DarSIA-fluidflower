@@ -90,7 +90,8 @@ def test_multiple_approved_same_content_versions_show_the_selected_literal_appro
     assert "Using Later approved map (approved 2026-01-01 02:00 UTC" in view.map_status.text()
     assert lp.read_map_approvals(view.project, view.session.run_id) == [first_approval, second_approval]
     assert view._approval_for_version(second) == second_approval
-    assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
+    assert view.place_version_button.isEnabled() and not view.prepare_adoption_button.isEnabled()
+    assert "RAW basis" in view.use_map_reasons[view.adopt_button].text()
     # Capture the GUI handoff before either real worker is constructed/started.
     # Geometry is only a synthetic selector here; no placement proof is claimed.
     index = tmp_path / "selection-only.json"

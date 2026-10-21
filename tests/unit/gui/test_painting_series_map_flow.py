@@ -38,8 +38,9 @@ def test_actual_step_order_places_facies_before_versions_and_actions_below(view)
                    view.prepare_adoption_button, view.adopt_button):
         assert view.step_use_map.content.isAncestorOf(button)
     assert view.step_export.content.isAncestorOf(view.export_button)
-    assert "Advanced" in view.step_export.toggle.text() and not view.step_export.is_expanded()
-    assert "Apply to all runs" in view.setup_pointer.text() and "Build run model" in view.setup_pointer.text()
+    assert view.step_export.isHidden()
+    assert not hasattr(view, "setup_pointer")
+    assert "Apply to all runs" in view.apply_build_button.text() and not view.apply_build_button.isEnabled()
 
 
 def test_approval_opens_use_step_and_retains_reachable_versions_without_starting_work(view, qtbot):
@@ -49,7 +50,7 @@ def test_approval_opens_use_step_and_retains_reachable_versions_without_starting
     assert not view.step_propose.is_expanded() and view.step_use_map.is_expanded()
     assert view.place_version_button.property("seriesMapNext") is True
     assert view.place_version_button.text() == "Transfer map to all runs…"
-    assert view.prepare_adoption_button.text() == "Check the series revision…"
+    assert view.prepare_adoption_button is view.adopt_button
     assert view.adopt_button.text() == "Adopt as the series' sand map…"
     before = _files(lp.painting_folder(view.project))
     view.step_propose.toggle.click()
@@ -97,7 +98,8 @@ def test_review_chooser_preselects_latest_transfer_of_selected_approved_version_
     assert isinstance(view._placement_dialog, MapPlacementDialog)
     assert view._placement_dialog.folder == chosen
     assert view._placement_dialog.isVisible()
-    assert view.prepare_adoption_button.property("seriesMapNext") is True
+    assert not view.adopt_button.isEnabled()
+    assert "RAW basis" in view.use_map_reasons[view.adopt_button].text()
     assert _files(root) == before
     view._placement_dialog.close()
 
@@ -156,7 +158,7 @@ def test_closing_during_finite_metadata_read_retains_thread_until_retired(qtbot,
         chooser.wait_for_workers()
 
 
-def test_adopt_button_uses_known_selected_revision_check_without_a_second_picker(view, qtbot, monkeypatch, tmp_path):
+def test_adopt_button_does_not_fall_back_to_legacy_dialog_for_known_check(view, qtbot, monkeypatch, tmp_path):
     record = _saved_manual(view, qtbot)
     approval = view.approve_version(record)
     view.last_adoption = dict(map_version=dict(record, approval=approval), folder=str(tmp_path / "private-check"))
@@ -165,6 +167,7 @@ def test_adopt_button_uses_known_selected_revision_check_without_a_second_picker
     def no_picker(*_args, **_kwargs):
         raise AssertionError("The known selected check must open without another path chooser")
     monkeypatch.setattr(QFileDialog, "getOpenFileName", no_picker)
-    view.adopt_button.click()
-    assert opened == [str(tmp_path / "private-check")]
+    view._adopt_clicked()
+    assert opened == []
+    assert "automatic adoption backend" in view.use_map_progress.text()
     assert view._adoption_thread is None and view._save_thread is None

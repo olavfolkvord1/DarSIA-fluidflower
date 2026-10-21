@@ -215,14 +215,15 @@ def test_the_button_reuses_shared_geometry_and_asks_for_runs_to_review_first(
 
 
 def test_prepare_adoption_writes_each_runs_label_grid_map_and_adopts_nothing(view, qtbot, tmp_path):
-    assert view.prepare_adoption_button.text() == "Check the series revision…"
+    assert view.prepare_adoption_button is view.adopt_button
     _show(view, _proposal())
     record = view.save_version("Map A")
     view.versions_table.selectRow(0)
     assert not view.prepare_adoption_button.isEnabled()
     view.approve_version(record)
     view.versions_table.selectRow(0)
-    assert view.prepare_adoption_button.isEnabled()
+    assert not view.prepare_adoption_button.isEnabled()
+    assert "RAW basis" in view.use_map_reasons[view.adopt_button].text()
     index = _index(tmp_path / "geometry")
     # Each run's label grid: its camera grid without the top 5 rows.
     for run in ("ac52", "ac53"):
