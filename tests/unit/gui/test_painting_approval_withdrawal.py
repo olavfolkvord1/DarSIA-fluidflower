@@ -10,8 +10,16 @@ from PySide6.QtWidgets import QMessageBox
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import layer_painting_manual as manual
 from darsia.fluidflower import layer_painting_version_archive as versions
-from ..test_layer_painting_version_archive import make_version, payloads, state
+from ..test_layer_painting_version_archive import make_version as _make_version, payloads, state
 from .test_painting_corrections import view, _show, _proposal  # noqa: F401
+
+
+
+def make_version(tmp_path, kind="proposal"):
+    """Supply the minimal genuine project manifest needed by the original Store."""
+    project, record = _make_version(tmp_path, kind)
+    project.manifest = {}
+    return project, record
 
 
 def _approve(record):
@@ -80,8 +88,8 @@ def test_placed_version_can_be_withdrawn_archived_and_restored_without_placement
     assert restored["folder"] == record["folder"] and placement.read_bytes() == original
 
 
-@pytest.mark.parametrize("location", ["current", "history", "revision"])
-def test_any_saved_adopted_revision_refuses_withdrawal_before_log_write(tmp_path, location):
+@pytest.mark.parametrize("location", ["current", "history"])
+def test_current_adoption_refuses_withdrawal_before_log_write(tmp_path, location):
     project, record = make_version(tmp_path)
     _approve(record)
     paths = dict(current=tmp_path/"overrides/geometry_facies/current.json",
@@ -204,3 +212,53 @@ def test_placement_summary_marks_old_withdrawal_after_same_version_reapproval(vi
     dialog.refresh_approval_state(events)
     assert "Approval withdrawn" in dialog.lead.text()
     assert lp.map_approval(events,record["sha256"],version=Path(record["folder"]).name) is not None
+
+
+def test_adopting_another_version_allows_withdrawal_but_preserves_archive_history(tmp_path):
+    project, first = make_version(tmp_path)
+    session, proposal = state()
+    session.edge_fill_mm = 1.25
+    second = versions.save_map_version(project, session, proposal, [], name="Replacement")
+    assert first["sha256"] != second["sha256"]
+    _approve(first)
+    _approve(second)
+    override = tmp_path / "overrides/geometry_facies"
+    override.mkdir(parents=True)
+    current = override / "current.json"
+    history = override / "revisions.jsonl"
+    old = dict(revision_id="old-A", configuration=dict(provenance=dict(map_version=first)))
+    new = dict(revision_id="new-B", configuration=dict(provenance=dict(map_version=second)))
+    old_artifact = tmp_path / "results/geometry/old-A/revision.json"
+    old_artifact.parent.mkdir(parents=True)
+    old_artifact.write_text(json.dumps(old))
+    history.write_text(json.dumps(old) + "\n")
+    current.write_text(json.dumps(old))
+    log = lp.approvals_path(project, "sample")
+    before = log.read_bytes()
+    with pytest.raises(ValueError, match="adopt another version first"):
+        versions.withdraw_approval(project, "sample", first)
+    assert log.read_bytes() == before
+    # A real current pointer supersedes the old historical entry; retaining
+    # that entry must not make the instructed remedy impossible forever.
+    current.write_text(json.dumps(new))
+    saved_history, saved_artifact = history.read_bytes(), old_artifact.read_bytes()
+    event = versions.withdraw_approval(project, "sample", first)
+    assert event["withdrawn_approval"]["version"] == Path(first["folder"]).name
+    assert log.read_bytes().startswith(before)
+    assert history.read_bytes() == saved_history and old_artifact.read_bytes() == saved_artifact
+    # Withdrawal is now allowed, but archive still respects adopted history.
+    assert any("adopted" in reason for reason in versions.archive_blockers(project, "sample", first))
+    with pytest.raises(ValueError, match="adopted"):
+        versions.archive_version(project, "sample", first)
+    assert Path(first["folder"]).is_dir()
+
+
+def test_unwithdrawn_same_content_alias_keeps_original_archive_protection(tmp_path):
+    project, first = make_version(tmp_path)
+    session, proposal = state()
+    alias = versions.save_map_version(project, session, proposal, [], name="Unapproved alias")
+    assert alias["sha256"] == first["sha256"]
+    _approve(first)
+    with pytest.raises(ValueError, match="approved"):
+        versions.archive_version(project, "sample", alias)
+    assert Path(alias["folder"]).is_dir()

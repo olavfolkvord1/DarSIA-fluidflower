@@ -330,10 +330,17 @@ def withdrawal_context(project, run_id, selected, *, reference_files=()):
                                version=Path(record["folder"]).name)
     if approval is None or approval.get("files") != record["files"]:
         raise ValueError("This exact saved version has no active approval to withdraw")
+    from .geometry_facies import GeometryRevisionStore
+    store = GeometryRevisionStore(project)
+    for path in (store.current_path, store.revisions_path):
+        path = _safe(path)
+        if path.is_file() and path.stat().st_size > _LIMIT:
+            raise ValueError("Geometry revision metadata exceeds the bounded read")
+    current = store.current()  # Original current-pointer/history-fallback selection.
+    if _adopted_cites(current, record):
+        raise ValueError("This version is adopted for the series; adopt another version first.")
     placements = []
     for state, value, path in _reference_metadata(project, reference_files):
-        if state == "adopted" and _adopted_cites(value, record):
-            raise ValueError("This version was adopted for the series; adopt another version first.")
         if state == "placed" and _exact_cites(value, record):
             placements.append(path)
     return dict(record=record, approval=approval, placements=placements)
@@ -353,9 +360,9 @@ def archive_blockers(project, run_id, record, *, reference_files=()):
     reasons = []
     events = _events(project, run_id)
     literal = Path(record["folder"]).name
-    if lp.map_approval(events, record["sha256"], version=literal) is not None:
-        reasons.append("This map SHA-256 is approved and cannot be archived")
     withdrawn = lp.map_approval_withdrawal(events, record["sha256"], version=literal)
+    if lp.map_approval(events, record["sha256"], version=literal if withdrawn else None) is not None:
+        reasons.append("This map SHA-256 is approved and cannot be archived")
     for state, value, path in _reference_metadata(project, reference_files):
         if _cites(value, record["sha256"]):
             if withdrawn and state in {"placed", "prepared for adoption"}:
@@ -384,8 +391,12 @@ def _move(project, run_id, selected, *, restore, reference_files):
         _event(project, record, action + "_intent", source_folder=str(source), destination_folder=str(target))
         # Recheck the actual approval log immediately before the move. The GUI
         # serializes approve/place/adopt and version actions while this runs.
-        if not restore and lp.map_approval(_events(project, run_id), record["sha256"], version=Path(record["folder"]).name) is not None:
-            raise ValueError("This map became approved and cannot be archived")
+        if not restore:
+            events = _events(project, run_id)
+            literal = Path(record["folder"]).name
+            withdrawn = lp.map_approval_withdrawal(events, record["sha256"], version=literal)
+            if lp.map_approval(events, record["sha256"], version=literal if withdrawn else None) is not None:
+                raise ValueError("This map became approved and cannot be archived")
         _child(source, deleted if restore else versions, exists=True)
         _child(target, root, exists=False)
         if target.exists():
