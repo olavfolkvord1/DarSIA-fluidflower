@@ -75,6 +75,8 @@ def current_series(imported, synthetic_payload_admission, tmp_path, monkeypatch,
             document = deepcopy(document)
             document["source"].update(execution_identity=identities,
                 required_execution_identity_keys=list(identities))
+            if mode == "native-large":
+                document["source"]["metadata_padding"] = "x" * (1024**2 + 1)
         return write_document(path, document)
 
     monkeypatch.setattr(round5_geometry, "write_new_json", native_identity)
@@ -166,6 +168,43 @@ def test_current_saved_series_automatically_registers_only_adopted_apply(current
     assert all(path.read_bytes() == raw for path, raw in sources.items())
     assert [path.name for path in (case.job_root / "queue").glob("*.json")] == ["setup-apply.json"]
     assert [item["run"] for item in result["tasks"]] == ["setup-apply"]
+    assert not list((case.project.root / "exports").iterdir())
+
+
+@pytest.mark.parametrize("imported", ["agree"], indirect=True)
+@pytest.mark.parametrize("current_series", ["native-large"], indirect=True)
+def test_large_original_native_document_is_retained_without_raw_reads_or_model_writes(current_series, monkeypatch):
+    """Queue the exact original native JSON beyond the small control ceiling."""
+    case = current_series
+    assert len(case.native_bytes) > 1024**2
+    sources = {path: path.read_bytes() for path in case.project.root.parent.rglob("*")
+               if path.is_file() and path.suffix.upper() != ".ARW"}
+    open_path = Path.open
+
+    def no_raw_reads(path, mode="r", *args, **kwargs):
+        if path.suffix.upper() == ".ARW" and "r" in mode:
+            raise AssertionError("Metadata planning must not open RAW")
+        return open_path(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", no_raw_reads)
+    result = _prepare(case)
+    plan, _ = _control(case.job_root / "setup-controls/plan.json")
+    original_native = dict(path=str(case.native), sha256=hashlib.sha256(case.native_bytes).hexdigest(),
+                           size_bytes=len(case.native_bytes))
+    assert plan["native_parameters"] == original_native
+    parameters = json.loads(case.native_bytes)
+    assert "raw_execution_identity" not in parameters["source"]
+    assert len(parameters["source"]["execution_identity"]) == 5
+    for build in plan["build_plans"]:
+        assert build["native_parameters"] == original_native
+        assert build["request_template"]["profile"] == original_native
+        certificate = planner.read_bound(build["request_template"]["shape_basis_certificate"])[0]
+        assert certificate["inputs"]["profile"] == original_native
+        assert not Path(build["request_template"]["output"]["destination"]).exists()
+    assert all(path.read_bytes() == raw for path, raw in sources.items())
+    assert case.native.read_bytes() == case.native_bytes
+    assert [row["run"] for row in result["tasks"]] == ["setup-apply"]
+    assert (case.job_root / "queue/setup-apply.json").is_file()
     assert not list((case.project.root / "exports").iterdir())
 
 

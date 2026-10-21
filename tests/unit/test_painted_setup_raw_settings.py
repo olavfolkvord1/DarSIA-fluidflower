@@ -26,11 +26,14 @@ def raw_named_setup(named_setup, monkeypatch):
     return named_setup
 
 
-def _settings(tmp_path):
+def _settings(tmp_path, *, native_padding_bytes=0):
     """Bind a real private JSON document with one explicit profile assignment."""
     profile = tmp_path / "raw-camera.json"
-    profile.write_text(json.dumps(dict(registration=dict(common=dict(profiles={"selected": {}})),
-        source=dict(profiles=dict(one="selected")))) + "\n", encoding="utf-8")
+    document = dict(registration=dict(common=dict(profiles={"selected": {}})),
+                    source=dict(profiles=dict(one="selected")))
+    if native_padding_bytes:
+        document["native_metadata_padding"] = "x" * native_padding_bytes
+    profile.write_text(json.dumps(document) + "\n", encoding="utf-8")
     return dict(run_id="one", raw_camera=dict(configuration=str(profile),
         sha256=hashlib.sha256(profile.read_bytes()).hexdigest(), profile_id="selected", run_id="one"),
         rig_path=str(tmp_path / "fresh-rig"))
@@ -172,3 +175,53 @@ def test_raw_camera_bytes_join_original_apply_cas(raw_named_setup, tmp_path, mon
     assert changed
     assert all(path.read_bytes() == raw for path, raw in before.items())
     assert not (export.destination / "apply-claim.json").exists()
+
+
+@pytest.mark.parametrize("imported", ["agree"], indirect=True)
+@pytest.mark.parametrize("change_during_cas", [False, True])
+def test_large_native_camera_uses_original_bound_reader_and_apply_cas(
+        raw_named_setup, tmp_path, monkeypatch, change_during_cas):
+    """Accept larger native metadata while retaining exact camera-byte CAS.
+
+    Padding enters the initial document before its SHA binding is captured.
+    The original profile assignment and actual export/Apply transaction are
+    exercised; no sensor, shape basis or scientific output is qualified.
+    """
+    data = raw_named_setup
+    export = _painting(data, tmp_path)
+    settings = _settings(tmp_path, native_padding_bytes=1024**2 + 512)
+    camera_path = Path(settings["raw_camera"]["configuration"])
+    camera_before = camera_path.read_bytes()
+    assert len(camera_before) > setup.LIMIT
+    assert hashlib.sha256(camera_before).hexdigest() == settings["raw_camera"]["sha256"]
+    before = {path: path.read_bytes() for path in _files(data)}
+    original_rebuild = rebuilt.rebuild_bytes
+    changed = False
+
+    def rebuild_with_camera_edit(*args, **kwargs):
+        """Expose a genuine source edit after preparation and before the CAS."""
+        nonlocal changed
+        result = original_rebuild(*args, **kwargs)
+        if kwargs.get("replacements") is not None and not changed:
+            camera_path.write_bytes(camera_before + b" ")
+            changed = True
+        return result
+
+    if change_during_cas:
+        monkeypatch.setattr(rebuilt, "rebuild_bytes", rebuild_with_camera_edit)
+        with pytest.raises(RuntimeError, match="changed"):
+            setup.apply_corrected_selected_run(data.project, export,
+                rebuild_facies_by_name=True, raw_setup_settings=settings)
+        assert changed
+        assert all(path.read_bytes() == raw for path, raw in before.items())
+        assert not (export.destination / "apply-claim.json").exists()
+    else:
+        attempt = setup.apply_corrected_selected_run(data.project, export,
+            rebuild_facies_by_name=True, raw_setup_settings=settings)
+        assert json.loads(attempt.read_bytes())["state"] == "complete"
+        for kind in ("runs", "merged"):
+            path = data.series / "config" / kind / "one.toml"
+            assert tomllib.loads(path.read_text())["data"]["raw_camera"] == settings["raw_camera"]
+        assert setup.require_corrected_export_for_build(
+            data.series / "config/merged/one.toml") == export.receipt
+        assert camera_path.read_bytes() == camera_before

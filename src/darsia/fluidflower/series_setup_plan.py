@@ -228,9 +228,9 @@ def prepare_current_series_setup(project, series_root, *, target_machine, job_ro
     native = read_series_native_binding(series)
     if native is None:
         raise ValueError("The series lacks its original bound native parameter JSON")
-    _, native_bound = _control(native.path)
-    if native_bound["sha256"] != native.sha256:
-        raise ValueError("The original native parameter JSON changed during preparation")
+    native_bound = dict(path=str(native.path), sha256=native.sha256,
+                        size_bytes=native.path.stat().st_size)
+    read_bound(native_bound)
     builds, writer_paths, raw_roots = [], [root, Path(project.root) / "exports"], []
     for run in runs:
         paths, selected = _paths(series, manifest, run, frame["runs"][run])

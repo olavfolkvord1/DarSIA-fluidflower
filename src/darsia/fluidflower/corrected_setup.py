@@ -1103,11 +1103,11 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport, *, rebui
     camera_before = None
     if raw_setup_settings is not None:
         from .rig_raw_input import profile_parameters
+        from .pipeline.capacity import read_bound
         require_raw_output(raw_setup_settings, actual_receipt, fresh=True)
         camera = raw_setup_settings["raw_camera"]
-        camera_before = _small(camera["configuration"])
-        if hashlib.sha256(camera_before).hexdigest() != camera["sha256"]:
-            raise ValueError("The RAW Setup camera differs from its exact profile bytes")
+        _parameters, camera_before = read_bound(dict(path=camera["configuration"],
+            sha256=camera["sha256"], size_bytes=Path(camera["configuration"]).stat().st_size))
         profile_parameters(camera)
     dual = binding.get("dual_configuration_binding")
     if dual is not None:
