@@ -1,7 +1,11 @@
 """The native page explains eligibility and reports candidate completion honestly."""
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from darsia.fluidflower import native_continuation_training as gui
 from darsia.fluidflower.native_continuation_training import NativeContinuationTraining
 from darsia.fluidflower.phase_training.continuation import CONTRACT
 
@@ -12,6 +16,66 @@ def test_missing_selected_parent_has_a_visible_reason_and_registers_the_route():
     adapter = NativeContinuationTraining(steps)
     assert steps.training_routes["existing"] == adapter.start
     assert "Choose an indexed saved model" in adapter.refresh()
+    assert not adapter.ready
+
+
+@pytest.fixture
+def selected_parent(tmp_path):
+    """Supply private placeholder files without inspecting or training a model."""
+    paths = [tmp_path / "training_request.json", *[
+        tmp_path / "models/generic" / (head + "_signal.json") for head in gui.continuation.HEADS]]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    studio = SimpleNamespace(_selected_validation_model=lambda: dict(root=str(tmp_path)),
+        _training_finished=lambda *args: None)
+    adapter = NativeContinuationTraining(SimpleNamespace(studio=studio, training_routes={}, series_id="campaign"))
+    return adapter, paths
+
+
+@pytest.mark.parametrize("index,label", [(0, "saved training request"), (1, "saved CO2 presence model file"), (2, "saved gas within CO2 model file")])
+def test_missing_required_parent_file_has_a_plain_reason(selected_parent, monkeypatch, index, label):
+    """Explain each unavailable required file without changing readiness."""
+    adapter, paths = selected_parent
+    original_stat = Path.stat
+    def missing(path, *args, **kwargs):
+        if path == paths[index]:
+            raise FileNotFoundError(2, "File not found", str(path))
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", missing)
+    assert adapter.refresh() == "Continuation unavailable: The selected model's " + label + " is missing. Choose a saved model that includes it."
+    assert not adapter.ready and adapter._cache_key is None
+
+
+@pytest.mark.parametrize("boundary", ["stat", "read"])
+def test_unreadable_required_parent_file_has_a_plain_reason(selected_parent, monkeypatch, boundary):
+    """Explain access failures at either existing metadata boundary."""
+    adapter, paths = selected_parent
+    error = PermissionError(13, "Access denied", str(paths[0]))
+    if boundary == "stat":
+        original_stat = Path.stat
+        def denied(path, *args, **kwargs):
+            if path == paths[0]:
+                raise error
+            return original_stat(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "stat", denied)
+    else:
+        def denied(_entry):
+            raise error
+        monkeypatch.setattr(gui.continuation, "inspect_parent", denied)
+    assert adapter.refresh() == "Continuation unavailable: The selected model's saved training request cannot be read. Check access to the saved model files."
+    assert not adapter.ready and adapter._cache_key is None
+
+
+@pytest.mark.parametrize("error", [json.JSONDecodeError("Malformed saved metadata", "{", 1),
+    ValueError("Physical scale QA is unavailable"), PermissionError(13, "Evidence access denied", "evidence.json")])
+def test_other_parent_validation_details_remain_visible(selected_parent, monkeypatch, error):
+    """Retain malformed metadata, QA and unrelated input error details."""
+    adapter, _paths = selected_parent
+    def refuse(_entry):
+        raise error
+    monkeypatch.setattr(gui.continuation, "inspect_parent", refuse)
+    assert adapter.refresh() == "Continuation unavailable: " + str(error)
     assert not adapter.ready
 
 

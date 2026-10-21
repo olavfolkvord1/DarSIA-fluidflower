@@ -29,6 +29,7 @@ class NativeContinuationTraining:
 
     def refresh(self):
         """Return the model-specific reason; opening the page writes nothing."""
+        required_file_labels = {}
         try:
             getter = getattr(self.studio, "_selected_validation_model", None)
             entry = getter() if callable(getter) else None
@@ -37,6 +38,9 @@ class NativeContinuationTraining:
             root = Path(entry["root"])
             paths = [root / "training_request.json", *[root / "models/generic" / f"{head}_signal.json"
                                                        for head in continuation.HEADS]]
+            required_file_labels = {str(paths[0]): "saved training request", **{
+                str(path): "saved " + head.replace("_", " ").replace("co2", "CO2") + " model file"
+                for head, path in zip(continuation.HEADS, paths[1:])}}
             key = (json.dumps(entry.get("library_source_identity"), sort_keys=True), self.steps.series_id,
                    tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths))
             if key != self._cache_key:
@@ -65,7 +69,13 @@ class NativeContinuationTraining:
                            "Earlier evidence and evaluation exclusions are retained; the new version requires independent validation.")
         except (OSError, KeyError, TypeError, ValueError) as error:
             self._cache_key = None
-            self.ready, self.reason = False, "Continuation unavailable: " + str(error)
+            detail = str(error)
+            label = required_file_labels.get(str(error.filename)) if isinstance(error, OSError) else None
+            if label:
+                detail = ("The selected model's " + label + " is missing. Choose a saved model that includes it."
+                    if isinstance(error, FileNotFoundError) else
+                    "The selected model's " + label + " cannot be read. Check access to the saved model files.")
+            self.ready, self.reason = False, "Continuation unavailable: " + detail
         return self.reason
 
     def start(self):
