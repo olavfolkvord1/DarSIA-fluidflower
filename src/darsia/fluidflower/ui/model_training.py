@@ -1440,9 +1440,9 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.add_bundle_button = QPushButton("Add evidence files...")
         self.add_bundle_button.clicked.connect(self._add_bundle)
         bundle_actions.addWidget(self.add_bundle_button)
-        add_selected = QPushButton("Add selected saved session")
-        add_selected.clicked.connect(self._add_selected_session_as_bundle)
-        bundle_actions.addWidget(add_selected)
+        self.add_selected_session_button = QPushButton("Add selected saved session")
+        self.add_selected_session_button.clicked.connect(self._add_selected_session_as_bundle)
+        bundle_actions.addWidget(self.add_selected_session_button)
         bundle_actions.addStretch(1)
         bundle_widget = QWidget()
         bundle_widget.setLayout(bundle_actions)
@@ -1635,7 +1635,7 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.start_button = QPushButton("Train new immutable model version")
         self.start_button.clicked.connect(self._start_training)
         actions.addWidget(self.start_button)
-        self.stop_button = QPushButton("Stop after current checkpoint")
+        self.stop_button = QPushButton("Stop training now")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop_training)
         actions.addWidget(self.stop_button)
@@ -3645,6 +3645,12 @@ class SharedPhaseModelTrainingPage(QWidget):
         self.resume_session_button.setEnabled(session is not None)
         self.add_session_evidence.setEnabled(
             bool(session and Path(str(session.get("decision_path") or "")).is_file())
+        )
+        self.add_selected_session_button.setEnabled(self.add_session_evidence.isEnabled())
+        self.add_selected_session_button.setToolTip(
+            "Add the selected saved session to the evidence packages."
+            if self.add_selected_session_button.isEnabled()
+            else "Select a saved review session with an available decisions file."
         )
         training_ready = reviewer_ready and bool(self.bundles.toPlainText().strip())
         if self.training_scope.currentData() == "single-series":

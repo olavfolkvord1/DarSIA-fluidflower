@@ -423,11 +423,11 @@ class NativePhaseSteps(QWidget):
         row.addWidget(self.phase_review_button)
         row.addStretch(1)
         _move(self.studio.review_status, self.layouts[3])
-        self.layouts[3].addWidget(
-            QLabel(
-                "Saved model maps and drawing tools open in the established review window. No map is recalculated by this page layout."
-            )
+        review_hint = QLabel(
+            "Saved model maps and drawing tools open in the established review window. No map is recalculated by this page layout."
         )
+        review_hint.setWordWrap(True)
+        self.layouts[3].addWidget(review_hint)
         self.review_route_button = QPushButton("Choose a model in Basis…")
         self.review_route_button.clicked.connect(self._open_review_requirement)
         self.layouts[3].addWidget(self.review_route_button)
@@ -588,7 +588,7 @@ class NativePhaseSteps(QWidget):
                 widget.hide()
         studio.start_button.clicked.disconnect(self._original_start)
         studio.start_button.clicked.connect(self.train)
-        studio.start_button.setText("Train")
+        studio.start_button.setText("Train model version")
         _move(studio.start_button, self.layouts[4])
         _move(studio.stop_button, self.layouts[4])
         _move(studio.status, self.layouts[4])

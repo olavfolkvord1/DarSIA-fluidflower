@@ -29,7 +29,7 @@ class PhaseModelStudioWindow(QMainWindow):
                 self,
                 "Phase-model training is still running",
                 "The studio remains open so the active model version is not "
-                "interrupted accidentally. Use 'Stop after current checkpoint' "
+                "interrupted accidentally. Use 'Stop training now' "
                 "before closing the studio.",
             )
             event.ignore()

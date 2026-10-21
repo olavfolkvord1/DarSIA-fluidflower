@@ -568,3 +568,102 @@ def test_real_catalogue_native_action_and_copy_keep_the_selected_older_model(ori
     assert studio.validation_model.count() == 2
     assert dialog.grab().save(str(tmp_path / "phase_model_layout_completed.png"))
     record_property("private_gui_screenshots", str(tmp_path))
+
+
+def test_actual_review_and_training_controls_fit_without_starting_jobs(originals, qtbot, monkeypatch, tmp_path, record_property):
+    """Walk the actual compact pages using an isolated catalogue without running jobs."""
+    from PySide6.QtCore import QPoint, QSettings
+    from PySide6.QtGui import QFont
+    from PySide6.QtWidgets import QLabel, QScrollArea
+    from darsia.fluidflower import native_phase_steps, phase_workflow
+    from darsia.fluidflower.native_continuation_training import NativeContinuationTraining
+    from darsia.fluidflower.pages.phase_interpretation.subpages.train_model import PhaseModelStudioSubpage
+    from darsia.fluidflower.ui import model_training
+    from darsia.fluidflower.ui.theme import apply_application_theme
+
+    data = originals
+    series_id = json.loads((data.model / "summary.json").read_bytes())["inventory"]["datasets"][0]
+    monkeypatch.setenv("DARSIA_FLUIDFLOWER_PHASE_MODEL_DEFAULTS", str(tmp_path / "no-defaults.json"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    for name in ("DARSIA_FLUIDFLOWER_PHASE_MODEL_LIBRARY", "DARSIA_NATIVE_CONFIGURATION",
+                 "DARSIA_NATIVE_CONFIGURATION_SHA256"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(model_training, "QSettings", lambda *_args: QSettings(
+        str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    monkeypatch.setattr(model_training, "default_phase_review_roots", lambda: (data.root / "reviews",))
+    monkeypatch.setattr(phase_workflow, "default_phase_review_roots", lambda: (data.root / "reviews",))
+    studio = model_training.SharedPhaseModelTrainingPage()
+
+    def readers_done():
+        """Wait for the actual local catalogue and evidence readers to finish."""
+        return (not studio._model_catalog_inflight and not studio._model_catalog_pending
+                and not studio._review_sessions_loading and not studio._retraction_inflight
+                and studio._pending_evidence_inflight is None)
+
+    def finish(_widget):
+        """Drain local readers before their Qt receivers are destroyed."""
+        for timer in studio.findChildren(model_training.QTimer):
+            timer.stop()
+        qtbot.waitUntil(readers_done, timeout=10000)
+
+    qtbot.addWidget(studio, before_close_func=finish)
+    steps = native_phase_steps.NativePhaseSteps(studio, actor_provider=lambda: "reviewer")
+    NativeContinuationTraining(steps)
+    steps.setFont(QFont("Segoe UI", 10))
+    apply_application_theme(steps)
+    qtbot.addWidget(steps, before_close_func=finish)
+    steps.set_context(data.root, series_id)
+    for timer in studio.findChildren(model_training.QTimer):
+        timer.stop()
+    steps.show_section("phase_model")
+    steps.resize(1280, 800)
+    steps.show()
+    qtbot.waitUntil(readers_done, timeout=10000)
+    assert studio.select_validation_model(data.model)
+    qtbot.waitUntil(readers_done, timeout=10000)
+    assert not studio._selected_validation_model()["errors"]
+    assert studio.review_sessions
+    assert all(Path(row["session_path"]).is_relative_to(data.root) for row in studio.review_sessions)
+    assert studio.saved_sessions.count() == 0
+    assert not studio.add_selected_session_button.isEnabled()
+    assert "Select a saved review session" in studio.add_selected_session_button.toolTip()
+    assert studio.start_button.text() == "Train model version"
+    assert studio.stop_button.text() == "Stop training now"
+    steps.model_name.setText("Candidate version")
+    assert not studio.start_button.isEnabled()
+    assert not studio.stop_button.isEnabled()
+    assert steps.findChildren(QScrollArea) == [steps.scroll]
+    review_hint = next(label for label in steps.groups[3].findChildren(QLabel)
+                       if label.text().startswith("Saved model maps and drawing tools"))
+    assert review_hint.wordWrap()
+
+    for number, controls in (
+        (3, (studio.open_model_correction, steps.phase_review_button, review_hint)),
+        (4, (steps.model_name, studio.start_button, studio.stop_button)),
+    ):
+        steps.phase_tabs.setCurrentWidget(steps.groups[number])
+        qtbot.wait(20)
+        assert steps.size().width() == 1280 and steps.size().height() == 800
+        assert steps.scroll.horizontalScrollBar().maximum() == 0
+        for control in controls:
+            position = control.mapTo(steps.scroll.widget(), QPoint(0, 0))
+            assert 0 <= position.x() <= steps.scroll.widget().width() - control.width()
+            steps.scroll.ensureWidgetVisible(control)
+            qtbot.wait(10)
+            assert control.visibleRegion().boundingRect().height() > 0
+        steps.scroll.verticalScrollBar().setValue(0)
+        assert steps.grab().save(str(tmp_path / ("phase_model_step_" + str(number) + ".png")))
+
+    steps.advanced.setChecked(True)
+    qtbot.wait(20)
+    assert studio.add_selected_session_button.isVisible()
+    assert not studio.add_selected_session_button.isEnabled()
+    assert steps.scroll.horizontalScrollBar().maximum() == 0
+    steps.scroll.ensureWidgetVisible(studio.add_selected_session_button)
+    qtbot.wait(20)
+    assert studio.add_selected_session_button.visibleRegion().boundingRect().height() > 0
+    assert steps.grab().save(str(tmp_path / "phase_model_training_inputs.png"))
+    assert studio.training_process is None and studio.validation_process is None
+    assert PhaseModelStudioSubpage._active_job_notice(studio) is None
+    assert all(Path(path).read_bytes() == raw for path, raw in data.before.items())
+    record_property("private_gui_screenshots", str(tmp_path))

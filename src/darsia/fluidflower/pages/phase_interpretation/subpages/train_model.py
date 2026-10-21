@@ -143,7 +143,7 @@ class PhaseModelStudioSubpage(QWidget):
             return (
                 "Phase-model training is still running",
                 "The Studio remains open so the active model version is not "
-                "interrupted accidentally. Use 'Stop after current checkpoint' "
+                "interrupted accidentally. Use 'Stop training now' "
                 "before closing the window.",
             )
         if getattr(studio, "_series_batch_active", False):
