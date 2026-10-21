@@ -5,6 +5,7 @@ Numerical products remain passive SHA/size identities in their original index.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
+from collections import OrderedDict
 import hashlib
 import json
 from pathlib import Path, PureWindowsPath, PurePosixPath
@@ -16,7 +17,8 @@ from .pipeline.job_queue import (
 )
 from .storage_profile import declared_storage_profile
 from .pipeline.products_publication import (
-    _read_index, read_published_metadata, published_metadata_descriptor, _bound, _json,
+    _read_index, _bound, _json, _identity, _relative, _file, _stamp,
+    _verified_bytes, _verify_file, ProductUnavailable, MAX_INDEX_BYTES, MAX_METADATA_BYTES,
 )
 
 def _same_bytes(left, right):
@@ -117,9 +119,10 @@ def _phase1_terminal(root, base_task, job, done, reader):
     index_path = _own_asset(root, done["products_index"])
     index = descriptor(index_path)
     _index_root, document, products = _read_index(index)
+    shared_metadata = _SnapshotMetadata(index, _index_root, products)
     if (document["run"] != base_task["run"] or document["attempt_id"] != done["attempt_id"]
             or not _same_bytes(document["job"], descriptor(root / "job.json"))
-            or not _same_bytes(published_metadata_descriptor(index), done["completed"])):
+            or not _same_bytes(shared_metadata.read("completed.json")[0], done["completed"])):
         raise ValueError("Published phase-one index/job/completion identity differs")
     actual = completed.get("task") or {}
     validate_phase1_claim(actual, job)
@@ -156,7 +159,7 @@ def _phase1_terminal(root, base_task, job, done, reader):
         if (not _same_bytes(row, asset) or _pure(row["local_path"]) != _pure(asset["path"])
                 or name(row["machine_id"]) != name(machine)):
             raise ValueError("Named phase-one metadata product differs from its original descriptor")
-        return _original_metadata(index, products, asset, attempt, machine)
+        return _original_metadata(index, products, asset, attempt, machine, metadata=shared_metadata)
     manifest = metadata(completed["manifest"], "manifest.json")
     core = metadata(completed["phase1_completion"], "phase1_completed.json")
     expected_stage = dict(pipeline=job["pipeline"], configuration=base_task["configuration"],
@@ -205,6 +208,7 @@ def _phase1_terminal(root, base_task, job, done, reader):
             expected_products.add(key)
     if set(products) != expected_products:
         raise ValueError("Phase-one products index has missing or extra original entries")
+    shared_metadata.finish()
     return completed, {case: machine for case in cases}, lineage
 
 
@@ -278,21 +282,77 @@ def _owner_machine(owner, task, token):
     return output["machine_id"]
 
 
-def _original_metadata(index, products, asset, attempt, machine, *, decode_json=True):
+class _SnapshotMetadata:
+    """Strict shared metadata reused only during one terminal snapshot."""
+
+    def __init__(self, index, root, products):
+        self.index = _bound(index)
+        self.root = Path(root)
+        self.by_path = {}
+        for key, row in products.items():
+            self.by_path.setdefault(_pure(row["local_path"]), []).append((key, row))
+        self.products = products
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.observed = {}
+        self.index_stamp = _stamp(_file(self.index["path"]).stat())
+
+    def matches(self, path):
+        return self.by_path.get(path, ())
+
+    def read(self, key):
+        row = self.products[_relative(key)]
+        copy = row.get("metadata_copy")
+        if copy is None:
+            raise ProductUnavailable("No published metadata copy: " + key)
+        path = self.root.joinpath(*copy["relative_path"].split("/"))
+        bound = dict(path=str(path), **_identity(copy))
+        stamp = _stamp(_file(path).stat())
+        previous = self.observed.get(str(path))
+        if previous is not None and (previous[0] != stamp or previous[1] != bound):
+            raise ValueError("Shared metadata identity changed during the snapshot")
+        cache_key = (str(path), bound["sha256"], bound["bytes"])
+        raw = self.cache.get(cache_key)
+        if raw is None:
+            raw = _verified_bytes(path, bound, limit=MAX_METADATA_BYTES)
+            after = _stamp(_file(path).stat())
+            if stamp != after:
+                raise ValueError("Shared metadata changed during the snapshot")
+            self.observed[str(path)] = (stamp, bound)
+            while self.cache and self.cache_bytes + len(raw) > MAX_METADATA_BYTES:
+                _old_key, old_raw = self.cache.popitem(last=False)
+                self.cache_bytes -= len(old_raw)
+            self.cache[cache_key] = raw
+            self.cache_bytes += len(raw)
+        else:
+            self.cache.move_to_end(cache_key)
+        return bound, raw
+
+    def finish(self):
+        # Rehash, do not trust stat alone: same-size/mtime edits must fail too.
+        _verified_bytes(self.index["path"], self.index, limit=MAX_INDEX_BYTES)
+        if _stamp(_file(self.index["path"]).stat()) != self.index_stamp:
+            raise ValueError("Products index identity changed during the snapshot")
+        for path, (stamp, bound) in self.observed.items():
+            _verify_file(path, bound, limit=MAX_METADATA_BYTES)
+            if _stamp(_file(path).stat()) != stamp:
+                raise ValueError("Shared metadata identity changed during the snapshot")
+
+
+def _original_metadata(index, products, asset, attempt, machine, *, metadata, decode_json=True):
     """Require the exact original descriptor and a verified shared byte copy."""
     original = _bound(asset)
     path = _original_path(original["path"], attempt)
-    matches = [(key,row) for key,row in products.items() if _pure(row["local_path"]) == path]
+    matches = metadata.matches(path)
     if not matches:
         raise ValueError("Original producer field has no exact indexed path")
     raw = None
     for key, row in matches:
         if not _same_bytes(row, original) or name(row["machine_id"]) != name(machine):
             raise ValueError("Original producer path/SHA/bytes/machine differs from index")
-        actual = published_metadata_descriptor(index, key)
+        actual, candidate = metadata.read(key)
         if not _same_bytes(actual, original):
             raise ValueError("Original producer field has no matching shared metadata copy")
-        candidate = read_published_metadata(index, key)
         if raw is not None and candidate != raw:
             raise ValueError("Duplicate original metadata paths have different shared bytes")
         raw = candidate
@@ -300,7 +360,7 @@ def _original_metadata(index, products, asset, attempt, machine, *, decode_json=
 
 
 def _producer_inventory(index, products, record, producer, task, job, *,
-                        current_attempt, current_token, owners):
+                        current_attempt, current_token, owners, metadata):
     attempt = _pure(producer["attempt_directory"])
     token = attempt.name
     if (not re.fullmatch(r"[0-9a-f]{32}", token) or token not in owners
@@ -320,7 +380,7 @@ def _producer_inventory(index, products, record, producer, task, job, *,
         proof_row = matches[0]
         proof = _original_metadata(index, products,
             dict(path=proof_row["local_path"],sha256=proof_row["sha256"],bytes=proof_row["bytes"]),
-            attempt, machine)
+            attempt, machine, metadata=metadata)
         if (proof.get("complete") is not True or proof.get("all_absent") is not True
                 or proof.get("worker_os_references_closed") is not True
                 or proof.get("run") != task["run"] or proof.get("attempt_id") != token
@@ -335,7 +395,7 @@ def _producer_inventory(index, products, record, producer, task, job, *,
             or not _same_bytes(producer["commit"],record["files"]["commit.json"])
             or producer["manifest"]["sha256"] != record["manifest_sha256"]):
         raise ValueError("Original frame producer fields do not match their actual frame paths")
-    originals = {field: _original_metadata(index,products,producer[field],attempt,machine)
+    originals = {field: _original_metadata(index,products,producer[field],attempt,machine, metadata=metadata)
                  for field in ("manifest","commit","frame_registration","publication","result")}
     commit = originals["commit"]
     _commit(record,commit,task)
@@ -376,10 +436,11 @@ def _terminal(root, run_root, base_task, job, done, reader):
     index_path=_own_asset(root,done["products_index"])
     index=descriptor(index_path)
     _index_root,document,products=_read_index(index)
+    shared_metadata = _SnapshotMetadata(index, _index_root, products)
     if (document["run"] != base_task["run"] or document["attempt_id"] != done["attempt_id"]
             or not _same_bytes(document["job"],descriptor(root/"job.json"))):
         raise ValueError("Published products index belongs to another job/run/attempt")
-    if not _same_bytes(published_metadata_descriptor(index),done["completed"]):
+    if not _same_bytes(shared_metadata.read("completed.json")[0],done["completed"]):
         raise ValueError("Done completion differs from its original shared index")
     actual_task=completed.get("task") or {}
     if (completed.get("complete") is not True or completed.get("worker_references_closed") is not True
@@ -415,10 +476,12 @@ def _terminal(root, run_root, base_task, job, done, reader):
     frame_machines={}
     for record,producer in zip(records,producers):
         frame_machines[record["frame_id"]]=_producer_inventory(index,products,record,producer,
-            base_task,job,current_attempt=current_attempt,current_token=done["attempt_id"],owners=owners)
+            base_task,job,current_attempt=current_attempt,current_token=done["attempt_id"],owners=owners,
+            metadata=shared_metadata)
     for field in ("manifest","table"):
         _original_metadata(index,products,completed[field],current_attempt,owners[done["attempt_id"]],
-                           decode_json=field != "table")
+                           metadata=shared_metadata, decode_json=field != "table")
+    shared_metadata.finish()
     return completed,frame_machines,lineage
 
 
