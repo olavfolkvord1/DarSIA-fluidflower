@@ -198,7 +198,8 @@ class SeriesGeometryWorkspace(QWidget):
         self.rig_class.setMinimumWidth(150)
         controls.addWidget(self.rig_class)
         controls.addSpacing(12)
-        controls.addWidget(QLabel("Reference run"))
+        self.reference_run_label = QLabel("Reference run")
+        controls.addWidget(self.reference_run_label)
         self.reference_run = QComboBox()
         self.reference_run.setToolTip(
             "Run whose raw baseline photograph the layers are drawn on. Native "
@@ -628,7 +629,8 @@ class SeriesGeometryWorkspace(QWidget):
 
         assert self.project is not None
         self._discard_page()
-        view = LayerPainterView(self.project, self.reference)
+        view = LayerPainterView(self.project, self.reference,
+            run_inputs=lambda: self.run_inputs, set_reference=self._set_painting_reference)
         view.rig_panel.set_rig_class(self._rig_class_key)
         view.exported.connect(self._show_export_dialog)
         view.busy_changed.connect(self._view_busy_changed)
@@ -673,6 +675,12 @@ class SeriesGeometryWorkspace(QWidget):
         if not busy and self._loaded_series != self.series_id and self.isVisible():
             # A series chosen on Start while the job ran opens now.
             self.ensure_page()
+
+    def _set_painting_reference(self, run_id: str) -> None:
+        """The explicit reference action; preview selection never reaches it."""
+        index = self.reference_run.findData(run_id)
+        if index >= 0:
+            self.reference_run.setCurrentIndex(index)
 
     @Slot(object)
     def _show_export_dialog(self, export: object) -> None:
@@ -789,6 +797,11 @@ class SeriesGeometryWorkspace(QWidget):
     # ----------------------------------------------------------------- export
 
     def _refresh_actions(self) -> None:
+        painting = (self.simple_view is not None
+                    and self.view_stack.currentWidget() is self.simple_view
+                    and self.pages.currentWidget() is self.page_host)
+        self.reference_run_label.setVisible(not painting)
+        self.reference_run.setVisible(not painting)
         exporting = self._export_thread is not None
         self.export_button.setEnabled(
             self.project is not None and not exporting and self.has_revision()

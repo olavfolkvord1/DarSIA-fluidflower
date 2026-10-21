@@ -1,0 +1,313 @@
+"""One painting run chooser; other runs are automatic, read-only previews."""
+from __future__ import annotations
+
+from copy import deepcopy
+
+import numpy as np
+from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QShortcut
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
+                              QMessageBox, QPushButton, QStackedWidget, QTableWidget,
+                              QTableWidgetItem, QVBoxLayout, QWidget, QAbstractItemView)
+
+from . import layer_painting as lp
+from . import painting_run_preview as preview
+
+_SETTINGS = ("DarSIA", "FluidFlower layer painting")
+_INDEX = "placement/geometry_index"
+_FIRST = "placement/first_runs"
+
+
+class _PreviewWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, project, session, proposal, corrections, frame, options):
+        super().__init__()
+        self.project, self.session, self.proposal = project, session, proposal
+        self.corrections, self.frame, self.options = corrections, frame, options
+
+    @Slot()
+    def run(self):
+        try:
+            record = self.options.get("record")
+            session = self.session
+            if record and record.get("kind") == "drawing":
+                from .layer_painting_version_archive import load_drawing_version
+                session = load_drawing_version(self.project, session.run_id, record)
+                record = None
+                source = "drawing"
+            else:
+                source = self.options["source"]
+            session, layers = preview.preview_layers(session, self.proposal, self.corrections,
+                                                     self.frame, source=source, record=record)
+            result = preview.prepare_preview(session, layers,
+                geometry_index=self.options["index"], target_run=self.options["run"],
+                config=self.options["config"], measure_offsets=True,
+                photo_loader=self.options["photo_loader"], source_name=self.options["name"])
+        except Exception as error:  # reported in the preview, no write fallback
+            self.failed.emit(f"{type(error).__name__}: {error}")
+            return
+        self.finished.emit((result, session))
+
+
+class PaintingRunPreview(QObject):
+    def __init__(self, view, editable_column, canvas_class, *, run_inputs=None, set_reference=None):
+        super().__init__(view)
+        self.view, self.run_inputs, self.set_reference = view, run_inputs, set_reference
+        self.thread = None
+        self.worker = None
+        self._pending = False
+        self.last_result = None
+        self._index = str(QSettings(*_SETTINGS).value(_INDEX, "") or "")
+        self.widget = QWidget()
+        layout = QVBoxLayout(self.widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Run"))
+        self.runs = QComboBox()
+        self.runs.setToolTip("The reference run is editable; other runs show a read-only placed preview")
+        self.previous = QPushButton("Previous")
+        self.next = QPushButton("Next")
+        self.reference_button = QPushButton("Set reference…")
+        self.geometry_button = QPushButton("Frame models…")
+        for widget in (self.runs, self.previous, self.next, self.reference_button, self.geometry_button):
+            row.addWidget(widget)
+        layout.addLayout(row)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Preview"))
+        self.sources = QComboBox()
+        self.sources.setToolTip("Preview an unfinished map, drawing or saved version; no approval is needed")
+        source_row.addWidget(self.sources, 1)
+        self.refresh_button = QPushButton("Refresh preview")
+        source_row.addWidget(self.refresh_button)
+        layout.addLayout(source_row)
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        self.note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.note)
+        self.measurements = QTableWidget(0, 7)
+        self.measurements.setHorizontalHeaderLabels(["Layers", "Median mm", "P10 mm", "P90 mm", "Δ reference mm", "Samples", "Status"])
+        self.measurements.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.measurements.setMaximumHeight(180)
+        self.measurements.hide()
+        layout.addWidget(self.measurements)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(editable_column)
+        self.canvas = canvas_class()
+        self.canvas.set_tool("pan")
+        self.stack.addWidget(self.canvas)
+        layout.addWidget(self.stack, 1)
+        self.runs.currentIndexChanged.connect(self._selected)
+        self.sources.currentIndexChanged.connect(self._source_changed)
+        self.previous.clicked.connect(lambda: self._step(-1))
+        self.next.clicked.connect(lambda: self._step(1))
+        self.geometry_button.clicked.connect(self.choose_geometry)
+        self.reference_button.clicked.connect(self.change_reference)
+        self.refresh_button.clicked.connect(self.request)
+        self.navigation_keys = []
+        for key, direction in (("Alt+Left", -1), ("Alt+Right", 1)):
+            shortcut = QShortcut(key, self.widget)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda step=direction: self._step(step))
+            self.navigation_keys.append(shortcut)
+        self.previous.setToolTip("Previous run (Alt+Left)")
+        self.next.setToolTip("Next run (Alt+Right)")
+
+    def busy(self):
+        return self.thread is not None
+
+    def is_reference(self):
+        session = self.view.session
+        return session is None or str(self.runs.currentData() or "").casefold() == session.run_id.casefold()
+
+    def refresh(self):
+        session = self.view.session
+        reference = session.run_id if session else ""
+        old = str(self.runs.currentData() or reference)
+        try:
+            runs = [row.run_id for row in self.run_inputs()] if self.run_inputs else self.view._series_runs()
+        except (OSError, ValueError, KeyError):
+            runs = []
+        if reference and reference not in runs:
+            runs.insert(0, reference)
+        from .map_placement import review_order
+        first = [part.strip() for part in str(QSettings(*_SETTINGS).value(_FIRST, "") or "").split(",") if part.strip()]
+        runs = review_order(runs, reference, first)
+        self.runs.blockSignals(True)
+        self.runs.clear()
+        for run in runs:
+            self.runs.addItem(run + (" — reference (editable)" if run.casefold() == reference.casefold() else " — read only"), run)
+        self.runs.setCurrentIndex(max(0, self.runs.findData(old)))
+        self.runs.blockSignals(False)
+        self._refresh_sources()
+        self._selected()
+
+    def _refresh_sources(self):
+        old = self.sources.currentData()
+        self.sources.blockSignals(True)
+        self.sources.clear()
+        self.sources.addItem("Current map (drawing if no proposal)", ("map", None))
+        self.sources.addItem("Current drawing", ("drawing", None))
+        for record in reversed(self.view.versions):
+            self.sources.addItem(str(record.get("display_name") or record.get("name") or "Saved version"),
+                                 ("version", dict(record)))
+        index = next((i for i in range(self.sources.count()) if self.sources.itemData(i) == old), 0)
+        self.sources.setCurrentIndex(index)
+        self.sources.blockSignals(False)
+
+    def _step(self, direction):
+        self.runs.setCurrentIndex(max(0, min(self.runs.count()-1, self.runs.currentIndex()+direction)))
+
+    def _selected(self, *_args):
+        reference = self.is_reference()
+        self.stack.setCurrentIndex(0 if reference else 1)
+        self.view.steps_scroll.setEnabled(reference)
+        for shortcut in self.view.findChildren(QShortcut):
+            if shortcut not in self.navigation_keys:
+                shortcut.setEnabled(reference)
+        self.measurements.setVisible(not reference and self.last_result is not None)
+        self.reference_button.setEnabled(not reference and self.set_reference is not None and not self.view.busy())
+        self.previous.setEnabled(self.runs.currentIndex() > 0)
+        self.next.setEnabled(self.runs.currentIndex() < self.runs.count()-1)
+        self.refresh_button.setEnabled(not reference)
+        if reference:
+            self.note.setText("Reference run: editable. Viewing other runs keeps this drawing on its own photograph.")
+        else:
+            self.request()
+
+    def _source_changed(self, *_args):
+        if not self.is_reference():
+            self.request()
+
+    def choose_geometry(self):
+        path, _ = QFileDialog.getOpenFileName(self.view, "Measured frame models (index.json)",
+                                             self._index, "Geometry index (index.json);;JSON (*.json)")
+        if path:
+            self._index = path
+            settings = QSettings(*_SETTINGS)
+            settings.setValue(_INDEX, path)
+            settings.sync()
+            self.request()
+
+    def request(self):
+        if self.is_reference():
+            return
+        if self.thread is not None:
+            self._pending = True
+            return
+        if self.view.busy():
+            self.note.setText("Wait for the current painting operation to finish before previewing another run.")
+            return
+        self.canvas.clear_photo()
+        self.last_result = None
+        self.measurements.setRowCount(0)
+        self.measurements.hide()
+        if not self._index:
+            self.note.setText("Choose Frame models once to preview the map automatically in each run. No approval is needed.")
+            return
+        session = self.view.session
+        if session is None:
+            self.note.setText("Choose a reference run with a drawing first.")
+            return
+        source, record = self.sources.currentData() or ("map", None)
+        if source == "map" and self.view._map_kind() == "manual map":
+            source = "manual"
+        options = {"run": str(self.runs.currentData()), "index": self._index,
+                   "source": source, "record": deepcopy(record), "name": self.sources.currentText(),
+                   "config": deepcopy(self.view._workspace_frame_config),
+                   "photo_loader": self.view._reference_photo_loader()}
+        worker = _PreviewWorker(self.view.project, deepcopy(session),
+                                self.view.proposal, deepcopy(self.view.corrections),
+                                deepcopy(self.view.current_frame()), options)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._finished)
+        worker.failed.connect(self._failed)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(self._retired)
+        self.thread, self.worker = thread, worker
+        self.sources.setEnabled(False)
+        self.reference_button.setEnabled(False)
+        self.note.setText("Placing the preview through this run's measured frame… Read only; no files are written.")
+        thread.start()
+
+    @Slot(object)
+    def _finished(self, value):
+        result, session = value
+        if (result.run_id != str(self.runs.currentData() or "").casefold() or self.is_reference()
+                or self.view.session is None
+                or result.source_run != self.view.session.run_id.casefold()
+                or self._pending):
+            return
+        self.last_result = result
+        self.canvas.set_photo(result.photo, (result.photo.shape[1], result.photo.shape[0]),
+                              token={"path": result.photo_path, "run_id": result.run_id}, reset_view=True)
+        rgba = np.zeros((*result.layers.shape, 4), dtype=np.uint8)
+        for layer in session.layers:
+            color = QColor(layer.color)
+            rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
+        # A gap stays a gap, including edge-replicated pixels the source does
+        # not reach. The overlay never turns those pixels into a decided layer.
+        gaps = result.uncovered | (result.layers == lp.OUTSIDE)
+        rgba[gaps] = (255, 0, 255, 95)
+        self.canvas.set_proposal(rgba)
+        self.canvas.set_overlays_visible(False, True)
+        offsets = result.measurements.get("layer_offsets") or {}
+        rows = offsets.get("boundaries") or []
+        self.measurements.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = (" / ".join(map(str, row["labels"])), row.get("median_mm"), row.get("p10_mm"),
+                      row.get("p90_mm"), row.get("change_from_reference_mm"),
+                      f"{row.get('measured_sample_count', 0)}/{row.get('sample_count', 0)}", row.get("status", ""))
+            for column, value in enumerate(values):
+                self.measurements.setItem(index, column, QTableWidgetItem("—" if value is None else str(value)))
+        self.measurements.resizeColumnsToContents()
+        self.measurements.show()
+        shift = result.measurements.get("offset_px") or {}
+        checks = result.measurements.get("checks") or {}
+        self.note.setText(f"{result.run_id}: {result.source_name} from {result.source_run}, placed through the saved frame models. "
+                          "Read only · no approval, placement receipt or adoption is created. Magenta: unassigned or uncovered. "
+                          f"Displacement: median {shift.get('median_px', '—')} px, maximum {shift.get('max_px', '—')} px. "
+                          f"Uncovered: {checks.get('uncovered_pixels', '—')} px; water pockets: {checks.get('water_pocket_pixels', '—')} px. "
+                          "Boundary offsets use the placement review's descriptive method.")
+
+    @Slot(str)
+    def _failed(self, message):
+        if not self.is_reference():
+            self.canvas.clear_photo()
+            self.note.setText("Preview unavailable: " + message)
+
+    @Slot()
+    def _retired(self):
+        thread = self.thread
+        if thread is not None:
+            thread.wait()
+        # Keep the worker alive until its thread has finished, then drop its
+        # last owned reference here in the GUI thread (the shared worker rule).
+        self.thread = self.worker = None
+        if thread is not None:
+            thread.deleteLater()
+        self.sources.setEnabled(True)
+        self.reference_button.setEnabled(not self.is_reference() and self.set_reference is not None)
+        if self._pending:
+            self._pending = False
+            self.request()
+
+    def wait(self):
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.wait()
+
+    def change_reference(self):
+        if self.is_reference() or self.view.busy() or self.busy() or self.set_reference is None:
+            return
+        old = self.view.session.run_id if self.view.session else ""
+        target = str(self.runs.currentData() or "")
+        answer = QMessageBox.question(self.view, "Set reference run",
+            f"Change the reference from {old} to {target}?\n\nThe drawing on {old} stays on that run's photograph. "
+            f"The drawing belonging to {target} will open; no marks are copied between photographs.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.set_reference(target)

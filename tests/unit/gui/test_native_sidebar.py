@@ -283,7 +283,7 @@ def test_custom_rows_return_to_real_preprocessing_settings(
     assert not window.toolbar_builder.wizard_action.isEnabled()
     # The run selector shows on run pages only; the header line names the
     # series on every page but Start (N141).
-    assert window.run_combo.isVisible() is (category == "geometry_facies")
+    assert window.run_combo.isVisible() is (category == "geometry_facies" and row != "layers")
     assert not window.setup_series_label.isVisible()
     assert window.status_header.line.isVisible() is (category != "start")
     if category == "phase_model":

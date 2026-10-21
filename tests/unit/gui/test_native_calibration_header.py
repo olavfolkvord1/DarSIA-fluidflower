@@ -86,3 +86,32 @@ def test_run_selector_only_on_run_pages_and_no_writes(scope_window, qtbot):
             assert w.status_header.line.text().endswith(" · Whole series (2 runs)"), logical
         assert w.content_stack.currentWidget() is not None
     assert _files(w) == before
+
+
+def test_painting_hides_only_the_global_selector_across_refreshes_and_restores_it(scope_window, qtbot):
+    w = scope_window
+    before = _files(w)
+    selector, selected = w.run_combo, w.run_combo.currentData()
+    for logical, visible in [
+        (("geometry_facies", "layers"), False),
+        (("geometry_facies", "rig_frame"), True),
+        (("geometry_facies", "layers"), False),
+        (("geometry_facies", "export"), True),
+        (("preprocessing", "protocols"), True),
+        (("geometry_facies", "layers"), False),
+        (("calibration", "color"), True),
+        (("geometry_facies", "layers"), False),
+    ]:
+        w._select_row(logical)
+        # Both refresh routes run during navigation and config updates. They
+        # must not bring back a second chooser while painting is selected.
+        for _ in range(3):
+            w.status_header.refresh()
+            w._refresh_scope_display()
+            qtbot.wait(1)
+        assert w.run_combo is selector and w.run_combo.currentData() == selected
+        assert w.series_header.isVisible() is visible, logical
+        for widget in (w.run_label, w.run_combo, w.run_path):
+            assert widget.isVisible() is visible, logical
+        assert w.status_header.line.isVisible(), logical
+    assert _files(w) == before

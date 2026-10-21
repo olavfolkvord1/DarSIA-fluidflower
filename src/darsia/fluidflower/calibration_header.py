@@ -111,7 +111,10 @@ class NativeStatusHeader:
                 if not widget.isHidden() and widget.text()
             )
         )
-        run_page = scope is None or scope.run_selector_enabled
+        # Painting has its own run chooser. The native configuration selector
+        # does not control that page; keep the other pages' scope unchanged.
+        painting = getattr(w, "_last_sidebar_selection", None) == ("geometry_facies", "layers")
+        run_page = (scope is None or scope.run_selector_enabled) and not painting
         w.setup_series_label.hide()
         w._set_run_controls_visible(run_page)
         w.series_header.setVisible(run_page)

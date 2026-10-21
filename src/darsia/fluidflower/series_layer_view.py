@@ -3292,6 +3292,9 @@ class LayerPainterView(QWidget):
         project: Any,
         reference: Callable[[], SeriesRunInputs | None],
         parent: QWidget | None = None,
+        *,
+        run_inputs: Callable[[], Sequence[SeriesRunInputs]] | None = None,
+        set_reference: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("seriesLayerView")
@@ -3428,7 +3431,10 @@ class LayerPainterView(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_steps())
-        splitter.addWidget(self._build_canvas_column())
+        from darsia.fluidflower.painting_run_preview_ui import PaintingRunPreview
+        self.run_preview = PaintingRunPreview(self, self._build_canvas_column(), LayerCanvas,
+            run_inputs=run_inputs, set_reference=set_reference)
+        splitter.addWidget(self.run_preview.widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([580, 1020])
@@ -4287,6 +4293,7 @@ class LayerPainterView(QWidget):
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
+        self.run_preview.wait()
         dialog_thread = getattr(self._adoption_dialog, "_thread", None)
         for thread in (
             self._proposal_thread,
@@ -4429,6 +4436,7 @@ class LayerPainterView(QWidget):
             self._refresh_manual_status()
         finally:
             self._loading = False
+            self.run_preview.refresh()
 
     def _load_reference_photo(self, reference: SeriesRunInputs) -> None:
         assert reference.baseline_image is not None
@@ -5908,7 +5916,7 @@ class LayerPainterView(QWidget):
             self.canvas_hint.setText(_CANVAS_HINT)
 
     def undo(self) -> None:
-        if self.session is None:
+        if self.session is None or not self.run_preview.is_reference():
             return
         if self.canvas.drafting():
             self.canvas.remove_last_point()
@@ -5923,7 +5931,7 @@ class LayerPainterView(QWidget):
         self._after_restore(current, snapshot)
 
     def redo(self) -> None:
-        if self.session is None or not self._redo_stack:
+        if self.session is None or not self._redo_stack or not self.run_preview.is_reference():
             return
         current, snapshot = self._snapshot(), self._redo_stack.pop()
         if snapshot[0] != current[0]:
@@ -6212,6 +6220,8 @@ class LayerPainterView(QWidget):
         self.place_version_button.setEnabled(self._placeable(self._selected_version()))
         self.prepare_adoption_button.setEnabled(self._placeable(self._selected_version()))
         self._refresh_map_status()
+        if hasattr(self, "run_preview"):
+            self.run_preview._refresh_sources()
 
     def _refresh_map_status(self) -> None:
         """Say in step 4 whether the map to be saved is the approved version."""
