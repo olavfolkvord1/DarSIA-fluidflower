@@ -21,6 +21,10 @@ _INDEX = "placement/geometry_index"
 _FIRST = "placement/first_runs"
 
 
+def _plain_error(error):
+    return str(error) if isinstance(error, ValueError) else f"{type(error).__name__}: {error}"
+
+
 class _PreviewWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -47,6 +51,17 @@ class _PreviewWorker(QObject):
                 source = "drawing"
             else:
                 source = self.options["source"]
+            source_name = self.options["name"]
+            if record is None and source == "manual":
+                source_name = "Current manual map"
+            elif record is None and source == "map" and self.proposal is not None:
+                from . import layer_painting_polygons_only as polygons
+
+                # Only the current-map convenience choice may use today's
+                # drawing. Explicit saved versions retain their strict proof.
+                if not polygons.proposal_current(self.proposal, session, self.frame):
+                    source = "manual"
+                    source_name = "Current manual map (the proposal is out of date)"
             session, layers = preview.preview_layers(session, self.proposal, self.corrections,
                                                      self.frame, source=source, record=record)
             def partial(value):
@@ -56,12 +71,12 @@ class _PreviewWorker(QObject):
             result = preview.prepare_preview(session, layers,
                 geometry_index=self.options["index"], target_run=self.options["run"],
                 config=self.options["config"], measure_offsets=True,
-                photo_loader=self.options["photo_loader"], source_name=self.options["name"],
+                photo_loader=self.options["photo_loader"], source_name=source_name,
                 on_progress=self.progress.emit,
                 on_preview=partial)
             frame_models.verify_frame_model_selection(self.options.get("geometry_selection"))
         except Exception as error:  # reported in the preview, no write fallback
-            self.error = f"{type(error).__name__}: {error}"
+            self.error = _plain_error(error)
             self.failed.emit(self.error)
             return
         self.result = result, session
@@ -324,7 +339,7 @@ class PaintingRunPreview(QObject):
         old = self.sources.currentData()
         self.sources.blockSignals(True)
         self.sources.clear()
-        self.sources.addItem("Current map (drawing if no proposal)", ("map", None))
+        self.sources.addItem("Current map (drawing when needed)", ("map", None))
         self.sources.addItem("Current drawing", ("drawing", None))
         for record in reversed(self.view.versions):
             self.sources.addItem(str(record.get("display_name") or record.get("name") or "Saved version"),
@@ -429,7 +444,7 @@ class PaintingRunPreview(QObject):
                                     self.view.proposal, deepcopy(self.view.corrections),
                                     deepcopy(self.view.current_frame()), options)
         except Exception as error:
-            self._status(f"Preview unavailable: {type(error).__name__}: {error}")
+            self._status(f"Preview unavailable: {_plain_error(error)}")
             return
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -467,7 +482,7 @@ class PaintingRunPreview(QObject):
                 raise ValueError("The preview result belongs to another selected photograph")
             self._render_result(result, session)
         except Exception as error:
-            self._failed(f"Could not display the preview: {type(error).__name__}: {error}")
+            self._failed(f"Could not display the preview: {_plain_error(error)}")
             return
         self.last_result = result
         self._last_session = session
@@ -538,7 +553,7 @@ class PaintingRunPreview(QObject):
         try:
             self._render_overlay(result, session)
         except Exception as error:
-            self._status(self.note.text() + f" Display colours unavailable: {type(error).__name__}: {error}",
+            self._status(self.note.text() + f" Display colours unavailable: {_plain_error(error)}",
                          loading=self._loading_status)
 
     @Slot(str)

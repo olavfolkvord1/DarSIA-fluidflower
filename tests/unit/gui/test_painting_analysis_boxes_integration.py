@@ -23,6 +23,8 @@ from darsia.fluidflower.map_placement import GEOMETRY_FORMAT
 from darsia.fluidflower.series_geometry import SeriesRunInputs
 from darsia.fluidflower.series_layer_view import LayerPainterView
 
+from .test_native_sidebar import native_window  # noqa: F401
+
 
 class _Project:
     def __init__(self, root, series):
@@ -258,13 +260,9 @@ def test_busy_metadata_blocks_parent_close_and_wait_joins_without_gui_quit_depen
     window = QWidget()
     qtbot.addWidget(window)
     layout = QVBoxLayout(window)
-    old_button = QPushButton("Analysis boxes [mm]…", window)
-    layout.addWidget(old_button)
     layout.addWidget(view)
-    window.metric_boxes_workflow = SimpleNamespace(workspace=SimpleNamespace(simple_view=view), button=old_button)
     window.show()
     qtbot.waitExposed(window)
-    assert not old_button.isVisible()
     started, release = threading.Event(), threading.Event()
     original = source_module.load_legacy_box_source
     def held(*args, **kwargs):
@@ -282,10 +280,36 @@ def test_busy_metadata_blocks_parent_close_and_wait_joins_without_gui_quit_depen
         assert not event.isAccepted() and window.isVisible()
     finally:
         release.set()
+    # No GUI event processing between releasing the real metadata worker and
+    # joining it: thread retirement must not depend on a queued GUI quit.
     view.wait_for_workers()
     assert not view.analysis_boxes.busy() and view.can_close()
-    view.hide()
-    assert old_button.isVisible()
+    assert view.analysis_boxes._thread is None and view.analysis_boxes._worker is None
+    window.close()
+    assert not window.isVisible()
+
+
+
+def test_native_window_has_one_inline_box_route_and_retains_legacy_import(native_window, tmp_path):
+    # native_window installs global private INI format/UserScope and empty
+    # project/series registries BEFORE constructing the actual main window.
+    # The isolated launcher may additionally redirect default constructors to
+    # its own private INI root. This explicit probe stays in this fixture root.
+    settings = QSettings(str(tmp_path / "native-window-proof.ini"), QSettings.Format.IniFormat)
+    settings.setFallbacksEnabled(False)
+    assert settings.format() == QSettings.Format.IniFormat
+    assert settings.scope() == QSettings.Scope.UserScope
+    assert Path(settings.fileName()) == tmp_path / "native-window-proof.ini"
+    assert not settings.fallbacksEnabled()
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    from darsia.fluidflower.metric_analysis_domains_ui import NativeMetricBoxesWorkflow
+
+    assert isinstance(NativeMetricBoxesWorkflow, type), "The compatibility import must remain available"
+    assert not hasattr(native_window, "metric_boxes_workflow")
+    assert not any(button.text().startswith("Analysis boxes [mm]")
+                   for button in native_window.findChildren(QPushButton))
+    assert not hasattr(LayerPainterView, "_show_separate_box_button")
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 
 
 def test_other_photo_and_late_canvas_destruction_cannot_leave_box_interception_active(context):
@@ -392,7 +416,8 @@ def test_saved_user_index_enables_draw_at_actual_view_start_without_picker(conte
 def test_empty_cached_index_recovers_saved_user_choice_on_reference_reload_without_picker(context, qtbot):
     view, boxes = context.view, context.view.analysis_boxes
     assert view.run_preview._index == "" and not boxes.draw_button.isEnabled()
-    assert "user settings" in boxes.note.text() and "Box actions" in boxes.note.text()
+    assert "series has no measured frame models" in boxes.note.text()
+    assert "Frame models" in boxes.note.text()
     before = _files(context)
     context.user_settings.setValue(preview_ui._INDEX, str(context.index))
     context.user_settings.sync()

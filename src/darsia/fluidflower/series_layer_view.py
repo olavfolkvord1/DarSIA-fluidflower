@@ -5217,7 +5217,6 @@ class LayerPainterView(QWidget):
         boxes = getattr(self, "analysis_boxes", None)
         if boxes is not None:
             boxes.set_mode(None)
-        self._show_separate_box_button(True)
         self.save_session()
         super().hideEvent(event)
 
@@ -5237,7 +5236,6 @@ class LayerPainterView(QWidget):
                 self._analysis_boxes_window.removeEventFilter(self)
             self._analysis_boxes_window = window
             window.installEventFilter(self)
-        self._show_separate_box_button(False)
         self._sync_analysis_boxes()
 
     def can_close(self) -> bool:
@@ -5263,17 +5261,6 @@ class LayerPainterView(QWidget):
         self._analysis_boxes_closed = True
         self._analysis_boxes_preview_items = []
 
-    def _show_separate_box_button(self, visible):
-        boxes = getattr(self, "analysis_boxes", None)
-        if self._analysis_boxes_closed or boxes is None or not boxes._alive():
-            return
-        workflow = getattr(self.window(), "metric_boxes_workflow", None)
-        workspace = getattr(workflow, "workspace", None)
-        button = getattr(workflow, "button", None)
-        if (button is not None and isValid(button) and workspace is not None
-                and getattr(workspace, "simple_view", None) is self):
-            button.setVisible(bool(visible))
-
     def _sync_analysis_boxes(self, *_args, force=False):
         boxes = getattr(self, "analysis_boxes", None)
         if (self._waiting_for_workers or self._analysis_boxes_closed or self._analysis_boxes_syncing or boxes is None
@@ -5283,7 +5270,6 @@ class LayerPainterView(QWidget):
         try:
             boxes.refresh()
             self._refresh_analysis_box_preview()
-            self._show_separate_box_button(not self.isVisible())
             if self._loading or self.session is None or self.image is None:
                 return
             reference = self.reference()  # GUI getter: capture before starting the worker.
