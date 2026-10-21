@@ -996,6 +996,8 @@ class JobsPanel(QWidget):
     workers_selected = Signal(object)
     error_reported = Signal(str)
     new_analysis_requested = Signal()
+    raw_model_requested = Signal()
+    raw_review_registered = Signal(object)
 
     def __init__(
         self,
@@ -1015,6 +1017,8 @@ class JobsPanel(QWidget):
         control_publisher=None,
         local_stores_path_provider=None,
         raw_review_runner=None,
+        raw_review_model_provider=None,
+        raw_review_registrar=None,
     ):
         super().__init__(parent)
         self.jobs_provider, self.plans_provider, self.machines_provider = (
@@ -1056,6 +1060,8 @@ class JobsPanel(QWidget):
         self.new_analysis = None
         self._target_borrower = None
         self._raw_review_runner = raw_review_runner
+        self._raw_review_model_provider = raw_review_model_provider
+        self._raw_review_registrar = raw_review_registrar
         self._raw_review_seen = {}
         self._raw_review_observed = set()
         self._raw_review_queued = set()
@@ -1113,6 +1119,9 @@ class JobsPanel(QWidget):
         self.raw_review_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         files_layout.insertWidget(0, self.raw_review_button)
         files_layout.insertWidget(1, self.raw_review_status)
+        self.raw_review_attach_button = QPushButton("Attach RAW review to selected model")
+        self.raw_review_attach_button.clicked.connect(self.attach_raw_review)
+        files_layout.insertWidget(1, self.raw_review_attach_button)
         controls = QHBoxLayout()
         self.backend_combo, self.workers_spin = QComboBox(), QSpinBox()
         self.backend_combo.addItem("CPU", "cpu")
@@ -1489,12 +1498,63 @@ class JobsPanel(QWidget):
         reason = (self.current or {}).get("raw_review_reason") or (
             "This action needs a completed run with verified final publications and this series' declared RAW acquisition preparations.")
         self.raw_review_button.setEnabled(eligible and root not in self._raw_review_queued)
+        self.raw_review_attach_button.setEnabled(
+            eligible and self._raw_review_thread is None and not self._raw_review_pending)
+        self.raw_review_attach_button.setToolTip(
+            "Attach already prepared RAW photographs and published phase maps to the exact model selected in Phase model → Basis."
+            if eligible else reason)
         self.raw_review_button.setToolTip(
             "Use the original RAW acquisition preparations to prepare this finished job's review images."
             if eligible else reason)
         self.raw_review_status.setText(self._raw_review_results.get(root,
             "Choose Prepare RAW review for an already completed job. With the GUI closed, run the same saved post-run request explicitly."
             if eligible else reason))
+
+    def attach_raw_review(self):
+        """Bind the original predictions only after an explicit model choice."""
+        if self._raw_review_thread is not None or self._raw_review_pending:
+            self.raw_review_status.setText("Wait for the current RAW review operation to finish before attaching a model.")
+            return
+        if not self._raw_review_eligible(self.current):
+            self.raw_review_status.setText((self.current or {}).get("raw_review_reason") or
+                "Prepare a completed run's RAW review before attaching it to a model.")
+            return
+        try:
+            model = self._raw_review_model_provider() if self._raw_review_model_provider else None
+        except Exception as error:
+            self.raw_review_status.setText("Could not read the selected model: " + str(error))
+            return
+        if not model or not model.get("root"):
+            self.raw_review_status.setText("Choose the original saved model in Phase model → Basis, then attach this review.")
+            self.raw_model_requested.emit()
+            return
+        root, series_root, model_root = self.current["root"], self.series_root, model["root"]
+        if root in self._raw_review_queued:
+            return
+        registrar = self._raw_review_registrar
+        def register():
+            from .raw_review_postrun import default_output
+            from .raw_production_review import register_review
+            try:
+                completion = default_output(root, series_root) / "postrun_completed.json"
+                binding = (registrar or register_review)(completion, model_root)
+                return dict(root=root, complete=True, binding=binding,
+                    text="RAW review attached to the selected model. Open Review and label in Phase model; scientific acceptance remains separate.")
+            except Exception as error:
+                return dict(root=root, complete=False,
+                    text="RAW review was not attached: " + str(error))
+        self._raw_review_queued.add(root)
+        self._raw_review_active = dict(root=root)
+        self._raw_review_results[root] = "Checking the original prediction and model bindings before attaching this RAW review."
+        self._raw_review_thread, self._raw_review_worker = self._start_call(
+            register, self._raw_review_registration_ready, self._raw_review_closed)
+        self._show_raw_review_state()
+
+    @Slot(object)
+    def _raw_review_registration_ready(self, value):
+        self._raw_review_ready(value)
+        if value.get("complete") and value.get("binding"):
+            self.raw_review_registered.emit(value["binding"])
 
 
     @Slot()

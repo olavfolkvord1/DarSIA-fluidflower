@@ -2158,14 +2158,28 @@ class NativeFluidFlowerMainWindow(MainWindow):
             from darsia.fluidflower.resource_advisor_panel import ResourceAdvisorPanel
 
             self.jobs_workspace = NativeJobsWorkspace(
-                self, resource_factory=ResourceAdvisorPanel
+                self, resource_factory=ResourceAdvisorPanel,
+                raw_review_model_provider=self._selected_jobs_review_model,
             )
             self.jobs_workspace.new_analysis_requested.connect(
                 lambda: self._select_row(("jobs", "new_analysis"))
             )
+            self.jobs_workspace.raw_model_requested.connect(self.show_phase_model_workflow)
+            self.jobs_workspace.raw_review_registered.connect(self._jobs_review_registered)
             self.content_stack.addWidget(self.jobs_workspace)
         self._refresh_jobs_context()
         return self.jobs_workspace
+
+    def _selected_jobs_review_model(self):
+        page = getattr(self.phase_model_workspace, "studio_page", None)
+        studio = getattr(page, "studio", None)
+        return studio._selected_validation_model() if studio is not None else None
+
+    def _jobs_review_registered(self, _binding):
+        page = getattr(self.phase_model_workspace, "studio_page", None)
+        studio = getattr(page, "studio", None)
+        if studio is not None:
+            studio._request_async_model_refresh(bindings_only=True)
 
     def show_jobs(self, *, start_analysis: bool = False) -> None:
         """Open Jobs, or New analysis, which replaces the start dialog (N141)."""

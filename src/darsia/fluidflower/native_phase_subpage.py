@@ -30,6 +30,8 @@ class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
         self._retry_button.hide()
         self._placeholder.setText("Opening the phase-model steps…")
         try:
+            from darsia.fluidflower.raw_production_review import install_readers
+            install_readers()
             from darsia.fluidflower.ui.model_training import (
                 SharedPhaseModelTrainingPage,
             )

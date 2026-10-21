@@ -12426,6 +12426,8 @@ def build_review_model(
 
 @saved_reader_ui_entrypoint
 def main(argv: Sequence[str] | None = None) -> int:
+    from darsia.fluidflower.raw_production_review import install_readers
+    install_readers()
     args = build_parser().parse_args(argv)
     if args.online or args.review_surface == "blind_gas_validation":
         args.offline_bundle = None

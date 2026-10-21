@@ -34,6 +34,8 @@ class NativeJobsWorkspace(QWidget):
     """
 
     new_analysis_requested = Signal()
+    raw_model_requested = Signal()
+    raw_review_registered = Signal(object)
 
     def __init__(
         self,
@@ -51,6 +53,7 @@ class NativeJobsWorkspace(QWidget):
         inventory_provider=None,
         resource_factory=None,
         store_panel_factory=StoreAvailabilityPanel,
+        raw_review_model_provider=None,
     ):
         super().__init__(parent)
         default = (
@@ -115,7 +118,10 @@ class NativeJobsWorkspace(QWidget):
             remote_launcher=remote_launcher,
             known_jobs_provider=self.registry.known_jobs,
             local_stores_path_provider=lambda: self.stores.path,
+            raw_review_model_provider=raw_review_model_provider,
         )
+        self.panel.raw_model_requested.connect(self.raw_model_requested)
+        self.panel.raw_review_registered.connect(self.raw_review_registered)
         self.resources = None
         if resource_factory is not None:
             self.attach_resources(

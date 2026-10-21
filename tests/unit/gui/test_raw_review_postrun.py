@@ -706,3 +706,60 @@ def test_declared_preparation_byte_identity_is_checked_before_request_write(fini
     with pytest.raises(ValueError, match="declared RAW acquisition preparation changed"):
         post.build_request(data.root, data.store_file, [declared], data.output, series_root=data.series_root)
     assert not data.output.exists() and not post.request_path(data.root).exists()
+
+
+def test_attach_review_routes_to_basis_when_no_model_is_selected(qtbot):
+    widget = gui.JobsPanel(raw_review_model_provider=lambda: None)
+    qtbot.addWidget(widget)
+    widget.current = _snapshot(True)
+    with qtbot.waitSignal(widget.raw_model_requested, timeout=1000):
+        widget.attach_raw_review()
+    assert "Phase model" in widget.raw_review_status.text() and widget.can_close()
+
+
+def test_attach_review_registers_the_explicit_model_off_the_gui_thread(finished_inputs, qtbot):
+    data = finished_inputs
+    calls, bindings = [], []
+    def register(completion, model):
+        calls.append((completion, model, threading.get_ident()))
+        return dict(combined_root="registered-collection", selected_candidates={"run-a": "saved-predictions"})
+    widget = gui.JobsPanel(raw_review_model_provider=lambda: {"root": "chosen-model"},
+                           raw_review_registrar=register)
+    qtbot.addWidget(widget, before_close_func=lambda value: qtbot.waitUntil(value.can_close, timeout=10000))
+    widget.series_root = data.series_root
+    widget.current = _snapshot(True, root=str(data.root))
+    widget.raw_review_registered.connect(bindings.append)
+    main_thread = threading.get_ident()
+    widget.attach_raw_review()
+    qtbot.waitUntil(lambda: widget.can_close() and bool(bindings), timeout=10000)
+    assert calls[0][0] == post.default_output(data.root, data.series_root) / "postrun_completed.json"
+    assert calls[0][1] == "chosen-model" and calls[0][2] != main_thread
+    assert bindings[0]["combined_root"] == "registered-collection"
+    assert "scientific acceptance remains separate" in widget.raw_review_status.text()
+
+
+def test_attach_review_origin_failure_is_visible_and_releases_the_thread(finished_inputs, qtbot):
+    def register(*_args):
+        raise ValueError("Production uses multiple model origins")
+    widget = gui.JobsPanel(raw_review_model_provider=lambda: {"root": "chosen-model"},
+                           raw_review_registrar=register)
+    qtbot.addWidget(widget, before_close_func=lambda value: qtbot.waitUntil(value.can_close, timeout=10000))
+    widget.series_root = finished_inputs.series_root
+    widget.current = _snapshot(True, root=str(finished_inputs.root))
+    widget.attach_raw_review()
+    qtbot.waitUntil(widget.can_close, timeout=10000)
+    assert "multiple model origins" in widget.raw_review_status.text()
+    assert widget._raw_review_worker is None and widget.raw_review_attach_button.isEnabled()
+
+
+def test_cli_uses_declared_preparations_when_no_picker_paths_are_given(finished_inputs, monkeypatch):
+    import toml
+    data = finished_inputs
+    declaration = dict(series_id=data.job.series_id,
+        raw_review=dict(preparations={data.job.runs[0]: data.preparation}))
+    (data.series_root / "series.toml").write_text(toml.dumps(declaration), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(post, "prepare_and_run", lambda *args, **kwargs: calls.append((args, kwargs)) or {"complete": True})
+    assert post.main(["--job-root", str(data.root), "--stores", str(data.store_file),
+                      "--series-root", str(data.series_root)]) == 0
+    assert calls[0][0][2] == [data.preparation]
