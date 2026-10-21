@@ -394,6 +394,10 @@ class NativePhaseSteps(QWidget):
         self.import_button = QPushButton("Import existing model…")
         self.import_button.clicked.connect(self._import_model)
         self.layouts[2].addWidget(self.import_button)
+        self.organise_button = QPushButton("Organise phase-model files…")
+        self.organise_button.clicked.connect(self._organise_phase_files)
+        self.layouts[2].addWidget(self.organise_button)
+        self._layout_dialog = None
         _move(studio.validation_model_summary, self.layouts[2])
         self.basis_note = QLabel()
         self.basis_note.setWordWrap(True)
@@ -677,6 +681,10 @@ class NativePhaseSteps(QWidget):
         self.import_button.setEnabled(self._ready)
         self.import_button.setToolTip("Import an existing saved model." if self._ready
             else "Complete and save Image normalisation before importing a model.")
+        organise = self.series_root is not None and bool(str(self.series_id or "").strip())
+        self.organise_button.setEnabled(organise)
+        self.organise_button.setToolTip("Preview exact copies into PhaseModel/Annotations and Model. Original files and the selected model are preserved."
+            if organise else "Choose a series to organise its phase-model files.")
         if self.method_panel is not None:
             self.method_panel._update_controls()
         mode = "existing" if self.existing_basis.isChecked() else "scratch"
@@ -835,6 +843,40 @@ class NativePhaseSteps(QWidget):
             self._ready or getattr(selection, "active", "") == "colour_path"
         ):
             return self.method_use(selection)
+
+    def can_close(self):
+        dialog = getattr(self, "_layout_dialog", None)
+        return dialog is None or dialog.can_close()
+
+    def _organise_phase_files(self):
+        if self.series_root is None or not str(self.series_id or "").strip():
+            return
+        from .phase_model_layout_dialog import PhaseModelLayoutDialog
+        if self._layout_dialog is not None and self._layout_dialog.isVisible():
+            self._layout_dialog.raise_()
+            self._layout_dialog.activateWindow()
+            return
+        original_root = self.series_root
+        self._layout_dialog = PhaseModelLayoutDialog(original_root, self)
+        self._layout_dialog.locations_changed.connect(lambda: self._phase_locations_changed(original_root))
+        self._layout_dialog.show()
+
+    def _phase_locations_changed(self, original_root):
+        # A background copy retains its original series even if the user opens
+        # another one. Never apply that series' model preference to the new page.
+        if self.series_root != original_root:
+            return
+        from .review_storage import resolve_review_path
+        selected = dict(self.studio._selected_validation_model() or {})
+        self.studio._sync_default_model_libraries()
+        if selected.get("root"):
+            relocated = resolve_review_path(selected["root"])
+            self.studio.set_saved_model_preference(relocated, context_key=(
+                "storage-layout", str(original_root), str(selected["root"]),
+                str(selected.get("version_sha256") or "")))
+        else:
+            self.studio._request_async_model_refresh()
+        self.refresh()
 
     def _import_model(self):
         if not self._ready or self.series_root is None:

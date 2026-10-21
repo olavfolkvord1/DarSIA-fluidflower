@@ -2177,6 +2177,13 @@ class NativeFluidFlowerMainWindow(MainWindow):
         return status_line(series or "No series selected", self._method_line_parts, "")
 
     def closeEvent(self, event) -> None:
+        page = getattr(getattr(self, "phase_model_workspace", None), "studio_page", None)
+        steps = getattr(page, "native_steps", None)
+        can_close = getattr(steps, "can_close", None)
+        if callable(can_close) and not can_close():
+            self.print_log("Phase-model file preview or copying is still finishing; close after it returns.")
+            event.ignore()
+            return
         jobs = getattr(self, "jobs_workspace", None)
         if jobs is not None and not jobs.can_close():
             self.print_log("Job metadata or hardware inspection is still finishing; close after it returns. No worker was stopped.")
