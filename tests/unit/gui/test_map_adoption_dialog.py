@@ -6,6 +6,8 @@ is chosen for the user; Check validates as the store will; Save appends a
 revision only after the question. Temporary folders only.
 """
 
+import threading
+
 from PySide6.QtWidgets import QMessageBox
 
 from darsia.fluidflower import geometry_facies as geometry
@@ -25,6 +27,15 @@ def _choose(dialog, value, facies_id):
 def test_the_facies_table_is_chosen_checked_and_saved(qtbot, registered_setup, tmp_path, monkeypatch):
     data = registered_setup
     prepared = _prepare(data, tmp_path)
+    # Every whole-revision validation runs off the GUI thread.
+    on_gui_thread = []
+    validate = geometry.validate_geometry_config
+
+    def spy(config):
+        on_gui_thread.append(threading.current_thread() is threading.main_thread())
+        return validate(config)
+
+    monkeypatch.setattr(geometry, "validate_geometry_config", spy)
     dialog = AdoptionDialog(data.project, prepared["folder"], actor="synthetic owner")
     qtbot.addWidget(dialog)
     assert dialog.values == [5, 6]
@@ -37,7 +48,10 @@ def test_the_facies_table_is_chosen_checked_and_saved(qtbot, registered_setup, t
     assert not dialog.check_button.isEnabled()
     _choose(dialog, 6, 2)
     assert dialog.check_button.isEnabled()
-    assert dialog.check() and "Ready to save: 2 runs and 2 regions" in dialog.status.text()
+    assert dialog.check()
+    assert not dialog.check() and dialog.busy()  # One worker at a time.
+    qtbot.waitUntil(lambda: not dialog.busy(), timeout=30000)
+    assert "Ready to save: 2 runs and 2 regions" in dialog.status.text()
     assert dialog.save_button.isEnabled()
     before = geometry.GeometryRevisionStore(data.project).current()["revision_id"]
     asked = []
@@ -58,6 +72,7 @@ def test_the_facies_table_is_chosen_checked_and_saved(qtbot, registered_setup, t
     assert "Saved revision" in dialog.status.text()
     # One save per window.
     assert not dialog.check_button.isEnabled() and not dialog.save_button.isEnabled()
+    assert on_gui_thread and not any(on_gui_thread)
 
 
 def test_a_revision_that_does_not_validate_is_said_and_not_saved(qtbot, registered_setup, tmp_path):
@@ -65,9 +80,11 @@ def test_a_revision_that_does_not_validate_is_said_and_not_saved(qtbot, register
     prepared = _prepare(data, tmp_path, approval="b" * 64)
     dialog = AdoptionDialog(data.project, prepared["folder"], actor="synthetic owner")
     qtbot.addWidget(dialog)
+    assert not dialog.check() and "every label" in dialog.status.text()
     _choose(dialog, 5, 1)
     _choose(dialog, 6, 2)
-    assert not dialog.check()
+    assert dialog.check()
+    qtbot.waitUntil(lambda: not dialog.busy(), timeout=30000)
     assert "does not validate" in dialog.status.text() and "approval" in dialog.status.text()
     assert not dialog.save_button.isEnabled() and not dialog.save()
 

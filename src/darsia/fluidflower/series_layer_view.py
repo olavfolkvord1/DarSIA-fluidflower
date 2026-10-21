@@ -5921,7 +5921,8 @@ class LayerPainterView(QWidget):
         """The label grid the adopted maps take, for every run: the imported
         parent's labels of the current geometry revision (their DarSIA
         metadata, shape and file binding), as the store's registered runs
-        keep it; None when the revision has no imported parent."""
+        keep it; None when the revision has no imported parent. The files
+        are read on first use, in the worker that prepares the adoption."""
 
         from darsia.fluidflower.geometry_facies import (
             GeometryRevisionStore,
@@ -5930,22 +5931,31 @@ class LayerPainterView(QWidget):
         )
         from darsia.fluidflower.geometry_raster_sources import descriptor
 
-        try:
-            config = GeometryRevisionStore(self.project).current().get("configuration") or {}
-            parent = (config.get("canonical_import_parent") or {}).get("imported_configuration") or {}
-            text = str(parent.get("labels_path") or "")
-            grid = (
-                {
-                    "metadata": _darsia_metadata(Path(text)),
-                    "shape_hw": list(_load_array(Path(text)).shape),
-                    "source": descriptor(text),
-                }
-                if text and Path(text).is_file()
-                else None
-            )
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            grid = None
-        return lambda run: grid
+        project = self.project
+        cache: dict[str, Any] = {}
+
+        def lookup(run: str) -> dict[str, Any] | None:
+            if "grid" not in cache:
+                try:
+                    config = GeometryRevisionStore(project).current().get("configuration") or {}
+                    parent = (config.get("canonical_import_parent") or {}).get(
+                        "imported_configuration"
+                    ) or {}
+                    text = str(parent.get("labels_path") or "")
+                    cache["grid"] = (
+                        {
+                            "metadata": _darsia_metadata(Path(text)),
+                            "shape_hw": list(_load_array(Path(text)).shape),
+                            "source": descriptor(text),
+                        }
+                        if text and Path(text).is_file()
+                        else None
+                    )
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    cache["grid"] = None
+            return cache["grid"]
+
+        return lookup
 
     def _adopt_clicked(self) -> None:
         """Choose a preparation's index.json and open its adoption window."""

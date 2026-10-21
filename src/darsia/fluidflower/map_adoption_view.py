@@ -5,14 +5,16 @@ and role, and asks for each label's facies id in the series' full facies
 table: the facies table of the map. None is filled in for the user.
 "Check" builds the revision candidate and validates it as the Store will;
 "Save revision…" asks once and then saves it with the existing geometry
-revision store, in a worker thread. The new revision is appended; the
-previous one stays.
+revision store. Both read every run's files and run in a worker thread,
+never on the GUI thread. The new revision is appended; the previous one
+stays.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -33,6 +35,41 @@ from PySide6.QtWidgets import (
 from darsia.fluidflower import map_adoption as ma
 
 _COLUMNS = ("Label", "Layer", "Facies in the map", "Role", "Facies id in the series' table")
+
+
+class _CheckWorker(QObject):
+    """Build the revision candidate and validate it as the Store will."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, current: Mapping[str, Any], folder: Path, facies_ids: Mapping[int, int]) -> None:
+        super().__init__()
+        self.current, self.folder, self.facies_ids = dict(current), Path(folder), dict(facies_ids)
+
+    @Slot()
+    def run(self) -> None:
+        from darsia.fluidflower.geometry_facies import validate_geometry_config
+
+        start = time.monotonic()
+        try:
+            candidate, summary = ma.adoption_candidate(self.current, self.folder, self.facies_ids)
+            report = validate_geometry_config(candidate)
+        except (OSError, ValueError, KeyError) as error:
+            self.failed.emit(str(error))
+            return
+        errors = [
+            str(issue.get("message")) for issue in report.get("issues") or []
+            if issue.get("severity") == "error"
+        ]
+        self.finished.emit(
+            {
+                "candidate": candidate,
+                "summary": summary,
+                "errors": errors,
+                "seconds": time.monotonic() - start,
+            }
+        )
 
 
 class _SaveRevisionWorker(QObject):
@@ -137,7 +174,7 @@ class AdoptionDialog(QDialog):
         layout.addWidget(self.status)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         self.check_button = buttons.addButton("Check", QDialogButtonBox.ButtonRole.ActionRole)
-        self.check_button.clicked.connect(self.check)
+        self.check_button.clicked.connect(lambda: self.check())
         self.save_button = buttons.addButton("Save revision…", QDialogButtonBox.ButtonRole.ActionRole)
         self.save_button.clicked.connect(self._save_clicked)
         buttons.rejected.connect(self.reject)
@@ -155,41 +192,66 @@ class AdoptionDialog(QDialog):
 
     def _choice_changed(self, *_args: Any) -> None:
         self.candidate = None
-        self.save_button.setEnabled(False)
-        self.check_button.setEnabled(
-            len(self.facies_ids()) == len(self.values)
-            and self._thread is None
-            and self.revision is None
-        )
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        """Check needs every facies id; Save needs a checked candidate; neither
+        runs while a worker does or after the revision is saved."""
+
+        idle = self._thread is None and self.revision is None
+        self.check_button.setEnabled(idle and len(self.facies_ids()) == len(self.values))
+        self.save_button.setEnabled(idle and self.candidate is not None)
 
     def check(self) -> bool:
-        """Build the candidate and validate it; True when it can be saved."""
+        """Start building and validating the candidate in a worker thread;
+        False when it cannot start. The status says the outcome."""
 
-        from darsia.fluidflower.geometry_facies import validate_geometry_config
-
+        if self._thread is not None or self.revision is not None:
+            return False
+        if len(self.facies_ids()) != len(self.values):
+            self.status.setText("Choose a facies id for every label first.")
+            return False
         self.candidate = None
-        self.save_button.setEnabled(False)
-        try:
-            candidate, summary = ma.adoption_candidate(self.current, self.folder, self.facies_ids())
-            report = validate_geometry_config(candidate)
-        except (OSError, ValueError, KeyError) as error:
-            self.status.setText(f"The revision cannot be built: {error}")
-            return False
-        errors = [
-            issue.get("message") for issue in report.get("issues") or []
-            if issue.get("severity") == "error"
-        ]
-        if errors:
-            self.status.setText("The revision does not validate:\n" + "\n".join(errors))
-            return False
-        self.candidate = candidate
+        worker = _CheckWorker(self.current, self.folder, self.facies_ids())
+        worker.finished.connect(self._checked)
+        worker.failed.connect(self._check_failed)
+        self._start(worker, "Checking the revision; this reads every prepared run's files…")
+        return True
+
+    def _checked(self, result: object) -> None:
+        """Keep a candidate that validates, or say why it does not."""
+
+        result = dict(result)
+        if result["errors"]:
+            self.status.setText("The revision does not validate:\n" + "\n".join(result["errors"]))
+            return
+        self.candidate = result["candidate"]
+        summary = result["summary"]
         left = summary["not_prepared"]
         self.status.setText(
-            f"Ready to save: {len(summary['runs'])} runs and {len(summary['regions'])} regions."
+            f"Ready to save: {len(summary['runs'])} runs and {len(summary['regions'])} regions "
+            f"(checked in {result['seconds']:.0f} s)."
             + (f" Not prepared, so not in the revision: {', '.join(run.upper() for run in left)}." if left else "")
         )
-        self.save_button.setEnabled(True)
-        return True
+
+    def _check_failed(self, message: str) -> None:
+        self.status.setText(f"The revision cannot be built: {message}")
+
+    def _start(self, worker: QObject, message: str) -> None:
+        """Run one worker in its own thread (0008 rule: freed in the GUI thread)."""
+
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Direct: quit from the worker thread, so that wait() in the GUI
+        # thread cannot block a queued quit.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(self._thread_finished)
+        self._thread, self._worker = thread, worker
+        self._update_buttons()
+        self.status.setText(message)
+        thread.start()
 
     def _save_clicked(self) -> None:
         if self.candidate is None:
@@ -214,26 +276,14 @@ class AdoptionDialog(QDialog):
             f"adopt the approved painted map {version.get('name') or ''} "
             f"(SHA-256 {str(version.get('sha256') or '')[:12]}) in every prepared run"
         )
-        thread = QThread(self)
         worker = _SaveRevisionWorker(self.project, self.candidate, self.actor, reason)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._saved)
         worker.failed.connect(self._failed)
-        # Direct: quit from the worker thread, so that wait() in the GUI
-        # thread cannot block a queued quit.
-        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
-        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
-        thread.finished.connect(self._thread_finished)
-        self._thread, self._worker = thread, worker
-        self.save_button.setEnabled(False)
-        self.check_button.setEnabled(False)
-        self.status.setText("Saving the revision…")
-        thread.start()
+        self._start(worker, "Saving the revision; the store validates every run again…")
         return True
 
     def busy(self) -> bool:
-        """Whether a save is running."""
+        """Whether a check or a save is running."""
 
         return self._thread is not None
 
@@ -255,7 +305,7 @@ class AdoptionDialog(QDialog):
         self._thread = self._worker = None
         if thread is not None:
             thread.deleteLater()
-        self._choice_changed()
+        self._update_buttons()
 
     def reject(self) -> None:
         if self._thread is None:
