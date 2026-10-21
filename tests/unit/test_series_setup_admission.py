@@ -39,7 +39,9 @@ def _admission(tmp_path, monkeypatch, *, metadata_cap, raw_cap=0, shared=True,
                                      maximum_file_bytes=metadata_cap if metadata_file_cap is None else metadata_file_cap)
     raw_root = None
     if raw_cap:
-        _old_task, _old_config, request_path, request = prepared_raw_request.__wrapped__(tmp_path)
+        scientific_inputs = tmp_path / "scientific-inputs"
+        scientific_inputs.mkdir()
+        _old_task, _old_config, request_path, request = prepared_raw_request.__wrapped__(scientific_inputs)
         request["output"].update(maximum_output_bytes=raw_cap, maximum_file_bytes=raw_cap)
         config["raw_build_request"] = _json(request_path, request)
         raw_root = Path(request["output"]["intended_root"])
@@ -256,7 +258,7 @@ def test_unlisted_path_or_changed_active_reservation_cannot_authorize_a_write(tm
     path = Path(actual.bound_reservations[0]["path"]) / "reserved.json"
     before = path.read_bytes()
     path.write_bytes(before + b" ")
-    with pytest.raises(ValueError, match="frozen bytes"):
+    with pytest.raises(ValueError, match="reservation.*changed"):
         actual.require_write(actual.test_context.metadata_root / "never.json")
 
 
