@@ -213,15 +213,19 @@ class AnalysisDomainDialog(QDialog):
     domains_saved = Signal(object)
 
     def __init__(
-        self, project: FluidFlowerProject, parent: QWidget | None = None
+        self, project: FluidFlowerProject, parent: QWidget | None = None,
+        *, store: AnalysisDomainStore | None = None,
+        configuration: dict[str, Any] | None = None,
+        load_reference: bool = True,
+        canvas: AnalysisDomainImageView | None = None,
     ) -> None:
         super().__init__(parent)
         self.project = project
-        self.store = AnalysisDomainStore(project)
+        self.store = store if store is not None else AnalysisDomainStore(project)
         current = self.store.current()
         self.config = deepcopy_settings(
-            current.get("configuration")
-            if current.get("format") == ANALYSIS_DOMAIN_REVISION_FORMAT
+            configuration if configuration is not None else current.get("configuration")
+            if configuration is not None or current.get("format") == ANALYSIS_DOMAIN_REVISION_FORMAT
             else default_analysis_domain_config(project)
         )
         self.reference: dict[str, Any] | None = None
@@ -272,7 +276,7 @@ class AnalysisDomainDialog(QDialog):
         tools.addWidget(fit_button)
         tools.addStretch(1)
         image_layout.addLayout(tools)
-        self.domain_canvas = AnalysisDomainImageView()
+        self.domain_canvas = canvas if canvas is not None else AnalysisDomainImageView()
         self.domain_canvas.rectangle_drawn.connect(self._rectangle_drawn)
         self.domain_canvas.domain_selected.connect(self._canvas_domain_selected)
         image_layout.addWidget(self.domain_canvas, 1)
@@ -330,7 +334,8 @@ class AnalysisDomainDialog(QDialog):
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
         self._refresh_domain_table()
-        self._load_reference(show_errors=False)
+        if load_reference:
+            self._load_reference(show_errors=False)
 
     def _set_mode(self, mode: str) -> None:
         self.domain_pan.setChecked(mode == "pan")

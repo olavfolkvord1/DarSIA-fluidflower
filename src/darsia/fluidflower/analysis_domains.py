@@ -625,7 +625,7 @@ class AnalysisDomainStore:
         reason: str,
     ) -> dict[str, Any]:
         candidate = deepcopy(dict(config))
-        report = validate_analysis_domain_config(self.project, candidate)
+        report = self.validate_candidate(candidate)
         if not report["valid"]:
             raise ValueError("Analysis-domain revision has blocking errors")
         revision_id = uuid.uuid4().hex
@@ -658,6 +658,15 @@ class AnalysisDomainStore:
             },
         )
         return deepcopy(revision)
+
+    def validate_candidate(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate the original corrected-grid format by default.
+
+        Editors for another explicit coordinate frame can reuse the append-only
+        revision writer with a separate namespace and a strict frame validator.
+        """
+
+        return validate_analysis_domain_config(self.project, config)
 
 
 if TYPE_CHECKING:

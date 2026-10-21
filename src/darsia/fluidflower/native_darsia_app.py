@@ -1409,6 +1409,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self.geometry_workspace = SeriesGeometryWorkspace(
             series=series, initial_series=initial_series
         )
+        from darsia.fluidflower.metric_analysis_domains_ui import NativeMetricBoxesWorkflow
+
+        self.metric_boxes_workflow = NativeMetricBoxesWorkflow(self, self.geometry_workspace)
         self.geometry_workspace.series_label.hide()
         self.crop_workflow = NativeCropWorkflow(self)
         self.coloured_map_workflow = NativeColouredMapWorkflow(self)
