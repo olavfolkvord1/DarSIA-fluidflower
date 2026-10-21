@@ -67,3 +67,21 @@ def test_apply_to_all_runs_asks_then_applies_every_run(qtbot, layout, monkeypatc
     for run in ("ac17", "ac29"):
         assert (layout["series"] / f"config/merged/{run}.toml").read_bytes() != layout["original"][run]
     assert not dialog.apply_all_button.isEnabled()
+
+
+def test_check_re_export_reports_every_run(qtbot, layout, monkeypatch):
+    export = subject.export_corrected_setup(
+        layout["project"], reference=layout["reference"]("ac17"), actor="synthetic"
+    )
+    workspace = _Workspace(
+        layout["project"], [layout["reference"]("ac17"), layout["reference"]("ac29")]
+    )
+    qtbot.addWidget(workspace)
+    dialog = CorrectedSetupExportDialog(export, workspace)
+    assert dialog.check_button.text() == "Check re-export…"
+    dialog.check_button.click()
+    qtbot.waitUntil(lambda: dialog._thread is None and "Re-export check" in dialog.note.text(), timeout=30000)
+    # Nothing is applied yet, so no run can have been built from its export.
+    assert "identical in 0 of 2 runs" in dialog.note.text()
+    assert "Not applied: ac17, ac29." in dialog.note.text()
+    assert dialog.check_button.isEnabled() and workspace.isEnabled()

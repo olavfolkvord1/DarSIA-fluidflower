@@ -65,6 +65,29 @@ class _ApplyAll(QObject):
             self.completed.emit(str(path))
 
 
+class _CheckRebuilt(QObject):
+    """Check every run's built rig against its adopted labels (read only)."""
+
+    progress = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, project, references):
+        super().__init__()
+        self.project, self.references = project, list(references)
+
+    @Slot()
+    def run(self):
+        from darsia.fluidflower.corrected_setup_all_runs import check_rebuilt_runs
+
+        try:
+            path, _result = check_rebuilt_runs(self.project, self.references, progress=self.progress.emit)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+        else:
+            self.completed.emit(str(path))
+
+
 class CorrectedSetupExportDialog(QDialog):
     """Keep the existing raw export dialog/crop application entirely separate."""
     def __init__(self, export, workspace):
@@ -102,6 +125,14 @@ class CorrectedSetupExportDialog(QDialog):
             "reference run first, with one receipt; Build run model is not run"
         )
         self.apply_all_button.clicked.connect(self.start_all)
+        self.check_button = buttons.addButton(
+            "Check re-export…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.check_button.setToolTip(
+            "After Build run model: check that every run's built rig holds exactly the labels "
+            "and facies its applied export adopted; reads only, one receipt"
+        )
+        self.check_button.clicked.connect(self.start_check)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -174,6 +205,21 @@ class CorrectedSetupExportDialog(QDialog):
             return
         self._run(window, _ApplyAll(self.project, references, default_actor()), "all")
 
+    def start_check(self):
+        """Check every run's built rig against its adopted labels, in a worker."""
+
+        if self._thread is not None:
+            return
+        references = list(getattr(self.workspace, "run_inputs", None) or [])
+        if not references:
+            self.note.setText("The series lists no runs; nothing was checked.")
+            return
+        window = self.workspace.window()
+        if getattr(window, "process_runner", None) is not None and window.process_runner.active:
+            self.note.setText("Wait for the current calculation before checking the built runs.")
+            return
+        self._run(window, _CheckRebuilt(self.project, references), "check")
+
     def _run(self, window, worker, mode):
         """Run one apply worker in its own thread, the main window disabled."""
 
@@ -183,10 +229,11 @@ class CorrectedSetupExportDialog(QDialog):
         self._outcome = None
         self.apply_button.setEnabled(False)
         self.apply_all_button.setEnabled(False)
+        self.check_button.setEnabled(False)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        if mode == "all":
+        if mode in ("all", "check"):
             worker.progress.connect(self.note.setText)
         worker.completed.connect(self._capture_success)
         worker.failed.connect(self._capture_failure)
@@ -215,9 +262,14 @@ class CorrectedSetupExportDialog(QDialog):
             thread.deleteLater()
         window = self.workspace.window()
         window.setEnabled(self._previous_enabled)
+        # Checking reads only, so it is available again after any step.
+        self.check_button.setEnabled(True)
         success, value = self._outcome or (False, "The setup writer exited without a result.")
         if self._mode == "all":
             self._finish_all(window, success, value)
+            return
+        if self._mode == "check":
+            self._finish_check(window, success, value)
             return
         if success:
             receipt = json.loads(_small(value))
@@ -236,6 +288,28 @@ class CorrectedSetupExportDialog(QDialog):
             window.print_log(message)
             self.apply_button.setEnabled(True)
             self.apply_all_button.setEnabled(True)
+
+    def _finish_check(self, window, success, value):
+        """Say what the re-export check found, from its receipt."""
+
+        self.check_button.setEnabled(True)
+        self.apply_all_button.setEnabled(True)
+        if not success:
+            message = f"The re-export check stopped at {utc_now()} before its receipt.\n{value}"
+            self.note.setText(message)
+            window.print_log(message)
+            return
+        receipt = json.loads(_small(value))
+        groups = {}
+        for row in receipt["runs"]:
+            groups.setdefault(row["status"], []).append(row["run_id"])
+        text = f"Re-export check: identical in {len(groups.get('identical', []))} of {len(receipt['runs'])} runs."
+        for status in ("differs", "not built", "not applied"):
+            if groups.get(status):
+                text += f" {status.capitalize()}: {', '.join(groups[status])}."
+        text += f" Receipt: {value}"
+        self.note.setText(text)
+        window.print_log(text)
 
     def _finish_all(self, window, success, value):
         """Say what the all-runs apply did, from its receipt."""

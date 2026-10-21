@@ -8,11 +8,17 @@ display reference run goes first, because every other run's export is bound
 to its export. The first run that cannot be applied stops the sequence, and
 one receipt lists every run: applied, stopped (with its error and its own
 receipt) or not attempted. Build run model is not run.
+
+:func:`check_rebuilt_runs` is the re-export gate after Build run model:
+each run's applied export is checked as Build checks it, and the rig
+folder its configuration names must hold exactly the labels and facies
+the export adopted. It reads only, and one receipt lists every run as
+identical, differs, not built or not applied.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
@@ -20,11 +26,16 @@ import time
 from typing import Any
 import uuid
 
+import tomllib
+
+import numpy as np
+
 from darsia.fluidflower import corrected_setup as cs
 from darsia.fluidflower.geometry_workspace_frame import frame_kind
 from darsia.fluidflower.project import utc_now
 
 ALL_RUNS_FORMAT = "darsia-corrected-setup-apply-all-runs-v1"
+REBUILT_CHECK_FORMAT = "darsia-corrected-setup-rebuilt-check-v1"
 
 
 def apply_order(runs: Sequence[str], display: str) -> list[str]:
@@ -129,9 +140,91 @@ def apply_geometry_to_all_runs(
     return path, result
 
 
+def rebuilt_run_check(project: Any, run: str, *, revision: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Whether a run's built rig holds exactly what its applied export adopted.
+
+    The run's applied corrected export is checked as Build run model checks
+    it (on the run's declared merged configuration); then the labels and
+    facies in the rig folder that configuration names are compared, array
+    for array, with the export's adopted labels and facies. Reads only.
+    """
+
+    from darsia.fluidflower.geometry_facies import _load_array
+    from darsia.fluidflower.series_geometry import _storage_path
+
+    revision = dict(revision or current_corrected_revision(project))
+    try:
+        _root, destination, _display, _planned = cs._canonical_location(
+            project.root, revision["configuration"], revision["revision_id"], run
+        )
+        export = json.loads(cs._small(destination / "export.json"))
+        merged = Path(export["binding"]["configuration_bundles"][run][-1])
+        receipt = cs.require_corrected_export_for_build(merged)
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        return {"run_id": run, "status": "not applied", "detail": f"{type(error).__name__}: {error}"}
+    configuration = tomllib.loads(cs._small(merged).decode("utf-8-sig"))
+    rig = _storage_path((configuration.get("rig") or {}).get("path"), Path(receipt["binding"]["series_root"]))
+    row = {"run_id": run, "configuration": str(merged), "rig": str(rig) if rig is not None else None}
+    if rig is None or not all((rig / f"{name}.npz").is_file() for name in ("labels", "facies")):
+        return dict(row, status="not built")
+    comparisons = {}
+    for name in ("labels", "facies"):
+        built = np.squeeze(_load_array(rig / f"{name}.npz"))
+        adopted = np.squeeze(_load_array(Path(receipt["binding"]["sources"][name]["path"])))
+        same_grid = built.shape == adopted.shape
+        comparisons[name] = {
+            "identical": bool(same_grid and np.array_equal(built, adopted)),
+            "different_pixels": int(np.count_nonzero(built != adopted)) if same_grid else None,
+            "built_shape": list(built.shape),
+            "adopted_shape": list(adopted.shape),
+        }
+    status = "identical" if all(item["identical"] for item in comparisons.values()) else "differs"
+    return dict(row, status=status, comparisons=comparisons)
+
+
+def check_rebuilt_runs(
+    project: Any,
+    references: Sequence[Any],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """The re-export gate for every run, with one receipt beside the revision's
+    export: each run identical, differs, not built or not applied."""
+
+    revision = current_corrected_revision(project)
+    order = apply_order([str(reference.run_id) for reference in references], revision["display_reference_run"])
+    rows = []
+    for number, run in enumerate(order, 1):
+        if progress is not None:
+            progress(f"Checking {run.upper()} ({number} of {len(order)})…")
+        rows.append(rebuilt_run_check(project, run, revision=revision))
+    result = {
+        "format": REBUILT_CHECK_FORMAT,
+        "created_utc": utc_now(),
+        "revision_id": revision["revision_id"],
+        "current_sha256": revision["current_sha256"],
+        "runs": rows,
+        "identical": [row["run_id"] for row in rows if row["status"] == "identical"],
+        "all_identical": all(row["status"] == "identical" for row in rows),
+    }
+    root = cs._canonical_location(
+        project.root, revision["configuration"], revision["revision_id"],
+        revision["display_reference_run"],
+    )[0]
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = root / f"rebuilt-check-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    with path.open("xb") as stream:
+        stream.write((json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    return path, result
+
+
 __all__ = [
     "ALL_RUNS_FORMAT",
+    "REBUILT_CHECK_FORMAT",
     "apply_geometry_to_all_runs",
     "apply_order",
+    "check_rebuilt_runs",
     "current_corrected_revision",
+    "rebuilt_run_check",
 ]
