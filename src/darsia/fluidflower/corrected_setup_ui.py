@@ -8,7 +8,9 @@ import tomllib
 import traceback
 
 from PySide6.QtCore import QEvent, QObject, QThread, Qt, Signal, Slot
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QPlainTextEdit, QVBoxLayout
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QLabel, QMessageBox, QPlainTextEdit, QVBoxLayout,
+)
 
 from darsia.fluidflower.corrected_setup import (
     FORMAT, EXPORT_FILES, CorrectedSetupExport, _small, _canonical_location,
@@ -38,12 +40,38 @@ class _Apply(QObject):
             self.completed.emit(str(result))
 
 
+class _ApplyAll(QObject):
+    """Export and apply the current corrected revision for every run."""
+
+    progress = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, project, references, actor):
+        super().__init__()
+        self.project, self.references, self.actor = project, list(references), actor
+
+    @Slot()
+    def run(self):
+        from darsia.fluidflower.corrected_setup_all_runs import apply_geometry_to_all_runs
+
+        try:
+            path, _result = apply_geometry_to_all_runs(
+                self.project, self.references, actor=self.actor, progress=self.progress.emit
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+        else:
+            self.completed.emit(str(path))
+
+
 class CorrectedSetupExportDialog(QDialog):
     """Keep the existing raw export dialog/crop application entirely separate."""
     def __init__(self, export, workspace):
         super().__init__(workspace)
         self.export, self.workspace, self.project = export, workspace, workspace.project
         self._thread = self._worker = self._outcome = None
+        self._mode = "one"
         self._previous_enabled = True
         self._window = workspace.window()
         self._window.installEventFilter(self)
@@ -66,37 +94,100 @@ class CorrectedSetupExportDialog(QDialog):
             f"Apply to {export.run_id}", QDialogButtonBox.ButtonRole.ActionRole
         )
         self.apply_button.clicked.connect(self.start)
+        self.apply_all_button = buttons.addButton(
+            "Apply to all runs…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.apply_all_button.setToolTip(
+            "Export and apply this revision for every run of the series, the display "
+            "reference run first, with one receipt; Build run model is not run"
+        )
+        self.apply_all_button.clicked.connect(self.start_all)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def start(self):
-        if self._thread is not None:
-            return
+    def _ready(self):
+        """The main window when a write may start now; None after saying why."""
+
         window = self.workspace.window()
         reference = self.workspace.reference()
         if self.workspace.project is not self.project or reference is None or reference.run_id != self.export.run_id or self.workspace._loaded_series != self.workspace.series_id:
             self.note.setText("The selected series or run changed. Reopen its corrected export.")
-            return
+            return None
         if getattr(window, "process_runner", None) is not None and window.process_runner.active:
             self.note.setText("Wait for the current calculation before applying setup inputs.")
-            return
+            return None
         if self.workspace.busy():
             self.note.setText("Wait for the geometry operation to finish before applying setup inputs.")
-            return
+            return None
         guard = getattr(window, "reference_open_guard", None)
         if guard is None:
             self.note.setText("Save-first protection is unavailable; no configuration was changed.")
-            return
+            return None
         if not guard.allowed():
+            return None
+        return window
+
+    def start(self):
+        if self._thread is not None:
             return
+        window = self._ready()
+        if window is None:
+            return
+        self._run(window, _Apply(self.project, self.export), "one")
+
+    def start_all(self):
+        """Ask, then export and apply this revision for every run, with one receipt."""
+
+        if self._thread is not None:
+            return
+        from darsia.fluidflower.corrected_setup_all_runs import current_corrected_revision
+        from darsia.fluidflower.series_geometry import default_actor
+
+        references = list(getattr(self.workspace, "run_inputs", None) or [])
+        if not references:
+            self.note.setText("The series lists no runs; nothing was applied.")
+            return
+        try:
+            revision = current_corrected_revision(self.project)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.note.setText(f"Could not read the current geometry revision: {error}")
+            return
+        if revision["revision_id"] != self.export.revision_id:
+            self.note.setText("The geometry revision changed. Reopen its corrected export.")
+            return
+        window = self._ready()
+        if window is None:
+            return
+        reason = f" ({revision['reason']})" if revision["reason"] else ""
+        answer = QMessageBox.question(
+            self,
+            "Apply to all runs",
+            f"Apply geometry revision {revision['revision_id'][:8]}{reason} to all "
+            f"{len(references)} runs? The display reference run "
+            f"{revision['display_reference_run']} goes first. For each run its corrected "
+            "Setup inputs are exported as byte copies and only its label and facies "
+            "references change; depth, crop and protocols stay unchanged, and the "
+            "originals are kept beside each export. The first run that cannot be applied "
+            "stops the sequence. Build run model is not run. One receipt lists every run.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._run(window, _ApplyAll(self.project, references, default_actor()), "all")
+
+    def _run(self, window, worker, mode):
+        """Run one apply worker in its own thread, the main window disabled."""
+
+        self._mode = mode
         self._previous_enabled = window.isEnabled()
         window.setEnabled(False)
         self._outcome = None
         self.apply_button.setEnabled(False)
+        self.apply_all_button.setEnabled(False)
         thread = QThread(self)
-        worker = _Apply(self.project, self.export)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        if mode == "all":
+            worker.progress.connect(self.note.setText)
         worker.completed.connect(self._capture_success)
         worker.failed.connect(self._capture_failure)
         worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
@@ -125,6 +216,9 @@ class CorrectedSetupExportDialog(QDialog):
         window = self.workspace.window()
         window.setEnabled(self._previous_enabled)
         success, value = self._outcome or (False, "The setup writer exited without a result.")
+        if self._mode == "all":
+            self._finish_all(window, success, value)
+            return
         if success:
             receipt = json.loads(_small(value))
             opened = getattr(window, "config_file", None)
@@ -141,6 +235,39 @@ class CorrectedSetupExportDialog(QDialog):
             self.note.setText(message)
             window.print_log(message)
             self.apply_button.setEnabled(True)
+            self.apply_all_button.setEnabled(True)
+
+    def _finish_all(self, window, success, value):
+        """Say what the all-runs apply did, from its receipt."""
+
+        if not success:
+            message = f"Applying to all runs stopped at {utc_now()} before its receipt.\n{value}"
+            self.note.setText(message)
+            window.print_log(message)
+            self.apply_button.setEnabled(True)
+            self.apply_all_button.setEnabled(True)
+            return
+        receipt = json.loads(_small(value))
+        rows = receipt["runs"]
+        applied = [row["run_id"] for row in rows if row["status"] == "applied"]
+        stopped = [row for row in rows if row["status"] != "applied"]
+        total = len(rows) + len(receipt["not_attempted"])
+        text = f"Applied to {len(applied)} of {total} runs. Build run model has not run."
+        if stopped:
+            text += f" Stopped at {stopped[0]['run_id']}: {stopped[0]['error']}"
+        if receipt["not_attempted"]:
+            text += f" Not attempted: {', '.join(receipt['not_attempted'])}."
+        text += f" Receipt: {value}"
+        self.note.setText(text)
+        window.print_log(text)
+        opened = getattr(window, "config_file", None)
+        if opened and applied and not window._load_run_config(opened):
+            self.note.setText(text + " Reopen the run configuration.")
+        refresh = getattr(window, "_update_painted_geometry_status", None)
+        if callable(refresh):
+            refresh()
+        if stopped:
+            self.apply_all_button.setEnabled(True)
 
     def eventFilter(self, watched, event):
         if watched is self._window and event.type() == QEvent.Type.Close and self._thread is not None:
