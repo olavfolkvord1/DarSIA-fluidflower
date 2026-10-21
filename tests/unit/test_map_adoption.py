@@ -153,4 +153,9 @@ def test_a_preparation_writes_each_runs_native_map_and_adopts_nothing(tmp_path):
     ]
     assert result["adopted"] is False
     assert json.loads((folder / "index.json").read_text(encoding="utf-8"))["runs"][0]["status"] == "prepared"
-    assert sorted(path.name for path in folder.iterdir()) == ["index.json", "run1"]
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "approval.json", "index.json", "run1", "source_map.npz",
+    ]
+    assert result["runs"][0]["label_values"] == [1, 2, 3]
+    with np.load(folder / "source_map.npz") as saved:
+        assert np.array_equal(saved["array"], _layers())

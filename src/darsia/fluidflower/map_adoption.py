@@ -16,12 +16,20 @@ categorical carrier, with the fill and support flags kept. It writes a new
 preparation folder; the facies ids of the regions wait for the facies table
 of the map, and none is invented.
 
+:func:`adoption_candidate` turns a preparation and the facies table of the
+map (each label's facies id in the series' full facies table) into a
+geometry revision candidate on the current corrected workspace revision: a
+canonical edit of its imported parent whose every run carries a
+``painted-map-placement-v1`` registration, replayed exactly by the Store.
+Saving it is a separate, explicit step.
+
 Nothing here writes a revision, a map or a run configuration.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -37,11 +45,11 @@ FACIES_IDS_PENDING = "waits for the facies table of the map"
 
 
 def _bound(path: Path) -> dict[str, Any]:
-    """A file bound by its path, SHA-256 and size."""
+    """A file bound by its resolved path, SHA-256 and size."""
 
-    from darsia.fluidflower.project import sha256_file
+    from darsia.fluidflower.geometry_raster_sources import descriptor
 
-    return {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+    return descriptor(path)
 
 
 def placement_provenance(folder: Path | str) -> dict[str, Any]:
@@ -232,6 +240,11 @@ def prepare_adoption(
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
     folder.mkdir(parents=True, exist_ok=False)
+    # The map itself and its approval, bound for the Store's replay.
+    np.savez_compressed(folder / "source_map.npz", array=layers)
+    with (folder / "approval.json").open("x", encoding="utf-8") as stream:
+        json.dump(dict(version.get("approval") or {}), stream, indent=2, ensure_ascii=False)
+    reference_bound = _bound(Path(reference.source))
     keys = [str(run).casefold() for run in runs]
     rows = []
     for number, run in enumerate(keys, 1):
@@ -277,6 +290,9 @@ def prepare_adoption(
                     "size_bytes": path.stat().st_size,
                 },
                 "shape_hw": list(labels.shape),
+                "label_values": [int(value) for value in np.unique(labels)],
+                "reference_model": reference_bound,
+                "target_model": _bound(Path(target.source)),
                 "composition_reference_u_to_native": composition,
                 "filled_pixels": int(np.count_nonzero(filled)),
                 "outside_support_pixels": int(np.count_nonzero(~support)),
@@ -306,6 +322,10 @@ def prepare_adoption(
         "reference_run": reference_key,
         "map_version": dict(version),
         "geometry_index": {"path": str(index_path.resolve()), "sha256": sha256_file(index_path)},
+        "source_map": {"path": "source_map.npz", **{
+            key: value for key, value in _bound(folder / "source_map.npz").items() if key != "path"
+        }},
+        "approval": dict(version.get("approval") or {}),
         "composition": "H_targetU_to_targetNative @ H_target_mm_to_U @ H_referenceU_to_mm, "
         "nearest neighbour; filled and support flags kept",
         "regions": regions,
@@ -319,14 +339,172 @@ def prepare_adoption(
     return dict(index, folder=str(folder))
 
 
+def read_preparation(folder: Path | str) -> dict[str, Any]:
+    """An adoption preparation folder's index, with ``folder`` added."""
+
+    folder = Path(folder)
+    index = json.loads((folder / "index.json").read_text(encoding="utf-8"))
+    if index.get("format") != PREPARATION_FORMAT:
+        raise ValueError(f"{folder} is not an adoption preparation folder")
+    return dict(index, folder=str(folder))
+
+
+def facies_table(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The rows of a configuration's full facies properties table (id, name,
+    porosity, permeability), in id order."""
+
+    from darsia.fluidflower.geometry_facies import _load_properties
+
+    path = str(config.get("facies_properties_source_path") or "")
+    if not path:
+        raise ValueError("The geometry revision names no facies properties table")
+    return [row for _key, row in sorted(_load_properties(Path(path)).items())]
+
+
+def label_values(preparation: Mapping[str, Any]) -> list[int]:
+    """Every label value in the prepared runs' maps (0 is outside the map)."""
+
+    return sorted(
+        {
+            int(value)
+            for row in preparation.get("runs") or []
+            if row.get("status") == "prepared"
+            for value in row.get("label_values") or []
+        }
+    )
+
+
+def adoption_candidate(
+    current: Mapping[str, Any],
+    folder: Path | str,
+    facies_ids: Mapping[int, int],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A geometry revision candidate adopting a prepared painted map.
+
+    ``current`` is the current corrected workspace revision, a canonical
+    edit of its imported parent; ``facies_ids`` maps each label value of the
+    prepared maps to a facies id of the series' full facies table (the
+    facies table of the map). The candidate keeps the parent, the frame and
+    the photographs; its labels are the display run's prepared map, its
+    regions take each facies' name, porosity and permeability from the
+    table and the role of its layer (excluded outside the map), and every
+    prepared run of the frame binding gets a ``painted-map-placement-v1``
+    registration. Returns the candidate and a summary; nothing is saved.
+    """
+
+    from darsia.fluidflower import geometry_raster_sources as sources
+
+    folder = Path(folder)
+    preparation = read_preparation(folder)
+    config = deepcopy(dict(current.get("configuration") or {}))
+    if config.get("source_mode") != sources.CANONICAL_EDIT:
+        raise ValueError(
+            "The adoption builds on a corrected workspace revision that is a canonical edit; "
+            "the current revision is not."
+        )
+    parent = config["canonical_import_parent"]
+    binding = dict((config.get("frame_binding") or {}).get("runs") or {})
+    display = str(config["frame_binding"]["display_reference_run"])
+    prepared = {
+        row["run_id"]: row for row in preparation.get("runs") or [] if row.get("status") == "prepared"
+    }
+    if display not in prepared:
+        raise ValueError(f"The display reference run {display.upper()} is not prepared")
+    values = label_values(preparation)
+    missing = [value for value in values if value not in facies_ids]
+    if missing:
+        raise ValueError(
+            f"No facies id for label(s) {', '.join(str(value) for value in missing)} "
+            f"({FACIES_IDS_PENDING})"
+        )
+    table = {int(row["facies_id"]): row for row in facies_table(config)}
+    layers = {int(row["layer_id"]): row for row in preparation.get("regions") or []}
+    regions = []
+    for value in values:
+        facies_id = int(facies_ids[value])
+        if facies_id not in table:
+            raise ValueError(f"Facies id {facies_id} is not in the series' facies table")
+        row = table[facies_id]
+        regions.append(
+            {
+                "label_id": value,
+                "facies_id": facies_id,
+                "name": row["name"],
+                "analysis_role": str((layers.get(value) or {}).get("role") or "excluded"),
+                "porosity": row["porosity"],
+                "permeability": row["permeability"],
+                "enabled": True,
+            }
+        )
+    measurement = _bound(folder / "index.json")
+    authority = _bound(folder / "approval.json")
+    source_map = _bound(folder / "source_map.npz")
+    rows, not_prepared = [], []
+    for run, row in binding.items():
+        entry = prepared.get(run)
+        if entry is None:
+            not_prepared.append(run)
+            continue
+        labels = folder / entry["labels"]["path"]
+        photograph = (row.get("fields") or {}).get("shape_corrected_baseline") or {}
+        rows.append(
+            {
+                "run_id": run,
+                "enabled": True,
+                "geometry_choice": "run_override",
+                "acquisition_state": "unknown",
+                "labels_path": str(labels.resolve()),
+                "source_image_path": str(photograph.get("path") or ""),
+                "registration": {
+                    "kind": sources.PAINTED,
+                    "parent_revision_id": parent["revision_id"],
+                    "status": "painted",
+                    "authority": authority,
+                    "measurement": measurement,
+                    "labels": _bound(labels),
+                    "source_image": {
+                        key: photograph.get(key) for key in ("path", "sha256", "size_bytes")
+                    },
+                    "source_map": source_map,
+                    "reference_model": entry["reference_model"],
+                    "target_model": entry["target_model"],
+                },
+            }
+        )
+    config["run_geometry"] = dict(config.get("run_geometry") or {}, runs=rows)
+    config["labels_path"] = str((folder / prepared[display]["labels"]["path"]).resolve())
+    config["regions"] = regions
+    config["provenance"] = {
+        "origin": "approved painted map placed in every run",
+        "parent_revision_id": parent["revision_id"],
+        "previous_revision_id": current.get("revision_id"),
+        "preparation": measurement,
+        "map_version": {
+            key: (preparation.get("map_version") or {}).get(key) for key in ("name", "sha256")
+        },
+        "registered_geometry_authorized": False,
+    }
+    summary = {
+        "runs": [row["run_id"] for row in rows],
+        "not_prepared": not_prepared,
+        "regions": regions,
+        "display_reference_run": display,
+    }
+    return config, summary
+
+
 __all__ = [
     "FACIES_IDS_PENDING",
     "PREPARATION_FORMAT",
     "PROVENANCE_FORMAT",
     "adoption_blockers",
+    "adoption_candidate",
+    "facies_table",
+    "label_values",
     "map_facies",
     "native_labels",
     "native_transport",
     "placement_provenance",
     "prepare_adoption",
+    "read_preparation",
 ]

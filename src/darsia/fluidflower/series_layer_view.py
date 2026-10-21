@@ -2985,6 +2985,7 @@ class LayerPainterView(QWidget):
         self._adoption_worker: _AdoptionWorker | None = None
         self.last_adoption: dict[str, Any] | None = None
         self._adoption_message: QMessageBox | None = None
+        self._adoption_dialog: QDialog | None = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -3332,6 +3333,13 @@ class LayerPainterView(QWidget):
         )
         self.prepare_adoption_button.clicked.connect(self._prepare_adoption_clicked)
         placement.addWidget(self.prepare_adoption_button)
+        self.adopt_button = QPushButton("Adopt…")
+        self.adopt_button.setToolTip(
+            "Give a prepared map its facies table and save it as a new geometry revision; "
+            "the current revision stays"
+        )
+        self.adopt_button.clicked.connect(self._adopt_clicked)
+        placement.addWidget(self.adopt_button)
         placement.addStretch(1)
         layout.addLayout(placement)
         self.versions_table = QTableWidget(0, 5)
@@ -3802,16 +3810,19 @@ class LayerPainterView(QWidget):
                     return True
             except RuntimeError:
                 continue
-        return False
+        dialog = self._adoption_dialog
+        return bool(dialog is not None and getattr(dialog, "busy", lambda: False)())
 
     def wait_for_workers(self) -> None:
         """Let a running proposal or save finish (before closing)."""
 
+        dialog_thread = getattr(self._adoption_dialog, "_thread", None)
         for thread in (
             self._proposal_thread,
             self._save_thread,
             self._placement_thread,
             self._adoption_thread,
+            dialog_thread,
         ):
             try:
                 if thread is not None and thread.isRunning():
@@ -5907,31 +5918,66 @@ class LayerPainterView(QWidget):
         return dialog
 
     def _current_label_fields(self):
-        """Each run's current corrected label field, from the current geometry
-        revision: its DarSIA metadata, grid shape and file binding; None for a
-        run without one."""
+        """The label grid the adopted maps take, for every run: the imported
+        parent's labels of the current geometry revision (their DarSIA
+        metadata, shape and file binding), as the store's registered runs
+        keep it; None when the revision has no imported parent."""
 
-        from darsia.fluidflower.geometry_facies import GeometryRevisionStore, _darsia_metadata
+        from darsia.fluidflower.geometry_facies import (
+            GeometryRevisionStore,
+            _darsia_metadata,
+            _load_array,
+        )
+        from darsia.fluidflower.geometry_raster_sources import descriptor
 
         try:
-            current = GeometryRevisionStore(self.project).current()
-            runs = dict(
-                ((current.get("configuration") or {}).get("frame_binding") or {}).get("runs") or {}
+            config = GeometryRevisionStore(self.project).current().get("configuration") or {}
+            parent = (config.get("canonical_import_parent") or {}).get("imported_configuration") or {}
+            text = str(parent.get("labels_path") or "")
+            grid = (
+                {
+                    "metadata": _darsia_metadata(Path(text)),
+                    "shape_hw": list(_load_array(Path(text)).shape),
+                    "source": descriptor(text),
+                }
+                if text and Path(text).is_file()
+                else None
             )
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            runs = {}
+            grid = None
+        return lambda run: grid
 
-        def lookup(run: str) -> dict[str, Any] | None:
-            row = ((runs.get(run) or {}).get("fields") or {}).get("labels")
-            if not isinstance(row, Mapping) or not row.get("path"):
-                return None
-            return {
-                "metadata": _darsia_metadata(Path(str(row["path"]))),
-                "shape_hw": list(row.get("shape") or []),
-                "source": {key: row.get(key) for key in ("path", "sha256", "size_bytes")},
-            }
+    def _adopt_clicked(self) -> None:
+        """Choose a preparation's index.json and open its adoption window."""
 
-        return lookup
+        root = lp.painting_folder(self.project).parent / "map_adoption" if self.project else Path()
+        start = Path(self.last_adoption["folder"]) if self.last_adoption else root
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Adoption preparation (index.json)",
+            str(start),
+            "Adoption preparation (index.json);;JSON (*.json)",
+        )
+        if path:
+            self.open_adoption(Path(path).parent)
+
+    def open_adoption(self, folder: Path | str) -> QDialog | None:
+        """Open the adoption window of a preparation folder; None when it
+        cannot be read (a message says why)."""
+
+        from darsia.fluidflower.map_adoption_view import AdoptionDialog
+        from darsia.fluidflower.series_geometry import default_actor
+
+        try:
+            dialog = AdoptionDialog(
+                self.project, folder, actor=self._reviewer() or default_actor(), parent=self
+            )
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(self, "Could not open the adoption", str(error))
+            return None
+        self._adoption_dialog = dialog
+        dialog.show()
+        return dialog
 
     def _prepare_adoption_clicked(self) -> None:
         """Ask for the geometry index, then prepare the adoption of the version."""

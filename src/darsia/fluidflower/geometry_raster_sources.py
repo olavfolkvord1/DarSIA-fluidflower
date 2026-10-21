@@ -732,6 +732,89 @@ def _validate_carried_registered_run(config, payload, parent, row):
     _carried_file_bindings(record)
 
 
+PAINTED = "painted-map-placement-v1"
+PAINTED_PREPARATION = "darsia-fluidflower-painted-map-adoption-preparation-v1"
+
+
+def painted_map_composition(reference_model, target_model):
+    """The matrices that carry a painted map from the reference run's camera
+    grid to a target run's rig-corrected native grid, and that grid's shape.
+
+    Both models are measured run geometries (darsia-measured-run-geometry-v1):
+    the reference matrix is the reference run's metric-to-camera homography;
+    the target matrix is the target's camera-to-native homography times its
+    metric-to-camera homography. carry_label_reference composes them as
+    target @ inverse(reference).
+    """
+    grid = target_model.get("baseline_native_grid") or {}
+    reference = _carried_matrix(reference_model.get("H_metric_mm_to_camera_u"))
+    to_native = _carried_matrix(grid.get("H_baseline_camera_u_to_rig_corrected_native"))
+    target = _carried_matrix(target_model.get("H_metric_mm_to_camera_u"))
+    return reference, to_native @ target, _carried_shape(grid.get("shape_hw"))
+
+
+def _validate_painted_run(config, payload, parent, row):
+    """A run's labels carried from an approved painted map: replayed exactly.
+
+    The record binds the painted map on the reference run's camera grid, both
+    measured geometry models, the adoption preparation record (measurement)
+    and the map approval (authority). The run's labels must equal the
+    existing nearest-neighbour carrier applied to the map with the models'
+    composition, on the imported grid with its metadata; facies stay
+    derived canonically and the photograph is the run's bound corrected
+    baseline.
+    """
+    from .geometry_facies import _darsia_metadata
+    record = row["registration"]
+    _carried_keys(record, ("kind", "parent_revision_id", "status", "authority", "measurement",
+        "labels", "source_image", "source_map", "reference_model", "target_model"), "painted registration")
+    run = str(row["run_id"]).strip().casefold()
+    if (record["status"] != "painted" or record["parent_revision_id"] != parent["revision_id"]
+            or str(row.get("facies_path") or "").strip()):
+        raise ValueError("A painted run needs its genuine imported parent and canonical facies.")
+    authority = _carried_descriptor(record["authority"])
+    measurement = _carried_descriptor(record["measurement"])
+    actual = _carried_descriptor(record["labels"])
+    if (Path(actual["path"]).suffix.casefold() != ".npz"
+            or Path(actual["path"]).resolve() != Path(row["labels_path"]).resolve()):
+        raise ValueError("A painted run lacks its actual NPZ labels.")
+    metadata = _darsia_metadata(Path(payload["actual"]["labels"]["path"]))
+    if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])), metadata):
+        raise ValueError("Painted labels changed the imported grid metadata.")
+    fields = ((((config.get("frame_binding") or {}).get("runs") or {}).get(run) or {}).get("fields") or {})
+    photograph = fields.get("shape_corrected_baseline") or {}
+    source = _carried_descriptor(record["source_image"])
+    if (any(source[key] != photograph.get(key) for key in ("path", "sha256", "size_bytes"))
+            or Path(source["path"]).resolve() != Path(row["source_image_path"]).resolve()):
+        raise ValueError("A painted run's photograph is not its bound corrected baseline.")
+    models = []
+    for name in ("reference_model", "target_model"):
+        bound = _carried_descriptor(record[name])
+        models.append(json.loads(Path(bound["path"]).read_bytes()))
+    reference_matrix, target_matrix, shape = painted_map_composition(*models)
+    if shape != payload["labels"].shape:
+        raise ValueError("A painted run's native grid is not the imported grid.")
+    source_map = _carried_descriptor(record["source_map"])
+    painted = _integer_map(source_map["path"])
+    carried = carry_label_reference(painted, reference_matrix=reference_matrix.tolist(),
+        target_matrix=target_matrix.tolist(), target_shape_hw=list(shape),
+        reference_filled=np.zeros(painted.shape, dtype=bool), source_fill_status="KNOWN",
+        reference_support=painted != 0)
+    labels = _integer_map(actual["path"])
+    if labels.shape != shape or not np.array_equal(labels, carried["labels"].astype(labels.dtype)):
+        raise ValueError("Painted labels differ from the exact replay of their placement.")
+    preparation = json.loads(Path(measurement["path"]).read_bytes())
+    entry = next((item for item in preparation.get("runs") or [] if item.get("run_id") == run), {})
+    approval = json.loads(Path(authority["path"]).read_bytes())
+    if (preparation.get("format") != PAINTED_PREPARATION or entry.get("status") != "prepared"
+            or (entry.get("labels") or {}).get("sha256") != actual["sha256"]
+            or (preparation.get("source_map") or {}).get("sha256") != source_map["sha256"]
+            or approval.get("sha256") != (preparation.get("map_version") or {}).get("sha256")):
+        raise ValueError("A painted run is not the run, map and approval its preparation names.")
+    _verify(actual)
+    _verify(source_map)
+
+
 def _validate_registered_runs(config, payload, parent, *, run_id=None):
     """Admit explicit original-Store run rows, not unbound arbitrary overrides."""
     from .geometry_facies import _darsia_metadata, _effective_run_geometry_choice
@@ -758,6 +841,9 @@ def _validate_registered_runs(config, payload, parent, *, run_id=None):
         record = row.get("registration") or {}
         if record.get("kind") == CARRIED:
             _validate_carried_registered_run(config, payload, parent, row)
+            continue
+        if record.get("kind") == PAINTED:
+            _validate_painted_run(config, payload, parent, row)
             continue
         if (record.get("parent_revision_id") != parent["revision_id"]
                 or record.get("parent_labels") != payload["actual"]["labels"]
@@ -867,6 +953,8 @@ def registered_run_sources(project_root, current, run_id):
                *[row["registration"][key] for key in ("authority", "measurement", "labels", "source_image")]]
     if row["registration"].get("kind") == CARRIED:
         guarded.extend(_carried_file_bindings(row["registration"]))
+    if row["registration"].get("kind") == PAINTED:
+        guarded.extend(row["registration"][key] for key in ("source_map", "reference_model", "target_model"))
     result = dict(revision_id=revision_id, run_id=run, current=current_file,
         revision=revision_file, files=files, labels_shape=list(labels.shape),
         registration=deepcopy(row["registration"]), guarded_sources=guarded,
@@ -874,6 +962,8 @@ def registered_run_sources(project_root, current, run_id):
         provenance="Fresh observed Store product SHA bound to genuine UUID/record and exact arrays; not historical source SHA")
     if row["registration"].get("kind") == CARRIED:
         result["label_serialization"] = "Original Store int32; exact numeric equality to admitted carried labels"
+    if row["registration"].get("kind") == PAINTED:
+        result["label_serialization"] = "Original Store int32; exact numeric equality to the replayed painted placement"
     verify_registered_sources(result)
     return result
 
