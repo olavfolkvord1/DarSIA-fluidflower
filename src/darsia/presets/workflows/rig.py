@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 class Rig:
     """Rig object for CO2 analysis."""
 
+    def _read_optical_image(self, path: Path, **kwargs) -> darsia.Image:
+        """Share the configured optical input basis between setup and reading."""
+        binding = getattr(self, "raw_camera", None)
+        if binding is not None:
+            from darsia.fluidflower.rig_raw_input import read_raw_image
+
+            if Path(path) == getattr(self, "baseline_path", None):
+                kwargs["expected_sha256"] = getattr(self, "raw_baseline_sha256", None)
+            return read_raw_image(path, binding, **kwargs)
+        return darsia.imread(path, **kwargs)
+
     @property
     def corrections(self) -> list[darsia.BaseCorrection]:
         """Combined correction workflow in execution order."""
@@ -70,13 +81,21 @@ class Rig:
         log: Path | None = None,
         show_plot: bool = False,
     ):
-        from darsia._opencv_runtime import scientific_thread, require_ipp_off
-        scientific_thread("Rig.setup_reading:before")
+        """Set up the original reading baseline and shape corrections within any owned RAW operation."""
+        from darsia._opencv_runtime import scientific_thread, require_ipp_off, completed_frame
+        ipp_before = scientific_thread("Rig.setup_reading:before")
+        if getattr(self, "raw_camera", None) is not None:
+            operation = getattr(self, "_raw_build", None)
+            if operation is None:
+                raise ValueError("RAW reading setup requires an exclusively owned build operation")
+            operation.require_setup(self, log)
         # Cache experiment for protocol-based datetime lookup
         self.experiment = experiment
 
         # Setup (based on baseline image without any corrections applied)
-        pre_baseline = darsia.imread(baseline_path)
+        pre_baseline = self._read_optical_image(baseline_path)
+        if getattr(self, "raw_camera", None) is not None:
+            self._raw_setup_input_metadata = pre_baseline.metadata()
 
         if show_plot:
             # Allows to visually check the baseline image before any corrections
@@ -91,7 +110,7 @@ class Rig:
         )
 
         # Define shape-corrected baseline.
-        self.shape_corrected_baseline = darsia.imread(
+        self.shape_corrected_baseline = self._read_optical_image(
             baseline_path, transformations=self.shape_corrections
         )
         self.baseline = self.shape_corrected_baseline.copy()
@@ -103,13 +122,20 @@ class Rig:
         if show_plot:
             plt.show()
         if log:
-            plt.savefig(
-                log / "corrected_baseline.png",
-                dpi=500,
-            )
+            if getattr(self, "raw_camera", None) is not None:
+                with self._raw_build.output.open(log / "corrected_baseline.png") as stream:
+                    plt.savefig(stream, format="png", dpi=500)
+            else:
+                plt.savefig(
+                    log / "corrected_baseline.png",
+                    dpi=500,
+                )
         plt.close()
 
-        require_ipp_off("Rig.setup_reading:after")
+        if getattr(self, "raw_camera", None) is not None:
+            self._raw_reading_opencv = completed_frame(ipp_before, "Rig.setup_reading:after")
+        else:
+            require_ipp_off("Rig.setup_reading:after")
         logger.info("Reading setup completed.")
 
     def load_corrections(
@@ -235,7 +261,8 @@ class Rig:
                     baseline_for_setup, corrections_config.drift.colorchecker
                 )
                 self.drift_correction = darsia.DriftCorrection(
-                    baseline_for_setup, config={"roi": cc_voxels}
+                    baseline_for_setup, config={"roi": cc_voxels,
+                        "linear_input": getattr(self, "raw_camera", None) is not None}
                 )
                 """Drift correction based on color checker alignment."""
             except Exception as e:
@@ -243,7 +270,10 @@ class Rig:
                     f"Color checker not found. Drift correction not setup. Error: {e}",
                     UserWarning,
                 )
-                self.drift_correction = darsia.DriftCorrection(baseline_for_setup)
+                self.drift_correction = darsia.DriftCorrection(
+                    baseline_for_setup,
+                    config={"linear_input": getattr(self, "raw_camera", None) is not None},
+                )
 
             # Update baseline and corrections workflow
             ...  # baseline image does not need drift correction.
@@ -344,7 +374,7 @@ class Rig:
                     )
                 relative_color_images = []
                 for path in relative_config.images:
-                    img = darsia.imread(path)
+                    img = self._read_optical_image(path)
                     for correction in self.shape_corrections:
                         img = correction(img)
                     relative_color_images.append(img)
@@ -880,8 +910,22 @@ class Rig:
         # ref_colorchecker_path: Path,
         log: Path | None = None,
         show_plot: bool = False,
+        raw_camera: dict | None = None,
+        raw_baseline_sha256: str | None = None,
+        raw_build_id: str | None = None,
+        raw_build=None,
     ) -> None:
         """Fast setup."""
+        from darsia.fluidflower.rig_raw_input import camera_binding, require_raw_rebuild
+
+        self.raw_camera = camera_binding(raw_camera)
+        if self.raw_camera is not None:
+            require_raw_rebuild(corrections_config)
+            if (raw_build is None or raw_build.camera != self.raw_camera
+                    or raw_build.raw_source["sha256"] != raw_baseline_sha256
+                    or raw_build.operation_id != raw_build_id):
+                raise ValueError("RAW rig setup requires its exact reserved build context")
+            raw_build.begin_setup(self, log)
         # Create log directory if it doesn't exist
         if log:
             assert isinstance(log, Path), "Log path must be a Path object."
@@ -901,6 +945,13 @@ class Rig:
             log=log,
             show_plot=show_plot,
         )
+
+        if self.raw_camera is not None:
+            # Only the corrected-baseline diagnostic has an owned, bounded
+            # writer. Later optional plots include nested writers and repeated
+            # filenames, so RAW setup keeps their scientific work/display but
+            # suppresses their disk diagnostics until those writers are owned.
+            log = None
 
         # Fetch depth map
         self.setup_depth(
@@ -1025,6 +1076,26 @@ class Rig:
     def save(self, folder: Path) -> None:
         """Save rig object to file."""
 
+        owned = None
+        if getattr(self, "raw_camera", None) is not None:
+            operation = getattr(self, "_raw_build", None)
+            if operation is None:
+                raise ValueError("RAW rig save requires its original exclusive build context")
+            owned = operation.output
+            owned.begin_save(self, folder)
+
+        def save_image(image, path):
+            if owned is None:
+                image.save(path)
+            else:
+                owned.image(image, path)
+
+        def save_correction(correction, path):
+            if owned is None:
+                correction.save(path)
+            else:
+                owned.correction(correction, path)
+
         # Create folder if not exists
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -1033,57 +1104,70 @@ class Rig:
         meta_data = {
             "baseline_path": str(self.baseline_path),
         }
-        with open(folder / "meta_data.json", "w") as f:
-            json.dump(meta_data, f)
+        if getattr(self, "raw_camera", None) is not None:
+            meta_data["raw_camera"] = dict(self.raw_camera)
+            if getattr(self, "raw_baseline_sha256", None) is not None:
+                meta_data["raw_baseline_sha256"] = self.raw_baseline_sha256
+            if getattr(self, "_raw_build_id", None) is not None:
+                meta_data["raw_build_id"] = self._raw_build_id
+        if owned is None:
+            with open(folder / "meta_data.json", "w") as f:
+                json.dump(meta_data, f)
+        else:
+            with owned.open(folder / "meta_data.json") as stream:
+                stream.write(json.dumps(meta_data).encode("utf-8"))
 
         # Save reading information
-        self.baseline.save(folder / "baseline.npz")
+        save_image(self.baseline, folder / "baseline.npz")
         if hasattr(self, "shape_corrected_baseline"):
-            self.shape_corrected_baseline.save(folder / "shape_corrected_baseline.npz")
+            save_image(self.shape_corrected_baseline, folder / "shape_corrected_baseline.npz")
 
         # Save split correction pipelines.
         for i, correction in enumerate(self.shape_corrections):
             correction_name = type(correction).__name__.lower()
-            correction.save(folder / f"shape_correction_{i}_{correction_name}.npz")
+            save_correction(correction, folder / f"shape_correction_{i}_{correction_name}.npz")
         for i, correction in enumerate(self.color_corrections):
             correction_name = type(correction).__name__.lower()
-            correction.save(folder / f"color_correction_{i}_{correction_name}.npz")
+            save_correction(correction, folder / f"color_correction_{i}_{correction_name}.npz")
 
         # Save geometry information
         try:
             assert isinstance(self.depth, darsia.Image)
-            self.depth.save(folder / "depth.npz")
+            save_image(self.depth, folder / "depth.npz")
         except Exception:
             warn("Depth not available for saving.", UserWarning)
 
         # Save labels information
         try:
-            self.labels.save(folder / "labels.npz")
+            save_image(self.labels, folder / "labels.npz")
         except Exception:
             warn("Labels not available for saving.", UserWarning)
 
         # Save facies information
         try:
-            self.facies.save(folder / "facies.npz")
+            save_image(self.facies, folder / "facies.npz")
         except Exception:
             warn("Facies not available for saving.", UserWarning)
 
         # Save facies properties
         try:
-            self.porosity.save(folder / "porosity.npz")
+            save_image(self.porosity, folder / "porosity.npz")
         except Exception:
             warn("Porosity not available for saving.", UserWarning)
 
         try:
-            self.permeability.save(folder / "permeability.npz")
+            save_image(self.permeability, folder / "permeability.npz")
         except Exception:
             warn("Permeability not available for saving.", UserWarning)
 
         # Save porosity information
         try:
-            self.image_porosity.save(folder / "image_porosity.npz")
+            save_image(self.image_porosity, folder / "image_porosity.npz")
         except Exception:
             warn("Image porosity not available for saving.", UserWarning)
+
+        if owned is not None:
+            owned.finish_save()
 
         # Use green color and hyperlink
         folder_uri = Path(folder).absolute().as_uri()
@@ -1113,6 +1197,11 @@ class Rig:
         with open(folder / "meta_data.json", "r") as f:
             meta_data = json.load(f)
         rig.baseline_path = Path(meta_data["baseline_path"])
+        if "raw_camera" in meta_data:
+            from darsia.fluidflower.rig_raw_input import camera_binding
+
+            rig.raw_camera = camera_binding(meta_data["raw_camera"])
+            rig.raw_baseline_sha256 = meta_data.get("raw_baseline_sha256")
 
         # Load data for reading images
         rig.baseline = darsia.imread(folder / "baseline.npz")
@@ -1268,7 +1357,7 @@ class Rig:
         date = self.experiment.get_datetime(path)
 
         # Read image from file and apply corrections
-        img = darsia.imread(
+        img = self._read_optical_image(
             path,
             transformations=self.corrections,
             date=date,

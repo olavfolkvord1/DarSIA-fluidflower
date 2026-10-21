@@ -179,6 +179,7 @@ class RunIOBinding:
         self.repository, self.commit = Path(repository).resolve(), admitted_commit
         self.locations, self.code_locations, self.code_audit = {}, {}, []
         self.resume_roots, self.producer_origins = set(), {}
+        self.common_publications = {}
         self._prefix_validation_root = None
         self.configuration = None
         self.configuration_descriptor = None
@@ -409,9 +410,61 @@ class RunIOBinding:
             if _version(row.path.stat()) != self.verified.versions[str(row.path)]:
                 raise InputHashMismatch("Verified input changed before scientific consumption")
             return dict(descriptor,path=str(row.path),size_bytes=row.reference["bytes"])
+        publication = self.common_publications.get(_key(descriptor["path"]))
+        if publication is not None:
+            expected, owned, public_version, owned_version = publication
+            if (descriptor.get("sha256") != expected["sha256"]
+                    or descriptor.get("size_bytes") != expected["size_bytes"]
+                    or _version(Path(expected["path"]).stat()) != public_version
+                    or _version(Path(owned["path"]).stat()) != owned_version):
+                raise InputHashMismatch("The exact own common publication changed after admission")
+            return dict(descriptor, path=owned["path"], size_bytes=owned["size_bytes"])
         if self._own_output(descriptor["path"]):
             return dict(descriptor)
         raise InputHashMismatch("Unlisted input cannot fall through to a historical locator: " + descriptor["path"])
+
+    def admit_common_completion(self, published, *, job, index):
+        """Bind only an exact own published completion to its indexed owned bytes."""
+        from .products_publication import _read_index
+        if getattr(self, "common_closure_released", False) is not True:
+            raise InputHashMismatch("Own completion admission requires its released common closure")
+        if getattr(self, "common_job_binding", None) != job:
+            raise InputHashMismatch("Own completion differs from the independently released job binding")
+        job_root = Path(job["path"]).parent
+        expected_public = job_root / "results" / self.task["run"] / "completed.json"
+        if (Path(job["path"]).name != "job.json" or job_root.name != self.task["job_id"]
+                or _key(published["path"]) != _key(expected_public)
+                or not Path(published["path"]).resolve().is_relative_to(job_root.resolve())):
+            raise InputHashMismatch("Own completion belongs to another immutable job")
+        _index_root, document, products = _read_index(index)
+        original = products.get("completed.json", {})
+        same = lambda left, right: (left.get("sha256"), left.get("bytes", left.get("size_bytes"))) == (
+            right.get("sha256"), right.get("bytes", right.get("size_bytes")))
+        if (document.get("run") != self.task["run"] or document.get("attempt_id") != self.task["attempt_id"]
+                or not same(document.get("job", {}), job)
+                or _key(document.get("job", {}).get("path", "")) != _key(job["path"])
+                or _key(original.get("local_path", "")) != _key(self.output / "candidate_completed.json")
+                or not same(original, published)
+                or _key(published["path"]) in self.locations or _key(published["path"]) in self.code_locations):
+            raise InputHashMismatch("Own completion/index does not match its exact original attempt")
+        owned = dict(path=original["local_path"], sha256=original["sha256"], size_bytes=original["bytes"])
+        if not self._own_output(owned["path"]):
+            raise InputHashMismatch("The original common candidate escaped its positively owned attempt")
+        public_version = _version(Path(published["path"]).stat())
+        owned_version = _version(Path(owned["path"]).stat())
+        public = self._proof_bytes(published, expected_public)
+        candidate = self._proof_bytes(owned, self.output / "candidate_completed.json")
+        if (public != candidate or candidate.get("task") != self.task
+                or candidate.get("attempt_id") != self.task["attempt_id"] or candidate.get("commit") != self.commit
+                or _version(Path(published["path"]).stat()) != public_version
+                or _version(Path(owned["path"]).stat()) != owned_version):
+            raise InputHashMismatch("Published common completion changed or belongs to another actual claim")
+        key = _key(published["path"])
+        admitted = (deepcopy(published), owned, public_version, owned_version)
+        if key in self.common_publications and self.common_publications[key] != admitted:
+            raise InputHashMismatch("Conflicting own common completion admission")
+        self.common_publications[key] = admitted
+        return deepcopy(owned)
 
     def asset_path(self, path):
         row = self.locations.get(_key(path))

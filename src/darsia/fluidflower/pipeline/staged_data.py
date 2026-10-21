@@ -89,8 +89,11 @@ def _same_json(first, second):
 def _statistics_template(value):
     required = {"format", "shared", "physical_correction", "recipe", "dimensions_m",
                 "boxes", "summary", "bindings", "geometry_fields"}
-    _keys(value, required, {"atmosphere_series", "dose", "contracts", "provenance"},
+    _keys(value, required, {"atmosphere_series", "dose", "contracts", "provenance", "opencl_acceleration"},
           where="statistics template")
+    if "opencl_acceleration" in value:
+        from ..mass.mass_opencl import configuration
+        configuration(value["opencl_acceleration"])
     if value["format"] != STATISTICS_FORMAT:
         raise ValueError("Explicit native statistics template format required")
     from ..mass.n1_pipeline import SHARED_REQUIRED, _geometry_fields
@@ -602,8 +605,11 @@ def validate_phase2_run(config):
     from ..mass.n1_pipeline import CONFIG_FORMAT, CONFIG_REQUIRED, FRAME_REQUIRED
     _keys(config, {"format", *CONFIG_REQUIRED, "precision", "phase1", "geometry_fields"},
           {"atmosphere_series", "dose", "contracts", "provenance", "data_aliases", "storage", "pixel_domain",
-           "storage_profile"},
+           "storage_profile", "opencl_acceleration"},
           where="phase-two configuration")
+    if "opencl_acceleration" in config:
+        from ..mass.mass_opencl import configuration
+        configuration(config["opencl_acceleration"])
     if config["format"] != CONFIG_FORMAT or config["precision"] not in {"float32", "float64"}:
         raise ValueError("Explicit precision-bound ordinary N1 stage required")
     if "storage_profile" in config:
@@ -738,7 +744,7 @@ def validate_n16_frame_binding(config, spec, *, authority, source, original, cal
 def seal_phase2_configuration(destination, completion_bound, configuration_bound, *,
                               expected_phase1_commit, fitted_calibration, fitted_anchor,
                               storage_data=None, pixel_domain_data=None, reader,
-                              storage_profile=None):
+                              storage_profile=None, frozen_refit=None):
     """Seal ordinary N1 DATA from actual phase-one products and explicit new fit.
 
     No native/inference or mass evaluation occurs. The returned DATA still needs
@@ -755,12 +761,23 @@ def seal_phase2_configuration(destination, completion_bound, configuration_bound
     _keys(fitted_anchor, {"elapsed_h", "affected_pore_volume_m3"}, where="explicit fitted mass anchor")
     _finite(fitted_anchor["elapsed_h"], where="fitted anchor time")
     _finite(fitted_anchor["affected_pore_volume_m3"], where="fitted anchor volume", positive=True)
+    refit_join = None
+    if frozen_refit is not None:
+        from .common_calibration import verify_frozen_refit
+        refit_join = verify_frozen_refit(frozen_refit, verified_phase1=verified,
+            fitted_calibration=fitted_calibration, fitted_anchor=fitted_anchor,
+            expected_commit=expected_phase1_commit, reader=reader)
     from .series import bind_mass_frame
     from ..mass.n1_pipeline import CONFIG_FORMAT, CONFIG_REQUIRED, FRAME_REQUIRED
     phase1 = verified["configuration"]
     candidate = deepcopy(phase1["statistics"])
     candidate.update(format=CONFIG_FORMAT, run=phase1["run"], precision=phase1["precision"],
                      calibration=deepcopy(fitted_calibration), anchor=deepcopy(fitted_anchor))
+    if refit_join is not None:
+        provenance = deepcopy(candidate.get("provenance", {}))
+        if not isinstance(provenance, dict) or "common_frozen_refit" in provenance:
+            raise ValueError("The explicit common refit join cannot replace existing provenance")
+        candidate["provenance"] = dict(provenance, common_frozen_refit=refit_join)
     candidate["frames"] = [bind_mass_frame(spec, item["record"]["native"], item["record"]["phase"],
                             baseline=phase1["phase"]["reference"]["full"])
                            for spec, item in zip(phase1["frames"], verified["records"])]

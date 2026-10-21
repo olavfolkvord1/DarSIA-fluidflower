@@ -8,12 +8,15 @@ Integration into the complete guarded loader is still required before use.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 
 
 @dataclass(frozen=True)
 class PixelMath:
     precision: str
+    _opencl: dict = field(default_factory=dict, repr=False, compare=False)
+    _opencl_lock: object = field(default_factory=Lock, repr=False, compare=False)
 
     def __post_init__(self):
         if self.precision not in ("float32", "float64"):
@@ -39,10 +42,55 @@ class PixelMath:
 
     def facts(self):
         """Report CPU pixel, coefficient and reduction dtypes without granting execution permission."""
-        return dict(precision=self.precision, backend="numpy_cpu",
+        record = dict(precision=self.precision, backend="numpy_cpu",
                     parameter_dtype="float64", reduction_dtype="float64",
                     input_storage_dtype="frozen_asset_encoding",
                     scientific_eligibility=False, production_permission_granted=False)
+        if "control" in self._opencl:
+            selector = self._opencl.get("selector")
+            record["opencl_n1"] = (selector.facts() if selector is not None else
+                dict(control=dict(self._opencl["control"]), used=False))
+        return record
+
+    def configure_opencl(self, value):
+        """Bind optional acceleration to the run configuration before arithmetic."""
+        if value is None:
+            return  # Undeclared legacy configurations retain CPU bytes and facts.
+        with self._opencl_lock:
+            self._configure_opencl(value)
+
+    def _configure_opencl(self, value):
+        """Validate declared controls against the actual worker binding."""
+        from copy import deepcopy
+        from .mass_opencl import configuration
+        from ..pipeline.run_io import current_binding
+        control = configuration(value)
+        binding = current_binding()
+        policy = deepcopy(getattr(binding, "opencl_policy", None))
+        if (control["mode"] == "auto" and binding is not None and policy is None
+                and getattr(binding, "opencl_proof_released", False) is not True):
+            raise ValueError("Worker OpenCL auto requires an admitted policy or its released common proof")
+        compare_cpu = getattr(binding, "opencl_compare_cpu", False)
+        if type(compare_cpu) is not bool:
+            raise ValueError("Common N1 comparison mode must be explicit")
+        if policy is not None and (not isinstance(policy, dict)
+                or set(policy) != {"qualified_devices", "cpu_fallback_qualified"}
+                or policy["cpu_fallback_qualified"] is not True
+                or not isinstance(policy["qualified_devices"], list)):
+            raise ValueError("Optional N1 OpenCL requires its admitted CPU fallback and devices")
+        if "selector" in self._opencl and (self._opencl["control"] != control
+                or self._opencl.get("policy") != policy
+                or self._opencl.get("compare_cpu") != compare_cpu):
+            raise RuntimeError("N1 OpenCL control cannot change after computation")
+        self._opencl["control"] = control
+        self._opencl["policy"] = policy
+        self._opencl["compare_cpu"] = compare_cpu
+
+    def close(self):
+        """Release only this provider's optional device buffers."""
+        selector = self._opencl.get("selector")
+        if selector is not None:
+            selector.close()
 
     def decode_log_rgb(self, stored_log):
         """Keep original log storage gate; cast BEFORE exp, not after decoding."""
@@ -269,6 +317,27 @@ class PixelMath:
 
     def selected_n1_fields(self, prepared, *, gain, factor, swi, aqueous_known,
                            gas_known, solubility, gas_density):
+        """Use an exact faster optional device; retain the original CPU fallback."""
+        self.require_pixels(prepared)
+        if aqueous_known.dtype != bool or gas_known.dtype != bool:
+            raise TypeError("Existing native boolean supports required")
+        values = dict(gain=gain, factor=factor, swi=swi, aqueous_known=aqueous_known,
+                      gas_known=gas_known, solubility=solubility, gas_density=gas_density)
+        control = self._opencl.get("control")
+        if control is None or control["mode"] == "cpu":
+            return self._selected_n1_fields_cpu(prepared, **values)
+        with self._opencl_lock:
+            if "selector" not in self._opencl:
+                from .mass_opencl import OptionalN1
+                policy = self._opencl.get("policy")
+                devices = None if policy is None else policy["qualified_devices"]
+                self._opencl["selector"] = OptionalN1(self.precision, control, qualified_devices=devices,
+                    verify_every_call=self._opencl.get("compare_cpu", False))
+            selector = self._opencl["selector"]
+        return selector.compute(self._selected_n1_fields_cpu, prepared, **values)
+
+    def _selected_n1_fields_cpu(self, prepared, *, gain, factor, swi, aqueous_known,
+                               gas_known, solubility, gas_density):
         """Selected frozen N1 only; original operation order and separate casts."""
         import numpy as np
         self.require_pixels(prepared)

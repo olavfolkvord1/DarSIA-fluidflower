@@ -59,7 +59,7 @@ def phase1_configuration(original, *, precision, atmosphere=None, frame_data=Non
                 "boxes", "summary", "bindings", "geometry_fields")
     statistics = {key: deepcopy(template[key]) for key in required}
     statistics["format"] = STATISTICS_FORMAT
-    for key in ("atmosphere_series", "dose", "contracts", "provenance"):
+    for key in ("atmosphere_series", "dose", "contracts", "provenance", "opencl_acceleration"):
         if key in template:
             statistics[key] = deepcopy(template[key])
     clearwater = statistics["shared"]["clearwater"]

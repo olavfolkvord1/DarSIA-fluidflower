@@ -95,6 +95,15 @@ _N16_FIELDS = ("n16_solubility_g_per_l", "full_physical_depth_m", "full_physical
                "full_physical_physical_area_m2")
 
 
+def run_record_files(config):
+    """Name the original run records once for the N1 writer and lean accounting."""
+    result = dict(manifest="manifest.json", resume="resume.json", store_archive=STORE_ARCHIVE,
+                  store_index=STORE_INDEX)
+    if "pixel_domain" in config:
+        result["scalar_table"] = "mass_table.csv"
+    return result
+
+
 def resolve(config):
     """Return the storage setting one run configuration's entry requests.
 
@@ -940,7 +949,9 @@ class LeanRun:
             arrays={name: _identity(value) for name, value in arrays.items()},
             tables=tables, sources=sources,
             role="constant inputs of the per-frame static fields, stored once per run")
-        index = _write_json(self.output / STORE_INDEX, document)
+        from .pipeline.io_ops import LEAN_METADATA_BYTES, metadata_ceiling
+        with metadata_ceiling(LEAN_METADATA_BYTES):
+            index = _write_json(self.output / STORE_INDEX, document)
         self.store_record = dict(index=dict(index), archive=dict(archive))
         # The write-time gate uses the store exactly as a reader loads it.
         self.store = load_store(dict(index), reader=self.reader)

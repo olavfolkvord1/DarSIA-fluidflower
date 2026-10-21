@@ -1,6 +1,8 @@
 """Prepare measured geometry DATA from saved camera-plane models.
 
-No image decoding, fitting, classification, adoption or worker launch occurs.
+The legacy model path performs no image decoding or fitting. The explicit
+released RAW-basis path reads its saved NPZ and original grid in its caller's
+worker; it does not run RAW decoding, registration, adoption or worker launch.
 The camera plane is U (column right, row down); physical coordinates are
 millimetres from the inner left-wall/bottom intersection, x right and y up.
 The optical offset is an explicit area factor, applied once after float32
@@ -66,7 +68,9 @@ def write_new_json(path, value):
 
 def reference_model(run, frame, *, reference_image, camera_profile, source_model,
                     edge_review, baseline_configuration, model_photograph=None,
-                    baseline_to_model=None, baseline_native_renderer=None):
+                    baseline_to_model=None, baseline_native_renderer=None,
+                    raw_shape_basis_authority=None, raw_shape_basis_workspace=None,
+                    raw_shape_basis_aliases=(), raw_shape_basis_folder=None):
     """Bind a saved model to the registered run's actual reference photograph."""
     if not run or not reference_image.get("sha256"):
         raise ValueError("A run and bound reference photograph are required")
@@ -77,7 +81,12 @@ def reference_model(run, frame, *, reference_image, camera_profile, source_model
     if different and baseline_to_model is None:
         raise ValueError("A different model photograph needs its measured baseline registration")
     if baseline_to_model is not None:
-        bridge = read_bound_json(baseline_to_model)
+        if raw_shape_basis_authority is None:
+            bridge = read_bound_json(baseline_to_model)
+        else:
+            from .raw_shape_basis_reader import _Pins
+            bridge = _Pins(raw_shape_basis_aliases, folder=raw_shape_basis_folder).add(
+                baseline_to_model, metadata=True, copyable=True)
         if bridge.get("accepted") is not True:
             raise ValueError("The baseline registration has not passed its displacement gate")
         if different:
@@ -128,8 +137,24 @@ def reference_model(run, frame, *, reference_image, camera_profile, source_model
     result.update(model_photograph=deepcopy(photograph),
                   H_model_photograph_u_to_metric_mm=saved_h.tolist(),
                   baseline_to_model_registration=deepcopy(baseline_to_model))
+    if ((raw_shape_basis_authority is None) != (raw_shape_basis_workspace is None)
+            or raw_shape_basis_authority is not None and baseline_native_renderer is None):
+        raise ValueError("An explicit RAW basis needs its renderer, external authority and original per-run workspace")
     if baseline_native_renderer is not None:
-        native = read_bound_json(baseline_native_renderer)
+        checked_basis = None
+        if raw_shape_basis_authority is not None:
+            from .raw_shape_basis_reader import read_shape_basis
+            checked_basis = read_shape_basis(baseline_native_renderer, run_id=run,
+                authority=raw_shape_basis_authority, parent_workspace=raw_shape_basis_workspace,
+                reference_image=reference_image, camera_profile=camera_profile,
+                aliases=raw_shape_basis_aliases, folder=raw_shape_basis_folder)
+            native = checked_basis.document
+            if not _same_identity(baseline_configuration, checked_basis.compatibility["configuration"]):
+                raise ValueError("The RAW basis and measured model have another original run configuration")
+        else:
+            native = read_bound_json(baseline_native_renderer)
+            if native.get("artifact_kind") == "raw_shape_basis":
+                raise ValueError("A RAW shape basis requires its explicit external authority; no implicit native-grid admission")
         certificate = native["renderer"]
         if (certificate["raw_acquisition"]["sha256"] != reference_image["sha256"]
                 or certificate["camera_u_wh"] != [width, height]
@@ -146,7 +171,20 @@ def reference_model(run, frame, *, reference_image, camera_profile, source_model
             "legacy_dimensions_m": [0.49, 0.9],
             "physical_metric_is_separate": True,
         }
+        if checked_basis is not None:
+            result["baseline_native_grid"].update(
+                raw_shape_basis_authority=deepcopy(raw_shape_basis_authority),
+                parent_workspace_revision=deepcopy(raw_shape_basis_workspace),
+                parent_grid_compatibility=deepcopy(checked_basis.compatibility))
+            checked_basis.revalidate()
     return result
+
+
+def _same_identity(left, right):
+    """Compare the existing run configuration's exact original file binding."""
+    from .raw_shape_basis_reader import _same
+    return _same({key: left.get(key) for key in ("path", "sha256", "size_bytes")},
+                 {key: right.get(key) for key in ("path", "sha256", "size_bytes")})
 
 
 def label_placement(reference, target):
@@ -217,7 +255,8 @@ def frame_area(row, *, metric_matrix, area_factor, geometry_parameters):
 
 def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mapping,
                           output: Path, observations: Mapping | None = None,
-                          allow_incomplete=False):
+                          allow_incomplete=False, raw_shape_basis_authorities=None,
+                          raw_shape_basis_workspaces=None):
     """Write real per-run reference files and an early, explicitly partial index.
 
     ``plan`` binds the saved joint models, the twelve saved replacement-bottom
@@ -225,6 +264,10 @@ def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mappi
     reference is checked against the plan's already bound actual acquisition.
     The output directory must be new; incomplete work is preserved on error.
     """
+    if raw_shape_basis_authorities is not None or raw_shape_basis_workspaces is not None:
+        return _build_basis_reference_index(plan, references=references, profiles=profiles,
+            output=output, observations=observations, authorities=raw_shape_basis_authorities,
+            workspaces=raw_shape_basis_workspaces)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     pins = plan["source_inputs"]
@@ -274,4 +317,61 @@ def build_reference_index(plan: Mapping, *, references: Mapping, profiles: Mappi
         "source_current_edges": pins["current_confirmed39_ledger"],
         "pending_runs": pending,
     }
+    return write_new_json(output / "index.json", index)
+
+
+def _build_basis_reference_index(plan, *, references, profiles, output, observations, authorities, workspaces):
+    """Publish only NEW preflighted basis models; never rewrite an old index."""
+    from .raw_shape_basis_reader import read_model_basis
+    order = list(plan["current_analysis_order"])
+    if (not order or len(order) != len(set(order)) or set(references) != set(order)
+            or not isinstance(authorities, Mapping) or set(authorities) != set(order)
+            or not isinstance(workspaces, Mapping) or set(workspaces) != set(order)
+            or not isinstance(observations, Mapping) or set(observations) != set(order)):
+        raise ValueError("Every requested NEW basis model needs its exact reference, authority, workspace and observation")
+    pins = plan["source_inputs"]
+    joint = read_bound_json(pins["actual_joint_result"])
+    saved_by_run = {row["run"]: row for row in joint["runs"]}
+    planned = {row["run"]: row for row in plan["runs"]}
+    values, checks = {}, {}
+    for run in order:
+        acquisition = planned[run]["RAW"]
+        reference = descriptor(references[run]["path"])
+        observation = observations[run]
+        source = pins.get("q108_model_" + run, pins["actual_joint_result"])
+        if "q108_model_" + run in pins:
+            saved = read_bound_json(source)
+            if saved["run"] != run or saved["new_fit_or_optimizer_calls"] != 0:
+                raise ValueError("Saved replacement-bottom model has another run or role")
+            frame = saved["conditional_frame"]
+        else:
+            frame = saved_by_run[run]["conditional_frame"]
+        value = reference_model(run, frame, reference_image=reference, camera_profile=profiles[run],
+            source_model=source, edge_review=pins["current_confirmed39_ledger"],
+            baseline_configuration=references[run]["configuration"], model_photograph=acquisition,
+            baseline_to_model=observation.get("bridge"), baseline_native_renderer=observation["native_renderer"],
+            raw_shape_basis_authority=authorities[run], raw_shape_basis_workspace=workspaces[run])
+        checked = read_model_basis(value)
+        for row in (source, pins["current_confirmed39_ledger"]):
+            checked.guards.add(row, metadata=True, copyable=True)
+        if observation.get("bridge") is not None:
+            checked.guards.add(observation["bridge"], metadata=True, copyable=True)
+        checked.guards.add({key: acquisition[key] for key in ("path", "sha256", "size_bytes")})
+        values[run], checks[run] = value, checked
+    for checked in checks.values():
+        checked.revalidate()
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    rows = {}
+    for run in order:
+        checks[run].revalidate()
+        bound = write_new_json(output / run / "reference_model.json", values[run])
+        rows[run] = dict(run=run, reference_model=bound)
+    for checked in checks.values():
+        checked.revalidate()
+    index = dict(format=FORMAT, state="REFERENCE_MODELS_COMPLETE_FRAME_ROWS_PENDING", complete=False,
+        reference_models_complete=True, frame_rows_complete=False, area_arrays_complete=False,
+        run_order=order, runs=rows, run_count=len(rows), metric_unit="mm", grid="camera_u", adopted=False,
+        source_joint=pins["actual_joint_result"], source_current_edges=pins["current_confirmed39_ledger"], pending_runs={},
+        raw_shape_basis_authorities=deepcopy(authorities))
     return write_new_json(output / "index.json", index)

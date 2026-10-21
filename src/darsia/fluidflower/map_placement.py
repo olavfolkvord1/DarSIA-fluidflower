@@ -25,6 +25,7 @@ changes no map, session, geometry revision, run configuration or result.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import os
@@ -449,6 +450,12 @@ def place_map_in_runs(
     if reference_key not in geometries:
         raise ValueError(f"The geometry index has no model for the reference run {reference_run}")
     reference = geometries[reference_key]
+    from .raw_shape_basis_reader import preflight_geometry, has_shape_basis
+    basis_checks = {}
+    selected = {reference_key, *(str(run).casefold() for run in runs)}
+    if any(has_shape_basis(geometries[key].model) for key in selected if key in geometries):
+        from .round5_geometry import descriptor
+        basis_checks = preflight_geometry(descriptor(index_path.resolve()), geometries, selected)
     layers = np.ascontiguousarray(layers, dtype=np.uint8)
     if reference.shape_hw is not None and layers.shape != reference.shape_hw:
         raise ValueError(
@@ -459,6 +466,9 @@ def place_map_in_runs(
     order = review_order(keys, reference_key, first_runs)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    if basis_checks:
+        from .raw_shape_basis_reader import guard_output_root
+        guard_output_root(folder, [geometries[run].model for run in basis_checks])
     folder.mkdir(parents=True, exist_ok=False)
     known = {int(layer) for layer in roles}
     rows = []
@@ -527,8 +537,18 @@ def place_map_in_runs(
         },
         "runs": rows,
     }
+    if basis_checks:
+        index["raw_shape_basis"] = {run: {
+            "renderer": deepcopy(geometries[run].model["baseline_native_grid"]["renderer"]),
+            "authority": deepcopy(geometries[run].model["baseline_native_grid"]["raw_shape_basis_authority"]),
+            "parent_workspace_revision": deepcopy(geometries[run].model["baseline_native_grid"]["parent_workspace_revision"]),
+        } for run in basis_checks}
+        for checked in basis_checks.values():
+            checked.revalidate()
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    for checked in basis_checks.values():
+        checked.revalidate()
     os.replace(temporary, folder / "index.json")
     return dict(index, folder=str(folder))
 

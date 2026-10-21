@@ -910,7 +910,7 @@ def supervise_original_worker(lease, *, api=None):
     finalization_attempted = False
     from .first_qualification import BOUND_IMPORT_PROFILE, BoundServiceReserveObservations
     bound_watch = (BoundServiceReserveObservations(lease, command)
-        if lease.profile.get("format") == BOUND_IMPORT_PROFILE else None)
+        if lease.profile.get("format") in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1"} else None)
     terminal = None
     try:
         if bound_watch is not None:

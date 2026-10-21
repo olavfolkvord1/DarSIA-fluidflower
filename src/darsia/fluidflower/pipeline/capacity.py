@@ -6,7 +6,8 @@ lease. All services on one machine/volume MUST share capacity.state_directory.
 """
 from __future__ import annotations
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, fields as dataclass_fields
 from pathlib import Path, PureWindowsPath
 import ctypes
 import ast
@@ -87,10 +88,15 @@ def _native_layout_for_task(stores, series_id, task, config, rows=None):
     ordinary measured profiles. A RAW-only layout takes its native grid from the
     frames' one RAW source binding and names that binding, so it never equals a
     rig layout, and a profile or reference of one kind never matches the other.
+
+    A phase-one statistics task runs the same native and phase stages on the
+    same frame DATA, so its layout is read the same way and is the same
+    native-phase-n1 stage layout.
     """
     from .store_runtime import resolve_catalog
-    if (task.get("pipeline") != "native-phase-n1"
-            or config.get("format") != "darsia-native-phase-n1-run-v1"):
+    if ((task.get("pipeline"), config.get("format")) not in {
+            ("native-phase-n1", "darsia-native-phase-n1-run-v1"),
+            ("native-phase-statistics", "darsia-native-phase-statistics-run-v1")}):
         raise ValueError("This measured layout is only for the genuine native-phase-n1 route")
     if rows is None:
         rows = resolve_catalog(task, stores, series_id)
@@ -355,6 +361,27 @@ class SpaceEstimate:
                 + _integer(reserve_bytes, "Reserve bytes"))
 
 
+@dataclass(frozen=True)
+class OptionSpaceEstimate(SpaceEstimate):
+    """A qualified core estimate plus the budgets of the task's declared optional outputs.
+
+    products_per_frame_estimated_bytes and transient_estimated_bytes already
+    include the option bytes of one frame (and the per-run option bytes), so
+    the ledger reserves them as it reserves any estimate. Retained serialization
+    bytes are included in the transient total for the whole task, never in the
+    per-frame amount that committed-prefix progress releases.
+    """
+    option_frame_bytes: int = 0
+    option_run_bytes: int = 0
+    options: dict = None
+    retained_serialization_estimated_bytes: int = 0
+
+    @property
+    def products_estimated_bytes(self):
+        """The core's products plus the option bytes of every frame."""
+        return super().products_estimated_bytes + self.option_frame_bytes * self.case_count
+
+
 LEAN_ESTIMATE_MODEL = ("ESTIMATE, not a measurement: the chosen storage profile's documented "
                        "per-file sizes (storage_profile.estimate_job_bytes); no measured lean "
                        "profile exists yet and the full measured profile is never reused")
@@ -416,7 +443,35 @@ def _lean_writers(pipeline, config):
         rows += ["src/darsia/fluidflower/storage_resolution.py", "src/darsia/fluidflower/storage_outputs.py"]
         if pipeline == "n1":
             rows.append("src/darsia/fluidflower/storage_n1_outputs.py")
-    return rows
+    if pipeline == "n1":
+        # The staged lean contract binds its complete output/budget boundary,
+        # including the actual metadata ceiling and unchanged N15/N16 writers.
+        rows += ["src/darsia/fluidflower/pipeline/lean_capacity.py",
+                 "src/darsia/fluidflower/pipeline/n1_capacity.py",
+                 "src/darsia/fluidflower/pipeline/option_capacity.py",
+                 "src/darsia/fluidflower/pipeline/io_ops.py",
+                 "src/darsia_cache/publication_paths.py",
+                 "src/darsia/fluidflower/pipeline/job_queue.py",
+                 "src/darsia/fluidflower/pipeline/staged_data.py",
+                 "src/darsia/fluidflower/pipeline/job_inputs.py"]
+        if config.get("pixel_domain") is not None:
+            from .n1_capacity import PIXEL_WRITERS
+            rows += list(PIXEL_WRITERS)
+        if config.get("storage") is not None and "n16" in (config.get("pixel_domain") or {}):
+            from .n1_capacity import EXTENSIVE_WRITERS
+            rows += list(EXTENSIVE_WRITERS)
+    return list(dict.fromkeys(rows))
+
+
+def _pinned_writer_rows(repository, commit, relatives):
+    """Each writer source's Git-blob SHA-256 at the commit, verified unchanged on disk."""
+    identity = []
+    for relative in relatives:
+        original = subprocess.check_output(["git", "-C", str(repository), "show", commit + ":" + relative])
+        row = dict(relative_path=relative, sha256=hashlib.sha256(original).hexdigest())
+        _writer_identity(repository, commit, row)
+        identity.append(row)
+    return identity
 
 
 def _lean_writer_identity(repository, commit, pipeline, config):
@@ -425,16 +480,10 @@ def _lean_writer_identity(repository, commit, pipeline, config):
     No measured lean profile pins them yet, so they are recorded with the
     estimate and its reservation, never compared with a full measurement.
     """
-    identity = []
-    for relative in _lean_writers(pipeline, config):
-        original = subprocess.check_output(["git", "-C", str(repository), "show", commit + ":" + relative])
-        row = dict(relative_path=relative, sha256=hashlib.sha256(original).hexdigest())
-        _writer_identity(repository, commit, row)
-        identity.append(row)
-    return identity
+    return _pinned_writer_rows(repository, commit, _lean_writers(pipeline, config))
 
 
-def lean_estimate(task, config, *, repository):
+def lean_estimate(task, config, *, repository, stores=None, series_id=None, metadata_rows=None):
     """Admission estimate of a lean task: its own profile, never the full profile's."""
     from ..storage_profile import declared_storage_profile, run_estimate
     if declared_storage_profile(task) != "lean":
@@ -447,11 +496,64 @@ def lean_estimate(task, config, *, repository):
             or ("precision" in config and config["precision"] != task.get("precision"))
             or re.fullmatch(r"[0-9a-f]{40}", str(task.get("commit", ""))) is None):
         raise ValueError("Lean capacity estimate: task pipeline, precision, commit or exact case order differs")
+    if pipeline == "n1":
+        return _phase2_lean_estimate(stores, series_id, task, config,
+                                    repository=repository, metadata_rows=metadata_rows)
     value = run_estimate("lean", config, pipeline=pipeline)
     writers = _lean_writer_identity(repository, task["commit"], pipeline, config)
     return StorageProfileEstimate(name(task["run"]), len(cases), "lean", value["colour_intermediates"],
         pipeline, value["per_frame_bytes"], value["per_run_bytes"], value["inflight_bytes"], value,
         writers, task["commit"])
+
+
+def _phase2_lean_estimate(stores, series_id, task, config, *, repository, metadata_rows):
+    """Exact-dtype fallback/store bound for an explicitly sealed lean stage.
+
+    This computes result-space DATA only. The independent cache/provider
+    admission must still prove the common staged run before an actual claim;
+    neither a size projection nor a conversion sample grants that permission.
+    """
+    from . import lean_capacity
+    from .staged_data import validate_phase2_run
+    from .store_runtime import resolve_catalog
+    from ..storage_profile import job_storage_profile
+    if (task.get("format") != "darsia-alias-task-v1" or task.get("format_version") != 2
+            or job_storage_profile(task) != "lean" or task.get("pipeline") != "n1"
+            or task.get("backend") != "cpu" or task.get("precision") != "float32"):
+        raise ValueError("The staged lean result bound requires its exact version-two CPU/float32 task")
+    validate_phase2_run(config)
+    frames = config["frames"]
+    shape = (frames[0].get("current") or {}).get("phase_shape_hw")
+    if (not isinstance(shape, list) or len(shape) != 2
+            or any(type(size) is not int or size < 1 for size in shape)
+            or any((frame.get("current") or {}).get("phase_shape_hw") != shape for frame in frames)):
+        raise ValueError("Every staged lean frame must declare one exact label canvas")
+    rows = metadata_rows
+    if rows is None:
+        if stores is None or series_id is None:
+            raise ValueError("Staged lean budgeting needs the existing rooted input catalogue")
+        rows = resolve_catalog(task, stores, series_id)
+
+    def path_for_use(use, descriptor):
+        matches = [row for row in rows if use in row.uses]
+        if len(matches) != 1:
+            raise ValueError("One explicit rooted run-store input role required: " + use)
+        row = matches[0]
+        sha, size = lean_capacity._pin(descriptor)
+        if (row.reference.get("sha256") != sha or type(row.reference.get("bytes")) is not int
+                or row.reference["bytes"] != size):
+            raise ValueError("Run-store input role differs from its configuration SHA/size: " + use)
+        return row.path
+
+    store = lean_capacity.run_store_budget(config, path_for_use=path_for_use)
+    value = lean_capacity.phase2_lean_budget(config, canvas_hw=shape, store_bound=store)
+    if "opencl_acceleration" in config:
+        from darsia_cache.common_qualification import _compute_control
+        value["compute_control"] = _compute_control(config, "phase2")
+    writers = _lean_writer_identity(repository, task["commit"], "n1", config)
+    return StorageProfileEstimate(name(task["run"]), len(task["ordered_case_ids"]),
+        "lean", "keep", "n1", value["admitted_frame_bytes"], value["admitted_run_bytes"],
+        value["inflight_bytes"], value, writers, task["commit"], model=lean_capacity.MODEL)
 
 
 @dataclass(frozen=True)
@@ -693,10 +795,18 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
     if declared_storage_profile(task) == "lean":
         # The task's explicit choice binds its own estimate and writer identity;
         # the full measured profile below is never reused for a lean writer.
-        return lean_estimate(task, config, repository=repository)
+        return lean_estimate(task, config, repository=repository, stores=stores,
+                             series_id=series_id, metadata_rows=metadata_rows)
     _state, _reserve, binding = settings(stores, series_id)
     profile, _raw = read_bound(binding)
     from darsia_cache.first_qualification import PROVIDER, BOUND_JOB_PROFILE, resolve_profile
+    if profile.get("format") == "darsia-common-phase-qualified-provider-v1":
+        from darsia_cache.bootstrap import _exact_authority_list
+        profile = resolve_profile(binding, "jobs", lambda pin: read_bound(pin)[0],
+            stores_source={key: stores.source[key] for key in ("path", "sha256", "size_bytes")},
+            read_authorities=lambda pin: _exact_authority_list(pin, __file__))
+        return _common_result_estimate(stores, series_id, task, config, profile, binding,
+            repository=repository, metadata_rows=metadata_rows)
     if profile.get("format") == PROVIDER:
         from darsia_cache.bootstrap import _exact_authority_list
         profile = resolve_profile(binding, "jobs", lambda pin:read_bound(pin)[0],
@@ -755,6 +865,43 @@ def load_estimate(stores, series_id, task, config, *, repository, metadata_rows=
                         requested_native_layout=requested)
 
 
+def _common_result_estimate(stores, series_id, task, config, profile, binding, *, repository, metadata_rows):
+    """Use only a completed common stage's own result allowance and exact route."""
+    from darsia_cache.common_qualification import require_applicable, CommonStageEntitlement
+    from .option_capacity import retained_serialization_bytes
+    from .phase1_capacity import phase1_additions, validate_requests
+    stage = require_applicable(profile, task, config=config)
+    if stage == "phase2":
+        return _phase2_lean_estimate(stores, series_id, task, config,
+            repository=repository, metadata_rows=metadata_rows)
+    space = profile["result_spaces"][stage]
+    count, measured_count = len(task["ordered_case_ids"]), _integer(space["case_count"], "Qualified case count", positive=True)
+    maximum = _integer(space["maximum_output_bytes"], "Qualified whole-stage output allowance", positive=True)
+    if stage == "calibration":
+        original = space["configuration"]
+        current = task["configuration"]
+        if (current.get("sha256") != original["sha256"]
+                or current.get("bytes", current.get("size_bytes")) != original["size_bytes"]):
+            raise ValueError("The common refit output allowance covers only its actual qualified plan")
+    else:
+        declared = validate_requests(config)
+        requested = _native_layout_for_task(stores, series_id, task, config, metadata_rows)
+        _check_measured_native_layout(space, requested, other_run=True)
+        # Keep at least the whole proved stage, including its fixed files.
+        maximum *= (count + measured_count - 1) // measured_count
+        additions = phase1_additions(config, canvas_hw=requested["phase_shape_hw"],
+            precision=task["precision"], declared=declared, include_core=False)
+        extra, run_bytes = additions["frame_bytes"], additions["run_bytes"]
+        maximum += extra * (count + 1) + run_bytes
+        maximum += retained_serialization_bytes(count, extra, run_bytes=run_bytes)
+    scope = dict(stage=stage, configuration=deepcopy(task["configuration"]))
+    source = config.get("statistics", {}) if stage == "phase1" else config
+    if stage != "calibration" and "opencl_acceleration" in source:
+        scope["compute_control"] = deepcopy(profile["compute_profiles"][stage]["control"])
+    return CommonStageEntitlement(task["run"], count, maximum, deepcopy(binding), deepcopy(binding), scope,
+        model="Qualified common whole-stage allowance, scaled in complete stage blocks; declared optional bytes added")
+
+
 def _bound_result_estimate(stores, series_id, task, config, profile, binding, *, repository, metadata_rows):
     """Original estimate arithmetic on genuine closed whole-allstage inventory.
 
@@ -763,15 +910,56 @@ def _bound_result_estimate(stores, series_id, task, config, profile, binding, *,
     qualified (N188 D2): the qualified bytes per frame times the task's frame
     count, plus its largest frame in flight. Another run's layout must have the
     measured kind, grid and canvas; it names its own configurations and binding.
+
+    A task may declare the gas probability (option_capacity.OPTIONS). Its
+    request is checked before any profile read; it adds its own upper-bound
+    budget per frame to the core, and its writer is pinned at the task commit.
+    Every other optional output is refused, with the qualified-route refusal
+    and its reason, and so is the colour-path coordinate unless the qualified
+    profile measured it. A task without optional outputs takes the unchanged
+    path.
+
+    A full phase-one statistics task on the qualified head (commit, CPU,
+    float32) is admitted by phase1_capacity's rule as another run: the
+    measured preparation bytes per frame and the phase-one additions. A full
+    phase-two n1 task is admitted by n1_capacity's rule: the measured
+    mass-frame bytes per frame and the declared n1 options.
     """
     route = ("commit", "pipeline", "backend", "precision")
+    refusal = "Qualified output profile does not cover this full/allstage task on its qualified head and route"
     qualified = profile.get("scope")
-    if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in route)
-            or task.get("pipeline") != "native-phase-n1" or task.get("backend") != "cpu"
-            or task.get("precision") != "float32"
-            or config.get("storage") is not None or config.get("pixel_domain") is not None
-            or "gas_probability_storage" in config or config.get("probability_storage") is not None):
-        raise ValueError("Qualified output profile does not cover this full/allstage task on its qualified head and route")
+    # A phase-one statistics task and a phase-two n1 task run the qualified
+    # stages on another route.
+    staged = (task.get("pipeline") in {"native-phase-statistics", "n1"} and isinstance(qualified, dict)
+              and qualified.get("pipeline") == "native-phase-n1")
+    phase1 = staged and task.get("pipeline") == "native-phase-statistics"
+    phase2 = staged and task.get("pipeline") == "n1"
+    keys = ("commit", "backend", "precision") if staged else route
+    if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in keys)
+            or task.get("pipeline") != (task.get("pipeline") if staged else "native-phase-n1")
+            or task.get("backend") != "cpu" or task.get("precision") != "float32"):
+        raise ValueError(refusal)
+    optional = (config.get("storage") is not None or config.get("pixel_domain") is not None
+                or "gas_probability_storage" in config or config.get("probability_storage") is not None)
+    if optional:
+        from .option_capacity import option_budget, validate_requests
+        if phase1:
+            from .phase1_capacity import validate_requests
+        elif phase2:
+            from .n1_capacity import validate_requests
+        try:
+            declared = validate_requests(config)
+        except ValueError as error:
+            raise ValueError(refusal + ": " + str(error)) from error
+    colour = config.get("storage_profile")
+    if isinstance(colour, dict) and colour.get("store_colour_coordinate") is True:
+        from ..storage_profile import COLOUR_COORDINATE_ARCHIVE
+        result = profile.get("result_profile")
+        measurement = result.get("measurement") if isinstance(result, dict) else None
+        rows = measurement.get("inventory") if isinstance(measurement, dict) else None
+        if not any(isinstance(row, dict) and PureWindowsPath(str(row.get("relative_path", ""))).name
+                   == COLOUR_COORDINATE_ARCHIVE for row in (rows if isinstance(rows, list) else ())):
+            raise ValueError(refusal + ": the colour-path coordinate was not measured by the qualified profile")
     other_run = ({key: task.get(key) for key in (*route, "run", "ordered_case_ids")} != qualified
                  or profile.get("configuration") != task.get("configuration"))
     actual = profile["result_profile"]
@@ -786,10 +974,46 @@ def _bound_result_estimate(stores, series_id, task, config, profile, binding, *,
         raise ValueError("Actual closed output writer/case/source profile is incomplete")
     for writer in actual["writers"]:
         _profile_writer_identity(repository, actual["measured_commit"], task["commit"], writer)
+    if phase2:
+        # n1 has no native stage: its frames' label grid is checked instead.
+        from .n1_capacity import n1_estimate
+        try:
+            return n1_estimate(task, config, actual, binding, declared=declared if optional else (),
+                               repository=repository)
+        except ValueError as error:
+            raise ValueError(refusal + ": " + str(error)) from error
     requested = _native_layout_for_task(stores, series_id, task, config, metadata_rows)
-    return estimate_run(task, config, actual, measurement=actual["measurement"],
-        completion=actual["completion"], requested_native_layout=requested,
-        profile_identity=dict(binding), other_run=other_run)
+    if phase1:
+        from .phase1_capacity import phase1_estimate
+        try:
+            return phase1_estimate(task, config, actual, binding, requested=requested,
+                                   declared=declared if optional else (), repository=repository)
+        except ValueError as error:
+            raise ValueError(refusal + ": " + str(error)) from error
+    if not optional:
+        return estimate_run(task, config, actual, measurement=actual["measurement"],
+            completion=actual["completion"], requested_native_layout=requested,
+            profile_identity=dict(binding), other_run=other_run)
+    try:
+        budget = option_budget(config, layout=requested, precision=task["precision"])
+    except ValueError as error:
+        raise ValueError(refusal + ": " + str(error)) from error
+    writers = _pinned_writer_rows(repository, task["commit"], budget.writers)
+    core = estimate_run(task, {key: value for key, value in config.items() if key not in declared},
+        actual, measurement=actual["measurement"], completion=actual["completion"],
+        requested_native_layout=requested, profile_identity=dict(binding), other_run=other_run)
+    values = {field.name: getattr(core, field.name) for field in dataclass_fields(SpaceEstimate)}
+    from .option_capacity import retained_serialization_bytes, run_file_bytes
+    retained = retained_serialization_bytes(core.case_count,
+        core.transient_estimated_bytes + budget.frame_bytes,
+        run_bytes=run_file_bytes(actual["measurement"]["inventory"], actual["measured_case_ids"]) + budget.run_bytes)
+    values.update(
+        products_per_frame_estimated_bytes=core.products_per_frame_estimated_bytes + budget.frame_bytes,
+        transient_estimated_bytes=core.transient_estimated_bytes + budget.frame_bytes + budget.run_bytes + retained,
+        model=core.model + "; " + budget.model)
+    return OptionSpaceEstimate(**values, option_frame_bytes=budget.frame_bytes,
+        option_run_bytes=budget.run_bytes, retained_serialization_estimated_bytes=retained,
+        options=dict(declared=list(budget.options), parts=budget.parts, writers=writers))
 
 
 def volume_info(root):
@@ -1360,7 +1584,7 @@ def report(estimate, volume, other_remaining, reserve):
     free = _integer(volume["free_bytes"], "Actual free bytes")
     message = f"{estimate.run}: estimated needed {needed} bytes / free {free} bytes (this job, estimated transient space and reserve; estimate, not coordinated across hosts)"
     if isinstance(estimate, StorageProfileEstimate):
-        message += "; storage profile " + estimate.storage_profile + ": " + LEAN_ESTIMATE_MODEL
+        message += "; storage profile " + estimate.storage_profile + ": " + estimate.model
     return dict(**asdict(estimate), needed_bytes=needed, free_bytes=free,
                 other_active_remaining_bytes=other, reserve_bytes=reserve,
                 other_active_remaining_included_in_results_estimate=False,
@@ -1428,11 +1652,18 @@ class ClaimCapacity:
         try:
             config = configuration_for_task(self.runtime.stores, self.runtime.job["series_id"], task, rows)
             first=getattr(getattr(getattr(self.runtime,"cache_adapter",None),"lease",None),"first_qualification",None)
-            if first is not None and first.reference_build:
+            lease = getattr(getattr(self.runtime, "cache_adapter", None), "lease", None)
+            if first is not None and getattr(first, "common_mode", False):
+                from darsia_cache.common_qualification import common_output_entitlement
+                estimate = common_output_entitlement(self.runtime, task, config, rows)
+            elif first is not None and first.reference_build:
                 estimate=n43_entitlement(self.runtime,task,config,rows)
             elif first is not None and first.bound_mode:
                 estimate = first_output_entitlement(self.runtime, task, config, rows)
             else:
+                if getattr(lease, "profile", {}).get("format") == "darsia-common-phase-import-profile-v1":
+                    from darsia_cache.common_qualification import require_applicable, JOB_PROFILE
+                    require_applicable(dict(lease.profile, format=JOB_PROFILE), task, config=config)
                 estimate = load_estimate(self.runtime.stores, self.runtime.job["series_id"], task, config,
                                          repository=Path(__file__).resolve().parents[4], metadata_rows=rows)
             # Slow original input admission/profile reads run outside this local
@@ -1532,8 +1763,8 @@ def whole_job_report(stores, series_id, tasks, configs, *, repository, job_root=
     combined = volume["free_bytes"] >= needed and cache["complete"] and cache["sufficient"]
     cache_message = cache["state"] + (": " + cache["reason"] if "reason" in cache else
         f"; required total {cache['required_cache_bytes']} bytes, quota headroom {cache['quota_headroom_bytes']} bytes")
-    profile_note = ("; lean runs: " + LEAN_ESTIMATE_MODEL
-                    if any(isinstance(row, StorageProfileEstimate) for row in estimates) else "")
+    lean_models = list(dict.fromkeys(row.model for row in estimates if isinstance(row, StorageProfileEstimate)))
+    profile_note = "; lean runs: " + "; ".join(lean_models) if lean_models else ""
     return dict(format="darsia-whole-job-expected-space-v1", machine_id=stores.machine_id,
         results_root=str(root), results_protocol=admission.protocol, results_local=admission.local,
         runs=[asdict(row) for row in estimates], products_expected_bytes=products,

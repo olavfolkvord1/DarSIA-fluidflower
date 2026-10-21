@@ -93,6 +93,8 @@ class DataConfig:
         },
     )
     """Whether to use the cache folder for reading/writing cached images."""
+    raw_camera: dict | None = field(default=None, metadata={"hidden": True})
+    """Explicit calibrated camera-U profile for RAW rig setup and image reads."""
 
     @property
     def folder(self) -> Path:
@@ -105,7 +107,12 @@ class DataConfig:
         require_data: bool,
         require_results: bool,
     ) -> "DataConfig":
+        """Load ordered data paths, dates and the optional calibrated RAW camera binding."""
         sec = _get_section_from_toml(path, "data")
+
+        from darsia.fluidflower.rig_raw_input import camera_binding
+
+        self.raw_camera = camera_binding(sec.get("raw_camera"), path)
 
         # Get folder(s) — support both legacy 'folder' (singular) and current
         # 'folders' (plural)

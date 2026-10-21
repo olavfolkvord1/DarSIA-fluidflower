@@ -3225,9 +3225,13 @@ class _AdoptionWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        from darsia.fluidflower import map_adoption as ma
-
+        """Check RAW-basis presence before drawing and preparing the selected saved map."""
         try:
+            from darsia.fluidflower import map_adoption as ma
+            from .raw_shape_basis_reader import require_basis_index
+
+            require_basis_index(self.options["geometry_index"],
+                                [self.record["run_id"], *self.options["runs"]])
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
@@ -3236,7 +3240,6 @@ class _AdoptionWorker(QObject):
                 from .layer_painting_fixtures import version_fixture_underlay
                 underlay = version_fixture_underlay(self.record, frame=self.frame)
                 if underlay is not None:
-                    layers = underlay.analysis_layers
                     fixture_options = dict(fixture_underlay=underlay, fixture_frame=self.frame)
             result = ma.prepare_adoption(
                 self.options["destination"],
@@ -3258,6 +3261,9 @@ class _AdoptionWorker(QObject):
                 current_labels=self.options.get("current_labels"),
                 progress=self.progress.emit,
                 **fixture_options,
+                painting_version=self.record,
+                painting_frame=self.frame,
+                painting_project=self.options.get("project"),
             )
         except Exception as error:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -7846,6 +7852,7 @@ class LayerPainterView(QWidget):
                 "runs": list(runs if runs is not None else self._series_runs()),
                 "approval": self._approval_for_version(record),
                 "current_labels": current_labels or self._current_label_fields(),
+                "project": self.project,
             },
         )
         worker.moveToThread(thread)

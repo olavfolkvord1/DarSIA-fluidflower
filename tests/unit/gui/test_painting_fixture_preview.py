@@ -1,6 +1,7 @@
 """Actual private painting view: opt-in underlay, guards and immutable inputs."""
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower.series_geometry import RigFrame
@@ -124,7 +125,7 @@ def test_stale_worker_never_publishes_after_drawing_changes_or_preview_closes(vi
 
 
 def test_adoption_worker_replays_real_saved_fixture_version_before_sink(view, qtbot, monkeypatch, tmp_path):
-    from darsia.fluidflower import map_adoption
+    from darsia.fluidflower import map_adoption, raw_shape_basis_reader
     from darsia.fluidflower import series_layer_view as module
     controller = _fixture(view, complete=True)
     # Use the original immutable manual saver/reader, without performing adoption.
@@ -133,11 +134,20 @@ def test_adoption_worker_replays_real_saved_fixture_version_before_sink(view, qt
     saved = manual.manual_map(view.session, (80, 60), frame=frame)
     record = manual.save_manual_version(view.project, view.session, saved, name="Private map")
     approval = manual.approve_manual_version(record)
-    seen = {}
-    monkeypatch.setattr(map_adoption, "prepare_adoption",
-        lambda destination, layers, **kwargs: seen.update(layers=layers, **kwargs) or {"private": True})
+    # Keep this as real fixture replay before its already mocked sink, with
+    # no claim that the synthetic index has scientific RAW-basis authority.
+    seen, preflights = {}, []
+    index = tmp_path / "unused-index.json"
+    def preflight(path, runs):
+        preflights.append((Path(path), list(runs)))
+    def capture(destination, layers, **kwargs):
+        assert preflights == [(index, [view.session.run_id, view.session.run_id])]
+        seen.update(layers=layers, **kwargs)
+        return {"private": True}
+    monkeypatch.setattr(raw_shape_basis_reader, "require_basis_index", preflight)
+    monkeypatch.setattr(map_adoption, "prepare_adoption", capture)
     worker = module._AdoptionWorker(record, frame, dict(destination=tmp_path / "unused",
-        geometry_index=tmp_path / "unused-index.json", runs=[view.session.run_id], approval=approval))
+        geometry_index=index, runs=[view.session.run_id], approval=approval))
     failures = []
     worker.failed.connect(failures.append)
     worker.run()

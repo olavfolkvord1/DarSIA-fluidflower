@@ -211,6 +211,9 @@ def prepare_adoption(
     progress: Callable[[str], None] | None = None,
     fixture_underlay: Any | None = None,
     fixture_frame: Any | None = None,
+    painting_version: Mapping[str, Any] | None = None,
+    painting_frame: Any = None,
+    painting_project: Any = None,
 ) -> dict[str, Any]:
     """Write a new adoption preparation folder for every run; adopt nothing.
 
@@ -225,23 +228,61 @@ def prepare_adoption(
     the regions (layer id, name, role, facies, facies id) and what an
     adoption still lacks. Facies without an id in ``facies_ids`` stay
     without one.
+
+    Explicit ``painting_version`` preparations instead bind the actual approved
+    immutable session and map, separately freezing the provided current frame
+    and its source context. Their later Check derives one facies row
+    per used painting facies, carrying porous extra cells by name and leaving
+    nonporous extra cells blank with provenance; it makes no
+    manual label-to-old-facies choices. Legacy preparations are unchanged.
     """
 
     from darsia.fluidflower.map_placement import read_run_geometry
     from darsia.fluidflower.project import sha256_file
 
+    painting_binding = None
+    analysis_derivation = None
+    if painting_version is not None:
+        from .raw_shape_basis_reader import require_basis_index
+        require_basis_index(geometry_index, [reference_run, *runs])
+        from .painted_adoption_table import capture_version, verify_version_summary
+        painting_binding = capture_version(painting_version, version.get("approval"), painting_frame, layers,
+                                          project=painting_project)
+        verify_version_summary(painting_binding, dict(version))
     index_path = Path(geometry_index)
+    frozen_index = _bound(index_path) if painting_binding is not None else None
     geometries = read_run_geometry(index_path)
+    if frozen_index is not None:
+        from .painted_adoption_table import _checked
+        _checked(frozen_index)
     reference_key = str(reference_run).casefold()
     if reference_key not in geometries:
         raise ValueError(f"The geometry index has no model for the reference run {reference_run}")
     reference = geometries[reference_key]
+    geometry_proof = None
+    if painting_binding is not None:
+        from .painted_adoption_geometry import make_proof
+        from .painted_adoption_table import _checked, _same
+        selected = {reference_key, *(str(run).casefold() for run in runs)}
+        model_bindings = {key: _bound(Path(geometries[key].source))
+                          for key in sorted(selected) if key in geometries}
+        geometry_proof = make_proof(painting_binding, model_bindings)
+        if any(not _same(geometries[key].model, _checked(bound, metadata=True))
+               for key, bound in model_bindings.items()):
+            raise ValueError("A measured model changed between selection and source admission")
     layers = np.ascontiguousarray(layers, dtype=np.uint8)
     if reference.shape_hw is not None and layers.shape != reference.shape_hw:
         raise ValueError("The map is not on the reference run's grid")
     if fixture_underlay is not None:
-        from .layer_painting_fixtures import checked_for_adoption
-        fixture_underlay = checked_for_adoption(fixture_underlay, layers, version, frame=fixture_frame)
+        if painting_binding is not None:
+            from .painted_adoption_table import checked_fixture_analysis
+            fixture_underlay, analysis_derivation = checked_fixture_analysis(painting_binding, fixture_underlay)
+            if fixture_frame is None or fixture_frame.to_dict() != painting_binding["frame"]:
+                raise ValueError("The fixture and saved painting preparation frames differ")
+            layers = fixture_underlay.analysis_layers
+        else:
+            from .layer_painting_fixtures import checked_for_adoption
+            fixture_underlay = checked_for_adoption(fixture_underlay, layers, version, frame=fixture_frame)
         frozen_roles = fixture_underlay.provenance["roles"]
         if any(str(roles.get(int(key))) != value for key, value in frozen_roles.items()):
             raise ValueError("The fixture underlay's frozen layer roles differ from the adoption roles")
@@ -249,7 +290,16 @@ def prepare_adoption(
         raise ValueError("A ColorChecker map needs its frozen version's drawn-only underlay")
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    if geometry_proof is not None and "raw_shape_basis" in geometry_proof:
+        from .raw_shape_basis_reader import guard_output_root
+        guard_output_root(folder, [geometries[key].model for key in model_bindings])
     folder.mkdir(parents=True, exist_ok=False)
+    if geometry_proof is not None:
+        from .painted_adoption_geometry import write_configuration_copies, basis_label_fields
+        write_configuration_copies(folder, geometry_proof)
+        basis_labels = basis_label_fields(painting_binding, geometry_proof, None, folder)
+    else:
+        basis_labels = None
     # The map itself and its approval, bound for the Store's replay.
     np.savez_compressed(folder / "source_map.npz", array=layers)
     if fixture_underlay is not None:
@@ -273,7 +323,10 @@ def prepare_adoption(
         except ValueError as error:
             rows.append({"run_id": run, "status": "no native grid", "error": str(error)})
             continue
-        current = dict(current_labels(run) or {}) if current_labels is not None else {}
+        if basis_labels is not None:
+            current = dict(basis_labels[run])
+        else:
+            current = dict(current_labels(run) or {}) if current_labels is not None else {}
         if current.get("shape_hw") and tuple(current["shape_hw"]) != labels.shape:
             rows.append(
                 {
@@ -337,14 +390,14 @@ def prepare_adoption(
     if not_prepared:
         blockers.append(f"Not prepared: {', '.join(not_prepared)}.")
     without = sorted({row["facies"] for row in regions if row["facies"] and row["facies_id"] is None})
-    if without:
+    if without and painting_binding is None:
         blockers.append(f"No facies id for: {', '.join(without)} ({FACIES_IDS_PENDING}).")
     index = {
         "format": PREPARATION_FORMAT,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "reference_run": reference_key,
         "map_version": dict(version),
-        "geometry_index": {"path": str(index_path.resolve()), "sha256": sha256_file(index_path)},
+        "geometry_index": frozen_index if frozen_index is not None else {"path": str(index_path.resolve()), "sha256": sha256_file(index_path)},
         "source_map": {"path": "source_map.npz", **{
             key: value for key, value in _bound(folder / "source_map.npz").items() if key != "path"
         }},
@@ -359,8 +412,20 @@ def prepare_adoption(
     if fixture_underlay is not None:
         index["source_fixture_underlay"] = source_underlay
         index["fixture_frame"] = fixture_frame.to_dict() if fixture_frame is not None else None
+        if analysis_derivation is not None:
+            index["painting_analysis_derivation"] = analysis_derivation
+    if painting_binding is not None:
+        index["painting_facies"] = painting_binding
+        index["painting_geometry"] = geometry_proof
+        from .painted_adoption_table import prepare_outside_proof
+        proof = prepare_outside_proof(folder, painting_binding, rows)
+        if proof is not None:
+            index["outside_frame_proof"] = proof
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if painting_binding is not None:
+        from .painted_adoption_table import verify_preparation_publication
+        verify_preparation_publication(index, folder)
     os.replace(temporary, folder / "index.json")
     return dict(index, folder=str(folder))
 
@@ -407,7 +472,7 @@ def label_values(preparation: Mapping[str, Any]) -> list[int]:
 def adoption_candidate(
     current: Mapping[str, Any],
     folder: Path | str,
-    facies_ids: Mapping[int, int],
+    facies_ids: Mapping[int, int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """A geometry revision candidate adopting a prepared painted map.
 
@@ -441,16 +506,29 @@ def adoption_candidate(
     if display not in prepared:
         raise ValueError(f"The display reference run {display.upper()} is not prepared")
     values = label_values(preparation)
-    missing = [value for value in values if value not in facies_ids]
+    if "painting_facies" in preparation:
+        from .painted_adoption_table import candidate_table
+        contract, regions, unit, table_result = candidate_table(current, preparation, folder)
+        automatic = {int(row["label_id"]): int(row["facies_id"]) for row in regions}
+        if facies_ids is not None and (dict(facies_ids) != automatic
+                or any(type(key) is not int or type(value) is not int for key, value in facies_ids.items())):
+            raise ValueError("Approved painting facies IDs are automatic; manual remapping is not allowed")
+        facies_ids = automatic
+        config["painted_adoption_table"] = contract
+        config["permeability_unit"] = unit
+    else:
+        regions = None
+    missing = [value for value in values if value not in (facies_ids or {})] if regions is None else []
     if missing:
         raise ValueError(
             f"No facies id for label(s) {', '.join(str(value) for value in missing)} "
             f"({FACIES_IDS_PENDING})"
         )
-    table = {int(row["facies_id"]): row for row in facies_table(config)}
+    table = {int(row["facies_id"]): row for row in facies_table(config)} if regions is None else {}
     layers = {int(row["layer_id"]): row for row in preparation.get("regions") or []}
-    regions = []
-    for value in values:
+    automatic_regions = regions
+    regions = [] if regions is None else regions
+    for value in (values if automatic_regions is None else ()):
         facies_id = int(facies_ids[value])
         if facies_id not in table:
             raise ValueError(f"Facies id {facies_id} is not in the series' facies table")
@@ -541,6 +619,11 @@ def adoption_candidate(
         "regions": regions,
         "display_reference_run": display,
     }
+    if automatic_regions is not None:
+        from .painted_adoption_table import frame_basis_text
+        summary["facies_table"] = dict(columns=list(table_result.columns),
+            rows=[dict(row) for row in table_result.rows], sha256=table_result.sha256)
+        summary["frame_basis"] = frame_basis_text(preparation["painting_facies"])
     return config, summary
 
 

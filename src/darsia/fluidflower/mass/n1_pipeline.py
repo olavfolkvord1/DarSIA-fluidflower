@@ -375,6 +375,8 @@ class N1Pipeline:
 
         config = dict(config, geometry_fields=_geometry_fields(config, geometry_fields))
         self.config, self.math = config, pixel_math
+        if "opencl_acceleration" in config and hasattr(pixel_math, "configure_opencl"):
+            pixel_math.configure_opencl(config["opencl_acceleration"])
         if "pixel_domain" in config:
             from .pixel_pipeline import validate_policy
 
@@ -987,7 +989,19 @@ def _storage_facts(output):
     return dict(local_retained=local,direct_NAS_write=not local,direct_local_write=local)
 
 
-def _publish_frame(
+def _publish_frame(output, manifest, manifest_asset, spec, evaluated, config,
+                   backend, position, compute_seconds, *, storage_context=None, lean=None):
+    """Publish through the existing writer, with a lean-only metadata guard."""
+    if lean is None:
+        return _publish_frame_content(output, manifest, manifest_asset, spec, evaluated,
+            config, backend, position, compute_seconds, storage_context=storage_context, lean=lean)
+    from ..pipeline.io_ops import LEAN_METADATA_BYTES, metadata_ceiling
+    with metadata_ceiling(LEAN_METADATA_BYTES):
+        return _publish_frame_content(output, manifest, manifest_asset, spec, evaluated,
+            config, backend, position, compute_seconds, storage_context=storage_context, lean=lean)
+
+
+def _publish_frame_content(
     output,
     manifest,
     manifest_asset,
@@ -1016,9 +1030,8 @@ def _publish_frame(
     retry_transient(lambda: final.parent.mkdir(parents=True, exist_ok=True))
     if final.exists():
         raise FileExistsError(final)
-    temporary = final.parent / (
-        "." + spec["case_id"] + "." + uuid.uuid4().hex + ".partial"
-    )
+    from darsia_cache.publication_paths import partial_name
+    temporary = final.parent / partial_name(spec["case_id"], uuid.uuid4().hex)
     _create_directory(temporary)
     response, result, prediction = (
         evaluated["response"],
@@ -1316,7 +1329,20 @@ def run_n1(
         cv2.setNumThreads(previous_cv2_threads)
 
 
-def _run_n1(
+def _run_n1(task: dict, output: Path, backend: str, precision: str,
+            on_progress: Callable | None = None, *, thread_runtime: dict, geometry_fields=None) -> dict:
+    """Scope the lean metadata bound around the original numerical runner."""
+    from ..storage_profile import declared_storage_profile
+    if declared_storage_profile(task) != "lean":
+        return _run_n1_content(task, output, backend, precision, on_progress,
+            thread_runtime=thread_runtime, geometry_fields=geometry_fields)
+    from ..pipeline.io_ops import LEAN_METADATA_BYTES, metadata_ceiling
+    with metadata_ceiling(LEAN_METADATA_BYTES):
+        return _run_n1_content(task, output, backend, precision, on_progress,
+            thread_runtime=thread_runtime, geometry_fields=geometry_fields)
+
+
+def _run_n1_content(
     task: dict,
     output: Path,
     backend: str,
@@ -1346,6 +1372,7 @@ def _run_n1(
     else:
         io_binding.require_output(output)
         unc_only = True  # DataReader requires the positive run binding for local I/O.
+    from ..storage_profile import run_record_files
     config = load_n1_run(
         configuration, unc_only=unc_only, geometry_fields=geometry_fields
     )
@@ -1383,7 +1410,7 @@ def _run_n1(
     resume_asset = None
     if task.get("resume_from") is not None:
         resume_asset = _write_json(
-            output / "resume.json",
+            output / run_record_files(config)["resume"],
             dict(
                 source=task["resume_from"],
                 prefix_case_ids=resume["prefix_case_ids"],
@@ -1458,7 +1485,7 @@ def _run_n1(
             manifest["resume_checkpoint"] = resume_asset
         if lean is not None:
             manifest["storage_profile"] = lean.manifest_record()
-        manifest_asset = _write_json(output / "manifest.json", manifest)
+        manifest_asset = _write_json(output / run_record_files(config)["manifest"], manifest)
         for position, spec in enumerate(config["frames"]):
             if position < resumed:
                 continue
@@ -1514,7 +1541,7 @@ def _run_n1(
             from ..pipeline.runner import scalar_table
 
             table = scalar_table(
-                records, config["pixel_domain"]["table_fields"], output / "mass_table.csv"
+                records, config["pixel_domain"]["table_fields"], output / run_record_files(config)["scalar_table"]
             )
         wall = time.perf_counter() - clock
         outcome = dict(

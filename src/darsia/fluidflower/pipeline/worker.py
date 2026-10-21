@@ -427,6 +427,7 @@ def _run_tasks(
             result["opencv_ipp_worker"] = dict(start=ipp_start, completed=require_ipp_off("pipeline-worker:complete"))
             shared.complete(claim, result)
             if io_runtime is not None:
+                io_runtime.finalize_common(claim)
                 io_runtime.capacity_close(claim)
             messages.put(
                 dict(kind="completed", run=task["run"], attempt_id=claim.token)

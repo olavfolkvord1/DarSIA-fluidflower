@@ -484,7 +484,8 @@ class FirstQualification:
                 or self.provider["namespace_admission"] != lease.document["cache_bootstrap"]["namespace_admission"]
                 or lease.policy.profiles.get("jobs")!=self.provider_binding
                 or lease.policy.volume_cap is None
-                or lease.policy.quota_bytes not in {500*1024**3,150*1024**3}):
+                or type(lease.policy.quota_bytes) is not int or lease.policy.quota_bytes <= 0
+                or getattr(lease.policy.volume_cap, "maximum_size_bytes", None) != lease.policy.quota_bytes):
             raise CachePolicyError("First output/cache namespace is not the actual accepted one-host cap")
 
     def service_entitlement(self, lease):
@@ -815,12 +816,14 @@ class FiniteObservations:
         return result
 
 
-def checked_bound_output_scope(value):
+def checked_bound_output_scope(value, *, common=False):
     """One current output root, not the old reference tree or the cache cap."""
     _exact_keys(value, {"format", "role", "path", "identity", "stat_identity", "volume_id",
         "entry_limit", "sample_period_seconds"}, "Exact current Q104 output scope required")
     path = PureWindowsPath(value["path"])
-    if (value["format"] != "darsia-first-q104-output-scope-v1" or value["role"] != "results"
+    expected_format = ("darsia-common-phase-output-scope-v1" if common
+                       else "darsia-first-q104-output-scope-v1")
+    if (value["format"] != expected_format or value["role"] != "results"
             or not path.is_absolute() or ".." in path.parts
             or not isinstance(value["identity"], dict) or not value["identity"]
             or not isinstance(value["volume_id"], str) or not value["volume_id"]
@@ -834,7 +837,7 @@ def checked_bound_output_scope(value):
     return deepcopy(value)
 
 
-def bound_output_snapshot(scope, *, entitlement_bytes, include_file_stats=False):
+def bound_output_snapshot(scope, *, entitlement_bytes, include_file_stats=False, common=False):
     """N43's finite no-follow length route, confined to ONE output-only root.
 
     No payload is read. Rename anomalies remain explicit lower-bound samples;
@@ -843,8 +846,9 @@ def bound_output_snapshot(scope, *, entitlement_bytes, include_file_stats=False)
     import stat
     from .capacity import volume_info
     from .bootstrap import _utc
-    scope = checked_bound_output_scope(scope)
-    if type(entitlement_bytes) is not int or entitlement_bytes < FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES:
+    scope = checked_bound_output_scope(scope, common=common)
+    minimum = 1 if common else FIRST_OUTPUT_BASE_ENTITLEMENT_BYTES
+    if type(entitlement_bytes) is not int or entitlement_bytes < minimum:
         raise CachePolicyError("Actual predeclared Q119 entitlement required before sampling")
     root = Path(scope["path"])
     before = _reference_stat_identity(_reference_directory_stat(root))
@@ -919,6 +923,20 @@ class BoundOutputObservations(FiniteObservations):
     """Only the existing BOUND branch adds a separate sampled output watch."""
     def __init__(self, first, *, clock=None):
         super().__init__(first, clock=clock)
+        self.common = getattr(first, "common_mode", False)
+        if self.common:
+            from .common_qualification import OUTPUT
+            if not first.bound_mode or first.output_entitlement.get("format") != OUTPUT:
+                raise CachePolicyError("Common output watch requires its actual stage entitlement")
+            self.entitlement_bytes = first.output_entitlement["maximum_output_bytes"]
+            if type(self.entitlement_bytes) is not int or self.entitlement_bytes <= 0:
+                raise CachePolicyError("Positive released common-stage output bound required")
+            self.output_scope = checked_bound_output_scope(
+                first.output_entitlement["watched_output_scope"], common=True)
+            self.output_samples = []; self.last_output_start = None; self.final_output_snapshot = None
+            self.output_stop = None; self.output_error = None
+            self.retained_cache_before = None; self.retained_cache_after = None
+            return
         if (not first.bound_mode or not isinstance(first.output_entitlement, dict)
                 or first.output_entitlement.get("format") != BOUND_OUTPUT_ADMINISTRATION):
             raise CachePolicyError("Bound output watch requires its actual current output-scope plan")
@@ -934,20 +952,31 @@ class BoundOutputObservations(FiniteObservations):
         if output == cache or output in cache.parents or cache in output.parents:
             raise CachePolicyError("Q104 output scope must be disjoint from cache accounting")
         started = self.clock()
-        current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes)
+        options = {"common": True} if self.common else {}
+        current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes, **options)
         if (current["logical_bytes"] != 0 or current["observed_scan_anomalies"]
                 or current["volume"]["free_bytes"] - PHYSICAL_RESERVE_BYTES < self.entitlement_bytes):
             raise CachePolicyError("Fresh complete output scope and free minus original40GiB covering wholeQ104 required")
         current["started_monotonic_seconds"] = started
         current["elapsed_seconds"] = self.clock() - started
         self.output_admission = current
+        if self.common:
+            with lease.ledger.locked(create_binding=False):
+                self.retained_cache_before = lease.measure(lease.policy.root,
+                    include_file_stats=True, hash_files=True)
 
     def observe_output(self, owned, *, force=False):
         started = self.clock()
         if not force and self.last_output_start is not None and started - self.last_output_start < 1:
             return
         try:
-            current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes, include_file_stats=force)
+            options = {"common": True} if self.common else {}
+            current = bound_output_snapshot(self.output_scope, entitlement_bytes=self.entitlement_bytes,
+                                            include_file_stats=force, **options)
+            if self.common and force:
+                with owned.lease.ledger.locked(create_binding=False):
+                    self.retained_cache_after = owned.lease.measure(owned.lease.policy.root,
+                        include_file_stats=True, hash_files=True)
         except BaseException as error:
             import traceback
             self.output_error = dict(error_type=type(error).__name__, message=str(error), traceback=traceback.format_exc())
@@ -1000,9 +1029,12 @@ class BoundOutputObservations(FiniteObservations):
         accepted_retirement = isinstance(eligibility, dict) and eligibility.get("original_retirement_verifier_accepted") is True
         closed = (kernel_retired and retirement is not None and accepted_retirement
             and final is not None and not final["observed_scan_anomalies"] and self.output_error is None)
+        if self.common:
+            closed = closed and self.retained_cache_before is not None and self.retained_cache_after is not None
         complete = (closed and self.output_stop is None and not self.reserve_crossed
             and terminal.get("wrapper_exit_code") == 0)
-        return dict(format="darsia-first-q104-closed-output-diagnostic-v1", request=self.first.binding,
+        result = dict(format=("darsia-common-phase-closed-output-diagnostic-v1" if self.common
+                            else "darsia-first-q104-closed-output-diagnostic-v1"), request=self.first.binding,
             provider=self.first.provider_binding, stores_source=self.first.stores_source,
             scope=self.first.provider["scope"],
             output_plan=self.first.request["output_entitlement_plan"], output_scope=self.output_scope,
@@ -1019,6 +1051,15 @@ class BoundOutputObservations(FiniteObservations):
             output_hard_quota=False, file_payload_SHA_or_arrays_read=False, original_comparison=None,
             state=("CLOSED_DIAGNOSTIC_ONLY" if complete else "STOP_OR_INCOMPLETE_DIAGNOSTIC"),
             complete=complete, passed=False, no_result_space_profile_created=True, no_ordinary_profile_created=True)
+        if self.common:
+            result.update(retained_cache_before=self.retained_cache_before,
+                retained_cache_after=self.retained_cache_after,
+                retained_cache_payload_hashes_read=True,
+                file_payload_SHA_or_arrays_read=True, result_payload_SHA_or_arrays_read=False,
+                scientific_arrays_decoded=False,
+                retained_cache_files_deleted_by_this_code=False,
+                retained_cache_scope_is_exhaustive_OS_write_proof=False)
+        return result
 
 
 class BoundServiceReserveObservations:
@@ -1029,7 +1070,7 @@ class BoundServiceReserveObservations:
     """
     def __init__(self, lease, command, *, clock=None):
         from types import SimpleNamespace
-        if lease.profile.get("format") != BOUND_IMPORT_PROFILE:
+        if lease.profile.get("format") not in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1"}:
             raise CachePolicyError("The ordinary bound watchdog needs an actually resolved bound import profile")
         positions = [i for i, value in enumerate(command) if value == "--job"]
         if len(positions) != 1 or positions[0]+1 >= len(command):
@@ -1099,6 +1140,48 @@ class BoundServiceReserveObservations:
             raise CachePolicyError("Ordinary bound operational reserve STOP; no recovered PASS or automatic finalization")
 
 
+def _close_common_stage_after_retirement(first, lease, native_completion):
+    """The existing controller's final common seam accepts metadata only after close."""
+    if (not getattr(first, "common_mode", False) or native_completion.get("passed") is not True
+            or native_completion.get("observer_native_handles_closed") is not True):
+        raise CachePolicyError("Common closure requires original accepted retirement and closed native handles")
+    from .common_qualification import close_stage
+    try:
+        return close_stage(first, lease)
+    except BaseException as error:
+        held = dict(request=first.binding, provider=first.provider_binding,
+            error_type=type(error).__name__, message=str(error), no_retry=False,
+            retry_action="metadata-close-only", scientific_worker_rerun_allowed=False,
+            native_completion_retained=True, reservation_closed=False)
+        try:
+            lease._record("first-held-" + uuid.uuid4().hex + ".json", held)
+        except BaseException as diagnostic:
+            error.add_note("Retryable metadata-close diagnostic was not recorded: " + repr(diagnostic))
+        raise
+
+
+def retry_common_stage_close(first, lease):
+    """Retry a retired common stage's metadata only; never consume or launch again."""
+    if not getattr(first, "common_mode", False):
+        raise CachePolicyError("Metadata-close recovery requires the exact released common request")
+    from .common_qualification import _slot_read as common_slot_read
+    native, _pin = common_slot_read(first.provider, "native_completion")
+    return _close_common_stage_after_retirement(first, lease, native)
+
+
+def _common_native_completion_present(first):
+    """Test the bound native slot name before opening it; absence is not a read error."""
+    from .windows import WindowsNamespace
+    from .transient import retry_transient
+    target = first.provider["output_namespace"]
+    namespace = WindowsNamespace(target["path"], target["identity"])
+    try:
+        present = {name.casefold() for name in retry_transient(namespace.names)}
+        return first.provider["slots"]["native_completion"].casefold() in present
+    finally:
+        namespace.close()
+
+
 def supervise_first_worker(lease, *, api=None):
     """Same exact native launch and natural retirement; never a numerical path."""
     from .owned_process import OwnedWorker, _public_command
@@ -1107,6 +1190,9 @@ def supervise_first_worker(lease, *, api=None):
     command = _public_command(lease)
     if command != first.request["public_command"]:
         raise CachePolicyError("Actual normal public command differs from the finite released argv")
+    if getattr(first, "common_mode", False) and _common_native_completion_present(first):
+        retry_common_stage_close(first, lease)
+        return 0
     first.consume(lease)
     owned = OwnedWorker(lease, api=api)
     observations = (BoundOutputObservations(first) if first.bound_mode else FiniteObservations(first))
@@ -1115,6 +1201,7 @@ def supervise_first_worker(lease, *, api=None):
     try:
         if first.bound_mode:
             observations.admit_output(lease)
+        launch_started = time.monotonic()
         owned.start(command, dict(os.environ), Path.cwd())
         terminal = owned.await_family(observer=observations.observe)
         observations.observe(owned,terminal["accounting"],force_cache=True)
@@ -1128,6 +1215,7 @@ def supervise_first_worker(lease, *, api=None):
         eligibility=ServiceLifecycle(context).retention_eligibility(now_utc=_utc(),
             retirement=retirement,verify_retirement=owned.verify_retirement,
             verify_publication=verify_worker_publication)
+        launch_to_retirement_seconds = time.monotonic() - launch_started
         from .owned_process import _exact_source
         from .bootstrap import _exact
         for pin in first.provider["module_closure"]:
@@ -1153,6 +1241,10 @@ def supervise_first_worker(lease, *, api=None):
                     or modules.get("predeclared_module_closure_sha256")!=_digest(first.provider["module_closure"])):
                 raise CachePolicyError("Actual registered owner's exit inventory differs from first request")
             modules_exact=modules_exact and modules.get("all_file_backed_modules_predeclared_and_exact") is True
+            if getattr(first, "common_mode", False):
+                if (modules.get("common_device_identity") != first.root_provider["device_identity"]
+                        or modules.get("actual_device_environment") != first.device["device_environment"]):
+                    raise CachePolicyError("Actual common owner device/runtime environment differs from its predeclared CPU scope")
             if modules.get("actual_task") is not None:tasks.append(modules["actual_task"])
             inventories.append(dict(owner=owner,registration=registered["binding"],inventory=exit_pin,
                 all_file_backed_modules_predeclared_and_exact=modules.get("all_file_backed_modules_predeclared_and_exact"),
@@ -1161,14 +1253,22 @@ def supervise_first_worker(lease, *, api=None):
                 inventories[-1]["actual_writer_environment"] = modules.get("actual_writer_environment")
                 inventories[-1]["writer_environment_is_actual_IO_or_lifetime_proof"] = modules.get(
                     "writer_environment_is_actual_IO_or_lifetime_proof")
+                if getattr(first, "common_mode", False):
+                    inventories[-1]["common_device_identity"] = modules["common_device_identity"]
+                    inventories[-1]["actual_device_environment"] = modules["actual_device_environment"]
+                    inventories[-1]["common_worker_scientific_evidence"] = modules.get("common_worker_scientific_evidence")
         if len(tasks)!=1:
             raise CachePolicyError("Exactly one actual worker-slot first claim is required")
         first.require_task(lease,tasks[0])
+        if getattr(first, "common_mode", False):
+            observation["native_launch_to_retirement_seconds"] = launch_to_retirement_seconds
         observation["actual_registered_owner_exit_inventories"]=inventories
         observation["actual_claim"]=tasks[0]
         observation["source_runtime_before_after_exact"]=True
         if first.bound_mode:
-            observation["profile_publication_state"] = "BOUND_OBSERVATION_AWAITING_ORIGINAL_COMPARISON"
+            observation["profile_publication_state"] = (
+                "COMMON_STAGE_OBSERVATION_AWAITING_COMPLETE_P1_C_P2_DAG"
+                if getattr(first, "common_mode", False) else "BOUND_OBSERVATION_AWAITING_ORIGINAL_COMPARISON")
             output_measurement_pin = _slot_write(first.provider, "measurement",
                 observations.output_document(terminal, retirement, eligibility))
             observation["output_measurement"] = output_measurement_pin
@@ -1177,9 +1277,14 @@ def supervise_first_worker(lease, *, api=None):
             # A separate record, never translated into old measured-v1 coverage.
             # It remains unqualified until independent output/comparison evidence
             # and the checked completed DAG exist. Q117 permits that distinct DAG.
-            _slot_write(first.provider, "writer_evidence",
-                bounded_evidence(first, context, observation,
-                    service_receipt=_exact(context.receipt, lease.package_file)))
+            if getattr(first, "common_mode", False):
+                from .common_qualification import bounded_evidence as common_evidence
+                writer_evidence = common_evidence(first, context, observation,
+                    service_receipt=_exact(context.receipt, lease.package_file))
+            else:
+                writer_evidence = bounded_evidence(first, context, observation,
+                    service_receipt=_exact(context.receipt, lease.package_file))
+            _slot_write(first.provider, "writer_evidence", writer_evidence)
         seal=_exact(eligibility["seal"],lease.package_file)
         native_completion=dict(format="darsia-native-worker-first-qualification-completion-v1",
             request=first.binding,provider=first.provider_binding,stores_source=lease.source,
@@ -1267,6 +1372,11 @@ def supervise_first_worker(lease, *, api=None):
         native_completion["state"] = "UNQUALIFIED_REFERENCE_PRODUCER_COMPLETE"
         native_completion["root_reference_acceptance_required"] = True
     _slot_write(first.provider,"native_completion",native_completion)
+    if getattr(first, "common_mode", False):
+        if not native_completion["passed"]:
+            raise CachePolicyError("Common stage stopped; partial evidence retained, no ordinary profile")
+        _close_common_stage_after_retirement(first, lease, native_completion)
+        return 0  # Original controller retires this real stage, not the whole common DAG.
     if first.reference_build:
         # Durable observations/retirement are genuine; this is deliberately not
         # a passing profile, self-comparison, accepted reference or adoption.
@@ -1323,7 +1433,15 @@ def checked_bounded_evidence(observation, value, *, first=None):
     _descriptor(value["namespace_admission"])
     _descriptor(value["capacity_bound_plan"])
     checked_required_capacity_bound(value["capacity_bound"])
-    if (value["actual_volume_observation"] != value["capacity_bound"]["volume_cap_observation"]
+    if getattr(first, "common_mode", False) is True:
+        required = first.required_capacity_bound
+        expected = required["volume_cap_observation"]
+        maximum = expected.get("binding", {}).get("maximum_size_bytes")
+        if (value["capacity_bound"] != required or value["actual_volume_observation"] != expected
+                or type(maximum) is not int or maximum <= 0
+                or expected.get("virtual_size_bytes") != maximum):
+            raise CachePolicyError("Fresh actual common volume observation differs from its pinned bound")
+    elif (value["actual_volume_observation"] != value["capacity_bound"]["volume_cap_observation"]
             or value["actual_volume_observation"].get("virtual_size_bytes") != 500 * 1024**3):
         raise CachePolicyError("Fresh actual fixed500GiB volume observation differs from its pinned bound")
     root = PureWindowsPath(value["service_namespace"])
@@ -1459,6 +1577,12 @@ def resolve_profile(binding, kind, read, *, stores_source=None, read_authorities
     native/output/original-comparison roles are checked before applicability.
     """
     value = read(binding)
+    if value.get("format") == "darsia-common-phase-qualified-provider-v1":
+        from .common_qualification import resolve_profile as common_profile
+        return common_profile(binding, value, kind, read, stores_source=stores_source,
+                              read_authorities=read_authorities)
+    if value.get("format") in {"darsia-common-phase-import-profile-v1", "darsia-common-phase-job-profile-v1"}:
+        raise CachePolicyError("Common profiles must resolve through their complete original provider DAG")
     if value.get("format") in {BOUND_IMPORT_PROFILE, BOUND_JOB_PROFILE}:
         raise CachePolicyError("Typed bound profiles must resolve through the original checked provider DAG")
     if value.get("format") != PROVIDER:

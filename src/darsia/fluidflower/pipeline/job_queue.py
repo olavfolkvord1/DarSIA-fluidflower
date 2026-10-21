@@ -34,50 +34,17 @@ def utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-TRANSIENT_RETRY_DELAYS = (0.5, 2.0, 5.0)  # Seconds before each retry of one file step.
-# Windows network-path errors that Python may report as a missing file or path.
-_NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 58, 59, 64, 67, 121, 1231, 1236})
-
-
-def transient_os_error(error: BaseException) -> bool:
-    """Whether a file error is a short SMB/NAS interruption worth waiting for.
-
-    Protocol answers are never transient: an existing file (a lost exclusive
-    create), a missing file or folder (moved, claimed or never written) and a
-    wrong file type keep their meaning. A dropped network path is transient
-    even when Python reports it as a missing file.
-    """
-    if not isinstance(error, OSError):
-        return False
-    if getattr(error, "winerror", None) in _NETWORK_WINERRORS:
-        return True
-    return not isinstance(error, (FileExistsError, FileNotFoundError,
-                                  NotADirectoryError, IsADirectoryError))
+from darsia_cache.transient import (
+    TRANSIENT_RETRY_DELAYS, _NETWORK_WINERRORS, transient_os_error,
+    retry_transient as _retry_transient,
+)
 
 
 def retry_transient(action, *, delays=None, wait=None, on_retry=None, retry_if=None):
-    """Run action; wait and retry a transient file error, then raise it (N111).
-
-    A single SMB file or claim error must not crash the work: each transient
-    failure waits for the next delay (default TRANSIENT_RETRY_DELAYS) and the
-    action runs again. Other errors, and the last transient one, are raised
-    unchanged. on_retry(attempt, delay, error) records a retry; wait(seconds)
-    may return True to stop early, which raises the error; retry_if(error)
-    can refuse a retry that is not safe at that point.
-    """
-    delays = TRANSIENT_RETRY_DELAYS if delays is None else delays
-    wait = time.sleep if wait is None else wait
-    for attempt, delay in enumerate((*delays, None), start=1):
-        try:
-            return action()
-        except OSError as error:
-            if (delay is None or not transient_os_error(error)
-                    or (retry_if is not None and not retry_if(error))):
-                raise
-            if on_retry is not None:
-                on_retry(attempt, delay, error)
-            if wait(delay):
-                raise
+    """Keep the queue's original delay override API with the shared filesystem retry."""
+    return _retry_transient(action,
+        delays=TRANSIENT_RETRY_DELAYS if delays is None else delays,
+        wait=wait, on_retry=on_retry, retry_if=retry_if)
 
 
 def read_json(path: Path) -> dict:
@@ -207,6 +174,10 @@ def _publish_bytes(path: Path, data: bytes, *, create_parents: bool) -> None:
     A file with identical bytes found after an interrupted try is that try's
     own completed write. Otherwise an existing file raises FileExistsError.
     """
+    # The optional lean-only context shares the existing exclusive publisher.
+    # Unscoped full/legacy calls retain their original behavior and bytes.
+    from .io_ops import check_metadata_bytes
+    check_metadata_bytes(path, data)
     interrupted = []
 
     def publish():

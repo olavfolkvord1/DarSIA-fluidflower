@@ -78,7 +78,11 @@ def test_statistics_context_never_reads_fitted_calibration(tiny_config, tmp_path
 @pytest.mark.parametrize("precision", ["float32", "float64"])
 def test_default_evaluate_exactly_matches_original_class(tiny_config, precision):
     config, _ = tiny_config
-    old = original_class()(config, precision=precision, pixel_math=PixelMath(precision))
+    from darsia.fluidflower.mass.mass_opencl import FORMAT
+    config["opencl_acceleration"] = dict(format=FORMAT, mode="cpu", device_id=None)
+    old_math = PixelMath(precision)
+    old_math.configure_opencl(config["opencl_acceleration"])
+    old = original_class()(config, precision=precision, pixel_math=old_math)
     new = pipeline.N1Pipeline(config, precision=precision, pixel_math=PixelMath(precision))
     original_capture, actual_capture = {}, {}
     expected = old.evaluate(config["frames"][0], output_capture=original_capture)

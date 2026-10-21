@@ -1,8 +1,8 @@
 """Adopt a prepared painted map as a geometry revision, with its facies table.
 
-The window lists every label of the prepared maps with its layer, facies
-and role, and asks for each label's facies id in the series' full facies
-table: the facies table of the map. None is filled in for the user.
+An approved-session preparation derives one row per used painting facies,
+with all extra current CSV cells carried by name and conflicts refused.
+Legacy preparations retain their explicit label-to-series-facies choices.
 "Check" builds the revision candidate and validates it as the Store will;
 "Save revision…" asks once and then saves it with the existing geometry
 revision store. Both read every run's files and run in a worker thread,
@@ -43,33 +43,35 @@ class _CheckWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, current: Mapping[str, Any], folder: Path, facies_ids: Mapping[int, int]) -> None:
+    def __init__(self, current: Mapping[str, Any], folder: Path, facies_ids: Mapping[int, int] | None) -> None:
+        """Retain the current revision, preparation and optional explicit facies choice."""
         super().__init__()
-        self.current, self.folder, self.facies_ids = dict(current), Path(folder), dict(facies_ids)
+        self.current, self.folder = dict(current), Path(folder)
+        self.facies_ids = None if facies_ids is None else dict(facies_ids)
 
     @Slot()
     def run(self) -> None:
-        from darsia.fluidflower.geometry_facies import validate_geometry_config
-
-        start = time.monotonic()
+        """Build and validate a candidate off the GUI thread, reporting its result or error."""
         try:
+            from darsia.fluidflower.geometry_facies import validate_geometry_config
+
+            start = time.monotonic()
             candidate, summary = ma.adoption_candidate(self.current, self.folder, self.facies_ids)
             report = validate_geometry_config(candidate)
-        except (OSError, ValueError, KeyError) as error:
-            self.failed.emit(str(error))
-            return
-        errors = [
-            str(issue.get("message")) for issue in report.get("issues") or []
-            if issue.get("severity") == "error"
-        ]
-        self.finished.emit(
-            {
+            errors = [
+                str(issue.get("message")) for issue in report.get("issues") or []
+                if issue.get("severity") == "error"
+            ]
+            result = {
                 "candidate": candidate,
                 "summary": summary,
                 "errors": errors,
                 "seconds": time.monotonic() - start,
             }
-        )
+        except Exception as error:  # noqa: BLE001 - the owner must retire this thread
+            self.failed.emit(f"{type(error).__name__}: {error}")
+            return
+        self.finished.emit(result)
 
 
 class _SaveRevisionWorker(QObject):
@@ -84,9 +86,10 @@ class _SaveRevisionWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        from darsia.fluidflower.geometry_facies import GeometryRevisionStore
-
+        """Append the confirmed candidate through the existing geometry revision Store."""
         try:
+            from darsia.fluidflower.geometry_facies import GeometryRevisionStore
+
             revision = GeometryRevisionStore(self.project).save_revision(
                 self.candidate, actor=self.actor, reason=self.reason
             )
@@ -107,6 +110,7 @@ class AdoptionDialog(QDialog):
         actor: str,
         parent: QWidget | None = None,
     ) -> None:
+        """Show the preparation table, validation result and explicit revision-save controls."""
         super().__init__(parent)
         from darsia.fluidflower.geometry_facies import GeometryRevisionStore
 
@@ -115,7 +119,19 @@ class AdoptionDialog(QDialog):
         self.actor = str(actor)
         self.preparation = ma.read_preparation(self.folder)
         self.current = GeometryRevisionStore(project).current()
-        self.table_rows = ma.facies_table(self.current.get("configuration") or {})
+        self.automatic = "painting_facies" in self.preparation
+        if self.automatic:
+            binding = self.preparation["painting_facies"]
+            snapshot = binding.get("facies_snapshot") if isinstance(binding, dict) else None
+            if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("layers"), list)
+                    or not isinstance(snapshot.get("facies"), list)
+                    or any(not isinstance(row, dict) or not {"layer_id", "name", "facies"} <= row.keys()
+                           for row in snapshot["layers"])
+                    or any(not isinstance(row, list) or len(row) != 2 or not isinstance(row[0], str)
+                           or not isinstance(row[1], dict) or not {"role", "porosity", "permeability"} <= row[1].keys()
+                           for row in snapshot["facies"])):
+                raise ValueError("The automatic painting preparation has no readable facies snapshot; no manual fallback is offered")
+        self.table_rows = [] if self.automatic else ma.facies_table(self.current.get("configuration") or {})
         self.candidate: dict[str, Any] | None = None
         self.revision: dict[str, Any] | None = None
         self._thread: QThread | None = None
@@ -125,11 +141,19 @@ class AdoptionDialog(QDialog):
         layout = QVBoxLayout(self)
         version = dict(self.preparation.get("map_version") or {})
         prepared = [row for row in self.preparation.get("runs") or [] if row.get("status") == "prepared"]
+        instruction = (
+            "Facies IDs come automatically from the approved saved painting, one row per used facies. "
+            "Extra CSV cells come from the current table by exact name; conflicts refuse and are shown. "
+            if self.automatic else
+            "Give each label the facies id it has in the series' facies table; nothing is chosen for you. "
+        )
+        if self.automatic:
+            from .painted_adoption_table import frame_basis_text
+            instruction += frame_basis_text(self.preparation["painting_facies"]) + " Check verifies these bindings. "
         note = QLabel(
             f"Map {version.get('name') or ''} (SHA-256 {str(version.get('sha256') or '')[:12]}…), "
             f"prepared on the label grid of {len(prepared)} of "
-            f"{len(self.preparation.get('runs') or [])} runs. Give each label the facies id it "
-            "has in the series' facies table; nothing is chosen for you. 'Check' builds the "
+            f"{len(self.preparation.get('runs') or [])} runs. " + instruction + "'Check' builds the "
             "new geometry revision and validates it as the store will. 'Save revision…' then "
             f"appends it after revision {str(self.current.get('revision_id') or '')[:8]}, which "
             "stays. Apply geometry to Setup and Build run model remain separate steps. "
@@ -140,13 +164,27 @@ class AdoptionDialog(QDialog):
         layout.addWidget(note)
         self.values = ma.label_values(self.preparation)
         regions = {int(row["layer_id"]): row for row in self.preparation.get("regions") or []}
-        self.table = QTableWidget(len(self.values), len(_COLUMNS))
-        self.table.setHorizontalHeaderLabels(list(_COLUMNS))
+        auto_rows = []
+        if self.automatic:
+            snapshot = self.preparation["painting_facies"]["facies_snapshot"]
+            used = {row["facies"] for row in snapshot["layers"] if row["layer_id"] in self.values}
+            for name, entry in snapshot["facies"]:
+                if name in used:
+                    layers = ", ".join(str(row["layer_id"]) for row in snapshot["layers"]
+                                       if row["layer_id"] in self.values and row["facies"] == name)
+                    auto_rows.append((name, layers, str(entry["role"]), str(entry["porosity"]),
+                                      str(entry["permeability"]), "Verified during Check"))
+        headings = ["Facies", "Layers", "Role", "Porosity", "Permeability", "Extra properties"] if self.automatic else list(_COLUMNS)
+        self.table = QTableWidget(len(auto_rows) if self.automatic else len(self.values), len(headings))
+        self.table.setHorizontalHeaderLabels(headings)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.choices: dict[int, QComboBox] = {}
-        for number, value in enumerate(self.values):
+        for number, row in enumerate(auto_rows):
+            for column, text in enumerate(row):
+                self.table.setItem(number, column, QTableWidgetItem(text))
+        for number, value in enumerate(self.values if not self.automatic else ()):
             region = regions.get(value) or {}
             cells = (
                 str(value),
@@ -168,7 +206,8 @@ class AdoptionDialog(QDialog):
             self.table.setCellWidget(number, len(cells), choice)
             self.choices[value] = choice
         layout.addWidget(self.table, 1)
-        self.status = QLabel("Choose a facies id for every label, then Check.")
+        self.status = QLabel("Check the automatic table and its full saved-source bindings." if self.automatic
+                             else "Choose a facies id for every label, then Check.")
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status)
@@ -181,9 +220,11 @@ class AdoptionDialog(QDialog):
         layout.addWidget(buttons)
         self._choice_changed()
 
-    def facies_ids(self) -> dict[int, int]:
+    def facies_ids(self) -> dict[int, int] | None:
         """The facies id chosen for each label so far."""
 
+        if self.automatic:
+            return None
         return {
             value: int(choice.currentData())
             for value, choice in self.choices.items()
@@ -199,7 +240,7 @@ class AdoptionDialog(QDialog):
         runs while a worker does or after the revision is saved."""
 
         idle = self._thread is None and self.revision is None
-        self.check_button.setEnabled(idle and len(self.facies_ids()) == len(self.values))
+        self.check_button.setEnabled(idle and (self.automatic or len(self.facies_ids()) == len(self.values)))
         self.save_button.setEnabled(idle and self.candidate is not None)
 
     def check(self) -> bool:
@@ -208,7 +249,7 @@ class AdoptionDialog(QDialog):
 
         if self._thread is not None or self.revision is not None:
             return False
-        if len(self.facies_ids()) != len(self.values):
+        if not self.automatic and len(self.facies_ids()) != len(self.values):
             self.status.setText("Choose a facies id for every label first.")
             return False
         self.candidate = None
@@ -227,10 +268,19 @@ class AdoptionDialog(QDialog):
             return
         self.candidate = result["candidate"]
         summary = result["summary"]
+        if self.automatic:
+            table = summary["facies_table"]
+            self.table.setColumnCount(len(table["columns"]))
+            self.table.setHorizontalHeaderLabels(table["columns"])
+            self.table.setRowCount(len(table["rows"]))
+            for number, row in enumerate(table["rows"]):
+                for column, name in enumerate(table["columns"]):
+                    self.table.setItem(number, column, QTableWidgetItem(str(row[name])))
         left = summary["not_prepared"]
         self.status.setText(
             f"Ready to save: {len(summary['runs'])} runs and {len(summary['regions'])} regions "
             f"(checked in {result['seconds']:.0f} s)."
+            + (" " + summary["frame_basis"] if self.automatic else "")
             + (f" Not prepared, so not in the revision: {', '.join(run.upper() for run in left)}." if left else "")
         )
 
@@ -254,14 +304,19 @@ class AdoptionDialog(QDialog):
         thread.start()
 
     def _save_clicked(self) -> None:
+        """Ask before appending the checked revision with its retained frame explanation."""
         if self.candidate is None:
             return
+        frame_note = ""
+        if self.automatic:
+            from .painted_adoption_table import frame_basis_text
+            frame_note = " " + frame_basis_text(self.preparation["painting_facies"])
         answer = QMessageBox.question(
             self,
             "Save revision",
             "Append a new geometry revision that adopts this map in every prepared run? The "
             "current revision stays in the history. Run configurations do not change until "
-            "Apply geometry to Setup.",
+            "Apply geometry to Setup." + frame_note,
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.save()

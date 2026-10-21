@@ -37,7 +37,8 @@ def _fresh_provenance(context):
         expected /= "current"
     fresh = manifest.get("fresh_scope_provenance")
     writer_directories, writer_keys = WRITER_SUBDIRECTORIES, WRITER_ENVIRONMENT_KEYS
-    if getattr(context, "profile", {}).get("format") == "darsia-cache-volume-bound-import-profile-v1":
+    if getattr(context, "profile", {}).get("format") in {
+            "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1"}:
         from .environment import FIRST_WRITER_ENVIRONMENT_KEYS, FIRST_WRITER_SUBDIRECTORIES
         writer_directories, writer_keys = FIRST_WRITER_SUBDIRECTORIES, FIRST_WRITER_ENVIRONMENT_KEYS
     required = {"format", "token", "owner", "purpose", "root_identity",

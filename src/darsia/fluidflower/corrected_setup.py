@@ -73,6 +73,20 @@ def _identity(row):
     return {key: row[key] for key in ("path", "sha256", "size_bytes")}
 
 
+def _revision_properties(config, saved, registered):
+    """The full table authority for this explicit revision, without a fallback.
+
+    The registered resolver has already validated a painted table against its
+    approved session, parent CSV, preparation and exact materialized bytes.
+    Every other revision keeps the selected run's original table authority.
+    """
+    if "painted_adoption_table" in config:
+        if registered is None:
+            raise ValueError("A painted adoption needs its verified registered full CSV")
+        return _identity(registered["files"]["facies_properties"])
+    return _identity(saved["facies_properties"])
+
+
 def _replacements(destination):
     return {
         "labeling": {"labels": str(destination / NAMES["labels"]), "frame": "rig-corrected"},
@@ -630,6 +644,21 @@ def _verify_reference_export(root, *, revision, display, planned, current_sha, c
     return root_binding
 
 
+def _require_painted_facies_documents(config, paths):
+    """Check only explicit new-table run/common inputs before Apply or Build."""
+    if "painted_adoption_table" not in config:
+        return
+    from .painted_facies_inputs import require_current_facies_inputs
+    documents = {}
+    for path in paths:
+        path = Path(path)
+        # Some series declare an optional merged file before its first build.
+        # Every actual required path is still checked by the original guards.
+        if path.is_file() and str(path) not in documents:
+            documents[str(path)] = tomllib.loads(_small(path).decode("utf-8-sig"))
+    require_current_facies_inputs(config, documents)
+
+
 def require_corrected_export_for_build(paths):
     """Admit only this exact declared selected-run bundle and canonical export."""
     from darsia.presets.workflows.config.utils import _get_section_from_toml
@@ -653,6 +682,14 @@ def require_corrected_export_for_build(paths):
     current_bytes = _small(current_path)
     current = json.loads(current_bytes)
     config = current["configuration"]
+    if "painted_adoption_table" in config:
+        checked_paths = [paths] if isinstance(paths, Path) else list(paths)
+        bound_inputs = receipt.get("binding") or {}
+        checked_paths.extend((bound_inputs.get("configuration_bundles") or {}).get(run) or [])
+        common_input = bound_inputs.get("common_configuration")
+        if common_input is not None:
+            checked_paths.append(common_input["path"])
+        _require_painted_facies_documents(config, checked_paths)
     actual_root, selected, recorded_display, planned = _canonical_location(root.parent.parent.parent, config, revision, run)
     if current.get("revision_id") != revision or not _same(selected, destination) or recorded_display != display:
         raise ValueError("Corrected Build export belongs to another current revision or selected run.")
@@ -672,7 +709,7 @@ def require_corrected_export_for_build(paths):
     elif "registered_geometry" in binding:
         raise ValueError("An unedited adoption cannot claim a registered Store binding.")
     if (binding["configuration"] != _identity(saved["configuration"])
-            or binding["properties"] != _identity(saved["facies_properties"])
+            or binding["properties"] != _revision_properties(config, saved, registered)
             or binding["configured_depth_source"] != _identity(saved["configured_depth_map"])
             or binding["replacements"] != _replacements(destination)
             or any(binding["sources"][name] != expected_sources[name]
@@ -762,8 +799,9 @@ def export_corrected_setup(project, *, reference, actor=""):
         configured_depth_path.resolve(), Path(row["configured_depth_map"]["path"]).resolve()
     ):
         raise ValueError("The original configured depth pointer changed.")
-    # This is intentionally the selected run's FULL original CSV, not the
-    # revision store's reduced/canonical derived property table.
+    # Preserve the selected run's full original table authority for ordinary
+    # revisions. The explicit painted contract below selects its verified full
+    # derived table, including all preserved source columns.
     props_path = _storage_path((original.get("facies") or {}).get("props"), series)
     if props_path is None:
         raise ValueError("The selected run has no original facies property table.")
@@ -772,6 +810,8 @@ def export_corrected_setup(project, *, reference, actor=""):
     if not isinstance(properties_binding, dict) or not _same(properties_binding.get("path", ""), props_path):
         raise ValueError("The saved revision must bind this run's original facies property table and SHA.")
     properties = _verified(properties_binding)
+    if "painted_adoption_table" in config:
+        properties = _verified(_revision_properties(config, row, registered))
     configured_depth_source = _verified(row["configured_depth_map"])
     sources = {name: _verified(fields[name]) for name in ("shape_corrected_baseline", "labels", "facies", "depth")}
     if registered is not None:
@@ -907,6 +947,13 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
         raise RuntimeError("The corrected export receipt changed; no setup was applied.")
     current = json.loads(export.current_bytes)
     config = current["configuration"]
+    if "painted_adoption_table" in config:
+        bound_inputs = actual_receipt.get("binding") or {}
+        checked_paths = list((bound_inputs.get("configuration_bundles") or {}).get(export.run_id) or [])
+        common_input = bound_inputs.get("common_configuration")
+        if common_input is not None:
+            checked_paths.append(common_input["path"])
+        _require_painted_facies_documents(config, checked_paths)
     _export_root, expected_destination, display, planned = _canonical_location(
         project.root, config, export.revision_id, export.run_id
     )
@@ -929,13 +976,13 @@ def apply_corrected_selected_run(project, export: CorrectedSetupExport):
             raise ValueError("Corrected Apply lacks this genuine registered Store binding.")
     elif "registered_geometry" in binding:
         raise ValueError("An unedited adoption cannot claim a registered Store binding.")
-    if binding["configuration"] != _identity(saved["configuration"]) or binding["properties"] != _identity(saved["facies_properties"]) or binding["configured_depth_source"] != _identity(saved["configured_depth_map"]) or binding["replacements"] != _replacements(export.destination):
+    if binding["configuration"] != _identity(saved["configuration"]) or binding["properties"] != _revision_properties(config, saved, registered) or binding["configured_depth_source"] != _identity(saved["configured_depth_map"]) or binding["replacements"] != _replacements(export.destination):
         raise ValueError("The corrected export input identities or target paths are not bound to this revision.")
     if any(binding["sources"][name] != expected_sources[name] for name in ("shape_corrected_baseline", "labels", "facies", "depth")):
         raise ValueError("The corrected export field identities differ from this revision.")
     if set(export.receipt["files"]) != EXPORT_FILES:
         raise ValueError("The corrected export must contain exactly its five canonical named files.")
-    for name, source in ((NAMES["labels"], expected_sources["labels"]), (NAMES["facies"], expected_sources["facies"]), ("facies_properties.csv", saved["facies_properties"])):
+    for name, source in ((NAMES["labels"], expected_sources["labels"]), (NAMES["facies"], expected_sources["facies"]), ("facies_properties.csv", _revision_properties(config, saved, registered))):
         row = export.receipt["files"][name]
         if not _same(row["path"], export.destination / name) or row["sha256"] != source["sha256"] or row["size_bytes"] != source["size_bytes"]:
             raise ValueError("The corrected export byte copies do not match their revision sources.")

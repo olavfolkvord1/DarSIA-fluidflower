@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 from pathlib import Path, PureWindowsPath
 import uuid
 import zipfile
@@ -66,22 +65,25 @@ def _array_identity(value):
 
 
 def _write_json(path, value):
-    with Path(path).open("xb") as stream:
-        stream.write((json.dumps(value, ensure_ascii=False, allow_nan=False,
-                                 sort_keys=True, separators=(",", ":")) + "\n").encode("utf8"))
-        stream.flush()
-        os.fsync(stream.fileno())
+    """Write one new JSON file through the N111-retried publisher; same bytes as before."""
+    from .pipeline.io_ops import check_metadata_bytes, publish_file
+    data = (json.dumps(value, ensure_ascii=False, allow_nan=False,
+                       sort_keys=True, separators=(",", ":")) + "\n").encode("utf8")
+    check_metadata_bytes(path, data)
+    publish_file(path, lambda stream: stream.write(data))
 
 
 def _write_npz(path, arrays):
-    with Path(path).open("xb") as stream:
+    """Write one new NPZ through the N111-retried publisher; same bytes as before."""
+    from .pipeline.io_ops import publish_file
+
+    def write(stream):
         with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED,
                              compresslevel=1) as archive:
             for name, array in arrays.items():
                 with archive.open(name + ".npy", "w", force_zip64=True) as member:
                     np.lib.format.write_array(member, np.asarray(array), allow_pickle=False)
-        stream.flush()
-        os.fsync(stream.fileno())
+    publish_file(path, write)
 
 
 def _bound_path(bound, reader=None):
@@ -246,10 +248,8 @@ def write_frame(output, task, spec, phase, inferred, phase_capture,
     files = []
     if la is not None:
         png = temporary / "storage_gas_probability_before_rules.png"
-        with png.open("xb") as stream:
-            Image.fromarray(la, mode="LA").save(stream, format="PNG")
-            stream.flush()
-            os.fsync(stream.fileno())
+        from .pipeline.io_ops import publish_file
+        publish_file(png, lambda stream: Image.fromarray(la, mode="LA").save(stream, format="PNG"))
         probabilities = {PROBABILITY_FIELDS[0]: decode_before(png, shape, request["precision"]),
                          PROBABILITY_FIELDS[1]: final_indicator}
         files.append(png)
@@ -315,11 +315,12 @@ def write_frame(output, task, spec, phase, inferred, phase_capture,
     _write_json(receipt_path, document)
     # Only our new flat namespace is moved; old native files are never touched.
     # The original _inventory(stage) will bind every SHA before native commit.
+    from .pipeline.job_queue import rename
     for path in [*files, receipt_path]:
         destination = parent / path.name
         if destination.exists():
             raise FileExistsError(destination)
-        path.rename(destination)
+        rename(path, destination)
     entry = dict(format=FRAME_FORMAT, case_id=spec["case_id"], attempt_directory=str(output),
                  receipt=dict(_asset(parent / "storage_completed.json"), kind="operational_receipt"),
                  files=bound_files)

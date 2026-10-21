@@ -84,12 +84,38 @@ class WorkerRunIO:
             binding=RunIOBinding.replay(claim.task,verified,claim.local_output,
                 repository=Path(__file__).resolve().parents[4],
                 admitted_commit=self.commit)
+            first = getattr(self.cache_adapter.lease, "first_qualification", None)
+            if first is not None and getattr(first, "common_mode", False):
+                from darsia_cache.common_qualification import _compute_control, require_phase2_predecessor
+                if first.stage != "calibration" and _compute_control(binding.configuration, first.stage) is None:
+                    raise ValueError("The released common proof needs its declared CPU or auto control")
+                first.require_task(self.cache_adapter.lease, claim.task)
+                require_phase2_predecessor(first, binding.configuration)
+                binding.opencl_proof_released = True
+                binding.common_closure_released = True
+                binding.common_job_binding = deepcopy(first.request["job"])
+                binding.opencl_compare_cpu = True
+            elif self.cache_adapter.lease.profile.get("format") == "darsia-common-phase-import-profile-v1":
+                from darsia_cache.common_qualification import runtime_compute_policy
+                binding.opencl_policy = runtime_compute_policy(
+                    self.cache_adapter.lease.profile, claim.task, binding.configuration)
         except (InputHashMismatch,RunUnavailable):
             raise
         except (OSError,ValueError,KeyError,TypeError) as error:
             raise InputHashMismatch("Input admission failed before science: "+str(error)) from error
         self.bindings[claim.token]=binding
         return binding
+
+    def finalize_common(self, claim):
+        """Close science inside its original admitted slot, before budget/exit closure."""
+        lease = self.cache_adapter.lease
+        first = getattr(lease, "first_qualification", None)
+        if first is None or not getattr(first, "common_mode", False):
+            return None
+        binding = self.bindings[claim.token]
+        from .common_worker_closure import finalize_worker_stage
+        with binding.activate():
+            return finalize_worker_stage(first, lease, claim=claim, binding=binding)
 
     def factory(self,claim):
         if claim.token not in self.factories:

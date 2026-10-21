@@ -752,7 +752,25 @@ def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict
         underlay = adopted_underlay(configuration, run.casefold(), labels)
         if underlay is not None:
             source["_drawn_fixture_underlay"] = underlay
-    return np.asarray(facies), roles, facies_table(properties, extra), source
+    table = facies_table(properties, extra)
+    if "painted_adoption_table" in configuration:
+        from ..geometry_raster_sources import canonical_parent_payload
+        import csv
+        import io
+        payload = canonical_parent_payload(configuration, run_id=run)
+        path = artifacts.get("facies_properties_path") or (revision.get("artifacts") or {}).get("facies_properties_path")
+        if not path or Path(path).read_bytes() != payload["painted_table_bytes"]:
+            raise ValueError("Simulator geometry lost its exact derived painting CSV")
+        reader = csv.DictReader(io.StringIO(payload["painted_table_bytes"].decode("utf8"), newline=""))
+        columns = list(reader.fieldnames)
+        names = {column.strip().casefold(): column for column in columns}
+        identity = names.get("id") or names["facies_id"]
+        full = {int(row[identity]): row for row in reader}
+        for row in table:
+            row["source_columns"] = columns
+            row["source_cells"] = [full[row["facies_id"]][column] for column in columns]
+        source["facies_table_sha256"] = configuration["painted_adoption_table"]["table"]["sha256"]
+    return np.asarray(facies), roles, table, source
 
 
 def depth_points_for(request: dict, series_root, config: dict) -> np.ndarray:

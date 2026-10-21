@@ -478,6 +478,9 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
 
     A typed volume-bound profile covers every full task on its qualified head
     and route (N188 D2); the old measured profile stays exact in case count and commit.
+    A native-phase-n1 profile also covers a full phase-one statistics task and
+    a full phase-two n1 task on its qualified head (commit, CPU, float32),
+    whose stages it measured.
     """
     from .capacity import read_bound
     verify = adapter.verify_profile_projection if projection else adapter.verify_profile
@@ -489,6 +492,14 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
     profile = resolve_profile(binding, "jobs", lambda pin:read_bound(pin)[0],
         stores_source=getattr(getattr(adapter,"lease",None),"source",None),
         read_authorities=lambda pin:_exact_authority_list(pin, adapter.lease.package_file))
+    if profile.get("format") == "darsia-common-phase-job-profile-v1":
+        from .common_qualification import require_applicable
+        require_applicable(profile, task)
+        measured, _ = read_bound(profile["measurement"])
+        complete, _ = read_bound(profile["completion"])
+        if verify(task, estimate, binding, profile, measured, complete) is not True:
+            raise CachePolicyError("Common physical-bound source/stage profile is not applicable")
+        return 0, dict(binding), profile, measured, complete
     from .first_qualification import BOUND_JOB_PROFILE, BOUND_WRITER_CONTRACT
     if profile.get("format") == BOUND_JOB_PROFILE:
         # The service-only writers add no claim bytes, so the qualified profile
@@ -497,9 +508,14 @@ def applicable_job_cache_profile(policy, adapter, task, estimate, *, projection=
         from darsia.fluidflower.storage_profile import declared_storage_profile
         route = ("commit", "pipeline", "backend", "precision")
         qualified = profile.get("scope")
+        # A phase-one statistics task and a phase-two n1 task run the qualified
+        # stages on another route: always another run, so a full task only.
+        staged = (task.get("pipeline") in {"native-phase-statistics", "n1"} and isinstance(qualified, dict)
+                  and qualified.get("pipeline") == "native-phase-n1")
+        keys = ("commit", "backend", "precision") if staged else route
         other_run = (isinstance(qualified, dict)
                      and {key: task.get(key) for key in (*route, "run", "ordered_case_ids")} != qualified)
-        if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in route)
+        if (not isinstance(qualified, dict) or any(task.get(key) != qualified.get(key) for key in keys)
                 or (other_run and declared_storage_profile(task) != "full")
                 or profile.get("purpose") != "jobs"
                 or profile.get("writer_contract") != BOUND_WRITER_CONTRACT

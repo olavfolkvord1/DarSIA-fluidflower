@@ -148,7 +148,9 @@ def test_a_manual_map_is_drawn_saved_and_approved_without_a_proposal(view, qtbot
     assert approval is not None and approval["kind"] == "manual map"
     assert view.versions_table.item(0, 5).text().startswith("Approved ")
     view.versions_table.selectRow(0)
-    assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
+    assert view.place_version_button.isEnabled()
+    assert not view.prepare_adoption_button.isEnabled()
+    assert "RAW basis and the automatic adoption backend" in view.use_map_reasons[view.adopt_button].text()
     # Back to the proposal: the corrections tools wait for one again.
     view.map_shown.setCurrentIndex(view.map_shown.findText("Proposal"))
     assert view.show_proposal.text() == "Proposal" and not view.manual_status.isVisibleTo(view)
@@ -225,7 +227,7 @@ def test_restoring_a_manual_map_brings_back_its_polygons_and_keeps_the_proposal(
     assert view.restore_version(first) and len(view.versions) == 2
 
 
-def test_an_approved_manual_map_is_placed_and_prepared_for_adoption_as_drawn(view, qtbot, tmp_path):
+def test_an_approved_manual_map_is_placed_as_drawn_but_unbound_adoption_is_refused(view, qtbot, tmp_path):
     for polygon in (LEFT, RIGHT, MIDDLE):
         view.add_polygon(polygon)
     view.map_shown.setCurrentIndex(view.map_shown.findText("Manual map"))
@@ -263,15 +265,13 @@ def test_an_approved_manual_map_is_placed_and_prepared_for_adoption_as_drawn(vie
         return {"metadata": {"run": run}, "shape_hw": [55, 80], "source": {"path": f"{run}.npz"}}
 
     assert view.prepare_adoption_of(record, index, runs=["ac52"], current_labels=current)
-    qtbot.waitUntil(lambda: view.last_adoption is not None and not view.busy(), timeout=30000)
-    adoption = view.last_adoption
-    assert [row["status"] for row in adoption["runs"]] == ["prepared"]
-    with np.load(Path(adoption["folder"]) / "ac52" / "labels.npz", allow_pickle=True) as saved:
-        assert np.array_equal(saved["array"], view._manual.classes[5:].astype(saved["array"].dtype))
-    approval = json.loads((Path(adoption["folder"]) / "approval.json").read_text(encoding="utf-8"))
-    assert approval["sha256"] == record["sha256"] and approval["kind"] == "manual map"
+    qtbot.waitUntil(lambda: not view.busy(), timeout=30000)
+    # This placement-only fixture has no Store/source/profile/renderer proof.
+    # A matrix with the right dimensions cannot authorize native adoption.
+    assert view.last_adoption is None
+    assert "The rigs need their RAW basis before the map can be adopted" in view.use_map_progress.text()
+    assert not (lp.painting_folder(view.project).parent / "map_adoption").exists()
     assert _files(lp.painting_folder(view.project)) == painting_before
-    view._adoption_message.close()
 
 
 def _old_proposal_overlay(view):

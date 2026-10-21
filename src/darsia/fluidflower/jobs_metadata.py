@@ -5,6 +5,7 @@ scientific payload is read and no controller/worker/SSH process is started.
 """
 
 from __future__ import annotations
+from darsia_cache.transient import retry_transient
 
 from datetime import datetime, timezone
 import hashlib
@@ -222,7 +223,7 @@ class JobSnapshotReader:
             _bound(expected)
             if _key(path) != _key(expected["path"]):
                 raise ValueError("Metadata path differs from its descriptor")
-        stat = path.stat()
+        stat = retry_transient(path.stat)
         stamp = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
         cache_key = (
             _key(path),
@@ -232,14 +233,14 @@ class JobSnapshotReader:
         if cached and cached[0] == stamp:
             return cached[1]
         if expected is not None:
-            raw = path.read_bytes()
+            raw = retry_transient(path.read_bytes)
             if (
                 len(raw) != expected["size_bytes"]
                 or hashlib.sha256(raw).hexdigest() != expected["sha256"]
             ):
                 raise ValueError("Published metadata SHA/size differs: " + str(path))
         value = read_json(path)
-        after = path.stat()
+        after = retry_transient(path.stat)
         if stamp != (after.st_size, after.st_mtime_ns, after.st_dev, after.st_ino):
             raise ValueError("Metadata changed while being read: " + str(path))
         self.cache[cache_key] = (stamp, value)

@@ -383,7 +383,12 @@ class ImportLease:
         if REQUEST_ENV in os.environ:
             if entry_kind!="worker" or self.purpose!="jobs":
                 raise CachePolicyError("Finite first qualification requires the original worker/jobs entry")
-            self.first_qualification=FirstQualification(json.loads(os.environ[REQUEST_ENV]),
+            first_binding = json.loads(os.environ[REQUEST_ENV])
+            first_type = FirstQualification
+            if _exact(first_binding, package_file).get("format") == "darsia-common-phase-qualification-request-v1":
+                from .common_qualification import CommonQualification
+                first_type = CommonQualification
+            self.first_qualification=first_type(first_binding,
                 provider_binding=self.profile_binding,stores_source=self.source,
                 namespace=boot["namespace_admission"],read=lambda pin:_exact(pin,package_file),
                 read_authorities=lambda pin:_exact_authority_list(pin,package_file))
@@ -403,11 +408,18 @@ class ImportLease:
             raise CachePolicyError("Managed startup requires an accepted actual fixed-volume write-cap binding")
         from .first_qualification import BOUND_IMPORT_PROFILE, checked_bound_import_context
         bounded = self.first_qualification is None and self.profile.get("format") == BOUND_IMPORT_PROFILE
+        common = (self.first_qualification is None
+                  and self.profile.get("format") == "darsia-common-phase-import-profile-v1")
+        if common:
+            from .common_qualification import checked_import_context
+            self.maximum = checked_import_context(self.profile, purpose=self.purpose,
+                role_identifier=self.role_identifier, entry_kind=self.entry_kind,
+                policy=self.policy, namespace=boot["namespace_admission"])
         if bounded:
             self.maximum = checked_bound_import_context(self.profile, purpose=self.purpose,
                 role_identifier=self.role_identifier, entry_kind=self.entry_kind,
                 policy=self.policy, namespace=boot["namespace_admission"])
-        if self.first_qualification is None and not bounded and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
+        if self.first_qualification is None and not bounded and not common and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
                 or self.profile.get("role_identifier")!=self.role_identifier
                 or self.profile.get("entry_kind")!=self.entry_kind
                 or self.profile.get("writer_contract")!="cooperative-start-admission-v1"):
@@ -437,10 +449,16 @@ class ImportLease:
             and actual["service_account_sid"] in admitted.get("authorized_sids",[])
             and Path(admitted["host_ledger"]["path"])==Path(actual["common_root"]))
 
-    def measure(self,root):
-        """Filename/lstat + pinned identity accounting, no cache payload reads."""
+    def measure(self,root, *, include_file_stats=False, hash_files=False):
+        """Original live accounting; explicit quiet snapshots may also hash retained files."""
+        if type(include_file_stats) is not bool or type(hash_files) is not bool or hash_files and not include_file_stats:
+            raise CachePolicyError("Explicit retained-file inventory options required")
         if str(root)!=self.policy.root:raise CachePolicyError("Different configured cache root")
         rootpath=Path(root);tokens={};sizes={};control=self.ledger.control
+        if include_file_stats:
+            import time
+            inventory_started=time.perf_counter()
+            inventory_started_utc=_utc()
         for name in control.names():
             if re.fullmatch(r"cache-r-[0-9a-f]{32}\.json",name):sizes[name[8:-5]]=0
             if re.fullmatch(r"cache-s-[0-9a-f]{32}\.json",name):
@@ -448,10 +466,11 @@ class ImportLease:
                 relative=Path(row["root"]).relative_to(rootpath)
                 if relative in tokens:raise CachePolicyError("Overlapping bound cache scopes")
                 tokens[relative]=row["token"]
-        entries=0;total=0
+        entries=0;total=0;files=[]
         with_namespace=WindowsNamespace(rootpath,self.admission["cache_identity"])
         def walk(handle,relative):
             nonlocal entries,total
+            directory_before=(rootpath/relative).lstat() if include_file_stats else None
             for name in with_namespace.api.names(handle):
                 entries+=1
                 if entries>self.entry_limit:raise CachePolicyError("Explicit accounting limit exceeded; no admission")
@@ -470,14 +489,44 @@ class ImportLease:
                     if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1:
                         raise CachePolicyError("Unqualified cache file type/link accounting")
                     total+=st.st_size
+                    if include_file_stats:
+                        row=dict(relative_path=str(rel),dev=st.st_dev,ino=st.st_ino,
+                            size_bytes=st.st_size,mtime_ns=st.st_mtime_ns)
+                        if hash_files:
+                            # Only explicit before-launch/retired common snapshots
+                            # request payload hashes; ordinary live accounting does not.
+                            version=lambda info:(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+                            digest=hashlib.sha256();count=0
+                            with (rootpath/rel).open("rb") as stream:
+                                if version(os.fstat(stream.fileno()))!=version(st):
+                                    raise CachePolicyError("Retained cache file changed before hash snapshot")
+                                while block:=stream.read(1024*1024):
+                                    digest.update(block);count+=len(block)
+                                after=os.fstat(stream.fileno())
+                            if (count!=st.st_size or version(after)!=version(st)
+                                    or version((rootpath/rel).lstat())!=version(st)):
+                                raise CachePolicyError("Retained cache file changed during hash snapshot")
+                            row["sha256"]=digest.hexdigest()
+                        files.append(row)
                     matches=[token for scope,token in tokens.items() if rel.is_relative_to(scope)]
                     if len(matches)>1:raise CachePolicyError("Overlapping bound scope accounting")
                     if matches:sizes[matches[0]]+=st.st_size
+            if include_file_stats:
+                directory_after=(rootpath/relative).lstat()
+                version=lambda info:(info.st_dev,info.st_ino,info.st_mtime_ns)
+                if version(directory_before)!=version(directory_after):
+                    raise CachePolicyError("Retained cache directory changed during finite inventory")
         try:walk(with_namespace.handle,Path())
         finally:with_namespace.close()
-        return dict(root=self.policy.root,fresh=True,root_identity=self.admission["cache_identity"],
+        result=dict(root=self.policy.root,fresh=True,root_identity=self.admission["cache_identity"],
             no_reparse_traversal=True,active_scope_bytes=sizes,logical_bytes=total,
             free_bytes=volume_info(root)["free_bytes"],measured_utc=_utc(),eligible_reclaimable_bytes=0)
+        if include_file_stats:
+            result.update(files=files,payload_hashes_included=hash_files,
+                observed_scan_anomalies=[], inventory_started_utc=inventory_started_utc,
+                inventory_elapsed_seconds=time.perf_counter()-inventory_started,
+                inventory_scope="entire original owned cache root, including redirected driver JIT files; outside-root OS writes unobserved")
+        return result
 
     def _record(self,name,document):
         control=WindowsNamespace(self.admission["receipts"]["path"],self.admission["receipts"]["identity"])
@@ -507,7 +556,8 @@ class ImportLease:
                 if initial_names:
                     raise CachePolicyError("New exclusive UUID scope was not observed empty")
                 first_writers = (getattr(self, "first_qualification", None) is not None
-                    or self.profile.get("format") == "darsia-cache-volume-bound-import-profile-v1")
+                    or self.profile.get("format") in {
+                        "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1"})
                 writer_directories = FIRST_WRITER_SUBDIRECTORIES if first_writers else WRITER_SUBDIRECTORIES
                 writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
                 fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
@@ -676,7 +726,8 @@ def before_darsia_import(*,package_file):
         environment=derive_cache_environment(document,purpose=lease.purpose,token=lease.reservation["token"],
             scope_root=lease.root,parent_environment=os.environ)
         first_writers = (getattr(lease, "first_qualification", None) is not None
-            or getattr(lease, "profile", {}).get("format") == "darsia-cache-volume-bound-import-profile-v1")
+            or getattr(lease, "profile", {}).get("format") in {
+                "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1"})
         if first_writers:
             environment = first_qualification_environment(environment, scope_root=lease.root)
             if q123 is not None:

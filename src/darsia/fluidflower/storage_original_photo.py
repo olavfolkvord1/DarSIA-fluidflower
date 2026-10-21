@@ -201,9 +201,8 @@ def _publish(destination, receipt, rgb, rgba, box, fields):
     """Write the RGBA PNG and its sealed receipt; shared by both original producers."""
     x, y, width, height = box
     source_roi = rgb[y:y + height, x:x + width]
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("xb") as stream:
-        Image.fromarray(rgba).save(stream, format="PNG")
+    from .pipeline.io_ops import publish_file
+    publish_file(destination, lambda stream: Image.fromarray(rgba).save(stream, format="PNG"))
     document = dict(fields, format="darsia-stored-registered-original-photo-v1", complete=True,
         source_review_canvas_hw=list(rgb.shape[:2]), target_canvas_hw=list(rgba.shape[:2]),
         stored_photograph_ROI_xywh=list(box),
@@ -213,8 +212,8 @@ def _publish(destination, receipt, rgb, rgba, box, fields):
         RGBA_pixel_identity=_pixels(rgba), display_dtype="uint8", colour_light_or_v5_changes=False,
         camera_RAW_or_correction_chain_executed=False, current_phase_products_changed=False,
         photograph=_asset(destination))
-    with receipt.open("xb") as stream:
-        stream.write((json.dumps(document, ensure_ascii=False, allow_nan=False,
-                                 sort_keys=True, indent=2) + "\n").encode("utf8"))
+    data = (json.dumps(document, ensure_ascii=False, allow_nan=False,
+                       sort_keys=True, indent=2) + "\n").encode("utf8")
+    publish_file(receipt, lambda stream: stream.write(data))
     return dict(photograph=document["photograph"], receipt=_asset(receipt),
                 full_canvas_photograph_coverage=document["full_canvas_photograph_coverage"])

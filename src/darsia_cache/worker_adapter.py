@@ -113,7 +113,7 @@ class WorkerCacheAdapter:
             maximum, binding, profile, measured, completion = applicable_job_cache_profile(
                 self.lease.policy, self, task, estimate, projection=True)
             from .first_qualification import BOUND_JOB_PROFILE
-            if profile.get("format") == BOUND_JOB_PROFILE:
+            if profile.get("format") in {BOUND_JOB_PROFILE, "darsia-common-phase-job-profile-v1"}:
                 profiles.append(dict(run=task["run"], profile=binding, maximum_new_claim_bytes=maximum,
                     measurement=profile["measurement"], completion=profile["completion"],
                     physical_bound=profile["capacity_bound"],
@@ -200,6 +200,9 @@ class WorkerCacheAdapter:
         no profile is synthesized from39 products or absence of a search hit.
         """
         from .first_qualification import BOUND_JOB_PROFILE
+        if profile.get("format") == "darsia-common-phase-job-profile-v1":
+            return self._verify_common_profile(task, estimate, binding, profile, measured, complete,
+                                               remember=remember)
         if profile.get("format") == BOUND_JOB_PROFILE:
             return self._verify_bound_profile(task, estimate, binding, profile, measured, complete, remember=remember)
         if (self.runtime.backend != "cpu" or task.get("pipeline") not in {"native-phase-n1", "n1"}
@@ -270,21 +273,76 @@ class WorkerCacheAdapter:
                 coverage_sha256=_coverage_hash(coverage))
         return True
 
+    def _verify_common_profile(self, task, estimate, binding, profile, measured, complete, *, remember):
+        """An actually resolved common DAG, never a full-profile compatibility cast."""
+        from .common_qualification import require_applicable, IMPORT_PROFILE
+        stage = require_applicable(profile, task)
+        facts = getattr(estimate, "estimate", None)
+        scope = getattr(estimate, "scope", None)
+        control = (facts.get("compute_control") if isinstance(facts, dict)
+                   else scope.get("compute_control") if isinstance(scope, dict) else None)
+        if control != profile.get("compute_profiles", {}).get(stage, {}).get("control"):
+            raise CachePolicyError("Common result projection changes its qualified optional-compute control")
+        imported = self.lease.profile
+        if (imported.get("format") != IMPORT_PROFILE or self.runtime.backend != "cpu"
+                or self.runtime.commit != task["commit"] or task["backend"] != self.runtime.backend
+                or binding != self.lease.profile_binding or profile.get("provider") != binding
+                or profile.get("stores_source") != self.lease.source
+                or profile.get("namespace_admission") != self.lease.document["cache_bootstrap"]["namespace_admission"]
+                or any(profile.get(key) != imported.get(key) for key in (
+                    "scope", "stages", "stage_routes", "device_identity", "python_executable", "module_closure",
+                    "producer_source_closure", "runtime_source_closure", "capacity_bound",
+                    "compute_profiles", "result_spaces"))
+                or profile.get("operational_service_entitlement_bytes") != self.lease.maximum
+                or profile.get("additional_claim_cache_bytes") != 0
+                or profile.get("allocation_model") != "shared-service-only-no-claim-files-v1"
+                or profile.get("actual_writer_IO_proven") is not False
+                or profile.get("sampled_highwater_is_lifetime_peak") is not False
+                or measured.get("complete") is not True or measured.get("first_stop") is not None
+                or measured.get("cache_operational_reserve_crossed") is not False
+                or complete.get("complete") is not True or complete.get("passed") is not True):
+            raise CachePolicyError("Common profile differs from the actual early service/runtime/source closure")
+        cap = self.lease.policy.volume_cap
+        observation = profile["capacity_bound"]["volume_cap_observation"]
+        if (cap is None or cap.maximum_size_bytes != self.lease.policy.quota_bytes
+                or observation.get("binding") != cap.document()
+                or observation.get("virtual_size_bytes") != cap.maximum_size_bytes):
+            raise CachePolicyError("Common profile has another actual physical-volume bound")
+        combined = profile["producer_source_closure"] + profile["runtime_source_closure"]
+        if (len({_key(pin["path"]) for pin in combined}) != len(combined)
+                or {_coverage_hash(pin) for pin in combined} != {
+                    _coverage_hash(pin) for pin in imported["module_closure"]}):
+            raise CachePolicyError("Common profile omits an actual startup producer/runtime boundary")
+        if remember:
+            self.profiles[task["attempt_id"]] = dict(task=deepcopy(task), binding=dict(binding),
+                coverage_sha256=_coverage_hash(profile["stages"]), qualification_kind="common-phase-physical-bound")
+        return True
+
     def _verify_bound_profile(self, task, estimate, binding, profile, measured, complete, *, remember):
         """A typed volume-bound profile, for every task on its qualified head and route.
 
         The task may be another run than the qualified one (N188 D2; another
         run must be a full task, see applicable_job_cache_profile): its claim
         adds no cache bytes, and the shared service keeps the qualified
-        entitlement. Commit, backend, pipeline and precision stay exact.
+        entitlement. Commit, backend, pipeline and precision stay exact. A
+        native-phase-n1 profile also covers a phase-one statistics task and a
+        phase-two n1 task on its qualified head, which run the same stages;
+        each route's own boundary modules must be in the qualified closure.
         """
         from .first_qualification import BOUND_WRITER_CONTRACT
         qualified = profile.get("scope") if isinstance(profile.get("scope"), dict) else {}
+        # A phase-one statistics task and a phase-two n1 task run the qualified
+        # native-phase-n1 stages.
+        staged = (task.get("pipeline") in {"native-phase-statistics", "n1"}
+                  and qualified.get("pipeline") == "native-phase-n1")
+        phase1 = staged and task.get("pipeline") == "native-phase-statistics"
+        keys = ("commit", "backend", "precision") if staged else ("commit", "pipeline", "backend", "precision")
         if (not qualified
-                or any(task.get(key) != qualified.get(key) for key in ("commit", "pipeline", "backend", "precision"))
+                or any(task.get(key) != qualified.get(key) for key in keys)
                 or task.get("commit") != self.runtime.commit
                 or task.get("backend") != self.runtime.backend or self.runtime.backend != "cpu"
-                or task.get("pipeline") != "native-phase-n1" or task.get("precision") != "float32"
+                or task.get("pipeline") != (task.get("pipeline") if staged else "native-phase-n1")
+                or task.get("precision") != "float32"
                 or profile.get("provider") != binding or binding != self.lease.profile_binding
                 or profile.get("namespace_admission") != self.lease.document["cache_bootstrap"]["namespace_admission"]
                 or profile.get("stores_source") != self.lease.source
@@ -309,6 +367,20 @@ class WorkerCacheAdapter:
         root = self.runtime.repository / "src" / "darsia" / "fluidflower" / "pipeline"
         required = [Path(__file__), root / "worker_io.py", root / "capacity.py", root / "runner.py",
             root / "series.py", root.parent / "native" / "sidecar.py", root.parent / "mass" / "n1_pipeline.py"]
+        if phase1:
+            # The phase-one route's own boundary: its runner, DATA, protocol and writers.
+            required += [root / "phase_statistics.py", root / "staged_data.py", root / "phase1_protocol.py",
+                         root / "run_io.py", root / "phase1_capacity.py", root.parent / "storage_outputs.py",
+                         root.parent / "storage_original_photo.py",
+                         root.parent / "phase" / "probability_storage.py"]
+        elif staged:
+            # The n1 route's own boundary, as the measured n1 route requires.
+            required += [root / "staged_data.py", root / "job_inputs.py", root / "n1_capacity.py",
+                         root.parent / "mass" / "pixel_pipeline.py", root.parent / "mass" / "pixels.py",
+                         root.parent / "geometry" / "pixels.py", root.parent / "storage_extensive.py",
+                         root.parent / "storage_extensive_io.py", root.parent / "storage_n1_outputs.py",
+                         root.parent / "storage_n1_saved_products.py", root.parent / "storage_outputs.py",
+                         root.parent / "storage_resolution.py"]
         combined = profile["producer_source_closure"] + profile["runtime_source_closure"]
         if (not {_key(path) for path in required} <= producers
                 or len({_key(pin["path"]) for pin in combined}) != len(combined)

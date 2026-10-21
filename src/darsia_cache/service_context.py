@@ -190,9 +190,13 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
     first=None
     if first_request is not None:
         from .first_qualification import FirstQualification, PROVIDER
-        if profile.get("format")!=PROVIDER:
+        first_type = FirstQualification
+        if profile.get("format") == "darsia-common-phase-qualified-provider-v1":
+            from .common_qualification import CommonQualification
+            first_type = CommonQualification
+        elif profile.get("format")!=PROVIDER:
             raise CachePolicyError("Explicit first observer requires the original immutable provider")
-        first=FirstQualification(first_request,provider_binding=role["profile"],
+        first=first_type(first_request,provider_binding=role["profile"],
             stores_source=policy_binding,namespace=receipt["namespace"],read=reads.read,
             read_authorities=reads.read_authorities, historical_authorities=historical_authorities)
         admin=receipt.get("first_qualification",{})
@@ -208,16 +212,23 @@ def resolve_original_service_context(receipt_binding, *, package_file, first_req
             module_closure=first.provider["module_closure"],
             native_supervision=dict(startup=first.provider["startup"]))
     elif profile.get("format") in {"darsia-cache-qualified-profile-provider-v1",
-            "darsia-cache-volume-bound-import-profile-v1", "darsia-cache-volume-bound-job-profile-v1"}:
+            "darsia-cache-volume-bound-import-profile-v1", "darsia-cache-volume-bound-job-profile-v1",
+            "darsia-common-phase-qualified-provider-v1", "darsia-common-phase-import-profile-v1",
+            "darsia-common-phase-job-profile-v1"}:
         from .first_qualification import resolve_profile
         profile=resolve_profile(role["profile"],"import",reads.read,stores_source=policy_binding,
             read_authorities=reads.read_authorities)
     from .first_qualification import BOUND_IMPORT_PROFILE, checked_bound_import_context
     bounded = first is None and profile.get("format") == BOUND_IMPORT_PROFILE
+    common = first is None and profile.get("format") == "darsia-common-phase-import-profile-v1"
+    if common:
+        from .common_qualification import checked_import_context
+        checked_import_context(profile, purpose=role["purpose"], role_identifier=role["role_identifier"],
+            entry_kind=role["entry_kind"], policy=policy, namespace=receipt["namespace"])
     if bounded:
         checked_bound_import_context(profile, purpose=role["purpose"], role_identifier=role["role_identifier"],
             entry_kind=role["entry_kind"], policy=policy, namespace=receipt["namespace"])
-    if first is None and not bounded and (profile.get("format") != "darsia-cache-import-profile-v1"
+    if first is None and not bounded and not common and (profile.get("format") != "darsia-cache-import-profile-v1"
             or profile.get("purpose") != role["purpose"]
             or profile.get("role_identifier") != role["role_identifier"]
             or profile.get("entry_kind") != role["entry_kind"]

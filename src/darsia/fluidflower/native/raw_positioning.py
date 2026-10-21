@@ -209,15 +209,17 @@ def drift_view(fraction: np.ndarray) -> np.ndarray:
 
 
 def _apply_drift(image, correction) -> None:
-    """Apply a saved DriftCorrection, estimating its translation on the sRGB view.
+    """Match the source encoding to the explicitly recorded drift baseline.
 
     The steps are DriftCorrection.correct_array's, except that the estimator
     sees drift_view of the ROI. The translation it finds warps the linear values.
     """
     roi = correction.roi
     values = image.img if roi is None else image.img[roi]
+    estimation_view = (values if getattr(correction, "linear_input", False)
+                       else drift_view(values))
     translation, intact = correction.translation_estimator.find_effective_translation(
-        drift_view(values), correction.base, None, roi)
+        estimation_view, correction.base, None, roi)
     if not intact:
         raise ValueError("ROIs cannot be aligned by translation.")
     height, width = correction.base.shape[:2]
@@ -230,9 +232,9 @@ def native_review_rgb(camera_rgb: np.ndarray, chain: Sequence, *,
                       image_metadata: Mapping) -> np.ndarray:
     """Use the saved per-frame shape/motion chain, without fitting a new rig.
 
-    A drift step measures its translation on the sRGB view of the linear
-    values (drift_view), as its JPEG-built base expects. Every other step, and
-    the returned DN values, use the linear values.
+    Historical drift bases use an sRGB estimation view. An explicitly marked
+    RAW-built base uses linear values. Every warp and the returned DN values
+    use the linear values.
     """
     import darsia
 
@@ -268,8 +270,9 @@ def render_native(sensor: Sensor, *, shape_assets: Sequence[Mapping],
 
     before = scientific_thread("raw_positioning.render_native:before")
     view = camera_u(sensor, parameters=parameters)
+    shape_chain = load_shape_chain(shape_assets)
     review = native_review_green(
-        view, load_shape_chain(shape_assets),
+        view, shape_chain,
         white_range_dn=sensor.metadata["white_level"] - sensor.metadata["black_level"],
         shape_hw=shape_hw, image_metadata=image_metadata)
     h, quality = registration.review_to_camera(
@@ -284,7 +287,10 @@ def render_native(sensor: Sensor, *, shape_assets: Sequence[Mapping],
         registration=quality, sensor_metadata=dict(sensor.metadata),
         profile_id=sensor.profile_id,
         white_balance_applied=False, gamma_applied=False,
-        drift_estimation_view="sRGB (IEC 61966-2-1) of linear DN/white, ROI only; warp applied to linear values",
+        drift_estimation_view=(
+            "linear DN/white for explicitly RAW-built drift bases; warp applied to linear values"
+            if any(getattr(step, "linear_input", False) for step in shape_chain)
+            else "sRGB (IEC 61966-2-1) of linear DN/white, ROI only; warp applied to linear values"),
         scientific_units="black-subtracted camera DN",
         scientific_interpolation="one direct per-channel sensor-to-native bilinear float32 warp",
         new_rig_fit=False, new_photometric_fit=False, training=False,

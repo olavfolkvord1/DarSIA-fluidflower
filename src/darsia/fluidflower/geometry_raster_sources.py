@@ -87,12 +87,13 @@ def descriptor(path):
     return {"path": str(path), "sha256": digest.hexdigest(), "size_bytes": size}
 
 
-def _verify(binding, path=None):
+def _verify(binding, path=None, *, descriptor_reader=None):
+    """Compare the exact binding using the original or an explicit opt-in reader."""
     if (not isinstance(binding, dict) or not Path(str(binding.get("path", ""))).is_absolute()
             or re.fullmatch(r"[0-9a-f]{64}", str(binding.get("sha256", ""))) is None
             or type(binding.get("size_bytes")) is not int or binding["size_bytes"] < 0):
         raise ValueError("Imported geometry requires explicit path/SHA-256/size bindings.")
-    actual = descriptor(path or binding["path"])
+    actual = (descriptor if descriptor_reader is None else descriptor_reader)(path or binding["path"])
     if any(actual[key] != binding[key] for key in ("sha256", "size_bytes")):
         raise ValueError("An imported geometry source changed: " + str(path or binding["path"]))
     return actual
@@ -113,26 +114,57 @@ def bind_imported_rasters(config, *, sources, diagnosis):
     return candidate
 
 
-def _full_csv(path):
-    # Preserve arbitrary original columns and all IDs. Never regenerate a CSV
-    # from only those facies which happen to be a region's modal assignment.
-    with Path(path).open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
+def _full_csv(path, *, csv_bytes=None, strict=False, max_rows=None):
+    """Read the full table, optionally validating bounded already-pinned bytes.
+
+    Ordinary path callers retain the existing permissive CSV and numeric-ID
+    rules. The explicit bytes branch shares this reader and preserves every
+    string cell while requiring exact headers, row widths and int64 identities.
+    """
+    import io
+    from decimal import Decimal, InvalidOperation
+
+    if csv_bytes is not None:
+        if type(csv_bytes) is not bytes:
+            raise ValueError("The FULL original facies CSV needs explicit bytes.")
+        if strict and b"\x00" in csv_bytes:
+            raise ValueError("NUL in CSV.")
+        stream = io.StringIO(csv_bytes.decode("utf-8-sig"), newline="")
+    else:
+        stream = Path(path).open("r", encoding="utf-8-sig", newline="")
+    with stream:
+        reader = csv.DictReader(stream, strict=strict)
         columns = reader.fieldnames or []
         names = {name.strip().casefold(): name for name in columns}
         identity = names.get("id") or names.get("facies_id")
         if identity is None:
             raise ValueError("The FULL original facies CSV has no id column.")
-        rows = list(reader)
+        if strict and (not columns or any(not name for name in names)
+                or len(names) != len(columns) or "name" not in names
+                or sum(key in names for key in ("id", "facies_id")) != 1):
+            raise ValueError("Blank, duplicate or ambiguous CSV columns.")
+        rows = []
+        for row in reader:
+            if strict and (None in row or any(value is None for value in row.values())):
+                raise ValueError("Ragged CSV row.")
+            if max_rows is not None and len(rows) >= max_rows:
+                raise ValueError("The FULL original facies CSV has too many rows.")
+            rows.append(row)
     ids = []
     for row in rows:
         text = str(row.get(identity, "")).strip()
         try:
-            value = float(text)
-            if not np.isfinite(value) or not value.is_integer():
-                raise ValueError
+            if strict:
+                value = Decimal(text)
+                if (not value.is_finite() or value != value.to_integral_value()
+                        or not -(1 << 63) <= value <= (1 << 63) - 1):
+                    raise ValueError
+            else:
+                value = float(text)
+                if not np.isfinite(value) or not value.is_integer():
+                    raise ValueError
             ids.append(int(value))
-        except (ValueError, OverflowError):
+        except (ValueError, OverflowError, InvalidOperation):
             raise ValueError("The FULL original facies CSV has a noninteger ID.") from None
     if len(ids) != len(set(ids)):
         raise ValueError("The FULL original facies CSV has duplicate IDs.")
@@ -182,6 +214,7 @@ def imported_payload(config):
 
 
 def difference_to_canonical(config, facies):
+    """Compare actual ID arrays while distinguishing an explicit painted change."""
     from .geometry_facies import _canonical_facies, _layer_boundary_mask
     canonical, _ = _canonical_facies(config)
     if canonical.shape != facies.shape:
@@ -191,12 +224,16 @@ def difference_to_canonical(config, facies):
     boundary = _layer_boundary_mask(labels, set(map(int, np.unique(labels))))
     count = int(np.count_nonzero(changed))
     total = int(changed.size)
+    notice = ("imported rasters; facies raster independent of labels; "
+              f"{count:,} pixels ({100 * count / total:.2f} %) differ from a label-derived facies map")
+    if "painted_adoption_table" in config:
+        notice = ("approved painted map and table compared with the retained parent; "
+                  f"{count:,} pixels ({100 * count / total:.2f} %) have a different facies ID")
     return dict(pixel_count=total, different_pixels=count,
                 different_fraction=count / total,
                 different_pixels_on_label_boundary=int(np.count_nonzero(changed & boundary)),
                 difference_rule="array values; no tolerance, splitting or interpolation",
-                notice=("imported rasters; facies raster independent of labels; "
-                        f"{count:,} pixels ({100 * count / total:.2f} %) differ from a label-derived facies map"))
+                notice=notice)
 
 
 def validate_source_mode(config, report):
@@ -250,6 +287,7 @@ def prepare_canonical_edit(project, *, actor, reason):
 
 
 def canonical_parent_payload(config, *, run_id=None):
+    """Read the retained imported parent or its explicit painted-table composition."""
     parent = config.get("canonical_import_parent") or {}
     record = _verify(parent.get("revision"))
     revision = json.loads(Path(record["path"]).read_bytes())
@@ -259,6 +297,9 @@ def canonical_parent_payload(config, *, run_id=None):
             or revision.get("configuration") != old):
         raise ValueError("A canonical edit lacks its actual imported parent and explicit opt-in.")
     payload = imported_payload(old)
+    if "painted_adoption_table" in config:
+        from .painted_adoption_table import canonical_payload
+        return canonical_payload(config, parent, payload, run_id=run_id)
     if (str(config.get("facies_properties_source_path")) != str(old.get("facies_properties_source_path"))
             or config.get("grouping_mode") != "shared_facies"):
         raise ValueError("A canonical edit must keep the FULL original CSV and facies IDs.")
@@ -778,9 +819,6 @@ def _validate_painted_run(config, payload, parent, row):
     if (Path(actual["path"]).suffix.casefold() != ".npz"
             or Path(actual["path"]).resolve() != Path(row["labels_path"]).resolve()):
         raise ValueError("A painted run lacks its actual NPZ labels.")
-    metadata = _darsia_metadata(Path(payload["actual"]["labels"]["path"]))
-    if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])), metadata):
-        raise ValueError("Painted labels changed the imported grid metadata.")
     fields = ((((config.get("frame_binding") or {}).get("runs") or {}).get(run) or {}).get("fields") or {})
     photograph = fields.get("shape_corrected_baseline") or {}
     source = _carried_descriptor(record["source_image"])
@@ -805,6 +843,19 @@ def _validate_painted_run(config, payload, parent, row):
         raise ValueError("Painted labels differ from the exact replay of their placement.")
     preparation = json.loads(Path(measurement["path"]).read_bytes())
     entry = next((item for item in preparation.get("runs") or [] if item.get("run_id") == run), {})
+    from .raw_shape_basis_reader import has_shape_basis
+    if has_shape_basis(models[-1]):
+        from .painted_adoption_geometry import basis_label_fields
+        from .painted_adoption_table import _same
+        expected = basis_label_fields(preparation["painting_facies"],
+            preparation["painting_geometry"], run, Path(measurement["path"]).parent)
+        if expected is None or not _same(entry.get("current_labels"), expected["source"]):
+            raise ValueError("Painted labels lost this run's exact RAW-basis parent label identity.")
+        metadata = expected["metadata"]
+    else:
+        metadata = _darsia_metadata(Path(payload["actual"]["labels"]["path"]))
+    if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])), metadata):
+        raise ValueError("Painted labels changed the imported grid metadata.")
     approval = json.loads(Path(authority["path"]).read_bytes())
     if (preparation.get("format") != PAINTED_PREPARATION or entry.get("status") != "prepared"
             or (entry.get("labels") or {}).get("sha256") != actual["sha256"]
@@ -946,7 +997,10 @@ def registered_run_sources(project_root, current, run_id):
     if not _same_grid_metadata(_darsia_metadata(Path(files["facies"]["path"])),
             _darsia_metadata(Path(files["labels"]["path"]))):
         raise ValueError("Stored registered facies changed their grid metadata.")
-    if Path(files["facies_properties"]["path"]).read_bytes() != Path(payload["actual"]["facies_properties"]["path"]).read_bytes():
+    if "painted_table_bytes" in payload:
+        if Path(files["facies_properties"]["path"]).read_bytes() != payload["painted_table_bytes"]:
+            raise ValueError("Stored registered run lost its exact derived painting properties CSV.")
+    elif Path(files["facies_properties"]["path"]).read_bytes() != Path(payload["actual"]["facies_properties"]["path"]).read_bytes():
         raise ValueError("Stored registered run lost the FULL original properties CSV.")
     guarded = [current_file, revision_file, config["canonical_import_parent"]["revision"],
                payload["diagnosis"], *payload["actual"].values(),
@@ -955,6 +1009,8 @@ def registered_run_sources(project_root, current, run_id):
         guarded.extend(_carried_file_bindings(row["registration"]))
     if row["registration"].get("kind") == PAINTED:
         guarded.extend(row["registration"][key] for key in ("source_map", "reference_model", "target_model"))
+    if "painted_table_guarded_sources" in payload:
+        guarded.extend(payload["painted_table_guarded_sources"])
     result = dict(revision_id=revision_id, run_id=run, current=current_file,
         revision=revision_file, files=files, labels_shape=list(labels.shape),
         registration=deepcopy(row["registration"]), guarded_sources=guarded,
@@ -991,6 +1047,8 @@ def require_source_mode_transition(store, config):
         history = store.revisions()
         current = history[-1] if history else {}
     old = current.get("configuration") or {}
+    if "painted_adoption_table" in old and "painted_adoption_table" not in config:
+        raise ValueError("A painted adoption cannot silently discard its derived table authority.")
     if old.get("source_mode") in {IMPORTED, CANONICAL_EDIT} and mode not in {IMPORTED, CANONICAL_EDIT}:
         raise ValueError(SILENT_EDIT)
     if old.get("source_mode") == IMPORTED and mode != IMPORTED:
@@ -1000,14 +1058,20 @@ def require_source_mode_transition(store, config):
 
 
 def materialize_source_mode(config, staging, destination):
-    """The Store's own artifacts; imported arrays and CSV are exact byte copies."""
+    """Copy original imported artifacts or materialize an explicit canonical edit."""
     from .geometry_facies import _canonical_facies, _darsia_metadata
     mode = config["source_mode"]
     payload = imported_payload(config) if mode == IMPORTED else canonical_parent_payload(config)
     copied = {}
     for name in ("labels", "facies", "facies_properties"):
         target = Path(staging) / ("facies_properties.csv" if name == "facies_properties" else name + ".npz")
-        if mode == CANONICAL_EDIT and name == "facies":
+        if name == "facies_properties" and "painted_table_bytes" in payload:
+            raw = payload["painted_table_bytes"]
+            with target.open("xb") as outgoing:
+                outgoing.write(raw)
+            expected = {"path": str(target.resolve()), "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+            _verify(expected)
+        elif mode == CANONICAL_EDIT and name == "facies":
             facies, _ = _canonical_facies(config)
             np.savez_compressed(target, array=facies, metadata=_darsia_metadata(Path(config["labels_path"])))
         else:
@@ -1027,6 +1091,11 @@ def materialize_source_mode(config, staging, destination):
         detail = {**detail, "labels_changed_from_parent": int(np.count_nonzero(labels != payload["labels"])),
                   "parent_revision": deepcopy(config["canonical_import_parent"]["revision"]),
                   "known_change": "Explicit canonical derivation from edited labels and the full original CSV; not an adopted-v1 identity gate."}
+    if "painted_table_bytes" in payload:
+        for source in payload["painted_table_guarded_sources"]:
+            _verify(source)
+        detail["known_change"] = ("Explicit approved-painting table derivation; original CSV preserved, "
+                                  "porous extra cells carried by name and nonporous extra cells explicitly blank.")
     return dict(source_mode=mode, labels_path=copied["labels"]["path"],
                 source_mode_files=copied, source_mode_difference=detail,
                 source_mode_diagnosis=payload["diagnosis"]), payload["rows"]

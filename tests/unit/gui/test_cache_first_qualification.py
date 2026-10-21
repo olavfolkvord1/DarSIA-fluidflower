@@ -178,7 +178,7 @@ def lease_for(state):
     ledger=Ledger_TESTONLY()
     return SimpleNamespace(first_qualification=state,ledger=ledger,
         document={"cache_bootstrap":{"namespace_admission":state.provider["namespace_admission"]}},
-        policy=SimpleNamespace(volume_cap=object(),quota_bytes=500*1024**3,
+        policy=SimpleNamespace(volume_cap=SimpleNamespace(maximum_size_bytes=500*1024**3),quota_bytes=500*1024**3,
             profiles={"jobs":state.provider_binding}),
         admission={"receipts":state.provider["output_namespace"]},
         owner=dict(pid=12,process_create_time="123.0"),source=state.stores_source)

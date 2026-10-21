@@ -433,6 +433,9 @@ def _producer_inventory(index, products, record, producer, task, job, *,
 def _terminal(root, run_root, base_task, job, done, reader):
     if base_task.get("pipeline") == "native-phase-statistics":
         return _phase1_terminal(root, base_task, job, done, reader)
+    if base_task.get("pipeline") == "n1-calibration-refit":
+        from .pipeline.common_calibration import refit_terminal
+        return refit_terminal(root, base_task, job, done, reader)
     if (done.get("format") != "darsia-alias-done-v1" or done.get("run") != base_task["run"]
             or done["completed"]["relative_path"] != "results/"+base_task["run"]+"/completed.json"):
         raise ValueError("Alias done record differs from its canonical run")

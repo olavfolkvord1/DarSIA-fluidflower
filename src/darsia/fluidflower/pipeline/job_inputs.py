@@ -119,6 +119,25 @@ class InputCatalog:
             self.documents[key] = _json_bytes(raw)
         return deepcopy(self.documents[key])
 
+    def statistics_document(self, descriptor, role, use):
+        """Decode only a named, SHA-verified statistics document, including gzip."""
+        import gzip
+        import io
+        reference = self.add(descriptor, role, use)
+        actual = self.physical(descriptor)
+        raw = self.metadata_bytes(actual["path"])
+        if (not isinstance(raw, bytes) or len(raw) != reference["bytes"]
+                or hashlib.sha256(raw).hexdigest() != descriptor["sha256"]):
+            raise ValueError("Consumed statistics SHA/size changed")
+        if raw[:2] == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+                decoded = stream.read(MAX_METADATA_BYTES + 1)
+        else:
+            decoded = raw
+        if len(decoded) > MAX_METADATA_BYTES:
+            raise ValueError("Decoded statistics exceed the metadata byte limit")
+        return _json_bytes(decoded)
+
     def pair(self, value, path_key, sha_key, role, use):
         return self.add({"path": value[path_key], "sha256": value[sha_key]}, role, use)
 
@@ -204,7 +223,13 @@ class InputCatalog:
                 or not isinstance(core.get("frames"), list) or len(core["frames"]) != len(order)):
             raise ValueError("Phase-two catalogue requires its actual complete phase-one source/order")
         for key, value in phase1["statistics"].items():
-            if key != "format" and not staged._same_json(config.get(key), value):
+            actual = config.get(key)
+            if key == "provenance" and isinstance(actual, dict) and "common_frozen_refit" in actual:
+                from .common_calibration import JOIN_FORMAT
+                if not isinstance(actual["common_frozen_refit"], dict) or actual["common_frozen_refit"].get("format") != JOIN_FORMAT:
+                    raise ValueError("Only the recognized verified common C provenance extension may be added")
+                actual = {field: content for field, content in actual.items() if field != "common_frozen_refit"}
+            if key != "format" and not staged._same_json(actual, value):
                 raise ValueError("Phase-two scientific DATA differs from its phase-one template: " + key)
         for spec, original, committed in zip(frames, phase1["frames"], core["frames"]):
             refs = binding["frames"][spec["case_id"]]
@@ -229,6 +254,9 @@ class InputCatalog:
                 self.doc(photo["receipt"], "configuration", use + ".photo_receipt")
                 if photo["state"] == "complete":
                     self.add(photo["png"], "image", use + ".photo_png")
+        if "common_frozen_refit" in config.get("provenance", {}):
+            from .common_calibration import catalogue_refit
+            catalogue_refit(self, config)
 
     def n16_inputs(self, config, frames, calibration):
         """Positive named N16 consumers; passive historical paths stay unvisited."""
@@ -494,6 +522,9 @@ class InputCatalog:
                 for frame in config["statistics"][run]:
                     self.add(frame["statistics"], "calibration",
                              "refit." + run + ".frame." + str(frame["frame_index"]) + ".statistics")
+            if "common_phase1" in config:
+                from .common_calibration import catalogue_common_phase1
+                catalogue_common_phase1(self, config["common_phase1"], use="refit.common_phase1")
         else:
             raise ValueError("Unsupported role catalogue run format: " + str(config.get("format")))
         return {"format": CATALOG_FORMAT, "complete": True, "run": config["run"],

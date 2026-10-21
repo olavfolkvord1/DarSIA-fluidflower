@@ -11,7 +11,6 @@ from copy import deepcopy
 import gzip
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import time
@@ -59,11 +58,9 @@ def _save_before(stage, spec, capture, shape):
                     source=deepcopy(spec["source"]), before_rules=evidence)
     result = dict(state=evidence["state"])
     if la is not None:
+        from .io_ops import publish_file
         path = Path(stage) / "storage_gas_probability_before_rules.png"
-        with path.open("xb") as stream:
-            Image.fromarray(la, mode="LA").save(stream, format="PNG")
-            stream.flush()
-            os.fsync(stream.fileno())
+        publish_file(path, lambda stream: Image.fromarray(la, mode="LA").save(stream, format="PNG"))
         document["png"] = asset(path)
         result["png"] = document["png"]
     result["receipt"] = _write_json(Path(stage) / "phase_before.json", document)
@@ -96,22 +93,25 @@ def _save_statistics(stage, extracted):
     if "opencv_ipp" in extracted:
         validate_observation(extracted["opencv_ipp"])
     from ..mass.n1_pipeline import _jsonable, asset, _write_json
+    from .io_ops import publish_file
     path = Path(stage) / "native_statistics.json.gz"
-    with path.open("xb") as raw:
-        with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=3) as compressed:
-            # Exact old JSON conversion/separators; only ownership-safe binary
-            # exclusive creation replaces gzip.open's overwritable filename.
-            data = json.dumps(_jsonable(extracted["statistics"]), allow_nan=False,
-                              separators=(",", ":")).encode("utf-8")
+    # Exact old JSON conversion/separators. The N111-retried publisher writes a
+    # temporary first, so the gzip header names the final file, as before.
+    data = json.dumps(_jsonable(extracted["statistics"]), allow_nan=False,
+                      separators=(",", ":")).encode("utf-8")
+
+    def write(raw):
+        with gzip.GzipFile(filename=str(path), fileobj=raw, mode="wb", compresslevel=3) as compressed:
             compressed.write(data)
-        raw.flush()
-        os.fsync(raw.fileno())
+    publish_file(path, write)
     _write_json(Path(stage) / "statistics_geometry_report.json", extracted["sandmap"])
     bound = asset(path)
     if "opencv_ipp" in extracted:
+        facts = ({"pixel_backend_facts": extracted["pixel_backend_facts"]}
+                 if "pixel_backend_facts" in extracted else {})
         _write_json(Path(stage) / "native_statistics_runtime.json", dict(
             format="darsia-native-statistics-runtime-v1", statistics=bound,
-            opencv_ipp=extracted["opencv_ipp"]))
+            opencv_ipp=extracted["opencv_ipp"], **facts))
     return bound
 
 
@@ -233,6 +233,8 @@ def _run_phase1(task, output, backend, precision, on_progress, runtime):
                                                      baseline=inputs.mass_baseline)
             extracted = statistics_context.extract_statistics(statistics_spec)
             extracted["opencv_ipp"] = statistics_context.last_opencv_ipp
+            if "opencl_acceleration" in statistics_config:
+                extracted["pixel_backend_facts"] = math_provider.facts()
             statistics = _save_statistics(stage, extracted)
             phase["opencv_ipp"] = completed_frame(ipp_before, "run_phase1:" + spec["case_id"] + ":after")
             committed = _commit_phase1(stage, spec, task=task, configuration=configuration,

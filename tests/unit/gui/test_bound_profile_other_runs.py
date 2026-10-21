@@ -91,7 +91,7 @@ def test_another_run_needs_the_measured_kind_grid_canvas_and_precision(monkeypat
 
 
 @pytest.mark.parametrize("key,value", [("commit", "f" * 40), ("backend", "cuda"),
-                                       ("precision", "float64"), ("pipeline", "n1")])
+                                       ("precision", "float64"), ("pipeline", "lattice-phase-n1")])
 def test_a_bound_profile_never_estimates_another_head_or_route(monkeypatch, key, value):
     task, config, wrapped = other_run_TESTONLY()
     task[key] = value
@@ -198,7 +198,7 @@ def test_the_qualified_task_and_a_projection_are_covered_as_before(bound_cache_T
 
 
 @pytest.mark.parametrize("key,value", [("commit", "4" * 40), ("backend", "cuda"),
-                                       ("precision", "float64"), ("pipeline", "n1")])
+                                       ("precision", "float64"), ("pipeline", "lattice-phase-n1")])
 def test_a_bound_cache_profile_never_covers_another_head_or_route(bound_cache_TESTONLY, key, value):
     f = bound_cache_TESTONLY
     task = other_cache_task_TESTONLY(f)

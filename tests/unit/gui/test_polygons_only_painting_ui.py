@@ -57,20 +57,32 @@ def _version_row(view, record):
 @pytest.mark.parametrize("worker_name", ["_PlacementWorker", "_AdoptionWorker"])
 @pytest.mark.parametrize("new_method", [False, True])
 def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, monkeypatch, worker_name, new_method):
-    from darsia.fluidflower import map_adoption, map_placement
+    from darsia.fluidflower import map_adoption, map_placement, raw_shape_basis_reader
 
     session = deepcopy(view.session)
     layers = np.ones((60, 80), np.uint8)
     record = {"name": "Draft", "kind": "proposal", "sha256": "a" * 64,
-              "created_utc": "2026-01-01T00:00:00Z", "folder": "saved"}
+              "created_utc": "2026-01-01T00:00:00Z", "folder": "saved", "run_id": session.run_id}
     if new_method:
         record["proposal_method"] = polygons.METHOD
+    # This metadata-routing case already mocks drawing and the operation sink;
+    # isolate the new presence preflight explicitly, without claiming RAW proof.
+    preflights = []
+    def preflight(index, runs):
+        preflights.append((str(index), list(runs)))
+    if worker_name == "_AdoptionWorker":
+        monkeypatch.setattr(raw_shape_basis_reader, "require_basis_index", preflight)
+    expected = [("unused", [session.run_id, session.run_id])] if worker_name == "_AdoptionWorker" else []
     loader = polygons if new_method else slv.lpm
-    monkeypatch.setattr(loader, "version_layers", lambda *args, **kwargs: (session, layers.copy()))
+    def version_layers(*args, **kwargs):
+        assert preflights == expected  # The preflight precedes even the stub drawing.
+        return session, layers.copy()
+    monkeypatch.setattr(loader, "version_layers", version_layers)
     calls, failures = [], []
     target = map_placement if worker_name == "_PlacementWorker" else map_adoption
     operation = "place_map_in_runs" if worker_name == "_PlacementWorker" else "prepare_adoption"
     def capture(*args, **kwargs):
+        assert preflights == expected
         calls.append(kwargs)
         return {"prepared": True}
     monkeypatch.setattr(target, operation, capture)
@@ -81,6 +93,7 @@ def test_placement_and_adoption_receipts_keep_explicit_new_method_only(view, mon
     worker.failed.connect(failures.append)
     worker.run()
     assert failures == [] and len(calls) == 1
+    assert preflights == expected
     identity = calls[0]["version"]
     assert identity["approval"] == approval
     if new_method:

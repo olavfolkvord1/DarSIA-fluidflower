@@ -72,6 +72,9 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
     if result.get("pipeline") == "native-phase-statistics":
         from .phase1_protocol import extract_phase1_products
         return extract_phase1_products(result, claim, machine_id)
+    if result.get("pipeline") == "n1-calibration-refit":
+        from .common_calibration import extract_refit_products
+        return extract_refit_products(result, claim, machine_id)
     if result.get("worker_references_closed") is not True or result.get("complete") is not True:
         raise ValueError("Original scientific producers have not closed their references")
     if result.get("run") != claim.task["run"] or result.get("attempt_id") != claim.token:

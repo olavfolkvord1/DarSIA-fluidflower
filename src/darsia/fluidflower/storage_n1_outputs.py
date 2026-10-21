@@ -23,22 +23,25 @@ PRODUCER_KIND = "n1-mass-only"
 
 
 def _copy(bound, destination, final, reader, *, kind):
-    """Copy exact already-saved bytes into this new frame, not a new producer."""
+    """Copy exact already-saved bytes into this new frame, not a new producer.
+
+    The copy goes through the N111-retried publisher; each try copies anew.
+    """
+    from .pipeline.io_ops import publish_file
     path = reader.path(bound)
-    with Path(path).open("rb") as source, Path(destination).open("xb") as target:
-        import hashlib
-        import os
-        digest, length = hashlib.sha256(), 0
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            target.write(chunk)
-            digest.update(chunk)
-            length += len(chunk)
-        target.flush()
-        os.fsync(target.fileno())
-    if digest.hexdigest() != bound["sha256"] or length != bound["size_bytes"]:
+    lengths = []
+
+    def copy(target):
+        lengths.clear()
+        with Path(path).open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                target.write(chunk)
+                lengths.append(len(chunk))
+    digest = publish_file(destination, copy)
+    if digest != bound["sha256"] or sum(lengths) != bound["size_bytes"]:
         raise ValueError("Saved phase-one bytes changed during exact storage copy")
     return dict(path=str(Path(final) / Path(destination).name),
-                sha256=digest.hexdigest(), size_bytes=length, kind=kind)
+                sha256=digest, size_bytes=sum(lengths), kind=kind)
 
 
 class Phase2Storage:
