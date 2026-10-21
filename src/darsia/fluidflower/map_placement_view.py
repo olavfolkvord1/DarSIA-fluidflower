@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHeaderView,
     QLabel,
+    QPlainTextEdit,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -34,27 +35,50 @@ from PySide6.QtWidgets import (
 
 from darsia.fluidflower.map_placement import OVERLAY_LEGEND
 
+# A layer pair counts as changed in the table only with this many measured
+# samples (shorter boundaries give unsteady medians; the details list all)
+# and a change of more than LARGE_CHANGE_MM.
+MIN_SAMPLES = 100
+LARGE_CHANGE_MM = 5.0
+
 _COLUMNS = (
     "Run",
     "Status",
     "Shift from reference (px)",
-    "Largest layer offset (mm)",
+    "Typical offset change (mm)",
+    f"Pairs changed > {LARGE_CHANGE_MM:g} mm",
     "Gaps to fill (px)",
     "Water pockets (px)",
     "Unknown layers",
 )
 
 
-def _largest_offset(row: Mapping[str, Any]) -> float | None:
-    """The layer-pair median offset of a run with the largest magnitude, or None."""
+def offset_summary(row: Mapping[str, Any]) -> tuple[float | None, int]:
+    """A run's typical change of the layer-pair offsets from the reference
+    run and the number of pairs that changed by more than LARGE_CHANGE_MM.
 
-    offsets = dict(row.get("layer_offsets") or {})
-    medians = [
-        float(boundary["median_mm"])
-        for boundary in offsets.get("boundaries") or []
-        if boundary.get("median_mm") is not None
+    The typical change is the median of the pairs' changes weighted by their
+    measured samples, so short boundaries with unsteady medians weigh little;
+    None when no pair has a change. A pair counts as changed only with at
+    least MIN_SAMPLES measured samples.
+    """
+
+    rows = [
+        (float(boundary["change_from_reference_mm"]), int(boundary.get("measured_sample_count") or 0))
+        for boundary in (dict(row.get("layer_offsets") or {})).get("boundaries") or []
+        if boundary.get("change_from_reference_mm") is not None
     ]
-    return max(medians, key=abs) if medians else None
+    large = sum(1 for change, count in rows if count >= MIN_SAMPLES and abs(change) > LARGE_CHANGE_MM)
+    rows = sorted((change, count) for change, count in rows if count > 0)
+    total = sum(count for _change, count in rows)
+    if not total:
+        return None, large
+    running = 0
+    for change, count in rows:
+        running += count
+        if 2 * running >= total:
+            return change, large
+    return rows[-1][0], large
 
 
 def _cells(row: Mapping[str, Any]) -> tuple[str, ...]:
@@ -62,13 +86,14 @@ def _cells(row: Mapping[str, Any]) -> tuple[str, ...]:
 
     checks = dict(row.get("checks") or {})
     shift = dict(row.get("offset_px") or {})
-    largest = _largest_offset(row)
+    typical, large = offset_summary(row)
     unknown = checks.get("unknown_layer_ids") or []
     return (
         str(row.get("run_id") or "").upper(),
         str(row.get("status") or ""),
         f"{shift['median_px']:.1f} / {shift['max_px']:.1f}" if shift else "",
-        f"{largest:+.1f}" if largest is not None else ("none measured" if checks else ""),
+        f"{typical:+.1f}" if typical is not None else ("none measured" if checks else ""),
+        str(large) if checks else "",
         str(checks.get("gap_pixels", "")),
         str(checks.get("water_pocket_pixels", "")),
         ", ".join(str(value) for value in unknown) or ("none" if checks else ""),
@@ -89,8 +114,9 @@ def offset_lines(row: Mapping[str, Any], layers: Mapping[str, Any]) -> list[str]
     for boundary in (dict(row.get("layer_offsets") or {})).get("boundaries") or []:
         first, second = boundary["labels"]
         lines.append(
-            f"{name(first)} | {name(second)}: median {mm(boundary['median_mm'])} mm "
-            f"(P10 {mm(boundary['p10_mm'])}, P90 {mm(boundary['p90_mm'])}); "
+            f"{name(first)} | {name(second)}: change {mm(boundary.get('change_from_reference_mm'))} mm; "
+            f"median {mm(boundary['median_mm'])} (P10 {mm(boundary['p10_mm'])}, "
+            f"P90 {mm(boundary['p90_mm'])}); "
             f"{boundary['measured_sample_count']} of {boundary['sample_count']} samples"
         )
     return lines
@@ -167,7 +193,8 @@ class MapPlacementDialog(QDialog):
             "through its measured geometry. Review only: compare the boundaries with each "
             "run's own photograph. Nothing is adopted and no run configuration changed. "
             "Layer offsets: the strongest colour edge within ±25 mm of each boundary, positive "
-            "from the lower towards the higher layer id. Gaps: pixels inside the map that it "
+            "from the lower towards the higher layer id; the change is the difference from the "
+            "reference run's own offset for the same pair. Gaps: pixels inside the map that it "
             "does not cover. Water pockets: free water apart from the main free water. "
             f"Folder: {self.folder}"
         )
@@ -175,9 +202,7 @@ class MapPlacementDialog(QDialog):
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(note)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        side = QWidget()
-        side_layout = QVBoxLayout(side)
-        side_layout.setContentsMargins(0, 0, 0, 0)
+        side = QSplitter(Qt.Orientation.Vertical)
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(list(_COLUMNS))
         self.table.verticalHeader().setVisible(False)
@@ -193,11 +218,11 @@ class MapPlacementDialog(QDialog):
             for column, value in enumerate(_cells(row)):
                 self.table.setItem(number, column, QTableWidgetItem(value))
         self.table.itemSelectionChanged.connect(self._selected)
-        side_layout.addWidget(self.table, 1)
-        self.details = QLabel()
-        self.details.setWordWrap(True)
-        self.details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        side_layout.addWidget(self.details)
+        side.addWidget(self.table)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        side.addWidget(self.details)
+        side.setSizes([500, 300])
         splitter.addWidget(side)
         self.view = OverlayView()
         splitter.addWidget(self.view)
@@ -240,10 +265,11 @@ class MapPlacementDialog(QDialog):
         run = str(row.get("run_id") or "").upper()
         lines = offset_lines(row, self.layers)
         if row.get("layer_offsets") is None:
-            self.details.setText(f"{run}: layer offsets not measured.")
+            self.details.setPlainText(f"{run}: layer offsets not measured.")
         else:
-            self.details.setText(
-                f"{run}, layer offsets:\n" + ("\n".join(lines) or "no measurable boundary")
+            self.details.setPlainText(
+                f"{run}, layer offsets (change from the reference run first):\n"
+                + ("\n".join(lines) or "no measurable boundary")
             )
         self.status.setText(
             f"{run}: the placed map on its reference photograph. Wheel: zoom · drag: move."
@@ -258,4 +284,4 @@ class MapPlacementDialog(QDialog):
             self.show_run(rows[0].row())
 
 
-__all__ = ["MapPlacementDialog", "OverlayView", "offset_lines"]
+__all__ = ["MapPlacementDialog", "OverlayView", "offset_lines", "offset_summary"]

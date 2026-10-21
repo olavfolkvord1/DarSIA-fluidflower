@@ -13,7 +13,10 @@ and an overlay of its boundaries on the run's own reference photograph, and
 one ``index.json`` with each run's shift, layer offsets and checks. The
 layer offsets are the existing read-only measurement of
 :mod:`geometry_offset` (the strongest colour edge within +/-25 mm of each
-boundary; median, 10th and 90th percentiles). The checks are the round-5
+boundary; median, 10th and 90th percentiles). The reference run measures
+its own map on its own photograph, so each offset is also given as the
+change from the reference run's median for the same pair of layers: the
+part that the placement adds. The checks are the round-5
 review's: layer ids missing from the map's table, free water enclosed in the
 medium, and pixels the map does not cover that need filling. A placement
 changes no map, session, geometry revision, run configuration or result.
@@ -306,6 +309,27 @@ def layer_offsets(
     }
 
 
+def add_changes_from_reference(
+    offsets: Mapping[str, Any] | None, reference: Mapping[str, Any] | None
+) -> None:
+    """Give each boundary of ``offsets`` its ``change_from_reference_mm``: its
+    median minus the reference run's median for the same pair of layers, or
+    None when either is missing."""
+
+    if not offsets:
+        return
+    medians = {
+        tuple(row["labels"]): row["median_mm"]
+        for row in (reference or {}).get("boundaries") or []
+    }
+    for row in offsets.get("boundaries") or []:
+        base = medians.get(tuple(row["labels"]))
+        value = row.get("median_mm")
+        row["change_from_reference_mm"] = (
+            None if base is None or value is None else round(float(value) - float(base), 2)
+        )
+
+
 def water_pockets(layers: np.ndarray, roles: Mapping[int, str]) -> int:
     """Free-water pixels outside the largest connected free-water region:
     water enclosed in the medium, which the review looks for."""
@@ -433,6 +457,7 @@ def place_map_in_runs(
     folder.mkdir(parents=True, exist_ok=False)
     known = {int(layer) for layer in roles}
     rows = []
+    reference_offsets: dict[str, Any] | None = None
     for number, run in enumerate(order, 1):
         if progress is not None:
             progress(f"Placing the map in {run.upper()} ({number} of {len(order)})…")
@@ -458,6 +483,9 @@ def place_map_in_runs(
             if progress is not None:
                 progress(f"Measuring the layer offsets in {run.upper()} ({number} of {len(order)})…")
             offsets = layer_offsets(photo, placed, target, roles)
+            if run == reference_key:
+                reference_offsets = offsets
+            add_changes_from_reference(offsets, reference_offsets)
         del photo
         rows.append(
             {
@@ -513,6 +541,7 @@ __all__ = [
     "BOUNDARY_COLOR",
     "GAP_COLOR",
     "OVERLAY_LEGEND",
+    "add_changes_from_reference",
     "boundary_overlay",
     "grid_spacing_mm",
     "layer_offsets",

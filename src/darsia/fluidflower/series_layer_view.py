@@ -3255,9 +3255,20 @@ class LayerPainterView(QWidget):
             "measured geometry and show the overlays; writes a review folder only"
         )
         self.place_version_button.clicked.connect(self._place_version_clicked)
-        buttons.addWidget(self.place_version_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+        # Placement in all runs: its own row, so the box does not get wider.
+        placement = QHBoxLayout()
+        placement.addWidget(self.place_version_button)
+        self.open_placement_button = QPushButton("Open placement review…")
+        self.open_placement_button.setToolTip(
+            "Open an earlier placement of a map in all runs: its runs, checks and "
+            "overlays; read only"
+        )
+        self.open_placement_button.clicked.connect(self._open_placement_clicked)
+        placement.addWidget(self.open_placement_button)
+        placement.addStretch(1)
+        layout.addLayout(placement)
         self.versions_table = QTableWidget(0, 5)
         self.versions_table.setHorizontalHeaderLabels(
             ["Name", "Saved (UTC)", "Map", "SHA-256", "Approved (UTC)"]
@@ -5787,6 +5798,36 @@ class LayerPainterView(QWidget):
         dialog = MapPlacementDialog(self.last_placement, self)
         self._placement_dialog = dialog
         dialog.show()
+
+    def _open_placement_clicked(self) -> None:
+        """Choose an earlier placement's index.json and open its review window."""
+
+        start = lp.painting_folder(self.project).parent / "map_placement" if self.project else Path()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Placement review (index.json)",
+            str(start),
+            "Placement review (index.json);;JSON (*.json)",
+        )
+        if path:
+            self.open_placement(Path(path).parent)
+
+    def open_placement(self, folder: Path | str) -> QDialog | None:
+        """Open the review window of a placement folder; None when it cannot be
+        read (a message says why)."""
+
+        from darsia.fluidflower import map_placement as mp
+        from darsia.fluidflower.map_placement_view import MapPlacementDialog
+
+        try:
+            placement = mp.read_placement(folder)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not open the placement review", str(error))
+            return None
+        dialog = MapPlacementDialog(placement, self)
+        self._placement_dialog = dialog
+        dialog.show()
+        return dialog
 
     def _placement_failed(self, message: str) -> None:
         """Say why the map was not placed."""

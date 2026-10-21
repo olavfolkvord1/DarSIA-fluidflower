@@ -144,6 +144,12 @@ def test_layer_offsets_use_the_existing_band_measurement():
     assert boundary["labels"] == [2, 3] and boundary["status"] == "candidate"
     assert boundary["median_mm"] == 3.0 and boundary["p10_mm"] == boundary["p90_mm"] == 3.0
     assert boundary["measured_sample_count"] == boundary["sample_count"] == 120
+    # The change from a reference run's own offset for the same pair of layers.
+    shifted = {"boundaries": [dict(boundary, median_mm=5.5), {"labels": [2, 9], "median_mm": 1.0}]}
+    mp.add_changes_from_reference(shifted, result)
+    assert [row["change_from_reference_mm"] for row in shifted["boundaries"]] == [2.5, None]
+    mp.add_changes_from_reference(result, result)
+    assert result["boundaries"][0]["change_from_reference_mm"] == 0.0
     # On a reduced grid the same edge is found, to within the coarser spacing.
     coarse = mp.layer_offsets(photo, layers, geometry, roles, spacing_mm=1.0)
     assert coarse["spacing_mm"] == [1.0, 1.0]

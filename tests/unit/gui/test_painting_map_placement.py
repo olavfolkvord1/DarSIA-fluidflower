@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtWidgets import QFileDialog, QInputDialog
+from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import map_placement as mp
@@ -51,6 +51,26 @@ def _index(folder):
     return path
 
 
+def test_the_typical_offset_change_weighs_pairs_by_their_samples():
+    from darsia.fluidflower.map_placement_view import offset_summary
+
+    def row(*pairs):
+        return {
+            "layer_offsets": {
+                "boundaries": [
+                    {"change_from_reference_mm": change, "measured_sample_count": count}
+                    for change, count in pairs
+                ]
+            }
+        }
+
+    # A short unsteady pair moves neither the typical change nor the count.
+    assert offset_summary(row((0.3, 1900), (-0.7, 1700), (-25.4, 60))) == (0.3, 0)
+    assert offset_summary(row((0.3, 1900), (6.0, 1700), (-25.4, 210))) == (0.3, 2)
+    assert offset_summary(row((None, 100))) == (None, 0)
+    assert offset_summary({}) == (None, 0)
+
+
 def _files(folder):
     return {
         path.relative_to(folder).as_posix(): path.read_bytes()
@@ -59,7 +79,7 @@ def _files(folder):
     }
 
 
-def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_path):
+def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_path, monkeypatch):
     assert view.place_version_button.text() == "Place in all runs…"
     _show(view, _proposal())
     record = view.save_version("Map A")
@@ -113,17 +133,30 @@ def test_an_approved_version_is_placed_in_all_runs_for_review(view, qtbot, tmp_p
     ]
     # A uniform photograph has no edge to measure; the 3 columns the map does
     # not reach lie inside the painted area, so they are gaps to fill.
-    assert cells[2][3:6] == ["none measured", str(3 * 60), "0"]
+    assert cells[2][3:7] == ["none measured", "0", str(3 * 60), "0"]
     assert dialog.legend.text().count("■") == 2
-    assert "layer offsets" in dialog.details.text()
+    assert "layer offsets" in dialog.details.toPlainText()
     assert not dialog.view.item.pixmap().isNull()
     assert dialog.view.item.pixmap().size().width() == 80
     assert not dialog.show_run(1) and "no geometry" in dialog.status.text()
-    assert "not measured" in dialog.details.text()
+    assert "not measured" in dialog.details.toPlainText()
     assert dialog.show_run(2) and "AC53" in dialog.status.text()
     # Nothing in the painting folder changed: no map, session, version or approval.
     assert _files(lp.painting_folder(view.project)) == painting_before
     dialog.close()
+    # The review opens again from its folder, without placing anew.
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        lambda *args, **kwargs: (str(Path(result["folder"]) / "index.json"), ""),
+    )
+    view.open_placement_button.click()
+    again = view._placement_dialog
+    assert again is not dialog and again.isVisible() and again.table.rowCount() == 3
+    again.close()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[1]))
+    assert view.open_placement(tmp_path) is None
+    assert warnings == ["Could not open the placement review"]
 
 
 def test_the_button_asks_for_the_geometry_and_the_runs_to_review_first(
