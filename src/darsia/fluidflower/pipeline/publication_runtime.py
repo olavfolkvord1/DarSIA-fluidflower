@@ -69,6 +69,9 @@ def extract_products(result, claim, machine_id, *, producer_origin_for_attempt):
     It returns machine_id, proof_descriptor and an explicitly accessible root.
     The current attempt instead follows this actual claim's admitted output.
     """
+    if result.get("pipeline") == "series-setup":
+        from .series_setup_results import extract_setup_products
+        return extract_setup_products(result, claim, machine_id)
     if result.get("pipeline") == "native-phase-statistics":
         from .phase1_protocol import extract_phase1_products
         return extract_phase1_products(result, claim, machine_id)
@@ -266,6 +269,11 @@ def make_publication_factory(job_root, job, machine_id, *, producer_origin_for_a
         if claim.task.get("pipeline") == "native-phase-statistics":
             from .phase1_protocol import validate_phase1_claim
             validate_phase1_claim(claim.task, job)
+        elif claim.task.get("pipeline") == "series-setup":
+            from .series_setup_protocol import validate_setup_claim
+            from .series_setup_results import validate_setup_result
+            validate_setup_claim(claim.task, job)
+            validate_setup_result(result, task=claim.task, job=job)
         else:
             if (result.get("task") != claim.task or result.get("commit") != claim.task["commit"]
                     or result.get("calibration_sha256") != claim.task["calibration_sha256"]):

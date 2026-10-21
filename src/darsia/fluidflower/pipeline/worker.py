@@ -105,6 +105,9 @@ def verify_startup(job_root: Path, *, stores_path=None, machine_id=None,
     if job.get("pipeline") == "native-phase-statistics":
         from .phase1_protocol import validate_phase1_job
         validate_phase1_job(job)
+    elif job.get("pipeline") == "series-setup":
+        from .series_setup_protocol import validate_setup_job
+        validate_setup_job(job)
     else:
         if not re.fullmatch(r"[0-9a-f]{64}", job.get("calibration_sha256", "")):
             raise ValueError("Explicit job calibration SHA required")
@@ -264,7 +267,9 @@ def _run_tasks(
                 found = shared.claim(machine,backend,owner,
                     availability=capacity.availability,
                     output_factory=io_runtime.output_factory,
-                    publication_factory=io_runtime.publications,exclude_runs=excluded_runs)
+                    publication_factory=io_runtime.publications,exclude_runs=excluded_runs,
+                    **({"claim_controls": capacity.claim_controls}
+                       if job.get("pipeline") == "series-setup" else {}))
                 held.extend([found] if found is not None else [])
                 try:
                     capacity.bind(found)
@@ -306,7 +311,13 @@ def _run_tasks(
                 actual_worker=owner,
             )
         )
+        from contextlib import ExitStack
+        writer_scope = ExitStack()
+        setup = claim.task.get("pipeline") == "series-setup"
+        retain_capacity = setup
         try:
+            if io_runtime is not None and setup:
+                writer_scope.enter_context(io_runtime.output_scope(claim))
             task = claim.task
             if (task.get("pipeline") == "native-phase-statistics"
                     or job.get("pipeline") == "native-phase-statistics"):
@@ -314,6 +325,11 @@ def _run_tasks(
                 validate_phase1_claim(task, job)
                 if task["commit"] != commit:
                     raise ValueError("Claimed phase-one commit differs from the actual worker")
+            elif setup:
+                from .series_setup_protocol import validate_setup_claim
+                validate_setup_claim(task, job)
+                if task["commit"] != commit:
+                    raise ValueError("Claimed Setup commit differs from the actual worker")
             else:
                 if (
                     task["commit"] != commit
@@ -335,15 +351,21 @@ def _run_tasks(
                     if task.get("pipeline") == "native-phase-statistics":
                         from .phase1_protocol import phase1_resume_source
                         prepared_resume=phase1_resume_source(shared,claim)
+                    elif setup:
+                        prepared_resume=None
                     else:
                         prepared_resume=resume_source_for_claim(shared,claim)
                 except (InputHashMismatch,RunUnavailable):
                     text=traceback.format_exc()
                     record=shared.reject_before_science(claim,text,owner)
                     excluded_runs.add(name(record["run"]))
-                    io_runtime.capacity_close(claim)
+                    if not setup:
+                        io_runtime.capacity_close(claim)
                     messages.put(dict(kind="input_rejected",run=task["run"],
-                        attempt_id=claim.token,traceback=text,actual_worker=owner))
+                        attempt_id=claim.token,traceback=text,actual_worker=owner,
+                        capacity_retained=retain_capacity))
+                    if setup:
+                        return
                     io_runtime.release(claim)
                     if once:
                         raise SystemExit(1)
@@ -368,6 +390,8 @@ def _run_tasks(
                 # frame_completed is emitted only after the original atomic
                 # publication. frame_started also permits a zero-frame pause.
                 if event.get("state") == "phase1_frame_completed":
+                    _job_control_boundary(root)
+                elif event.get("state") == "setup_progress":
                     _job_control_boundary(root)
                 elif event.get("state") in {"frame_started", "frame_completed"}:
                     _job_control_boundary(root)
@@ -398,6 +422,10 @@ def _run_tasks(
                 from .phase_statistics import run_phase1
 
                 execute = run_phase1
+            elif pipeline == "series-setup":
+                from .series_setup_operations import execute_setup
+
+                execute = execute_setup
             elif pipeline == "n1-calibration-refit":
                 from .refit_runner import run_refit
 
@@ -415,6 +443,15 @@ def _run_tasks(
                 from .phase1_protocol import worker_result
                 result = worker_result(result, task=task, job=job, commit=commit,
                                        owner=owner, token=claim.token)
+            elif setup:
+                result = dict(result, actual_worker=owner, commit=commit,
+                              attempt_id=claim.token, task=task)
+                from .series_setup_results import validate_setup_result
+                validate_setup_result(result, task=task, job=job)
+                if task["operation"] == "apply":
+                    from .series_setup_jobs import enqueue_setup_builds
+                    with io_binding.activate():
+                        enqueue_setup_builds(root, claim, result)
             else:
                 result = dict(
                     result,
@@ -426,12 +463,15 @@ def _run_tasks(
                 )
             result["opencv_ipp_worker"] = dict(start=ipp_start, completed=require_ipp_off("pipeline-worker:complete"))
             shared.complete(claim, result)
+            retain_capacity = False
             if io_runtime is not None:
                 io_runtime.finalize_common(claim)
-                io_runtime.capacity_close(claim)
-            messages.put(
-                dict(kind="completed", run=task["run"], attempt_id=claim.token)
-            )
+                if not setup:
+                    io_runtime.capacity_close(claim)
+            if not setup:
+                messages.put(
+                    dict(kind="completed", run=task["run"], attempt_id=claim.token)
+                )
         except _JobControlBoundary as requested:
             # Keep this claim attached to the parent slot so the existing exact
             # child-retirement code binds its original manifest/frame receipts.
@@ -442,11 +482,12 @@ def _run_tasks(
             return
         except LeaseLost:
             text = traceback.format_exc()
-            if io_runtime is not None:
+            if io_runtime is not None and not setup:
                 io_runtime.capacity_close(claim)
             messages.put(
                 dict(
                     kind="lease_lost",
+                    capacity_retained=retain_capacity,
                     run=claim.task["run"],
                     attempt_id=claim.token,
                     traceback=text,
@@ -462,11 +503,12 @@ def _run_tasks(
             except Exception as error:
                 publication_error = error
                 original_error.add_note("Failure publication/diagnostic also failed: " + repr(error))
-            if io_runtime is not None:
+            if io_runtime is not None and not setup:
                 io_runtime.capacity_close(claim)
             messages.put(
                 dict(
                     kind="failed",
+                    capacity_retained=retain_capacity,
                     run=claim.task["run"],
                     attempt_id=claim.token,
                     traceback=text,
@@ -477,8 +519,16 @@ def _run_tasks(
             if once:
                 raise SystemExit(1)
         finally:
+            writer_scope.close()
             if io_runtime is not None:
-                io_runtime.release(claim)
+                if setup:
+                    io_runtime.release(claim, retain_capacity=retain_capacity)
+                else:
+                    io_runtime.release(claim)
+        if setup and not retain_capacity:
+            messages.put(dict(kind="completed", run=task["run"], attempt_id=claim.token))
+        if setup and retain_capacity:
+            return  # Original parent proves owned process retirement before release.
         if once:
             return
 
@@ -799,15 +849,25 @@ def _start_slot(context, args, job, commit, identity, messages, stop, number):
     return slot
 
 
-def _record_retirement(slot, args, identity):
+def _record_retirement(slot, args, identity, *, before_record=None):
     """The live parent publishes a separate genuine owned-child closure."""
     if slot["root"] is None and slot["process"].is_alive():
         raise RuntimeError(
             "Live launch has no bound epoch; preserve it and do not replace"
         )
+    if before_record is not None:
+        before_record()
     identities = retire_owned_processes(slot["root"], slot["observed"])
     slot["observed"] = identities
     slot["process"].join(timeout=1.0)
+    if before_record is not None:
+        from copy import deepcopy
+        proved = deepcopy(identities)
+        before_record()
+        if slot["observed"] != proved:
+            identities = retire_owned_processes(slot["root"], slot["observed"])
+            slot["observed"] = identities
+            slot["process"].join(timeout=1.0)
     claim = slot["claim"]
     if claim is not None:
         from .checkpoint import retirement_document
@@ -833,6 +893,17 @@ def _record_retirement(slot, args, identity):
         document["actual_launch_wrapper"] = slot["root"]
         document["owned_launch_handle_retired"] = not slot["process"].is_alive()
         path = output / "retirement.json"
+        setup_writer = None
+        if claim["task"].get("pipeline") == "series-setup":
+            from .series_setup_worker_admission import retirement_control_writer
+            writers = slot.setdefault("setup_retirement_writers", {})
+            setup_writer = writers.get(claim["attempt_id"])
+            if setup_writer is None:
+                setup_writer = retirement_control_writer(args.job, claim["task"], stores, output, actual_owner)
+                writers[claim["attempt_id"]] = setup_writer
+            elif (setup_writer.task != claim["task"] or setup_writer.owner != actual_owner
+                    or setup_writer.output != output):
+                raise ValueError("The retained supervisor writer belongs to another claim")
         if path.exists():
             old = read_json(path)
             if (
@@ -842,7 +913,12 @@ def _record_retirement(slot, args, identity):
             ):
                 raise ValueError("A different retirement already exists; preserve it")
         else:
-            write_immutable(path, document)
+            if setup_writer is None:
+                write_immutable(path, document)
+            else:
+                with setup_writer.activate():
+                    write_immutable(path, document)
+                setup_writer.close()
         if claim["task"].get("format")=="darsia-alias-task-v1":
             from .capacity import release_retired_capacity
             release_retired_capacity(args.job,claim["task"],stores,document)
@@ -875,6 +951,7 @@ def _parent(args, identity, job, commit, log):
     )
     fatal = False
     control_failed = False
+    setup_job = job.get("pipeline") == "series-setup"
 
     def parent_retry(step):
         """Log one wait for a transient SMB error in a parent queue step (N111)."""
@@ -886,6 +963,107 @@ def _parent(args, identity, job, commit, log):
         shared.recover_publications()
         return shared.reclaim_stale()
 
+    def handle_event(event):
+        """Validate and attach one exact child event before retirement."""
+        nonlocal control_failed
+        number = event.get("worker_slot")
+        slot = (
+            slots[number]
+            if isinstance(number, int) and 0 <= number < len(slots)
+            else None
+        )
+        if (
+            slot is not None
+            and event.get("worker_generation") != slot["generation"]
+        ):
+            if event.get("kind") != "watchdog_heartbeat":
+                emit(
+                    log, event
+                )  # Preserve old output, never attribute it to the replacement.
+            return False
+        owner = event.get("actual_worker")
+        if slot is not None and owner is not None:
+            if owner.get("machine") != identity:
+                raise ValueError("Owned worker message machine differs")
+            process = _same_process(owner)
+            if process is not None:
+                root = _same_process(slot["root"])
+                try:
+                    owned = root is not None and (
+                        process.pid == root.pid
+                        or any(
+                            parent.pid == root.pid
+                            and parent.create_time() == root.create_time()
+                            for parent in process.parents()
+                        )
+                    )
+                except psutil.NoSuchProcess:
+                    owned = _same_process(owner) is None
+                if not owned:
+                    raise ValueError(
+                        "Live worker is outside its owned launch tree"
+                    )
+            if owner not in slot["observed"]:
+                slot["observed"].append(dict(owner))
+        if slot is not None and event.get("kind") == "watchdog_heartbeat":
+            slot["last_heartbeat"] = time.monotonic()
+        elif event.get("kind") == "watchdog_heartbeat":
+            raise ValueError("Watchdog message has no owned worker slot")
+        else:
+            if slot is not None and event.get("kind") == "claimed":
+                path = (
+                    args.job
+                    / "claimed"
+                    / identity
+                    / (name(event["run"]) + ".json")
+                )
+                if job.get("format")=="darsia-alias-job-v1":
+                    from .worker_io import claimed_task_after_archive
+                    task=claimed_task_after_archive(args.job,identity,event)
+                else:
+                    task = read_json(path)
+                if task["attempt_id"] != event["attempt_id"]:
+                    raise ValueError(
+                        "Claim message and actual task generation differ"
+                    )
+                slot["claim"] = dict(
+                    run=event["run"], attempt_id=event["attempt_id"], task=task
+                )
+            if slot is not None and event.get("kind") in {
+                "completed",
+                "failed",
+                "lease_lost",
+                "input_rejected",
+            }:
+                # Terminal/revoked attempts do not need a numerical restart.
+                if event.get("capacity_retained") is not True:
+                    slot["claim"] = None
+            emit(log, event)
+            if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
+                    "control_failure", "paused", "control_stopped"}:
+                args._cache_terminal_events.append(dict(event))
+            if event.get("kind") == "control_failure":
+                control_failed = True
+
+    def drain_pending_events():
+        """Attach flushed child ownership events before their retirement record."""
+        nonlocal control_failed
+        while True:
+            try:
+                event = messages.get_nowait()
+            except queue.Empty:
+                return
+            if setup_job:
+                handle_event(event)
+            else:
+                if event.get("kind") != "watchdog_heartbeat":
+                    emit(log, event)
+                if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
+                        "control_failure", "paused", "control_stopped"}:
+                    args._cache_terminal_events.append(dict(event))
+                if event.get("kind") == "control_failure":
+                    control_failed = True
+
     try:
         while True:
             try:
@@ -893,83 +1071,8 @@ def _parent(args, identity, job, commit, log):
             except queue.Empty:
                 event = None
             if event is not None:
-                number = event.get("worker_slot")
-                slot = (
-                    slots[number]
-                    if isinstance(number, int) and 0 <= number < len(slots)
-                    else None
-                )
-                if (
-                    slot is not None
-                    and event.get("worker_generation") != slot["generation"]
-                ):
-                    if event.get("kind") != "watchdog_heartbeat":
-                        emit(
-                            log, event
-                        )  # Preserve old output, never attribute it to the replacement.
+                if handle_event(event) is False:
                     continue
-                owner = event.get("actual_worker")
-                if slot is not None and owner is not None:
-                    if owner.get("machine") != identity:
-                        raise ValueError("Owned worker message machine differs")
-                    process = _same_process(owner)
-                    if process is not None:
-                        root = _same_process(slot["root"])
-                        try:
-                            owned = root is not None and (
-                                process.pid == root.pid
-                                or any(
-                                    parent.pid == root.pid
-                                    and parent.create_time() == root.create_time()
-                                    for parent in process.parents()
-                                )
-                            )
-                        except psutil.NoSuchProcess:
-                            owned = _same_process(owner) is None
-                        if not owned:
-                            raise ValueError(
-                                "Live worker is outside its owned launch tree"
-                            )
-                    if owner not in slot["observed"]:
-                        slot["observed"].append(dict(owner))
-                if slot is not None and event.get("kind") == "watchdog_heartbeat":
-                    slot["last_heartbeat"] = time.monotonic()
-                elif event.get("kind") == "watchdog_heartbeat":
-                    raise ValueError("Watchdog message has no owned worker slot")
-                else:
-                    if slot is not None and event.get("kind") == "claimed":
-                        path = (
-                            args.job
-                            / "claimed"
-                            / identity
-                            / (name(event["run"]) + ".json")
-                        )
-                        if job.get("format")=="darsia-alias-job-v1":
-                            from .worker_io import claimed_task_after_archive
-                            task=claimed_task_after_archive(args.job,identity,event)
-                        else:
-                            task = read_json(path)
-                        if task["attempt_id"] != event["attempt_id"]:
-                            raise ValueError(
-                                "Claim message and actual task generation differ"
-                            )
-                        slot["claim"] = dict(
-                            run=event["run"], attempt_id=event["attempt_id"], task=task
-                        )
-                    if slot is not None and event.get("kind") in {
-                        "completed",
-                        "failed",
-                        "lease_lost",
-                        "input_rejected",
-                    }:
-                        # Terminal/revoked attempts do not need a numerical restart.
-                        slot["claim"] = None
-                    emit(log, event)
-                    if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
-                            "control_failure", "paused", "control_stopped"}:
-                        args._cache_terminal_events.append(dict(event))
-                    if event.get("kind") == "control_failure":
-                        control_failed = True
             active = False
             for number, slot in enumerate(slots):
                 if slot["finished"]:
@@ -985,7 +1088,8 @@ def _parent(args, identity, job, commit, log):
                     active = True
                     continue
                 if not slot["retired"]:
-                    identifiers = _record_retirement(slot, args, identity)
+                    identifiers = _record_retirement(slot, args, identity,
+                        **({"before_record": drain_pending_events} if setup_job else {}))
                     emit(
                         log,
                         dict(
@@ -1068,21 +1172,16 @@ def _parent(args, identity, job, commit, log):
     finally:
         for slot in slots:
             if fatal and slot["process"].is_alive():
-                _record_retirement(slot, args, identity)
+                _record_retirement(slot, args, identity,
+                    **({"before_record": drain_pending_events} if setup_job else {}))
             else:
                 slot["process"].join()
-        while True:
-            try:
-                event = messages.get_nowait()
-            except queue.Empty:
-                break
-            if event.get("kind") != "watchdog_heartbeat":
-                emit(log, event)
-            if event.get("kind") in {"completed", "failed", "lease_lost", "input_rejected",
-                    "control_failure", "paused", "control_stopped"}:
-                args._cache_terminal_events.append(dict(event))
-            if event.get("kind") == "control_failure":
-                control_failed = True
+                if setup_job:
+                    drain_pending_events()
+                    claim = slot["claim"]
+                    if not slot["retired"] and claim is not None:
+                        _record_retirement(slot, args, identity, before_record=drain_pending_events)
+        drain_pending_events()
         emit(log, dict(kind="stopped", message="Worker service stopped."))
     return 1 if fatal or control_failed else 0
 
