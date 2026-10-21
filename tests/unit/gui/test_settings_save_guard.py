@@ -165,6 +165,80 @@ def test_the_pending_changes_follow_the_panels_own_sync(tmp_path):
     assert guard.pending_settings_changes(window) is None
 
 
+def test_a_setting_added_in_a_lossy_panel_is_never_silently_left_out(tmp_path):
+    # The panel would retype rig.dim and the person added a value the file lacks.
+    added = lambda: dict(_lossy(None), image_porosity=dict(active=True))  # noqa: E731
+    window, path = _window(tmp_path, added)
+    changes = guard.pending_settings_changes(window)
+    assert changes.lossy and not changes.changed and "image_porosity.active" in changes.added
+    window._settings_save_guard["edited"] = True  # what the input watcher records
+    assert window.process_runner.start_workflow_process(["setup"]) is None
+    assert window.process_runner.started == 0 and window.settings_factory.writes == 0
+    assert window.logs[-1].startswith("Run cancelled:") and "changed or added" in window.logs[-1]
+    assert path.read_text(encoding="utf-8") == ORIGINAL
+
+
+def test_loading_a_file_clears_the_edit_mark(tmp_path):
+    path = tmp_path / "run.toml"
+    path.write_text(ORIGINAL, encoding="utf-8")
+    loads = []
+    window = SimpleNamespace(config_file=str(path), config_dict={}, logs=[],
+                             config_controller=SimpleNamespace(load_config=lambda: loads.append(1)))
+    window.print_log = window.logs.append
+    window.settings_factory = FakeFactory(window, lambda: _lossy(None))
+    window.process_runner = FakeRunner(window)
+    guard.guard_lossless_settings_save(window, warn=lambda *_: None)
+    window._settings_save_guard["edited"] = True
+    window.config_controller.load_config()
+    assert loads == [1] and window._settings_save_guard["edited"] is False
+    assert window.process_runner.start_workflow_process(["setup"]) == "process"
+
+
+def test_a_written_save_clears_the_edit_mark(tmp_path):
+    window, _ = _window(tmp_path, lambda: dict(rig=dict(dim=3)), text="[rig]\ndim = 2\n")
+    window._settings_save_guard["edited"] = True
+    window.settings_factory.save_settings()
+    assert window.settings_factory.writes == 1 and window._settings_save_guard["edited"] is False
+
+
+def test_only_inputs_inside_the_panel_count_as_user_edits(qtbot):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QCheckBox, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+
+    container, outside = QWidget(), QPushButton("Run")
+    layout = QVBoxLayout(container)
+    qtbot.addWidget(container)
+    qtbot.addWidget(outside)
+    built = {}
+
+    def render(_sections=None):
+        """The panel's render: it replaces its widgets with new ones."""
+        while layout.count():
+            layout.takeAt(0).widget().deleteLater()
+        built.update(line=QLineEdit(), box=QCheckBox("active"), label=QLabel("A label"))
+        for widget in built.values():
+            layout.addWidget(widget)
+
+    render()
+    assert guard.is_settings_input(built["line"], container) and guard.is_settings_input(built["box"], container)
+    assert not guard.is_settings_input(built["label"], container)
+    assert not guard.is_settings_input(outside, container)
+    state = {"edited": False}
+    factory = SimpleNamespace(_render_settings_tabs=render)
+    guard._watch_user_input(SimpleNamespace(settings_container=container, settings_factory=factory), state)
+    container.show()
+    qtbot.mouseClick(built["label"], Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(outside, Qt.MouseButton.LeftButton)
+    assert state["edited"] is False
+    qtbot.keyClick(built["line"], "a")
+    assert state["edited"] is True
+    # A new render gets new inputs, and they are watched too.
+    state["edited"] = False
+    factory._render_settings_tabs()
+    qtbot.mouseClick(built["box"], Qt.MouseButton.LeftButton)
+    assert state["edited"] is True
+
+
 def test_the_native_window_installs_the_guard(native_window):  # noqa: F811
     # The fixture replaces the workflow start with a failing stub, so only the
     # save chain is visible here; both wrappers are installed by the same call.

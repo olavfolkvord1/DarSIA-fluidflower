@@ -165,30 +165,115 @@ def _warn(window, text: str) -> None:
     QMessageBox.warning(window, "Settings not saved", text)
 
 
+#: The widget kinds through which a person changes a setting in the panel.
+_INPUT_CLASS_NAMES = ("QLineEdit", "QComboBox", "QAbstractSpinBox", "QAbstractButton",
+                      "QAbstractItemView", "QTextEdit", "QPlainTextEdit")
+
+
+def is_settings_input(widget, container) -> bool:
+    """Whether ``widget`` is, or lies inside, an input of the settings panel ``container``.
+
+    Inputs are line edits, combo boxes, spin boxes, buttons (check boxes and the
+    add/remove row buttons), item views and text edits. Labels, tab bars, scroll
+    bars and empty space are not inputs.
+    """
+    from PySide6 import QtWidgets
+
+    if widget is None or container is None or not container.isAncestorOf(widget):
+        return False
+    inputs = tuple(getattr(QtWidgets, name) for name in _INPUT_CLASS_NAMES)
+    current = widget
+    while current is not None and current is not container:
+        if isinstance(current, QtWidgets.QScrollBar):
+            return False
+        if isinstance(current, inputs):
+            return True
+        current = current.parentWidget()
+    return False
+
+
+def _watch_user_input(window, state) -> None:
+    """Mark the panel as edited on any key, click or wheel on one of its inputs.
+
+    One event filter sits on every input inside ``window.settings_container``.
+    It is attached again after each render of the panel
+    (``settings_factory._render_settings_tabs``), so only the panel's own
+    inputs are watched. Switching tabs, scrolling the page and the workflow
+    buttons outside the panel never mark it. A click without a change counts
+    too: the guard then refuses rather than guesses. Values the panel fills in
+    by itself send no input events.
+    """
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import QWidget
+
+    factory = window.settings_factory
+    container = getattr(window, "settings_container", None)
+    render = getattr(factory, "_render_settings_tabs", None)
+    if container is None:
+        return
+    kinds = {QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick,
+             QEvent.Type.Wheel}
+
+    class _UserInput(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt's name
+            if event.type() in kinds:
+                state["edited"] = True
+            return False
+
+    watcher = _UserInput(container)
+
+    def attach() -> None:
+        for widget in container.findChildren(QWidget):
+            if is_settings_input(widget, container):
+                widget.installEventFilter(watcher)
+
+    if callable(render):
+        def _render_settings_tabs(*args, **kwargs):
+            """Render as before, then watch the new inputs."""
+            result = render(*args, **kwargs)
+            attach()
+            return result
+
+        _render_settings_tabs.__wrapped__ = render
+        factory._render_settings_tabs = _render_settings_tabs
+    attach()
+    state["watcher"] = watcher
+    state["attach"] = attach
+
+
 def guard_lossless_settings_save(window, *, warn: Callable[[Any, str], None] | None = None) -> None:
     """Refuse every settings save that would remove or retype file entries.
 
-    Wraps ``window.settings_factory.save_settings`` and
-    ``window.process_runner.start_workflow_process``. A workflow first checks
-    the pending save. If it is lossy without any changed value, the save made
+    Wraps ``window.settings_factory.save_settings``,
+    ``window.process_runner.start_workflow_process`` and, when present,
+    ``window.config_controller.load_config``. The panel counts as edited after
+    any input by the user since the file was loaded (see _watch_user_input),
+    or when a value would differ from the file. A workflow first checks the
+    pending save. If it is lossy and the panel is not edited, the save made
     inside the workflow start is skipped and the workflow runs on the unchanged
-    file. If it is lossy with changed values, the workflow does not start.
+    file. If it is lossy and the panel is edited, the workflow does not start,
+    so a setting added or changed in the panel is never silently left out.
     Saves that keep every entry and its type behave as before.
     """
     factory = window.settings_factory
     runner = window.process_runner
     save = factory.save_settings
     start = runner.start_workflow_process
-    state = {"skip_next_save": False}
+    state = {"skip_next_save": False, "edited": False}
+    window._settings_save_guard = state
     notify = warn or _warn
 
     def _name() -> str:
         return Path(window.config_file).name
 
+    def _edited(changes: SettingsChanges) -> bool:
+        return state["edited"] or bool(changes.changed)
+
     def _refusal(changes: SettingsChanges) -> str:
         return (f"Writing {_name()} from this panel would also {changes.summary()}. "
-                f"Your {len(changes.changed)} changed setting(s) are not saved; edit {_name()} "
-                "directly, then reload it.")
+                f"Settings shown here were changed or added ({len(changes.changed)} value(s) differ "
+                f"from the file), and they are not saved. Edit {_name()} directly, then reload it. "
+                "If you changed nothing, select the run again to reload its file.")
 
     def save_settings(*args, **kwargs):
         """Save as before, unless the write would remove or retype entries."""
@@ -197,8 +282,10 @@ def guard_lossless_settings_save(window, *, warn: Callable[[Any, str], None] | N
             return None
         changes = pending_settings_changes(window)
         if changes is None or not changes.lossy:
-            return save(*args, **kwargs)
-        if not changes.changed:
+            result = save(*args, **kwargs)
+            state["edited"] = False
+            return result
+        if not _edited(changes):
             window.print_log(f"{_name()}: no setting changed, so the file is not rewritten. "
                              f"Rewriting it here would {changes.summary()}.")
             return None
@@ -211,7 +298,7 @@ def guard_lossless_settings_save(window, *, warn: Callable[[Any, str], None] | N
         """Start as before, without a lossy save first; refuse when edits would be lost."""
         changes = pending_settings_changes(window)
         if changes is not None and changes.lossy:
-            if changes.changed:
+            if _edited(changes):
                 text = "Run cancelled: " + _refusal(changes)
                 window.print_log(text)
                 notify(window, text)
@@ -224,6 +311,18 @@ def guard_lossless_settings_save(window, *, warn: Callable[[Any, str], None] | N
         finally:
             state["skip_next_save"] = False
 
+    controller = getattr(window, "config_controller", None)
+    load = getattr(controller, "load_config", None)
+    if callable(load):
+        def load_config(*args, **kwargs):
+            """Load as before; a freshly loaded file has no edits."""
+            result = load(*args, **kwargs)
+            state["edited"] = False
+            return result
+
+        load_config.__wrapped__ = load
+        controller.load_config = load_config
+    _watch_user_input(window, state)
     save_settings.__wrapped__ = save
     start_workflow_process.__wrapped__ = start
     factory.save_settings = save_settings
@@ -231,4 +330,4 @@ def guard_lossless_settings_save(window, *, warn: Callable[[Any, str], None] | N
 
 
 __all__ = ["SettingsChanges", "flatten_settings", "compare_settings", "pending_settings_changes",
-           "guard_lossless_settings_save"]
+           "is_settings_input", "guard_lossless_settings_save"]
