@@ -1301,6 +1301,9 @@ class NativeFluidFlowerMainWindow(MainWindow):
         guard_config_file(self)
         guard_published_dataset(self)
         settle_settings_before_sync(self)
+        from .settings_save_guard import guard_lossless_settings_save
+
+        guard_lossless_settings_save(self)
         self.dataset_analysis_page = None
         self._config_series: str | None = None
         self._current_category = "start"
