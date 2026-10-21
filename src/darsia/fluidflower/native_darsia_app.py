@@ -1616,6 +1616,10 @@ class NativeFluidFlowerMainWindow(MainWindow):
         self._sync_series_display()
         self._select_row(("start", "series"))
         self.status_header = NativeStatusHeader(self)
+        from darsia.fluidflower.running_pressure_view import ProtocolsRunningPressure
+
+        # Setup > Protocols: a read-only view of every run's running pressure.
+        self.running_pressure = ProtocolsRunningPressure(self)
 
     def refresh_sidebar_progress(self):
         """Native metadata status; preserve unrelated shallow completion dots."""
