@@ -49,6 +49,9 @@ class NativePhaseModelStudioSubpage(PhaseModelStudioSubpage):
             steps = NativePhaseSteps(studio, **options)
             if photometry_factory is not None:
                 steps.training_photometry = photometry_factory(steps)
+            from darsia.fluidflower.native_continuation_training import NativeContinuationTraining
+
+            NativeContinuationTraining(steps)
             steps.set_context(self.project_root, self.series_id)
         except Exception as error:
             self._load_failed = True

@@ -690,8 +690,10 @@ class NativePhaseSteps(QWidget):
         mode = "existing" if self.existing_basis.isChecked() else "scratch"
         self.studio.validation_model.setEnabled(mode == "existing")
         route = self.training_routes.get(mode)
+        continuation = getattr(self, "continuation_training", None)
         if mode == "existing":
-            reason = "The selected model is the basis for review. A compatible existing-model training route is not available in the retained code; no fresh fit is substituted."
+            reason = (continuation.refresh() if continuation is not None else
+                "The selected model is the basis for review. A compatible existing-model training route is not available in the retained code; no fresh fit is substituted.")
         else:
             reason = "The retained fresh-training route uses its recorded radiometry settings. A saved v5 status report does not configure that route; compatible v5 training is not attached."
         if mode == "scratch" and photometry is not None:
@@ -700,10 +702,12 @@ class NativePhaseSteps(QWidget):
         self.basis_note.setText(reason)
         self.training_note.setText(
             reason
-            if not callable(route)
+            if not callable(route) or mode == "existing" and continuation is not None
             else "Training reuses the admitted original callback and requires a new version name."
         )
         training_available = self._legacy_start_available
+        if mode == "existing" and continuation is not None:
+            training_available = continuation.ready
         if mode == "scratch" and photometry is not None:
             training_available = photometry.fresh_ui_ready()
         name_ready = bool(self.model_name.text().strip())
