@@ -22,7 +22,7 @@ changes no map, session, geometry revision, run configuration or result.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -49,13 +49,17 @@ OFFSET_SPACING_MM = 0.5
 
 @dataclass(frozen=True)
 class RunGeometry:
-    """One run's measured geometry: metric rig millimetres to its camera grid."""
+    """One run's measured geometry: metric rig millimetres to its camera grid.
+
+    ``model`` is the whole reference model as read, for display.
+    """
 
     run_id: str
     metric_to_grid: np.ndarray
     reference_image: dict[str, Any]
     shape_hw: tuple[int, int] | None
     source: str
+    model: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -151,6 +155,7 @@ def read_run_geometry(index_path: Path | str) -> dict[str, RunGeometry]:
             reference_image=image,
             shape_hw=(int(shape[0]), int(shape[1])) if shape else None,
             source=str(model_path),
+            model=model,
         )
     if not result:
         raise ValueError(f"{index_path} lists no runs")

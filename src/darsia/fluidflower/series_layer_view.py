@@ -2926,6 +2926,7 @@ class LayerPainterView(QWidget):
         self._placement_worker: _PlacementWorker | None = None
         self.last_placement: dict[str, Any] | None = None
         self._placement_dialog: QDialog | None = None
+        self._geometry_dialog: QDialog | None = None
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -2988,8 +2989,24 @@ class LayerPainterView(QWidget):
                 "fit; then group the layers into facies and export them."
             )
         )
+        frame_step = QWidget()
+        frame_layout = QVBoxLayout(frame_step)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.addWidget(self.rig_panel)
+        measured = QHBoxLayout()
+        # Outside the rig panel: the view stays available where the panel is
+        # disabled (a corrected workspace).
+        self.measured_geometry_button = QPushButton("Measured geometry of all runs…")
+        self.measured_geometry_button.setToolTip(
+            "Show each run's measured frame model, area factor and area maps from a "
+            "geometry index; read only"
+        )
+        self.measured_geometry_button.clicked.connect(self._measured_geometry_clicked)
+        measured.addWidget(self.measured_geometry_button)
+        measured.addStretch(1)
+        frame_layout.addLayout(measured)
         self.step_frame = StepSection(
-            1, "Rig frame and injection points", self.rig_panel, expanded=False
+            1, "Rig frame and injection points", frame_step, expanded=False
         )
         self.step_paint = StepSection(2, "Mark layers", self._build_paint_step())
         self.step_propose = StepSection(
@@ -5617,6 +5634,47 @@ class LayerPainterView(QWidget):
             return load_reduced_rgb8(path, 1, camera_u=camera_u)
 
         return load
+
+    def _measured_geometry_clicked(self) -> None:
+        """Choose the runs' geometry index and show each run's measured geometry."""
+
+        settings = QSettings(*_BACKGROUND_SETTINGS)
+        start = str(settings.value(_GEOMETRY_INDEX_KEY, "") or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Measured geometry of the runs (index.json)",
+            start,
+            "Geometry index (index.json);;JSON (*.json)",
+        )
+        if not path:
+            return
+        settings.setValue(_GEOMETRY_INDEX_KEY, path)
+        settings.sync()
+        self.show_measured_geometry(path)
+
+    def show_measured_geometry(
+        self,
+        index_path: Path | str,
+        *,
+        photo_loader: Callable[..., np.ndarray] | None = None,
+    ) -> QDialog | None:
+        """Open the read-only view of each run's measured geometry; None when
+        the index cannot be read (a message says why)."""
+
+        from darsia.fluidflower.measured_geometry_view import MeasuredGeometryDialog
+
+        try:
+            dialog = MeasuredGeometryDialog(
+                index_path,
+                photo_loader=photo_loader or self._reference_photo_loader(),
+                parent=self,
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not read the geometry index", str(error))
+            return None
+        self._geometry_dialog = dialog
+        dialog.show()
+        return dialog
 
     def _place_version_clicked(self) -> None:
         """Ask for the geometry index and the runs to review first, then place."""

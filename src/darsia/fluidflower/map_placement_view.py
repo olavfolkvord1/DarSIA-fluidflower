@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QDesktopServices, QPainter, QPixmap
+from PySide6.QtGui import QDesktopServices, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -117,6 +117,23 @@ class OverlayView(QGraphicsView):
         self.item.setPixmap(pixmap)
         if pixmap.isNull():
             return False
+        self.scene().setSceneRect(self.item.boundingRect())
+        self.fit()
+        return True
+
+    def show_rgb(self, image: Any) -> bool:
+        """Show a uint8 RGB array, fitted to the view; False when it is empty."""
+
+        import numpy as np
+
+        array = np.ascontiguousarray(image[..., :3], dtype=np.uint8)
+        if array.size == 0:
+            self.item.setPixmap(QPixmap())
+            return False
+        height, width = array.shape[:2]
+        # The QImage only borrows the buffer: copy it while the array lives.
+        picture = QImage(array.data, width, height, 3 * width, QImage.Format.Format_RGB888).copy()
+        self.item.setPixmap(QPixmap.fromImage(picture))
         self.scene().setSceneRect(self.item.boundingRect())
         self.fit()
         return True
