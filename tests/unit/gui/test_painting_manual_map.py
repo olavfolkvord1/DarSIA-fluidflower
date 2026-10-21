@@ -115,7 +115,7 @@ def test_a_manual_map_is_drawn_saved_and_approved_without_a_proposal(view, qtbot
     assert record["uncovered_pixels"] == gap
     assert "cover them, save a new version" in view.versions_note.text()
     assert not lp.proposal_path(view.project, "ac52").exists()
-    assert view.versions_table.item(0, 2).text() == "manual map (gaps)"
+    assert view.versions_table.item(0, 1).text() == "manual map (gaps)"
     # It cannot be approved while pixels are uncovered.
     view.versions_table.selectRow(0)
     asked = []
@@ -140,13 +140,13 @@ def test_a_manual_map_is_drawn_saved_and_approved_without_a_proposal(view, qtbot
     complete = view.save_version("Complete")
     assert complete["kind"] == "manual map" and complete["sha256"] != record["sha256"]
     assert complete["sha256"] == lpm.manual_map_digest(view.session, view._manual)
-    assert view.versions_table.item(0, 2).text() == "manual map"
+    assert view.versions_table.item(0, 1).text() == "manual map"
     view.versions_table.selectRow(0)
     view.approve_version_button.click()
     assert asked == ["Approve version"]
     approval = lp.map_approval(view.map_approvals, complete["sha256"])
     assert approval is not None and approval["kind"] == "manual map"
-    assert view.versions_table.item(0, 4).text() != ""
+    assert view.versions_table.item(0, 5).text().startswith("Approved ")
     view.versions_table.selectRow(0)
     assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
     # Back to the proposal: the corrections tools wait for one again.

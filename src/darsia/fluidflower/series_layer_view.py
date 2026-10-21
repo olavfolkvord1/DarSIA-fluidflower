@@ -98,6 +98,9 @@ from PySide6.QtWidgets import (
 
 from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import layer_painting_manual as lpm
+from darsia.fluidflower import layer_painting_polygons_only as lpp
+from darsia.fluidflower import layer_painting_version_archive as lpv
+from darsia.fluidflower.painting_native_cache import ASYNC_PIXELS, NativeProposalCache
 from darsia.fluidflower.layer_painting_join import (
     JoinEdgesError, JoinPreview, join_to_neighbour,
 )
@@ -3063,17 +3066,23 @@ class _ProposalWorker(QObject):
         session: lp.PaintingSession,
         frame: RigFrame | None,
         destination: Path,
+        *,
+        method: str = lp.PROPOSAL_METHOD,
     ) -> None:
         super().__init__()
         self.image = image
         self.session = session
         self.frame = frame
         self.destination = destination
+        self.method = method
 
     @Slot()
     def run(self) -> None:
         try:
-            proposal = lp.propose_layers(
+            propose = lpp.make_proposal if self.method == lpp.METHOD else lp.propose_layers
+            if self.method not in {lp.PROPOSAL_METHOD, lpp.METHOD}:
+                raise ValueError("Choose a supported proposal method")
+            proposal = propose(
                 self.image, self.session, frame=self.frame, progress=self.progress.emit
             )
         except ValueError as error:
@@ -3119,11 +3128,14 @@ class _ManualMapWorker(QObject):
                 )
             if result["compare_key"]:
                 self.progress.emit("Drawing the proposal at full resolution to compare…")
-                result["layers"] = lpm.painted_layers(
+                painted = (lpp.painted_layers if lpp.is_polygons_only(self.request["proposal"])
+                           else lpm.painted_layers)
+                result["layers"] = painted(
                     self.session,
                     self.request["proposal"],
                     frame=self.frame,
                     corrections=self.request["corrections"],
+                    **({"require_complete": False} if lpp.is_polygons_only(self.request["proposal"]) else {}),
                 )
         except Exception as error:  # noqa: BLE001 - reported to the user
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -3151,7 +3163,8 @@ class _AdoptionWorker(QObject):
 
         try:
             self.progress.emit("Drawing the approved map at full resolution…")
-            session, layers = lpm.version_layers(self.record, frame=self.frame)
+            version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
+            session, layers = version_layers(self.record, frame=self.frame)
             result = ma.prepare_adoption(
                 self.options["destination"],
                 layers,
@@ -3167,6 +3180,7 @@ class _AdoptionWorker(QObject):
                     key: self.record.get(key)
                     for key in ("name", "kind", "sha256", "created_utc", "folder")
                 }
+                | ({"proposal_method": lpp.METHOD} if self.record.get("proposal_method") == lpp.METHOD else {})
                 | {"approval": self.options.get("approval")},
                 current_labels=self.options.get("current_labels"),
                 progress=self.progress.emit,
@@ -3196,7 +3210,8 @@ class _PlacementWorker(QObject):
 
         try:
             self.progress.emit("Drawing the approved map at full resolution…")
-            session, layers = lpm.version_layers(self.record, frame=self.frame)
+            version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
+            session, layers = version_layers(self.record, frame=self.frame)
             roles = {
                 row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
             }
@@ -3214,6 +3229,7 @@ class _PlacementWorker(QObject):
                     key: self.record.get(key)
                     for key in ("name", "kind", "sha256", "created_utc", "folder")
                 }
+                | ({"proposal_method": lpp.METHOD} if self.record.get("proposal_method") == lpp.METHOD else {})
                 | {"approval": self.options.get("approval")},
                 first_runs=self.options.get("first_runs") or (),
                 progress=self.progress.emit,
@@ -3252,7 +3268,8 @@ class _SaveWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            lp.save_painted_revision(
+            save_revision = lpp.save_painted_revision if lpp.is_polygons_only(self.proposal) else lp.save_painted_revision
+            save_revision(
                 self.project,
                 self.session,
                 self.proposal,
@@ -3324,6 +3341,16 @@ class LayerPainterView(QWidget):
         # The corrected proposal on the display grid, extended as corrections
         # are added.
         self._display_corrections = _CorrectedGrid()
+        self._native_corrections_key = None
+        self._native_corrections_state = None
+        self._native_corrections_gaps = 0
+        self._native_corrections_gap_mask = None
+        self._native_corrections_cache = {}
+        self._native_display_key = self._native_display_state = None
+        self._new_export_check_key = self._new_export_check_problems = None
+        self._new_map_digest_key = self._new_map_digest = None
+        self._native_async = NativeProposalCache(self)
+        self._native_async.changed.connect(self._native_cache_changed)
         # Saved versions of the run's map, oldest first (records with a folder).
         self.versions: list[dict[str, Any]] = []
         # Approvals of the run's saved versions, oldest first, and why they
@@ -3674,6 +3701,18 @@ class LayerPainterView(QWidget):
         self.detail.currentIndexChanged.connect(self._settings_changed)
         snap_row.addWidget(self.detail)
         snap_row.addSpacing(10)
+        snap_row.addWidget(QLabel("Method"))
+        self.proposal_method = QComboBox()
+        self.proposal_method.addItem("Classifier", lp.PROPOSAL_METHOD)
+        self.proposal_method.addItem("Polygons only", lpp.METHOD)
+        self.proposal_method.setToolTip(
+            "Polygons only draws the exact polygons at photograph resolution. "
+            "Strokes, classifier settings and automatic edge fill are ignored. "
+            "Unassigned pixels stay magenta until corrected; approval and export require no gaps."
+        )
+        self.proposal_method.currentIndexChanged.connect(self._proposal_method_changed)
+        snap_row.addWidget(self.proposal_method)
+        snap_row.addSpacing(10)
         shared_label = QLabel("Classifier may move shared edges")
         shared_label.setToolTip(_MOVE_SHARED_TIP)
         snap_row.addWidget(shared_label)
@@ -3765,9 +3804,9 @@ class LayerPainterView(QWidget):
         placement.addWidget(self.adopt_button)
         placement.addStretch(1)
         layout.addLayout(placement)
-        self.versions_table = QTableWidget(0, 5)
+        self.versions_table = QTableWidget(0, 6)
         self.versions_table.setHorizontalHeaderLabels(
-            ["Name", "Saved (UTC)", "Map", "SHA-256", "Approved (UTC)"]
+            ["Name", "Kind", "Settings", "Saved UTC", "SHA-256", "State"]
         )
         self.versions_table.verticalHeader().setVisible(False)
         self.versions_table.setSelectionBehavior(
@@ -3781,10 +3820,10 @@ class LayerPainterView(QWidget):
         )
         header = self.versions_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3, 4):
+        for column in (1, 2, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.versions_table.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.versions_table.itemSelectionChanged.connect(self._version_selected)
         self.versions_table.itemDoubleClicked.connect(self._version_double_clicked)
@@ -3795,6 +3834,8 @@ class LayerPainterView(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(self.versions_note)
+        from .painting_versions_ui import PaintingVersionsActions
+        self.version_actions = PaintingVersionsActions(self, layout)
         return widget
 
     def _build_export_step(self) -> QWidget:
@@ -4276,6 +4317,8 @@ class LayerPainterView(QWidget):
         return frame if frame is not None and frame.complete() else None
 
     def busy(self) -> bool:
+        if self._native_async.busy():
+            return True
         for thread in (
             self._proposal_thread,
             self._save_thread,
@@ -4294,6 +4337,7 @@ class LayerPainterView(QWidget):
         """Let a running proposal or save finish (before closing)."""
 
         self.run_preview.wait()
+        self._native_async.wait()
         dialog_thread = getattr(self._adoption_dialog, "_thread", None)
         for thread in (
             self._proposal_thread,
@@ -4402,12 +4446,25 @@ class LayerPainterView(QWidget):
                 self._load_reference_photo(reference)
                 self._restore_background()
                 proposal = lp.load_proposal(self.project, reference.run_id)
+                if proposal is None and lp.proposal_path(self.project, reference.run_id).is_file():
+                    try:
+                        proposal = lpp.load_proposal(lp.proposal_path(self.project, reference.run_id))
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        self.propose_status.setText(f"The saved proposal could not be read: {error}")
                 if (
                     proposal is not None
                     and self.image is not None
                     and tuple(proposal.image_size) == tuple(self.image.image_size)
                 ):
                     self.proposal = proposal
+                    if lpp.is_polygons_only(proposal):
+                        try:
+                            self.session = lpp.checked_current_session(
+                                proposal, self.session, self.current_frame())
+                        except ValueError:
+                            # Keep the independently saved draft. Showing a stale
+                            # proposal does not adopt its vertices or input image.
+                            self.propose_status.setText("The current draft changed; propose the polygons again.")
                 self.corrections = self._read_corrections(reference.run_id)
                 self.versions = self._read_versions(reference.run_id)
                 self._read_approvals(reference.run_id)
@@ -4927,6 +4984,7 @@ class LayerPainterView(QWidget):
             self.min_region,
             self.snap,
             self.detail,
+            self.proposal_method,
             self.move_shared_edges,
             self.unit,
         )
@@ -4940,6 +4998,8 @@ class LayerPainterView(QWidget):
                 self.min_region.setValue(float(session.min_region_cm2))
                 self.snap.setValue(float(session.snap_mm))
                 self.detail.setCurrentIndex(max(0, self.detail.findData(session.detail)))
+                self.proposal_method.setCurrentIndex(
+                    1 if lpp.is_polygons_only(self.proposal) else 0)
                 self.move_shared_edges.setCurrentIndex(
                     0 if session.move_shared_edges else 1
                 )
@@ -4959,12 +5019,14 @@ class LayerPainterView(QWidget):
             self.min_region,
             self.snap,
             self.detail,
+            self.proposal_method,
             self.move_shared_edges,
             self.unit,
             self.add_facies_button,
             self.remove_facies_button,
         ):
             widget.setEnabled(session is not None)
+        self._sync_method_controls()
 
     # ----------------------------------------------------------- saving
 
@@ -4982,7 +5044,9 @@ class LayerPainterView(QWidget):
         if not self._dirty or self.session is None:
             return
         try:
-            lp.save_painting_session(self.project, self.session, actor=default_actor())
+            save = (lpp.save_current_session if lpp.is_polygons_only(self.proposal)
+                    or self.proposal_method.currentData() == lpp.METHOD else lp.save_painting_session)
+            save(self.project, self.session, actor=default_actor())
         except OSError as error:
             self.propose_status.setText(f"The strokes could not be saved: {error}")
             return
@@ -6001,6 +6065,8 @@ class LayerPainterView(QWidget):
                 "Propose the boundaries first (step 3); corrections are drawn on "
                 "the proposal."
             )
+        if lpp.is_polygons_only(self.proposal) and not self.proposal_current():
+            return "The exact polygons or frame changed; propose again before correcting this map."
         return ""
 
     def corrections_available(self) -> bool:
@@ -6047,13 +6113,23 @@ class LayerPainterView(QWidget):
             self._canvas_notice(problem)
             return False
         assert self.proposal is not None
-        classes = lp.corrected_classes(
-            self.proposal, self.corrections, layer_ids=self._layer_ids()
-        )[0]
+        if lpp.is_polygons_only(self.proposal):
+            state = self._corrected_native_state()
+            if state is None:
+                self._canvas_notice("Computing the exact native corrections; wait before filling a region.")
+                return False
+            classes = state[0]
+        else:
+            classes = lp.corrected_classes(self.proposal, self.corrections,
+                                           layer_ids=self._layer_ids())[0]
         scale = lp.proposal_grid_scale(self.proposal)
         current = lp.layer_at(classes, (row, col), scale)
         layer = int(self.canvas.layer_id)
-        if current is None or current == lp.OUTSIDE:
+        inside_gap = False
+        if lpp.is_polygons_only(self.proposal):
+            seed = lp._grid_seed((row, col), classes.shape, scale)
+            inside_gap = seed is not None and bool(self.proposal.inside[seed])
+        if current is None or (current == lp.OUTSIDE and not inside_gap):
             self._canvas_notice("Fill works on the regions inside the rig frame.")
             return False
         if current == layer:
@@ -6062,6 +6138,83 @@ class LayerPainterView(QWidget):
         return self.add_correction(
             lp.Correction("fill", layer, [(row, col)], replaced_layer=current)
         )
+
+    def _corrected_native_state(self, *, shown: bool = False):
+        """Cache this method's exact native corrections before display reduction.
+
+        Editing and export always use all corrections. The visibility switch
+        affects only the separately keyed display state.
+        """
+        proposal = self.proposal
+        assert lpp.is_polygons_only(proposal)
+        if self._native_async_required():
+            result = self._large_native_result()
+            if result is None or result.error:
+                return None
+            visible = not shown or self.show_corrections.isChecked()
+            state = (result.classes, result.decided, list(result.skipped)) if visible else (
+                proposal.classes, result.base_decided, [])
+            self._native_corrections_state = state
+            self._native_corrections_gap_mask = result.gap_mask
+            self._native_corrections_gaps = result.gap_count
+            self._native_corrections_key = result.key
+            return state
+        visible = not shown or self.show_corrections.isChecked()
+        corrections = tuple(self.corrections) if visible else ()
+        layer_ids = frozenset(self._layer_ids())
+        key = (id(proposal), proposal.digest, id(proposal.classes), id(proposal.inside),
+               lpp._json_bytes(proposal.source), lp.corrections_digest(corrections),
+               layer_ids, visible)
+        cached = self._native_corrections_cache.get(key)
+        if cached is None:
+            # A stale draft may have added/removed a layer. Rendering remains
+            # passive; currentness/export gates handle that input change.
+            known = layer_ids & set(proposal.source["layer_ids"])
+            state = lpp.corrected_classes(proposal, corrections, layer_ids=known)
+            gaps = proposal.inside & (state[0] == lp.OUTSIDE)
+            cached = state, gaps, int(np.count_nonzero(gaps))
+            if len(self._native_corrections_cache) >= 2:
+                self._native_corrections_cache.clear()
+            self._native_corrections_cache[key] = cached
+        self._native_corrections_key = key
+        self._native_corrections_state, self._native_corrections_gap_mask, self._native_corrections_gaps = cached
+        return self._native_corrections_state
+
+    def _native_async_required(self):
+        return lpp.is_polygons_only(self.proposal) and self.proposal.classes.size > ASYNC_PIXELS
+
+    def _large_native_result(self):
+        """Request the exact current snapshot; only its worker may fill the cache."""
+        assert self._native_async_required() and self.session is not None and self.image is not None
+        proposal, frame, reference = self.proposal, self.current_frame(), self.reference()
+        payload = lpv._drawing_payload(self.session)
+        payload.pop("updated_utc", None)
+        payload.pop("updated_by", None)
+        reference_key = (str(reference.run_id), str(reference.baseline_image),
+                         reference.width_m, reference.height_m) if reference is not None else None
+        layer_ids = frozenset(self._layer_ids())
+        shape = tuple(self.image.display.shape[:2])
+        key = (id(proposal), proposal.digest, id(proposal.classes), id(proposal.confidence),
+               id(proposal.inside), lpp._json_bytes(proposal.source),
+               lpp._json_bytes([payload, frame.to_dict() if frame else None, reference_key]),
+               lp.corrections_digest(self.corrections), layer_ids, shape)
+        was_busy = self._native_async.busy()
+        result = self._native_async.request(key, proposal, self.session, self.corrections,
+            frame, reference, layer_ids=layer_ids, display_shape=shape)
+        if not was_busy and self._native_async.busy():
+            self.busy_changed.emit(True)
+        return result
+
+    @Slot()
+    def _native_cache_changed(self):
+        # Every callback executes in the view's thread. A result for a prior
+        # draft can be reused by Undo, but is never shown as the current map.
+        if self._native_async_required() and self.session is not None and self.image is not None:
+            self._render_proposal()
+            self._refresh_status()
+            self._schedule_manual_map()
+            self._refresh_manual_status()
+        self.busy_changed.emit(self.busy())
 
     def clear_corrections(self, *, confirm: bool = True) -> bool:
         """Remove all corrections of the run shown, as one step to undo."""
@@ -6104,6 +6257,24 @@ class LayerPainterView(QWidget):
     def _corrections_text(self) -> str:
         if self._corrections_error:
             return self._corrections_error
+        if lpp.is_polygons_only(self.proposal):
+            if self._native_async_required():
+                result = self._large_native_result()
+                if result is None:
+                    return f"Computing native corrections… {len(self.corrections)} correction(s) queued."
+                if result.error:
+                    return "Native corrections unavailable: " + result.error
+                text = f"{len(self.corrections)} correction(s)" if self.corrections else "No corrections"
+                text += f" · {result.gap_count:,} unassigned pixels (magenta)"
+                if result.skipped:
+                    text += f" · {len(result.skipped)} no longer apply"
+                return text
+            _classes, _decided, skipped = self._corrected_native_state()
+            text = f"{len(self.corrections)} correction(s)" if self.corrections else "No corrections"
+            text += f" · {self._native_corrections_gaps:,} unassigned pixels (magenta)"
+            if skipped:
+                text += f" · {len(skipped)} no longer apply"
+            return text
         if not self.corrections:
             return "No corrections." if self.proposal is not None else ""
         parts = [f"{len(self.corrections)} correction(s)"]
@@ -6139,8 +6310,10 @@ class LayerPainterView(QWidget):
 
     def _read_versions(self, run_id: str) -> list[dict[str, Any]]:
         try:
-            return lp.list_versions(self.project, run_id)
-        except OSError:
+            return lpv.list_version_metadata(self.project, run_id)
+        except (OSError, ValueError, KeyError) as error:
+            if hasattr(self, "versions_note"):
+                self.versions_note.setText(f"The version library could not be read: {error}")
             return []
 
     def _read_approvals(self, run_id: str) -> None:
@@ -6162,6 +6335,12 @@ class LayerPainterView(QWidget):
     def _versions_unavailable(self) -> str:
         """Why no version can be saved now ("" when one can)."""
 
+        if self._native_async_required():
+            result = self._large_native_result()
+            if result is None or self._native_async.busy():
+                return "Computing the exact native map; wait before saving a version."
+            if result.error:
+                return "The exact native map is unavailable: " + result.error
         if self.busy():
             return "Wait until the proposal or export has finished."
         if self._map_kind() == _MANUAL:
@@ -6179,6 +6358,10 @@ class LayerPainterView(QWidget):
 
         if getattr(self, "versions_table", None) is None:
             return  # Called before the steps are built.
+        native_ready = True
+        if self._native_async_required():
+            native = self._large_native_result()
+            native_ready = native is not None and not native.error
         selected = self._selected_version()
         keep = selected.get("folder") if selected else None
         table = self.versions_table
@@ -6188,6 +6371,8 @@ class LayerPainterView(QWidget):
             digest = str(record.get("sha256") or "")
             count = int(record.get("correction_count") or 0)
             kind = f"edited ({count})" if count else "proposal"
+            if record.get("kind") == lpv.DRAWING_KIND:
+                kind = "drawing"
             if lpm.is_manual_version(record):
                 kind = "manual map (gaps)" if record.get("uncovered_pixels") else "manual map"
             saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
@@ -6197,11 +6382,28 @@ class LayerPainterView(QWidget):
                 if approval
                 else ""
             )
-            for column, value in enumerate(
-                (str(record.get("name") or ""), saved, kind, digest[:12], approved)
-            ):
+            from .painting_versions_ui import settings_text
+            state = f"Approved {approved} UTC" if approval else "Not approved"
+            if record.get("kind") == lpv.DRAWING_KIND:
+                state = "Drawing only"
+            elif record.get("uncovered_pixels"):
+                state = f"{int(record['uncovered_pixels']):,} unassigned pixels"
+            history_error = str(record.get("history_error") or self._map_approvals_error or "")
+            if history_error:
+                state = "History UNKNOWN"
+            for flag, label in (("placed", "Placed"), ("adopted", "Adopted")):
+                if record.get(flag):
+                    state += " · " + label
+            for column, value in enumerate((str(record.get("display_name") or record.get("name") or ""),
+                    kind, settings_text(record), saved, digest[:12], state)):
                 item = QTableWidgetItem(value)
-                item.setToolTip(f"SHA-256 {digest}")
+                tooltip = (f"SHA-256 {digest}\n" + str(record.get("note") or "")
+                    + "\n" + json.dumps(record.get("settings") or {}, ensure_ascii=False, sort_keys=True))
+                if approval is not None and not history_error:
+                    tooltip += "\nApproval: " + json.dumps(approval, ensure_ascii=False, sort_keys=True)
+                if history_error:
+                    tooltip += "\nHistory UNKNOWN: " + history_error
+                item.setToolTip(tooltip)
                 item.setData(Qt.ItemDataRole.UserRole, record.get("folder"))
                 table.setItem(row, column, item)
             if keep is not None and record.get("folder") == keep:
@@ -6214,12 +6416,17 @@ class LayerPainterView(QWidget):
         )
         self.approve_version_button.setEnabled(
             self._selected_version() is not None
+            and self._selected_version().get("kind") != lpv.DRAWING_KIND
             and not self.busy()
             and not self._map_approvals_error
+            and native_ready
         )
         self.place_version_button.setEnabled(self._placeable(self._selected_version()))
         self.prepare_adoption_button.setEnabled(self._placeable(self._selected_version()))
+        self.adopt_button.setEnabled(not self.busy() and not self._map_approvals_error and native_ready)
         self._refresh_map_status()
+        if hasattr(self, "version_actions"):
+            self.version_actions.refresh()
         if hasattr(self, "run_preview"):
             self.run_preview._refresh_sources()
 
@@ -6237,8 +6444,16 @@ class LayerPainterView(QWidget):
         if self.session is None or self.proposal is None:
             label.setText("")
             return
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None:
+                label.setText("Computing the exact native map and its SHA-256…")
+                return
+            if native.error:
+                label.setText("The exact native map is unavailable: " + native.error)
+                return
         try:
-            digest = lp.map_digest(self.session, self.proposal, self.corrections)
+            digest = self._current_map_digest()
         except (OSError, ValueError, TypeError) as error:
             label.setText(f"The map's SHA-256 could not be computed: {error}")
             return
@@ -6284,11 +6499,19 @@ class LayerPainterView(QWidget):
                 text += f" · {gaps}"
             self.versions_note.setText(text)
         self.restore_version_button.setEnabled(record is not None and not self.busy())
+        native_ready = True
+        if self._native_async_required():
+            native = self._large_native_result()
+            native_ready = native is not None and not native.error
         self.approve_version_button.setEnabled(
             record is not None and not self.busy() and not self._map_approvals_error
+            and record.get("kind") != lpv.DRAWING_KIND
+            and native_ready
         )
         self.place_version_button.setEnabled(self._placeable(record))
         self.prepare_adoption_button.setEnabled(self._placeable(record))
+        if hasattr(self, "version_actions"):
+            self.version_actions.refresh()
 
     @staticmethod
     def _version_gaps(record: Mapping[str, Any]) -> str:
@@ -6296,7 +6519,7 @@ class LayerPainterView(QWidget):
         the version is not a manual map)."""
 
         uncovered = int(record.get("uncovered_pixels") or 0)
-        if not lpm.is_manual_version(record) or not uncovered:
+        if not (lpm.is_manual_version(record) or record.get("proposal_method") == lpp.METHOD) or not uncovered:
             return ""
         return (
             f"{uncovered:,} px inside the rig frame are covered by no polygon; cover "
@@ -6306,10 +6529,17 @@ class LayerPainterView(QWidget):
     def _placeable(self, record: Mapping[str, Any] | None) -> bool:
         """Whether a version may be placed in all runs: it is approved."""
 
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None or native.error:
+                return False
         return (
             record is not None
+            and record.get("kind") != lpv.DRAWING_KIND
+            and not record.get("uncovered_pixels")
             and not self.busy()
             and not self._map_approvals_error
+            and not record.get("history_error")
             and lp.map_approval(self.map_approvals, str(record.get("sha256") or ""))
             is not None
         )
@@ -6456,6 +6686,7 @@ class LayerPainterView(QWidget):
         start (the note says why). ``first_runs`` are reviewed right after
         this run. The review window opens when it is done."""
 
+        self._read_approvals(str(record.get("run_id") or (self.session.run_id if self.session else "")))
         if not self._placeable(record) or self.session is None:
             self.versions_note.setText("Approve the version before placing it in all runs.")
             return False
@@ -6596,6 +6827,16 @@ class LayerPainterView(QWidget):
         """Open the adoption window of a preparation folder; None when it
         cannot be read (a message says why)."""
 
+        if self.session is not None:
+            self._read_approvals(self.session.run_id)
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None or native.error or self._native_async.busy():
+                self.versions_note.setText("Wait for the exact native map before opening adoption.")
+                return None
+        if self._map_approvals_error:
+            self.versions_note.setText("Version history is unreadable; adoption remains blocked.")
+            return None
         from darsia.fluidflower.map_adoption_view import AdoptionDialog
         from darsia.fluidflower.series_geometry import default_actor
 
@@ -6657,6 +6898,7 @@ class LayerPainterView(QWidget):
         """Start preparing an approved version's adoption on every run's label
         grid; False when it cannot start (the note says why)."""
 
+        self._read_approvals(str(record.get("run_id") or (self.session.run_id if self.session else "")))
         if not self._placeable(record) or self.session is None:
             self.versions_note.setText("Approve the version before preparing its adoption.")
             return False
@@ -6797,8 +7039,13 @@ class LayerPainterView(QWidget):
                 )
             else:
                 assert self.proposal is not None
-                record = lp.save_version(
-                    self.project, self.session, self.proposal, self.corrections, name=name
+                method = lpp.METHOD if lpp.is_polygons_only(self.proposal) else lp.PROPOSAL_METHOD
+                record = lpv.save_map_version(
+                    self.project, self.session, self.proposal, self.corrections, name=name,
+                    method=method, settings=(dict(method=lpp.METHOD, grid="native photograph",
+                        automatic_edge_fill=False, strokes_used=False)
+                        if method == lpp.METHOD else self.session.to_dict()["proposal_settings"]),
+                    proposal_writer=lpp.save_proposal if method == lpp.METHOD else None,
                 )
         except (OSError, ValueError) as error:
             self.versions_note.setText(f"The version could not be saved: {error}")
@@ -6849,14 +7096,25 @@ class LayerPainterView(QWidget):
         """Approve a saved version as the run's map, with the series' reviewer
         setting. Returns the approval record, or None (the note says why)."""
 
-        if self.busy() or self._map_approvals_error:
+        self._read_approvals(str(record.get("run_id") or (self.session.run_id if self.session else "")))
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None or native.error or self._native_async.busy():
+                self.versions_note.setText("Computing the exact native map; approval remains blocked.")
+                return None
+        if self.busy() or self._map_approvals_error or record.get("history_error"):
             self.versions_note.setText(
-                self._map_approvals_error or "Wait until the proposal or export has finished."
+                self._map_approvals_error or str(record.get("history_error") or "")
+                or "Wait until the proposal or export has finished."
             )
             return None
         try:
             reviewer = self._reviewer() or None
-            if lpm.is_manual_version(record):
+            if record.get("kind") == lpv.DRAWING_KIND:
+                raise ValueError("A drawing has no map to approve; propose or save a manual map first")
+            if record.get("proposal_method") == lpp.METHOD:
+                approval = lpp.approve_version(record, reviewer=reviewer)
+            elif lpm.is_manual_version(record):
                 approval = lpm.approve_manual_version(record, reviewer=reviewer)
             else:
                 approval = lp.approve_version(record, reviewer=reviewer)
@@ -6875,12 +7133,15 @@ class LayerPainterView(QWidget):
         record = self._selected_version()
         if record is None:
             return
+        if record.get("kind") == lpv.DRAWING_KIND:
+            self.version_actions.use_drawing(record)
+            return
         saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
         keep = (
             "The current map is saved as a version first, so that it can be "
             "restored again."
             if self.proposal is not None or self._map_kind() == _MANUAL
-            else "The current marks have no proposal and are replaced."
+            else "The current drawing is saved as a version first."
         )
         if lpm.is_manual_version(record):
             keep += (
@@ -6905,6 +7166,22 @@ class LayerPainterView(QWidget):
 
         if self.busy() or self.session is None:
             return False
+        if record.get("kind") == lpv.DRAWING_KIND:
+            return self.version_actions.use_drawing(record)
+        restored_new = None
+        if record.get("proposal_method") == lpp.METHOD:
+            try:
+                restored_new = lpp.load_version(record)
+                loaded, painted, _corrections = restored_new
+                if (loaded.run_id != self.session.run_id
+                        or tuple(loaded.image_size or ()) != tuple(self.session.image_size or ())
+                        or Path(loaded.image_path) != Path(self.session.image_path)
+                        or loaded.image_stamp != self.session.image_stamp
+                        or not lpp.proposal_current(painted, loaded, self.current_frame())):
+                    raise ValueError("This version belongs to another photograph or full rig frame; no draft was changed")
+            except (OSError, ValueError, KeyError) as error:
+                self.versions_note.setText(f"The version could not be restored: {error}")
+                return False
         if self._map_kind() == _MANUAL:
             # The manual map shown is kept as a version first.
             problem = self._versions_unavailable()
@@ -6917,13 +7194,36 @@ class LayerPainterView(QWidget):
                 if self.save_version(f"Before restoring {record.get('name')}") is None:
                     return False
         elif self.proposal is not None and not self._corrections_error:
-            current = lp.map_digest(self.session, self.proposal, self.corrections)
-            if not any(row.get("sha256") == current for row in self.versions):
-                if self.save_version(f"Before restoring {record.get('name')}") is None:
+            if lpp.is_polygons_only(self.proposal) and not self.proposal_current():
+                try:
+                    lpv.save_drawing_version(self.project, self.session,
+                        name=f"Drawing before restoring {record.get('name')}")
+                except (OSError, ValueError) as error:
+                    self.versions_note.setText(f"The exact current drawing could not be kept: {error}")
                     return False
+            else:
+                current = self._current_map_digest()
+                if not any(row.get("sha256") == current for row in self.versions):
+                    if self.save_version(f"Before restoring {record.get('name')}") is None:
+                        return False
+        else:
+            try:
+                lpv.save_drawing_version(self.project, self.session,
+                    name=f"Drawing before restoring {record.get('name')}")
+            except (OSError, ValueError) as error:
+                self.versions_note.setText(f"The current drawing could not be kept: {error}")
+                return False
         self.save_session()
         try:
-            if lpm.is_manual_version(record):
+            if restored_new is not None:
+                loaded, painted, corrections = restored_new
+                lpp.save_current_session(self.project, loaded, actor=default_actor())
+                painted.save(lp.proposal_path(self.project, loaded.run_id))
+                if corrections or lp.corrections_path(self.project, loaded.run_id).exists():
+                    lp.save_corrections(self.project, loaded.run_id, corrections)
+                self.session = loaded
+                self._dirty = self._corrections_dirty = False
+            elif lpm.is_manual_version(record):
                 lpm.restore_manual_version(self.project, record, actor=default_actor())
             else:
                 lp.restore_version(self.project, record, actor=default_actor())
@@ -6965,6 +7265,18 @@ class LayerPainterView(QWidget):
 
     # ---------------------------------------------------------- proposal
 
+    def _sync_method_controls(self) -> None:
+        classifier = self.proposal_method.currentData() != lpp.METHOD
+        available = self.session is not None
+        for widget in (self.smoothing, self.min_region, self.snap, self.detail,
+                       self.move_shared_edges):
+            widget.setEnabled(available and classifier)
+
+    def _proposal_method_changed(self, *_args: Any) -> None:
+        self._sync_method_controls()
+        if not self._loading:
+            self._refresh_status()
+
     def _settings_changed(self, *_args: Any) -> None:
         if self.session is None or self._loading:
             return
@@ -6982,8 +7294,7 @@ class LayerPainterView(QWidget):
         return (
             self.proposal is not None
             and self.session is not None
-            and self.proposal.digest
-            == lp.proposal_digest(self.session, self.current_frame())
+            and lpp.proposal_current(self.proposal, self.session, self.current_frame())
         )
 
     def propose(self) -> None:
@@ -6998,13 +7309,22 @@ class LayerPainterView(QWidget):
         if self._other_photo is not None:
             self.show_reference_photo()
         self.save_session()
-        snapshot = lp.PaintingSession.from_dict(self.session.to_dict())
+        method = str(self.proposal_method.currentData() or lp.PROPOSAL_METHOD)
+        if method == lpp.METHOD:
+            try:
+                lpp.save_current_session(self.project, self.session, actor=default_actor())
+            except (OSError, ValueError) as error:
+                self.propose_status.setText(f"The exact drawing could not be saved: {error}")
+                return
+        snapshot = (deepcopy(self.session) if method == lpp.METHOD
+                    else lp.PaintingSession.from_dict(self.session.to_dict()))
         thread = QThread(self)
         worker = _ProposalWorker(
             self._proposal_image(),
             snapshot,
-            self.current_frame(),
+            deepcopy(self.current_frame()) if method == lpp.METHOD else self.current_frame(),
             lp.proposal_path(self.project, reference.run_id),
+            method=method,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -7091,6 +7411,8 @@ class LayerPainterView(QWidget):
 
     def _proposal_thread_finished(self) -> None:
         thread = self._proposal_thread
+        if thread is not None:
+            thread.wait()
         self._proposal_thread = None
         self._proposal_worker = None
         if thread is not None:
@@ -7166,6 +7488,38 @@ class LayerPainterView(QWidget):
         import cv2
 
         height, width = self.image.display.shape[:2]
+        if lpp.is_polygons_only(self.proposal):
+            if self._native_async_required():
+                native = self._large_native_result()
+                if native is None or native.error:
+                    self.canvas.set_proposal(None)
+                    self._update_polygon_fill()
+                    return
+                visible = self.show_corrections.isChecked()
+                classes = native.display_classes if visible else native.base_display_classes
+                gaps = native.display_gaps if visible else native.base_display_gaps
+                corrected = native.display_decided if visible else None
+            else:
+                native, decided, _skipped = self._corrected_native_state(shown=True)
+                display_key = self._native_corrections_key, height, width
+                if self._native_display_key != display_key:
+                    classes = cv2.resize(native, (width, height), interpolation=cv2.INTER_NEAREST)
+                    gaps = cv2.resize(self._native_corrections_gap_mask.astype(np.uint8),
+                                      (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+                    corrected = cv2.resize(decided.astype(np.uint8), (width, height),
+                                           interpolation=cv2.INTER_NEAREST).astype(bool)
+                    self._native_display_key = display_key
+                    self._native_display_state = classes, gaps, corrected
+                classes, gaps, corrected = self._native_display_state
+            rgba, _shown = self._layer_overlay(classes)
+            rgba[gaps] = (255, 0, 255, 150)
+            if corrected is not None and self.corrections and self.show_corrections.isChecked():
+                inner = cv2.erode(corrected.astype(np.uint8), np.ones((3, 3), np.uint8))
+                rgba[corrected & ~inner.astype(bool)] = _CORRECTED_EDGE
+            self._mark_differences(rgba)
+            self.canvas.set_proposal(rgba)
+            self._update_polygon_fill()
+            return
         classes = cv2.resize(
             self.proposal.classes, (width, height), interpolation=cv2.INTER_NEAREST
         )
@@ -7298,9 +7652,13 @@ class LayerPainterView(QWidget):
         assert self.session is not None and self.image is not None
         if tuple(self.proposal.image_size) != tuple(self.image.image_size):
             return ""
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None or native.error:
+                return ""
         frame = self.current_frame()
         payload = [
-            lp.map_digest(self.session, self.proposal, self.corrections),
+            self._current_map_digest(),
             list(self.image.image_size),
             frame.to_dict() if frame is not None else None,
         ]
@@ -7444,6 +7802,10 @@ class LayerPainterView(QWidget):
 
         height, width = self.image.display.shape[:2]
         layers = self._compare_layers if self._compare_run == self._manual_run else None
+        if self._native_async_required():
+            current = self._compare_inputs_key()
+            if not current or self._compare_key != current:
+                layers = None
         key = (id(manual), id(layers), height, width)
         if self._manual_display is not None and self._manual_display["key"] == key:
             return self._manual_display
@@ -7560,7 +7922,12 @@ class LayerPainterView(QWidget):
                     "strokes guide the proposal only."
                 )
         if self.show_differences.isChecked():
-            if self.proposal is None:
+            native = self._large_native_result() if self._native_async_required() else None
+            if self._native_async_required() and native is None:
+                parts.append("Computing exact native corrections before comparing the maps.")
+            elif self._native_async_required() and native.error:
+                parts.append("Differences unavailable: " + native.error)
+            elif self.proposal is None:
                 parts.append("There is no proposal to compare it with.")
             elif display is not None and display["difference_pixels"] is not None:
                 pixels = display["difference_pixels"]
@@ -7930,6 +8297,27 @@ class LayerPainterView(QWidget):
 
     # ------------------------------------------------------------ export
 
+    def _current_map_digest(self) -> str:
+        if not lpp.is_polygons_only(self.proposal):
+            return lp.map_digest(self.session, self.proposal, self.corrections)
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None:
+                raise ValueError("Computing the exact native map and its SHA-256")
+            if native.error:
+                raise ValueError(native.error)
+            return native.map_digest
+        payload = self.session.to_dict()
+        payload.pop("updated_utc", None)
+        payload.pop("updated_by", None)
+        key = (id(self.proposal), self.proposal.digest, id(self.proposal.classes),
+               id(self.proposal.confidence), lpp._json_bytes(payload),
+               lp.corrections_digest(self.corrections))
+        if self._new_map_digest_key != key:
+            self._new_map_digest = lp.map_digest(self.session, self.proposal, self.corrections)
+            self._new_map_digest_key = key
+        return self._new_map_digest
+
     def export_problems_now(self) -> list[str]:
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             return ["Corrected-frame production export and Build run model are not qualified yet."]
@@ -7937,7 +8325,34 @@ class LayerPainterView(QWidget):
             return [_RAW_SESSION_EXPORT_NOTE]
         if self.session is None:
             return ["Choose a reference run with a baseline photograph."]
-        return lp.check_ready_for_revision(
+        if self._native_async_required():
+            native = self._large_native_result()
+            if native is None:
+                return ["Computing the exact native map; approval and export wait for the checked result."]
+            return list(native.problems)
+        if lpp.is_polygons_only(self.proposal):
+            reference, frame = self.reference(), self.current_frame()
+            try:
+                source = lpp._source(self.session, frame, tuple(self.proposal.image_size))
+                roles = [(row.layer_id, row.name, row.facies) for row in self.session.layers]
+                properties = [(name, value.role, value.porosity, value.permeability)
+                              for name, value in self.session.facies.items()]
+                key = (id(self.proposal), self.proposal.digest, id(self.proposal.classes),
+                       id(self.proposal.inside), lpp._json_bytes(source),
+                       lpp._json_bytes([roles, properties, self.session.permeability_unit]),
+                       lp.corrections_digest(self.corrections),
+                       str(reference.baseline_image) if reference else None,
+                       reference.width_m if reference else None,
+                       reference.height_m if reference else None)
+                if self._new_export_check_key != key:
+                    self._new_export_check_problems = lpp.check_ready_for_revision(
+                        self.session, self.proposal, frame, reference, self.corrections)
+                    self._new_export_check_key = key
+                return list(self._new_export_check_problems)
+            except (ValueError, TypeError, KeyError) as error:
+                return [str(error)]
+        check = lpp.check_ready_for_revision if lpp.is_polygons_only(self.proposal) else lp.check_ready_for_revision
+        return check(
             self.session,
             self.proposal,
             self.current_frame(),
@@ -7968,10 +8383,11 @@ class LayerPainterView(QWidget):
         thread = QThread(self)
         worker = _SaveWorker(
             self.project,
-            lp.PaintingSession.from_dict(self.session.to_dict()),
+            deepcopy(self.session) if lpp.is_polygons_only(self.proposal)
+            else lp.PaintingSession.from_dict(self.session.to_dict()),
             self.proposal,
             reference,
-            self.current_frame(),
+            deepcopy(self.current_frame()) if lpp.is_polygons_only(self.proposal) else self.current_frame(),
             default_actor(),
             corrections=tuple(self.corrections),
         )
@@ -8020,6 +8436,8 @@ class LayerPainterView(QWidget):
 
     def _save_thread_finished(self) -> None:
         thread = self._save_thread
+        if thread is not None:
+            thread.wait()
         self._save_thread = None
         self._save_worker = None
         if thread is not None:
@@ -8168,8 +8586,13 @@ class LayerPainterView(QWidget):
         self.redo_button.setEnabled(bool(self._redo_stack))
 
         busy = self.busy()
+        native = self._large_native_result() if self._native_async_required() else None
         if self._proposal_thread is not None:
             self.step_propose.set_status("Working…", "warn")
+        elif self._native_async_required() and native is None:
+            self.step_propose.set_status("Computing native corrections…", "warn")
+        elif self._native_async_required() and native.error:
+            self.step_propose.set_status("Native corrections unavailable", "warn")
         elif self.proposal is None:
             self.step_propose.set_status("Not proposed yet", "warn")
             self.proposal_summary.setText("")
@@ -8211,6 +8634,11 @@ class LayerPainterView(QWidget):
         session = self.session
         if proposal is None or session is None:
             return ""
+        native = self._large_native_result() if self._native_async_required() else None
+        if self._native_async_required() and native is None:
+            return "Polygons only · computing the exact native map and gap count…"
+        if self._native_async_required() and native.error:
+            return "Polygons only · native map unavailable: " + native.error
         parts = []
         for row in proposal.layers:
             if not row.get("pixels"):
@@ -8235,6 +8663,15 @@ class LayerPainterView(QWidget):
         )
         if proposal.merged_regions:
             text += f" {proposal.merged_regions} small island(s) merged."
+        if lpp.is_polygons_only(proposal):
+            if self._native_async_required():
+                gap_count = native.gap_count
+            else:
+                self._corrected_native_state()
+                gap_count = self._native_corrections_gaps
+            return "Polygons only · exact photograph grid. " + text + (
+                f" {gap_count:,} unassigned pixels (magenta); "
+                "approval and export require no gaps.")
         uncertain = int(np.count_nonzero(proposal.uncertain()))
         inside = int(np.count_nonzero(proposal.classes != lp.OUTSIDE))
         if inside:

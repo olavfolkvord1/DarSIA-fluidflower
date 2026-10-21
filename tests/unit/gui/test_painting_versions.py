@@ -45,9 +45,9 @@ def test_versions_are_saved_listed_and_restored(view):
     assert table.rowCount() == 2
     names = [table.item(row, 0).text() for row in range(2)]
     assert names == ["Edited", "Proposal only"]  # Newest first.
-    assert table.item(0, 2).text() == "edited (1)"
-    assert table.item(1, 2).text() == "proposal"
-    assert table.item(0, 3).text() == second["sha256"][:12]
+    assert table.item(0, 1).text() == "edited (1)"
+    assert table.item(1, 1).text() == "proposal"
+    assert table.item(0, 4).text() == second["sha256"][:12]
     # The current map equals "Edited", so restoring keeps no extra version.
     assert view.restore_version(first)
     assert view.corrections == [] and len(view.versions) == 2

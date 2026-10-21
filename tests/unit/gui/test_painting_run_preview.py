@@ -134,7 +134,9 @@ def test_logged_placement_still_requires_approval_while_preview_is_available(vie
     _show(view, _proposal())
     record = view.save_version("Draft")
     controller = _runs(view)
-    assert any(controller.sources.itemData(i)[1] == record for i in range(controller.sources.count()))
+    assert any(value is not None and value.get("sha256") == record["sha256"]
+               and value.get("folder") == record["folder"]
+               for value in (controller.sources.itemData(i)[1] for i in range(controller.sources.count())))
     assert not view.place_version(record, "unused.json", runs=["ac53"])
     assert "Approve" in view.versions_note.text()
     assert not view.map_approvals

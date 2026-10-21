@@ -26,7 +26,7 @@ def _brush(view):
 
 def test_approve_records_the_version_and_step_4_names_the_approved_map(view):
     assert view.approve_version_button.text() == "Approve…"
-    assert view.versions_table.horizontalHeaderItem(4).text() == "Approved (UTC)"
+    assert view.versions_table.horizontalHeaderItem(5).text() == "State"
     _show(view, _proposal())
     assert not view.approve_version_button.isEnabled()
     assert "not saved as a version" in view.map_status.text()
@@ -37,7 +37,10 @@ def test_approve_records_the_version_and_step_4_names_the_approved_map(view):
     approval = view.approve_version(record)
     assert approval["sha256"] == record["sha256"] and approval["reviewer"] == "Test reviewer"
     assert lp.read_map_approvals(view.project, "ac52") == [approval]
-    assert view.versions_table.item(0, 4).text() == approval["approved_utc"][:16].replace("T", " ")
+    state = view.versions_table.item(0, 5)
+    assert state.text() == "Approved " + approval["approved_utc"][:16].replace("T", " ") + " UTC"
+    assert approval["approved_utc"] in state.toolTip()
+    assert approval["reviewer"] in state.toolTip()
     assert "the approved version Map A" in view.map_status.text()
     assert "by Test reviewer" in view.map_status.text()
     assert "by Test reviewer" in view.versions_note.text()
@@ -75,7 +78,17 @@ def test_the_button_asks_first_and_an_unreadable_file_blocks_approval(view, monk
     path.write_text("not json\n", encoding="utf-8")
     view.reload()
     assert "could not be read" in view.map_status.text()
+    assert len(view.versions) == 1 and view.versions[0]["sha256"] == record["sha256"]
+    assert view.versions[0]["approved"] is None and not view.versions[0]["approval_known"]
+    assert "UNKNOWN" in view.versions_table.item(0, 5).text()
+    assert view.versions[0]["history_error"] in view.versions_table.item(0, 5).toolTip()
     view.versions_table.selectRow(0)
     assert not view.approve_version_button.isEnabled()
+    assert not view.place_version_button.isEnabled()
+    assert not view.prepare_adoption_button.isEnabled() and not view.adopt_button.isEnabled()
+    assert not view.version_actions.buttons["archive"].isEnabled()
+    assert not view.version_actions.buttons["rename"].isEnabled()
+    assert not view.version_actions.buttons["note"].isEnabled()
+    assert not view.version_actions.buttons["restore_deleted"].isEnabled()
     assert view.approve_version(view.versions[0]) is None
     assert path.read_text(encoding="utf-8") == "not json\n"
