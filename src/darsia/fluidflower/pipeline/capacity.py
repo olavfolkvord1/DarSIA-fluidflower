@@ -1447,6 +1447,10 @@ class CapacityLedger:
                         or row["scope"] != row["estimate"].get("scope")
                         or row["scope"].get("ordered_case_ids") != row["ordered_case_ids"]):
                     raise ValueError("First Q119 reservation differs from actual predeclared whole-output plan")
+            elif row.get("reservation_model") == "setup-explicit-whole-operation":
+                from .series_setup_admission import validate_retained_reservation
+                validate_retained_reservation(row, capacity_key=self.key,
+                                              volume_id=self.volume["volume_id"])
             else:
                 if row["format"]!="darsia-local-capacity-reservation-v1":
                     raise ValueError("Unknown typed capacity reservation model")
@@ -1464,6 +1468,9 @@ class CapacityLedger:
                 continue
             committed = 0
             progress_paths = list(islice(path.parent.glob("p-*.json"), row["case_count"] + 1))
+            if (row.get("reservation_model") == "setup-explicit-whole-operation"
+                    and progress_paths):
+                raise ValueError("A Setup whole-operation reservation cannot have frame progress")
             if len(progress_paths) > row["case_count"]:
                 raise ValueError("Capacity progress exceeds original case count")
             for progress in progress_paths:
@@ -1481,6 +1488,8 @@ class CapacityLedger:
                 # Never divide by 39 or shrink a whole-tree ceiling with prefix
                 # progress. Actual committed/preparation files remain retained.
                 total += row["maximum_output_bytes"]
+            elif row.get("reservation_model") == "setup-explicit-whole-operation":
+                total += row["maximum_output_bytes"]
             else:
                 total += ((row["case_count"] - committed) * row["products_per_frame_estimated_bytes"]
                           + row["transient_estimated_bytes"])
@@ -1488,6 +1497,7 @@ class CapacityLedger:
 
     def bind(self, job_root, claim, owner, estimate):
         _owner(owner)
+        from .series_setup_admission import SetupVolumeReservation
         if not self._common_binding():
             raise RunUnavailable("Bind the authoritative host-volume directory before any reservation")
         if claim.token != claim.task["attempt_id"] or estimate.case_count != len(claim.task["ordered_case_ids"]):
@@ -1513,6 +1523,20 @@ class CapacityLedger:
                 request=estimate.request, administration=estimate.administration,
                 all_stage_reference=estimate.all_stage_reference, scope=estimate.scope,
                 not_a_measured_profile=True, estimate=asdict(estimate))
+        elif isinstance(estimate, SetupVolumeReservation):
+            if (estimate.capacity_key != self.key or estimate.volume_id != self.volume["volume_id"]
+                    or claim.task.get("pipeline") != "series-setup"
+                    or estimate.operation != claim.task.get("operation")):
+                raise ValueError("Setup output reservation differs from its actual volume or operation")
+            value = dict(common, format="darsia-local-capacity-reservation-v1",
+                reservation_model="setup-explicit-whole-operation",
+                maximum_output_bytes=estimate.maximum_output_bytes,
+                products_per_frame_estimated_bytes=estimate.maximum_output_bytes,
+                transient_estimated_bytes=0,
+                not_a_measured_profile=True, estimate=asdict(estimate))
+            from .series_setup_admission import validate_retained_reservation
+            validate_retained_reservation(value, capacity_key=self.key,
+                                          volume_id=self.volume["volume_id"])
         else:
             value = dict(common,format="darsia-local-capacity-reservation-v1",
                 products_per_frame_estimated_bytes=estimate.products_per_frame_estimated_bytes,
@@ -1529,6 +1553,8 @@ class CapacityLedger:
         if event.get("state") not in {"frame_completed", "phase1_frame_completed"}:
             return
         row = _read_local(Path(reservation) / "reserved.json")
+        if row.get("reservation_model") == "setup-explicit-whole-operation":
+            raise ValueError("Setup retains the whole output ceiling until actual release")
         if row["owner"] != owner or event.get("complete") is not True or event.get("run") != row["run"]:
             raise ValueError("Capacity progress must follow the original owned committed event")
         case = event.get("case_id")
@@ -1615,19 +1641,26 @@ class ClaimCapacity:
         self.ledger = self.lock = self.error = None
         self.cache = None
         self.estimates = {}
+        self.setup_candidate = None
 
     def __enter__(self):
         try:
             root = self.runtime.stores.roots(self.runtime.job["series_id"])["results"]
             self.ledger = CapacityLedger(self.runtime.stores, self.runtime.job["series_id"], root)
-            from darsia_cache.control import ClaimCacheBudget
-            self.cache = ClaimCacheBudget(self.runtime, self.ledger, self.owner)
+            if self.runtime.job.get("pipeline") != "series-setup":
+                from darsia_cache.control import ClaimCacheBudget
+                self.cache = ClaimCacheBudget(self.runtime, self.ledger, self.owner)
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.error = "Capacity admission unavailable: " + str(error)
         return self
 
     def _unlock(self):
         try:
+            if self.setup_candidate is not None:
+                candidate, self.setup_candidate = self.setup_candidate, None
+                candidate.unlock()
+                if not candidate.bound and not candidate.admission.bound_reservations:
+                    self.runtime.setup_verified_inputs.pop(candidate.task["attempt_id"], None)
             if self.cache is not None:
                 self.cache.unlock()  # Reverse of result-volume -> cache acquisition.
         finally:
@@ -1649,8 +1682,21 @@ class ClaimCapacity:
             self._refuse(task, RunUnavailable(self.error))
         # Original input/resume identity errors retain their original behavior.
         rows = self.runtime.availability(task)
+        if rows is None and task.get("pipeline") == "series-setup":
+            return None
         try:
             config = configuration_for_task(self.runtime.stores, self.runtime.job["series_id"], task, rows)
+            if task.get("pipeline") == "series-setup":
+                from .series_setup_worker_admission import setup_claim_admission
+                from .store_runtime import verify_inputs
+                if not hasattr(self.runtime, "setup_verified_inputs"):
+                    self.runtime.setup_verified_inputs = {}
+                self.runtime.setup_verified_inputs[task["attempt_id"]] = verify_inputs(task, rows)
+                self.setup_candidate = setup_claim_admission(self.runtime, task, config, self.owner)
+                self.setup_candidate.acquire()
+                self.setup_candidate.check()
+                self.runtime.capacity_refusals.pop(task["run"], None)
+                return rows
             first=getattr(getattr(getattr(self.runtime,"cache_adapter",None),"lease",None),"first_qualification",None)
             lease = getattr(getattr(self.runtime, "cache_adapter", None), "lease", None)
             if first is not None and getattr(first, "common_mode", False):
@@ -1692,6 +1738,14 @@ class ClaimCapacity:
 
     def bind(self, claim):
         if claim is not None:
+            if claim.task.get("pipeline") == "series-setup":
+                if self.setup_candidate is None:
+                    raise ValueError("The actual Setup claim has no locked original candidate")
+                if not hasattr(self.runtime, "setup_admissions"):
+                    self.runtime.setup_admissions = {}
+                self.runtime.setup_admissions[claim.token] = self.setup_candidate
+                self.setup_candidate.bind(claim)
+                return
             lease = getattr(getattr(self.runtime, "cache_adapter", None), "lease", None)
             first = getattr(lease, "first_qualification", None)
             if first is not None:
@@ -1700,6 +1754,15 @@ class ClaimCapacity:
                                            self.estimates[claim.token])
             self.runtime.capacities[claim.token] = (self.ledger, reservation, self.owner)
             self.cache.bind(claim)  # Adapter must bind actual writers/temporary lifecycle before science.
+
+    def claim_controls(self, task, machine):
+        """Bound Setup's finite original claim controls; leave other IO intact."""
+        if task.get("pipeline") != "series-setup":
+            from contextlib import nullcontext
+            return nullcontext()
+        if self.setup_candidate is None:
+            raise ValueError("Setup claim controls require their locked original candidate")
+        return self.setup_candidate.preclaim_scope(task, machine)
 
     def __exit__(self, *args):
         self._unlock()
@@ -1711,6 +1774,9 @@ def release_retired_capacity(root, task, stores, retirement):
     if stores.document.get("capacity") is None:
         # Pre-J6 attempts cannot own a reservation in a never-configured ledger.
         return
+    if task.get("pipeline") == "series-setup":
+        from .series_setup_worker_admission import release_retired_setup_capacity
+        return release_retired_setup_capacity(root, task, stores, retirement)
     job = read_json(Path(root) / "job.json")
     result_root = stores.roots(job["series_id"])["results"]
     ledger = CapacityLedger(stores, job["series_id"], result_root)
