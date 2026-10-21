@@ -1149,6 +1149,9 @@ class JobsPanel(QWidget):
         self.master_label, self.progress_label = _label("No active job"), _label("")
         detail_layout.addWidget(self.master_label)
         detail_layout.addWidget(self.progress_label)
+        self.operation_label = _label()
+        self.operation_label.hide()
+        detail_layout.addWidget(self.operation_label)
         self.capacity_button = QPushButton("Check expected space on this machine")
         self.capacity_button.clicked.connect(self.check_capacity)
         self.capacity_label = _label("Expected space not checked. The worker checks fresh free space before claiming a run.")
@@ -1404,15 +1407,24 @@ class JobsPanel(QWidget):
         self._known_launch_errors = result.get("known_launch_errors", [])
         with QSignalBlocker(self.job_table):
             self.job_table.setRowCount(len(self.snapshots))
+            setup_jobs = [self._is_setup_job(data) for data in self.snapshots]
+            self.job_table.horizontalHeaderItem(2).setText(
+                "Operations" if setup_jobs and all(setup_jobs) else "Runs / operations" if any(setup_jobs) else "Runs")
+            self.job_table.horizontalHeaderItem(3).setText(
+                "Progress" if setup_jobs and all(setup_jobs) else "Images / operations" if any(setup_jobs) else "Frames")
             for row, data in enumerate(self.snapshots):
                 frames = f"{data.get('committed', '?')} / {data.get('total_frames') if data.get('total_frames') is not None else '?'}"
+                runs = f"{data.get('completed_runs', '?')} / {data.get('run_count', '?')}"
+                if self._is_setup_job(data):
+                    frames = f"{data.get('completed_operations', '?')} / {data.get('total_operations', '?')} operations"
+                    runs = str(data.get("total_operations", "?"))
                 _fill(
                     self.job_table,
                     row,
                     [
                         data["name"],
                         data.get("series", "Not recorded"),
-                        f"{data.get('completed_runs', '?')} / {data.get('run_count', '?')}",
+                        runs,
                         frames,
                         data.get("created_utc", "Not recorded"),
                         data["state"],
@@ -1701,11 +1713,22 @@ class JobsPanel(QWidget):
             legacy = (data.get("job_facts") or {}).get("legacy_paths", True)
             self.master_label.setText(self.master_label.text() + "\nlegacy_paths=" +
                                       ("true" if legacy else "false"))
-            self.progress_label.setText(
-                f"Committed images: {data.get('committed', '?')} · Remaining: {data.get('remaining') if data.get('remaining') is not None else 'Unknown'} · Average: {_rate(data.get('frames_per_minute'))} · ETA: {_eta(data.get('eta_seconds'))}\n{data.get('rate_scope', '')}"
-            )
+            if self._is_setup_job(data):
+                self.progress_label.setText(
+                    f"Completed operations: {data.get('completed_operations', '?')} / {data.get('total_operations', '?')}"
+                    f" · Remaining operations: {data.get('remaining_operations', '?')}\n{data.get('rate_scope', '')}")
+            else:
+                self.progress_label.setText(
+                    f"Committed images: {data.get('committed', '?')} · Remaining: {data.get('remaining') if data.get('remaining') is not None else 'Unknown'} · Average: {_rate(data.get('frames_per_minute'))} · ETA: {_eta(data.get('eta_seconds'))}\n{data.get('rate_scope', '')}"
+                )
         else:
             self.progress_label.setText("")
+        self.operation_label.setVisible(self._is_setup_job(data))
+        stages = {"apply": "Apply geometry", "build": "Build run model"}
+        self.operation_label.setText("\n".join(
+            f"{stages.get(row.get('operation'), 'Setup operation')} · {row['run']}: {row['state']}"
+            for row in (data or {}).get("runs", [])
+        ) if self._is_setup_job(data) else "")
         self.machine_table.setRowCount(len((data or {}).get("machines", [])))
         for row, facts in enumerate((data or {}).get("machines", [])):
             _fill(
@@ -1783,6 +1806,8 @@ class JobsPanel(QWidget):
         facts = data.get("job_facts")
         if not facts:
             return "Storage profile: not shown, the job metadata could not be read."
+        if self._is_setup_job(data):
+            return "Setup outputs use the limits recorded in each operation. No image-frame storage profile applies."
         if facts.get("pipeline") == "native-phase-statistics" and "storage_profile" not in facts:
             return "Storage profile: not applicable; phase one writes no N1 frame products."
         try:
@@ -1805,6 +1830,11 @@ class JobsPanel(QWidget):
         else:
             text += "\nCheck expected space on this machine for this job's estimate against fresh free space."
         return text
+
+    @staticmethod
+    def _is_setup_job(data):
+        """Use only the typed pipeline identity to select operation presentation."""
+        return ((data or {}).get("job_facts") or {}).get("pipeline") == "series-setup"
 
     def set_resource_panel(self, panel):
         if self.resource_panel is not None:

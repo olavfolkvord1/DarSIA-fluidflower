@@ -635,6 +635,8 @@ class SeriesGeometryWorkspace(QWidget):
         view.exported.connect(self._show_export_dialog)
         view.busy_changed.connect(self._view_busy_changed)
         self.simple_view = view
+        from .series_setup_jobs_ui import SeriesSetupJobsController
+        self.setup_jobs_controller = SeriesSetupJobsController(self, view)
         self.view_stack.insertWidget(0, view)
         self.view_stack.setCurrentWidget(view)
         self.pages.setCurrentWidget(self.page_host)
