@@ -693,6 +693,12 @@ def read_shape_basis(certificate, *, run_id, authority, parent_workspace,
         raise ValueError("Shape-basis run must be one explicit safe lowercase identity")
     if authority is None or parent_workspace is None:
         raise ValueError("RAW shape basis needs its external Root source/request/review authority and per-run parent grid")
+    if isinstance(authority, dict) and "received_basis" in authority:
+        from .raw_shape_basis_copy import read_received_basis
+        return read_received_basis(certificate, run_id=run_id, authority=authority,
+            parent_workspace=parent_workspace, reference_image=reference_image,
+            camera_profile=camera_profile, aliases=aliases, folder=folder,
+            parent_configuration_lineage=parent_configuration_lineage)
     pins = _Pins(aliases, folder=folder)
     try:
         document = pins.add(certificate, metadata=True)

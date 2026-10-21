@@ -433,7 +433,7 @@ def _verify_preparation_publication(preparation, folder):
     Historical saved-version and approval readers keep their original guards.
     """
     from .geometry_raster_sources import _integer_map
-    from .painted_adoption_geometry import verify_proof
+    from .painted_adoption_geometry import verify_proof, received_source_rows
 
     binding = preparation[PREPARATION_KEY]
     verify_version_summary(binding, preparation.get("map_version"))
@@ -482,20 +482,25 @@ def _verify_preparation_publication(preparation, folder):
             _, bound = _checked_native_underlay(folder, row, fixture_source, labels)
             guarded.append(bound)
     guarded.extend(verify_proof(binding, proof, models, folder))
+    received, received_checks = received_source_rows(proof)
     # Only a NEW publication requires the original configuration to remain
     # unchanged. Historical verify_proof continues using its retained copies.
     for bound in models.values():
         model = _checked(bound, metadata=True)
         original = model["baseline_configuration"]
-        guarded.append({key: original[key] for key in ("path", "sha256", "size_bytes")})
-    # NEW RAW preparations still verify consumed originals before publication;
-    # later historical replay may use its exact retained metadata/source copies.
-    guarded.extend(row["original"] for row in
-        (proof.get("raw_shape_basis") or {}).get("source_copies", []))
+        source = {key: original[key] for key in ("path", "sha256", "size_bytes")}
+        guarded.append(received.get((source["path"], source["sha256"], source["size_bytes"]), source))
+    # Current receipted pools preserve foreign original identity without
+    # reopening foreign runtime paths or trusting newly made preparation copies.
+    for row in (proof.get("raw_shape_basis") or {}).get("source_copies", []):
+        source = row["original"]
+        guarded.append(received.get((source["path"], source["sha256"], source["size_bytes"]), source))
     if preparation.get("outside_frame_proof") is not None:
         guarded.extend(verify_outside_proof(preparation, folder, carrier, frame))
     for bound in guarded:
         _checked(bound)
+    for checked in received_checks:
+        checked.revalidate()
 
 
 def _source(current):

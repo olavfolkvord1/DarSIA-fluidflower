@@ -224,17 +224,50 @@ def make_proof(binding, model_bindings):
     return proof
 
 
+def received_source_rows(proof):
+    """Recheck CURRENT receipted sources for NEW preparation, never its own copies.
+
+    Only explicitly received bases select this route. Every lookup comes from
+    the public reader's genuine Root-bound pool and unchanged scientific checks;
+    RAW, original parent NPZ and output ownership remain physical and checked.
+    Caller must revalidate the returned readers after its last source/output IO.
+    """
+    from .painted_adoption_table import _checked
+    from .raw_shape_basis_reader import has_shape_basis, read_model_basis
+    rows, checks = {}, []
+    if 'raw_shape_basis' not in proof:
+        return rows, checks
+    for bound in proof['models'].values():
+        model = _checked(bound, metadata=True)
+        if (not has_shape_basis(model)
+                or 'received_basis' not in model['baseline_native_grid']['raw_shape_basis_authority']):
+            continue
+        checked = read_model_basis(model)
+        checked.guards.add(_identity(bound), metadata=True, copyable=True)
+        checked.revalidate()
+        for row in checked.copy_source_rows():
+            original, physical = _identity(row['original']), _identity(row['physical'])
+            key = (original['path'], original['sha256'], original['size_bytes'])
+            if any(original[name] != physical[name] for name in ('sha256', 'size_bytes')):
+                raise ValueError('Receipted source changed its exact original byte identity')
+            rows.setdefault(key, physical)
+        checks.append(checked)
+    return rows, checks
+
+
 def write_configuration_copies(folder, proof):
     """Keep actual before-Apply bytes, never rewrite an original run file."""
     from .painted_adoption_table import _checked, _read, _relative
+    received, checks = received_source_rows(proof)
     target = Path(folder) / "configuration_sources"
     target.mkdir(exist_ok=False)
     rows = {}
     for run, bound in proof["models"].items():
         model = _checked(bound, metadata=True)
         source = _identity(model["baseline_configuration"])
-        _checked(source)
-        raw = _read(source["path"], 1024 * 1024)
+        physical = received.get((source["path"], source["sha256"], source["size_bytes"]), source)
+        _checked(physical)
+        raw = _read(physical["path"], 1024 * 1024)
         destination = target / (run + ".toml")
         if not destination.resolve().is_relative_to(target.resolve()):
             raise ValueError("Configuration copy leaves its new preparation")
@@ -243,11 +276,13 @@ def write_configuration_copies(folder, proof):
         copied = _relative(folder, destination)
         if any(copied[key] != source[key] for key in ("sha256", "size_bytes")):
             raise ValueError("The preparation configuration copy differs from its actual source")
-        _checked(source)
+        _checked(physical)
         rows[run] = dict(original=source, copy=copied)
     proof["baseline_configurations"] = rows
     if "raw_shape_basis" in proof:
-        _write_basis_copies(folder, proof)
+        _write_basis_copies(folder, proof, received_sources=received)
+    for checked in checks:
+        checked.revalidate()
 
 
 def verify_proof(binding, proof, expected_models, folder):
@@ -312,7 +347,7 @@ def _basis_authority_summary(model, bound):
     return summary
 
 
-def _write_basis_copies(folder, proof):
+def _write_basis_copies(folder, proof, *, received_sources=None):
     """Exclusively retain consumed metadata/source bytes before any Apply."""
     import hashlib
     import os
@@ -320,14 +355,16 @@ def _write_basis_copies(folder, proof):
     target = Path(folder) / "raw_basis_sources"
     target.mkdir(exist_ok=False)
     copied = {}
+    received = {} if received_sources is None else received_sources
     for row in proof["raw_shape_basis"]["source_copies"]:
         original = _identity(row["original"])
         key = (original["path"], original["sha256"], original["size_bytes"])
         if key not in copied:
-            _checked(original)
+            physical = received.get(key, original)
+            _checked(physical)
             destination = target / f"{len(copied):06d}.bin"
             digest, size = hashlib.sha256(), 0
-            with Path(original["path"]).open("rb") as source, destination.open("xb") as output:
+            with Path(physical["path"]).open("rb") as source, destination.open("xb") as output:
                 for block in iter(lambda: source.read(1024 * 1024), b""):
                     output.write(block)
                     digest.update(block)
@@ -336,7 +373,7 @@ def _write_basis_copies(folder, proof):
                 os.fsync(output.fileno())
             if digest.hexdigest() != original["sha256"] or size != original["size_bytes"]:
                 raise ValueError("A RAW-basis source changed while its historical copy was written")
-            _checked(original)
+            _checked(physical)
             copied[key] = _relative(folder, destination)
         row["copy"] = deepcopy(copied[key])
 
