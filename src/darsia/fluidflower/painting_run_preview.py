@@ -97,9 +97,14 @@ def preview_layers(session, proposal, corrections, frame, *, source="map", recor
 
 def prepare_preview(session, layers, *, geometry_index, target_run, config,
                     photo_loader, source_name="Current map", display_limit=1600,
-                    measure_offsets=False):
+                    measure_offsets=False, on_progress=None, on_preview=None):
     """Apply the same measured homographies as placement, entirely in memory."""
     import cv2
+    def progress(message):
+        if on_progress is not None:
+            on_progress(message)
+
+    progress("Reading measured frame models")
     models = placement.read_run_geometry(geometry_index)
     source_run, target_run = session.run_id.casefold(), str(target_run).casefold()
     if source_run not in models or target_run not in models:
@@ -112,30 +117,47 @@ def prepare_preview(session, layers, *, geometry_index, target_run, config,
     if wf.frame_kind(config) == "rig-corrected":
         raise ValueError("The saved corrected baseline has no verified identity link to the measured native renderer. "
                          "Preview on that grid is unavailable; no raw-photo fallback was used.")
+    progress("Loading " + target_run + " photograph on its camera grid")
     photo = np.asarray(photo_loader(target_run, target))
     if photo.dtype != np.uint8 or photo.ndim != 3 or photo.shape[2] != 3:
         raise ValueError("The target photograph must be uint8 RGB")
     target_shape = photo.shape[:2]
     path = str(target.reference_image.get("path") or "")
     target = _photo_geometry(target, config, path, target_shape)
+    progress("Placing the map on " + target_run)
     placed, uncovered = placement.place_layer_map(layers, source, target, target_shape)
     roles = {row.layer_id: session.facies_of(row.layer_id).role for row in session.layers}
     measurements = {"offset_px": placement.map_offset(layers, source, target),
                     "checks": placement.run_checks(placed, uncovered, roles, set(roles))}
+    def display_result(values):
+        # Only display copies are reduced; the full native arrays below still
+        # feed the unchanged optional boundary measurements.
+        ratio = min(1., display_limit / max(target_shape))
+        size = (max(1, round(target_shape[1] * ratio)), max(1, round(target_shape[0] * ratio)))
+        shown_photo, shown_layers, shown_uncovered = photo, placed, uncovered
+        if (photo.shape[1], photo.shape[0]) != size:
+            shown_photo = cv2.resize(photo, size, interpolation=cv2.INTER_AREA)
+        if (placed.shape[1], placed.shape[0]) != size:
+            shown_layers = cv2.resize(placed, size, interpolation=cv2.INTER_NEAREST)
+            shown_uncovered = cv2.resize(uncovered.astype(np.uint8), size,
+                                        interpolation=cv2.INTER_NEAREST).astype(bool)
+        return RunPreview(target_run, shown_photo, shown_layers, shown_uncovered,
+                          str(path), source_run, source_name, values)
+
+    if measure_offsets and on_preview is not None:
+        # A shallow copy prevents adding the later measurement to an already
+        # published packet. Its nested base measurements are read-only here.
+        on_preview(display_result(dict(measurements)))
     if measure_offsets:
+        progress("Loading " + source_run + " reference photograph for boundary measurements")
         reference_photo = np.asarray(photo_loader(source_run, source))
         if reference_photo.shape != (*layers.shape, 3):
             raise ValueError("The reference photograph no longer matches the painting grid")
+        progress("Measuring boundaries on " + source_run)
         reference_offsets = placement.layer_offsets(reference_photo, layers, source, roles)
+        progress("Measuring boundaries on " + target_run)
         offsets = placement.layer_offsets(photo, placed, target, roles)
         placement.add_changes_from_reference(offsets, reference_offsets)
         measurements["layer_offsets"] = offsets
-    # Display reduction follows placement on the exact native grids.
-    ratio = min(1., display_limit / max(target_shape))
-    size = (max(1, round(target_shape[1] * ratio)), max(1, round(target_shape[0] * ratio)))
-    if (photo.shape[1], photo.shape[0]) != size:
-        photo = cv2.resize(photo, size, interpolation=cv2.INTER_AREA)
-    if (placed.shape[1], placed.shape[0]) != size:
-        placed = cv2.resize(placed, size, interpolation=cv2.INTER_NEAREST)
-        uncovered = cv2.resize(uncovered.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
-    return RunPreview(target_run, photo, placed, uncovered, str(path), source_run, source_name, measurements)
+    progress("Preview ready")
+    return display_result(measurements)

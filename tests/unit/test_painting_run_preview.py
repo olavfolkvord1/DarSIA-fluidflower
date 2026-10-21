@@ -82,6 +82,54 @@ def _prepare(index, session, layers, **kwargs):
                                    **kwargs)
 
 
+def test_early_preview_precedes_optional_reference_loading_and_preserves_exact_result(tmp_path):
+    target_h = np.array([[1., 0., 3.], [0., 1., 2.], [0., 0., 1.]])
+    index, session, _models_read, _photos = _models(tmp_path, target_matrix=target_h)
+    layers = np.full(SHAPE, 2, np.uint8)
+    baseline = _prepare(index, session, layers, display_limit=16)
+    packets, stages, calls = [], [], []
+
+    def load(run, geometry):
+        calls.append(run)
+        if run == "source":
+            assert len(packets) == 1
+            early = packets[0]
+            assert early.photo_path == str(_photos["target"])
+            assert np.array_equal(early.photo, baseline.photo)
+            assert np.array_equal(early.layers, baseline.layers)
+            assert np.array_equal(early.uncovered, baseline.uncovered)
+            assert "layer_offsets" not in early.measurements
+        return _load_photo(run, geometry)
+
+    result = _prepare(index, session, layers, display_limit=16, measure_offsets=True,
+                      photo_loader=load, on_progress=stages.append, on_preview=packets.append)
+    assert calls == ["target", "source"]
+    assert np.array_equal(result.photo, baseline.photo)
+    assert np.array_equal(result.layers, baseline.layers)
+    assert np.array_equal(result.uncovered, baseline.uncovered)
+    assert "layer_offsets" in result.measurements and "layer_offsets" not in packets[0].measurements
+    assert stages[0] == "Reading measured frame models" and stages[-1] == "Preview ready"
+    assert any("Loading target" in stage for stage in stages)
+    assert any("Measuring boundaries on source" in stage for stage in stages)
+
+
+def test_optional_boundary_failure_leaves_a_bound_early_preview(tmp_path):
+    index, session, _models_read, _photos = _models(tmp_path)
+    packets = []
+
+    def load(run, geometry):
+        if run == "source":
+            raise OSError("reference photograph unavailable")
+        return _load_photo(run, geometry)
+
+    with pytest.raises(OSError, match="reference photograph unavailable"):
+        _prepare(index, session, np.full(SHAPE, 2, np.uint8), measure_offsets=True,
+                 photo_loader=load, on_preview=packets.append)
+    assert len(packets) == 1 and packets[0].run_id == "target"
+    assert packets[0].photo_path == str(_photos["target"])
+    assert "layer_offsets" not in packets[0].measurements
+
+
 def test_projective_placement_matches_independent_pixel_landmarks_and_writes_nothing(tmp_path):
     target_h = np.array([[1, .05, 3], [.03, 1, 2], [.002, .001, 1]], dtype=float)
     index, session, _models_read, _photos = _models(tmp_path, target_matrix=target_h)

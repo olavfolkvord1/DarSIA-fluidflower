@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import time
 
 import numpy as np
-from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QShortcut
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
-                              QMessageBox, QPushButton, QStackedWidget, QTableWidget,
+                              QMessageBox, QProgressBar, QPushButton, QStackedWidget, QTableWidget,
                               QTableWidgetItem, QVBoxLayout, QWidget, QAbstractItemView)
+from shiboken6 import isValid
 
 from . import layer_painting as lp
 from . import painting_run_preview as preview
@@ -21,15 +23,19 @@ _FIRST = "placement/first_runs"
 class _PreviewWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
+    partial = Signal(object)
 
     def __init__(self, project, session, proposal, corrections, frame, options):
         super().__init__()
         self.project, self.session, self.proposal = project, session, proposal
         self.corrections, self.frame, self.options = corrections, frame, options
+        self.result, self.error = None, ""
 
     @Slot()
     def run(self):
         try:
+            self.progress.emit("Preparing the reference drawing")
             record = self.options.get("record")
             session = self.session
             if record and record.get("kind") == "drawing":
@@ -44,10 +50,14 @@ class _PreviewWorker(QObject):
             result = preview.prepare_preview(session, layers,
                 geometry_index=self.options["index"], target_run=self.options["run"],
                 config=self.options["config"], measure_offsets=True,
-                photo_loader=self.options["photo_loader"], source_name=self.options["name"])
+                photo_loader=self.options["photo_loader"], source_name=self.options["name"],
+                on_progress=self.progress.emit,
+                on_preview=lambda value: self.partial.emit((value, session)))
         except Exception as error:  # reported in the preview, no write fallback
-            self.failed.emit(f"{type(error).__name__}: {error}")
+            self.error = f"{type(error).__name__}: {error}"
+            self.failed.emit(self.error)
             return
+        self.result = result, session
         self.finished.emit((result, session))
 
 
@@ -58,6 +68,13 @@ class PaintingRunPreview(QObject):
         self.thread = None
         self.worker = None
         self._pending = False
+        self._active_key = self._waiting_key = self._result_key = None
+        self._disposed = False
+        self._started = None
+        self._stage = ""
+        self._loading_status = False
+        self._retry_attempts = 0
+        self._joining = False
         self.last_result = None
         self._index = str(QSettings(*_SETTINGS).value(_INDEX, "") or "")
         self.widget = QWidget()
@@ -84,6 +101,7 @@ class PaintingRunPreview(QObject):
         layout.addLayout(source_row)
         self.note = QLabel()
         self.note.setWordWrap(True)
+        self.note.setTextFormat(Qt.TextFormat.PlainText)
         self.note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.note)
         self.measurements = QTableWidget(0, 7)
@@ -97,6 +115,35 @@ class PaintingRunPreview(QObject):
         self.canvas = canvas_class()
         self.canvas.set_tool("pan")
         self.stack.addWidget(self.canvas)
+        self._viewport = self.canvas.viewport()
+        self.status_overlay = QWidget(self._viewport)
+        self.status_overlay.setStyleSheet("background: #252525; color: white;")
+        overlay_layout = QVBoxLayout(self.status_overlay)
+        overlay_layout.addStretch(1)
+        self.status_text = QLabel()
+        self.status_text.setWordWrap(True)
+        self.status_text.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        overlay_layout.addWidget(self.status_text)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        overlay_layout.addWidget(self.progress_bar)
+        overlay_layout.addStretch(1)
+        self.status_overlay.hide()
+        self._viewport.installEventFilter(self)
+        self._viewport.destroyed.connect(self._invalidate)
+        self.canvas.destroyed.connect(self._invalidate)
+        view.destroyed.connect(self._invalidate)
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._elapsed)
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.setInterval(250)
+        self._retry_timer.timeout.connect(self._retry_waiting)
+        if hasattr(view, "busy_changed"):
+            view.busy_changed.connect(self._parent_busy_changed)
         layout.addWidget(self.stack, 1)
         self.runs.currentIndexChanged.connect(self._selected)
         self.sources.currentIndexChanged.connect(self._source_changed)
@@ -116,6 +163,89 @@ class PaintingRunPreview(QObject):
 
     def busy(self):
         return self.thread is not None
+
+    def _alive(self):
+        return (not self._disposed and isValid(self) and isValid(self.view)
+                and isValid(self.canvas) and isValid(self._viewport) and isValid(self.widget))
+
+    def _invalidate(self, *_args):
+        self._disposed = True
+        self._waiting_key = None
+
+    def _key(self):
+        session = self.view.session
+        source, record = self.sources.currentData() or ("map", None)
+        version = None if record is None else (record.get("folder"), record.get("sha256"), record.get("kind"))
+        return (id(self.view.project), id(session), getattr(session, "run_id", ""),
+                getattr(session, "image_path", ""), tuple(getattr(session, "image_size", ()) or ()),
+                getattr(session, "image_stamp", ""), getattr(session, "updated_utc", ""),
+                id(getattr(self.view, "proposal", None)), str(self.runs.currentData() or "").casefold(),
+                self._index, source, version)
+
+    def _accepts_result(self):
+        return (self._alive() and not self.is_reference() and self._active_key == self._key()
+                and not self._pending)
+
+    def _status(self, message, *, loading=False):
+        if not self._alive():
+            return
+        self._stage = str(message)
+        self._loading_status = loading
+        self.progress_bar.setVisible(loading)
+        self._elapsed(force=True)
+        shown = self.last_result is not None and self._result_key == self._key()
+        self.status_overlay.setGeometry(self._viewport.rect())
+        self.status_overlay.setVisible(not shown and not self.is_reference())
+        self.status_overlay.raise_()
+        if loading:
+            self._elapsed_timer.start()
+        else:
+            self._elapsed_timer.stop()
+
+    def _elapsed(self, *, force=False):
+        if not self._alive():
+            if isValid(self._elapsed_timer):
+                self._elapsed_timer.stop()
+            return
+        if not force and not self._loading_status:
+            return
+        elapsed = "" if self._started is None else f" · {int(time.monotonic()-self._started)} s"
+        message = self._stage + elapsed
+        self.note.setText(message)
+        self.status_text.setText(message)
+
+    def _cancel_waiting(self):
+        self._waiting_key = None
+        self._retry_timer.stop()
+
+    def _parent_busy_changed(self, busy):
+        if not busy and self._alive() and self._waiting_key is not None:
+            self._retry_waiting()
+
+    def _retry_waiting(self):
+        if not self._alive():
+            if isValid(self._retry_timer):
+                self._retry_timer.stop()
+            return
+        if self.is_reference() or self._waiting_key != self._key():
+            self._cancel_waiting()
+            return
+        if self.thread is not None:
+            return
+        if not self.view.busy():
+            self._cancel_waiting()
+            self.request()
+        elif self._retry_attempts < 120:
+            self._retry_attempts += 1
+            self._retry_timer.start()
+        else:
+            self._status("The painting operation is still busy. The preview will resume when it finishes; "
+                         "Refresh preview also retries.")
+
+    def eventFilter(self, watched, event):
+        if self._alive() and watched is self._viewport and event.type() == QEvent.Type.Resize:
+            self.status_overlay.setGeometry(self._viewport.rect())
+        return False
 
     def is_reference(self):
         session = self.view.session
@@ -160,6 +290,8 @@ class PaintingRunPreview(QObject):
         self.runs.setCurrentIndex(max(0, min(self.runs.count()-1, self.runs.currentIndex()+direction)))
 
     def _selected(self, *_args):
+        if not self._alive():
+            return
         reference = self.is_reference()
         self.stack.setCurrentIndex(0 if reference else 1)
         self.view.steps_scroll.setEnabled(reference)
@@ -172,6 +304,11 @@ class PaintingRunPreview(QObject):
         self.next.setEnabled(self.runs.currentIndex() < self.runs.count()-1)
         self.refresh_button.setEnabled(not reference)
         if reference:
+            self._cancel_waiting()
+            self._pending = False
+            self._elapsed_timer.stop()
+            self._loading_status = False
+            self.status_overlay.hide()
             self.note.setText("Reference run: editable. Viewing other runs keeps this drawing on its own photograph.")
         else:
             self.request()
@@ -191,63 +328,113 @@ class PaintingRunPreview(QObject):
             self.request()
 
     def request(self):
-        if self.is_reference():
+        if not self._alive() or self.is_reference():
             return
+        key = self._key()
         if self.thread is not None:
-            self._pending = True
+            self._pending = key != self._active_key
+            if self._pending:
+                self._started = time.monotonic()
+                self._status("Waiting for the previous preview before loading " + str(self.runs.currentData()), loading=True)
+            else:
+                self._status(self._stage or "This preview is already loading", loading=True)
             return
+        self._started = time.monotonic()
         if self.view.busy():
-            self.note.setText("Wait for the current painting operation to finish before previewing another run.")
+            self._waiting_key = key
+            self._retry_attempts = 0
+            self._status("Waiting for the current painting operation before loading " + str(self.runs.currentData()),
+                         loading=True)
+            self._retry_timer.start()
             return
+        self._cancel_waiting()
+        self._pending = False
         self.canvas.clear_photo()
         self.last_result = None
+        self._result_key = None
         self.measurements.setRowCount(0)
         self.measurements.hide()
         if not self._index:
-            self.note.setText("Choose Frame models once to preview the map automatically in each run. No approval is needed.")
+            self._status("Choose Frame models once to preview the map automatically in each run. No approval is needed.")
             return
         session = self.view.session
         if session is None:
-            self.note.setText("Choose a reference run with a drawing first.")
+            self._status("Choose a reference run with a drawing first.")
             return
-        source, record = self.sources.currentData() or ("map", None)
-        if source == "map" and self.view._map_kind() == "manual map":
-            source = "manual"
-        options = {"run": str(self.runs.currentData()), "index": self._index,
-                   "source": source, "record": deepcopy(record), "name": self.sources.currentText(),
-                   "config": deepcopy(self.view._workspace_frame_config),
-                   "photo_loader": self.view._reference_photo_loader()}
-        worker = _PreviewWorker(self.view.project, deepcopy(session),
-                                self.view.proposal, deepcopy(self.view.corrections),
-                                deepcopy(self.view.current_frame()), options)
+        try:
+            source, record = self.sources.currentData() or ("map", None)
+            if source == "map" and self.view._map_kind() == "manual map":
+                source = "manual"
+            options = {"run": str(self.runs.currentData()), "index": self._index,
+                       "source": source, "record": deepcopy(record), "name": self.sources.currentText(),
+                       "config": deepcopy(self.view._workspace_frame_config),
+                       "photo_loader": self.view._reference_photo_loader()}
+            worker = _PreviewWorker(self.view.project, deepcopy(session),
+                                    self.view.proposal, deepcopy(self.view.corrections),
+                                    deepcopy(self.view.current_frame()), options)
+        except Exception as error:
+            self._status(f"Preview unavailable: {type(error).__name__}: {error}")
+            return
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(self._finished)
-        worker.failed.connect(self._failed)
+        worker.progress.connect(self._progress)
+        worker.partial.connect(self._partial)
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         thread.finished.connect(self._retired)
         self.thread, self.worker = thread, worker
+        self._active_key = key
         self.sources.setEnabled(False)
         self.reference_button.setEnabled(False)
-        self.note.setText("Placing the preview through this run's measured frame… Read only; no files are written.")
+        self._status("Loading " + options["run"] + " preview… Read only; no files are written.", loading=True)
         thread.start()
 
+    @Slot(str)
+    def _progress(self, message):
+        if self.worker is not None and self.sender() is self.worker and self._accepts_result():
+            self._status(message, loading=True)
+
     @Slot(object)
-    def _finished(self, value):
-        result, session = value
-        if (result.run_id != str(self.runs.currentData() or "").casefold() or self.is_reference()
-                or self.view.session is None
-                or result.source_run != self.view.session.run_id.casefold()
-                or self._pending):
+    def _partial(self, value):
+        if self.worker is not None and self.sender() is self.worker and self._accepts_result():
+            self._finished(value, partial=True)
+
+    @Slot(object)
+    def _finished(self, value, *, partial=False):
+        if not self._accepts_result():
+            return
+        try:
+            result, session = value
+            if (result.run_id != str(self.runs.currentData() or "").casefold()
+                    or result.source_run != self.view.session.run_id.casefold()):
+                raise ValueError("The preview result belongs to another selected photograph")
+            self._render_result(result, session)
+        except Exception as error:
+            self._failed(f"Could not display the preview: {type(error).__name__}: {error}")
             return
         self.last_result = result
+        self._result_key = self._active_key
+        self.status_overlay.hide()
+        if partial:
+            self._status("Photo and placed map shown; checking boundary measurements…", loading=True)
+        else:
+            self._elapsed_timer.stop()
+            self._loading_status = False
+
+    def _render_result(self, result, session):
         self.canvas.set_photo(result.photo, (result.photo.shape[1], result.photo.shape[0]),
                               token={"path": result.photo_path, "run_id": result.run_id}, reset_view=True)
         rgba = np.zeros((*result.layers.shape, 4), dtype=np.uint8)
+        style = getattr(self.view, "display_layer_styles", None)
+        if callable(style):
+            colors, hidden = style(session)
+        else:
+            colors, hidden = {layer.layer_id: QColor(layer.color) for layer in session.layers}, frozenset()
         for layer in session.layers:
-            color = QColor(layer.color)
+            if layer.layer_id in hidden:
+                continue
+            color = QColor(colors.get(layer.layer_id, layer.color))
             rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
         # A gap stays a gap, including edge-replicated pixels the source does
         # not reach. The overlay never turns those pixels into a decided layer.
@@ -265,7 +452,7 @@ class PaintingRunPreview(QObject):
             for column, value in enumerate(values):
                 self.measurements.setItem(index, column, QTableWidgetItem("—" if value is None else str(value)))
         self.measurements.resizeColumnsToContents()
-        self.measurements.show()
+        self.measurements.setVisible(bool(rows))
         shift = result.measurements.get("offset_px") or {}
         checks = result.measurements.get("checks") or {}
         self.note.setText(f"{result.run_id}: {result.source_name} from {result.source_run}, placed through the saved frame models. "
@@ -276,29 +463,56 @@ class PaintingRunPreview(QObject):
 
     @Slot(str)
     def _failed(self, message):
-        if not self.is_reference():
-            self.canvas.clear_photo()
-            self.note.setText("Preview unavailable: " + message)
+        if self._accepts_result():
+            retained = self.last_result is not None and self._result_key == self._active_key
+            self._status(("Photo and placed map retained; preview update unavailable: " if retained
+                          else "Preview unavailable: ") + message)
 
     @Slot()
     def _retired(self):
-        thread = self.thread
+        self._retire(self.sender())
+
+    def _retire(self, thread):
+        if thread is None or thread is not self.thread:
+            return
         if thread is not None:
             thread.wait()
+        worker = self.worker
+        if self._accepts_result():
+            if worker.error:
+                self._failed(worker.error)
+            elif worker.result is not None:
+                self._finished(worker.result)
+            else:
+                self._failed("The preview worker stopped without a result.")
         # Keep the worker alive until its thread has finished, then drop its
         # last owned reference here in the GUI thread (the shared worker rule).
         self.thread = self.worker = None
-        if thread is not None:
+        del worker
+        if thread is not None and isValid(thread):
             thread.deleteLater()
+        if not self._alive():
+            return
+        self._elapsed_timer.stop()
+        self._loading_status = False
         self.sources.setEnabled(True)
         self.reference_button.setEnabled(not self.is_reference() and self.set_reference is not None)
-        if self._pending:
+        if not self._joining and (self._pending or (not self.is_reference() and self._active_key != self._key())):
             self._pending = False
             self.request()
 
     def wait(self):
-        if self.thread is not None and self.thread.isRunning():
-            self.thread.wait()
+        self._cancel_waiting()
+        self._pending = False
+        self._active_key = None
+        self._elapsed_timer.stop()
+        self._loading_status = False
+        self._joining = True
+        try:
+            if self.thread is not None:
+                self._retire(self.thread)
+        finally:
+            self._joining = False
 
     def change_reference(self):
         if self.is_reference() or self.view.busy() or self.busy() or self.set_reference is None:
