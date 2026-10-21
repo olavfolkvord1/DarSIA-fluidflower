@@ -47,11 +47,13 @@ def _descriptor(value):
 
 
 def inspect_physical_context(source, native_configuration, *, reader=None):
-    """Verify supplied full reference fields and explicit geometry/scale QA.
+    """Verify full reference fields and optical geometry QA for non-mass RAW.
 
     ``source`` identifies a JSON document and the key containing its context
     binding. The existing RAW context keys and configured raster ABI are used;
     no missing mask, coordinate, area or QA flag receives a substitute.
+    Scale QA is required for mass-eligible use, not this RAW preparation.
+    Its value is preserved when supplied and omitted when absent.
     """
     reader = reader or VerifiedAssetReader()
     source = _descriptor(source)
@@ -101,12 +103,12 @@ def inspect_physical_context(source, native_configuration, *, reader=None):
         if (np.any(arrays["pixel_area_m2"][supported] <= 0)
                 or not np.isfinite(arrays["x_m"]).all() or not np.isfinite(arrays["y_m"]).all()):
             raise ValueError("Physical-context areas and nominal axes must be finite, with positive areas")
-    missing_qa = [name for name in ("optical_geometry_qa_pass", "physical_scale_qa_pass")
+    missing_qa = [name for name in ("optical_geometry_qa_pass",)
                   if binding.get(name) is not True]
     if missing_qa:
         raise ValueError("Full physical context lacks approved QA: " + ", ".join(missing_qa))
     return dict(source=source, archive=context_asset, native_shape_hw=list(shape), fields=list(fields),
-                binding={name: binding[name] for name in PHYSICAL_BINDING_KEYS})
+                binding={name: binding[name] for name in PHYSICAL_BINDING_KEYS if name in binding})
 
 
 def _verify_photometry_inputs(value, reader):

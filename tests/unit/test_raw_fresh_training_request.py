@@ -84,16 +84,40 @@ def test_missing_physical_fields_report_the_actual_gap_before_output(source, tmp
     assert not source["output_root"].exists()
 
 
-def test_full_context_requires_real_source_and_approved_scale_qa(source, tmp_path):
+def test_full_context_requires_real_source_and_approved_optical_qa(source, tmp_path):
     with pytest.raises(ValueError, match="complete SHA-bound physical-context"):
         fresh.prepare_request(**dict(source, context_source=None))
     document = json.loads(Path(source["context_source"]["path"]).read_text())
-    document["binding"]["physical_scale_qa_pass"] = False
+    document["binding"]["optical_geometry_qa_pass"] = False
     path = tmp_path / "unapproved.json"
     path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="approved QA: physical_scale_qa_pass"):
+    with pytest.raises(ValueError, match="approved QA: optical_geometry_qa_pass"):
         fresh.prepare_request(**dict(source, context_source=asset(path)))
     assert not source["output_root"].exists()
+
+
+@pytest.mark.parametrize("scale_qa", ["absent", False, None], ids=["absent", "false", "null"])
+def test_non_mass_raw_context_preserves_optional_scale_qa(source, tmp_path, scale_qa):
+    document = json.loads(Path(source["context_source"]["path"]).read_text())
+    if scale_qa == "absent":
+        document["binding"].pop("physical_scale_qa_pass")
+    else:
+        document["binding"]["physical_scale_qa_pass"] = scale_qa
+    path = tmp_path / "non_mass_context.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    request = fresh.prepare_request(**dict(source, context_source=asset(path)))
+    assert request["context_mode"] == "full" and request["execution_ready"] is False
+    assert request["deployment_allowed"] is False and request["generalization_validated"] is False
+    assert request["native_configuration"] == source["native_configuration"]
+    binding = request["physical_context"]["binding"]
+    assert binding["optical_geometry_qa_pass"] is True
+    if scale_qa == "absent":
+        assert "physical_scale_qa_pass" not in binding
+    else:
+        assert binding["physical_scale_qa_pass"] is scale_qa
+    saved = json.loads(Path(request["request_path"]).read_bytes())
+    assert saved["physical_context"]["binding"] == binding
+    assert "fresh-cohort trainer" in saved["execution_blocker"]
 
 
 def test_frozen_ids_empty_reviewers_and_changed_photometry_cannot_enter_new_cohort(source):
