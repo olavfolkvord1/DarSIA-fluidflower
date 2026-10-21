@@ -113,8 +113,9 @@ def _region_rows(config, properties, native_ids, facies_roles):
         permeability = prop.get("permeability")
         regions.append({"label_id": label_id, "facies_id": facies_id,
                         "name": str(prop.get("name") or f"Facies {facies_id}"),
-                        "analysis_role": role, "porosity": porosity,
-                        "permeability": permeability, "enabled": role != "excluded"})
+                        "analysis_role": role, "porosity": 0.0 if role == "colorchecker" else porosity,
+                        "permeability": None if role == "colorchecker" else permeability,
+                        "enabled": False if role == "colorchecker" else role != "excluded"})
     return regions
 
 

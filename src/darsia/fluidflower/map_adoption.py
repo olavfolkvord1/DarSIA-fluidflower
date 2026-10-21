@@ -209,6 +209,8 @@ def prepare_adoption(
     facies_ids: Mapping[str, int] | None = None,
     current_labels: Callable[[str], Mapping[str, Any] | None] | None = None,
     progress: Callable[[str], None] | None = None,
+    fixture_underlay: Any | None = None,
+    fixture_frame: Any | None = None,
 ) -> dict[str, Any]:
     """Write a new adoption preparation folder for every run; adopt nothing.
 
@@ -237,11 +239,23 @@ def prepare_adoption(
     layers = np.ascontiguousarray(layers, dtype=np.uint8)
     if reference.shape_hw is not None and layers.shape != reference.shape_hw:
         raise ValueError("The map is not on the reference run's grid")
+    if fixture_underlay is not None:
+        from .layer_painting_fixtures import checked_for_adoption
+        fixture_underlay = checked_for_adoption(fixture_underlay, layers, version, frame=fixture_frame)
+        frozen_roles = fixture_underlay.provenance["roles"]
+        if any(str(roles.get(int(key))) != value for key, value in frozen_roles.items()):
+            raise ValueError("The fixture underlay's frozen layer roles differ from the adoption roles")
+    elif np.isin(layers, [key for key, role in roles.items() if role == "colorchecker"]).any():
+        raise ValueError("A ColorChecker map needs its frozen version's drawn-only underlay")
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
     folder.mkdir(parents=True, exist_ok=False)
     # The map itself and its approval, bound for the Store's replay.
     np.savez_compressed(folder / "source_map.npz", array=layers)
+    if fixture_underlay is not None:
+        from .layer_painting_fixtures import save_underlay
+        source_underlay = save_underlay(folder / "source_fixture_underlay.npz", fixture_underlay)
+        source_underlay["path"] = "source_fixture_underlay.npz"
     with (folder / "approval.json").open("x", encoding="utf-8") as stream:
         json.dump(dict(version.get("approval") or {}), stream, indent=2, ensure_ascii=False)
     reference_bound = _bound(Path(reference.source))
@@ -280,8 +294,17 @@ def prepare_adoption(
             filled=filled,
             support=support,
         )
+        underlay_fields = {}
+        if fixture_underlay is not None:
+            from .layer_painting_fixtures import project_underlay, save_underlay
+            native_underlay = project_underlay(fixture_underlay, reference, target, labels)
+            bound_underlay = save_underlay(run_folder / "fixture_underlay.npz", native_underlay)
+            bound_underlay["path"] = f"{run}/fixture_underlay.npz"
+            underlay_fields = dict(fixture_underlay=bound_underlay,
+                fixture_underlay_layer_ids=[int(v) for v in np.unique(native_underlay.drawn_layers) if v])
         rows.append(
             {
+                **underlay_fields,
                 "run_id": run,
                 "status": "prepared",
                 "labels": {
@@ -333,6 +356,9 @@ def prepare_adoption(
         "blockers": blockers,
         "adopted": False,
     }
+    if fixture_underlay is not None:
+        index["source_fixture_underlay"] = source_underlay
+        index["fixture_frame"] = fixture_frame.to_dict() if fixture_frame is not None else None
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(temporary, folder / "index.json")
@@ -364,7 +390,7 @@ def facies_table(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 def label_values(preparation: Mapping[str, Any]) -> list[int]:
     """Every label value in the prepared runs' maps (0 is outside the map)."""
 
-    return sorted(
+    values = sorted(
         {
             int(value)
             for row in preparation.get("runs") or []
@@ -372,6 +398,10 @@ def label_values(preparation: Mapping[str, Any]) -> list[int]:
             for value in row.get("label_values") or []
         }
     )
+    if preparation.get("source_fixture_underlay") is not None:
+        values = sorted(set(values) | {int(value) for row in preparation.get("runs") or []
+                                      for value in row.get("fixture_underlay_layer_ids") or []})
+    return values
 
 
 def adoption_candidate(
@@ -425,17 +455,25 @@ def adoption_candidate(
         if facies_id not in table:
             raise ValueError(f"Facies id {facies_id} is not in the series' facies table")
         row = table[facies_id]
+        role = str((layers.get(value) or {}).get("role") or "excluded")
         regions.append(
             {
                 "label_id": value,
                 "facies_id": facies_id,
                 "name": row["name"],
-                "analysis_role": str((layers.get(value) or {}).get("role") or "excluded"),
-                "porosity": row["porosity"],
-                "permeability": row["permeability"],
-                "enabled": True,
+                "analysis_role": role,
+                "porosity": 0.0 if role == "colorchecker" else row["porosity"],
+                "permeability": None if role == "colorchecker" else row["permeability"],
+                "enabled": False if role == "colorchecker" else True,
             }
         )
+    if any(row["analysis_role"] == "colorchecker" for row in regions):
+        for facies_id in {row["facies_id"] for row in regions}:
+            roles = {row["analysis_role"] for row in regions if row["facies_id"] == facies_id}
+            if "colorchecker" in roles and len(roles) != 1:
+                raise ValueError("A ColorChecker and another role cannot share one facies id")
+            if preparation.get("source_fixture_underlay") is not None and len(roles) != 1:
+                raise ValueError("Different drawn roles cannot share one facies id")
     measurement = _bound(folder / "index.json")
     authority = _bound(folder / "approval.json")
     source_map = _bound(folder / "source_map.npz")
@@ -474,6 +512,19 @@ def adoption_candidate(
     config["run_geometry"] = dict(config.get("run_geometry") or {}, runs=rows)
     config["labels_path"] = str((folder / prepared[display]["labels"]["path"]).resolve())
     config["regions"] = regions
+    if preparation.get("source_fixture_underlay") is not None:
+        def bound_underlay(value):
+            return dict(value, path=str((folder / value["path"]).resolve()))
+        config["painted_fixture_underlays"] = {
+            run: dict(artifact=bound_underlay(entry["fixture_underlay"]),
+                      source=bound_underlay(preparation["source_fixture_underlay"]),
+                      preparation=measurement,
+                      layer_to_facies={str(key): int(value) for key, value in facies_ids.items()})
+            for run, entry in prepared.items()
+        }
+    else:
+        # A later ordinary map must not inherit a preceding fixture underlay.
+        config.pop("painted_fixture_underlays", None)
     config["provenance"] = {
         "origin": "approved painted map placed in every run",
         "parent_revision_id": parent["revision_id"],

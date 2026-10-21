@@ -79,12 +79,13 @@ LAYER_ROLES: dict[str, str] = {
     "porous_medium": "Porous medium",
     "free_water": "Free water",
     "excluded": "Excluded",
+    "colorchecker": "ColorChecker",
 }
 # Porosity of the roles without a porous medium: free water fills the whole
 # volume, excluded regions and the area outside the rig frame hold none. Native
 # DarSIA integrates mass with depth x porosity, and a facies without porosity
 # would make every integral over the rig NaN.
-ROLE_POROSITY: dict[str, float] = {"free_water": 1.0, "excluded": 0.0}
+ROLE_POROSITY: dict[str, float] = {"free_water": 1.0, "excluded": 0.0, "colorchecker": 0.0}
 OUTSIDE_POROSITY = 0.0
 SMOOTHING_SIGMA: dict[str, float] = {"low": 1.5, "medium": 3.0, "high": 6.0}
 PERMEABILITY_UNITS = ("darcy", "mD", "m2")
@@ -2893,7 +2894,7 @@ def painted_label_map(
                     "analysis_role": entry.role,
                     "porosity": entry.effective_porosity(),
                     "permeability": entry.permeability if porous else None,
-                    "enabled": entry.role != "excluded",
+                    "enabled": False if entry.role == "colorchecker" else entry.role != "excluded",
                 }
             )
             next_label += 1

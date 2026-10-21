@@ -78,6 +78,7 @@ class CompletedGeometry:
     edge_filled: np.ndarray
     unfilled: np.ndarray
     counts: dict
+    drawn_behind: np.ndarray | None = None
 
 
 def canvas_coordinates(shape, width_m: float, height_m: float) -> tuple[np.ndarray, np.ndarray, float]:
@@ -307,7 +308,7 @@ def replicate_edges(facies, donors, targets, x_m, y_m) -> tuple[np.ndarray, np.n
 
 def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, inner_frame: str,
                       sand_surface: str, fixture_polygons_m=None, fixture_roles=DEFAULT_FIXTURE_ROLES,
-                      raster_shift: int = RASTER_SHIFT) -> CompletedGeometry:
+                      raster_shift: int = RASTER_SHIFT, drawn_underlay: dict | None = None) -> CompletedGeometry:
     """Complete a rig-corrected facies map (N18 steps 1-3); ``roles`` maps each facies id to its role.
 
     The inputs must be declared, and a missing one raises ValueError:
@@ -347,23 +348,52 @@ def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, i
                          "for a rig without fixtures")
     polygons = fixture_masks(labels.shape, width_m, height_m, fixture_polygons_m or {}, raster_shift=raster_shift)
     fixture = roled & ~frame
-    for mask in polygons.values():
-        fixture |= mask & ~frame
+    if drawn_underlay is None:
+        for mask in polygons.values():
+            fixture |= mask & ~frame
     porous_ids = sorted(key for key, value in role.items() if value in POROUS_ROLES)
     if 0 in porous_ids and np.any(labels == 0):
         raise ValueError("Facies id 0 cannot be porous: the production depth and porosity rule skips it")
     porous = has(POROUS_ROLES) & ~fixture
     domain, counts = porous_domain(porous, fixture, water, frame, sand_surface=sand_surface)
-    for name, mask in polygons.items():
-        if not (mask & domain).any():
-            raise ValueError(f"The fixture polygon {name!r} covers no cell of the porous domain")
+    if drawn_underlay is None:
+        for name, mask in polygons.items():
+            if not (mask & domain).any():
+                raise ValueError(f"The fixture polygon {name!r} covers no cell of the porous domain")
     original = porous & domain
     x_m, y_m, _area = canvas_coordinates(labels.shape, width_m, height_m)
     hidden = fixture & domain
-    stage, fixture_filled = continue_layers(labels, original, hidden, y_m)
+    drawn_behind = None
+    seeds, known = labels, original
+    if drawn_underlay is not None:
+        footprint = np.asarray(drawn_underlay["fixture_mask"], bool)
+        drawn = np.asarray(drawn_underlay["drawn_facies"])
+        if (footprint.shape != labels.shape or drawn.shape != labels.shape
+                or drawn.dtype.kind not in "iu" or not np.array_equal(footprint, roled)):
+            raise ValueError("The drawn underlay must match this map's fixture-role grid")
+        drawn_behind = np.asarray(drawn_underlay.get("drawn_mask", drawn != 0), bool)
+        allowed = [key for key, value in role.items() if value in POROUS_ROLES | WATER_ROLES | {"excluded"}]
+        if (drawn_behind.shape != labels.shape or np.any(drawn_behind & ~footprint)
+                or np.any(drawn_behind & ~np.isin(drawn, allowed))):
+            raise ValueError("Drawn layers need an explicit non-fixture role inside the fixture")
+        drawn_porous = drawn_behind & np.isin(drawn, porous_ids)
+        # An explicit drawing wins even beyond an inferred sand surface. A
+        # drawn excluded or free-water layer stays outside the porous domain.
+        domain = (domain | drawn_porous) & ~(drawn_behind & ~drawn_porous)
+        original = porous & domain
+        hidden = fixture & domain
+        seeds = labels.copy()
+        seeds[drawn_behind] = drawn[drawn_behind]
+        known = original | drawn_porous
+    targets = hidden if drawn_behind is None else hidden & ~drawn_behind
+    stage, fixture_filled = continue_layers(seeds, known, targets, y_m)
     gaps = domain & ~original & ~hidden
-    result, edge_filled = replicate_edges(stage, original | fixture_filled, gaps, x_m, y_m)
+    if drawn_behind is not None:
+        gaps &= ~drawn_behind
+    result, edge_filled = replicate_edges(stage, known | fixture_filled, gaps, x_m, y_m)
     unfilled = domain & ~original & ~fixture_filled & ~edge_filled
+    if drawn_behind is not None:
+        unfilled &= ~drawn_behind
     by_role = {}
     for value in np.unique(labels[gaps]):
         name = role.get(int(value), UNDEFINED)
@@ -372,8 +402,11 @@ def complete_geometry(facies, roles: dict, *, width_m: float, height_m: float, i
                   fixture_filled_cells=int(fixture_filled.sum()), edge_filled_cells=int(edge_filled.sum()),
                   unfilled_cells=int(unfilled.sum()), edge_filled_cells_by_role=by_role,
                   fixture_polygons=sorted(polygons), fixture_role_cells=int((roled & domain).sum()))
-    return CompletedGeometry(np.where(domain, result, labels), domain, original, fixture_filled, edge_filled,
-                             unfilled, counts)
+    if drawn_behind is not None:
+        counts["drawn_behind_cells"] = int(drawn_behind.sum())
+    output_mask = domain if drawn_behind is None else domain | drawn_behind
+    return CompletedGeometry(np.where(output_mask, result, labels), domain, original, fixture_filled, edge_filled,
+                             unfilled, counts, drawn_behind)
 
 
 def covering_extent(width_m: float, height_m: float, resolution_mm: float) -> tuple[float, float, float, float]:
@@ -531,6 +564,20 @@ def grid_products(completed: CompletedGeometry, *, width_m: float, height_m: flo
     }
     for name in ("fixture_filled", "edge_filled", "unfilled"):
         arrays[name] = np.nan_to_num(arrays[name + "_area_fraction"]) > 0
+    if completed.drawn_behind is not None:
+        # Drawn excluded/free-water pixels lie outside the porous domain. Use
+        # the existing full-canvas cell indices so their flags and roles are
+        # retained, without admitting them to depth, porosity or pore volume.
+        full_ids = grid.probability_cell_index.ravel()
+        def drawn_area(mask):
+            return np.bincount(full_ids, weights=(cell * mask).ravel(), minlength=size)
+        drawn_ids = sorted(int(v) for v in np.unique(completed.facies[completed.drawn_behind]))
+        arrays["drawn_behind_area_fraction"] = (drawn_area(completed.drawn_behind) / (step * step)).reshape(grid.shape).astype(dtype)
+        arrays["drawn_behind"] = np.nan_to_num(arrays["drawn_behind_area_fraction"]) > 0
+        arrays["drawn_behind_facies_ids"] = np.asarray(drawn_ids, np.int32)
+        arrays["drawn_behind_facies_area_fractions"] = np.stack([
+            (drawn_area(completed.drawn_behind & (completed.facies == value)) / (step * step)).reshape(grid.shape).astype(dtype)
+            for value in drawn_ids]) if drawn_ids else np.zeros((0, *grid.shape), dtype)
     return arrays, grid.metadata()
 
 
@@ -541,13 +588,16 @@ UNITS = {"facies_majority": "facies id", "facies_majority_area_fraction": "1", "
          "edge_filled_area_fraction": "1 of the domain area", "unfilled_area_fraction": "1 of the domain area",
          "depth_outside_hull_area_fraction": "1 of the domain area", "fixture_filled": "flag",
          "edge_filled": "flag", "unfilled": "flag"}
+UNITS.update(drawn_behind="flag", drawn_behind_area_fraction="1 of the cell",
+             drawn_behind_facies_ids="facies id",
+             drawn_behind_facies_area_fractions="1 of the cell (one layer per drawn facies id, same order)")
 
 
 def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_m: float, depth_points,
                     resolution_mm: float, inner_frame: str, sand_surface: str, fixture_polygons_m=None,
                     fixture_roles=DEFAULT_FIXTURE_ROLES, permeability_unit: str | None = None,
                     depth_source: str = "", precision: str = "float32",
-                    source: dict | None = None) -> tuple[bytes, bytes, dict, list]:
+                    source: dict | None = None, drawn_underlay: dict | None = None) -> tuple[bytes, bytes, dict, list]:
     """The simulator geometry of one run (N18): the NPZ bytes, the JSON bytes, the counts and the warnings.
 
     A missing or unusable input raises ValueError with the reason, and nothing
@@ -556,9 +606,15 @@ def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_
     three depth points with positive depths, and every cell of the domain
     being filled.
     """
+    source = dict(source or {})
+    stored_underlay = source.pop("_drawn_fixture_underlay", None)
+    if drawn_underlay is None:
+        drawn_underlay = stored_underlay
+    elif stored_underlay is not None:
+        raise ValueError("Supply one explicit drawn underlay, not two competing bindings")
     completed = complete_geometry(facies, roles, width_m=width_m, height_m=height_m, inner_frame=inner_frame,
                                   sand_surface=sand_surface, fixture_polygons_m=fixture_polygons_m,
-                                  fixture_roles=fixture_roles)
+                                  fixture_roles=fixture_roles, drawn_underlay=drawn_underlay)
     counts = completed.counts
     if counts["unfilled_cells"]:
         raise ValueError(f"{counts['unfilled_cells']} cell(s) of the porous domain have no geometry: a hidden "
@@ -612,6 +668,13 @@ def export_geometry(facies, roles: dict, table: list, *, width_m: float, height_
         "depth_points": [[float(x), float(y), float(d)] for x, y, d in points],
         "source": source or {},
     }
+    if drawn_underlay is not None:
+        from ..layer_painting_fixtures import fixture_boundary_agreement
+        document["method"]["drawn_behind"] = "every explicit drawn role retained; only undrawn fixture cells continued as sand"
+        document["method"]["fixtures_declared"] = "frozen fixture-role regions; measured polygons compared only"
+        document["source"]["fixture_underlay"] = dict(drawn_underlay.get("provenance") or {})
+        document["fixture_boundary_agreement"] = fixture_boundary_agreement(
+            drawn_underlay["fixture_mask"], fixture_polygons_m, width_m=width_m, height_m=height_m)
     text = (json.dumps(document, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
     return stream.getvalue(), text, counts, warnings
 
@@ -682,6 +745,13 @@ def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict
                                   or (revision.get("artifacts") or {}).get("facies_properties_path"))
     source = {"scope": artifacts.get("scope"), "labels": PureWindowsPath(labels_path).name,
               "revision": revision.get("revision_id")}
+    if (configuration.get("painted_fixture_underlays")
+            or any((row.get("registration") or {}).get("kind") == "painted-map-placement-v1"
+                   for row in (configuration.get("run_geometry") or {}).get("runs") or [])):
+        from ..layer_painting_fixtures import adopted_underlay
+        underlay = adopted_underlay(configuration, run.casefold(), labels)
+        if underlay is not None:
+            source["_drawn_fixture_underlay"] = underlay
     return np.asarray(facies), roles, facies_table(properties, extra), source
 
 
