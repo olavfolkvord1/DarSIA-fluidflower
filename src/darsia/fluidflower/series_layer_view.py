@@ -17,8 +17,10 @@ The full geometry-and-facies page remains available as the advanced view.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,6 +96,7 @@ from PySide6.QtWidgets import (
 )
 
 from darsia.fluidflower import layer_painting as lp
+from darsia.fluidflower import layer_painting_manual as lpm
 from darsia.fluidflower.layer_painting_join import (
     JoinEdgesError, JoinPreview, join_to_neighbour,
 )
@@ -219,6 +222,34 @@ _SATURATION_TIP = (
     "only: the proposal, the session and the export always use the photograph "
     "itself."
 )
+# The manual map: the polygons exactly as drawn, without a classifier.
+_MANUAL = lpm.MANUAL_MAP_KIND
+_MAP_SHOWN_TIP = (
+    "The map drawn over the photograph and saved by 'Save version…': the proposal "
+    "with its corrections, or the manual map, which is the polygons exactly as "
+    "drawn at full resolution, without a classifier"
+)
+# Manual-map pixels inside the rig frame that no polygon covers, pixels the
+# frame-edge fill gave a layer (hatched), and where the manual map and the
+# proposal disagree (RGBA).
+_UNCOVERED_COLOR = (255, 0, 255, 230)
+_EDGE_FILL_COLOR = (255, 255, 255, 150)
+_DIFFERENCE_COLOR = (230, 25, 25, 215)
+
+
+def _any_pixel(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """A mask on a coarser grid of ``size`` (width, height), true in each cell
+    that holds a true pixel, so that thin areas stay visible."""
+
+    import cv2
+
+    width, height = int(size[0]), int(size[1])
+    if mask.shape == (height, width):
+        return mask.copy()
+    area = cv2.resize(
+        mask.astype(np.float32), (width, height), interpolation=cv2.INTER_AREA
+    )
+    return area > 0.0
 
 
 def _muted(widget: QWidget) -> QColor:
@@ -3047,18 +3078,46 @@ class _ProposalWorker(QObject):
         self.finished.emit(proposal)
 
 
-def _approved_map_layers(record, frame):
-    """The session of a saved version and its full-resolution layer ids
-    (uint8, 0 outside the map) on the reference run's photograph."""
+class _ManualMapWorker(QObject):
+    """Draw the manual map at full resolution and, when asked, the proposal's
+    map to compare it with (for display; nothing is saved)."""
 
-    session, proposal, corrections = lp.load_version(record)
-    labels, regions = lp.painted_label_map(
-        session, proposal, frame=frame, corrections=corrections
-    )
-    table = np.zeros(int(labels.max()) + 1, dtype=np.uint8)
-    for row in regions:
-        table[int(row["label_id"])] = int(row["layer_id"])
-    return session, table[labels]
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, session, image_size, frame, request) -> None:
+        super().__init__()
+        self.session = session
+        self.image_size = tuple(image_size)
+        self.frame = frame
+        self.request = dict(request)
+
+    @Slot()
+    def run(self) -> None:
+        result = {
+            key: self.request[key] for key in ("run_id", "manual_key", "compare_key")
+        }
+        try:
+            if result["manual_key"]:
+                result["manual"] = lpm.manual_map(
+                    self.session,
+                    self.image_size,
+                    frame=self.frame,
+                    progress=self.progress.emit,
+                )
+            if result["compare_key"]:
+                self.progress.emit("Drawing the proposal at full resolution to compare…")
+                result["layers"] = lpm.painted_layers(
+                    self.session,
+                    self.request["proposal"],
+                    frame=self.frame,
+                    corrections=self.request["corrections"],
+                )
+        except Exception as error:  # noqa: BLE001 - reported to the user
+            self.failed.emit(f"{type(error).__name__}: {error}")
+            return
+        self.finished.emit(result)
 
 
 class _AdoptionWorker(QObject):
@@ -3081,7 +3140,7 @@ class _AdoptionWorker(QObject):
 
         try:
             self.progress.emit("Drawing the approved map at full resolution…")
-            session, layers = _approved_map_layers(self.record, self.frame)
+            session, layers = lpm.version_layers(self.record, frame=self.frame)
             result = ma.prepare_adoption(
                 self.options["destination"],
                 layers,
@@ -3126,7 +3185,7 @@ class _PlacementWorker(QObject):
 
         try:
             self.progress.emit("Drawing the approved map at full resolution…")
-            session, layers = _approved_map_layers(self.record, self.frame)
+            session, layers = lpm.version_layers(self.record, frame=self.frame)
             roles = {
                 row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
             }
@@ -3307,6 +3366,26 @@ class LayerPainterView(QWidget):
         self.last_adoption: dict[str, Any] | None = None
         self._adoption_message: QMessageBox | None = None
         self._adoption_dialog: QDialog | None = None
+        # The manual map (the polygons as drawn, at full resolution) and the
+        # proposal's full-resolution map it is compared with, each with the
+        # key of what it was drawn from; display data, saved only as a version.
+        self._manual: lpm.ManualMap | None = None
+        self._manual_key = ""
+        self._manual_run = ""
+        self._compare_layers: np.ndarray | None = None
+        self._compare_key = ""
+        self._compare_run = ""
+        self._manual_display: dict[str, Any] | None = None
+        # The worker's progress, or why the manual map could not be drawn.
+        self._manual_message = ""
+        self._manual_thread: QThread | None = None
+        self._manual_worker: _ManualMapWorker | None = None
+        self._manual_pending = False
+        # The manual map is drawn again once the marks rest for a moment.
+        self._manual_timer = QTimer(self)
+        self._manual_timer.setSingleShot(True)
+        self._manual_timer.setInterval(500)
+        self._manual_timer.timeout.connect(self._update_manual_map)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -3602,17 +3681,20 @@ class LayerPainterView(QWidget):
         layout.addWidget(title)
         layout.addWidget(
             _note(
-                "Save the proposal, with its corrections, as a version at any "
-                "time. A saved version is never changed. Restoring one first saves "
-                "the current map as a version, so that it can be restored again. "
-                "Approve the version that is the run's map; the approval records "
-                "its SHA-256, the reviewer and the time, and changes nothing else."
+                "Save the map shown under the photograph as a version at any "
+                "time: the proposal with its corrections, or the manual map, "
+                "which is the polygons exactly as drawn. A saved version is never "
+                "changed. Restoring one first saves the current map as a version, "
+                "so that it can be restored again. Approve the version that is "
+                "the run's map; the approval records its SHA-256, the reviewer "
+                "and the time, and changes nothing else."
             )
         )
         buttons = QHBoxLayout()
         self.save_version_button = QPushButton("Save version…")
         self.save_version_button.setToolTip(
-            "Save the proposal and its corrections as a new version"
+            "Save the map shown (the proposal and its corrections, or the manual "
+            "map) as a new version"
         )
         self.save_version_button.clicked.connect(self._save_version_clicked)
         buttons.addWidget(self.save_version_button)
@@ -3959,9 +4041,41 @@ class LayerPainterView(QWidget):
         layout.addWidget(self.canvas, 1)
         layout.addLayout(display)
         layout.addLayout(photo)
+        layout.addLayout(self._build_map_choice())
+        self.manual_status = QLabel()
+        self.manual_status.setWordWrap(True)
+        self.manual_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.manual_status.hide()
+        layout.addWidget(self.manual_status)
         self.canvas_hint = _note(_CANVAS_HINT)
         layout.addWidget(self.canvas_hint)
         return column
+
+    def _build_map_choice(self) -> QHBoxLayout:
+        """Which map is shown and saved as a version, and the layer of their
+        differences."""
+
+        row = QHBoxLayout()
+        label = QLabel("Map")
+        label.setToolTip(_MAP_SHOWN_TIP)
+        row.addWidget(label)
+        self.map_shown = QComboBox()
+        self.map_shown.addItem("Proposal", "proposal")
+        self.map_shown.addItem("Manual map", _MANUAL)
+        self.map_shown.setToolTip(_MAP_SHOWN_TIP)
+        self.map_shown.currentIndexChanged.connect(self._map_shown_changed)
+        row.addWidget(self.map_shown)
+        self.show_differences = QCheckBox("Differences")
+        self.show_differences.setToolTip(
+            "Mark in red where the manual map and the proposal with its corrections "
+            "give a pixel different layers, and give their area in cm²"
+        )
+        self.show_differences.toggled.connect(self._differences_toggled)
+        row.addWidget(self.show_differences)
+        row.addStretch(1)
+        return row
 
     def _build_correction_tools(self) -> QHBoxLayout:
         """The tools that correct the proposal by hand, and their state."""
@@ -4144,6 +4258,7 @@ class LayerPainterView(QWidget):
             self._placement_thread,
             self._adoption_thread,
             dialog_thread,
+            self._manual_thread,
         ):
             try:
                 if thread is not None and thread.isRunning():
@@ -4186,7 +4301,17 @@ class LayerPainterView(QWidget):
             self._workspace_frame_config = {}
         self.rig_panel.setEnabled(workspace_frame.frame_kind(self._workspace_frame_config) == "raw")
         self._saved_corrected_boundaries = None
-        self.show_proposal.setText("Saved layer boundaries" if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected" else "Proposal")
+        # Manual maps are drawn on the raw reference photo only.
+        corrected = workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
+        if corrected and self._map_kind() == _MANUAL:
+            self.map_shown.blockSignals(True)
+            self.map_shown.setCurrentIndex(0)
+            self.map_shown.blockSignals(False)
+            self._refresh_manual_status()
+        self.map_shown.setEnabled(not corrected)
+        self.show_proposal.setText(self._overlay_text())
+        self._manual_display = None
+        self._manual_message = ""
         self._loading = True
         try:
             self.session = None
@@ -4264,6 +4389,8 @@ class LayerPainterView(QWidget):
             )
             self.step_frame.set_expanded(not frame_done)
             self.set_tool("polygon" if self.session is not None else "pan")
+            self._update_manual_map()
+            self._refresh_manual_status()
         finally:
             self._loading = False
 
@@ -4802,6 +4929,7 @@ class LayerPainterView(QWidget):
         self._export_stale = True
         if not self._loading:
             self._save_timer.start()
+        self._schedule_manual_map()
         self.changed.emit()
 
     def save_session(self) -> None:
@@ -5718,6 +5846,11 @@ class LayerPainterView(QWidget):
             return "Choose a reference run with a baseline photograph first."
         if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
             return "Saved corrected rig maps are shown; corrections need a proposal."
+        if self._map_kind() == _MANUAL:
+            return (
+                "Corrections are drawn on the proposal; show the proposal to draw "
+                "them. A manual map changes with its polygons."
+            )
         if self._corrections_error:
             return self._corrections_error
         if self.proposal is None or tuple(self.proposal.image_size) != tuple(
@@ -5819,6 +5952,7 @@ class LayerPainterView(QWidget):
         self._export_stale = True
         if not self._loading:
             self._save_timer.start()
+        self._schedule_manual_map()
         self.changed.emit()
 
     def _after_correction_change(self) -> None:
@@ -5889,6 +6023,11 @@ class LayerPainterView(QWidget):
 
         if self.busy():
             return "Wait until the proposal or export has finished."
+        if self._map_kind() == _MANUAL:
+            problem = self._manual_unavailable()
+            if not problem and not self._manual_current():
+                problem = "The manual map is being drawn; save it once it is shown."
+            return problem
         problem = self._corrections_unavailable()
         if problem:
             return problem
@@ -5908,6 +6047,8 @@ class LayerPainterView(QWidget):
             digest = str(record.get("sha256") or "")
             count = int(record.get("correction_count") or 0)
             kind = f"edited ({count})" if count else "proposal"
+            if lpm.is_manual_version(record):
+                kind = "manual map (gaps)" if record.get("uncovered_pixels") else "manual map"
             saved = str(record.get("created_utc") or "")[:16].replace("T", " ")
             approval = lp.map_approval(self.map_approvals, digest)
             approved = (
@@ -5995,6 +6136,9 @@ class LayerPainterView(QWidget):
             approval = lp.map_approval(self.map_approvals, str(record.get("sha256")))
             if approval is not None:
                 text += f" · {self._approval_text(approval)}"
+            gaps = self._version_gaps(record)
+            if gaps:
+                text += f" · {gaps}"
             self.versions_note.setText(text)
         self.restore_version_button.setEnabled(record is not None and not self.busy())
         self.approve_version_button.setEnabled(
@@ -6002,6 +6146,19 @@ class LayerPainterView(QWidget):
         )
         self.place_version_button.setEnabled(self._placeable(record))
         self.prepare_adoption_button.setEnabled(self._placeable(record))
+
+    @staticmethod
+    def _version_gaps(record: Mapping[str, Any]) -> str:
+        """Why a saved manual map cannot be approved ("" when it can, or when
+        the version is not a manual map)."""
+
+        uncovered = int(record.get("uncovered_pixels") or 0)
+        if not lpm.is_manual_version(record) or not uncovered:
+            return ""
+        return (
+            f"{uncovered:,} px inside the rig frame are covered by no polygon; cover "
+            "them, save a new version and approve that"
+        )
 
     def _placeable(self, record: Mapping[str, Any] | None) -> bool:
         """Whether a version may be placed in all runs: it is approved."""
@@ -6466,14 +6623,17 @@ class LayerPainterView(QWidget):
             self.save_version(name)
 
     def default_version_name(self) -> str:
-        """The name a version gets when none is given: "Proposal" or "Edited map"
-        with the local date and time."""
+        """The name a version gets when none is given: "Proposal", "Edited map"
+        or "Manual map" with the local date and time."""
 
         kind = "Edited map" if self.corrections else "Proposal"
+        if self._map_kind() == _MANUAL:
+            kind = "Manual map"
         return f"{kind} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
     def save_version(self, name: str = "") -> dict[str, Any] | None:
-        """Save the current map, the proposal with its corrections, as a version.
+        """Save the map shown as a version: the proposal with its corrections,
+        or the manual map with the session.
 
         An empty name gives the default name. Returns the version's record, or
         None (the note says why).
@@ -6483,21 +6643,28 @@ class LayerPainterView(QWidget):
         if problem:
             self.versions_note.setText(problem)
             return None
-        assert self.session is not None and self.proposal is not None
+        assert self.session is not None
         name = str(name).strip() or self.default_version_name()
         self.save_session()
         try:
-            record = lp.save_version(
-                self.project, self.session, self.proposal, self.corrections, name=name
-            )
+            if self._map_kind() == _MANUAL:
+                assert self._manual is not None
+                record = lpm.save_manual_version(
+                    self.project, self.session, self._manual, name=name
+                )
+            else:
+                assert self.proposal is not None
+                record = lp.save_version(
+                    self.project, self.session, self.proposal, self.corrections, name=name
+                )
         except (OSError, ValueError) as error:
             self.versions_note.setText(f"The version could not be saved: {error}")
             return None
         self.versions = self._read_versions(self.session.run_id)
         self._refresh_versions()
-        self.versions_note.setText(
-            f"Saved {record['name']} ({record['kind']}): SHA-256 {record['sha256']}"
-        )
+        text = f"Saved {record['name']} ({record['kind']}): SHA-256 {record['sha256']}"
+        gaps = self._version_gaps(record)
+        self.versions_note.setText(text + (f" · {gaps}" if gaps else ""))
         return record
 
     def _reviewer(self) -> str:
@@ -6513,6 +6680,10 @@ class LayerPainterView(QWidget):
     def _approve_version_clicked(self) -> None:
         record = self._selected_version()
         if record is None:
+            return
+        gaps = self._version_gaps(record)
+        if gaps:
+            self.versions_note.setText(f"{record.get('name')} cannot be approved: {gaps}.")
             return
         reviewer = self._reviewer()
         who = (
@@ -6541,7 +6712,11 @@ class LayerPainterView(QWidget):
             )
             return None
         try:
-            approval = lp.approve_version(record, reviewer=self._reviewer() or None)
+            reviewer = self._reviewer() or None
+            if lpm.is_manual_version(record):
+                approval = lpm.approve_manual_version(record, reviewer=reviewer)
+            else:
+                approval = lp.approve_version(record, reviewer=reviewer)
         except (OSError, ValueError, KeyError) as error:
             self.versions_note.setText(f"The version could not be approved: {error}")
             return None
@@ -6561,9 +6736,14 @@ class LayerPainterView(QWidget):
         keep = (
             "The current map is saved as a version first, so that it can be "
             "restored again."
-            if self.proposal is not None
+            if self.proposal is not None or self._map_kind() == _MANUAL
             else "The current marks have no proposal and are replaced."
         )
+        if lpm.is_manual_version(record):
+            keep += (
+                " A manual map brings back its polygons, layers and facies; the "
+                "proposal and its corrections stay as they are."
+            )
         answer = QMessageBox.question(
             self,
             "Restore version",
@@ -6582,14 +6762,28 @@ class LayerPainterView(QWidget):
 
         if self.busy() or self.session is None:
             return False
-        if self.proposal is not None and not self._corrections_error:
+        if self._map_kind() == _MANUAL:
+            # The manual map shown is kept as a version first.
+            problem = self._versions_unavailable()
+            if problem:
+                self.versions_note.setText(problem)
+                return False
+            assert self._manual is not None
+            current = lpm.manual_map_digest(self.session, self._manual)
+            if not any(row.get("sha256") == current for row in self.versions):
+                if self.save_version(f"Before restoring {record.get('name')}") is None:
+                    return False
+        elif self.proposal is not None and not self._corrections_error:
             current = lp.map_digest(self.session, self.proposal, self.corrections)
             if not any(row.get("sha256") == current for row in self.versions):
                 if self.save_version(f"Before restoring {record.get('name')}") is None:
                     return False
         self.save_session()
         try:
-            lp.restore_version(self.project, record, actor=default_actor())
+            if lpm.is_manual_version(record):
+                lpm.restore_manual_version(self.project, record, actor=default_actor())
+            else:
+                lp.restore_version(self.project, record, actor=default_actor())
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.warning(self, "Could not restore the version", str(error))
             return False
@@ -6738,6 +6932,7 @@ class LayerPainterView(QWidget):
         self._render_proposal()
         self._refresh_facies_table()
         self.step_export.set_expanded(True)
+        self._schedule_manual_map()
 
     @Slot(str)
     def _proposal_failed(self, message: str) -> None:
@@ -6762,7 +6957,46 @@ class LayerPainterView(QWidget):
         self._refresh_status()
         self.busy_changed.emit(self.busy())
 
+    def _layer_overlay(self, classes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The colours of a layer map on the display grid, and its pixels of
+        shown layers.
+
+        Each layer in its colour at the chosen opacity, the area outside the
+        rig frame dark, hidden layers transparent, and white boundaries where
+        a shown layer meets another (display only).
+        """
+
+        alpha = int(round(2.55 * self.opacity.value()))
+        table = np.zeros((256, 4), dtype=np.uint8)
+        table[lp.OUTSIDE] = (0, 0, 0, 110)
+        assert self.session is not None
+        for layer in self.session.layers:
+            color = QColor(layer.color)
+            table[layer.layer_id] = (color.red(), color.green(), color.blue(), alpha)
+        # Hidden layers are fully transparent (display only).
+        hidden = np.zeros(256, dtype=bool)
+        for layer_id in self._hidden_layers:
+            if 0 < layer_id < 256:
+                hidden[layer_id] = True
+        table[hidden] = 0
+        rgba = table[classes]
+        shown = ~hidden[classes]
+        # A boundary pixel is drawn where it touches a shown layer (or the area
+        # outside the rig frame); between hidden layers there is none.
+        boundary = np.zeros(classes.shape, dtype=bool)
+        boundary[:, 1:] |= (classes[:, 1:] != classes[:, :-1]) & (
+            shown[:, 1:] | shown[:, :-1]
+        )
+        boundary[1:, :] |= (classes[1:, :] != classes[:-1, :]) & (
+            shown[1:, :] | shown[:-1, :]
+        )
+        rgba[boundary] = (255, 255, 255, 235)
+        return rgba, shown
+
     def _render_proposal(self) -> None:
+        if self._map_kind() == _MANUAL:
+            self._render_manual_map()
+            return
         if (workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected"
                 and self._other_photo is None and self.proposal is None):
             self.canvas.set_proposal(self._saved_corrected_boundaries)
@@ -6792,30 +7026,7 @@ class LayerPainterView(QWidget):
                 (height / self.image.image_size[1], width / self.image.image_size[0]),
                 layer_ids,
             )
-        alpha = int(round(2.55 * self.opacity.value()))
-        table = np.zeros((256, 4), dtype=np.uint8)
-        table[lp.OUTSIDE] = (0, 0, 0, 110)
-        for layer in self.session.layers:
-            color = QColor(layer.color)
-            table[layer.layer_id] = (color.red(), color.green(), color.blue(), alpha)
-        # Hidden layers are fully transparent (display only).
-        hidden = np.zeros(256, dtype=bool)
-        for layer_id in self._hidden_layers:
-            if 0 < layer_id < 256:
-                hidden[layer_id] = True
-        table[hidden] = 0
-        rgba = table[classes]
-        shown = ~hidden[classes]
-        # A boundary pixel is drawn where it touches a shown layer (or the area
-        # outside the rig frame); between hidden layers there is none.
-        boundary = np.zeros(classes.shape, dtype=bool)
-        boundary[:, 1:] |= (classes[:, 1:] != classes[:, :-1]) & (
-            shown[:, 1:] | shown[:, :-1]
-        )
-        boundary[1:, :] |= (classes[1:, :] != classes[:-1, :]) & (
-            shown[1:, :] | shown[:-1, :]
-        )
-        rgba[boundary] = (255, 255, 255, 235)
+        rgba, shown = self._layer_overlay(classes)
         if self.show_uncertain.isChecked():
             uncertain = cv2.resize(
                 self.proposal.uncertain().astype(np.uint8),
@@ -6830,6 +7041,7 @@ class LayerPainterView(QWidget):
         if corrected is not None and np.any(corrected):
             inner = cv2.erode(corrected.astype(np.uint8), np.ones((3, 3), np.uint8))
             rgba[corrected & ~inner.astype(bool)] = _CORRECTED_EDGE
+        self._mark_differences(rgba)
         self.canvas.set_proposal(rgba)
         self._update_polygon_fill()
 
@@ -6845,14 +7057,16 @@ class LayerPainterView(QWidget):
             self._render_proposal()
 
     def _update_polygon_fill(self) -> None:
-        """Outlines only where the proposal already colours the layers."""
+        """Outlines only where the proposal or the manual map already colours
+        the layers."""
 
+        drawn = (
+            self._manual_display_layers() is not None
+            if self._map_kind() == _MANUAL
+            else self.proposal is not None
+        )
         self.canvas.set_polygon_fill(
-            not (
-                self.proposal is not None
-                and self.show_proposal.isChecked()
-                and self._other_photo is None
-            )
+            not (drawn and self.show_proposal.isChecked() and self._other_photo is None)
         )
 
     def _enhance_toggled(self, _checked: bool) -> None:
@@ -6867,6 +7081,341 @@ class LayerPainterView(QWidget):
             self._show_reference(reset_view=False)
         self._brush_changed(self.brush_size.value())
         self._refresh_status()
+        self._schedule_manual_map()
+
+    # ---------------------------------------------------------- manual map
+
+    def _map_kind(self) -> str:
+        """The map shown and saved as a version: the proposal or the manual map."""
+
+        box = getattr(self, "map_shown", None)
+        return str(box.currentData() or "proposal") if box is not None else "proposal"
+
+    def _overlay_text(self) -> str:
+        """The name of the map drawn over the photograph."""
+
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            return "Saved layer boundaries"
+        return "Manual map" if self._map_kind() == _MANUAL else "Proposal"
+
+    def _manual_unavailable(self) -> str:
+        """Why no manual map can be drawn now ("" when one can)."""
+
+        if self.session is None or self.image is None:
+            return "Choose a reference run with a baseline photograph first."
+        if workspace_frame.frame_kind(self._workspace_frame_config) == "rig-corrected":
+            return "A manual map is drawn on the raw reference photograph."
+        return ""
+
+    def _manual_wanted(self) -> bool:
+        """Whether the manual map is shown or compared with the proposal."""
+
+        box = getattr(self, "show_differences", None)
+        compared = box is not None and box.isChecked()
+        return (self._map_kind() == _MANUAL or compared) and not self._manual_unavailable()
+
+    def _manual_inputs_key(self) -> str:
+        """SHA-256 of what the manual map is drawn from: the polygons, the
+        edge fill, the photograph's size and the rig frame ("" without them)."""
+
+        if self._manual_unavailable():
+            return ""
+        assert self.session is not None and self.image is not None
+        frame = self.current_frame()
+        payload = [
+            self.session.to_dict().get("polygons"),
+            self.session.edge_fill_mm,
+            list(self.image.image_size),
+            frame.to_dict() if frame is not None else None,
+        ]
+        text = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _compare_inputs_key(self) -> str:
+        """SHA-256 of what the proposal's map to compare with is drawn from
+        ("" when the differences are not shown or there is no proposal)."""
+
+        if (
+            not self.show_differences.isChecked()
+            or self._manual_unavailable()
+            or self.proposal is None
+            or self._corrections_error
+        ):
+            return ""
+        assert self.session is not None and self.image is not None
+        if tuple(self.proposal.image_size) != tuple(self.image.image_size):
+            return ""
+        frame = self.current_frame()
+        payload = [
+            lp.map_digest(self.session, self.proposal, self.corrections),
+            list(self.image.image_size),
+            frame.to_dict() if frame is not None else None,
+        ]
+        text = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _manual_current(self) -> bool:
+        """Whether the manual map drawn is that of the polygons shown now."""
+
+        return (
+            self._manual is not None
+            and self.session is not None
+            and self._manual_run == self.session.run_id
+            and bool(self._manual_key)
+            and self._manual_key == self._manual_inputs_key()
+        )
+
+    def _schedule_manual_map(self) -> None:
+        """Draw the manual map again once the marks, the proposal or the frame
+        rest for a moment, when it is shown or compared."""
+
+        timer = getattr(self, "_manual_timer", None)
+        if timer is not None and not self._loading and self._manual_wanted():
+            timer.start()
+
+    def _update_manual_map(self) -> bool:
+        """Start drawing the manual map, and the proposal's map it is compared
+        with, in a worker when either is out of date. True when one started."""
+
+        self._manual_timer.stop()
+        if self._manual_thread is not None:
+            self._manual_pending = True  # Drawn again when this one is done.
+            return False
+        if not self._manual_wanted():
+            self._refresh_manual_status()
+            return False
+        assert self.session is not None and self.image is not None
+        manual_key = self._manual_inputs_key()
+        compare_key = self._compare_inputs_key()
+        compared = bool(compare_key) and not (
+            compare_key == self._compare_key and self._compare_run == self.session.run_id
+        )
+        request = {
+            "run_id": self.session.run_id,
+            "manual_key": "" if self._manual_current() else manual_key,
+            "compare_key": compare_key if compared else "",
+            "proposal": self.proposal if compared else None,
+            "corrections": deepcopy(self.corrections) if compared else [],
+        }
+        if not request["manual_key"] and not request["compare_key"]:
+            self._refresh_manual_status()
+            return False
+        thread = QThread(self)
+        worker = _ManualMapWorker(
+            # Copies: the marks and the frame stay editable while it draws.
+            deepcopy(self.session),
+            self.image.image_size,
+            deepcopy(self.current_frame()),
+            request,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._manual_progress)
+        worker.finished.connect(self._manual_map_ready)
+        worker.failed.connect(self._manual_map_failed)
+        # Direct: quit from the worker thread, so that wait() in the GUI
+        # thread cannot block a queued quit.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(self._manual_thread_finished)
+        self._manual_thread, self._manual_worker = thread, worker
+        self._manual_message = (
+            "Drawing the manual map…" if request["manual_key"] else "Comparing with the proposal…"
+        )
+        thread.start()
+        self._refresh_manual_status()
+        return True
+
+    def _manual_progress(self, message: str) -> None:
+        """Show the worker's progress under the photograph."""
+
+        self._manual_message = message
+        self._refresh_manual_status()
+
+    def _manual_map_ready(self, result: object) -> None:
+        """Keep what the worker drew, in the GUI thread, and show it."""
+
+        drawn = dict(result)  # type: ignore[call-overload]
+        if "manual" in drawn:
+            self._manual = drawn["manual"]
+            self._manual_key = drawn["manual_key"]
+            self._manual_run = drawn["run_id"]
+        if "layers" in drawn:
+            self._compare_layers = drawn["layers"]
+            self._compare_key = drawn["compare_key"]
+            self._compare_run = drawn["run_id"]
+        self._manual_display = None
+        self._manual_message = ""
+        self._render_proposal()
+        self._refresh_versions()
+        self._refresh_manual_status()
+
+    def _manual_map_failed(self, message: str) -> None:
+        """Say why the manual map could not be drawn."""
+
+        self._manual_message = f"The manual map could not be drawn: {message}"
+        self._refresh_manual_status()
+
+    def _manual_thread_finished(self) -> None:
+        """Drop the finished worker and its thread here, in the GUI thread, and
+        draw again if the marks changed meanwhile."""
+
+        thread = self._manual_thread
+        self._manual_thread = None
+        self._manual_worker = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._manual_pending:
+            self._manual_pending = False
+            self._update_manual_map()
+        self._refresh_versions()
+        self._refresh_manual_status()
+
+    def _manual_display_layers(self) -> dict[str, Any] | None:
+        """The manual map of the run shown, and its differences from the
+        proposal, on the display grid (None when there is none to show).
+
+        Kept until either map changes; thin areas stay visible.
+        """
+
+        manual = self._manual
+        if (
+            manual is None
+            or self.image is None
+            or self.session is None
+            or self._manual_run != self.session.run_id
+            or tuple(manual.image_size) != tuple(self.image.image_size)
+        ):
+            return None
+        import cv2
+
+        height, width = self.image.display.shape[:2]
+        layers = self._compare_layers if self._compare_run == self._manual_run else None
+        key = (id(manual), id(layers), height, width)
+        if self._manual_display is not None and self._manual_display["key"] == key:
+            return self._manual_display
+        display: dict[str, Any] = {
+            "key": key,
+            "classes": cv2.resize(
+                manual.classes, (width, height), interpolation=cv2.INTER_NEAREST
+            ),
+            "uncovered": _any_pixel(manual.uncovered(), (width, height)),
+            "edge": _any_pixel(manual.edge_filled, (width, height)),
+            "uncovered_pixels": manual.uncovered_pixels(),
+            "edge_filled_pixels": manual.edge_filled_pixels(),
+            "differences": None,
+            "difference_pixels": None,
+        }
+        if layers is not None and layers.shape == manual.classes.shape:
+            differ = lpm.manual_map_differences(manual, layers)
+            display["differences"] = _any_pixel(differ, (width, height))
+            display["difference_pixels"] = int(np.count_nonzero(differ))
+        self._manual_display = display
+        return display
+
+    def _render_manual_map(self) -> None:
+        """Show the manual map: its layers, the pixels no polygon covers in
+        magenta and the frame-edge fill hatched (display only)."""
+
+        display = self._manual_display_layers()
+        if display is None or self._other_photo is not None:
+            self.canvas.set_proposal(None)
+            self._update_polygon_fill()
+            return
+        rgba, shown = self._layer_overlay(display["classes"])
+        rows, cols = np.indices(display["classes"].shape)
+        hatch = ((rows + cols) // 3) % 2 == 0
+        rgba[display["edge"] & hatch & shown] = _EDGE_FILL_COLOR
+        rgba[display["uncovered"]] = _UNCOVERED_COLOR
+        self._mark_differences(rgba)
+        self.canvas.set_proposal(rgba)
+        self._update_polygon_fill()
+
+    def _mark_differences(self, rgba: np.ndarray) -> None:
+        """Mark in red where the manual map and the proposal disagree, when
+        the differences are shown and both maps are drawn."""
+
+        if not self.show_differences.isChecked() or self.proposal is None:
+            return
+        display = self._manual_display_layers()
+        if display is None or display["differences"] is None:
+            return
+        if display["differences"].shape == rgba.shape[:2]:
+            rgba[display["differences"]] = _DIFFERENCE_COLOR
+
+    def _map_shown_changed(self, _index: int) -> None:
+        """Show the other map; the manual map is drawn when it is out of date."""
+
+        self.show_proposal.setText(self._overlay_text())
+        if not self.show_proposal.isChecked():
+            self.show_proposal.setChecked(True)
+        self._update_manual_map()
+        self._render_proposal()
+        self._refresh_corrections()
+        self._refresh_versions()
+        self._refresh_manual_status()
+
+    def _differences_toggled(self, _checked: bool) -> None:
+        """Show or hide where the manual map and the proposal disagree."""
+
+        self._update_manual_map()
+        self._render_proposal()
+        self._refresh_manual_status()
+
+    def _refresh_manual_status(self) -> None:
+        """Say under the photograph what the manual map covers and how much it
+        differs from the proposal."""
+
+        label = getattr(self, "manual_status", None)
+        if label is None:
+            return
+        if not (self._map_kind() == _MANUAL or self.show_differences.isChecked()):
+            label.hide()
+            label.setText("")
+            return
+        label.show()
+        problem = self._manual_unavailable()
+        if problem:
+            label.setText(problem)
+            return
+        assert self.session is not None and self.image is not None
+        parts = [self._manual_message] if self._manual_message else []
+        display = self._manual_display_layers()
+        frame = self.current_frame()
+        area = lpm.pixel_area_cm2(frame, self.image.image_size)
+        scale = "" if lp.frame_pixels_per_metre(frame) else " at a nominal scale"
+        if display is not None:
+            uncovered = display["uncovered_pixels"]
+            if uncovered:
+                parts.append(
+                    f"Manual map: {uncovered:,} px inside the rig frame "
+                    f"({uncovered * area:.1f} cm²{scale}) are covered by no polygon "
+                    "(magenta). A version of it can be saved, but approved only "
+                    "when polygons cover them."
+                )
+            else:
+                parts.append("Manual map: every pixel inside the rig frame has a layer.")
+            filled = display["edge_filled_pixels"]
+            if filled:
+                parts.append(
+                    f"The {self._manual.edge_fill_mm:g} mm edge fill gives {filled:,} px "
+                    "along the frame edge the nearest polygon's layer (hatched)."
+                )
+            if self.session.strokes:
+                parts.append(
+                    f"The {len(self.session.strokes)} stroke(s) are not part of it; "
+                    "strokes guide the proposal only."
+                )
+        if self.show_differences.isChecked():
+            if self.proposal is None:
+                parts.append("There is no proposal to compare it with.")
+            elif display is not None and display["difference_pixels"] is not None:
+                pixels = display["difference_pixels"]
+                parts.append(
+                    f"It and the proposal disagree on {pixels * area:.1f} cm²{scale} "
+                    f"({pixels:,} px, red)."
+                )
+        label.setText(" ".join(parts))
 
     # ------------------------------------------------------------ facies
 
