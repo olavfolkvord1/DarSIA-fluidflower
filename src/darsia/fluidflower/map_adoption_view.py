@@ -102,6 +102,9 @@ class _SaveRevisionWorker(QObject):
 class AdoptionDialog(QDialog):
     """The facies table of a prepared map, its check and its explicit save."""
 
+    operation_retired = Signal(str)
+    confirmation_decided = Signal(bool)
+
     def __init__(
         self,
         project: Any,
@@ -109,6 +112,7 @@ class AdoptionDialog(QDialog):
         *,
         actor: str,
         parent: QWidget | None = None,
+        automatic_only: bool = False,
     ) -> None:
         """Show the preparation table, validation result and explicit revision-save controls."""
         super().__init__(parent)
@@ -120,6 +124,8 @@ class AdoptionDialog(QDialog):
         self.preparation = ma.read_preparation(self.folder)
         self.current = GeometryRevisionStore(project).current()
         self.automatic = "painting_facies" in self.preparation
+        if automatic_only and not self.automatic:
+            raise ValueError("This action requires an approved-painting preparation; manual facies remapping is not a fallback")
         if self.automatic:
             binding = self.preparation["painting_facies"]
             snapshot = binding.get("facies_snapshot") if isinstance(binding, dict) else None
@@ -136,6 +142,8 @@ class AdoptionDialog(QDialog):
         self.revision: dict[str, Any] | None = None
         self._thread: QThread | None = None
         self._worker: _SaveRevisionWorker | None = None
+        self._operation = None
+        self._waiting_for_workers = False
         self.setWindowTitle("Adopt the prepared map")
         self.resize(900, 640)
         layout = QVBoxLayout(self)
@@ -298,6 +306,7 @@ class AdoptionDialog(QDialog):
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         thread.finished.connect(self._thread_finished)
+        self._operation = "check" if isinstance(worker, _CheckWorker) else "save"
         self._thread, self._worker = thread, worker
         self._update_buttons()
         self.status.setText(message)
@@ -318,7 +327,9 @@ class AdoptionDialog(QDialog):
             "current revision stays in the history. Run configurations do not change until "
             "Apply geometry to Setup." + frame_note,
         )
-        if answer == QMessageBox.StandardButton.Yes:
+        accepted = answer == QMessageBox.StandardButton.Yes
+        self.confirmation_decided.emit(accepted)
+        if accepted:
             self.save()
 
     def save(self) -> bool:
@@ -352,15 +363,32 @@ class AdoptionDialog(QDialog):
     def _failed(self, message: str) -> None:
         self.status.setText(f"The revision was not saved: {message}")
 
-    def _thread_finished(self) -> None:
-        thread = self._thread
-        if thread is not None:
-            # After wait() the worker is freed here, in the GUI thread.
-            thread.wait()
-        self._thread = self._worker = None
-        if thread is not None:
-            thread.deleteLater()
+    @Slot()
+    def _thread_finished(self, expected=None) -> None:
+        """Retire only the matching native thread before allowing a continuation."""
+        if expected is None and isinstance(self.sender(), QThread):
+            expected = self.sender()
+        if self._thread is None or expected is not None and self._thread is not expected:
+            return
+        thread, worker, operation = self._thread, self._worker, self._operation
+        thread.wait()
+        self._thread = self._worker = self._operation = None
+        del worker
+        thread.deleteLater()
         self._update_buttons()
+        if not self._waiting_for_workers:
+            self.operation_retired.emit(operation)
+
+    def wait_for_workers(self) -> None:
+        """Naturally retire an owned worker without opening another operation."""
+        self._waiting_for_workers = True
+        try:
+            if self._thread is not None:
+                thread = self._thread
+                thread.wait()
+                self._thread_finished(thread)
+        finally:
+            self._waiting_for_workers = False
 
     def reject(self) -> None:
         if self._thread is None:

@@ -98,8 +98,9 @@ def test_review_chooser_preselects_latest_transfer_of_selected_approved_version_
     assert isinstance(view._placement_dialog, MapPlacementDialog)
     assert view._placement_dialog.folder == chosen
     assert view._placement_dialog.isVisible()
-    assert not view.adopt_button.isEnabled()
-    assert "RAW basis" in view.use_map_reasons[view.adopt_button].text()
+    assert view.adopt_button.isEnabled()
+    assert view._adoption_thread is None  # Reviewing metadata never starts adoption.
+    assert not view.apply_build_button.isEnabled()
     assert _files(root) == before
     view._placement_dialog.close()
 

@@ -48,16 +48,21 @@ def test_version_actions_are_below_list_and_only_one_adopt_action_is_visible(vie
 
 
 def test_adopt_and_old_check_entry_never_open_a_picker_or_legacy_facies_dialog(view, qtbot, monkeypatch):
+    assert view.adoption_controller.available
+    assert view._series_adopt_action == view.adoption_controller.start
     record = _saved_manual(view, qtbot)
     assert view.approve_version(record) is not None
     def forbidden(*args, **kwargs):
         raise AssertionError("Step 5 must not ask for a path or open the legacy adoption dialog")
     monkeypatch.setattr(QFileDialog, "getOpenFileName", forbidden)
     monkeypatch.setattr(view, "open_adoption", forbidden)
+    def missing_geometry():
+        raise ValueError("The series has no measured frame models.")
+    monkeypatch.setattr(view.run_preview, "geometry_selection", missing_geometry)
     view._adopt_clicked()
     view._prepare_adoption_clicked()
-    assert not view.adopt_button.isEnabled()
-    assert "RAW basis and the automatic adoption backend" in view.use_map_progress.text()
+    assert view.adopt_button.isEnabled()
+    assert "The series has no measured frame models" in view.use_map_progress.text()
     assert view._adoption_thread is None and view._save_thread is None
 
 

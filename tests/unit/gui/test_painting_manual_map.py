@@ -148,9 +148,7 @@ def test_a_manual_map_is_drawn_saved_and_approved_without_a_proposal(view, qtbot
     assert approval is not None and approval["kind"] == "manual map"
     assert view.versions_table.item(0, 5).text().startswith("Approved ")
     view.versions_table.selectRow(0)
-    assert view.place_version_button.isEnabled()
-    assert not view.prepare_adoption_button.isEnabled()
-    assert "RAW basis and the automatic adoption backend" in view.use_map_reasons[view.adopt_button].text()
+    assert view.place_version_button.isEnabled() and view.prepare_adoption_button.isEnabled()
     # Back to the proposal: the corrections tools wait for one again.
     view.map_shown.setCurrentIndex(view.map_shown.findText("Proposal"))
     assert view.show_proposal.text() == "Proposal" and not view.manual_status.isVisibleTo(view)

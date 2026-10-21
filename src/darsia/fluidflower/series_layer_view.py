@@ -3616,6 +3616,10 @@ class LayerPainterView(QWidget):
         if application is not None:
             application.aboutToQuit.connect(self.wait_for_workers)
             application.focusChanged.connect(self._refresh_analysis_box_undo)
+        from .painting_series_adoption_ui import SeriesAdoptionController
+        self.adoption_controller = SeriesAdoptionController(self)
+        self._series_adopt_action = (self.adoption_controller.start
+            if self.adoption_controller.available else None)
         self.reload()
 
     # ------------------------------------------------------------ layout
@@ -4569,6 +4573,9 @@ class LayerPainterView(QWidget):
         previous = self._waiting_for_workers
         self._waiting_for_workers = True
         try:
+            adoption = getattr(self, "adoption_controller", None)
+            if adoption is not None:
+                adoption.wait_for_workers()
             for controller in (self.analysis_boxes, self.measured_edges, self.other_frames,
                                getattr(self, "fixture_preview", None)):
                 if controller is not None:
@@ -7769,8 +7776,8 @@ class LayerPainterView(QWidget):
     def _adopt_clicked(self) -> None:
         """Use one automatic check/adopt route and its latest literal preparation.
 
-        The separately reviewed backend installs this action. The older manual
-        facies-ID dialog is not a fallback for the series-map button.
+        The controller uses the existing preparation, checks and final human
+        question. The manual facies-ID dialog is not a fallback for this button.
         """
         record = self._selected_version()
         if self._series_adopt_action is None:
@@ -7890,6 +7897,9 @@ class LayerPainterView(QWidget):
         ) + f"\n\nFolder: {self.last_adoption['folder']}"
         self.use_map_progress.setText(f"{text} {self.last_adoption['folder']}")
         self.series_use_status.invalidate()
+        controller = getattr(self, "adoption_controller", None)
+        if controller is not None and controller.prepared(self.last_adoption):
+            return
         message = QMessageBox(self)
         message.setWindowTitle("Adoption prepared")
         message.setText(detail)
@@ -7901,6 +7911,9 @@ class LayerPainterView(QWidget):
         """Say why the adoption was not prepared."""
 
         self.use_map_progress.setText(f"The adoption was not prepared: {message}")
+        controller = getattr(self, "adoption_controller", None)
+        if controller is not None:
+            controller.failed(message)
 
     def _adoption_thread_finished(self) -> None:
         """Drop the finished worker and its thread here, in the GUI thread."""
@@ -7914,6 +7927,9 @@ class LayerPainterView(QWidget):
             thread.deleteLater()
         self._refresh_versions()
         self.busy_changed.emit(self.busy())
+        controller = getattr(self, "adoption_controller", None)
+        if controller is not None:
+            controller.preparation_retired()
 
     def _placement_failed(self, message: str) -> None:
         """Say why the map was not placed."""

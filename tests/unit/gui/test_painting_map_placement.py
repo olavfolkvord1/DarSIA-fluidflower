@@ -222,8 +222,8 @@ def test_prepare_adoption_refuses_unbound_source_grids_and_adopts_nothing(view, 
     assert not view.prepare_adoption_button.isEnabled()
     view.approve_version(record)
     view.versions_table.selectRow(0)
-    assert not view.prepare_adoption_button.isEnabled()
-    assert "RAW basis" in view.use_map_reasons[view.adopt_button].text()
+    assert view.prepare_adoption_button.isEnabled()
+    assert view.use_map_reasons[view.adopt_button].text() == ""
     index = _index(tmp_path / "geometry")
     # Each run's label grid: its camera grid without the top 5 rows.
     for run in ("ac52", "ac53"):

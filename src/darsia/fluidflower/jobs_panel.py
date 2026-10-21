@@ -432,6 +432,7 @@ class NewAnalysisPage(QWidget):
         self.facts_reader = facts_reader
         self.form = StartAnalysisChoices((), self)
         self.created_root = None
+        self._pending_action = None
         self.facts = self.facts_error = None
         self._facts_key = None
         self._facts_thread = self._facts_worker = None
@@ -530,6 +531,10 @@ class NewAnalysisPage(QWidget):
         self.form.changed.connect(self._choices_changed)
         self.computed_combo.currentIndexChanged.connect(self._show_facts)
         panel.job_created.connect(self._job_created)
+        panel.job_creation_failed.connect(self._creation_failed)
+        panel.local_worker_launch_requested.connect(self._start_requested)
+        panel.remote_worker_launch_requested.connect(self._start_requested)
+        panel.error_reported.connect(self._action_failed)
         self._show_facts()
 
     def set_context(self, *, method_text=""):
@@ -557,6 +562,7 @@ class NewAnalysisPage(QWidget):
     def reset(self):
         """Forget the job created here, for another series."""
         self.created_root = None
+        self._pending_action = None
         self.action_label.setText("No job files created on this page yet.")
         self.sync_actions()
 
@@ -699,6 +705,7 @@ class NewAnalysisPage(QWidget):
         """Create job files with the page's choices; no worker starts."""
         if not self.create_button.isEnabled():
             return
+        self._pending_action = "create"
         self.action_label.setText("Creating job files… No worker is started.")
         self.panel.create_job(**self.form.choices())
         self.sync_actions()
@@ -706,6 +713,9 @@ class NewAnalysisPage(QWidget):
     @Slot(object)
     def _job_created(self, registration):
         """Remember the job created here, so Start can follow."""
+        if self._pending_action != "create":
+            return
+        self._pending_action = None
         self.created_root = (registration or {}).get("root")
         self.action_label.setText(
             f"Job files created: {self.created_root}. Choose the machine, backend and workers, then Start."
@@ -716,8 +726,44 @@ class NewAnalysisPage(QWidget):
         """Start the created job on the chosen machine, as Jobs does."""
         if not self.start_button.isEnabled():
             return
+        self._pending_action = "start"
+        self.action_label.setText("Requesting start…")
         self.panel.start_selected_machine()
+        if self._pending_action == "start":
+            self._pending_action = None
+            self.action_label.setText(
+                "Start was not requested. " + self.panel.start_button.toolTip()
+            )
+        self.sync_actions()
+
+    @Slot(object)
+    def _start_requested(self, record):
+        """Confirm only a start requested from this page."""
+        if self._pending_action != "start":
+            return
+        self._pending_action = None
         self.action_label.setText("Start requested. Follow the progress on Jobs.")
+        self.sync_actions()
+
+    @Slot(str)
+    def _action_failed(self, text):
+        """Replace only a pending start with its synchronous reported failure."""
+        if self._pending_action != "start":
+            return
+        self._show_action_failure("Start request failed. ", text)
+
+    @Slot(str)
+    def _creation_failed(self, text):
+        """Show a failure reported by the active creator only."""
+        if self._pending_action != "create":
+            return
+        self._show_action_failure("Job file creation failed. ", text)
+
+    def _show_action_failure(self, prefix, text):
+        """Retire pending feedback and show the final nonempty error line."""
+        self._pending_action = None
+        detail = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        self.action_label.setText(prefix + detail)
         self.sync_actions()
 
     def can_close(self):
@@ -989,6 +1035,7 @@ class JobsPanel(QWidget):
     """All automatic work is bounded metadata reading from explicit registrations."""
 
     job_created = Signal(object)
+    job_creation_failed = Signal(str)
     machine_registered = Signal(object)
     local_worker_launch_requested = Signal(object)
     remote_worker_launch_requested = Signal(object)
@@ -2529,7 +2576,10 @@ class JobsPanel(QWidget):
 
     @Slot(str)
     def _error(self, text):
+        source = self.sender()
         self.error_text.setPlainText(text)
+        if self._create_worker is not None and source is self._create_worker:
+            self.job_creation_failed.emit(text)
         self.error_reported.emit(text)
 
     def can_close(self):
