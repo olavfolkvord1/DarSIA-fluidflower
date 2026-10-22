@@ -76,6 +76,7 @@ from .job_launch_state import (
 )
 
 CONTROL_BOUNDARY = "Pause and stop exit after the current committed frame. Requested control is not proof of worker retirement or completed results; outputs and the original claim are preserved."
+SETUP_CONTROL_BOUNDARY = "Pause and stop exit at the next operation checkpoint. Requested control is not proof of worker retirement or completed results; outputs and the original claim are preserved."
 CONTROL_LEASE = "Waiting for the existing claim lease to expire (up to 10 minutes)"
 REMOTE_GAP = "Remote start needs explicit existing SSH/checkout/interpreter facts and a confirmed PowerShell SSH default shell. Registration never contacts or installs a machine."
 
@@ -2083,6 +2084,8 @@ class JobsPanel(QWidget):
         self._launch_records.append(deepcopy(record))
         self.local_worker_launch_requested.emit(deepcopy(record))
         self.progress_label.setText(
+            "Local worker launch requested. Only subsequent verified operation completions count as progress."
+            if self._is_setup_job(self.current) else
             "Local worker launch requested. Only subsequent actual frame publications count as progress."
         )
         self.refresh()
@@ -2381,9 +2384,12 @@ class JobsPanel(QWidget):
         self.start_button.setEnabled(enabled)
         self.start_button.setToolTip(
             reason
-            or "Explicit start of the existing whole-run worker; frame publications alone show progress."
+            or ("Explicit start of the existing whole-run worker; verified operation completions alone show progress."
+                if self._is_setup_job(job) else
+                "Explicit start of the existing whole-run worker; frame publications alone show progress.")
         )
-        self.control_note.setText(CONTROL_BOUNDARY + " " + (reason or REMOTE_GAP))
+        boundary = SETUP_CONTROL_BOUNDARY if self._is_setup_job(job) else CONTROL_BOUNDARY
+        self.control_note.setText(boundary + " " + (reason or REMOTE_GAP))
         self._show_control_state()
         self._sync_new_analysis()
 
@@ -2439,6 +2445,10 @@ class JobsPanel(QWidget):
         return ""
 
     def _show_control_state(self):
+        setup = self._is_setup_job(self.current)
+        boundary = SETUP_CONTROL_BOUNDARY if setup else CONTROL_BOUNDARY
+        self.pause_button.setText("Pause job at next operation checkpoint" if setup else "Pause job after current frame")
+        self.stop_button.setText("Stop job at next operation checkpoint" if setup else "Stop job after current frame")
         control = (self.current or {}).get("control") or {}
         if not control.get("available"):
             self.control_state_label.setText(
@@ -2494,7 +2504,7 @@ class JobsPanel(QWidget):
             reason = self._control_reason(action)
             button.setEnabled(not reason)
             button.setToolTip(
-                reason or (CONTROL_LEASE if action == "run" else CONTROL_BOUNDARY)
+                reason or (CONTROL_LEASE if action == "run" else boundary)
             )
 
     def pause_job(self):
@@ -2627,6 +2637,8 @@ class JobsPanel(QWidget):
         self._launch_records.append(deepcopy(record))
         self.remote_worker_launch_requested.emit(deepcopy(record))
         self.progress_label.setText(
+            "SSH transport launch requested. Worker startup and operation progress are not inferred from transport startup."
+            if self._is_setup_job(self.current) else
             "SSH transport launch requested. Worker startup and frame progress are not inferred from transport startup."
         )
         self.refresh()

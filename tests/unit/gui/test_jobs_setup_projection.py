@@ -1,7 +1,13 @@
 """Typed Setup operation labels beside unchanged image-job presentation."""
 from copy import deepcopy
+from pathlib import Path
 
+import pytest
+
+from darsia.fluidflower import jobs_panel as ui
+from darsia.fluidflower import remote_worker_launch as remote
 from darsia.fluidflower.jobs_panel import JobsPanel
+from .test_new_analysis_action_feedback import _job, _put
 
 
 def _image(root):
@@ -78,3 +84,69 @@ def test_mixed_and_image_only_job_views_preserve_image_progress(qtbot, tmp_path)
     _ready(panel, [image])
     assert panel.job_table.horizontalHeaderItem(3).text() == "Frames"
     assert panel.can_close()
+
+
+@pytest.mark.parametrize("job_kind", ["image", "setup"])
+@pytest.mark.parametrize("transport", ["local", "ssh"])
+def test_selected_pipeline_controls_and_launch_feedback_use_its_progress_unit(
+    qtbot, tmp_path, monkeypatch, job_kind, transport
+):
+    """Switch job kinds and request a fake transport without claiming progress."""
+    image = _image(_job(tmp_path / "image-job"))
+    setup = _setup(_job(tmp_path / "setup-job"))
+    snapshots = [image, setup]
+    for snapshot in snapshots:
+        root = Path(snapshot["root"])
+        snapshot["control"] = dict(available=True, master_machine="fixture",
+            state=dict(action="run", sequence=0, command=None))
+        if transport == "ssh":
+            record = dict(machine="remote-fixture", ssh_alias="fixture",
+                python=r"C:\fixture\python.exe", checkout=r"C:\fixture\checkout",
+                ssh_executable=r"C:\fixture\ssh.exe", default_shell="windows-powershell",
+                job=ui.descriptor(root / "job.json"))
+            record["source"] = _put(root / "ui" / "machines" / "registered.json", record)
+            snapshot["registered_machines"] = [record]
+    monkeypatch.setattr(remote, "require_unc", lambda path: None)
+    launches = []
+
+    def launcher(root, **choices):
+        launches.append((root, choices))
+        return dict(job_root=root, transport_started=True, numerical_progress_claimed=False)
+
+    by_root = {snapshot["root"]: snapshot for snapshot in snapshots}
+    panel = JobsPanel(local_machine="fixture", local_launcher=launcher,
+        remote_launcher=launcher, reader=lambda row: deepcopy(by_root[row["root"]]))
+    qtbot.addWidget(panel, before_close_func=lambda value: qtbot.waitUntil(value.can_close, timeout=10000))
+    panel.registrations = [dict(root=snapshot["root"]) for snapshot in snapshots]
+    _ready(panel, snapshots)
+    for index in (0, 1, 0):
+        panel.job_table.selectRow(index)
+        expected_boundary = ui.SETUP_CONTROL_BOUNDARY if index else ui.CONTROL_BOUNDARY
+        assert panel.pause_button.isEnabled() and panel.stop_button.isEnabled()
+        assert panel.pause_button.text() == (
+            "Pause job at next operation checkpoint" if index else "Pause job after current frame")
+        assert panel.stop_button.text() == (
+            "Stop job at next operation checkpoint" if index else "Stop job after current frame")
+        assert panel.pause_button.toolTip() == panel.stop_button.toolTip() == expected_boundary
+        assert panel.control_note.text().startswith(expected_boundary)
+        assert ("verified operation completions" if index else "frame publications") in panel.start_button.toolTip()
+    panel.job_table.selectRow(1 if job_kind == "setup" else 0)
+    if transport == "ssh":
+        panel.target_combo.setCurrentIndex(1)
+    assert panel.start_button.isEnabled() and not launches
+    panel.start_button.click()
+    assert len(launches) == 1 and launches[0][0] == panel.current["root"]
+    if transport == "local":
+        expected = ("Local worker launch requested. Only subsequent verified operation completions count as progress."
+            if job_kind == "setup" else
+            "Local worker launch requested. Only subsequent actual frame publications count as progress.")
+    else:
+        expected = ("SSH transport launch requested. Worker startup and operation progress are not inferred from transport startup."
+            if job_kind == "setup" else
+            "SSH transport launch requested. Worker startup and frame progress are not inferred from transport startup.")
+    assert panel.progress_label.text() == expected
+    qtbot.waitUntil(panel.can_close, timeout=10000)
+    if job_kind == "setup":
+        assert panel.current["completed_operations"] == 1
+    else:
+        assert panel.current["committed"] == 1

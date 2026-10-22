@@ -6911,7 +6911,7 @@ body.space-pan .frame-shell { cursor:grab; }
         <input id="annotationLineWidth" type="range" min="0.5" max="2" step="0.25" value="1" aria-label="Annotation line width">
         <output id="annotationLineWidthValue" for="annotationLineWidth">1.00 px</output>
       </label>
-      <button id="undoBox" class="command" type="button">Undo</button>
+      <button id="undoBox" class="command" type="button">Undo latest annotation</button>
       <span id="annotationSummary" class="annotation-summary">0 annotations</span>
     </div>
     <div id="annotationCategoryHelp" class="annotation-category-help" aria-live="polite"></div>
@@ -7334,6 +7334,9 @@ function annotationShapeLabel(item){if(item.shape==='point')return`Pixel (${item
 function updateAnnotationEditor(){const item=annotationById(selectedAnnotationId),editor=byId('annotationEditor');editor.classList.toggle('visible',Boolean(item));if(!item)return;byId('annotationLabel').textContent=`Candidate ${item.candidate} | ${annotationElapsed(item)} | ${annotationShapeLabel(item)}`;byId('selectedAnnotationCategory').value=item.category;byId('selectedAnnotationPhase').value=item.phase||'unspecified';byId('selectedAnnotationSeverity').value=item.severity||'major';byId('selectedAnnotationConfidence').value=item.confidence||'unspecified';byId('annotationComment').value=item.comment||'';}
 function renderAnnotationList(){const root=byId('annotationList');root.innerHTML='';if(!annotations.length){const empty=document.createElement('div');empty.className='annotation-item-meta';empty.textContent='No annotations';root.appendChild(empty);return;}const ordered=[...annotations].sort((left,right)=>left.frame_index-right.frame_index||left.candidate.localeCompare(right.candidate));for(const item of ordered){const row=document.createElement('div');row.className=`annotation-item ${item.id===selectedAnnotationId?'selected':''}`;row.tabIndex=0;row.setAttribute('role','button');const text=document.createElement('div');text.className='annotation-item-main';const title=document.createElement('div');title.textContent=`${item.candidate} | ${annotationElapsed(item)} | ${CATEGORY_LABELS[item.category]||item.category}`;const meta=document.createElement('div');meta.className='annotation-item-meta';meta.textContent=`${annotationShapeLabel(item)} | ${PHASE_LABELS[item.phase]||item.phase} | ${SEVERITY_LABELS[item.severity]||item.severity} | confidence ${CONFIDENCE_LABELS[item.confidence]||item.confidence}`;text.append(title,meta);const remove=document.createElement('button');remove.type='button';remove.className='annotation-delete';remove.title='Delete this annotation';remove.setAttribute('aria-label','Delete this annotation');remove.textContent='×';remove.onclick=event=>{event.stopPropagation();removeAnnotation(item.id);};row.onclick=()=>selectAnnotation(item.id);row.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectAnnotation(item.id);}};row.append(text,remove);root.appendChild(row);}}
 function renderAnnotations(){
+  const undo=byId('undoBox');
+  undo.disabled=annotations.length===0;
+  undo.title=undo.disabled?'No annotations to undo':'Remove the most recently added annotation';
   byId('comparison').classList.toggle('shared-phase-quiz',Boolean(currentPhaseQuizProposal()));
   const referenceMode=Boolean(currentPair&&byId('reference').checked&&currentPair.reference_ready);
   for(const side of ['A','B']){
