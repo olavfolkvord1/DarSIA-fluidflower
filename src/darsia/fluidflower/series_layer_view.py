@@ -7599,6 +7599,7 @@ class LayerPainterView(QWidget):
             selection = self.run_preview.geometry_selection()
         except ValueError as error:
             self.versions_note.setText(str(error))
+            self.use_map_progress.setText(str(error))
             return
         path = selection.index_path
         settings = QSettings(*_BACKGROUND_SETTINGS)
@@ -7664,6 +7665,7 @@ class LayerPainterView(QWidget):
                 selected = capture_frame_model_selection(self.project, override_path=str(geometry_index))
             except ValueError as error:
                 self.versions_note.setText(str(error))
+                self.use_map_progress.setText(str(error))
                 return False
         approval = self._approval_for_version(record)
         thread = QThread(self)
