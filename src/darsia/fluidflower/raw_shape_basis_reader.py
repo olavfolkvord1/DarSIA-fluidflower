@@ -726,6 +726,13 @@ def read_shape_basis(certificate, *, run_id, authority, parent_workspace,
         if parent_configuration_lineage is None:
             labels, compatibility = _parent_grid(pins, document, parent_workspace, run_id)
         else:
+            from .raw_shape_basis_copy import _physical_lineage_inputs
+            retained_aliases = dict(pins.aliases)
+            _physical_lineage_inputs(pins, document, parent_workspace, run_id, request,
+                                     parent_configuration_lineage)
+            # Keep the retained copies guarded separately from the live loader files.
+            for key in retained_aliases.keys() - pins.aliases.keys():
+                pins.add(retained_aliases[key][1], copyable=False)
             labels, compatibility = _parent_grid(
                 pins, document, parent_workspace, run_id, request=request,
                 parent_configuration_lineage=parent_configuration_lineage)

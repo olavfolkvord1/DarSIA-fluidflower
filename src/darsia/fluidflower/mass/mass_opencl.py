@@ -307,6 +307,12 @@ class OptionalN1:
                 if candidate_ns < best:
                     best_entry, best = entry, candidate_ns
             except _ProofMismatch:
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass  # Cleanup cannot replace the original pixel mismatch.
+                    session = None
                 raise
             except Exception as error:
                 candidate["fallback"] = type(error).__name__

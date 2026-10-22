@@ -269,6 +269,59 @@ def test_common_proof_cannot_hide_initial_probe_pixel_mismatch(device_runtime, m
         math.selected_n1_fields(prepared, **values)
 
 
+def test_probe_mismatch_survives_candidate_cleanup_failure(device_runtime, monkeypatch):
+    """A second device cleanup error cannot turn a proof mismatch into CPU fallback."""
+    from darsia.fluidflower.pipeline import run_io
+    session_type, sessions = device_runtime
+    session_type.mismatch = True
+    closed = []
+    original_close = session_type.close
+
+    def failing_close(self):
+        """Record the original close attempt before simulating a queue failure."""
+        closed.append(self)
+        original_close(self)
+        raise RuntimeError("device cleanup unavailable")
+
+    monkeypatch.setattr(session_type, "close", failing_close)
+    monkeypatch.setattr(run_io, "current_binding", lambda: SimpleNamespace(
+        opencl_compare_cpu=True, opencl_proof_released=True))
+    prepared, values = operands()
+    math = PixelMath("float32")
+    math.configure_opencl(control())
+    with pytest.raises(backend._ProofMismatch, match="pixels differ"):
+        math.selected_n1_fields(prepared, **values)
+    assert closed == sessions and len(sessions) == 1 and sessions[0].closed
+    facts = math.facts()["opencl_n1"]
+    assert facts["comparison_failures"] == 1 and facts["accelerated_calls"] == 0
+    assert facts["used"] is False and "fallback" not in facts
+
+
+def test_candidate_cleanup_failure_without_mismatch_keeps_cpu(device_runtime, monkeypatch):
+    """A cleanup-only runtime error still returns the original CPU fields."""
+    session_type, sessions = device_runtime
+    closed = []
+    original_close = session_type.close
+
+    def failing_close(self):
+        """Record the original close attempt before simulating a queue failure."""
+        closed.append(self)
+        original_close(self)
+        raise RuntimeError("device cleanup unavailable")
+
+    monkeypatch.setattr(session_type, "close", failing_close)
+    prepared, values = operands()
+    expected = PixelMath("float32").selected_n1_fields(prepared, **values)
+    math = PixelMath("float32")
+    math.configure_opencl(control())
+    identical(expected, math.selected_n1_fields(prepared, **values))
+    identical(expected, math.selected_n1_fields(prepared, **values))
+    assert closed == sessions and len(sessions) == 1 and sessions[0].closed
+    facts = math.facts()["opencl_n1"]
+    assert facts["fallback"] == "RuntimeError" and facts["comparison_failures"] == 0
+    assert facts["selected_device"] is None and facts["used"] is False
+
+
 def test_undeclared_control_keeps_cpu_facts_without_reading_policy(monkeypatch):
     from darsia.fluidflower.pipeline import run_io
     monkeypatch.setattr(run_io, "current_binding", lambda: pytest.fail("Undeclared control reads no policy"))
