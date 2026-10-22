@@ -80,6 +80,9 @@ class StoreSettingsDialog(QDialog):
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText('Load the existing map, or choose New and enter [machine] and [stores.<series>] with actual locations.')
         layout.addWidget(self.editor, 1)
+        self.validation_label = _label()
+        self.validation_label.hide()
+        layout.addWidget(self.validation_label)
         self.status = _label("Nothing loaded. No filesystem check or write has run.")
         layout.addWidget(self.status)
         self.preview = QPlainTextEdit()
@@ -103,13 +106,23 @@ class StoreSettingsDialog(QDialog):
         self.roots_button.setEnabled(idle and self.series_root is not None)
         self.editor.setReadOnly(not idle)
         valid = False
+        validation = ""
         if self._loaded:
             try:
                 parse_store_map(self.editor.toPlainText().encode("utf-8"))
                 valid = True
-            except (ValueError, TypeError, KeyError):
-                pass
+            except (ValueError, TypeError, KeyError) as error:
+                validation = "Cannot save local settings: " + str(error)
+        self.validation_label.setText(validation)
+        self.validation_label.setVisible(bool(validation))
         self.save_button.setEnabled(idle and valid)
+        if not idle:
+            reason = "Wait for the current local metadata operation to finish before saving."
+        elif not self._loaded:
+            reason = "Load existing stores.toml or choose New local store map before saving."
+        else:
+            reason = validation or "Save the validated local settings."
+        self.save_button.setToolTip(reason)
 
     def _start(self, callback, done):
         if self._thread is not None:

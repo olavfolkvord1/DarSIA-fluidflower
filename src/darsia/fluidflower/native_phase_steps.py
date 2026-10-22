@@ -852,10 +852,32 @@ class NativePhaseSteps(QWidget):
         ):
             return self.method_use(selection)
 
-    def can_close(self):
-        """Report whether the storage dialog has finished its filesystem work."""
+    def close_block_reason(self):
+        """Retain owned processes until their original finished cleanup returns."""
+        if getattr(self.studio, "training_process", None) is not None:
+            return (
+                "Training is still running or finishing. Wait for it to finish, or use "
+                f"{self.studio.stop_button.text()} and wait for cleanup before closing."
+            )
+        if getattr(self.studio, "validation_process", None) is not None:
+            return "Phase-model preparation or metadata lookup is still finishing; close after it returns."
         dialog = getattr(self, "_layout_dialog", None)
-        return dialog is None or dialog.can_close()
+        if dialog is not None and not dialog.can_close():
+            return "Phase-model file preview or copying is still finishing; close after it returns."
+        return ""
+
+    def can_close(self):
+        """Report whether owned process and filesystem work has retired."""
+        return not self.close_block_reason()
+
+    def closeEvent(self, event):
+        reason = self.close_block_reason()
+        if reason:
+            self.studio.status.setText(reason)
+            self.studio.review_status.setText(reason)
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _organise_phase_files(self):
         """Open the explicit file preview for the selected workspace."""

@@ -2197,7 +2197,12 @@ class NativeFluidFlowerMainWindow(MainWindow):
         steps = getattr(page, "native_steps", None)
         can_close = getattr(steps, "can_close", None)
         if callable(can_close) and not can_close():
-            self.print_log("Phase-model file preview or copying is still finishing; close after it returns.")
+            reason = getattr(steps, "close_block_reason", None)
+            self.print_log((reason() if callable(reason) else "") or
+                "Phase-model file preview or copying is still finishing; close after it returns.")
+            log_dock = getattr(self, "log_dock", None)
+            if log_dock is not None:
+                log_dock.show()
             event.ignore()
             return
         jobs = getattr(self, "jobs_workspace", None)
