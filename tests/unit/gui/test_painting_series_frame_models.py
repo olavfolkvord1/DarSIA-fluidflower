@@ -72,7 +72,11 @@ def context(qtbot, tmp_path, monkeypatch, request):
     (series / "series.toml").write_text('schema_version = 1\nseries_id = "private_series"\n'
         '[paths]\ncommon_config = "config/common.toml"\n[runs]\nids = ["run_a", "run_b"]\n'
         '[runs.config_files]\nrun_a = "config/first.toml"\nrun_b = "config/second.toml"\n', encoding="utf8")
-    (series / "config/common.toml").write_text("# Private drawing fixture\n", encoding="utf8")
+    (series / "config/common.toml").write_text(
+        '[rig]\nwidth = 0.159\nheight = 0.119\n'
+        '[corrections.curvature.crop]\n'
+        'top_left = [0.0, 0.0]\nbottom_left = [119.0, 0.0]\n'
+        'bottom_right = [119.0, 159.0]\ntop_right = [0.0, 159.0]\n', encoding="utf8")
     project = _Project(tmp_path / "project", series)
     folder = project.root / "display-models"
     folder.mkdir(parents=True)
@@ -119,6 +123,9 @@ def context(qtbot, tmp_path, monkeypatch, request):
     monkeypatch.setattr(frame_models, "verify_frame_model_selection", observed_verify)
     if getattr(preview_ui, "verify_frame_model_selection", None) is original_verify:
         monkeypatch.setattr(preview_ui, "verify_frame_model_selection", observed_verify)
+    # New placement policy freezes the real private project/config authority;
+    # no in-memory-only frame or real USER/project file is substituted.
+    (project.root / "series.json").write_text(json.dumps(project.manifest), encoding="utf8")
     view = layer_ui.LayerPainterView(project, lambda: references["run_a"],
                                     run_inputs=lambda: list(references.values()))
     qtbot.addWidget(view)

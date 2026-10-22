@@ -185,12 +185,19 @@ class AnalysisPreparationDialog(QDialog):
         self._run(lambda: adopt_prepared_plan(source, source.with_name("execution.adopted.toml"),
             expected_sha256=bound["sha256"], actor=actor.strip(), reason=reason.strip()), adopting=True)
 
+    def can_close(self):
+        """Keep the original preparation/adoption callback alive until retirement."""
+        return self._thread is None
+
     def closeEvent(self, event):
-        if self._thread is not None:
+        if not self.can_close():
+            self.status.setText("Plan preparation or adoption is still finishing; close after it returns.")
             event.ignore()
             return
         super().closeEvent(event)
 
     def reject(self):
-        if self._thread is None:
+        if self.can_close():
             super().reject()
+        else:
+            self.status.setText("Plan preparation or adoption is still finishing; close after it returns.")

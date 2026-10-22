@@ -7,6 +7,7 @@ profile metadata; they make no RAW-rendering qualification claim.
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import threading
 
 import numpy as np
@@ -19,6 +20,7 @@ from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import layer_painting_manual as manual
 from darsia.fluidflower import painting_drawing_coverage as coverage
 from darsia.fluidflower import painting_other_frames_ui as guides
+from darsia.fluidflower import painting_photo_continuation as continuation
 from darsia.fluidflower import painting_preview_frame_domain as domain
 from darsia.fluidflower import painting_run_preview as preview_core
 from darsia.fluidflower.series_geometry import RigFrame
@@ -115,9 +117,48 @@ def test_live_placement_carries_outer_drawing_but_never_claims_pixels_beyond_sou
     assert value["projected_frame_native_xy"][0] == [25., 5.]
     rgba = next(array for array in reversed(captured) if array is not None)
     assert rgba[35, 10, 3] > 0, "Explicit outer context remains visible"
-    assert result.uncovered[35, 1] and rgba[35, 1, 3] == 0, "Replicated source-edge labels are not actual coverage"
-    assert "outside the reference photo cannot be covered" in preview.note.text()
-    assert "gap statistics keep the placed reference-frame domain" in preview.note.text()
+    continued = result.measurements[continuation.KEY]
+    # The configured target's own frame spans the complete 160 x 120 photo.
+    # N373 permits separate geometric continuation there, while the unchanged
+    # original source-photo coverage still records that this pixel was filled.
+    assert continued["display_inside"][35, 1] and continued["display_continued"][35, 1]
+    assert result.uncovered[35, 1], "Continuation must not rewrite original source-photo provenance"
+    assert np.array_equal(rgba[35, 1], [0, 220, 255, 150])
+    assert "Target own frame" in preview.note.text()
+    assert "original filled/support provenance is retained" in preview.note.text()
+    assert "placed-reference-frame diagnostic is unchanged" in preview.note.text()
+    _unchanged(context, before)
+
+
+@pytest.mark.parametrize("source_kind", ["manual", "drawing"])
+def test_live_continuation_stays_hidden_outside_explicit_saved_target_own_frame(context, qtbot, monkeypatch, source_kind):
+    """A saved target frame excludes replicated pixels but keeps real context."""
+    view = _prepare(context, qtbot)
+    target = _frame(context, "run_b", left=20., right=159., top=0., bottom=119.)
+    target.width_m, target.height_m = .139, .119
+    link = context.project.manifest["tools"]["native_series"]
+    link.setdefault("rig_frames", {})["run_b"] = target.to_dict()
+    (context.project.root / "series.json").write_text(json.dumps(context.project.manifest), encoding="utf8")
+    if source_kind == "drawing":
+        source = view.run_preview.sources
+        source.setCurrentIndex(next(i for i in range(source.count())
+            if source.itemData(i) == ("drawing", None)))
+    before = _before(context)
+    captured = []
+    original = view.run_preview.canvas.set_proposal
+    def observe(rgba):
+        captured.append(None if rgba is None else rgba.copy())
+        return original(rgba)
+    monkeypatch.setattr(view.run_preview.canvas, "set_proposal", observe)
+    preview = _other(context, qtbot)
+    result = preview.last_result
+    continued = result.measurements[continuation.KEY]
+    rgba = next(array for array in reversed(captured) if array is not None)
+    assert continued["authority"] == "saved rig frame"
+    assert not continued["display_inside"][35, 1] and not continued["display_continued"][35, 1]
+    assert result.uncovered[35, 1] and rgba[35, 1, 3] == 0
+    assert not continued["display_inside"][35, 10] and not result.uncovered[35, 10]
+    assert result.layers[35, 10] == 3 and rgba[35, 10, 3] > 0, "The exact explicit outer polygon remains visible"
     _unchanged(context, before)
 
 

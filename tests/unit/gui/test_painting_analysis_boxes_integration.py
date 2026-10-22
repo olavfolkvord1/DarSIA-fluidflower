@@ -65,7 +65,11 @@ def context(qtbot, tmp_path, monkeypatch, request):
         '[paths]\ncommon_config = "config/common.toml"\n[runs]\nids = ["run_a", "run_b"]\n'
         '[runs.config_files]\nrun_a = "config/runs/first.toml"\nrun_b = "config/runs/second.toml"\n', encoding="utf8")
     common = series / "config/common.toml"
-    common.write_text('[[roi]]\nname = "box1"\ncorner_1 = [0.01, 0.005]\ncorner_2 = [0.03, 0.02]\n'
+    common.write_text('[rig]\nwidth = 0.159\nheight = 0.119\n'
+                      '[corrections.curvature.crop]\n'
+                      'top_left = [0.0, 0.0]\nbottom_left = [119.0, 0.0]\n'
+                      'bottom_right = [119.0, 159.0]\ntop_right = [0.0, 159.0]\n'
+                      '[[roi]]\nname = "box1"\ncorner_1 = [0.01, 0.005]\ncorner_2 = [0.03, 0.02]\n'
                       '[[roi]]\nname = "box2"\ncorner_1 = [0.04, 0.025]\ncorner_2 = [0.06, 0.04]\n', encoding="utf8")
     project = _Project(tmp_path / "geometry-package", series)
     current = project.root / "overrides/geometry_facies/current.json"
@@ -94,6 +98,8 @@ def context(qtbot, tmp_path, monkeypatch, request):
     if getattr(request, "param", None) != "late_index":
         settings.setValue(preview_ui._INDEX, str(index))
     settings.sync()
+    # The real preview policy freezes this actual temporary project authority.
+    (project.root / "series.json").write_text(json.dumps(project.manifest), encoding="utf8")
     active = {"run": "run_a"}
     gui_thread, getter_threads = threading.get_ident(), []
     def reference():

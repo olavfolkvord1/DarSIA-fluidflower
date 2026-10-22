@@ -23,8 +23,8 @@ class PaintingVersionsActions(QObject):
         for choices in (
             (("save_drawing", "Save drawing…", self.save_drawing),
              ("load_drawing", "Load drawing…", self.load_drawing)),
-            (("rename", "Rename…", self.rename), ("note", "Note…", self.note),
-             ("withdraw", "Withdraw approval…", self.withdraw),
+            (("rename", "Rename…", self.rename), ("note", "Note…", self.note)),
+            (("withdraw", "Withdraw approval…", self.withdraw),
              ("archive", "Delete version…", self.archive),
              ("restore_deleted", "Restore deleted version…", self.restore_deleted)),
         ):

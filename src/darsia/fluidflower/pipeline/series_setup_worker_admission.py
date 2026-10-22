@@ -232,6 +232,14 @@ class SetupWorkerAdmission:
                 or not self.adapter._is_current_claim_owner(owner)):
             raise ValueError("Setup requires its original pre-import worker service and actual owner")
         self.lease = self.adapter.lease
+        first = getattr(self.lease, "first_qualification", None)
+        if first is not None:
+            if getattr(first, "setup_mode", False) is not True:
+                raise ValueError("Setup cannot borrow another finite service qualification")
+            first.require_task(self.lease, task)
+        elif getattr(self.lease, "profile", {}).get("format") == "darsia-setup-service-import-profile-v1":
+            from darsia_cache.setup_qualification import require_applicable
+            require_applicable(self.lease.profile, task, config=config)
         scope = config["output_scope"]
         self.admission = prepare_setup_admission(runtime.stores, runtime.job["series_id"], task, config,
             metadata_roots=scope["metadata_roots"], scratch_roots=scope["scratch_roots"])
@@ -305,6 +313,9 @@ class SetupWorkerAdmission:
         if self.preclaim_sink.open_writers:
             raise RuntimeError("Setup claim-control streams remain open")
         self.check()
+        first = getattr(self.lease, "first_qualification", None)
+        if first is not None:
+            first.remember_claim_locked(self.lease, claim)
         self.admission.bind(self.runtime.root, claim, self.owner)
         self.bound = True
         self.sink = SetupMetadataSink(self.admission)

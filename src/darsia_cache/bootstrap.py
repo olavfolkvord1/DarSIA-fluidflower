@@ -385,9 +385,13 @@ class ImportLease:
                 raise CachePolicyError("Finite first qualification requires the original worker/jobs entry")
             first_binding = json.loads(os.environ[REQUEST_ENV])
             first_type = FirstQualification
-            if _exact(first_binding, package_file).get("format") == "darsia-common-phase-qualification-request-v1":
+            first_format = _exact(first_binding, package_file).get("format")
+            if first_format == "darsia-common-phase-qualification-request-v1":
                 from .common_qualification import CommonQualification
                 first_type = CommonQualification
+            elif first_format == "darsia-setup-service-request-v1":
+                from .setup_qualification import PositiveSetupServiceQualification
+                first_type = PositiveSetupServiceQualification
             self.first_qualification=first_type(first_binding,
                 provider_binding=self.profile_binding,stores_source=self.source,
                 namespace=boot["namespace_admission"],read=lambda pin:_exact(pin,package_file),
@@ -410,6 +414,13 @@ class ImportLease:
         bounded = self.first_qualification is None and self.profile.get("format") == BOUND_IMPORT_PROFILE
         common = (self.first_qualification is None
                   and self.profile.get("format") == "darsia-common-phase-import-profile-v1")
+        setup = (self.first_qualification is None
+                 and self.profile.get("format") == "darsia-setup-service-import-profile-v1")
+        if setup:
+            from .setup_qualification import checked_import_context
+            self.maximum = checked_import_context(self.profile, purpose=self.purpose,
+                role_identifier=self.role_identifier, entry_kind=self.entry_kind,
+                policy=self.policy, namespace=boot["namespace_admission"])
         if common:
             from .common_qualification import checked_import_context
             self.maximum = checked_import_context(self.profile, purpose=self.purpose,
@@ -419,7 +430,7 @@ class ImportLease:
             self.maximum = checked_bound_import_context(self.profile, purpose=self.purpose,
                 role_identifier=self.role_identifier, entry_kind=self.entry_kind,
                 policy=self.policy, namespace=boot["namespace_admission"])
-        if self.first_qualification is None and not bounded and not common and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
+        if self.first_qualification is None and not bounded and not common and not setup and (self.profile.get("format")!="darsia-cache-import-profile-v1" or self.profile.get("purpose")!=self.purpose
                 or self.profile.get("role_identifier")!=self.role_identifier
                 or self.profile.get("entry_kind")!=self.entry_kind
                 or self.profile.get("writer_contract")!="cooperative-start-admission-v1"):
@@ -557,7 +568,8 @@ class ImportLease:
                     raise CachePolicyError("New exclusive UUID scope was not observed empty")
                 first_writers = (getattr(self, "first_qualification", None) is not None
                     or self.profile.get("format") in {
-                        "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1"})
+                        "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1",
+                        "darsia-setup-service-import-profile-v1"})
                 writer_directories = FIRST_WRITER_SUBDIRECTORIES if first_writers else WRITER_SUBDIRECTORIES
                 writer_keys = FIRST_WRITER_ENVIRONMENT_KEYS if first_writers else WRITER_ENVIRONMENT_KEYS
                 fresh=dict(format="darsia-fresh-exclusive-empty-service-scope-v1",
@@ -727,7 +739,8 @@ def before_darsia_import(*,package_file):
             scope_root=lease.root,parent_environment=os.environ)
         first_writers = (getattr(lease, "first_qualification", None) is not None
             or getattr(lease, "profile", {}).get("format") in {
-                "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1"})
+                "darsia-cache-volume-bound-import-profile-v1", "darsia-common-phase-import-profile-v1",
+                "darsia-setup-service-import-profile-v1"})
         if first_writers:
             environment = first_qualification_environment(environment, scope_root=lease.root)
             if q123 is not None:

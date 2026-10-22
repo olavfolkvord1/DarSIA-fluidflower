@@ -272,7 +272,7 @@ def adopted_underlay(config: Mapping, run: str, labels: np.ndarray) -> dict | No
     if run not in records:
         if records:
             raise ValueError("No bound fixture underlay exists for this run")
-        if registration.get("kind") == "painted-map-placement-v1":
+        if registration.get("kind") in {"painted-map-placement-v1", "painted-map-placement-v2"}:
             index = _bound_json(registration["measurement"])
             if index.get("source_fixture_underlay") is not None:
                 raise ValueError("The adopted revision lost its prepared fixture underlay binding")
@@ -280,7 +280,7 @@ def adopted_underlay(config: Mapping, run: str, labels: np.ndarray) -> dict | No
     bound = records[run]
     if set(bound) != {"artifact", "source", "preparation", "layer_to_facies"}:
         raise ValueError("The adopted fixture underlay has unknown or missing fields")
-    if (registration.get("kind") != "painted-map-placement-v1"
+    if (registration.get("kind") not in {"painted-map-placement-v1", "painted-map-placement-v2"}
             or registration.get("measurement") != bound["preparation"]):
         raise ValueError("The fixture underlay has no matching original painted registration")
     index = _bound_json(bound["preparation"])

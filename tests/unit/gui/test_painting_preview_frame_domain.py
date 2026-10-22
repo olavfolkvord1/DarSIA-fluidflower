@@ -18,6 +18,7 @@ from darsia.fluidflower import layer_painting as lp
 from darsia.fluidflower import map_placement as placement
 from darsia.fluidflower import painting_preview_frame_domain as domain
 from darsia.fluidflower import painting_run_preview as preview_core
+from darsia.fluidflower import painting_photo_continuation as photo_continuation
 from darsia.fluidflower.series_geometry import RigFrame
 
 from .test_painting_series_frame_models import context  # noqa: F401
@@ -248,14 +249,15 @@ def test_actual_worker_renderer_keeps_outside_transparent_and_inside_gaps_visibl
     assert value["status"] == "available", value.get("reason")
     assert worker_threads and all(number != context.gui_thread for number in worker_threads)
     assert value["inside_uncovered_pixels"] > 0 and value["inside_uncovered_cm2"] > 0.
-    assert "Inside-frame uncovered:" in preview.note.text() and "cm²" in preview.note.text()
+    assert "Target own frame" in preview.note.text() and "cm²" in preview.note.text()
+    current = result.measurements[photo_continuation.KEY]
     for layer_id in (2, 3):
         view.set_facies_visible(view.session.layer(layer_id).facies, False)
     assert preview.last_result is result and not preview.busy()
     rgba = overlays[-1]
-    assert np.all(rgba[~value["display_inside"], 3] == 0)
-    assert np.all(rgba[value["display_gaps"]] == (255, 0, 255, 95))
-    assert np.all(rgba[value["display_inside"] & ~value["display_gaps"], 3] == 0)
+    assert np.all(rgba[~current["display_inside"], 3] == 0)
+    assert np.all(rgba[current["display_gaps"]] == (255, 0, 255, 95))
+    assert np.all(rgba[current["display_inside"] & ~current["display_gaps"], 3] == 0)
     assert _files(context.series, context.project.root) == before[0]
     assert view.session.to_dict() == before[1]
     assert np.array_equal(proposal.classes, before[2]) and np.array_equal(proposal.confidence, before[3])
@@ -263,7 +265,11 @@ def test_actual_worker_renderer_keeps_outside_transparent_and_inside_gaps_visibl
     assert context.settings_path.read_bytes() == before[4]
     # Missing frame authority is descriptive failure only: retain checked
     # photo/map arrays and show its reason instead of painting a whole-photo gap.
-    unavailable = original_attach(result, view.session, None, native_inputs[-1])
+    # An old packet has no positive continuation policy. Its original missing
+    # N365 authority behavior remains independent of new-placement metadata.
+    legacy = replace(result, measurements={key: item for key, item in result.measurements.items()
+        if key != photo_continuation.KEY})
+    unavailable = original_attach(legacy, view.session, None, native_inputs[-1])
     assert unavailable.photo is result.photo and unavailable.layers is result.layers
     preview._render_result(unavailable, view.session)
     assert "Inside-frame gaps unavailable:" in preview.note.text()

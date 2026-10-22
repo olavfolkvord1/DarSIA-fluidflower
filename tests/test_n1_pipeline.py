@@ -366,3 +366,102 @@ def test_invalid_thread_request_rejected_before_outputs(threads,tmp_path):
     with pytest.raises(ValueError,match="positive integer"):
         pipeline.run_n1({"threads":threads},output,"cpu","float32")
     assert not output.exists()
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_frame_loading_only_matches_full_native_preparation(tiny_config, precision):
+    """Read real saved fields with no optical package and preserve every output."""
+    from copy import deepcopy
+    from dataclasses import fields
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    config = dict(config, geometry_fields=dict(pipeline._LEGACY_GEOMETRY_FIELDS))
+    original = N1Pipeline(config, precision=precision, pixel_math=PixelMath(precision))
+    expected = original.load_frame(config["frames"][0])
+    inputs = deepcopy(config)
+    # These genuine files need no invented bootstrap replacement. An absent
+    # descriptor must not be touched by frame loading, even in statistics-only
+    # setups whose old constructor would need saved optical models.
+    for key in ("calibration", "boxes", "bindings", "anchor", "summary"):
+        inputs.pop(key)
+    inputs["shared"].pop("optics")
+    loader = N1Pipeline(inputs, precision=precision, pixel_math=PixelMath(precision),
+                        frame_loading_only=True)
+    actual = loader.load_frame(inputs["frames"][0])
+    for field in fields(models.FrameData):
+        assert_same(getattr(expected[0], field.name), getattr(actual[0], field.name))
+    for old, new in zip(expected[1:], actual[1:]):
+        assert_same(old, new)
+    assert not hasattr(loader, "models")
+    assert not hasattr(loader, "parameters")
+    assert not hasattr(loader, "boxes")
+    assert "physical_context_verified" not in actual[0].provenance
+    assert "optical_source_contract" not in actual[0].provenance
+
+
+@pytest.mark.parametrize("entrypoint", ["_prepare_statistics", "extract_statistics", "evaluate"])
+def test_frame_loading_only_refuses_optical_statistics_and_mass(tiny_config, entrypoint):
+    """The input adapter cannot accidentally call absent/fake optical models."""
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    loader = N1Pipeline(config, precision="float32", pixel_math=PixelMath("float32"),
+        geometry_fields=pipeline._LEGACY_GEOMETRY_FIELDS, frame_loading_only=True)
+    # A bad source would fail loading if the guard were reached only afterwards.
+    with pytest.raises(ValueError, match="frame-loading-only context cannot"):
+        getattr(loader, entrypoint)({"case_id": "must-not-read"})
+
+
+@pytest.mark.parametrize("mode", [1, "yes", None])
+def test_frame_loading_only_requires_literal_boolean(tiny_config, mode):
+    """The new model-free route is an explicit positive caller choice."""
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    with pytest.raises(TypeError, match="Frame-loading-only mode must be explicit"):
+        N1Pipeline(config, precision="float32", pixel_math=PixelMath("float32"),
+            geometry_fields=pipeline._LEGACY_GEOMETRY_FIELDS, frame_loading_only=mode)
+
+
+def test_frame_loading_only_is_separate_from_optical_statistics(tiny_config):
+    """Contradictory mode declarations cannot imply optical qualification."""
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    with pytest.raises(ValueError, match="separate modes"):
+        N1Pipeline(config, precision="float32", pixel_math=PixelMath("float32"),
+            geometry_fields=pipeline._LEGACY_GEOMETRY_FIELDS,
+            frame_loading_only=True, statistics_only=True)
+
+
+def test_frame_loading_only_keeps_original_physical_source_sha_check(tiny_config):
+    """A changed measured physical field never enters the model-free adapter."""
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    physical = Path(config["shared"]["physical_reference"]["path"])
+    physical.write_bytes(physical.read_bytes() + b"changed")
+    with pytest.raises(ValueError, match="Data size differs"):
+        N1Pipeline(config, precision="float32", pixel_math=PixelMath("float32"),
+            geometry_fields=pipeline._LEGACY_GEOMETRY_FIELDS, frame_loading_only=True)
+
+
+def test_frame_loading_only_keeps_original_phase_domain_check(tiny_config):
+    """Real categorical input reading still checks the original native domain."""
+    from copy import deepcopy
+    from PIL import Image
+    from darsia.fluidflower.mass.n1_pipeline import N1Pipeline
+
+    config, _ = tiny_config
+    spec = deepcopy(config["frames"][0])
+    phase_path = Path(spec["labels"]["path"])
+    with Image.open(phase_path) as image:
+        labels = np.asarray(image).copy()
+    labels[0, 0] = 255
+    Image.fromarray(labels).save(phase_path)
+    spec["labels"] = pipeline.asset(phase_path)
+    loader = N1Pipeline(config, precision="float32", pixel_math=PixelMath("float32"),
+        geometry_fields=pipeline._LEGACY_GEOMETRY_FIELDS, frame_loading_only=True)
+    with pytest.raises(ValueError, match="Fixed labels and original rig domain disagree"):
+        loader.load_frame(spec)

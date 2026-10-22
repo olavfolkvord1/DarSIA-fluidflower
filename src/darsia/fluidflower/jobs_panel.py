@@ -437,6 +437,7 @@ class NewAnalysisPage(QWidget):
         self._facts_key = None
         self._facts_thread = self._facts_worker = None
         self._facts_pending = False
+        self._preparation_dialog = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         # The page's one scroll area; the lent resource advisor has none here.
@@ -543,10 +544,18 @@ class NewAnalysisPage(QWidget):
 
     def prepare_plan(self):
         from .analysis_preparation_ui import AnalysisPreparationDialog
+        if self._preparation_dialog is not None:
+            self._preparation_dialog.raise_()
+            self._preparation_dialog.activateWindow()
+            return
         dialog = AnalysisPreparationDialog(self.panel, self)
-        dialog.adopted.connect(self._prepared_adopted)
-        dialog.exec()
-        dialog.deleteLater()
+        self._preparation_dialog = dialog
+        try:
+            dialog.adopted.connect(self._prepared_adopted)
+            dialog.exec()
+        finally:
+            self._preparation_dialog = None
+            dialog.deleteLater()
 
     @Slot(object)
     def _prepared_adopted(self, bound):
@@ -780,8 +789,9 @@ class NewAnalysisPage(QWidget):
         self.sync_actions()
 
     def can_close(self):
-        """True once no plan read is running."""
-        return self._facts_thread is None
+        """Wait for the selected-plan read and the active preparation dialog."""
+        return self._facts_thread is None and (
+            self._preparation_dialog is None or self._preparation_dialog.can_close())
 
 
 class RegisterMachineDialog(QDialog):
@@ -2273,11 +2283,22 @@ class JobsPanel(QWidget):
         job = self.current or {}
         enabled = bool(job.get("job_facts")) and not job.get("errors")
         reason = ""
+        if not job.get("job_facts"):
+            reason = "Choose a job with readable execution metadata before starting workers. See Errors for details."
+        if job.get("errors"):
+            detail = next((line.strip() for line in reversed(str(job["errors"][0]).splitlines())
+                           if line.strip()), "")
+            if len(detail) > 240:
+                detail = detail[:237] + "..."
+            reason = "Worker start unavailable: selected job has metadata errors."
+            if detail:
+                reason += " " + detail
+            reason += " See Errors for details."
         if ((job.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"
                 and (job["job_facts"].get("execution_ready") is not True
                      or job["job_facts"].get("runtime_support") != "darsia-role-io-runtime-v1")):
             enabled = False
-            reason = job["job_facts"].get("execution_blocker") or "J3 alias-job runtime is not available"
+            reason = reason or job["job_facts"].get("execution_blocker") or "J3 alias-job runtime is not available"
         if enabled and not selected.get("local"):
             try:
                 build_remote_worker_launch(

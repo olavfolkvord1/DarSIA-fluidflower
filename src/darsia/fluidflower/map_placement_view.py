@@ -94,7 +94,7 @@ def _cells(row: Mapping[str, Any]) -> tuple[str, ...]:
         f"{shift['median_px']:.1f} / {shift['max_px']:.1f}" if shift else "",
         f"{typical:+.1f}" if typical is not None else ("none measured" if checks else ""),
         str(large) if checks else "",
-        str(checks.get("gap_pixels", "")),
+        str(checks.get("inside_gap_pixels", checks.get("gap_pixels", ""))),
         str(checks.get("water_pocket_pixels", "")),
         ", ".join(str(value) for value in unknown) or ("none" if checks else ""),
     )
@@ -207,6 +207,11 @@ class MapPlacementDialog(QDialog):
             "reference run's own offset for the same pair. Gaps: pixels inside the map that it "
             "does not cover. Water pockets: free water apart from the main free water. "
         )
+        positive_continuation = self.placement.get("format") == "darsia-fluidflower-map-placement-v2"
+        if positive_continuation:
+            note.setText(note.text() + " Known photo-edge layers continue only inside each target rig frame. "
+                         "Cyan marks continuation beyond the reference photo; filled/support flags remain separate. "
+                         "Zero or unknown edge donors remain true gaps.")
         note.setWordWrap(True)
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(note)
@@ -232,8 +237,9 @@ class MapPlacementDialog(QDialog):
                 layout.addWidget(label)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         side = QSplitter(Qt.Orientation.Vertical)
-        self.table = QTableWidget(0, len(_COLUMNS))
-        self.table.setHorizontalHeaderLabels(list(_COLUMNS))
+        columns = _COLUMNS + (("Continued beyond photo (px)",) if positive_continuation else ())
+        self.table = QTableWidget(0, len(columns))
+        self.table.setHorizontalHeaderLabels(list(columns))
         for column, tooltip in column_notes.items():
             self.table.horizontalHeaderItem(column).setToolTip(tooltip)
         self.table.verticalHeader().setVisible(False)
@@ -246,7 +252,8 @@ class MapPlacementDialog(QDialog):
         self.rows = list(self.placement.get("runs") or [])
         self.table.setRowCount(len(self.rows))
         for number, row in enumerate(self.rows):
-            for column, value in enumerate(_cells(row)):
+            cells = _cells(row) + ((str((row.get("continuation") or {}).get("continued_pixels", "")),) if positive_continuation else ())
+            for column, value in enumerate(cells):
                 item = QTableWidgetItem(value)
                 if column in column_notes:
                     item.setToolTip(column_notes[column])

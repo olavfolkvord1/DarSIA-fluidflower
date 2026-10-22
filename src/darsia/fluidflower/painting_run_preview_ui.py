@@ -18,6 +18,7 @@ from . import painting_run_preview as preview
 from . import painting_frame_models as frame_models
 from . import painting_preview_frame_domain as frame_domain
 from . import painting_drawing_coverage as drawing_coverage
+from . import painting_photo_continuation as photo_continuation
 
 _SETTINGS = ("DarSIA", "FluidFlower layer painting")
 _INDEX = "placement/geometry_index"
@@ -75,8 +76,17 @@ class _PreviewWorker(QObject):
             if live_drawing:
                 layers, added = drawing_coverage.add_explicit_outside(
                     session, self.frame, layers, drawing=source != "manual")
+            contract = None
+            if self.options.get("continue_photo_edges"):
+                from .photo_edge_continuation import build_contracts
+                run = str(self.options["run"]).casefold()
+                contract = build_contracts(self.project, self.options["index"], session.run_id,
+                    [run], [layer.layer_id for layer in session.layers])[run]
 
             def display_metadata(value):
+                if contract is not None:
+                    from .photo_edge_continuation import verify_capture
+                    verify_capture({contract["target_run"]: contract})
                 value = frame_domain.attach_frame_domain(value, session, self.frame, layers)
                 if live_drawing:
                     measurements = dict(value.measurements)
@@ -84,7 +94,7 @@ class _PreviewWorker(QObject):
                         display_only=True, explicit_outside_pixels=added,
                         stored_version_unchanged=True)
                     value = replace(value, measurements=measurements)
-                return value
+                return value if contract is None else photo_continuation.attach(value, layers, contract)
 
             def partial(value):
                 value = display_metadata(value)
@@ -462,9 +472,10 @@ class PaintingRunPreview(QObject):
             options = {"run": str(self.runs.currentData()), "index": self._index,
                        "geometry_selection": self._geometry_selection,
                        "source": source, "record": deepcopy(record), "name": self.sources.currentText(),
+                       "continue_photo_edges": True,
                        "config": deepcopy(self.view._workspace_frame_config),
                        "photo_loader": self.view._reference_photo_loader()}
-            worker = _PreviewWorker(self.view.project, deepcopy(session),
+            worker = _PreviewWorker(deepcopy(self.view.project), deepcopy(session),
                                     self.view.proposal, deepcopy(self.view.corrections),
                                     deepcopy(self.view.current_frame()), options)
         except Exception as error:
@@ -539,6 +550,7 @@ class PaintingRunPreview(QObject):
         checks = result.measurements.get("checks") or {}
         domain = result.measurements.get(frame_domain.KEY) or {}
         current_coverage = result.measurements.get(drawing_coverage.KEY) or {}
+        continued = result.measurements.get(photo_continuation.KEY) or {}
         if domain.get("status") == "available":
             gap_note = (f"Inside-frame uncovered: {domain['inside_uncovered_pixels']:,} px "
                         f"({domain['inside_uncovered_cm2']:.4g} cm²). ")
@@ -548,8 +560,15 @@ class PaintingRunPreview(QObject):
             gap_note = "Inside-frame gaps unavailable: " + str(domain.get("reason") or "The reference rig frame is not bound.") + " "
         if current_coverage:
             gap_note += "Areas outside the reference photo cannot be covered by extending polygons inside it. Saved manual versions keep their original map. "
+        if continued:
+            gap_note = (f"Target own frame ({continued['authority']}): {continued['inside_gap_pixels']:,} true gap pixels "
+                f"({continued['inside_uncovered_cm2']:.4g} cm²); {continued['continued_pixels']:,} pixels continued beyond the reference photo (cyan hatch). "
+                "The original filled/support provenance is retained. The separate placed-reference-frame diagnostic is unchanged. ")
         self.note.setText(f"{result.run_id}: {result.source_name} from {result.source_run}, placed through the saved frame models. "
-                          "Read only · no approval, placement receipt or adoption is created. Magenta: uncovered inside the placed reference rig frame. "
+                          "Read only · no approval, placement receipt or adoption is created. "
+                          + ("Magenta: a true gap inside the target's own rig frame. " if continued
+                             else "Magenta: uncovered inside the placed reference rig frame. ")
+                          +
                           f"Displacement: median {shift.get('median_px', '—')} px, maximum {shift.get('max_px', '—')} px. "
                           + gap_note + f"Water pockets: {checks.get('water_pocket_pixels', '—')} px. "
                           "Boundary offsets use the placement review's descriptive method.")
@@ -567,10 +586,23 @@ class PaintingRunPreview(QObject):
                 continue
             color = QColor(colors.get(layer.layer_id, layer.color))
             rgba[result.layers == layer.layer_id] = (color.red(), color.green(), color.blue(), 100)
-        # A gap stays a gap, including edge-replicated pixels the source does
-        # not reach. The overlay never turns those pixels into a decided layer.
+        # New positive packets distinguish authorized continuation from true
+        # gaps; historical packets retain their original frame diagnostic.
         domain = result.measurements.get(frame_domain.KEY) or {}
-        if domain.get("status") == "available":
+        continued = result.measurements.get(photo_continuation.KEY) or {}
+        if continued:
+            inside, gaps, filled = continued["display_inside"], continued["display_gaps"], continued["display_continued"]
+            if any(mask.shape != result.layers.shape for mask in (inside, gaps, filled)):
+                raise ValueError("The continued preview masks belong to another display grid.")
+            outside = ~inside
+            if result.measurements.get(drawing_coverage.KEY):
+                outside &= result.uncovered | (result.layers == lp.OUTSIDE)
+            rgba[outside] = (0, 0, 0, 0)
+            rows, columns = np.indices(result.layers.shape)
+            hatch = ((rows + columns) // 3) % 2 == 0
+            rgba[filled & hatch & (rgba[..., 3] > 0)] = (0, 220, 255, 150)
+            rgba[gaps] = (255, 0, 255, 95)
+        elif domain.get("status") == "available":
             inside, gaps = domain["display_inside"], domain["display_gaps"]
             if inside.shape != result.layers.shape or gaps.shape != result.layers.shape:
                 raise ValueError("The displayed drawing-frame masks belong to another photograph grid.")

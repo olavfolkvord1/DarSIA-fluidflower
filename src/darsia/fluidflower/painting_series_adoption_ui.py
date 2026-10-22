@@ -71,7 +71,7 @@ class SeriesAdoptionController(QObject):
                 project_root=str(self.view.project.root),
                 version=_version_identity(record), approval=deepcopy(approval),
                 frame=deepcopy(frame.to_dict()), selection=deepcopy(selection))
-            if not self.view.prepare_adoption_of(record, selection.index_path):
+            if not self.view.prepare_adoption_of(record, selection.index_path, continue_photo_edges=True):
                 self.context = None
                 self.view.use_map_progress.setText(self.view.versions_note.text())
                 return False

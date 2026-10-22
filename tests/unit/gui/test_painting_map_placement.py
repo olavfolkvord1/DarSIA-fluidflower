@@ -210,7 +210,8 @@ def test_the_button_reuses_shared_geometry_and_asks_for_runs_to_review_first(
     assert settings.value("placement/geometry_index") == str(index)
     monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: (" ac53 , ac60 ", True))
     view.place_version_button.click()
-    assert started == [{"runs": ["ac52", "ac53"], "first_runs": ["ac53", "ac60"]}]
+    assert started == [{"runs": ["ac52", "ac53"], "first_runs": ["ac53", "ac60"],
+                        "continue_photo_edges": True}]
     assert settings.value("placement/first_runs") == "ac53 , ac60"
 
 

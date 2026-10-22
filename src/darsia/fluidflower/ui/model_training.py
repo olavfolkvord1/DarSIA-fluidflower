@@ -3037,9 +3037,33 @@ class SharedPhaseModelTrainingPage(QWidget):
         entry = self._selected_model_history()
         if entry is None:
             return
-        path = Path(str(entry.get("root") or "")).expanduser()
-        if path.is_dir():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        root = str(entry.get("root") or "").strip()
+        if not root:
+            QMessageBox.warning(
+                self, "Model folder unavailable",
+                "The selected model has no recorded folder. Refresh the model list.",
+            )
+            return
+        path = Path(root).expanduser()
+        try:
+            if not path.is_dir():
+                QMessageBox.warning(
+                    self, "Model folder unavailable",
+                    f"The selected model folder is missing or unavailable:\n{path}\n"
+                    "Check its storage connection and refresh the model list.",
+                )
+                return
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+                QMessageBox.warning(
+                    self, "Could not open model folder",
+                    f"The desktop could not open the selected model folder:\n{path}",
+                )
+        except OSError as error:
+            QMessageBox.warning(
+                self, "Model folder unavailable",
+                f"Could not access the selected model folder:\n{path}\n"
+                f"{type(error).__name__}: {error}",
+            )
 
     def _use_selected_history_model_for_validation(self) -> None:
         entry = self._selected_model_history()
@@ -3656,13 +3680,13 @@ class SharedPhaseModelTrainingPage(QWidget):
         session = self._selected_session()
         self.resume_session_button.setEnabled(session is not None)
         self.add_session_evidence.setEnabled(
-            bool(session and Path(str(session.get("decision_path") or "")).is_file())
+            bool(session and str(session.get("decision_path") or "").strip())
         )
         self.add_selected_session_button.setEnabled(self.add_session_evidence.isEnabled())
         self.add_selected_session_button.setToolTip(
-            "Add the selected saved session to the evidence packages."
+            "Check that the saved decisions and campaign manifest are available, then add this session to the evidence packages."
             if self.add_selected_session_button.isEnabled()
-            else "Select a saved review session with an available decisions file."
+            else "Select a saved review session with a recorded decisions path."
         )
         training_ready = reviewer_ready and bool(self.bundles.toPlainText().strip())
         if self.training_scope.currentData() == "single-series":
@@ -4793,18 +4817,28 @@ class SharedPhaseModelTrainingPage(QWidget):
         session = self._selected_session()
         if session is None:
             return
-        decisions = resolve_review_path(str(session.get("decision_path") or ""))
-        combined = resolve_review_path(str(session.get("combined_root") or ""))
-        manifest = combined / "postflight_manifest.json"
-        if not decisions.is_file() or not manifest.is_file():
+        try:
+            decisions = resolve_review_path(str(session.get("decision_path") or ""))
+            combined = resolve_review_path(str(session.get("combined_root") or ""))
+            manifest = combined / "postflight_manifest.json"
+            if not decisions.is_file() or not manifest.is_file():
+                QMessageBox.warning(
+                    self,
+                    "Evidence package incomplete",
+                    "The selected session needs both saved decisions and its combined "
+                    "postflight manifest before it can be used for training.",
+                )
+                return
+            self._append_bundle_row(decisions, manifest)
+        except (OSError, ValueError) as error:
             QMessageBox.warning(
                 self,
-                "Evidence package incomplete",
-                "The selected session needs both saved decisions and its combined "
-                "postflight manifest before it can be used for training.",
+                "Evidence package unavailable",
+                "Could not access the selected session's saved evidence. "
+                "Check its storage connection and try again.\n"
+                f"{type(error).__name__}: {error}",
             )
             return
-        self._append_bundle_row(decisions, manifest)
         self.tabs.setCurrentWidget(self.training_tab)
         self.status.setText("Session added to the manual training inputs. Review the full input list and use Start training; Train further keeps its separate cumulative evidence selection.")
 

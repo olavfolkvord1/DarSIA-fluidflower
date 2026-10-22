@@ -170,6 +170,12 @@ class AdoptionDialog(QDialog):
             f"Preparation: {self.folder}"
         )
         note.setWordWrap(True)
+        if self.preparation.get("format") == ma.PREPARATION_FORMAT_V2:
+            continued = sum(int((row.get("continuation") or {}).get("continued_pixels", 0)) for row in prepared)
+            gaps = sum(int((row.get("continuation") or {}).get("inside_gap_pixels", 0)) for row in prepared)
+            note.setText(note.text() + f" New photo-edge continuation contract: {continued:,} continued pixels, {gaps:,} true inside-frame gaps. "
+                         "Original filled/support flags are retained; separate effective coverage includes only authorized continuation. "
+                         "This preparation grants no adoption or optical support.")
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(note)
         self.values = ma.label_values(self.preparation)

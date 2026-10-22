@@ -341,19 +341,15 @@ def test_plan_and_declared_reservation_are_defensive_copies(tmp_path, monkeypatc
 def test_original_reader_still_counts_the_positive_setup_record(tmp_path, monkeypatch):
     """An existing worker sees a conservative whole cap, not an unknown format."""
     import ast
-    import os
-    import subprocess
     actual = _admission(tmp_path, monkeypatch, metadata_cap=100)
     data = actual.test_context
     ledger = capacity.CapacityLedger(data.stores, "sample-series", data.metadata_root,
         volume_provider=data.volume, context_provider=lambda: dict(data.context))
-    # Immutable pre-Setup source; no production module is replaced or imported.
-    repository = Path(__file__).resolve().parents[2]
-    environment = {key: value for key, value in os.environ.items()
-                   if not key.upper().startswith("GIT_")}
-    source = subprocess.check_output(["git", "--no-optional-locks", "-C", str(repository),
-        "show", "098465c1b82f92ae6ce129571e9bf8e2e6267ddf:src/darsia/fluidflower/pipeline/capacity.py"],
-        env=environment)
+    # Exact original method from the pinned pre-Setup source, with only CRLF
+    # normalized for Git checkouts. No current reader or Git history is borrowed.
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "capacity_remaining_098465c1.py.txt"
+    source = fixture.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(source).hexdigest() == "9d3b3098efa41957eb0c2295666ddae6e4ee67e10398c2be3433ce5e5e2b9b33"
     cls = next(node for node in ast.parse(source).body
                if isinstance(node, ast.ClassDef) and node.name == "CapacityLedger")
     original = next(node for node in cls.body

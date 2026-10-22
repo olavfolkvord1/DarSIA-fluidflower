@@ -38,6 +38,7 @@ import numpy as np
 
 GEOMETRY_FORMAT = "darsia-measured-run-geometry-v1"
 PLACEMENT_FORMAT = "darsia-fluidflower-map-placement-v1"
+PLACEMENT_FORMAT_V2 = "darsia-fluidflower-map-placement-v2"
 MAX_JSON_BYTES = 16 * 1024 * 1024
 # The overlays have at most two labelled line types.
 BOUNDARY_COLOR = (255, 255, 0)
@@ -199,6 +200,16 @@ def place_layer_map(
     return np.asarray(carried["labels"], dtype=np.uint8), np.asarray(
         carried["geometry_filled"], dtype=bool
     )
+
+
+def place_with_continuation(layers, reference, target, shape_hw, *, contract):
+    """An explicitly versioned new placement; original arrays stay unchanged."""
+    from .photo_edge_continuation import apply_policy
+    if (contract.get("source_run") != reference.run_id or contract.get("target_run") != target.run_id
+            or contract.get("target_grid") != "camera_u"):
+        raise ValueError("The continuation contract belongs to another placement/grid.")
+    placed, filled = place_layer_map(layers, reference, target, shape_hw)
+    return apply_policy(layers, contract, labels=placed, filled=filled)
 
 
 def _edges(values: np.ndarray) -> np.ndarray:
@@ -424,6 +435,8 @@ def place_map_in_runs(
     first_runs: Sequence[str] = (),
     measure_offsets: bool = True,
     progress: Callable[[str], None] | None = None,
+    continuation: Mapping[str, Any] | None = None,
+    approved_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Place the map in every run and write a new review folder.
 
@@ -463,6 +476,10 @@ def place_map_in_runs(
             f"run's grid ({reference.shape_hw[1]} x {reference.shape_hw[0]} px)"
         )
     keys = [str(run).casefold() for run in runs]
+    if continuation is not None:
+        from .photo_edge_continuation import verify_source, verify_placement_inputs
+        verify_source(approved_source, layers, continuation)
+        verify_placement_inputs(continuation, geometries, index_path, reference_key, keys, "camera_u")
     order = review_order(keys, reference_key, first_runs)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     folder = Path(destination_root) / f"{stamp}-{uuid.uuid4().hex[:8]}"
@@ -470,6 +487,12 @@ def place_map_in_runs(
         from .raw_shape_basis_reader import guard_output_root
         guard_output_root(folder, [geometries[run].model for run in basis_checks])
     folder.mkdir(parents=True, exist_ok=False)
+    if continuation is not None:
+        from .photo_edge_continuation import save_contracts
+        if set(continuation) != (set(keys) & set(geometries)):
+            raise ValueError("A new placement needs a continuation contract for every requested run.")
+        save_contracts(folder / "continuation.json", continuation)
+        np.savez_compressed(folder / "source_map.npz", array=layers)
     known = {int(layer) for layer in roles}
     rows = []
     reference_offsets: dict[str, Any] | None = None
@@ -485,12 +508,24 @@ def place_map_in_runs(
         if tuple(photo.shape[:2]) != tuple(shape):
             raise ValueError(f"{run}: the photograph does not have the geometry's grid size")
         placed, uncovered = place_layer_map(layers, reference, target, shape)
+        classified = None
+        if continuation is not None:
+            classified = place_with_continuation(layers, reference, target, shape,
+                contract=continuation[run])
         run_folder = folder / run
         run_folder.mkdir()
-        np.savez_compressed(run_folder / "layers.npz", layers=placed, uncovered=uncovered)
+        if classified is None:
+            np.savez_compressed(run_folder / "layers.npz", layers=placed, uncovered=uncovered)
+        else:
+            np.savez_compressed(run_folder / "layers.npz", layers=placed, uncovered=uncovered,
+                support=classified["support"], continued=classified["continued"], inside=classified["inside"],
+                effective_coverage=classified["effective_coverage"], gaps=classified["gaps"])
         # A full-resolution JPEG without chroma subsampling: the boundaries
         # stay sharp, at a fraction of a PNG's size. The exact map is the npz.
-        Image.fromarray(boundary_overlay(photo, placed, uncovered)).save(
+        overlay = boundary_overlay(photo, placed, uncovered if classified is None else classified["gaps"])
+        if classified is not None:
+            overlay[_edges(classified["continued"])] = (0, 220, 255)
+        Image.fromarray(overlay).save(
             run_folder / "overlay.jpg", quality=92, subsampling=0
         )
         offsets = None
@@ -515,8 +550,19 @@ def place_map_in_runs(
                 "checks": run_checks(placed, uncovered, roles, known),
             }
         )
+        if classified is not None:
+            rows[-1]["continuation"] = dict(classified["counts"], contract_run=run,
+                authority=continuation[run]["frame_authority"]["kind"])
+            rows[-1]["product"] = dict(path=f"{run}/layers.npz", sha256=sha256_file(run_folder / "layers.npz"),
+                size_bytes=(run_folder / "layers.npz").stat().st_size)
+            rows[-1]["checks"]["continued_pixels"] = classified["counts"]["continued_pixels"]
+            rows[-1]["checks"]["inside_gap_pixels"] = classified["counts"]["inside_gap_pixels"]
+    if continuation is not None:
+        from .photo_edge_continuation import verify_capture
+        verify_capture(continuation)
+        verify_source(approved_source, layers, continuation)
     index = {
-        "format": PLACEMENT_FORMAT,
+        "format": PLACEMENT_FORMAT if continuation is None else PLACEMENT_FORMAT_V2,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "reference_run": reference_key,
         "map_version": dict(version),
@@ -545,6 +591,14 @@ def place_map_in_runs(
         } for run in basis_checks}
         for checked in basis_checks.values():
             checked.revalidate()
+    if continuation is not None:
+        from .photo_edge_continuation import POLICY
+        index["continuation"] = dict(policy=POLICY, file="continuation.json",
+            sha256=sha256_file(folder / "continuation.json"), adopted=False)
+        index["approved_source"] = dict(approved_source)
+        index["source_map"] = dict(path="source_map.npz", sha256=sha256_file(folder / "source_map.npz"),
+            size_bytes=(folder / "source_map.npz").stat().st_size)
+        index["overlay_legend"].append(dict(label="Continued beyond the reference photo", rgb=[0, 220, 255]))
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     for checked in basis_checks.values():
@@ -558,14 +612,62 @@ def read_placement(folder: Path | str) -> dict[str, Any]:
 
     folder = Path(folder)
     index = _read_json(folder / "index.json")
-    if index.get("format") != PLACEMENT_FORMAT:
+    if index.get("format") not in {PLACEMENT_FORMAT, PLACEMENT_FORMAT_V2}:
         raise ValueError(f"{folder} is not a map placement folder")
+    if index.get("format") == PLACEMENT_FORMAT_V2:
+        from .photo_edge_continuation import POLICY, read_contracts, validate_contract, verify_source, verify_product
+        from .project import sha256_file
+        record = index.get("continuation") or {}
+        if (record.get("policy") != POLICY or record.get("adopted") is not False
+                or record.get("file") != "continuation.json"
+                or sha256_file(folder / "continuation.json") != record.get("sha256")):
+            raise ValueError("The new placement's continuation contract changed.")
+        source_bound = index.get("source_map") or {}
+        source_path = folder / "source_map.npz"
+        if (source_bound.get("path") != "source_map.npz" or source_path.stat().st_size != source_bound.get("size_bytes")
+                or sha256_file(source_path) != source_bound.get("sha256")):
+            raise ValueError("The V2 placement's source map changed.")
+        with np.load(source_path, allow_pickle=False) as source_file:
+            if set(source_file.files) != {"array"}:
+                raise ValueError("The V2 placement source map has unexpected fields.")
+            source_layers = source_file["array"].copy()
+        sidecar = read_contracts(folder / "continuation.json")
+        contracts = {}
+        for row in index.get("runs") or []:
+            if row.get("status") == "placed":
+                run = row["run_id"]
+                if run in contracts:
+                    raise ValueError("The V2 placement repeats a run.")
+                contracts[run] = sidecar["runs"].get(run)
+                validate_contract(contracts[run], verify_files=True)
+                product = folder / run / "layers.npz"
+                if Path(row["layers"]) != Path(run) / "layers.npz":
+                    raise ValueError("The V2 placement product belongs to another run.")
+                product_bound = row.get("product") or {}
+                summary = row.get("continuation") or {}
+                if (product_bound.get("path") != row["layers"] or product.stat().st_size != product_bound.get("size_bytes")
+                        or sha256_file(product) != product_bound.get("sha256")
+                        or summary.get("contract_run") != run
+                        or summary.get("authority") != contracts[run]["frame_authority"]["kind"]):
+                    raise ValueError("The V2 placement product or its own-frame authority changed.")
+                verify_product(product, source_layers, contracts[run], counts=row.get("continuation"))
+        version = index.get("map_version") or {}
+        geometry_index = index.get("geometry_index") or {}
+        if (set(sidecar["runs"]) != set(contracts) or not contracts
+                or version.get("sha256") != (index.get("approved_source") or {}).get("approval", {}).get("sha256")
+                or version.get("approval") != (index.get("approved_source") or {}).get("approval")
+                or any(index.get("reference_run") != c["source_run"]
+                       or any(geometry_index.get(k) != c["geometry_index"][k] for k in ("path", "sha256"))
+                       for c in contracts.values())):
+            raise ValueError("The V2 placement index differs from its exact source/run closure.")
+        verify_source(index.get("approved_source"), source_layers, contracts)
     return dict(index, folder=str(folder))
 
 
 __all__ = [
     "GEOMETRY_FORMAT",
     "PLACEMENT_FORMAT",
+    "PLACEMENT_FORMAT_V2",
     "RunGeometry",
     "BOUNDARY_COLOR",
     "GAP_COLOR",
@@ -576,6 +678,7 @@ __all__ = [
     "layer_offsets",
     "map_offset",
     "place_layer_map",
+    "place_with_continuation",
     "place_map_in_runs",
     "read_placement",
     "read_run_geometry",

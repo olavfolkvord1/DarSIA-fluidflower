@@ -2207,11 +2207,19 @@ class GeometryRevisionStore:
                     run_labels = np.squeeze(_load_array(Path(labels_text)))
                     run_config["labels_path"] = labels_text
                     run_facies, run_properties = _canonical_facies(run_config)
-                    np.savez_compressed(
-                        run_root / "labels.npz",
-                        array=np.asarray(run_labels, dtype=np.int32),
-                        metadata=_darsia_metadata(Path(labels_text)),
-                    )
+                    if (row.get("registration") or {}).get("kind") == "painted-map-placement-v2":
+                        # The positive V2 admission has replayed every mask.
+                        # Keep its full NPZ (including effective coverage) as an
+                        # exact Store copy, rather than silently dropping flags.
+                        shutil.copyfile(labels_text, run_root / "labels.npz")
+                        if (run_root / "labels.npz").read_bytes() != Path(labels_text).read_bytes():
+                            raise ValueError("The V2 Store copy lost its continuation provenance.")
+                    else:
+                        np.savez_compressed(
+                            run_root / "labels.npz",
+                            array=np.asarray(run_labels, dtype=np.int32),
+                            metadata=_darsia_metadata(Path(labels_text)),
+                        )
                 else:
                     run_facies = np.squeeze(_load_array(Path(facies_text)))
                     run_properties = properties

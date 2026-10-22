@@ -39,6 +39,18 @@ def _files(view):
     return {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
 
 
+def _mock_policy_unrelated_preview(monkeypatch):
+    """Synthetic lifecycle packets claim no continuation/source qualification.
+
+    The real frame/photo/version gates are exercised by the actual preview and
+    photo-continuation tests. This seam changes only metadata construction;
+    worker dispatch, callbacks, GUI rendering and retirement remain real.
+    """
+    from darsia.fluidflower import photo_edge_continuation
+    monkeypatch.setattr(photo_edge_continuation, "build_contracts",
+        lambda project, index, source, runs, ids, **kwargs: {run: None for run in runs})
+
+
 def test_one_chooser_keeps_reference_editable_and_other_run_read_only(view):
     controller = _runs(view)
     before = deepcopy(view.session), _files(view)
@@ -101,6 +113,7 @@ def test_other_run_disables_undo_without_changing_reference_stack(view):
 
 
 def test_worker_uses_exact_snapshot_and_retires_in_gui_thread(view, qtbot, monkeypatch):
+    _mock_policy_unrelated_preview(monkeypatch)
     controller = _runs(view)
     view.session.polygons = [lp.Polygon(2, [(5.1234567, 5.7654321), (5., 20.), (20., 20.)])]
     exact = deepcopy(view.session)
@@ -151,6 +164,7 @@ def test_actual_preview_worker_places_drawing_on_own_photo_without_writes(view, 
     from PIL import Image
 
     from darsia.fluidflower import map_placement
+    from darsia.fluidflower.series_geometry import RigFrame
 
     controller = _runs(view)
     source_run, target_run = view.session.run_id, "ac53"
@@ -176,6 +190,26 @@ def test_actual_preview_worker_places_drawing_on_own_photo_without_writes(view, 
     index = folder / "index.json"
     index.write_text(json.dumps({"format": map_placement.GEOMETRY_FORMAT, "runs": entries}),
                      encoding="utf-8")
+    # Supply real private own-frame authority for the actual positive policy.
+    # It must be on disk, independently of the in-memory reference getter.
+    (folder / "config/runs").mkdir(parents=True)
+    (folder / "config/common.toml").write_text("# private own-frame fixtures\n", encoding="utf-8")
+    (folder / "series.toml").write_text(
+        f'schema_version = 1\nseries_id = "private-preview"\n[runs]\nids = ["{source_run}", "{target_run}"]\n',
+        encoding="utf-8")
+    own_frames = {}
+    for run, photo in ((source_run, Path(view.session.image_path)), (target_run, target_photo)):
+        (folder / "config/runs" / (run + ".toml")).write_text(
+            f'[data]\nbaseline = "{photo.as_posix()}"\n', encoding="utf-8")
+        frame = RigFrame(
+            corners=dict(top_left=(0., 0.), top_right=(0., 79.),
+                         bottom_right=(59., 79.), bottom_left=(59., 0.)),
+            width_m=.079, height_m=.059, run_id=run,
+            source="private saved frame", image=str(photo), image_size=(80, 60))
+        own_frames[run] = frame.to_dict()
+    view.project.manifest.setdefault("tools", {})["native_series"] = dict(
+        series_root=str(folder), series_id="private-preview", rig_frames=own_frames)
+    (view.project.root / "series.json").write_text(json.dumps(view.project.manifest), encoding="utf-8")
     view.session.polygons = [
         lp.Polygon(2, [(0, 0), (0, 39), (59, 39), (59, 0)]),
         lp.Polygon(3, [(0, 40), (0, 79), (59, 79), (59, 40)]),
@@ -198,7 +232,8 @@ def test_actual_preview_worker_places_drawing_on_own_photo_without_writes(view, 
     assert controller.thread is None and controller.worker is None
     controller.runs.setCurrentIndex(controller.runs.findData(target_run))
     assert controller.worker is not None
-    qtbot.waitUntil(lambda: controller.thread is None, timeout=15000)
+    # The accepted packet also rebinds boxes through a read-only metadata worker.
+    qtbot.waitUntil(lambda: controller.thread is None and not view.busy(), timeout=15000)
     result = controller.last_result
     assert result is not None, controller.note.text()
     expected = np.full((60, 80), 2, np.uint8)

@@ -13,10 +13,12 @@ from darsia.fluidflower import painting_run_preview_ui as ui
 from darsia.fluidflower.painting_run_preview import RunPreview
 
 from .test_painting_corrections import view  # noqa: F401
-from .test_painting_run_preview import private_settings, _files  # noqa: F401
+from .test_painting_run_preview import private_settings, _files, _mock_policy_unrelated_preview  # noqa: F401
 
 
 def _chooser(view, qtbot, monkeypatch):
+    # Shared lifecycle-only packets intentionally have no scientific source binding.
+    _mock_policy_unrelated_preview(monkeypatch)
     for timer in (view._save_timer, view._manual_timer, view._saturation_timer):
         timer.stop()
     qtbot.waitUntil(lambda: not view.busy(), timeout=10000)

@@ -774,7 +774,9 @@ def _validate_carried_registered_run(config, payload, parent, row):
 
 
 PAINTED = "painted-map-placement-v1"
+PAINTED_V2 = "painted-map-placement-v2"
 PAINTED_PREPARATION = "darsia-fluidflower-painted-map-adoption-preparation-v1"
+PAINTED_PREPARATION_V2 = "darsia-fluidflower-painted-map-adoption-preparation-v2"
 
 
 def painted_map_composition(reference_model, target_model):
@@ -794,7 +796,7 @@ def painted_map_composition(reference_model, target_model):
     return reference, to_native @ target, _carried_shape(grid.get("shape_hw"))
 
 
-def _validate_painted_run(config, payload, parent, row):
+def _validate_painted_run(config, payload, parent, row, *, continuation=False):
     """A run's labels carried from an approved painted map: replayed exactly.
 
     The record binds the painted map on the reference run's camera grid, both
@@ -807,8 +809,9 @@ def _validate_painted_run(config, payload, parent, row):
     """
     from .geometry_facies import _darsia_metadata
     record = row["registration"]
-    _carried_keys(record, ("kind", "parent_revision_id", "status", "authority", "measurement",
-        "labels", "source_image", "source_map", "reference_model", "target_model"), "painted registration")
+    keys = ("kind", "parent_revision_id", "status", "authority", "measurement",
+        "labels", "source_image", "source_map", "reference_model", "target_model")
+    _carried_keys(record, keys + (("continuation",) if continuation else ()), "painted registration")
     run = str(row["run_id"]).strip().casefold()
     if (record["status"] != "painted" or record["parent_revision_id"] != parent["revision_id"]
             or str(row.get("facies_path") or "").strip()):
@@ -857,11 +860,34 @@ def _validate_painted_run(config, payload, parent, row):
     if not _same_grid_metadata(_darsia_metadata(Path(actual["path"])), metadata):
         raise ValueError("Painted labels changed the imported grid metadata.")
     approval = json.loads(Path(authority["path"]).read_bytes())
-    if (preparation.get("format") != PAINTED_PREPARATION or entry.get("status") != "prepared"
+    expected_format = PAINTED_PREPARATION_V2 if continuation else PAINTED_PREPARATION
+    if (preparation.get("format") != expected_format or entry.get("status") != "prepared"
             or (entry.get("labels") or {}).get("sha256") != actual["sha256"]
             or (preparation.get("source_map") or {}).get("sha256") != source_map["sha256"]
             or approval.get("sha256") != (preparation.get("map_version") or {}).get("sha256")):
         raise ValueError("A painted run is not the run, map and approval its preparation names.")
+    if continuation:
+        from .photo_edge_continuation import load_contract, verify_source, verify_product, verify_native_proof, POLICY
+        sidecar = _carried_descriptor(record["continuation"])
+        expected_sidecar = Path(measurement["path"]).parent / "continuation.json"
+        declared = preparation.get("continuation") or {}
+        if (Path(sidecar["path"]).resolve() != expected_sidecar.resolve()
+                or declared.get("file") != "continuation.json" or declared.get("policy") != POLICY
+                or declared.get("adopted") is not False
+                or any(declared.get(k) != sidecar[k] for k in ("sha256", "size_bytes"))):
+            raise ValueError("The V2 run has another continuation sidecar.")
+        contract = load_contract(sidecar["path"], run)
+        if (contract["target_grid"] != "native" or contract["source_run"] != preparation.get("reference_run")
+                or contract["source_model"]["descriptor"] != record["reference_model"]
+                or contract["target_model"]["descriptor"] != record["target_model"]):
+            raise ValueError("The V2 continuation is bound to other models, runs or native grid.")
+        binding = preparation.get("approved_source")
+        verify_source(binding, painted, {run: contract},
+            preparation=preparation if "painting_facies" in preparation else None, folder=Path(measurement["path"]).parent)
+        if approval != binding["approval"] or preparation.get("approval") != approval:
+            raise ValueError("The V2 source approval differs from its immutable approved version.")
+        verify_product(actual["path"], painted, contract, counts=entry.get("continuation"))
+        verify_native_proof(preparation, Path(measurement["path"]).parent)
     _verify(actual)
     _verify(source_map)
 
@@ -895,6 +921,9 @@ def _validate_registered_runs(config, payload, parent, *, run_id=None):
             continue
         if record.get("kind") == PAINTED:
             _validate_painted_run(config, payload, parent, row)
+            continue
+        if record.get("kind") == PAINTED_V2:
+            _validate_painted_run(config, payload, parent, row, continuation=True)
             continue
         if (record.get("parent_revision_id") != parent["revision_id"]
                 or record.get("parent_labels") != payload["actual"]["labels"]
@@ -1007,10 +1036,20 @@ def registered_run_sources(project_root, current, run_id):
                *[row["registration"][key] for key in ("authority", "measurement", "labels", "source_image")]]
     if row["registration"].get("kind") == CARRIED:
         guarded.extend(_carried_file_bindings(row["registration"]))
-    if row["registration"].get("kind") == PAINTED:
+    if row["registration"].get("kind") in {PAINTED, PAINTED_V2}:
         guarded.extend(row["registration"][key] for key in ("source_map", "reference_model", "target_model"))
     if "painted_table_guarded_sources" in payload:
         guarded.extend(payload["painted_table_guarded_sources"])
+    if row["registration"].get("kind") == PAINTED_V2:
+        from .photo_edge_continuation import verify_native_proof
+        guarded.append(row["registration"]["continuation"])
+        preparation = json.loads(Path(row["registration"]["measurement"]["path"]).read_bytes())
+        guarded.extend(verify_native_proof(preparation, Path(row["registration"]["measurement"]["path"]).parent))
+        approved = preparation["approved_source"]
+        guarded.extend([approved["version"], *approved["files"].values(),
+            approved["frame_basis"]["workspace_revision"], approved["frame_basis"]["photograph"]])
+        if approved["frame_basis"]["camera_profile"]["kind"] == "camera_u":
+            guarded.append(approved["frame_basis"]["camera_profile"]["parameters"])
     result = dict(revision_id=revision_id, run_id=run, current=current_file,
         revision=revision_file, files=files, labels_shape=list(labels.shape),
         registration=deepcopy(row["registration"]), guarded_sources=guarded,
@@ -1018,7 +1057,7 @@ def registered_run_sources(project_root, current, run_id):
         provenance="Fresh observed Store product SHA bound to genuine UUID/record and exact arrays; not historical source SHA")
     if row["registration"].get("kind") == CARRIED:
         result["label_serialization"] = "Original Store int32; exact numeric equality to admitted carried labels"
-    if row["registration"].get("kind") == PAINTED:
+    if row["registration"].get("kind") in {PAINTED, PAINTED_V2}:
         result["label_serialization"] = "Original Store int32; exact numeric equality to the replayed painted placement"
     verify_registered_sources(result)
     return result
@@ -1028,6 +1067,21 @@ def verify_registered_sources(binding):
     """Recheck the exact already-admitted files without decoding them again."""
     for row in [*binding["guarded_sources"], *binding["files"].values()]:
         _verify(row)
+    if (binding.get("registration") or {}).get("kind") == PAINTED_V2:
+        # Positive V2 also rechecks actual approval history/profile/stat source.
+        # Historical registrations retain the original descriptor-only route.
+        from .photo_edge_continuation import load_contract, verify_source, verify_product, verify_native_proof
+        record = binding["registration"]
+        preparation = json.loads(Path(record["measurement"]["path"]).read_bytes())
+        run = binding["run_id"]
+        contract = load_contract(record["continuation"]["path"], run)
+        source = _integer_map(record["source_map"]["path"])
+        verify_source(preparation["approved_source"], source, {run: contract},
+            preparation=preparation if "painting_facies" in preparation else None, folder=Path(record["measurement"]["path"]).parent)
+        entry = next(row for row in preparation["runs"] if row.get("run_id") == run)
+        verify_product(record["labels"]["path"], source, contract, counts=entry.get("continuation"))
+        verify_product(binding["files"]["labels"]["path"], source, contract, counts=entry.get("continuation"))
+        verify_native_proof(preparation, Path(record["measurement"]["path"]).parent)
 
 def require_source_mode_transition(store, config):
     """The simple editor cannot remove the mode and bypass its authority."""

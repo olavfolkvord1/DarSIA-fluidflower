@@ -364,9 +364,19 @@ class N1Pipeline:
 
     def __init__(
         self, config, *, precision, pixel_math, unc_only=False, geometry_fields=None,
-        statistics_only=False
+        statistics_only=False, frame_loading_only=False
     ):
-        """Load only this run's shared data and saved scientific models."""
+        """Load saved native inputs, optionally without any optical/mass model.
+
+        ``frame_loading_only`` retains the original measured input preparation
+        for callers fitting NEW optical paths. It cannot extract optical
+        statistics or evaluate mass and does not certify adoption or Build.
+        """
+        if type(frame_loading_only) is not bool:
+            raise TypeError("Frame-loading-only mode must be explicit")
+        if frame_loading_only and statistics_only:
+            raise ValueError("Frame loading and optical statistics are separate modes")
+        self.frame_loading_only = frame_loading_only
         from darsia._opencv_runtime import scientific_thread
         scientific_thread("N1Pipeline:setup")
         import numpy as np
@@ -387,7 +397,9 @@ class N1Pipeline:
         if type(statistics_only) is not bool:
             raise TypeError("Statistics-only mode must be explicit")
         self.statistics_only = statistics_only
-        if statistics_only:
+        if frame_loading_only:
+            pass  # Native preparation reads no mass calibration or optical method.
+        elif statistics_only:
             self.method_bindings = dict(config["bindings"])
             for name in ("round4_spec_sha256", "amendment_sha256"):
                 if name not in self.method_bindings:
@@ -448,6 +460,8 @@ class N1Pipeline:
             or self.clear_rgb.shape != (*self.clear_valid.shape, 3)
         ):
             raise ValueError("Frozen float32 scientific clear-water storage required")
+        if frame_loading_only:
+            return  # load_frame below uses only the verified native/physical inputs.
         optics = shared["optics"]
         metadata = self.reader.json(optics["metadata"])
         self.models = {
@@ -766,6 +780,8 @@ class N1Pipeline:
             exact_prediction,
         )
 
+        if getattr(self, "frame_loading_only", False):
+            raise ValueError("A frame-loading-only context cannot extract optical statistics")
         frame, x, y, photo, report = self.load_frame(spec)
         shared, math, config = self.config["shared"], self.math, self.config
         # The default call stays exactly the original one.
@@ -845,6 +861,8 @@ class N1Pipeline:
         self.last_opencv_ipp = None
         from darsia._opencv_runtime import scientific_thread, completed_frame
         ipp_before = scientific_thread("N1Pipeline.evaluate:before")
+        if getattr(self, "frame_loading_only", False):
+            raise ValueError("A frame-loading-only context cannot evaluate fitted mass")
         if self.statistics_only:
             raise ValueError("A statistics-only context cannot evaluate fitted mass")
         if "pixel_domain" in getattr(self, "config", {}):

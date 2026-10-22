@@ -277,6 +277,8 @@ def test_reader_traceback_displayed_verbatim_without_producer(panel, app):
     wait(app, widget.can_close)
     assert "ValueError: literal Ω metadata error" in widget.error_text.toPlainText()
     assert not widget.start_button.isEnabled() and not calls
+    assert "ValueError: literal Ω metadata error" in widget.start_button.toolTip()
+    assert "See Errors" in widget.start_button.toolTip()
 
 
 def test_start_dialog_chooses_existing_plan_only(app):
@@ -426,3 +428,30 @@ def test_machine_registration_records_facts_without_contact_or_overwrite(
     )
     with pytest.raises(FileExistsError):
         ui.register_machine_facts(tmp_path, facts, local_machine="Second")
+
+
+@pytest.mark.parametrize("state", ["missing", "error", "ready"])
+def test_start_explains_execution_metadata_without_changing_its_gate(panel, app, tmp_path, state):
+    """A grey Start names the missing input; valid passive selection stays ready."""
+    widget, calls = panel
+    data = snapshot(str(tmp_path / "private-job"))
+    if state == "missing":
+        data["job_facts"] = None
+    elif state == "error":
+        data["errors"] = ["Traceback (most recent call last):\nValueError: Selected job source binding differs"]
+    widget._show_snapshot(data)
+    tooltip = widget.start_button.toolTip()
+    if state == "ready":
+        assert widget.start_button.isEnabled()
+        assert tooltip == "Explicit start of the existing whole-run worker; frame publications alone show progress."
+    else:
+        assert not widget.start_button.isEnabled()
+        assert "See Errors" in tooltip
+        if state == "missing":
+            assert "readable execution metadata" in tooltip
+        else:
+            assert "ValueError: Selected job source binding differs" in tooltip
+            assert widget.error_text.toPlainText() == data["errors"][0]
+            assert "Traceback" not in tooltip
+        widget.start_button.click()
+    assert not calls and widget.can_close()

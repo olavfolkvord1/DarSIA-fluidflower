@@ -539,7 +539,11 @@ def _public_command(lease):
         _exact_source(bindings[0])
     # uv exposes its backing interpreter in orig_argv[0]. Re-enter through the
     # exact selected venv, preserving every original flag/module/worker argument.
-    return [sys.executable, *original[1:]]
+    command = [sys.executable, *original[1:]]
+    if lease.profile.get("format") == "darsia-setup-service-import-profile-v1":
+        from .setup_qualification import require_public_command
+        require_public_command(lease.profile, command)
+    return command
 
 
 def native_child_context(lease, *, api=None):
@@ -910,7 +914,8 @@ def supervise_original_worker(lease, *, api=None):
     finalization_attempted = False
     from .first_qualification import BOUND_IMPORT_PROFILE, BoundServiceReserveObservations
     bound_watch = (BoundServiceReserveObservations(lease, command)
-        if lease.profile.get("format") in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1"} else None)
+        if lease.profile.get("format") in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1",
+                                          "darsia-setup-service-import-profile-v1"} else None)
     terminal = None
     try:
         if bound_watch is not None:

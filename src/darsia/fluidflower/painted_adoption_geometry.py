@@ -201,10 +201,12 @@ def validate_models(binding, model_bindings, *, configuration_copies=None, folde
     return guarded
 
 
-def make_proof(binding, model_bindings):
+def make_proof(binding, model_bindings, *, basis_checks=None):
     """Freeze the actual measured-model and optional explicit RAW-basis closure."""
     checks = {}
     validate_models(binding, model_bindings, basis_checks=checks)
+    if basis_checks is not None:
+        basis_checks.update(checks)
     proof = dict(format=FORMAT, models=deepcopy(model_bindings), baseline_configurations={})
     if checks:
         from .painted_adoption_table import _checked
@@ -224,41 +226,70 @@ def make_proof(binding, model_bindings):
     return proof
 
 
-def received_source_rows(proof):
+def received_source_rows(proof, *, basis_checks=None):
     """Recheck CURRENT receipted sources for NEW preparation, never its own copies.
 
-    Only explicitly received bases select this route. Every lookup comes from
-    the public reader's genuine Root-bound pool and unchanged scientific checks;
-    RAW, original parent NPZ and output ownership remain physical and checked.
+    Received bases retain their genuine Root-bound pool. An ordinary basis may
+    substitute ONLY the historical parent TOML that its strict, Root-released
+    configuration-lineage audit already proved byte-identical. RAW, parent NPZ,
+    producer/current configuration and ownership checks remain physical.
     Caller must revalidate the returned readers after its last source/output IO.
     """
     from .painted_adoption_table import _checked
-    from .raw_shape_basis_reader import has_shape_basis, read_model_basis
+    from .raw_shape_basis_reader import has_shape_basis, read_model_basis, ReadShapeBasis, _key, _same
     rows, checks = {}, []
     if 'raw_shape_basis' not in proof:
         return rows, checks
-    for bound in proof['models'].values():
+    for run, bound in proof['models'].items():
         model = _checked(bound, metadata=True)
-        if (not has_shape_basis(model)
-                or 'received_basis' not in model['baseline_native_grid']['raw_shape_basis_authority']):
+        if not has_shape_basis(model):
             continue
-        checked = read_model_basis(model)
-        checked.guards.add(_identity(bound), metadata=True, copyable=True)
+        grid = model['baseline_native_grid']
+        received = 'received_basis' in grid['raw_shape_basis_authority']
+        lineage = (grid.get('parent_grid_compatibility') or {}).get('configuration_lineage')
+        if not received and lineage is None:
+            continue
+        checked = None if basis_checks is None else basis_checks.get(run)
+        if checked is None:
+            checked = read_model_basis(model)
+        elif (not isinstance(checked, ReadShapeBasis)
+                or not _same(checked.certificate, grid['renderer'])
+                or not _same(checked.compatibility, grid['parent_grid_compatibility'])):
+            raise ValueError('The preparation retained another checked RAW basis')
+        if not _same(checked.guards.add(_identity(bound), metadata=True, copyable=True), model):
+            raise ValueError('The checked RAW model changed before source retention')
         checked.revalidate()
-        for row in checked.copy_source_rows():
-            original, physical = _identity(row['original']), _identity(row['physical'])
-            key = (original['path'], original['sha256'], original['size_bytes'])
+        if received:
+            for row in checked.copy_source_rows():
+                original, physical = _identity(row['original']), _identity(row['physical'])
+                key = (original['path'], original['sha256'], original['size_bytes'])
+                if any(original[name] != physical[name] for name in ('sha256', 'size_bytes')):
+                    raise ValueError('Receipted source changed its exact original byte identity')
+                rows.setdefault(key, physical)
+        audit = (checked.compatibility or {}).get('configuration_lineage')
+        if audit is not None:
+            original = _identity(audit['parent_configuration'])
+            archived = _identity(audit['verified_original_configuration_copy'])
+            if (not _same(original, _identity(model['baseline_configuration']))
+                    or not _same(original, checked.compatibility['configuration'])
+                    or Path(original['path']).suffix.casefold() != '.toml'
+                    or Path(archived['path']).suffix.casefold() != '.toml'
+                    or any(original[name] != archived[name] for name in ('sha256', 'size_bytes'))):
+                raise ValueError('The checked lineage lost its exact historical parent TOML')
+            checked.guards.add(archived, copyable=True)
+            physical = _identity(checked.guards.rows[_key(archived['path'])]['physical'])
             if any(original[name] != physical[name] for name in ('sha256', 'size_bytes')):
-                raise ValueError('Receipted source changed its exact original byte identity')
+                raise ValueError('The checked historical TOML changed its physical bytes')
+            key = (original['path'], original['sha256'], original['size_bytes'])
             rows.setdefault(key, physical)
         checks.append(checked)
     return rows, checks
 
 
-def write_configuration_copies(folder, proof):
+def write_configuration_copies(folder, proof, *, basis_checks=None):
     """Keep actual before-Apply bytes, never rewrite an original run file."""
     from .painted_adoption_table import _checked, _read, _relative
-    received, checks = received_source_rows(proof)
+    received, checks = received_source_rows(proof, basis_checks=basis_checks)
     target = Path(folder) / "configuration_sources"
     target.mkdir(exist_ok=False)
     rows = {}
@@ -285,7 +316,7 @@ def write_configuration_copies(folder, proof):
         checked.revalidate()
 
 
-def verify_proof(binding, proof, expected_models, folder):
+def verify_proof(binding, proof, expected_models, folder, *, basis_checks=None):
     """Replay the exact preparation proof, using retained metadata bytes only."""
     from .painted_adoption_table import _same
     if (not isinstance(proof, dict) or set(proof) not in (
@@ -302,6 +333,8 @@ def verify_proof(binding, proof, expected_models, folder):
         basis_sources=sources, basis_checks=checks)
     if bool(checks) != ("raw_shape_basis" in proof):
         raise ValueError("The preparation changed its explicit RAW-basis branch")
+    if basis_checks is not None:
+        basis_checks.update(checks)
     return guards
 
 

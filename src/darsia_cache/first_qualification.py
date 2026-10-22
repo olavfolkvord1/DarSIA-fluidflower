@@ -626,7 +626,7 @@ class FirstQualification:
             predeclared_module_closure_sha256=_digest(self.provider["module_closure"]),
             module_inventory_scope="actual Python sys.modules file bindings; not an OS DLL enumeration",
             actual_task=deepcopy(self.claim),this_is_not_process_retirement=True)
-        if self.bound_mode:
+        if self.bound_mode or getattr(self, "setup_mode", False):
             from .environment import FIRST_WRITER_ENVIRONMENT_KEYS
             result["actual_writer_environment"] = {
                 key: os.environ.get(key) for key in FIRST_WRITER_ENVIRONMENT_KEYS}
@@ -686,7 +686,8 @@ class FiniteObservations:
 
     def observe_reserve(self, owned, started, *, force=False):
         """Q106 sampled operational reserve; a sample never proves a free-floor."""
-        if not (self.first.bound_mode or self.first.reference_build):
+        if not (self.first.bound_mode or self.first.reference_build
+                or getattr(self.first, "setup_mode", False)):
             return
         period = (1 if self.first.reference_build else
             self.first.required_capacity_bound["reserve_watchdog_period_seconds"])
@@ -798,7 +799,8 @@ class FiniteObservations:
             kernel_total_processes=total, kernel_total_processes_is_concurrent_peak=False,
             conservative_family_process_bound_from_kernel_total=total,
             kernel_lifetime_memory=peaks,
-            reserve_watchdog_period_seconds=(1 if (self.first.bound_mode or self.first.reference_build) else None),
+            reserve_watchdog_period_seconds=(1 if (self.first.bound_mode or self.first.reference_build
+                or getattr(self.first, "setup_mode", False)) else None),
             reserve_samples=self.reserve_samples, operational_reserve_crossed=self.reserve_crossed,
             operational_stop_response=self.stop_response,
             reserve_semantics="operational admission plus sampled watchdog; not a hard free-volume floor",
@@ -1070,7 +1072,8 @@ class BoundServiceReserveObservations:
     """
     def __init__(self, lease, command, *, clock=None):
         from types import SimpleNamespace
-        if lease.profile.get("format") not in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1"}:
+        if lease.profile.get("format") not in {BOUND_IMPORT_PROFILE, "darsia-common-phase-import-profile-v1",
+                                              "darsia-setup-service-import-profile-v1"}:
             raise CachePolicyError("The ordinary bound watchdog needs an actually resolved bound import profile")
         positions = [i for i, value in enumerate(command) if value == "--job"]
         if len(positions) != 1 or positions[0]+1 >= len(command):
@@ -1371,7 +1374,14 @@ def supervise_first_worker(lease, *, api=None):
         native_completion["passed"] = False
         native_completion["state"] = "UNQUALIFIED_REFERENCE_PRODUCER_COMPLETE"
         native_completion["root_reference_acceptance_required"] = True
-    _slot_write(first.provider,"native_completion",native_completion)
+    native_pin = _slot_write(first.provider,"native_completion",native_completion)
+    if getattr(first, "setup_mode", False):
+        if not native_completion["passed"]:
+            raise CachePolicyError("Setup service qualification stopped; original evidence retained")
+        from .setup_qualification import close_operation
+        from .bootstrap import _exact
+        close_operation(first, native_pin, read=lambda pin: _exact(pin, lease.package_file))
+        return 0
     if getattr(first, "common_mode", False):
         if not native_completion["passed"]:
             raise CachePolicyError("Common stage stopped; partial evidence retained, no ordinary profile")
@@ -1577,6 +1587,12 @@ def resolve_profile(binding, kind, read, *, stores_source=None, read_authorities
     native/output/original-comparison roles are checked before applicability.
     """
     value = read(binding)
+    if value.get("format") == "darsia-setup-service-provider-v1":
+        from .setup_qualification import resolve_profile as setup_profile
+        return setup_profile(binding, value, kind, read, stores_source=stores_source,
+                             read_authorities=read_authorities)
+    if value.get("format") == "darsia-setup-service-import-profile-v1":
+        raise CachePolicyError("Setup import profiles must resolve through their complete original provider")
     if value.get("format") == "darsia-common-phase-qualified-provider-v1":
         from .common_qualification import resolve_profile as common_profile
         return common_profile(binding, value, kind, read, stores_source=stores_source,

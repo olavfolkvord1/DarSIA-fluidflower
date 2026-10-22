@@ -121,6 +121,7 @@ def _basis_inputs(data, folder, *, bind_profile=True):
     # TOMLs, Store revisions and the adopted parent NPZ bytes are never rewritten.
     import toml
     document = toml.loads(manifest.read_text())
+    document.setdefault("schema_version", 1)
     if bind_profile:
         document["native"] = dict(configuration=profile["path"], sha256=profile["sha256"])
     else:
@@ -261,7 +262,7 @@ def _models(data, folder, inputs, *, unmapped=False, mutate=None):
 
 def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside=False, unmapped=False,
                       method="manual", mutate_model=None, preparation_frame=None,
-                      corrected_source=False, raw_source=False, fixture=False, during_prepare=None):
+                      corrected_source=False, raw_source=False, fixture=False, during_prepare=None, continuation=False):
     inputs = _basis_inputs(data, tmp_path / "owned_basis", bind_profile=not raw_source)
     image = inputs.photos["one"]
     if corrected_source:
@@ -317,12 +318,26 @@ def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside
     current_frame = deepcopy(frame)
     if preparation_frame is not None:
         preparation_frame(current_frame)
+    # Genuine temporary own-frame/project authority for the new placement policy.
+    own_frames = {}
+    for run in ("one", "two"):
+        own = deepcopy(frame)
+        own.run_id, own.image = run, str(inputs.photos[run])
+        own_frames[run] = own.to_dict()
+    data.project.manifest["tools"]["native_series"]["rig_frames"] = own_frames
+    (data.project.root / "series.json").write_text(json.dumps(data.project.manifest), encoding="utf-8")
     fixture_options = {}
+    if continuation:
+        from darsia.fluidflower import photo_edge_continuation as policy
+        binding = contract.capture_version(version, approval, current_frame, layers, project=data.project)
+        fixture_options.update(continuation=policy.build_contracts(data.project, index, "one",
+            ["one"] if outside else ["one", "two"], [row.layer_id for row in session.layers], target_grid="native"),
+            approved_source=binding)
     if fixture:
         from darsia.fluidflower.layer_painting_fixtures import version_fixture_underlay
         underlay = version_fixture_underlay(version, frame=current_frame)
         assert underlay is not None and not np.array_equal(underlay.analysis_layers, layers)
-        fixture_options = dict(fixture_underlay=underlay, fixture_frame=current_frame)
+        fixture_options.update(fixture_underlay=underlay, fixture_frame=current_frame)
     result = adoption.prepare_adoption(tmp_path / "preparation", layers,
         reference_run="one", geometry_index=index,
         runs=["one"] if outside else ["one", "two"],
@@ -876,3 +891,80 @@ def test_same_sha_distinct_saved_version_cannot_replace_literal_preparation_iden
     with pytest.raises(ValueError, match="literal saved version"):
         adoption.adoption_candidate(registered_setup.revision, folder)
     assert all(Path(path).read_bytes() == raw for path, raw in before.items())
+
+
+@pytest.mark.parametrize("fixture", [False, True])
+def test_photo_continuation_preserves_current_owned_basis_and_analysis_derivation(
+        registered_setup, tmp_path, fixture):
+    """Use current real admission; only the established tiny decoder is synthetic."""
+    from darsia.fluidflower import photo_edge_continuation as policy
+    prepared, version, session, frame, original = prepared_painting(
+        registered_setup, tmp_path, fixture=fixture, continuation=True)
+    assert prepared["format"] == adoption.PREPARATION_FORMAT_V2
+    assert "raw_shape_basis" in prepared["painting_geometry"]
+    assert prepared["approved_source"] == prepared["painting_facies"]
+    assert prepared["map_version"]["sha256"] == version["sha256"]
+    folder = Path(prepared["folder"])
+    assert policy.read_contracts(folder / "continuation.json")["runs"].keys() == {"one", "two"}
+    if fixture:
+        assert prepared["painting_analysis_derivation"]["carrier_sha256"] != prepared["painting_analysis_derivation"]["analysis_sha256"]
+        assert prepared["source_fixture_underlay"]
+    assert adoption.read_preparation(folder)["approved_source"] == prepared["approved_source"]
+    candidate, summary, revision = _saved(registered_setup, prepared)
+    for run in ("one", "two"):
+        bound = sources.registered_run_sources(registered_setup.project.root, revision, run)
+        assert bound["registration"]["kind"] == sources.PAINTED_V2
+        with np.load(bound["files"]["labels"]["path"], allow_pickle=True) as product:
+            assert {"inside", "continued", "effective_coverage", "gaps"} <= set(product.files)
+            assert not product["gaps"].any()
+            if run == "two":
+                assert product["continued"][:, 0].all()
+                assert not product["support"][:, 0].any()
+                assert product["effective_coverage"][:, 0].all()
+        _, _, _, exported = simulator_geometry.run_geometry(revision, run)
+        assert exported["photo_edge_continuation"]["adopted_by_this_export"] is False
+        if fixture:
+            assert exported.get("_drawn_fixture_underlay") is not None
+    assert summary["runs"] == ["one", "two"]
+
+
+def test_photo_continuation_reuses_only_an_unchanged_complete_native_proof(
+        registered_setup, tmp_path, monkeypatch):
+    from darsia.fluidflower import photo_edge_continuation as policy
+    prepared, *_ = prepared_painting(registered_setup, tmp_path, continuation=True)
+    folder = Path(prepared["folder"])
+    policy._NATIVE_PROOFS.clear()
+    original, calls = geometry_proof.verify_proof, []
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(geometry_proof, "verify_proof", observed)
+    first = policy.verify_native_proof(prepared, folder)
+    assert policy.verify_native_proof(prepared, folder) == first
+    assert len(calls) == 1, "Each per-run check reuses the same fully admitted all-run proof"
+    copied = folder / prepared["painting_geometry"]["baseline_configurations"]["two"]["copy"]["path"]
+    copied.write_bytes(copied.read_bytes() + b"\nchanged retained configuration\n")
+    with pytest.raises(ValueError):
+        policy.verify_native_proof(prepared, folder)
+    assert len(calls) == 2, "Any consumed-file drift forces the original admission again"
+
+
+def test_photo_continuation_memo_rehashes_original_raw_when_file_stamps_collide(
+        registered_setup, tmp_path, monkeypatch):
+    from darsia.fluidflower import photo_edge_continuation as policy
+    prepared, *_ = prepared_painting(registered_setup, tmp_path, continuation=True)
+    folder = Path(prepared["folder"])
+    policy._NATIVE_PROOFS.clear()
+    policy.verify_native_proof(prepared, folder)
+    cached = next(iter(policy._NATIVE_PROOFS.values()))
+    assert cached["checks"], "The memo retains the original finite metadata readers"
+    stamps = {str(Path(row["path"]).resolve()): row["stamp"]
+              for row in cached["dependencies"]["files"].values()}
+    original_stamp = contract._FILES.stamp
+    monkeypatch.setattr(contract._FILES, "stamp", lambda path:
+        stamps.get(str(Path(path).resolve()), original_stamp(path)))
+    raw = Path(prepared["approved_source"]["frame_basis"]["photograph"]["path"])
+    before = raw.read_bytes()
+    raw.write_bytes(bytes([before[0] ^ 1]) + before[1:])
+    with pytest.raises(ValueError, match="Shape-basis source changed"):
+        policy.verify_native_proof(prepared, folder)

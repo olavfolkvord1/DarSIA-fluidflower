@@ -728,6 +728,12 @@ def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict
     configuration = dict(revision.get("configuration") or revision)
     if configuration.get("coordinate_convention") != "origin_lower_left_x_right_y_up":
         raise ValueError("The geometry must be rig-corrected with its origin at the lower left")
+    continuation_row = next((row for row in (configuration.get("run_geometry") or {}).get("runs") or []
+        if str(row.get("run_id") or "").casefold() == str(run).casefold()
+        and (row.get("registration") or {}).get("kind") == "painted-map-placement-v2"), None)
+    if continuation_row is not None:
+        from ..geometry_raster_sources import canonical_parent_payload
+        canonical_parent_payload(configuration, run_id=run)
     artifacts = resolve_run_geometry_artifacts(revision, run) if "artifacts" in revision else {
         "scope": "series_reference", "labels_path": configuration.get("labels_path", "")}
     labels_path = str(artifacts.get("labels_path") or configuration.get("labels_path") or "")
@@ -745,8 +751,16 @@ def run_geometry(revision: dict, run: str) -> tuple[np.ndarray, dict, list, dict
                                   or (revision.get("artifacts") or {}).get("facies_properties_path"))
     source = {"scope": artifacts.get("scope"), "labels": PureWindowsPath(labels_path).name,
               "revision": revision.get("revision_id")}
+    if continuation_row is not None:
+        from ..photo_edge_continuation import load_contract, verify_product, POLICY
+        from ..geometry_raster_sources import _integer_map
+        registration = continuation_row["registration"]
+        contract = load_contract(registration["continuation"]["path"], str(run).casefold())
+        replay = verify_product(labels_path, _integer_map(registration["source_map"]["path"]), contract)
+        source["photo_edge_continuation"] = dict(policy=POLICY, **replay["counts"],
+            labels_with_masks=labels_path, adopted_by_this_export=False)
     if (configuration.get("painted_fixture_underlays")
-            or any((row.get("registration") or {}).get("kind") == "painted-map-placement-v1"
+            or any((row.get("registration") or {}).get("kind") in {"painted-map-placement-v1", "painted-map-placement-v2"}
                    for row in (configuration.get("run_geometry") or {}).get("runs") or [])):
         from ..layer_painting_fixtures import adopted_underlay
         underlay = adopted_underlay(configuration, run.casefold(), labels)

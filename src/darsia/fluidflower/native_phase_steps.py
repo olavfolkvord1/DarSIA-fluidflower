@@ -532,6 +532,10 @@ class NativePhaseSteps(QWidget):
         if isinstance(annotators, QWidget):
             _move(annotators, self.layouts[4])
         _move(studio.saved_sessions, self.layouts[4])
+        for name in ("refresh_review_sessions_button", "saved_sessions_status"):
+            control = getattr(studio, name, None)
+            if isinstance(control, QWidget):
+                _move(control, self.layouts[4])
         _move(studio.session_summary, self.layouts[4])
         _move(studio.resume_session_button, self.layouts[4])
         _move(studio.add_session_evidence, self.layouts[4])

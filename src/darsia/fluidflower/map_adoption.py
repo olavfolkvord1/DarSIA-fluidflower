@@ -40,7 +40,9 @@ import uuid
 import numpy as np
 
 PROVENANCE_FORMAT = "darsia-fluidflower-painted-placement-provenance-v1"
+PROVENANCE_FORMAT_V2 = "darsia-fluidflower-painted-placement-provenance-v2"
 PREPARATION_FORMAT = "darsia-fluidflower-painted-map-adoption-preparation-v1"
+PREPARATION_FORMAT_V2 = "darsia-fluidflower-painted-map-adoption-preparation-v2"
 FACIES_IDS_PENDING = "waits for the facies table of the map"
 
 
@@ -83,7 +85,7 @@ def placement_provenance(folder: Path | str) -> dict[str, Any]:
             }
         )
     version = dict(placement.get("map_version") or {})
-    return {
+    result = {
         "format": PROVENANCE_FORMAT,
         "placement": {"folder": str(folder), "index": _bound(folder / "index.json")},
         "reference_run": placement.get("reference_run"),
@@ -94,6 +96,11 @@ def placement_provenance(folder: Path | str) -> dict[str, Any]:
         "runs": runs,
         "incomplete_runs": incomplete,
     }
+    if placement.get("continuation") is not None:
+        result["format"] = PROVENANCE_FORMAT_V2
+        result["continuation"] = _bound(folder / "continuation.json")
+        result["approved_source"] = deepcopy(placement["approved_source"])
+    return result
 
 
 def map_facies(provenance: Mapping[str, Any]) -> list[str]:
@@ -195,6 +202,16 @@ def native_labels(
     )
 
 
+def native_with_continuation(layers, reference, target, *, contract):
+    """Keep the original native carrier, adding separately replayed coverage."""
+    from .photo_edge_continuation import apply_policy
+    if (contract.get("source_run") != reference.run_id or contract.get("target_run") != target.run_id
+            or contract.get("target_grid") != "native"):
+        raise ValueError("The continuation contract belongs to another native placement.")
+    labels, filled, support, composition = native_labels(layers, reference, target)
+    return apply_policy(layers, contract, labels=labels, filled=filled, support=support), composition
+
+
 def prepare_adoption(
     destination_root: Path | str,
     layers: np.ndarray,
@@ -214,6 +231,8 @@ def prepare_adoption(
     painting_version: Mapping[str, Any] | None = None,
     painting_frame: Any = None,
     painting_project: Any = None,
+    continuation: Mapping[str, Any] | None = None,
+    approved_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a new adoption preparation folder for every run; adopt nothing.
 
@@ -260,19 +279,43 @@ def prepare_adoption(
         raise ValueError(f"The geometry index has no model for the reference run {reference_run}")
     reference = geometries[reference_key]
     geometry_proof = None
+    basis_checks = {}
     if painting_binding is not None:
         from .painted_adoption_geometry import make_proof
         from .painted_adoption_table import _checked, _same
         selected = {reference_key, *(str(run).casefold() for run in runs)}
         model_bindings = {key: _bound(Path(geometries[key].source))
                           for key in sorted(selected) if key in geometries}
-        geometry_proof = make_proof(painting_binding, model_bindings)
+        geometry_proof = make_proof(painting_binding, model_bindings, basis_checks=basis_checks)
         if any(not _same(geometries[key].model, _checked(bound, metadata=True))
                for key, bound in model_bindings.items()):
             raise ValueError("A measured model changed between selection and source admission")
     layers = np.ascontiguousarray(layers, dtype=np.uint8)
     if reference.shape_hw is not None and layers.shape != reference.shape_hw:
         raise ValueError("The map is not on the reference run's grid")
+    original_grid = None
+    if continuation is not None:
+        from .photo_edge_continuation import verify_source, verify_placement_inputs
+        verify_source(approved_source, layers, continuation)
+        verify_placement_inputs(continuation, geometries, index_path, reference_key,
+            [str(run).casefold() for run in runs], "native")
+        if set(continuation) != {str(run).casefold() for run in runs}:
+            raise ValueError("Every newly prepared run needs its own continuation contract.")
+        if painting_binding is not None:
+            from .painted_adoption_table import _same
+            if not _same(painting_binding, approved_source):
+                raise ValueError("The continuation must bind the same exact current painting preparation.")
+        else:
+            # Retain the qualified explicit V2 route for historical callers.
+            from .painted_adoption_geometry import make_proof
+            model_bindings = {reference_key: _bound(Path(reference.source))}
+            model_bindings.update({str(run).casefold(): _bound(Path(geometries[str(run).casefold()].source)) for run in runs})
+            geometry_proof = make_proof(approved_source, model_bindings, basis_checks=basis_checks)
+            from .geometry_facies import _darsia_metadata, _load_array
+            revision = json.loads(Path(approved_source["frame_basis"]["workspace_revision"]["path"]).read_bytes())
+            original = revision["configuration"]["canonical_import_parent"]["imported_configuration"]["labels_path"]
+            original_grid = dict(source=_bound(Path(original)), metadata=_darsia_metadata(Path(original)),
+                                 shape_hw=list(_load_array(Path(original)).shape))
     if fixture_underlay is not None:
         if painting_binding is not None:
             from .painted_adoption_table import checked_fixture_analysis
@@ -296,10 +339,13 @@ def prepare_adoption(
     folder.mkdir(parents=True, exist_ok=False)
     if geometry_proof is not None:
         from .painted_adoption_geometry import write_configuration_copies, basis_label_fields
-        write_configuration_copies(folder, geometry_proof)
-        basis_labels = basis_label_fields(painting_binding, geometry_proof, None, folder)
+        write_configuration_copies(folder, geometry_proof, basis_checks=basis_checks)
+        basis_labels = basis_label_fields(painting_binding or approved_source, geometry_proof, None, folder)
     else:
         basis_labels = None
+    if continuation is not None:
+        from .photo_edge_continuation import save_contracts
+        save_contracts(folder / "continuation.json", continuation)
     # The map itself and its approval, bound for the Store's replay.
     np.savez_compressed(folder / "source_map.npz", array=layers)
     if fixture_underlay is not None:
@@ -320,6 +366,12 @@ def prepare_adoption(
             continue
         try:
             labels, filled, support, composition = native_labels(layers, reference, target)
+            classified = None
+            if continuation is not None:
+                classified, replayed = native_with_continuation(layers, reference, target,
+                    contract=continuation[run])
+                if replayed != composition:
+                    raise ValueError("The new native placement changed the original composition.")
         except ValueError as error:
             rows.append({"run_id": run, "status": "no native grid", "error": str(error)})
             continue
@@ -327,6 +379,12 @@ def prepare_adoption(
             current = dict(basis_labels[run])
         else:
             current = dict(current_labels(run) or {}) if current_labels is not None else {}
+        if original_grid is not None:
+            from .geometry_raster_sources import _same_grid_metadata
+            if (current.get("source") != original_grid["source"]
+                    or current.get("shape_hw") != original_grid["shape_hw"]
+                    or not _same_grid_metadata(current.get("metadata"), original_grid["metadata"])):
+                raise ValueError("The V2 native labels need the exact imported parent's grid metadata and source.")
         if current.get("shape_hw") and tuple(current["shape_hw"]) != labels.shape:
             rows.append(
                 {
@@ -340,13 +398,11 @@ def prepare_adoption(
         run_folder = folder / run
         run_folder.mkdir()
         path = run_folder / "labels.npz"
-        np.savez_compressed(
-            path,
-            array=labels.astype(np.int32),
-            metadata=dict(current.get("metadata") or {}),
-            filled=filled,
-            support=support,
-        )
+        fields = dict(array=labels.astype(np.int32), metadata=dict(current.get("metadata") or {}),
+                      filled=filled, support=support)
+        if classified is not None:
+            fields.update({key: classified[key] for key in ("inside", "continued", "effective_coverage", "gaps")})
+        np.savez_compressed(path, **fields)
         underlay_fields = {}
         if fixture_underlay is not None:
             from .layer_painting_fixtures import project_underlay, save_underlay
@@ -375,6 +431,9 @@ def prepare_adoption(
                 "current_labels": current.get("source"),
             }
         )
+        if classified is not None:
+            rows[-1]["continuation"] = dict(classified["counts"], contract_run=run,
+                authority=continuation[run]["frame_authority"]["kind"])
     regions = [
         {
             "layer_id": int(layer),
@@ -392,8 +451,11 @@ def prepare_adoption(
     without = sorted({row["facies"] for row in regions if row["facies"] and row["facies_id"] is None})
     if without and painting_binding is None:
         blockers.append(f"No facies id for: {', '.join(without)} ({FACIES_IDS_PENDING}).")
+    if continuation is not None:
+        from .photo_edge_continuation import verify_capture
+        verify_capture(continuation)
     index = {
-        "format": PREPARATION_FORMAT,
+        "format": PREPARATION_FORMAT if continuation is None else PREPARATION_FORMAT_V2,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "reference_run": reference_key,
         "map_version": dict(version),
@@ -421,6 +483,16 @@ def prepare_adoption(
         proof = prepare_outside_proof(folder, painting_binding, rows)
         if proof is not None:
             index["outside_frame_proof"] = proof
+    if continuation is not None:
+        from .photo_edge_continuation import POLICY
+        index["continuation"] = dict(policy=POLICY, file="continuation.json",
+            **{key: value for key, value in _bound(folder / "continuation.json").items() if key != "path"}, adopted=False)
+        index["approved_source"] = deepcopy(dict(approved_source))
+        index["painting_geometry"] = geometry_proof
+        from .photo_edge_continuation import verify_native_proof
+        verify_source(approved_source, layers, continuation,
+            preparation=index if painting_binding is not None else None, folder=folder)
+        verify_native_proof(index, folder)
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if painting_binding is not None:
@@ -435,8 +507,52 @@ def read_preparation(folder: Path | str) -> dict[str, Any]:
 
     folder = Path(folder)
     index = json.loads((folder / "index.json").read_text(encoding="utf-8"))
-    if index.get("format") != PREPARATION_FORMAT:
+    if index.get("format") not in {PREPARATION_FORMAT, PREPARATION_FORMAT_V2}:
         raise ValueError(f"{folder} is not an adoption preparation folder")
+    if index.get("format") == PREPARATION_FORMAT_V2:
+        from .photo_edge_continuation import POLICY, read_contracts, validate_contract, verify_product, verify_source, verify_native_proof
+        from .geometry_raster_sources import _integer_map
+        continuation = index.get("continuation") or {}
+        sidecar = folder / "continuation.json"
+        actual = _bound(sidecar)
+        if (continuation.get("policy") != POLICY or continuation.get("file") != sidecar.name
+                or continuation.get("adopted") is not False
+                or any(continuation.get(key) != actual[key] for key in ("sha256", "size_bytes"))):
+            raise ValueError("The native continuation sidecar changed.")
+        source = folder / "source_map.npz"
+        source_bound = index.get("source_map") or {}
+        actual_source = _bound(source)
+        if source_bound.get("path") != source.name or any(source_bound.get(k) != actual_source[k] for k in ("sha256", "size_bytes")):
+            raise ValueError("The V2 preparation source map changed.")
+        original = _integer_map(source)
+        captured = read_contracts(sidecar)["runs"]
+        contracts = {}
+        for row in index.get("runs") or []:
+            if row.get("status") != "prepared":
+                continue
+            run = row["run_id"]
+            contract = captured.get(run)
+            validate_contract(contract, verify_files=True)
+            if contract["target_grid"] != "native":
+                raise ValueError("The V2 preparation is not on the native label grid.")
+            summary = row.get("continuation") or {}
+            if (summary.get("contract_run") != run or
+                    summary.get("authority") != contract["frame_authority"]["kind"]):
+                raise ValueError("The V2 native continuation has another run or frame authority.")
+            path = folder / run / "labels.npz"
+            bound = row.get("labels") or {}
+            actual_labels = _bound(path)
+            if bound.get("path") != f"{run}/labels.npz" or any(bound.get(k) != actual_labels[k] for k in ("sha256", "size_bytes")):
+                raise ValueError("The V2 prepared labels changed.")
+            verify_product(path, original, contract, counts=row.get("continuation"))
+            contracts[run] = contract
+        verify_source(index.get("approved_source"), original, contracts,
+            preparation=index if "painting_facies" in index else None, folder=folder)
+        if (index.get("approval") != index["approved_source"]["approval"]
+                or (index.get("map_version") or {}).get("sha256") != index["approval"].get("sha256")
+                or (index.get("map_version") or {}).get("approval") != index["approval"]):
+            raise ValueError("The V2 preparation approval differs from its approved-version closure.")
+        verify_native_proof(index, folder)
     return dict(index, folder=str(folder))
 
 
@@ -572,7 +688,7 @@ def adoption_candidate(
                 "labels_path": str(labels.resolve()),
                 "source_image_path": str(photograph.get("path") or ""),
                 "registration": {
-                    "kind": sources.PAINTED,
+                    "kind": sources.PAINTED if preparation["format"] == PREPARATION_FORMAT else sources.PAINTED_V2,
                     "parent_revision_id": parent["revision_id"],
                     "status": "painted",
                     "authority": authority,
@@ -587,6 +703,8 @@ def adoption_candidate(
                 },
             }
         )
+        if preparation["format"] == PREPARATION_FORMAT_V2:
+            rows[-1]["registration"]["continuation"] = _bound(folder / "continuation.json")
     config["run_geometry"] = dict(config.get("run_geometry") or {}, runs=rows)
     config["labels_path"] = str((folder / prepared[display]["labels"]["path"]).resolve())
     config["regions"] = regions
@@ -630,13 +748,16 @@ def adoption_candidate(
 __all__ = [
     "FACIES_IDS_PENDING",
     "PREPARATION_FORMAT",
+    "PREPARATION_FORMAT_V2",
     "PROVENANCE_FORMAT",
+    "PROVENANCE_FORMAT_V2",
     "adoption_blockers",
     "adoption_candidate",
     "facies_table",
     "label_values",
     "map_facies",
     "native_labels",
+    "native_with_continuation",
     "native_transport",
     "placement_provenance",
     "prepare_adoption",

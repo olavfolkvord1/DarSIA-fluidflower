@@ -3209,6 +3209,25 @@ class _ManualMapWorker(QObject):
         self.finished.emit(result)
 
 
+def _new_placement_contracts(record, frame, options, session, layers, *, grid):
+    """GUI metadata-worker capture; old programmatic callers keep V1."""
+    if not options.get("continue_photo_edges"):
+        return None, None
+    from .painting_frame_models import verify_frame_model_selection
+    from .photo_edge_continuation import build_contracts
+    from .painted_adoption_table import capture_version
+    verify_frame_model_selection(options["geometry_selection"])
+    project = options["continuation_project"]
+    approved = capture_version(record, options.get("approval"), frame, layers, project=project)
+    from .painting_run_preview import read_preview_geometry
+    models, _binding = read_preview_geometry(options["geometry_index"])
+    requested = options.get("continuation_runs", options["runs"])
+    contracts = build_contracts(project, options["geometry_index"], session.run_id,
+        [str(run).casefold() for run in requested if str(run).casefold() in models], [layer.layer_id for layer in session.layers], target_grid=grid)
+    verify_frame_model_selection(options["geometry_selection"])
+    return contracts, approved
+
+
 class _AdoptionWorker(QObject):
     """Prepare the adoption of an approved map version on every run's label
     grid (a preparation folder only; nothing is adopted)."""
@@ -3238,6 +3257,8 @@ class _AdoptionWorker(QObject):
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
+            continuation, approved = _new_placement_contracts(self.record, self.frame,
+                dict(self.options, continuation_runs=cohort["runs"]), session, layers, grid="native")
             fixture_options = {}
             if any(session.facies_of(row.layer_id).role == "colorchecker" for row in session.layers):
                 from .layer_painting_fixtures import version_fixture_underlay
@@ -3268,6 +3289,7 @@ class _AdoptionWorker(QObject):
                 painting_version=self.record,
                 painting_frame=self.frame,
                 painting_project=self.options.get("project"),
+                continuation=continuation, approved_source=approved,
             )
             verify_adoption_cohort(cohort)
             if any(result['geometry_index'].get(key) != val for key, val in cohort['geometry_index'].items()):
@@ -3302,6 +3324,8 @@ class _PlacementWorker(QObject):
             self.progress.emit("Drawing the approved map at full resolution…")
             version_layers = lpp.version_layers if self.record.get("proposal_method") == lpp.METHOD else lpm.version_layers
             session, layers = version_layers(self.record, frame=self.frame)
+            continuation, approved = _new_placement_contracts(self.record, self.frame, self.options,
+                session, layers, grid="camera_u")
             roles = {
                 row.layer_id: session.facies_of(row.layer_id).role for row in session.layers
             }
@@ -3322,6 +3346,7 @@ class _PlacementWorker(QObject):
                 | ({"proposal_method": lpp.METHOD} if self.record.get("proposal_method") == lpp.METHOD else {})
                 | {"approval": self.options.get("approval")},
                 first_runs=self.options.get("first_runs") or (),
+                continuation=continuation, approved_source=approved,
                 progress=self.progress.emit,
             )
             verify_frame_model_selection(self.options.get("geometry_selection"))
@@ -7603,6 +7628,7 @@ class LayerPainterView(QWidget):
             path,
             runs=runs,
             first_runs=[part.strip() for part in first.split(",") if part.strip()],
+            continue_photo_edges=True,
         )
 
     def place_version(
@@ -7613,6 +7639,7 @@ class LayerPainterView(QWidget):
         runs: Sequence[str] | None = None,
         first_runs: Sequence[str] = (),
         photo_loader: Callable[..., np.ndarray] | None = None,
+        continue_photo_edges: bool = False,
     ) -> bool:
         """Start placing an approved version in all runs; False when it cannot
         start (the note says why). ``first_runs`` are reviewed right after
@@ -7652,6 +7679,8 @@ class LayerPainterView(QWidget):
                 "photo_loader": photo_loader or self._reference_photo_loader(),
                 "approval": approval,
                 "first_runs": list(first_runs),
+                **({"continue_photo_edges": True, "continuation_project": deepcopy(self.project)}
+                   if continue_photo_edges else {}),
             },
         )
         worker.moveToThread(thread)
@@ -7847,6 +7876,7 @@ class LayerPainterView(QWidget):
         *,
         runs: Sequence[str] | None = None,
         current_labels: Callable[[str], Mapping[str, Any] | None] | None = None,
+        continue_photo_edges: bool = False,
     ) -> bool:
         """Start preparing an approved version's adoption on every run's label
         grid; False when it cannot start (the note says why)."""
@@ -7856,6 +7886,17 @@ class LayerPainterView(QWidget):
             self.versions_note.setText("Approve the version before preparing its adoption.")
             return False
         from copy import deepcopy
+
+        continuation_options = {}
+        if continue_photo_edges:
+            from .painting_frame_models import capture_frame_model_selection
+            try:
+                selection = capture_frame_model_selection(self.project, override_path=str(geometry_index))
+            except ValueError as error:
+                self.versions_note.setText(str(error))
+                return False
+            continuation_options = dict(continue_photo_edges=True,
+                continuation_project=deepcopy(self.project), geometry_selection=selection)
 
         thread = QThread(self)
         worker = _AdoptionWorker(
@@ -7869,6 +7910,7 @@ class LayerPainterView(QWidget):
                 "approval": self._approval_for_version(record),
                 "current_labels": current_labels or self._current_label_fields(),
                 "project": self.project,
+                **continuation_options,
             },
         )
         worker.moveToThread(thread)

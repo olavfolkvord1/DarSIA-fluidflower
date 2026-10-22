@@ -859,7 +859,7 @@ def canonical_payload(config, parent, payload, *, run_id=None):
             or str(config.get("facies_properties_source_path")) != str(parent["imported_configuration"].get("facies_properties_source_path"))):
         raise ValueError("Explicit painted-adoption table contract and unchanged imported source required")
     preparation = _checked(contract["preparation"], metadata=True)
-    if (not isinstance(preparation, dict) or preparation.get("format") != sources.PAINTED_PREPARATION
+    if (not isinstance(preparation, dict) or preparation.get("format") not in {sources.PAINTED_PREPARATION, sources.PAINTED_PREPARATION_V2}
             or PREPARATION_KEY not in preparation):
         raise ValueError("The facies table lacks its exact approved-painting preparation")
     folder = Path(contract["preparation"]["path"]).parent
@@ -884,9 +884,10 @@ def canonical_payload(config, parent, payload, *, run_id=None):
         raise ValueError("Painted adoption run rows differ from their bound preparation")
     authority = _bound(folder / "approval.json")
     source_map = _local(folder, preparation["source_map"])
+    expected_kind = sources.PAINTED_V2 if preparation["format"] == sources.PAINTED_PREPARATION_V2 else sources.PAINTED
     for row in rows:
         record = row.get("registration") or {}
-        if (record.get("kind") != sources.PAINTED or not _same(record.get("measurement"), contract["preparation"])
+        if (record.get("kind") != expected_kind or not _same(record.get("measurement"), contract["preparation"])
                 or not _same(record.get("authority"), authority) or not _same(record.get("source_map"), source_map)):
             raise ValueError("Automatic facies apply only to their exact painted run registration")
     sources._validate_registered_runs(config, payload, parent, run_id=run_id)
