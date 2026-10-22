@@ -212,6 +212,23 @@ def test_existing_output_is_never_reused_or_overwritten(case):
     assert marker.read_bytes() == b"retained failed or completed namespace"
 
 
+def test_geometry_output_cannot_overlap_actual_aliased_metadata_folder(case):
+    args = case.seal()
+    logical = args["phase_configuration"]
+    original = Path(logical["path"]).read_bytes()
+    folder = case.output.parent / "aliased_geometry_metadata"
+    folder.mkdir()
+    physical = folder / "phase.json"
+    physical.write_bytes(original)
+    args["reader"] = DataReader(aliases=[dict(logical=logical, physical=asset(physical))])
+    args["output"] = folder / "new_geometry"
+    with pytest.raises(ValueError, match="overlaps its source folders"):
+        prepare_geometry_data(**args)
+    assert not args["output"].exists()
+    assert physical.read_bytes() == original
+    assert Path(logical["path"]).read_bytes() == original
+
+
 def test_old_audit_without_original_producer_configuration_join_refuses(case):
     args = case.seal()
     collection = case.reader.json(args["old_acquisition_collection"])

@@ -39,6 +39,50 @@ def prepare_geometry_data(*, old_geometry, old_raw_audit, old_acquisition_collec
     remain unchanged; the output retains their scope and the exact coordinate
     transport separately. The caller still owns scientific qualification.
     """
+    context = _coordinate_context(old_geometry=old_geometry, old_raw_audit=old_raw_audit,
+        old_acquisition_collection=old_acquisition_collection, old_native_configuration=old_native_configuration,
+        new_bridge_frame=new_bridge_frame, native_configuration=native_configuration,
+        phase_configuration=phase_configuration, phase_shape_hw=phase_shape_hw, reader=reader)
+    reader, inputs, row = (context[key] for key in ("reader", "inputs", "row"))
+    reference, shape, origin, transform = (context[key] for key in ("reference", "shape", "origin", "transform"))
+    native = context["native"]
+    top, curve_binding = _photographic_inputs(context)
+    inputs["top_curve"] = deepcopy(curve_binding)
+    curve = reader.array(curve_binding)
+    keep, _ = top_curve_mask(curve, reference, shape, origin)
+    result = _transported_row(context)
+    # Recheck actual consumed source descriptors before the first output. The
+    # RAW itself and old/new image rasters are not consumed by this DATA adapter.
+    consumed_paths = [reader.path(binding) for binding in inputs.values()]
+    output = Path(output)
+    from ..job_filesystem import inspect_local_file
+    from ..rig_raw_write import _no_links
+    if not output.is_absolute() or output.exists() or not inspect_local_file(output / ".geometry-data-location").allowed:
+        raise ValueError("Geometry DATA needs one fresh positively local output folder")
+    _no_links(output.parent)
+    protected_paths = consumed_paths + [Path(binding["path"]) for binding in inputs.values()]
+    if any(output.resolve() == path.resolve().parent
+           or output.resolve().is_relative_to(path.resolve().parent)
+           for path in protected_paths):
+        raise ValueError("Geometry DATA output overlaps its source folders")
+    output.mkdir()
+    produced_top = _write_npz(output / "photo_top.npz", dict(top_keep=keep))
+    result["frame_photo_top_keep"] = dict(top, **produced_top, array_key="top_keep", shape_hw=shape)
+    result["coordinate_transport"] = dict(inputs=inputs,
+        old_native_to_new_native_h=transform.tolist(), producer=asset(Path(__file__)),
+        scope="same-acquisition coordinate DATA only; original independent QA and uncertainty unchanged")
+    for binding in inputs.values():
+        reader.path(binding)
+    geometry = _write_json(output / "geometry.json", result)
+    return dict(geometry=geometry, frame_photo_top_keep=result["frame_photo_top_keep"],
+                phase_roles=dict(current_h=deepcopy(native["baseline_to_native_h"]),
+                                 reference_to_current_h=deepcopy(native["reference_to_native_h"])))
+
+
+def _coordinate_context(*, old_geometry, old_raw_audit, old_acquisition_collection,
+                        old_native_configuration, new_bridge_frame, native_configuration,
+                        phase_configuration, phase_shape_hw, reader=None):
+    """Re-admit the original RAW coordinate graph without reading image/curve bodies."""
     reader = DataReader() if reader is None else reader
     inputs = {}
 
@@ -156,6 +200,14 @@ def prepare_geometry_data(*, old_geometry, old_raw_audit, old_acquisition_collec
             or not source._same_h(homography(native["baseline_to_native_h"]),
                                   homography(now["H_v5_B_to_frame_native"]), parameters=parameters)):
         raise ValueError("Coordinate-only geometry and measured current RAW reference transforms disagree")
+    return dict(reader=reader, inputs=inputs, document=document, row=row, old=old, now=now, native=native,
+        previous=previous, current=current, phase=phase, transform=transform, reference=reference,
+        reference_field=reference_field, shape=shape, origin=origin, box=box, native_shape=native_shape)
+
+
+def _photographic_inputs(context):
+    """Retain the original independent observation checks, without curve decoding."""
+    row, document = context["row"], context["document"]
     # No inferred geometry or old safe-sand complement may supply missing walls,
     # fixtures or the independently photographed surface.
     if (not isinstance(row.get("boundary_evidence"), str) or not row["boundary_evidence"]
@@ -180,9 +232,15 @@ def prepare_geometry_data(*, old_geometry, old_raw_audit, old_acquisition_collec
             or not _same(evidence["curve"], curve_binding)
             or not isinstance(evidence.get("photographic_definition"), str)):
         raise ValueError("The original independently photographed top curve is required")
-    inputs["top_curve"] = deepcopy(curve_binding)
-    curve = reader.array(curve_binding)
-    keep, _ = top_curve_mask(curve, reference, shape, origin)
+    return top, curve_binding
+
+
+def _transported_row(context):
+    """Keep the original producer's exact independent coordinate updates."""
+    row, reference_field, reference, transform = (context[key] for key in
+        ("row", "reference_field", "reference", "transform"))
+    origin, shape, native_shape, box, phase = (context[key] for key in
+        ("origin", "shape", "native_shape", "box", "phase"))
     result = deepcopy(row)
     result[reference_field] = reference.tolist()
     result["area_parameters"][reference_field] = reference.tolist()
@@ -194,29 +252,51 @@ def prepare_geometry_data(*, old_geometry, old_raw_audit, old_acquisition_collec
     result.update(native_origin_xy=deepcopy(origin), phase_shape_hw=shape,
                   source_native_shape_hw=deepcopy(native_shape), source_content_box_xywh=deepcopy(box),
                   photograph_canvas_wh=deepcopy(phase["parameters"]["scientific"]["photograph_canvas_wh"]))
-    # Recheck actual consumed source descriptors before the first output. The
-    # RAW itself and old/new image rasters are not consumed by this DATA adapter.
-    for binding in inputs.values():
+    return result
+
+
+def _read_geometry_transport(geometry, *, reader=None):
+    """Check saved coordinate DATA against the same original metadata-only joins.
+
+    This shared producer input reader never decodes the RAW, top curve/mask or
+    physical rasters. It grants no new photographic or physical qualification.
+    """
+    reader = DataReader() if reader is None else reader
+    row = reader.json(_bound(geometry))
+    transport = row["coordinate_transport"]
+    declared = transport["inputs"]
+    names = ("old_geometry", "old_raw_audit", "old_acquisition_collection", "old_native_configuration",
+             "new_bridge_frame", "native_configuration", "phase_configuration")
+    context = _coordinate_context(**{key: declared[key] for key in names},
+        phase_shape_hw=row["phase_shape_hw"], reader=reader)
+    _photographic_inputs(context)
+    expected = _transported_row(context)
+    if (not _same(transport["old_native_to_new_native_h"], context["transform"].tolist())
+            or not _same({key: value for key, value in row.items()
+                          if key not in ("coordinate_transport", "frame_photo_top_keep")},
+                         {key: value for key, value in expected.items() if key != "frame_photo_top_keep"})):
+        raise ValueError("Saved geometry differs from its original admitted RAW coordinate transport")
+    top = row["frame_photo_top_keep"]
+    original_top = expected["frame_photo_top_keep"]
+    replaced = ("path", "sha256", "size_bytes", "array_key", "shape_hw")
+    if (not _same({key: value for key, value in top.items() if key not in replaced},
+                  {key: value for key, value in original_top.items() if key not in replaced})
+            or top.get("array_key") != "top_keep" or top.get("shape_hw") != context["shape"]):
+        raise ValueError("Saved geometry changed its original photograph-top source metadata")
+    for key, binding in context["inputs"].items():
+        if not _same(binding, declared.get(key)):
+            raise ValueError("Saved geometry source graph differs from its original RAW inputs")
+    original = context["row"]
+    inherited = dict(hardware_pose=original["hardware_pose_receipt"],
+        top_photo_evidence=original_top["reference_photo_evidence"], top_curve=original_top["curve_source"])
+    if (set(declared) != set(context["inputs"]) | set(inherited)
+            or any(not _same(declared[key], value) for key, value in inherited.items())):
+        raise ValueError("Saved geometry changed its original independent source bindings")
+    # Recheck consumed metadata only. The saved geometry already retains every
+    # curve/mask descriptor; downstream area/static producers do not consume
+    # those array bodies and must not decode or hash them to re-admit coordinates.
+    context["inputs"].update(geometry=deepcopy(geometry), geometry_producer=deepcopy(transport["producer"]))
+    for binding in context["inputs"].values():
         reader.path(binding)
-    output = Path(output)
-    from ..job_filesystem import inspect_local_file
-    from ..rig_raw_write import _no_links
-    if not output.is_absolute() or output.exists() or not inspect_local_file(output / ".geometry-data-location").allowed:
-        raise ValueError("Geometry DATA needs one fresh positively local output folder")
-    _no_links(output.parent)
-    if any(output.resolve() == Path(binding["path"]).resolve().parent
-           or output.resolve().is_relative_to(Path(binding["path"]).resolve().parent)
-           for binding in inputs.values()):
-        raise ValueError("Geometry DATA output overlaps its source folders")
-    output.mkdir()
-    produced_top = _write_npz(output / "photo_top.npz", dict(top_keep=keep))
-    result["frame_photo_top_keep"] = dict(top, **produced_top, array_key="top_keep", shape_hw=shape)
-    result["coordinate_transport"] = dict(inputs=inputs,
-        old_native_to_new_native_h=transform.tolist(), producer=asset(Path(__file__)),
-        scope="same-acquisition coordinate DATA only; original independent QA and uncertainty unchanged")
-    for binding in inputs.values():
-        reader.path(binding)
-    geometry = _write_json(output / "geometry.json", result)
-    return dict(geometry=geometry, frame_photo_top_keep=result["frame_photo_top_keep"],
-                phase_roles=dict(current_h=deepcopy(native["baseline_to_native_h"]),
-                                 reference_to_current_h=deepcopy(native["reference_to_native_h"])))
+    context["geometry"] = row
+    return context

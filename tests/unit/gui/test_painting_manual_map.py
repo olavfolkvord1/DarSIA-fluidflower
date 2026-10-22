@@ -263,7 +263,13 @@ def test_an_approved_manual_map_is_placed_as_drawn_but_unbound_adoption_is_refus
         return {"metadata": {"run": run}, "shape_hw": [55, 80], "source": {"path": f"{run}.npz"}}
 
     assert view.prepare_adoption_of(record, index, runs=["ac52"], current_labels=current)
-    qtbot.waitUntil(lambda: not view.busy(), timeout=30000)
+    # Native thread exit can precede delivery of the queued GUI refusal/retirement.
+    qtbot.waitUntil(
+        lambda: view._adoption_thread is None
+        and not view.busy()
+        and "The rigs need their RAW basis before the map can be adopted" in view.use_map_progress.text(),
+        timeout=30000,
+    )
     # This placement-only fixture has no Store/source/profile/renderer proof.
     # A matrix with the right dimensions cannot authorize native adoption.
     assert view.last_adoption is None
