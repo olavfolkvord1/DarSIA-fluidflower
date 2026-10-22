@@ -7,7 +7,7 @@ import pytest
 
 
 def test_review_undo_tracks_real_annotations_and_retains_draft_semantics(qtbot):
-    """Empty, add and Undo use the actual renderer, button and recovery draft."""
+    """Keep actual editing controls visible while preserving Undo and drafts."""
     core = pytest.importorskip("PySide6.QtWebEngineCore")
     widgets = pytest.importorskip("PySide6.QtWebEngineWidgets")
     from PySide6.QtCore import QUrl
@@ -54,6 +54,8 @@ def test_review_undo_tracks_real_annotations_and_retains_draft_semantics(qtbot):
         })""")
 
     try:
+        view.resize(1780, 1000)
+        view.show()
         with qtbot.waitSignal(view.loadFinished, timeout=15000) as loaded:
             view.setHtml(html, QUrl("about:blank"))
         assert loaded.args == [True]
@@ -78,6 +80,30 @@ def test_review_undo_tracks_real_annotations_and_retains_draft_semantics(qtbot):
         added = state()
         assert not added["disabled"] and added["title"] == "Remove the most recently added annotation"
         assert added["annotations"] == added["listed"] == added["draft"] == added["storedDraft"] == 1
+        for width, height, columns in ((1280, 900, 2), (1780, 1000, 7)):
+            view.resize(width, height)
+            qtbot.waitUntil(lambda: evaluate("innerWidth") == width, timeout=10000)
+            layout = evaluate(r"""(() => {
+              const editor=byId('annotationEditor');
+              editor.scrollIntoView({block:'center'});
+              return {
+                active:editor.classList.contains('visible'),
+                columns:getComputedStyle(editor).gridTemplateColumns.split(/\s+/).length,
+                viewport:document.documentElement.clientWidth,
+                document:document.documentElement.scrollWidth,
+                height:innerHeight,
+                controls:[editor,byId('deleteBox')].map(element=>{
+                  const r=element.getBoundingClientRect();
+                  return {id:element.id,left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height};
+                })
+              };
+            })()""")
+            assert layout["active"] and layout["columns"] == columns, layout
+            assert layout["document"] <= layout["viewport"], layout
+            for control in layout["controls"]:
+                assert control["width"] > 0 and control["height"] > 0, layout
+                assert 0 <= control["left"] <= control["right"] <= layout["viewport"] + 1, layout
+                assert 0 <= control["top"] <= control["bottom"] <= layout["height"] + 1, layout
         assert evaluate("""(() => {
           byId('undoBox').click();
           return annotations.length;

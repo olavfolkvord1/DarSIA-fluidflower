@@ -86,6 +86,44 @@ def test_mixed_and_image_only_job_views_preserve_image_progress(qtbot, tmp_path)
     assert panel.can_close()
 
 
+def test_setup_explains_missing_machine_statistics_and_keeps_operation_and_claim_rows(qtbot, tmp_path):
+    """Switching pipelines restores frame statistics without inventing Setup rates."""
+    panel = JobsPanel(local_machine="fixture")
+    qtbot.addWidget(panel)
+    setup, image = _setup(tmp_path / "setup-job"), _image(tmp_path / "image-job")
+    setup["runs"][2]["state"] = "Claimed (liveness not established)"
+    setup["workers"] = [dict(machine="fixture-cpu", worker="PID 42", run="run-b",
+        state="Claimed (liveness not established)", last_progress_utc="Not reported", error="")]
+    image["machines"] = [dict(machine="fixture", committed=1, frames_per_minute=2.5,
+        eta_seconds=60, rate_scope="Published image receipts")]
+    _ready(panel, [setup, image])
+    assert panel.machine_progress_note.wordWrap()
+    assert panel.machine_progress_note.textFormat() == ui.Qt.TextFormat.PlainText
+    for index in (0, 1, 0):
+        panel.job_table.selectRow(index)
+        if index == 0:
+            assert panel.machine_table.isHidden()
+            assert not panel.machine_progress_note.isHidden()
+            assert panel.machine_progress_note.text() == (
+                "Per-machine operation counts, throughput and ETA are not recorded.")
+            assert "Completed operations: 1 / 3" in panel.progress_label.text()
+            assert "Remaining operations: 2" in panel.progress_label.text()
+            assert not panel.operation_label.isHidden()
+            assert "Build run model · run-b: Claimed (liveness not established)" in panel.operation_label.text()
+            assert not panel.worker_table.isHidden() and panel.worker_table.rowCount() == 1
+            assert [panel.worker_table.item(0, column).text() for column in range(6)] == [
+                "fixture-cpu", "PID 42", "run-b", "Claimed (liveness not established)", "Not reported", ""]
+        else:
+            assert not panel.machine_table.isHidden()
+            assert panel.machine_progress_note.isHidden()
+            assert panel.machine_table.horizontalHeaderItem(1).text() == "Committed frames"
+            assert [panel.machine_table.item(0, column).text() for column in range(5)] == [
+                "fixture", "1", "2.50 frames/min", "1.0 min", "Published image receipts"]
+            assert "Committed images: 1" in panel.progress_label.text()
+            assert panel.worker_table.rowCount() == 0
+    assert panel.can_close()
+
+
 @pytest.mark.parametrize("job_kind", ["image", "setup"])
 @pytest.mark.parametrize("transport", ["local", "ssh"])
 def test_selected_pipeline_controls_and_launch_feedback_use_its_progress_unit(

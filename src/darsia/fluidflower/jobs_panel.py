@@ -1251,6 +1251,9 @@ class JobsPanel(QWidget):
         self.control_note = _label(CONTROL_BOUNDARY + " " + REMOTE_GAP)
         detail_layout.addWidget(self.control_note)
         self.backend_combo.currentIndexChanged.connect(self._target_changed)
+        self.machine_progress_note = _label("Per-machine operation counts, throughput and ETA are not recorded.")
+        self.machine_progress_note.hide()
+        progress_layout.addWidget(self.machine_progress_note)
         self.machine_table = _table(
             ["Machine", "Committed frames", "Average throughput", "ETA", "Scope"]
         )
@@ -1766,6 +1769,8 @@ class JobsPanel(QWidget):
             f"{stages.get(row.get('operation'), 'Setup operation')} · {row['run']}: {row['state']}"
             for row in (data or {}).get("runs", [])
         ) if self._is_setup_job(data) else "")
+        self.machine_table.setVisible(not self._is_setup_job(data))
+        self.machine_progress_note.setVisible(self._is_setup_job(data))
         self.machine_table.setRowCount(len((data or {}).get("machines", [])))
         for row, facts in enumerate((data or {}).get("machines", [])):
             _fill(

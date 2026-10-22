@@ -6713,7 +6713,7 @@ body.space-pan .frame-shell { cursor:grab; }
 .save-indicator.error { background:#bd443b; }
 .status { min-width:0; overflow-wrap:anywhere; }
 .reveal { margin-top:10px; padding:10px; border:1px solid #b8c0c3; background:#f7f8f8; display:none; white-space:pre-wrap; font:12px/1.45 Consolas,monospace; }
-@media (max-width:1250px) { .annotation-editor{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@media (max-width:1400px) { .annotation-editor{grid-template-columns:repeat(2,minmax(0,1fr))} }
 @media (max-width:1000px) { .shell{grid-template-columns:1fr} aside{max-height:none;border-right:0;border-bottom:1px solid var(--line)} .run-list{grid-template-columns:repeat(8,1fr)} .comparison{grid-template-columns:1fr} .tool-group{width:100%;flex-wrap:wrap;border-right:0;padding-right:0}.inspection-tools select{max-width:100%}.annotation-summary{min-width:0}.video-tools{grid-template-columns:auto minmax(120px,1fr) auto}.time{grid-column:1/-1;text-align:left}.frame-readout{min-width:0} }
 @media (max-width:620px) { .video-tools{grid-template-columns:auto 1fr}.frame-readout{grid-column:1/-1;justify-content:space-between}.time{grid-column:1/-1} }
 </style>
