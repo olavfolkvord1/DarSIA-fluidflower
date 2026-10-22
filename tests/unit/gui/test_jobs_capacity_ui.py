@@ -1,6 +1,7 @@
 """Explicit asynchronous expected-space display; no actual OS/job/SCI operations."""
 from types import SimpleNamespace
 import threading
+import pytest
 from darsia.fluidflower import jobs_panel as ui,store_map
 from darsia.fluidflower.pipeline import capacity
 
@@ -17,6 +18,33 @@ def test_passive_construction_never_checks_capacity(qtbot,tmp_path,monkeypatch):
     value=panel(qtbot,tmp_path)
     assert value._capacity_thread is None and "not checked" in value.capacity_label.text()
     assert value.can_close()
+
+
+@pytest.mark.parametrize("state,enabled,feedback",[
+    ("no-selection",False,"Select a job"),
+    ("no-map",False,"local storage settings"),
+    ("legacy",False,"Choose a job created from a saved execution plan"),
+    ("alias",True,"Check this job's expected space"),
+])
+def test_passive_capacity_action_explains_prerequisites_without_probes(
+    qtbot,tmp_path,monkeypatch,state,enabled,feedback
+):
+    calls=[]
+    def unexpected(*args,**kwargs):
+        calls.append((args,kwargs))
+        raise AssertionError("Passive capacity display must not inspect storage")
+    monkeypatch.setattr(store_map,"read_store_map",unexpected)
+    monkeypatch.setattr(capacity,"report_job_root",unexpected)
+    value=panel(qtbot,tmp_path)
+    value.local_stores_path_provider=None if state=="no-map" else unexpected
+    data=None if state=="no-selection" else dict(
+        root=str(tmp_path/"shared-job"),
+        job_facts=dict(format="legacy-job" if state=="legacy" else "darsia-alias-job-v1"))
+    value._show_snapshot(data)
+    assert value.capacity_button.isEnabled() is enabled
+    assert feedback in value.capacity_button.toolTip()
+    assert "not checked" in value.capacity_label.text()
+    assert value._capacity_thread is None and value.can_close() and not calls
 
 
 def test_explicit_background_report_shows_needed_free_and_estimation_scope(qtbot,tmp_path,monkeypatch):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+import json
 import time
 from typing import Any
 
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,6 +37,18 @@ from PySide6.QtWidgets import (
 from darsia.fluidflower import map_adoption as ma
 
 _COLUMNS = ("Label", "Layer", "Facies in the map", "Role", "Facies id in the series' table")
+
+
+def _check_messages(report):
+    """Show every original issue with the run/source context that distinguishes it."""
+    lines = []
+    for row in (report or {}).get("issues") or []:
+        label = str(row.get("severity") or "message").capitalize()
+        code = f" [{row['code']}]" if row.get("code") else ""
+        lines.append(f"{label}{code}: {row.get('message') or ''}")
+        if row.get("details"):
+            lines.append("  " + json.dumps(row["details"], ensure_ascii=False, sort_keys=True))
+    return "\n".join(lines)
 
 
 class _CheckWorker(QObject):
@@ -66,6 +80,7 @@ class _CheckWorker(QObject):
                 "candidate": candidate,
                 "summary": summary,
                 "errors": errors,
+                "validation_report": report,
                 "seconds": time.monotonic() - start,
             }
         except Exception as error:  # noqa: BLE001 - the owner must retire this thread
@@ -141,6 +156,7 @@ class AdoptionDialog(QDialog):
                 raise ValueError("The automatic painting preparation has no readable facies snapshot; no manual fallback is offered")
         self.table_rows = [] if self.automatic else ma.facies_table(self.current.get("configuration") or {})
         self.candidate: dict[str, Any] | None = None
+        self.validation_report: dict[str, Any] | None = None
         self.revision: dict[str, Any] | None = None
         self._thread: QThread | None = None
         self._worker: _SaveRevisionWorker | None = None
@@ -227,6 +243,12 @@ class AdoptionDialog(QDialog):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status)
+        self.check_messages = QPlainTextEdit()
+        self.check_messages.setReadOnly(True)
+        self.check_messages.setAccessibleName("Check messages")
+        self.check_messages.setMaximumHeight(150)
+        self.check_messages.hide()
+        layout.addWidget(self.check_messages)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         self.check_button = buttons.addButton("Check", QDialogButtonBox.ButtonRole.ActionRole)
         self.check_button.clicked.connect(lambda: self.check())
@@ -249,6 +271,9 @@ class AdoptionDialog(QDialog):
 
     def _choice_changed(self, *_args: Any) -> None:
         self.candidate = None
+        self.validation_report = None
+        self.check_messages.clear()
+        self.check_messages.hide()
         self._update_buttons()
 
     def _update_buttons(self) -> None:
@@ -269,6 +294,9 @@ class AdoptionDialog(QDialog):
             self.status.setText("Choose a facies id for every label first.")
             return False
         self.candidate = None
+        self.validation_report = None
+        self.check_messages.clear()
+        self.check_messages.hide()
         worker = _CheckWorker(self.current, self.folder, self.facies_ids())
         worker.finished.connect(self._checked)
         worker.failed.connect(self._check_failed)
@@ -279,6 +307,10 @@ class AdoptionDialog(QDialog):
         """Keep a candidate that validates, or say why it does not."""
 
         result = dict(result)
+        self.validation_report = result.get("validation_report")
+        empty = "No validation issues." if self.validation_report is not None else "No validation report is available."
+        self.check_messages.setPlainText(_check_messages(self.validation_report) or empty)
+        self.check_messages.show()
         if result["errors"]:
             self.status.setText("The revision does not validate:\n" + "\n".join(result["errors"]))
             return
@@ -301,6 +333,9 @@ class AdoptionDialog(QDialog):
         )
 
     def _check_failed(self, message: str) -> None:
+        self.validation_report = None
+        self.check_messages.clear()
+        self.check_messages.hide()
         self.status.setText(f"The revision cannot be built: {message}")
 
     def _start(self, worker: QObject, message: str) -> None:
@@ -328,13 +363,15 @@ class AdoptionDialog(QDialog):
         if self.automatic:
             from .painted_adoption_table import frame_basis_text
             frame_note = " " + frame_basis_text(self.preparation["painting_facies"])
+        messages = _check_messages(getattr(self, "validation_report", None))
+        check_note = "\n\nCheck messages:\n" + messages if messages else ""
         answer = QMessageBox.question(
             self,
             "Save revision",
             self.adoption_scope_note + ("\n\n" if self.adoption_scope_note else "") +
             "Append a new geometry revision that adopts this map in every prepared run? The "
             "current revision stays in the history. Run configurations do not change until "
-            "Apply geometry to Setup." + frame_note,
+            "Apply geometry to Setup." + frame_note + check_note,
         )
         accepted = answer == QMessageBox.StandardButton.Yes
         self.confirmation_decided.emit(accepted)

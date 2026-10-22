@@ -1687,6 +1687,7 @@ class JobsPanel(QWidget):
             return dict(generation=generation,root=root,result=result)
         self._capacity_thread,self._capacity_worker=self._start_call(
             read_capacity,self._capacity_ready,self._capacity_closed)
+        self._sync_capacity_action()
 
     @Slot(object)
     def _capacity_ready(self, value):
@@ -1710,8 +1711,22 @@ class JobsPanel(QWidget):
         if self._capacity_thread is not None:
             self._capacity_thread.wait()
         self._capacity_thread=self._capacity_worker=None
-        self.capacity_button.setEnabled(bool(self.current and self.local_stores_path_provider
-            and (self.current.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"))
+        self._sync_capacity_action()
+
+    def _sync_capacity_action(self):
+        if not self.current:
+            reason = "Select a job before checking expected space on this machine."
+        elif not self.local_stores_path_provider:
+            reason = "Configure this machine's local storage settings before checking expected space."
+        elif (self.current.get("job_facts") or {}).get("format") != "darsia-alias-job-v1":
+            reason = "This job has no supported execution metadata. Choose a job created from a saved execution plan."
+        elif self._capacity_thread is not None:
+            reason = "Checking expected space. Wait for the result."
+        else:
+            reason = ""
+        self.capacity_button.setEnabled(not reason)
+        self.capacity_button.setToolTip(reason or
+            "Check this job's expected space against the current free space on this machine.")
 
     def _show_snapshot(self, data):
         old_root = (self.current or {}).get("root")
@@ -1720,9 +1735,7 @@ class JobsPanel(QWidget):
         if (data or {}).get("root") != old_root:
             self.capacity_label.setText("Expected space not checked. The worker checks fresh free space before claiming a run.")
         self.profile_label.setText(self._profile_text(data))
-        self.capacity_button.setEnabled(bool(data and self.local_stores_path_provider
-            and (data.get("job_facts") or {}).get("format") == "darsia-alias-job-v1"
-            and self._capacity_thread is None))
+        self._sync_capacity_action()
         enabled = bool(data and data.get("job_facts"))
         self.start_button.setEnabled(enabled)
         self.add_machine_button.setEnabled(enabled)
