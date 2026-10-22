@@ -590,6 +590,8 @@ def adoption_candidate(
     current: Mapping[str, Any],
     folder: Path | str,
     facies_ids: Mapping[int, int] | None = None,
+    *,
+    facies_source_acquisition: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """A geometry revision candidate adopting a prepared painted map.
 
@@ -602,10 +604,17 @@ def adoption_candidate(
     table and the role of its layer (excluded outside the map), and every
     prepared run of the frame binding gets a ``painted-map-placement-v1``
     registration. Returns the candidate and a summary; nothing is saved.
+
+    An optional explicit ``facies_source_acquisition`` statement binds the one
+    approved painting photograph/map and decision, independently of each
+    target's review photograph. Without it every new row stays unknown.
     """
 
     from darsia.fluidflower import geometry_raster_sources as sources
 
+    # A caller may change its input while this worker reads the preparation.
+    # Keep its explicit statement separate from old target/run metadata.
+    declaration = (None if facies_source_acquisition is None else deepcopy(dict(facies_source_acquisition)))
     folder = Path(folder)
     preparation = read_preparation(folder)
     config = deepcopy(dict(current.get("configuration") or {}))
@@ -669,6 +678,10 @@ def adoption_candidate(
                 raise ValueError("A ColorChecker and another role cannot share one facies id")
             if preparation.get("source_fixture_underlay") is not None and len(roles) != 1:
                 raise ValueError("Different drawn roles cannot share one facies id")
+    source_acquisition = None
+    if declaration is not None:
+        from .painted_adoption_table import checked_facies_source_acquisition
+        source_acquisition = checked_facies_source_acquisition(preparation, folder, declaration)
     measurement = _bound(folder / "index.json")
     authority = _bound(folder / "approval.json")
     source_map = _bound(folder / "source_map.npz")
@@ -685,7 +698,8 @@ def adoption_candidate(
                 "run_id": run,
                 "enabled": True,
                 "geometry_choice": "run_override",
-                "acquisition_state": "unknown",
+                "acquisition_state": (source_acquisition["acquisition_state"]
+                                      if source_acquisition is not None else "unknown"),
                 "labels_path": str(labels.resolve()),
                 "source_image_path": str(photograph.get("path") or ""),
                 "registration": {
@@ -732,6 +746,8 @@ def adoption_candidate(
         },
         "registered_geometry_authorized": False,
     }
+    if source_acquisition is not None:
+        config["provenance"]["facies_source_acquisition"] = source_acquisition
     summary = {
         "runs": [row["run_id"] for row in rows],
         "not_prepared": not_prepared,

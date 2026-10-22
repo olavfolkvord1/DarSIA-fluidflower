@@ -927,6 +927,42 @@ def _derive_uncached(preparation, folder, source):
     return table, spec, regions, session.permeability_unit, guarded
 
 
+def checked_facies_source_acquisition(preparation, folder, declaration):
+    """Bind an explicit statement to the already-verified painting, not targets.
+
+    The ordinary derivation must first replay its original approved source/map
+    checks. This metadata handoff neither infers chemistry nor interprets or
+    grants the caller's scientific/adoption authority. The literal decision is
+    retained for review; no saved map, approval or preparation is rewritten.
+    """
+    from .geometry_facies import RUN_GEOMETRY_ACQUISITION_STATES
+
+    required = {"acquisition_state", "preparation", "photograph", "version",
+                "approval", "source_map", "decision"}
+    if not isinstance(declaration, dict) or set(declaration) != required:
+        raise ValueError("A facies-source acquisition statement needs its exact source and decision")
+    # Keep only literal finite JSON metadata, without coercing an enum or
+    # accepting a mutable caller object as the candidate's provenance.
+    try:
+        result = _json(json.dumps(declaration, ensure_ascii=False, allow_nan=False).encode("utf8"))
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("The facies-source acquisition statement is not finite JSON metadata") from error
+    if (type(result["acquisition_state"]) is not str
+            or result["acquisition_state"] not in RUN_GEOMETRY_ACQUISITION_STATES
+            or not isinstance(result["decision"], dict) or not result["decision"]):
+        raise ValueError("A facies-source acquisition statement needs an explicit state and decision")
+    binding = preparation.get(PREPARATION_KEY)
+    if not isinstance(binding, dict):
+        raise ValueError("A facies-source acquisition statement requires an approved painting source")
+    expected = dict(preparation=_bound(Path(folder) / "index.json"),
+        photograph=binding["frame_basis"]["photograph"], version=binding["version"],
+        approval=binding["approval"], source_map=_local(folder, preparation["source_map"]))
+    for name, value in expected.items():
+        if not _same(result[name], value):
+            raise ValueError(f"The facies-source acquisition statement binds another {name}")
+    return result
+
+
 def candidate_table(current, preparation, folder):
     """Create the explicit table contract from one verified all-run derivation."""
     source = _source(current)
@@ -967,6 +1003,14 @@ def canonical_payload(config, parent, payload, *, run_id=None):
     rows = (config.get("run_geometry") or {}).get("runs") or []
     if len(rows) != len(expected_runs) or {row.get("run_id") for row in rows} != expected_runs:
         raise ValueError("Painted adoption run rows differ from their bound preparation")
+    provenance = config.get("provenance") or {}
+    if "facies_source_acquisition" in provenance:
+        # This belongs outside memoized derive: every current candidate must
+        # bind its statement and every transported row, even after a warm read.
+        acquisition = checked_facies_source_acquisition(
+            preparation, folder, provenance["facies_source_acquisition"])
+        if any(row.get("acquisition_state") != acquisition["acquisition_state"] for row in rows):
+            raise ValueError("Painted run acquisition states differ from their explicit facies source")
     authority = _bound(folder / "approval.json")
     source_map = _local(folder, preparation["source_map"])
     expected_kind = sources.PAINTED_V2 if preparation["format"] == sources.PAINTED_PREPARATION_V2 else sources.PAINTED

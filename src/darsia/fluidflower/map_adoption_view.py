@@ -13,6 +13,7 @@ stays.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 import json
 import time
@@ -57,11 +58,13 @@ class _CheckWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, current: Mapping[str, Any], folder: Path, facies_ids: Mapping[int, int] | None) -> None:
+    def __init__(self, current: Mapping[str, Any], folder: Path, facies_ids: Mapping[int, int] | None,
+                 *, facies_source_acquisition: Mapping[str, Any] | None = None) -> None:
         """Retain the current revision, preparation and optional explicit facies choice."""
         super().__init__()
         self.current, self.folder = dict(current), Path(folder)
         self.facies_ids = None if facies_ids is None else dict(facies_ids)
+        self._facies_source_acquisition = (None if facies_source_acquisition is None else deepcopy(dict(facies_source_acquisition)))
 
     @Slot()
     def run(self) -> None:
@@ -70,7 +73,9 @@ class _CheckWorker(QObject):
             from darsia.fluidflower.geometry_facies import validate_geometry_config
 
             start = time.monotonic()
-            candidate, summary = ma.adoption_candidate(self.current, self.folder, self.facies_ids)
+            options = ({} if self._facies_source_acquisition is None else
+                       dict(facies_source_acquisition=self._facies_source_acquisition))
+            candidate, summary = ma.adoption_candidate(self.current, self.folder, self.facies_ids, **options)
             report = validate_geometry_config(candidate)
             errors = [
                 str(issue.get("message")) for issue in report.get("issues") or []
@@ -129,6 +134,7 @@ class AdoptionDialog(QDialog):
         parent: QWidget | None = None,
         automatic_only: bool = False,
         adoption_scope_note: str = "",
+        facies_source_acquisition: Mapping[str, Any] | None = None,
     ) -> None:
         """Show the preparation table, validation result and explicit revision-save controls."""
         super().__init__(parent)
@@ -138,6 +144,7 @@ class AdoptionDialog(QDialog):
         self.folder = Path(folder)
         self.actor = str(actor)
         self.adoption_scope_note = str(adoption_scope_note)
+        self._facies_source_acquisition = (None if facies_source_acquisition is None else deepcopy(dict(facies_source_acquisition)))
         self.preparation = ma.read_preparation(self.folder)
         self.current = GeometryRevisionStore(project).current()
         self.automatic = "painting_facies" in self.preparation
@@ -297,7 +304,9 @@ class AdoptionDialog(QDialog):
         self.validation_report = None
         self.check_messages.clear()
         self.check_messages.hide()
-        worker = _CheckWorker(self.current, self.folder, self.facies_ids())
+        options = ({} if self._facies_source_acquisition is None else
+                   dict(facies_source_acquisition=self._facies_source_acquisition))
+        worker = _CheckWorker(self.current, self.folder, self.facies_ids(), **options)
         worker.finished.connect(self._checked)
         worker.failed.connect(self._check_failed)
         self._start(worker, "Checking the revision; this reads every prepared run's files…")

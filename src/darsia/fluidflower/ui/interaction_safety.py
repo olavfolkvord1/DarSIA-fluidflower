@@ -6,6 +6,7 @@ from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import QApplication, QAbstractSpinBox, QComboBox, QWidget
+from shiboken6 import isValid
 
 
 class ComboBoxWheelGuard(QObject):
@@ -30,10 +31,19 @@ class ComboBoxWheelGuard(QObject):
         return None
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if event.type() in (QEvent.Type.Polish, QEvent.Type.Show):
+        # Reentrant widget teardown can invalidate either Python wrapper. Qt
+        # must not dispatch further to a deleted receiver/event.
+        if not isValid(watched) or not isValid(event):
+            return True
+        event_type = event.type()
+        if event_type in (QEvent.Type.Polish, QEvent.Type.Show):
             self.prepare_control(watched)
-        if event.type() != QEvent.Type.Wheel:
-            return super().eventFilter(watched, event)
+            # Setting focus policy can itself deliver events and delete a
+            # control before the outer event filter resumes.
+            if not isValid(watched) or not isValid(event):
+                return True
+        if event_type != QEvent.Type.Wheel:
+            return False
         combo = self._combo_box(watched)
         if combo is not None:
             popup = combo.view()
@@ -42,7 +52,7 @@ class ComboBoxWheelGuard(QObject):
                 and isinstance(watched, QWidget)
                 and (watched is popup or popup.isAncestorOf(watched))
             ):
-                return super().eventFilter(watched, event)
+                return False
             if not self._has_control_focus(combo):
                 event.ignore()
                 return True
@@ -50,7 +60,7 @@ class ComboBoxWheelGuard(QObject):
         if spin_box is not None and not self._has_control_focus(spin_box):
             event.ignore()
             return True
-        return super().eventFilter(watched, event)
+        return False
 
     @staticmethod
     def _has_control_focus(control: QWidget) -> bool:

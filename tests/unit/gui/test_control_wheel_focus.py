@@ -2,14 +2,16 @@
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QDate, QPoint, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QDate, QEvent, QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDoubleSpinBox, QLineEdit,
-    QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from darsia.fluidflower.ui.interaction_safety import install_interaction_safety
+from shiboken6 import isValid
+
+from darsia.fluidflower.ui.interaction_safety import ComboBoxWheelGuard, install_interaction_safety
 
 
 def make_control(kind):
@@ -127,3 +129,61 @@ def test_existing_controls_receive_strong_focus_and_keyboard_popup_selection_sta
     qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton,
                      pos=view.visualRect(index).center())
     assert ui.control.currentIndex() == 3
+
+
+@pytest.mark.parametrize("expired", ["receiver", "event"])
+def test_expired_hide_delivery_is_consumed_without_native_wrapper_conversion(qapp, expired):
+    guard = ComboBoxWheelGuard()
+    watched = QLabel("Private lifetime regression")
+    event = QEvent(QEvent.Type.Hide)
+    try:
+        if expired == "receiver":
+            watched.deleteLater()
+            QCoreApplication.sendPostedEvents(watched, QEvent.Type.DeferredDelete)
+            assert not isValid(watched) and isValid(event)
+        else:
+            # Qt owns and destroys a posted event after delivery. Retain its
+            # Python wrapper to exercise the expired-event boundary too.
+            QCoreApplication.postEvent(watched, event)
+            QCoreApplication.sendPostedEvents(watched, QEvent.Type.Hide)
+            assert isValid(watched) and not isValid(event)
+        assert guard.eventFilter(watched, event) is True
+    finally:
+        if isValid(watched):
+            watched.deleteLater()
+            QCoreApplication.sendPostedEvents(watched, QEvent.Type.DeferredDelete)
+
+
+def test_valid_unhandled_hide_remains_unfiltered(qapp):
+    guard = ComboBoxWheelGuard()
+    watched = QLabel("Private live receiver")
+    event = QEvent(QEvent.Type.Hide)
+    try:
+        assert guard.eventFilter(watched, event) is False
+        assert isValid(watched) and isValid(event)
+    finally:
+        if isValid(watched):
+            watched.deleteLater()
+            QCoreApplication.sendPostedEvents(watched, QEvent.Type.DeferredDelete)
+
+
+def test_reentrant_focus_preparation_consumes_a_receiver_deleted_during_the_callback(qapp):
+    class SelfDeletingCombo(QComboBox):
+        def setFocusPolicy(self, policy):
+            super().setFocusPolicy(policy)
+            if getattr(self, "expire_on_policy", False):
+                self.deleteLater()
+                QCoreApplication.sendPostedEvents(self, QEvent.Type.DeferredDelete)
+
+    guard = ComboBoxWheelGuard()
+    watched = SelfDeletingCombo()
+    watched.expire_on_policy = True
+    event = QEvent(QEvent.Type.Show)
+    try:
+        assert isValid(watched) and isValid(event)
+        assert guard.eventFilter(watched, event) is True
+        assert not isValid(watched)
+    finally:
+        if isValid(watched):
+            watched.deleteLater()
+            QCoreApplication.sendPostedEvents(watched, QEvent.Type.DeferredDelete)
