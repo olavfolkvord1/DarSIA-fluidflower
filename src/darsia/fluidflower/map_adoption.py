@@ -479,10 +479,6 @@ def prepare_adoption(
     if painting_binding is not None:
         index["painting_facies"] = painting_binding
         index["painting_geometry"] = geometry_proof
-        from .painted_adoption_table import prepare_outside_proof
-        proof = prepare_outside_proof(folder, painting_binding, rows)
-        if proof is not None:
-            index["outside_frame_proof"] = proof
     if continuation is not None:
         from .photo_edge_continuation import POLICY
         index["continuation"] = dict(policy=POLICY, file="continuation.json",
@@ -493,6 +489,11 @@ def prepare_adoption(
         verify_source(approved_source, layers, continuation,
             preparation=index if painting_binding is not None else None, folder=folder)
         verify_native_proof(index, folder)
+    if painting_binding is not None:
+        from .painted_adoption_table import prepare_outside_proof
+        proof = prepare_outside_proof(folder, painting_binding, rows, preparation=index)
+        if proof is not None:
+            index["outside_frame_proof"] = proof
     temporary = folder / f".index.json.{uuid.uuid4().hex}.tmp"
     temporary.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if painting_binding is not None:

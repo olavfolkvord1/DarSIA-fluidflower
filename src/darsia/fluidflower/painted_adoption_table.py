@@ -32,6 +32,7 @@ FRAME_BASIS_FORMAT = "darsia-painted-adoption-preparation-frame-v1"
 KEY = "painted_adoption_table"
 PREPARATION_KEY = "painting_facies"
 OUTSIDE_FORMAT = "darsia-painted-adoption-outside-frame-proof-v1"
+OUTSIDE_FORMAT_V2 = "darsia-painted-adoption-outside-frame-proof-v2"
 FIXTURE_DERIVATION_FORMAT = "darsia-painted-fixture-analysis-derivation-v1"
 _LIMIT = 16 * 1024 * 1024
 _FILES = BoundVerificationCache()
@@ -577,7 +578,65 @@ def _relative(folder, path):
     return dict(bound, path=str(Path(path).resolve().relative_to(Path(folder).resolve())).replace("\\", "/"))
 
 
-def prepare_outside_proof(folder, binding, rows):
+def _continuation_outside_context(preparation, folder, binding):
+    """Bind the existing V2 policy; a sidecar's mere presence grants nothing."""
+    from .geometry_raster_sources import PAINTED_PREPARATION_V2, _integer_map
+    from .photo_edge_continuation import POLICY, read_contracts, verify_source
+    if preparation is None or preparation.get("format") != PAINTED_PREPARATION_V2:
+        return None
+    record = preparation.get("continuation")
+    if (not isinstance(record, dict)
+            or set(record) != {"policy", "file", "sha256", "size_bytes", "adopted"}
+            or record["policy"] != POLICY or record["file"] != "continuation.json"
+            or record["adopted"] is not False
+            or not _same(preparation.get("approved_source"), binding)
+            or not _same(preparation.get(PREPARATION_KEY), binding)):
+        raise ValueError("V2 outside proof needs its exact approved source and continuation")
+    sidecar = _local(folder, {"path": record["file"],
+                              **{key: record[key] for key in ("sha256", "size_bytes")}})
+    contracts = read_contracts(sidecar["path"])["runs"]
+    rows = preparation.get("runs") or []
+    ids = [row.get("run_id") for row in rows]
+    if (not ids or any(not isinstance(run, str) for run in ids)
+            or len(ids) != len(set(ids)) or set(ids) != set(contracts)
+            or any(row.get("status") != "prepared" for row in rows)):
+        raise ValueError("V2 outside proof needs the exact complete continuation run set")
+    source_bound = _local(folder, preparation["source_map"])
+    source = retry_transient(lambda: _integer_map(source_bound["path"]))
+    verify_source(binding, source, contracts, preparation=preparation, folder=folder)
+    guarded = [sidecar, source_bound]
+    for row in rows:
+        run = row["run_id"]
+        contract = contracts[run]
+        summary = row.get("continuation") or {}
+        if (contract["target_grid"] != "native"
+                or contract["source_run"] != preparation.get("reference_run")
+                or contract["target_run"] != run
+                or not _same(contract["source_model"]["descriptor"], row.get("reference_model"))
+                or not _same(contract["target_model"]["descriptor"], row.get("target_model"))
+                or not _same(contract["geometry_index"], preparation.get("geometry_index"))
+                or summary.get("contract_run") != run
+                or summary.get("authority") != contract["frame_authority"]["kind"]):
+            raise ValueError("V2 outside proof belongs to other models, frame authority or native grid")
+        # These external dependencies must participate in the table's original
+        # derivation cache, as well as the policy's independent strict readers.
+        guarded.append(_checked(contract["geometry_index"]))
+        guarded.extend(_checked(contract[key]["descriptor"]) for key in ("source_model", "target_model"))
+    return dict(contracts=contracts, source=source, guarded=guarded, sidecar=sidecar)
+
+
+def _continuation_outside_mask(folder, row, context):
+    """Replay every original V2 field before classifying any zero as outside."""
+    from .photo_edge_continuation import verify_product
+    product = _local(folder, row["labels"])
+    replay = verify_product(product["path"], context["source"],
+                            context["contracts"][row["run_id"]], counts=row["continuation"])
+    if np.any((replay["labels"] == 0) & replay["inside"]):
+        raise ValueError(f"{row['run_id']}: zero labels are INSIDE its frozen own frame; no nonphysical classification is permitted")
+    return replay["inside"]
+
+
+def prepare_outside_proof(folder, binding, rows, *, preparation=None):
     """Write only explicit frame proof products inside a new preparation."""
     from . import layer_painting as lp
     _, approved, frame = verify_version(binding)
@@ -592,18 +651,26 @@ def prepare_outside_proof(folder, binding, rows):
                 zero_rows.append(row)
     if not zero_rows:
         return None
+    context = _continuation_outside_context(preparation, folder, binding)
     path = Path(folder) / "source_frame_inside.npz"
     with path.open("xb") as stream:
         np.savez_compressed(stream, inside=inside)
     result = dict(format=OUTSIDE_FORMAT, source_inside=_relative(folder, path), runs={})
+    if context is not None:
+        from .photo_edge_continuation import POLICY
+        result.update(format=OUTSIDE_FORMAT_V2, policy=POLICY,
+                      continuation=_relative(folder, context["sidecar"]["path"]))
     for row in zero_rows:
         labels, filled, support, _ = _native_flags(folder, row)
-        carried = _native_inside(row, inside)
-        native = np.asarray(carried["labels"]) != 0
-        if (not np.array_equal(filled, carried["geometry_filled"])
-                or not np.array_equal(support, carried["support"])
-                or np.any((labels == 0) & (native | filled))):
-            raise ValueError(f"{row['run_id']}: zero labels are interior or unmapped; no nonphysical frame classification is permitted")
+        if context is not None:
+            native = _continuation_outside_mask(folder, row, context)
+        else:
+            carried = _native_inside(row, inside)
+            native = np.asarray(carried["labels"]) != 0
+            if (not np.array_equal(filled, carried["geometry_filled"])
+                    or not np.array_equal(support, carried["support"])
+                    or np.any((labels == 0) & (native | filled))):
+                raise ValueError(f"{row['run_id']}: zero labels are interior or unmapped; no nonphysical frame classification is permitted")
         target = Path(folder) / row["run_id"] / "frame_inside.npz"
         with target.open("xb") as stream:
             np.savez_compressed(stream, inside=native)
@@ -618,10 +685,23 @@ def verify_outside_proof(preparation, folder, approved, frame):
     if np.any((approved == 0) & inside):
         raise ValueError("Zero pixels INSIDE the approved frame cannot be classified as outside")
     proof = preparation.get("outside_frame_proof")
-    if (not isinstance(proof, dict) or set(proof) != {"format", "source_inside", "runs"}
-            or proof["format"] != OUTSIDE_FORMAT or not isinstance(proof["runs"], dict)):
+    context = _continuation_outside_context(preparation, folder, preparation[PREPARATION_KEY])
+    own_frame_proof = isinstance(proof, dict) and proof.get("format") == OUTSIDE_FORMAT_V2
+    keys = {"format", "source_inside", "runs"}
+    if own_frame_proof:
+        keys |= {"policy", "continuation"}
+    if (not isinstance(proof, dict) or set(proof) != keys
+            or proof["format"] != (OUTSIDE_FORMAT_V2 if own_frame_proof else OUTSIDE_FORMAT)
+            or (own_frame_proof and context is None)
+            or not isinstance(proof["runs"], dict)):
         raise ValueError("Native zero labels lack their bound frozen-frame inside-mask proof")
     guarded = [_inside_file(folder, proof["source_inside"], inside)]
+    if own_frame_proof:
+        from .photo_edge_continuation import POLICY
+        if proof["policy"] != POLICY or not _same(_local(folder, proof["continuation"]), context["sidecar"]):
+            raise ValueError("V2 outside proof changed its exact continuation policy or sidecar")
+    if context is not None:
+        guarded.extend(context["guarded"])
     expected = set()
     for row in preparation["runs"]:
         if row.get("status") != "prepared":
@@ -631,12 +711,17 @@ def verify_outside_proof(preparation, folder, approved, frame):
             continue
         run = row["run_id"]
         expected.add(run)
-        carried = _native_inside(row, inside)
-        native = np.asarray(carried["labels"]) != 0
-        if (not np.array_equal(filled, carried["geometry_filled"])
-                or not np.array_equal(support, carried["support"])
-                or np.any((labels == 0) & (native | filled))):
-            raise ValueError(f"{run}: zero labels include interior or unmapped pixels, not proven outside frame")
+        if context is not None:
+            native = _continuation_outside_mask(folder, row, context)
+        # Historical V2 source-frame proofs retain their original comparison
+        # too. Choosing that older format cannot evade the own-frame veto.
+        if not own_frame_proof:
+            carried = _native_inside(row, inside)
+            native = np.asarray(carried["labels"]) != 0
+            if (not np.array_equal(filled, carried["geometry_filled"])
+                    or not np.array_equal(support, carried["support"])
+                    or np.any((labels == 0) & (native | filled))):
+                raise ValueError(f"{run}: zero labels include interior or unmapped pixels, not proven outside frame")
         if run not in proof["runs"]:
             raise ValueError(f"{run}: the native frame-inside proof is missing")
         guarded.append(_inside_file(folder, proof["runs"][run], native))

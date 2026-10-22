@@ -262,7 +262,8 @@ def _models(data, folder, inputs, *, unmapped=False, mutate=None):
 
 def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside=False, unmapped=False,
                       method="manual", mutate_model=None, preparation_frame=None,
-                      corrected_source=False, raw_source=False, fixture=False, during_prepare=None, continuation=False):
+                      corrected_source=False, raw_source=False, fixture=False, during_prepare=None, continuation=False,
+                      outside_targets=False, own_frame_change=None):
     inputs = _basis_inputs(data, tmp_path / "owned_basis", bind_profile=not raw_source)
     image = inputs.photos["one"]
     if corrected_source:
@@ -324,6 +325,8 @@ def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside
         own = deepcopy(frame)
         own.run_id, own.image = run, str(inputs.photos[run])
         own_frames[run] = own.to_dict()
+    if own_frame_change is not None:
+        own_frame_change(own_frames)
     data.project.manifest["tools"]["native_series"]["rig_frames"] = own_frames
     (data.project.root / "series.json").write_text(json.dumps(data.project.manifest), encoding="utf-8")
     fixture_options = {}
@@ -331,7 +334,8 @@ def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside
         from darsia.fluidflower import photo_edge_continuation as policy
         binding = contract.capture_version(version, approval, current_frame, layers, project=data.project)
         fixture_options.update(continuation=policy.build_contracts(data.project, index, "one",
-            ["one"] if outside else ["one", "two"], [row.layer_id for row in session.layers], target_grid="native"),
+            ["one"] if outside and not outside_targets else ["one", "two"],
+            [row.layer_id for row in session.layers], target_grid="native"),
             approved_source=binding)
     if fixture:
         from darsia.fluidflower.layer_painting_fixtures import version_fixture_underlay
@@ -340,7 +344,7 @@ def prepared_painting(data, tmp_path, *, same_facies=False, water=False, outside
         fixture_options.update(fixture_underlay=underlay, fixture_frame=current_frame)
     result = adoption.prepare_adoption(tmp_path / "preparation", layers,
         reference_run="one", geometry_index=index,
-        runs=["one"] if outside else ["one", "two"],
+        runs=["one"] if outside and not outside_targets else ["one", "two"],
         roles={layer.layer_id: session.facies[layer.facies].role for layer in session.layers},
         names={layer.layer_id: layer.name for layer in session.layers},
         facies={layer.layer_id: layer.facies for layer in session.layers},
@@ -968,3 +972,197 @@ def test_photo_continuation_memo_rehashes_original_raw_when_file_stamps_collide(
     raw.write_bytes(bytes([before[0] ^ 1]) + before[1:])
     with pytest.raises(ValueError, match="Shape-basis source changed"):
         policy.verify_native_proof(prepared, folder)
+
+
+def _outside_target_frame(frames):
+    """A distinct frozen target frame, partly beyond this tiny photograph."""
+    frames["two"]["corners"] = dict(top_left=[1., 2.], top_right=[1., 3.],
+        bottom_right=[2., 3.], bottom_left=[2., 2.])
+
+
+def _v2_outside(data, tmp_path):
+    return prepared_painting(data, tmp_path, outside=True, continuation=True,
+        outside_targets=True, own_frame_change=_outside_target_frame)
+
+
+def test_v2_outside_proof_replays_own_frame_and_preserves_store_export_labels(registered_setup, tmp_path):
+    """Zero edge donors outside the own frame remain exact zeros, never sand."""
+    from darsia.fluidflower import photo_edge_continuation as policy
+    data = registered_setup
+    prepared, version, _, frame, original = _v2_outside(data, tmp_path)
+    folder = Path(prepared["folder"])
+    assert prepared["outside_frame_proof"]["format"] == contract.OUTSIDE_FORMAT_V2
+    source_files = {p: p.read_bytes() for p in Path(version["folder"]).rglob("*") if p.is_file()}
+    expected = np.asarray([[0, 0, 5], [0, 0, 5]], np.int32)
+    own_inside = np.asarray([[False, False, False], [False, False, True]])
+    with np.load(folder / "two/labels.npz", allow_pickle=True) as product:
+        assert np.array_equal(product["array"], expected)
+        assert np.array_equal(product["inside"], own_inside)
+        assert product["filled"][:, 0].all() and not product["array"][:, 0].any()
+        assert not product["gaps"].any()
+        assert np.array_equal(product["effective_coverage"], own_inside)
+    row = prepared["runs"][1]
+    legacy = contract._native_inside(row, lp.frame_mask(frame, original.shape, (1., 1.)))
+    assert not np.array_equal(legacy["labels"] != 0, own_inside)
+    proof = prepared["outside_frame_proof"]["runs"]["two"]
+    with np.load(folder / proof["path"]) as saved:
+        assert np.array_equal(saved["inside"], own_inside)
+    assert adoption.read_preparation(folder)["format"] == adoption.PREPARATION_FORMAT_V2
+    _, _, revision = _saved(data, prepared)
+    resolved = sources.registered_run_sources(data.project.root, revision, "two")
+    with np.load(resolved["files"]["labels"]["path"], allow_pickle=True) as saved:
+        assert np.array_equal(saved["array"], expected)
+        assert np.array_equal(saved["inside"], own_inside)
+    export.export_corrected_setup(data.project,
+        reference=SimpleNamespace(run_id="one"), actor="synthetic display-reference proof")
+    exported = export.export_corrected_setup(data.project,
+        reference=SimpleNamespace(run_id="two"), actor="synthetic own-frame proof")
+    with np.load(exported.destination / "native_labels.npz", allow_pickle=True) as saved:
+        assert np.array_equal(saved["array"], expected)
+        assert np.array_equal(saved["inside"], own_inside)
+    run_contract = policy.load_contract(folder / "continuation.json", "two")
+    policy.verify_product(exported.destination / "native_labels.npz", original, run_contract,
+                          counts=row["continuation"])
+    outside = next(v for v in revision["configuration"]["regions"] if v["label_id"] == 0)
+    assert (outside["analysis_role"], outside["porosity"], outside["enabled"]) == ("frame", 0., False)
+    assert all(p.read_bytes() == content for p, content in source_files.items())
+
+
+def test_v2_outside_proof_refuses_zero_inside_the_target_own_frame(registered_setup, tmp_path):
+    """A real own-frame gap is not cleared by the technical proof branch."""
+    current = geometry.GeometryRevisionStore(registered_setup.project).current_path
+    before = current.read_bytes()
+    # The target retains columns1..2 while its transported source has zeros
+    # in columns0..1. Column1 is therefore an interior gap, not outside.
+    with pytest.raises(ValueError, match="zero labels are INSIDE its frozen own frame"):
+        prepared_painting(registered_setup, tmp_path, outside=True, continuation=True,
+                         outside_targets=True)
+    assert current.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["array", "filled", "support", "inside", "continued", "effective_coverage", "gaps"])
+def test_v2_outside_proof_replays_every_mask_even_after_descriptor_rebinding(registered_setup, tmp_path, field):
+    prepared, _, _, frame, original = _v2_outside(registered_setup, tmp_path)
+    folder = Path(prepared["folder"])
+    row = prepared["runs"][1]
+    path = folder / row["labels"]["path"]
+    with np.load(path, allow_pickle=True) as archive:
+        values = {key: archive[key].copy() for key in archive.files}
+    if field == "array":
+        values[field][1, 2] = 0
+    else:
+        values[field][0, 0] = not values[field][0, 0]
+    np.savez_compressed(path, **values)
+    row["labels"].update({key: value for key, value in sources.descriptor(path).items() if key != "path"})
+    with pytest.raises(ValueError, match="V2 (labels differ|continuation mask differs)"):
+        contract.verify_outside_proof(prepared, folder, original, frame)
+
+
+def test_v2_outside_proof_refuses_rebound_wrong_own_inside_mask(registered_setup, tmp_path):
+    prepared, _, _, frame, original = _v2_outside(registered_setup, tmp_path)
+    folder = Path(prepared["folder"])
+    mask = prepared["outside_frame_proof"]["runs"]["two"]
+    path = folder / mask["path"]
+    np.savez_compressed(path, inside=np.ones((2, 3), bool))
+    mask.update({key: value for key, value in sources.descriptor(path).items() if key != "path"})
+    with pytest.raises(ValueError, match="exact mask"):
+        contract.verify_outside_proof(prepared, folder, original, frame)
+
+
+@pytest.mark.parametrize("dependency", ["continuation", "geometry_index", "target_model"])
+def test_v2_outside_proof_derivation_cache_tracks_policy_and_model_dependencies(registered_setup, tmp_path, dependency):
+    prepared, _, _, _, _ = _v2_outside(registered_setup, tmp_path)
+    folder = Path(prepared["folder"])
+    contract._DERIVED.clear()
+    contract.candidate_table(registered_setup.revision, prepared, folder)
+    if dependency == "continuation":
+        path = folder / "continuation.json"
+    elif dependency == "geometry_index":
+        path = Path(prepared["geometry_index"]["path"])
+    else:
+        path = Path(prepared["runs"][1]["target_model"]["path"])
+    cached = next(iter(contract._DERIVED.values()))
+    captured = {Path(row["path"]).resolve() for row in cached["dependencies"]["files"].values()}
+    assert path.resolve() in captured
+    path.write_bytes(path.read_bytes() + b"\n ")
+    with pytest.raises(ValueError):
+        contract.candidate_table(registered_setup.revision, prepared, folder)
+
+
+def test_v2_legacy_outside_proof_retains_valid_historical_source_frame(registered_setup, tmp_path):
+    prepared, _, _, frame, original = prepared_painting(
+        registered_setup, tmp_path, outside=True, continuation=True)
+    folder = Path(prepared["folder"])
+    proof = prepared["outside_frame_proof"]
+    proof["format"] = contract.OUTSIDE_FORMAT
+    proof.pop("policy")
+    proof.pop("continuation")
+    # The identity reference's two frame masks coincide, so this also models
+    # a valid historical V2 preparation with its original V1-format proof.
+    contract.verify_outside_proof(prepared, folder, original, frame)
+
+
+def test_v2_legacy_proof_format_cannot_hide_a_replayed_own_frame_gap(registered_setup, tmp_path):
+    """An otherwise valid old proof cannot overrule a larger own-frame mask."""
+    from darsia.fluidflower import photo_edge_continuation as policy
+    data = registered_setup
+    prepared, _, session, frame, original = prepared_painting(data, tmp_path, outside=True)
+    folder = Path(prepared["folder"])
+    # Model a historical V2 closure retaining the earlier V1 proof. Its own
+    # target frame comes from genuinely captured temporary project authority.
+    own = data.project.manifest["tools"]["native_series"]["rig_frames"]["one"]
+    own["corners"] = dict(top_left=[0., 0.], top_right=[0., 2.],
+                          bottom_right=[1., 2.], bottom_left=[1., 0.])
+    (data.project.root / "series.json").write_text(json.dumps(data.project.manifest), encoding="utf-8")
+    contracts = policy.build_contracts(data.project, prepared["geometry_index"]["path"],
+        "one", ["one"], [layer.layer_id for layer in session.layers], target_grid="native")
+    sidecar = folder / "continuation.json"
+    policy.save_contracts(sidecar, contracts)
+    row = prepared["runs"][0]
+    path = folder / row["labels"]["path"]
+    with np.load(path, allow_pickle=True) as archive:
+        values = {key: archive[key].copy() for key in archive.files}
+    replay = policy.apply_policy(original, contracts["one"])
+    assert np.array_equal(values["array"], replay["labels"])
+    assert np.array_equal(values["filled"], replay["filled"])
+    assert np.array_equal(values["support"], replay["support"])
+    values.update({key: replay[key] for key in ("inside", "continued", "effective_coverage", "gaps")})
+    np.savez_compressed(path, **values)
+    row["labels"].update({key: value for key, value in sources.descriptor(path).items() if key != "path"})
+    row["continuation"] = dict(replay["counts"], contract_run="one", authority="saved rig frame")
+    prepared.update(format=adoption.PREPARATION_FORMAT_V2,
+        approved_source=deepcopy(prepared["painting_facies"]),
+        continuation=dict(policy=policy.POLICY, file=sidecar.name, adopted=False,
+            **{key: value for key, value in sources.descriptor(sidecar).items() if key != "path"}))
+    assert prepared["outside_frame_proof"]["format"] == contract.OUTSIDE_FORMAT
+    assert replay["counts"]["inside_gap_pixels"] == 2
+    with pytest.raises(ValueError, match="zero labels are INSIDE its frozen own frame"):
+        contract.verify_outside_proof(prepared, folder, original, frame)
+
+
+@pytest.mark.parametrize("changed", ["target_model", "source_run", "frame_authority", "policy"])
+def test_v2_outside_proof_refuses_other_contract_identity(registered_setup, tmp_path, changed):
+    prepared, _, _, frame, original = _v2_outside(registered_setup, tmp_path)
+    if changed == "target_model":
+        prepared["runs"][1]["target_model"] = prepared["runs"][0]["target_model"]
+    elif changed == "source_run":
+        prepared["reference_run"] = "two"
+    elif changed == "frame_authority":
+        prepared["runs"][1]["continuation"]["authority"] = "series configuration"
+    else:
+        prepared["continuation"]["policy"] = "unapproved-policy"
+    with pytest.raises(ValueError, match="V2 outside proof"):
+        contract.verify_outside_proof(prepared, prepared["folder"], original, frame)
+
+
+def test_v1_outside_proof_never_selects_v2_from_sidecar_presence(registered_setup, tmp_path):
+    prepared, _, _, frame, original = prepared_painting(registered_setup, tmp_path, outside=True)
+    folder = Path(prepared["folder"])
+    path = folder / "continuation.json"
+    path.write_bytes(b"not a valid or authoritative continuation\n")
+    contract.verify_outside_proof(prepared, folder, original, frame)
+    proof = prepared["outside_frame_proof"]
+    proof.update(format=contract.OUTSIDE_FORMAT_V2, policy="nearest-photo-edge-to-target-frame-v1",
+                 continuation=dict(sources.descriptor(path), path=path.name))
+    with pytest.raises(ValueError, match="inside-mask proof"):
+        contract.verify_outside_proof(prepared, folder, original, frame)
