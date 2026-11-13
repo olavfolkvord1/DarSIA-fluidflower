@@ -38,6 +38,11 @@ def _unit(name):
     return [float(other == name) for other in NAMES]
 
 
+def _feature(probability):
+    """Feature value behind a probability of a head selecting one feature."""
+    return np.log(probability / (1 - probability))
+
+
 def test_read_phase_model_reads_the_two_heads(tmp_path):
     """Coefficients, intercepts, the texture scale in mm and the gas threshold
     come from the folder."""
@@ -64,3 +69,47 @@ def test_head_probability_is_the_clipped_logistic_in_the_feature_dtype():
     np.testing.assert_allclose(
         probability, [1 / (1 + np.exp(-logit)), 1 / (1 + np.exp(30.0))], rtol=1e-6
     )
+
+
+def test_probabilities_compare_with_baseline_and_previous_frame(tmp_path):
+    """Change against the baseline and the previous frame, in the images' dtype."""
+    model = _model(tmp_path, _head(_unit("delta_r")), _head(_unit("dynamic_delta_g")))
+    baseline = np.full((40, 50, 3), 0.3)
+    previous = baseline + [0.0, 0.05, 0.0]
+    current = baseline + [0.12, 0.2, 0.0]
+    co2, gas = darsia.phase_probabilities(
+        model, current, baseline, previous, pixel_size_mm=0.5
+    )
+    assert co2.dtype == np.float64
+    np.testing.assert_allclose(_feature(co2), 0.12)
+    np.testing.assert_allclose(_feature(gas), 0.15)
+    co2, gas = darsia.phase_probabilities(
+        model,
+        *(image.astype(np.float32) for image in (current, baseline)),
+        pixel_size_mm=0.5,
+    )
+    assert gas.dtype == np.float32
+    np.testing.assert_allclose(_feature(co2), 0.12, atol=1e-5)
+    np.testing.assert_array_equal(gas, 0.5)
+
+
+def test_probabilities_need_a_valid_texture_window(tmp_path):
+    """An invalid pixel removes the texture window around it, scaled with the grid."""
+    rng = np.random.default_rng(2)
+    model = _model(
+        tmp_path, _head(rng.normal(size=36), 0.1), _head(rng.normal(size=36), -0.2)
+    )
+    baseline = rng.uniform(0.1, 0.9, (60, 70, 3))
+    current = baseline * rng.uniform(0.8, 1.2, baseline.shape)
+    current[30, 40, 1] = np.nan
+    # The texture sigma of 1 mm is 2 pixels on the training grid, 4 on the finer.
+    for pixel_size_mm, half in ((0.5, 8), (0.25, 16)):
+        co2, gas = darsia.phase_probabilities(
+            model, current, baseline, pixel_size_mm=pixel_size_mm
+        )
+        unsupported = np.isnan(co2)
+        window = np.s_[30 - half : 31 + half, 40 - half : 41 + half]
+        assert unsupported[window].all()
+        assert unsupported.sum() == (2 * half + 1) ** 2
+        assert np.array_equal(unsupported, np.isnan(gas))
+        assert ((co2[~unsupported] > 0) & (co2[~unsupported] < 1)).all()

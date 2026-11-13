@@ -25,7 +25,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
+
+import darsia
 
 PHASE_FEATURE_NAMES = (
     "delta_r",
@@ -69,6 +72,13 @@ PHASE_FEATURE_NAMES = (
 
 _LINEAR_RGB = "camera-white-relative-linear-rgb"
 """Input colour space of the features: linear RGB without clipping or scaling."""
+
+_SPATIAL_CONTEXT_FRACTION = 0.0015
+"""Width of the local change statistics, as a fraction of the shorter physical
+side of the image (on square pixels, of its shorter pixel count)."""
+
+_ROWS_PER_CHUNK = 64
+"""Image rows per feature chunk; the full feature matrix is never held."""
 
 
 @dataclass(frozen=True)
@@ -184,3 +194,148 @@ def read_phase_model(folder: str | Path, pixel_size_mm: float) -> PhaseModel:
         texture_sigma_mm=float(sigmas.pop()) * pixel_size_mm,
         gas_threshold=float(gas["presence_threshold"]),
     )
+
+
+def _log_ratios(rgb: np.ndarray, epsilon: np.floating) -> np.ndarray:
+    """Logarithms of red/green, green/blue and red/blue, one column each."""
+    safe = np.maximum(rgb, epsilon)
+    return np.column_stack(
+        [
+            np.log(safe[..., i] / safe[..., j]).reshape(-1)
+            for i, j in ((0, 1), (1, 2), (0, 2))
+        ]
+    )
+
+
+def phase_probabilities(
+    model: PhaseModel,
+    current: np.ndarray,
+    baseline: np.ndarray,
+    previous: np.ndarray | None = None,
+    *,
+    pixel_size_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """CO2-presence and gas-within-CO2 probabilities of one frame.
+
+    The features compare the current image with the baseline (colour,
+    chromaticity, log ratios, texture and its local statistics, bright grains)
+    and with the previous frame; without a previous frame the dynamic features
+    are zero. Both heads read one feature matrix, built in chunks of rows.
+
+    The model's texture scale is converted to pixels of the images' grid. A
+    pixel with a non-finite channel is invalid and enters the filters as zero.
+    A pixel is supported if all given images are valid in the square window of
+    half-width four texture sigmas (rounded) around it; elsewhere both
+    probabilities are NaN.
+
+    Parameters
+    ----------
+    model : PhaseModel
+        The delivered model.
+    current, baseline : array
+        Linear RGB images of shape (rows, cols, 3) on one grid.
+    previous : array, optional
+        Linear RGB image of the run's previous frame on the same grid.
+    pixel_size_mm : float
+        Pixel size of the images' grid.
+
+    Returns
+    -------
+    co2, gas : array
+        Probabilities of shape (rows, cols) in the images' floating dtype, NaN
+        outside the support.
+
+    """
+    given = [image for image in (current, baseline, previous) if image is not None]
+    dtype = np.result_type(*given).type
+    if len({image.shape for image in given}) != 1:
+        raise ValueError("The images of a frame differ in shape.")
+    valid = np.ones(current.shape[:2], dtype=bool)
+    images = []
+    for image in given:
+        finite = np.isfinite(image).all(axis=-1)
+        valid &= finite
+        images.append(np.where(finite[..., None], image, 0).astype(dtype, copy=False))
+    current, baseline = images[:2]
+    dynamic = previous is not None
+
+    sigma = model.texture_sigma_mm / pixel_size_mm
+    spatial = dtype(max(sigma, _SPATIAL_CONTEXT_FRACTION * min(current.shape[:2])))
+    epsilon, floor = dtype(1e-4), dtype(0.05)
+    gray = [np.mean(image, axis=2, dtype=dtype) for image in images]
+    smooth = [darsia.gaussian_blur(g, sigma) for g in gray]
+    contrast = [g - s for g, s in zip(gray, smooth)]
+    delta = current - baseline
+    norm = np.linalg.norm(delta, axis=-1)
+    local_mean = darsia.gaussian_blur(norm, spatial)
+    local_squared = darsia.gaussian_blur(np.square(norm), spatial)
+    local_std = np.sqrt(np.maximum(local_squared - np.square(local_mean), 0))
+    if dynamic:
+        dynamic_delta = current - images[2]
+        dynamic_norm = np.linalg.norm(dynamic_delta, axis=-1)
+        local_dynamic_mean = darsia.gaussian_blur(dynamic_norm, spatial)
+
+    rows, cols = valid.shape
+    co2 = np.empty((rows, cols), dtype)
+    gas = np.empty((rows, cols), dtype)
+    for start in range(0, rows, _ROWS_PER_CHUNK):
+        chunk = np.s_[start : start + _ROWS_PER_CHUNK]
+        rgb = [image[chunk] for image in images]
+        intensity = [np.mean(image, axis=-1, dtype=dtype) for image in rgb]
+        fractions = [i / (i.sum(axis=-1, keepdims=True) + epsilon) for i in rgb[:2]]
+        texture = [np.abs(c[chunk]) for c in contrast]
+        texture_delta = texture[0] - texture[1]
+        bright = [np.maximum(c[chunk], 0) for c in contrast[:2]]
+        rel_current, rel_baseline = (
+            np.clip(c[chunk] / np.maximum(s[chunk], floor), -1.0, 4.0)
+            for c, s in zip(contrast[:2], smooth[:2])
+        )
+        rel_bright = [np.maximum(rel_current, 0), np.maximum(rel_baseline, 0)]
+        persistent = np.minimum(rel_bright[1], rel_bright[0])
+        columns = [
+            delta[chunk],
+            intensity[0] - intensity[1],
+            fractions[0] - fractions[1],
+            _log_ratios(rgb[0], epsilon) - _log_ratios(rgb[1], epsilon),
+            texture_delta,
+            np.abs(texture_delta),
+            norm[chunk],
+            local_mean[chunk],
+            local_std[chunk],
+            local_mean[chunk] / (local_std[chunk] + epsilon),
+            intensity[1],
+            contrast[1][chunk],
+            contrast[0][chunk],
+            contrast[0][chunk] - contrast[1][chunk],
+            np.minimum(bright[1], bright[0]),
+            np.maximum(bright[0] - bright[1], 0),
+            rel_baseline,
+            rel_current,
+            rel_current - rel_baseline,
+            persistent,
+            np.maximum(rel_bright[0] - rel_bright[1], 0),
+            persistent
+            * persistent
+            / (np.maximum(rel_bright[1], rel_bright[0]) + floor),
+        ]
+        count = intensity[0].size
+        if dynamic:
+            columns += [
+                np.ones(count, dtype),
+                dynamic_delta[chunk],
+                intensity[0] - intensity[2],
+                texture[0] - texture[2],
+                dynamic_norm[chunk],
+                local_dynamic_mean[chunk],
+            ]
+        else:
+            columns.append(np.zeros((count, 8), dtype))
+        features = np.column_stack([c.reshape(count, -1) for c in columns])
+        co2[chunk] = model.co2_presence.probability(features).reshape(-1, cols)
+        gas[chunk] = model.gas_within_co2.probability(features).reshape(-1, cols)
+
+    width = 2 * round(4 * sigma) + 1
+    support = cv2.erode(valid.astype(np.uint8), np.ones((width, width), np.uint8))
+    co2[support == 0] = np.nan
+    gas[support == 0] = np.nan
+    return co2, gas
