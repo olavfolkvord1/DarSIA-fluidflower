@@ -281,3 +281,97 @@ def test_rig_maps_baseline_and_reloads_the_mapping(tmp_path):
     # The corrected baseline is not corrected again.
     with pytest.raises(ValueError, match="not on the source grid"):
         darsia.imread(tmp_path / "rig" / "baseline.npz", transformations=corrections)
+
+
+FIT = (
+    "[corrections.material_illumination.fit]\n"
+    "spatial_ridge = 0.002\noffset_ridge = 0.02\nresidual_constant_ridge = 0.02\n"
+    "residual_spatial_ridge = 0.01\niterations = 8\nhuber_threshold = 1.5\n"
+    "clip_level = 0.98\ndark_level = 8.0\nminimum_block_cells = 32\n"
+    "chroma_cutoff = 0.08\nchroma_sigmas = 3.5\n"
+)
+"""The fit's settings our production ran with."""
+
+
+def _material_rig(tmp_path) -> tuple[Rig, CorrectionsConfig, np.ndarray]:
+    """Rig with a shape-corrected baseline under a smooth illumination, and the
+    configuration of its material illumination correction."""
+    rows, cols = np.mgrid[0:200, 0:300]
+    x = (cols + 0.5) * 2 / 300 - 1
+    gain = np.exp(np.stack([0.2 + 0.3 * x, 0.1 - 0.2 * x, 0.1 * x], axis=-1))
+    facies = np.ones((200, 300), dtype=int)
+    facies[70:140] = 2
+    facies[140:] = 3
+    colours = {1: [0.3, 0.2, 0.1], 2: [0.2, 0.25, 0.3], 3: [0.4, 0.35, 0.2]}
+    image = np.array([colours[m] for m in facies.ravel()]).reshape(200, 300, 3)
+    rig = Rig()
+    rig.shape_corrected_baseline = darsia.OpticalImage(
+        image / gain, color_space="RGB", dimensions=[0.2, 0.3]
+    )
+    rig.facies = darsia.ScalarImage(facies, dimensions=[0.2, 0.3])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[corrections.material_illumination]\n"
+        "fit_shape = [100, 150]\nblock_size = 10\nedge_margin = 0.0\n"
+        "dn_scale = 1000.0\n[corrections.material_illumination.targets]\n"
+        + "".join(
+            f'"{m}" = {np.log(np.array(colour) * 1000).tolist()}\n'
+            for m, colour in colours.items()
+        )
+        + FIT
+    )
+    return rig, CorrectionsConfig().load(config_path), image
+
+
+def test_material_illumination_is_fitted_and_reloaded(tmp_path):
+    """The configured material correction is fitted on the baseline and saved."""
+    rig, config, image = _material_rig(tmp_path)
+
+    rig.setup_color_corrections(config)
+    rig.baseline_path = tmp_path / "baseline.npz"
+    rig.shape_corrections = []
+    with pytest.warns(UserWarning):
+        rig.save(tmp_path / "rig")
+    loaded = Rig()
+    loaded.load_corrections(tmp_path / "rig")
+
+    assert isinstance(
+        rig.illumination_correction, darsia.MaterialIlluminationCorrection
+    )
+    np.testing.assert_allclose(rig.baseline.img, image, rtol=2e-3)
+    assert [type(c) for c in loaded.corrections] == [
+        darsia.MaterialIlluminationCorrection
+    ]
+    np.testing.assert_array_equal(
+        loaded.corrections[0](rig.shape_corrected_baseline).img, rig.baseline.img
+    )
+
+
+def test_official_and_material_illumination_give_one_form(monkeypatch, tmp_path):
+    """Swapping the illumination method changes the correction, not the result form."""
+    material_rig, config, _ = _material_rig(tmp_path)
+    material_rig.setup_color_corrections(config)
+    gain = material_rig.illumination_correction.gain(np.float64)
+
+    # The official illumination correction with the same gain field.
+    official = darsia.IlluminationCorrection()
+    official.colorspace = "rgb"
+    official.local_scaling = [darsia.ScalarImage(gain[..., i]) for i in range(3)]
+    official_rig, _, _ = _material_rig(tmp_path)
+    monkeypatch.setattr(
+        official_rig, "setup_illumination_correction", lambda *_a, **_k: official
+    )
+    official_rig.setup_color_corrections(
+        CorrectionsConfig(illumination=IlluminationCorrectionConfig())
+    )
+
+    for rig in (material_rig, official_rig):
+        assert isinstance(rig.illumination_correction, darsia.BaseCorrection)
+        assert isinstance(rig.baseline, darsia.OpticalImage)
+    assert official_rig.baseline.dimensions == material_rig.baseline.dimensions
+    np.testing.assert_array_equal(
+        official_rig.baseline.origin, material_rig.baseline.origin
+    )
+    np.testing.assert_allclose(
+        official_rig.baseline.img, material_rig.baseline.img, rtol=1e-12
+    )
