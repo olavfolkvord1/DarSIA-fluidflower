@@ -19,8 +19,9 @@ import darsia
 
 @dataclass(frozen=True)
 class MaterialFitSettings:
-    """Settings of the robust fit of the material gains; part of the material
-    illumination correction's configuration table."""
+    """Settings of the material illumination fit: the block samples of the
+    baseline (:func:`darsia.fit_material_illumination`) and the robust fit of
+    the gains; part of the correction's configuration table."""
 
     spatial_ridge: float
     """Ridge penalty of the spatial terms of the common field."""
@@ -34,6 +35,17 @@ class MaterialFitSettings:
     """Number of robust solves per channel and stage."""
     huber_threshold: float
     """Residuals beyond this many robust standard deviations are down-weighted."""
+    clip_level: float
+    """Values at or above it, in units of the white level, are not fitted."""
+    dark_level: float
+    """Cells at or below this value in a channel, in target units, are not fitted."""
+    minimum_block_cells: int
+    """Fewest usable cells of one material for which a block gives a median."""
+    chroma_cutoff: float
+    """Smallest chromaticity deviation of a colour outlier block."""
+    chroma_sigmas: float
+    """Chromaticity deviation of a colour outlier block, in robust standard
+    deviations."""
 
 
 def _polynomial(positions: np.ndarray) -> np.ndarray:

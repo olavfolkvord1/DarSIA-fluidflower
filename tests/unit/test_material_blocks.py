@@ -1,0 +1,146 @@
+"""Unit tests for the block fit of the material illumination correction."""
+
+import tomllib
+
+import numpy as np
+
+import darsia
+
+FIT = darsia.MaterialFitSettings(
+    **tomllib.loads(
+        """
+        # The values the fit ran with in production.
+        spatial_ridge = 0.002
+        offset_ridge = 0.02
+        residual_constant_ridge = 0.02
+        residual_spatial_ridge = 0.01
+        iterations = 8
+        huber_threshold = 1.5
+        clip_level = 0.98
+        dark_level = 8.0
+        minimum_block_cells = 32
+        chroma_cutoff = 0.08
+        chroma_sigmas = 3.5
+        """
+    )
+)
+
+
+def _bands(shape=(40, 60)) -> np.ndarray:
+    """Material 1 in the upper and material 2 in the lower half."""
+    material_map = np.ones(shape, dtype=int)
+    material_map[shape[0] // 2 :] = 2
+    return material_map
+
+
+def test_projection_to_the_fitting_grid():
+    """Area means; unusable and clipped cells unsafe; pure cells eroded by one."""
+    rgb = np.full((40, 60, 3), 0.5, dtype=np.float32)
+    rgb[0, 0, 1] = -0.1
+    rgb[8:12, 20:24, 0] = 0.99
+
+    projection = darsia.project_to_fit_grid(
+        rgb, _bands(), np.ones((40, 60), dtype=bool), (10, 15), [1, 2], FIT
+    )
+
+    expected = np.full((10, 15, 3), 0.5, dtype=np.float32)
+    expected[0, 0] = np.nan
+    expected[2, 5, 0] = 0.99
+    np.testing.assert_allclose(projection["rgb"], expected, rtol=1e-6)
+    np.testing.assert_array_equal(
+        np.argwhere(~projection["fit_safe"]), [[0, 0], [2, 5]]
+    )
+    assert (projection["materials"][1:4, 1:-1] == 1).all()
+    assert (projection["materials"][6:9, 1:-1] == 2).all()
+    # Erosion at the material boundary and at the grid's edge.
+    assert (projection["materials"][[0, 4, 5, 9]] == -1).all()
+    assert (projection["materials"][:, [0, -1]] == -1).all()
+
+
+def test_block_samples_positions_folds_and_margin():
+    """Block medians carry their centre, fold and the target colour."""
+    rgb = np.full((80, 120, 3), 0.5, dtype=np.float32)
+    projection = darsia.project_to_fit_grid(
+        rgb,
+        _bands((80, 120)),
+        np.ones((80, 120), dtype=bool),
+        (20, 30),
+        [1, 2],
+        FIT,
+    )
+    targets = {1: np.log([10.0, 20.0, 30.0]), 2: np.log([5.0, 5.0, 5.0])}
+
+    def samples(edge_margin):
+        return darsia.collect_block_samples(
+            projection,
+            targets,
+            dimensions=(0.8, 1.2),
+            edge_margin=edge_margin,
+            block_size=10,
+            dn_scale=100.0,
+            settings=FIT,
+        )
+
+    # Two block rows and three block columns, one material each.
+    blocks = samples(0.0)
+    assert len(blocks["x"]) == 6
+    np.testing.assert_allclose(blocks["before"], 50.0, rtol=1e-6)
+    np.testing.assert_allclose(
+        blocks["target"][blocks["material"] == 1], [[10, 20, 30]] * 3, rtol=1e-6
+    )
+    np.testing.assert_array_equal(blocks["fold"], [0, 2, 4, 3, 0, 2])
+    # The margin leaves 30 cells in the outer blocks and 50 in the middle ones.
+    assert len(samples(0.17)["x"]) == 2
+
+
+def test_colour_outlier_block_is_flagged():
+    """A block whose chromaticity deviates from its material's blocks is flagged."""
+    count = 20
+    before = np.full((count, 3), 50.0)
+    before[7] = [80.0, 50.0, 50.0]
+    samples = {
+        "before": before,
+        "target": np.full((count, 3), 40.0),
+        "material": np.ones(count, dtype=np.int64),
+        "fold": np.zeros(count, dtype=np.int64),
+    }
+
+    outliers = darsia.block_color_outliers(samples, [1], FIT)
+
+    np.testing.assert_array_equal(np.flatnonzero(outliers), [7])
+
+
+def test_fit_removes_a_known_illumination():
+    """The corrected baseline matches the target colours of its materials."""
+    rows, cols = np.mgrid[0:200, 0:300]
+    y, x = (rows + 0.5) * 2 / 200 - 1, (cols + 0.5) * 2 / 300 - 1
+    gain = np.exp(
+        np.stack(
+            [0.2 + 0.3 * x - 0.1 * y + 0.05 * x * x, 0.1 - 0.2 * x + 0.2 * y, 0.1 * x],
+            axis=-1,
+        )
+    )
+    material_map = np.ones((200, 300), dtype=int)
+    material_map[70:140] = 2
+    material_map[140:] = 3
+    colours = {1: [0.3, 0.2, 0.1], 2: [0.2, 0.25, 0.3], 3: [0.4, 0.35, 0.2]}
+    target_image = np.array([colours[m] for m in material_map.ravel()]).reshape(
+        200, 300, 3
+    )
+    targets = {m: np.log(np.array(colour) * 1000.0) for m, colour in colours.items()}
+
+    correction = darsia.fit_material_illumination(
+        target_image / gain,
+        material_map,
+        np.ones((200, 300), dtype=bool),
+        targets,
+        dimensions=(0.2, 0.3),
+        fit_shape=(100, 150),
+        block_size=10,
+        edge_margin=0.0,
+        dn_scale=1000.0,
+        settings=FIT,
+    )
+
+    corrected = correction.correct_array(target_image / gain)
+    np.testing.assert_allclose(corrected, target_image, rtol=2e-3)
