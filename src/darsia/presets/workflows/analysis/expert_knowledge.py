@@ -89,6 +89,7 @@ class ExpertKnowledgeAdapter:
             labels_image=labels_image,
             facies_image=facies_image,
             roi_registry=roi_registry,
+            phase_maps=config.phase_maps,
         )
 
     def _signature(self, image: darsia.Image) -> tuple:

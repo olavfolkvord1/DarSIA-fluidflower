@@ -6,6 +6,7 @@ import pytest
 import darsia
 from darsia.presets.workflows.analysis.expert_knowledge import ExpertKnowledgeAdapter
 from darsia.presets.workflows.analysis.scalar_products import analysis_scalar_products
+from darsia.presets.workflows.config.expert_knowledge import ExpertKnowledgeConfig
 
 W, D, G, U = darsia.PhaseLabel
 
@@ -21,7 +22,11 @@ def test_each_frame_keeps_co2_inside_its_own_phase_map(tmp_path):
     for stem, labels in maps.items():
         phase = darsia.ScalarImage(np.array(labels, np.uint8), dimensions=[0.2, 0.4])
         phase.save(tmp_path / f"{stem}.npz")
-    adapter = ExpertKnowledgeAdapter(phase_maps=tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text(f'[expert_knowledge]\nphase_maps = "{tmp_path.as_posix()}"\n')
+    adapter = ExpertKnowledgeAdapter.from_config(
+        ExpertKnowledgeConfig().load(config), roi_registry=None
+    )
     for stem, labels in maps.items():
         name = f"{stem}.jpg"
         result = darsia.SimpleMassAnalysisResults(
