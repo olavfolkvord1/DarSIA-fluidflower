@@ -151,6 +151,7 @@ from darsia.assistants.labels_assistant import *
 # Multiphase flow
 from darsia.multiphase.flash import *
 from darsia.multiphase.mass_analysis import *
+from darsia.multiphase.phase_model import *
 from darsia.multiphase.fluidflower_co2_meta import *
 from darsia.multiphase.multiphase_time_series_data import *
 from darsia.multiphase.multiphase_time_series_analysis import *
