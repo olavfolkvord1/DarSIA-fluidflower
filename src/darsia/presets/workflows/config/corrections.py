@@ -191,6 +191,45 @@ class ResizeCorrectionConfig:
 
 
 @dataclass
+class ImageMappingCorrectionConfig:
+    """Configuration for an image mapping correction.
+
+    The mapping is stored in a file written by
+    :meth:`darsia.ImageMappingCorrection.save`.
+    """
+
+    path: Path = field(
+        default_factory=Path,
+        metadata={
+            "name": "Mapping file",
+            "help": (
+                "Path to a stored image mapping (.npz) that samples the input images "
+                "onto the target grid. Labels and facies are expected on the target "
+                "grid."
+            ),
+        },
+    )
+    """Path to the stored image mapping."""
+
+    def load(self, sec: dict) -> "ImageMappingCorrectionConfig":
+        """Load image mapping configuration from a dictionary.
+
+        Parameters
+        ----------
+        sec : dict
+            Dictionary containing the image mapping settings.
+
+        Returns
+        -------
+            Self with loaded configuration.
+        """
+        if "path" not in sec:
+            raise ValueError("corrections.mapping requires 'path'.")
+        self.path = Path(sec["path"])
+        return self
+
+
+@dataclass
 class InitCorrectionConfig:
     """Configuration for initial (pre-bulge) curvature correction stage.
 
@@ -1242,6 +1281,7 @@ class PatchwiseIlluminationCorrectionConfig:
 _CORRECTION_CLASSES: dict[str, type] = {
     "type": TypeCorrectionConfig,
     "resize": ResizeCorrectionConfig,
+    "mapping": ImageMappingCorrectionConfig,
     "drift": DriftCorrectionConfig,
     "curvature": CurvatureCorrectionConfig,
     "color": ColorCorrectionConfig,
@@ -1267,6 +1307,9 @@ class CorrectionsConfig:
     resize
         ResizeCorrectionConfig for resize correction (default: None).
         Resizes images to a target shape or scale.
+    mapping
+        ImageMappingCorrectionConfig for an image mapping (default: None).
+        Samples images onto a target grid at stored coordinates.
     drift
         DriftCorrectionConfig for drift correction (default: None).
         Corrects color drift based on color checker position.
@@ -1294,6 +1337,10 @@ class CorrectionsConfig:
     resize: ResizeCorrectionConfig | None = field(
         default=None,
         metadata={"name": "Resize correction", "active_list_key": "active"},
+    )
+    mapping: ImageMappingCorrectionConfig | None = field(
+        default=None,
+        metadata={"name": "Image mapping correction", "active_list_key": "active"},
     )
     drift: DriftCorrectionConfig | None = field(
         default=None, metadata={"name": "Drift correction", "active_list_key": "active"}

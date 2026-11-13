@@ -242,3 +242,42 @@ def test_import_from_csv_supports_coordinate_layout(tmp_path):
 
     assert isinstance(image, darsia.ScalarImage)
     assert np.allclose(image.img, reference.img)
+
+
+def test_rig_maps_baseline_and_reloads_the_mapping(tmp_path):
+    """A configured mapping corrects the baseline once and survives save/load."""
+    i, j = np.mgrid[0:4, 0:5].astype(np.float32)
+    mapping = darsia.ImageMappingCorrection(
+        1.5 + 1.25 * j, 0.75 + 1.5 * i, source_shape=(8, 10), dimensions=[0.4, 0.5]
+    )
+    mapping.save(tmp_path / "mapping.npz")
+    rows, cols = np.mgrid[0:8, 0:10].astype(np.float32)
+    source = np.stack([rows, cols, rows + cols], axis=-1)
+    darsia.OpticalImage(source, color_space="RGB").save(tmp_path / "baseline.npz")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[corrections.mapping]\npath = "{(tmp_path / "mapping.npz").as_posix()}"\n'
+    )
+
+    rig = Rig()
+    rig.setup_reading(
+        tmp_path / "baseline.npz",
+        experiment=None,
+        corrections_config=CorrectionsConfig().load(config_path),
+    )
+    rig.baseline_path = tmp_path / "baseline.npz"
+    rig.color_corrections = []
+    with pytest.warns(UserWarning):
+        rig.save(tmp_path / "rig")
+    loaded = Rig()
+    loaded.load_corrections(tmp_path / "rig")
+    corrections = loaded.corrections
+    reread = darsia.imread(tmp_path / "baseline.npz", transformations=corrections)
+
+    assert rig.baseline.img.shape == (4, 5, 3)
+    assert rig.baseline.dimensions == [0.4, 0.5]
+    assert any(isinstance(c, darsia.ImageMappingCorrection) for c in corrections)
+    np.testing.assert_array_equal(reread.img, rig.baseline.img)
+    # The corrected baseline is not corrected again.
+    with pytest.raises(ValueError, match="not on the source grid"):
+        darsia.imread(tmp_path / "rig" / "baseline.npz", transformations=corrections)

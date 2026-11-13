@@ -110,6 +110,7 @@ class Rig:
                 darsia.ResizeCorrection,
                 darsia.DriftCorrection,
                 darsia.CurvatureCorrection,
+                darsia.ImageMappingCorrection,
             ),
         )
 
@@ -273,6 +274,17 @@ class Rig:
             # Update baseline and corrections workflow
             baseline_for_setup = self.rescale_correction(baseline_for_setup)
             self.shape_corrections.append(self.rescale_correction)
+
+        if corrections_config.mapping:
+            # Sample onto the target grid of a stored mapping. All later shape
+            # corrections, and labels and facies, refer to the target grid.
+            self.mapping_correction = darsia.ImageMappingCorrection()
+            """Mapping onto the target grid at stored coordinates."""
+            self.mapping_correction.load(corrections_config.mapping.path)
+
+            # Update baseline and corrections workflow
+            baseline_for_setup = self.mapping_correction(baseline_for_setup)
+            self.shape_corrections.append(self.mapping_correction)
 
         # Resize for consistency (drift, curvature). Free no-op when shapes
         # already match, via early return in Resize.resize_array.
