@@ -64,6 +64,19 @@ class ExpertKnowledgeConfig:
         },
     )
     """ROI registry keys where concentration_aq is forced to zero (exclusion)."""
+    phase_maps: Path | None = field(
+        default=None,
+        metadata={
+            "name": "Phase maps",
+            "help": (
+                "Folder with one phase map per image, named by the image's stem "
+                "(.npz). concentration_aq is kept only where the map says CO2, "
+                "saturation_g only where it says free gas; both are unknown (NaN) "
+                "where the map is unknown."
+            ),
+        },
+    )
+    """Folder of per-image phase maps, as dynamic expert knowledge."""
 
     def load(
         self, path: Path | list[Path], roi_registry: "RoiRegistry | None" = None
@@ -80,6 +93,7 @@ class ExpertKnowledgeConfig:
         self.no_concentration_aq = _get_key(
             sec, "no_concentration_aq", required=False, default=[]
         )
+        self.phase_maps = _get_key(sec, "phase_maps", required=False, type_=Path)
 
         roi_key_fields = (
             ("saturation_g", self.saturation_g),
