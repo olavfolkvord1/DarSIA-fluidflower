@@ -19,6 +19,7 @@ MODULES = [
     "darsia/corrections/shape/imagemapping.py",
     "darsia/corrections/color/materialilluminationcorrection.py",
     "darsia/corrections/color/materialblocks.py",
+    "darsia/multiphase/phase_model.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
