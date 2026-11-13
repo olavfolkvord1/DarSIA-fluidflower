@@ -290,3 +290,13 @@ def test_coordinate_vector_unit_coordinatesystem_2d():
     assert np.allclose(
         coordinate_vectors, [[0.5, -1 / 3], [0.5, -2 / 3]]
     ), "coordinate_vector values not correct"
+
+
+def test_pixel_centres_lie_half_a_pixel_inside_the_top_left_corner():
+    """x runs right from the origin, y down from it, half a voxel inside."""
+    image = darsia.Image(np.zeros((2, 4)), dimensions=[0.2, 0.8], origin=[1.0, 3.0])
+
+    x, y = darsia.pixel_centres(image)
+
+    assert np.allclose(x, [1.1, 1.3, 1.5, 1.7])
+    assert np.allclose(y, [2.95, 2.85])
