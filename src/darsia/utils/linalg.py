@@ -1,9 +1,10 @@
-"""Wrapper to Krylov subspace methods from SciPy."""
+"""Wrappers to Krylov subspace methods from SciPy, and dense solves in a precision."""
 
 from typing import Optional, Union
 
 import numpy as np
 import numpy.typing as npt
+import scipy.linalg
 import scipy.sparse as sps
 from scipy.sparse.linalg import cg, gmres
 
@@ -370,3 +371,100 @@ except ImportError:
             **kwargs,
         ) -> None:
             raise ImportError("petsc4py not found. PETSc solver not available.")
+
+
+_SCALE_FLOOR = 0.02
+"""Smallest robust standard deviation of the residuals."""
+
+
+def solve(matrix: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Solve a dense linear system in the operands' precision.
+
+    NumPy promotes single precision to double; two single-precision operands
+    are therefore solved by LAPACK in single precision, any other by NumPy.
+
+    Parameters
+    ----------
+    matrix : array
+        Square system matrix (N, N).
+    rhs : array
+        Right-hand side (N,) or (N, K).
+
+    Returns
+    -------
+    array
+        The solution, in the operands' precision.
+
+    """
+    if np.result_type(matrix, rhs) == np.float32:
+        return scipy.linalg.solve(matrix, rhs, assume_a="general", check_finite=False)
+    return np.linalg.solve(matrix, rhs)
+
+
+def robust_ridge(
+    design: np.ndarray,
+    response: np.ndarray,
+    base: np.ndarray,
+    penalty: np.ndarray,
+    iterations: int,
+    threshold: float,
+) -> np.ndarray:
+    """Robust ridge regression, one solve per iteration and channel.
+
+    Each iteration solves the weighted, penalized normal equations
+    (:func:`solve`, in the operands' precision) and updates the weights with a
+    Huber rule on the residuals: residuals beyond ``threshold`` robust standard
+    deviations (1.4826 times the MAD, at least 0.02) are down-weighted.
+
+    Parameters
+    ----------
+    design : array
+        Design matrix (N, P).
+    response : array
+        Responses (N, 3), one column per channel.
+    base : array
+        Base weights (N,).
+    penalty : array
+        Ridge penalty (P, P).
+    iterations : int
+        Number of solves per channel.
+    threshold : float
+        Huber threshold, in robust standard deviations of the residuals.
+
+    Returns
+    -------
+    array
+        Coefficients (P, 3), in the design's dtype.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is not a positive integer: no solve would run and the
+        coefficients would be left uninitialised.
+
+    """
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, (int, np.integer))
+        or iterations < 1
+    ):
+        raise ValueError(
+            f"The iteration count must be a positive integer, got {iterations!r}."
+        )
+    coefficients = np.empty((design.shape[1], 3), design.dtype)
+    for channel in range(3):
+        weights = base.copy()
+        for _ in range(iterations):
+            coefficients[:, channel] = solve(
+                design.T @ (weights[:, None] * design) + penalty,
+                design.T @ (weights * response[:, channel]),
+            )
+            residual = response[:, channel] - design @ coefficients[:, channel]
+            scale = max(
+                _SCALE_FLOOR,
+                1.4826 * np.median(np.abs(residual - np.median(residual))),
+            )
+            weights = base * np.minimum(
+                1.0, threshold * scale / np.maximum(np.abs(residual), 1e-12)
+            )
+    return coefficients
