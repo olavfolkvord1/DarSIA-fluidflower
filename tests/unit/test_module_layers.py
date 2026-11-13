@@ -17,6 +17,8 @@ SOURCE = Path(__file__).resolve().parents[2] / "src"
 
 MODULES = [
     "darsia/corrections/shape/imagemapping.py",
+    "darsia/corrections/color/materialilluminationcorrection.py",
+    "darsia/corrections/color/materialblocks.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
