@@ -510,6 +510,10 @@ class HeterogeneousColorToMassAnalysis:
         density_gas, aqueous_capacity = properties
         keep_aq = keep_g = None
         if self.expert_knowledge_adapter is not None:
+            if self.expert_knowledge_adapter.phase_maps is not None:
+                # Each image's phase map also makes its unknown pixels unknown (NaN),
+                # which only `ExpertKnowledgeAdapter.apply` does.
+                return None
             keep_aq = self.expert_knowledge_adapter.mask_for(pH, "concentration_aq")
             keep_g = self.expert_knowledge_adapter.mask_for(pH, "saturation_g")
             if any(
