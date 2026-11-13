@@ -19,6 +19,11 @@ FIT = darsia.MaterialFitSettings(
         residual_spatial_ridge = 0.01
         iterations = 8
         huber_threshold = 1.5
+        clip_level = 0.98
+        dark_level = 8.0
+        minimum_block_cells = 32
+        chroma_cutoff = 0.08
+        chroma_sigmas = 3.5
         """
     )
 )
