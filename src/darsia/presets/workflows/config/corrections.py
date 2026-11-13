@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Any, Literal, Type
 
 import numpy as np
 
+from darsia.corrections.color.materialilluminationcorrection import (
+    MaterialFitSettings,
+)
+
 from ._key_list_sources import ROI_SOURCES
 from .roi_registry import _load_roi_key_list
 from .utils import _get_section_from_toml
@@ -1213,6 +1217,131 @@ class IlluminationCorrectionConfig:
 
 
 @dataclass
+class MaterialIlluminationCorrectionConfig:
+    """Configuration for the material illumination correction.
+
+    Smooth positive gains, one per material and a common one for all other pixels,
+    are fitted on block medians of the baseline such that each material matches a
+    constant target colour.
+    """
+
+    targets: dict[int, list[float]] = field(
+        default_factory=dict,
+        metadata={
+            "name": "Target colours",
+            "help": (
+                "Natural logarithm of the target RGB of each material, keyed by "
+                "material (facies) id. Edit via TOML: "
+                "[corrections.material_illumination.targets] with entries like "
+                '"3" = [r, g, b].'
+            ),
+            "hidden": True,
+        },
+    )
+    """Natural logarithm of the target RGB of each material."""
+    fit_shape: tuple[int, int] | None = field(
+        default=None,
+        metadata={
+            "name": "Fitting grid",
+            "help": "Rows and columns of the coarse grid the baseline is reduced to.",
+            "placeholder": "e.g., [150, 225]",
+        },
+    )
+    """Rows and columns of the fitting grid."""
+    block_size: int | None = field(
+        default=None,
+        metadata={
+            "name": "Block size",
+            "help": "Side length of the blocks, in cells of the fitting grid.",
+            "placeholder": "e.g., 16",
+        },
+    )
+    """Block side length in cells of the fitting grid."""
+    edge_margin: float | None = field(
+        default=None,
+        metadata={
+            "name": "Edge margin",
+            "help": "Physical margin along the image edges left out of the fit.",
+            "placeholder": "e.g., 0.03",
+        },
+    )
+    """Physical margin along the image edges left out of the fit."""
+    dn_scale: float | None = field(
+        default=None,
+        metadata={
+            "name": "Target scale",
+            "help": (
+                "Factor from image values to the units of the targets, e.g., the "
+                "sensor's white level in camera digital numbers. Cells at or below "
+                "8 target units are not fitted."
+            ),
+            "placeholder": "e.g., 16383 for a 14-bit sensor",
+        },
+    )
+    """Factor from image values to the units of the targets."""
+    fit_mask: Path | None = field(
+        default=None,
+        metadata={
+            "name": "Fit mask",
+            "help": (
+                "Optional boolean image (.npz) on the corrected grid marking the "
+                "pixels eligible for the fit. Defaults to all pixels of the "
+                "materials with a target."
+            ),
+        },
+    )
+    """Optional path to a boolean mask of pixels eligible for the fit."""
+    fit: MaterialFitSettings | None = field(
+        default=None,
+        metadata={
+            "name": "Robust fit",
+            "help": (
+                "Thresholds of the block samples and the ridge penalties, iteration "
+                "count and Huber threshold of the robust fit, in "
+                "[corrections.material_illumination.fit]."
+            ),
+        },
+    )
+    """Settings of the block samples and of the robust fit of the gains."""
+
+    def load(self, sec: dict) -> "MaterialIlluminationCorrectionConfig":
+        """Load material illumination correction configuration from a dictionary.
+
+        Parameters
+        ----------
+        sec : dict
+            Dictionary containing the material illumination correction settings.
+
+        Returns
+        -------
+            Self with loaded configuration.
+        """
+        required = (
+            "targets",
+            "fit_shape",
+            "block_size",
+            "edge_margin",
+            "dn_scale",
+            "fit",
+        )
+        if any(key not in sec for key in required):
+            raise ValueError(
+                f"corrections.material_illumination requires the keys {required}."
+            )
+        self.targets = {
+            int(key): [float(v) for v in value] for key, value in sec["targets"].items()
+        }
+        self.fit_shape = tuple(int(n) for n in sec["fit_shape"])
+        self.block_size = int(sec["block_size"])
+        self.edge_margin = float(sec["edge_margin"])
+        self.dn_scale = float(sec["dn_scale"])
+        fit_mask = sec.get("fit_mask", self.fit_mask)
+        self.fit_mask = Path(fit_mask) if fit_mask is not None else None
+        self.fit = MaterialFitSettings(**sec["fit"])
+        return self
+
+
+@dataclass
 class PatchwiseIlluminationCorrectionConfig:
     """Configuration for patchwise illumination correction.
 
@@ -1288,6 +1417,7 @@ _CORRECTION_CLASSES: dict[str, type] = {
     "relative_color": RelativeColorCorrectionConfig,
     "illumination": IlluminationCorrectionConfig,
     "patchwise_illumination": PatchwiseIlluminationCorrectionConfig,
+    "material_illumination": MaterialIlluminationCorrectionConfig,
 }
 
 
@@ -1328,6 +1458,10 @@ class CorrectionsConfig:
         PatchwiseIlluminationCorrectionConfig for patchwise
         illumination correction (default: None). Corrects illumination variations
         across the image using patchwise interpolation.
+    material_illumination
+        MaterialIlluminationCorrectionConfig for the material illumination
+        correction (default: None). Smooth gains per material, fitted to constant
+        target colours.
     """
 
     # Configuration objects for each correction type
@@ -1368,6 +1502,13 @@ class CorrectionsConfig:
         default=None,
         metadata={
             "name": "Patchwise illumination correction",
+            "active_list_key": "active",
+        },
+    )
+    material_illumination: MaterialIlluminationCorrectionConfig | None = field(
+        default=None,
+        metadata={
+            "name": "Material illumination correction",
             "active_list_key": "active",
         },
     )
