@@ -3,6 +3,7 @@
 import logging
 from typing import Optional, Union, overload
 
+import cv2
 import numpy as np
 import scipy.ndimage
 import skimage
@@ -231,3 +232,28 @@ def porosity_based_averaging(
         rev=darsia.REV(rev_size, ref_image),
         mask=porosity,
     )
+
+
+def gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian filter of aperture 8 sigma + 1, in the image's dtype.
+
+    Parameters
+    ----------
+    image : array
+        Floating image (rows, cols).
+    sigma : float
+        Standard deviation of the Gaussian in pixels.
+
+    Returns
+    -------
+    array
+        The filtered image, in the image's dtype, with OpenCV's default
+        (reflected) border.
+
+    """
+    dtype = image.dtype.type
+    width = int(np.rint(dtype(sigma) * 8 + 1)) | 1
+    offsets = np.arange(width, dtype=dtype) - width // 2
+    kernel = np.exp((-dtype(0.5) / dtype(sigma) ** 2) * offsets**2)
+    kernel /= kernel.sum(dtype=dtype)
+    return cv2.sepFilter2D(image, -1, kernel, kernel, borderType=cv2.BORDER_DEFAULT)
