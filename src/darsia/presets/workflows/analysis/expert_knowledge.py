@@ -1,19 +1,33 @@
-"""Expert-knowledge adapter for constraining scalar analysis fields by ROIs."""
+"""Expert-knowledge adapter for constraining scalar analysis fields.
+
+Static expert knowledge is a set of ROIs per field. Dynamic expert knowledge is
+each image's own phase map: concentration_aq may be nonzero only where it says
+CO2, saturation_g only where it says free gas, and both are unknown (NaN) where
+the phase map is unknown.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 import darsia
+from darsia.multiphase.phase_rules import PhaseLabel
 from darsia.utils.standard_images import roi_to_mask
 
 if TYPE_CHECKING:
     from darsia.presets.workflows.config.expert_knowledge import ExpertKnowledgeConfig
     from darsia.presets.workflows.config.roi import RoiConfig
     from darsia.presets.workflows.config.roi_registry import RoiRegistry
+
+_PHASES = {
+    "concentration_aq": (PhaseLabel.DISSOLVED, PhaseLabel.GAS),
+    "saturation_g": (PhaseLabel.GAS,),
+}
+"""Phase-map categories in which each field may be nonzero."""
 
 
 @dataclass
@@ -30,8 +44,13 @@ class ExpertKnowledgeAdapter:
     """Resolved facies-ID image backing shape='facies' ROI entries, if any."""
     roi_registry: "RoiRegistry | None" = None
     """Registry used to resolve shape='intersection'/'union' entries' `members`."""
+    phase_maps: Path | None = None
+    """Folder holding each image's phase map as ``<image stem>.npz``, if any."""
     _mask_cache: dict[tuple[str, tuple], np.ndarray] = field(
         default_factory=dict, init=False
+    )
+    _last_phase_map: tuple[str | None, darsia.Image | None] = field(
+        default=(None, None), init=False
     )
 
     @classmethod
@@ -171,7 +190,7 @@ class ExpertKnowledgeAdapter:
             mask |= self._mask_for_roi(roi, image)
         return mask
 
-    def mask_for(self, image: darsia.Image, mode: str) -> np.ndarray | None:
+    def _static_mask_for(self, image: darsia.Image, mode: str) -> np.ndarray | None:
         """Boolean "keep" mask for `mode` - True where the field may stay non-zero.
 
         Combines two independent rules: a positive ROI union (only keep
@@ -199,6 +218,38 @@ class ExpertKnowledgeAdapter:
             self._mask_cache[cache_key] = keep_mask
         return self._mask_cache[cache_key]
 
+    def _phase_labels(self, image: darsia.Image) -> np.ndarray:
+        """Labels of the image's own phase map, read once per image.
+
+        The map's grid is checked against the image's on every call.
+        """
+        if image.name is None:
+            raise ValueError("A phase map is found by the image's name.")
+        if self._last_phase_map[0] != image.name:
+            path = self.phase_maps / f"{Path(image.name).stem}.npz"
+            self._last_phase_map = (image.name, darsia.imread(path))
+        phase = self._last_phase_map[1]
+        if (
+            phase.img.shape != image.img.shape
+            or not np.array_equal(phase.dimensions, image.dimensions)
+            or not np.array_equal(phase.origin, image.origin)
+        ):
+            raise ValueError(f"The phase map of {image.name} has another grid.")
+        return phase.img
+
+    def mask_for(self, image: darsia.Image, mode: str) -> np.ndarray | None:
+        """Boolean "keep" mask for `mode`: static ROIs and the image's phase map.
+
+        Without a phase-map folder this is the static mask (see
+        `_static_mask_for`); with one, it is intersected with the region the
+        image's own phase map allows for the field.
+        """
+        static = self._static_mask_for(image, mode)
+        if self.phase_maps is None or mode not in _PHASES:
+            return static
+        allowed = np.isin(self._phase_labels(image), _PHASES[mode])
+        return allowed if static is None else static & allowed
+
     def apply(self, image: darsia.Image | None, mode: str) -> darsia.Image | None:
         if image is None:
             return None
@@ -208,4 +259,7 @@ class ExpertKnowledgeAdapter:
 
         constrained = image.copy()
         constrained.img[~mask] = 0.0
+        if self.phase_maps is not None and mode in _PHASES:
+            unknown = self._phase_labels(image) == PhaseLabel.UNKNOWN
+            constrained.img[unknown] = np.nan
         return constrained
