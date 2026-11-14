@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .utils import _get_section_from_toml, _normalize_mode
+from .utils import _get_key, _get_section_from_toml, _normalize_mode
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +313,20 @@ class InjectionProtocolConfig:
         },
     )
     """Injected fluid density in kg/m3 (optional; volumetric rate units only, 0 = none)."""
+    injection_reference_density: float | None = field(
+        default=None,
+        metadata={
+            "name": "Reference density of the flow controller (kg/m3)",
+            "help": (
+                "Density of the injected gas at the mass flow controller's "
+                "reference conditions, to which the volume rates of the injection "
+                "protocol (sccm, mL/min, mL/s, mL/hr) refer. Empty: the "
+                "protocol's density column converts them."
+            ),
+            "group": "Operating conditions",
+        },
+    )
+    """Gas density [kg/m3] at the flow controller's reference, or None."""
     injection_coordinates: tuple[float, float] = field(
         default=(0.0, 0.0),
         metadata={
@@ -352,6 +366,9 @@ class InjectionProtocolConfig:
         )
         self.injection_rate = float(sec.get("injection_rate", 0.0))
         self.injection_density = float(sec.get("injection_density", 0.0))
+        self.injection_reference_density = _get_key(
+            sec, "injection_reference_density", required=False, type_=float
+        )
 
         injection_coordinates = sec.get("injection_coordinates", (0.0, 0.0))
         if len(injection_coordinates) != 2:
