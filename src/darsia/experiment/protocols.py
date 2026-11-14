@@ -755,3 +755,60 @@ class PressureTemperatureProtocol:
                 "temperature_gradient_celsius": temperature_gradient_celsius,
             }
         )
+
+
+class OverflowProtocol:
+    """Overflow protocol: the scale readings of the water a run's overflow carried."""
+
+    def __init__(self, path: Path | tuple[Path, str]) -> None:
+        self.df = self._load_protocol(path)
+        """DataFrame of the readings: datetime, weight_g and status."""
+
+    def readings(
+        self, origin: datetime, statuses: list[str]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Times and weights of the readings with one of the given statuses.
+
+        Parameters
+        ----------
+        origin : datetime
+            Time from which the reading times are counted, e.g. the injection
+            start.
+        statuses : list of str
+            Review statuses of the readings to use.
+
+        Returns
+        -------
+        tuple of arrays
+            Times [h] since ``origin`` and weights [g], in time order.
+
+        """
+        df = self.df[self.df["status"].isin(statuses)].sort_values(
+            "datetime", kind="stable"
+        )
+        hours = (df["datetime"] - origin).dt.total_seconds() / 3600
+        return hours.to_numpy(np.float64), df["weight_g"].to_numpy(np.float64)
+
+    def _load_protocol(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
+        df = _read_table(path)
+
+        # Make columns all lowercase
+        df.columns = [col.lower() for col in df.columns]
+
+        # Expect columns 'image_time', 'weight_g', 'status'; keep rows with a weight
+        assert (
+            "image_time" in df.columns
+        ), "Column 'Image_Time' not found in the protocol file."
+        assert (
+            "weight_g" in df.columns
+        ), "Column 'Weight_G' not found in the protocol file."
+        assert "status" in df.columns, "Column 'Status' not found in the protocol file."
+        df = df[df["weight_g"].notna()]
+
+        return pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(df["image_time"]),
+                "weight_g": df["weight_g"].astype(float),
+                "status": df["status"].astype(str),
+            }
+        )
