@@ -1,22 +1,21 @@
 """Overflow reference: the free-gas volume of a run's frames from displaced water.
 
 Injected CO2 displaces water from the porous layers, and the overflow carries
-the displaced water, together with a slowly drifting feed of water, to a scale.
-The overflow measures that displaced water, never CO2 leaving the rig. The
-displaced volume of a run is its scale weight above the feed (one gram of water
-per mL), and the free-gas volume of a frame is that volume at the frame's time,
-at least zero (:func:`measured_reference`). A frame without usable readings of
-its own takes the free-gas share of the injected CO2 mass from the most similar
-run with readings (:func:`ranked_donors`, :func:`estimated_reference`).
+the displaced water to a scale. The overflow measures that displaced water,
+never CO2 leaving the rig. How the weight shows it depends on the rig, and the
+configuration chooses the variant: an overflow fed from a tank, where the
+displaced water is the weight above the feed (:mod:`overflow_feed`), or one
+circulating its water, where it is the absolute weight
+(:mod:`overflow_circulation`). Either way the displaced volume of a run counts
+from its baseline, the readings before the injection, at one gram of water per
+mL (:func:`displaced_volume`), and the free-gas volume of a frame is that
+volume at the frame's time, at least zero (:func:`measured_reference`). A
+frame without usable readings of its own takes the free-gas share of the
+injected CO2 mass from the most similar run with readings
+(:func:`ranked_donors`, :func:`estimated_reference`).
 
-The feed (:func:`displaced_volume`) stops where the readings stop rising: at
-the first reading, from ``supply_check_h`` on, after which the weight rises by
-less than ``supply_stop_rise_g`` within ``supply_check_span_h``. Over the late
-window, from ``late_window_h[0]`` to ``late_window_h[1]`` before that stop, the
-weight is the feed alone. The feed starts from the last reading before the
-injection, with a rate and a constant change of rate fitted over the late window.
-
-Every setting is a field of :class:`OverflowSettings`.
+Every setting is a field of :class:`OverflowSettings` or of its variant's
+settings.
 
 """
 
@@ -24,38 +23,85 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal, Protocol
 
 import numpy as np
+
+from darsia.experiment.overflow_circulation import CirculationSettings
+from darsia.experiment.overflow_feed import FeedSettings
+
+
+class OverflowVariant(Protocol):
+    """How a rig's scale weight shows the displaced water: the settings of an
+    overflow variant, e.g. :class:`darsia.FeedSettings`.
+
+    A new variant is one module with a settings class of these two members.
+
+    """
+
+    minimum_readings: int
+    """Fewest readings a run needs."""
+
+    def displaced_ml(
+        self, times_h: np.ndarray, weights_g: np.ndarray, baseline: np.ndarray
+    ) -> tuple[np.ndarray | None, tuple[str, ...]]:
+        """Displaced water [mL] at each reading, and why the readings are not
+        usable (empty when they are), from the readings' times [h since the
+        injection start], their weights [g] and the baseline readings."""
 
 
 @dataclass(frozen=True)
 class OverflowSettings:
-    """Settings of the overflow reference; one configuration table."""
+    """Settings of the overflow reference; the ``[overflow]`` table.
+
+    ``variant`` chooses the variant, and the table of that name holds its
+    settings. Tables given as mappings, as read from a TOML file, become their
+    settings.
+
+    """
 
     statuses: Sequence[str]
     """Review statuses of the scale readings that are used."""
-    minimum_readings: int
-    """Fewest readings a run needs."""
-    supply_check_h: float
-    """Time [h] from which the feed may stop."""
-    supply_check_span_h: float
-    """Time [h] after a reading within which a rising weight shows the feed."""
-    supply_stop_rise_g: float
-    """The feed has stopped at a reading the weight then rises less than this."""
-    late_window_h: Sequence[float]
-    """Start and end [h] of the late window, counted back from the feed's stop."""
-    minimum_supply_h: float
-    """Readings whose feed stops before this time [h] are not usable."""
-    maximum_late_sd_g: float
-    """Largest standard deviation of the late weight about a line."""
-    maximum_pre_injection_offset_ml: float
-    """Largest mean distance of the readings before the injection from that line."""
-    pre_injection_span_h: float
-    """Readings before the injection spanning this time [h] give their rate."""
-    maximum_pre_injection_rate_g_h: float
-    """Readings before the injection must rise slower than this."""
     recipe_tolerance: Mapping[str, float]
     """Recipe entries a donor may differ in, by this fraction of the larger value."""
+    variant: Literal["feed", "circulation"]
+    """``"feed"`` for an overflow fed from a tank, ``"circulation"`` for one
+    circulating its water."""
+    feed: FeedSettings | None = None
+    """The feed's settings, given with the feed variant only."""
+    circulation: CirculationSettings | None = None
+    """The circulation's settings, given with the circulation variant only."""
+    baseline_window_h: float | None = None
+    """Hours before the injection whose readings are the baseline; without it,
+    all readings before the injection."""
+
+    def __post_init__(self) -> None:
+        """Turn tables given as mappings into settings; check the variant."""
+        for name, kind in (
+            ("feed", FeedSettings),
+            ("circulation", CirculationSettings),
+        ):
+            table = getattr(self, name)
+            if isinstance(table, Mapping):
+                object.__setattr__(self, name, kind(**table))
+        if self.variant not in ("feed", "circulation"):
+            raise ValueError(f"The overflow variant {self.variant!r} is unknown.")
+        for name in ("feed", "circulation"):
+            given = getattr(self, name) is not None
+            if name == self.variant and not given:
+                raise ValueError(
+                    f"The {name} variant needs its [overflow.{name}] table."
+                )
+            if name != self.variant and given:
+                raise ValueError(
+                    f"The [overflow.{name}] table does not match the {self.variant}"
+                    " variant."
+                )
+
+    @property
+    def variant_settings(self) -> OverflowVariant:
+        """The settings of the chosen variant."""
+        return getattr(self, self.variant)
 
 
 @dataclass(frozen=True)
@@ -65,9 +111,12 @@ class DisplacedVolume:
     times_h: np.ndarray
     """Times of the readings [h since the injection start], increasing."""
     volume_ml: np.ndarray | None
-    """Displaced water volume [mL] at each reading; None without a feed."""
+    """Displaced water volume [mL] at each reading; None without a reference to
+    count from."""
     reasons: tuple[str, ...]
     """Why the readings are not usable; empty when they are."""
+    baseline: np.ndarray
+    """Which readings are the baseline: before the injection, in the window."""
 
 
 @dataclass(frozen=True)
@@ -93,13 +142,12 @@ def displaced_volume(
 ) -> DisplacedVolume:
     """Displaced water volume of a run at its scale readings.
 
-    The volume is the weight above the feed described in the module. The
-    readings are usable with at least ``minimum_readings`` of them, one before
-    the injection, a feed lasting until ``minimum_supply_h``, a late weight
-    close to a line (``maximum_late_sd_g``), readings before the injection close
-    to that line (``maximum_pre_injection_offset_ml``) and, where they span
-    ``pre_injection_span_h``, rising slower than
-    ``maximum_pre_injection_rate_g_h``. The fits are in float64.
+    The baseline readings are those before the injection, within
+    ``baseline_window_h`` of it if that is given; the window scopes the
+    circulation's reference, while a feed counts from the last reading before
+    the injection and checks all readings before it. The readings are usable
+    with at least the variant's ``minimum_readings`` of them, one before the
+    injection, and as the variant requires. The fits are in float64.
 
     Parameters
     ----------
@@ -108,7 +156,7 @@ def displaced_volume(
     weights_g : array
         Scale weights [g].
     settings : OverflowSettings
-        Settings of the feed and of usable readings.
+        The overflow's variant and its settings.
 
     Returns
     -------
@@ -118,41 +166,16 @@ def displaced_volume(
     """
     t = np.asarray(times_h, np.float64)
     w = np.asarray(weights_g, np.float64)
-    pre = t < 0
-    if t.size < settings.minimum_readings or not pre.any():
-        return DisplacedVolume(t, None, ("too few readings, or none before injection",))
-
-    stop = t[-1]
-    for i in np.flatnonzero(t >= settings.supply_check_h):
-        later = (t > t[i]) & (t <= t[i] + settings.supply_check_span_h)
-        if later.any() and w[later].max() - w[i] < settings.supply_stop_rise_g:
-            stop = t[i]
-            break
-    late = (t >= stop - settings.late_window_h[0]) & (
-        t <= stop - settings.late_window_h[1]
-    )
-    rate, offset = np.polyfit(t[late], w[late], 1)
-    line = w - (offset + rate * t)
-
-    first = np.flatnonzero(pre)[-1]
-    dt = t - t[first]
-    (rate, drift), *_ = np.linalg.lstsq(
-        np.c_[dt[late], 0.5 * dt[late] ** 2], w[late] - w[first], rcond=None
-    )
-    volume = w - (w[first] + rate * dt + 0.5 * drift * dt**2)
-
-    reasons = []
-    if stop < settings.minimum_supply_h:
-        reasons.append(f"the feed stops at {stop:g} h")
-    if np.std(line[late]) > settings.maximum_late_sd_g:
-        reasons.append(f"the late weight deviates by {np.std(line[late]):g} g")
-    if abs(line[pre].mean()) > settings.maximum_pre_injection_offset_ml:
-        reasons.append(f"the late line misses the start by {line[pre].mean():g} mL")
-    if pre.sum() >= 2 and np.ptp(t[pre]) >= settings.pre_injection_span_h:
-        pre_rate = np.polyfit(t[pre], w[pre], 1)[0]
-        if abs(pre_rate) >= settings.maximum_pre_injection_rate_g_h:
-            reasons.append(f"the weight rises {pre_rate:g} g/h before injection")
-    return DisplacedVolume(t, volume, tuple(reasons))
+    before = t < 0
+    baseline = before.copy()
+    if settings.baseline_window_h is not None:
+        baseline &= t >= -settings.baseline_window_h
+    variant = settings.variant_settings
+    if t.size < variant.minimum_readings or not before.any():
+        reasons = ("too few readings, or none before injection",)
+        return DisplacedVolume(t, None, reasons, baseline)
+    volume, reasons = variant.displaced_ml(t, w, baseline)
+    return DisplacedVolume(t, volume, reasons, baseline)
 
 
 def _volume_at(volume: DisplacedVolume, elapsed_h: float):
