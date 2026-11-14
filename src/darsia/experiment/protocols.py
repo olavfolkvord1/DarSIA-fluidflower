@@ -415,6 +415,41 @@ class ImagingProtocol:
         return list(dict.fromkeys(image_paths))
 
 
+def injected_mass_g(
+    rate_ml_per_min: float, duration_min: float, density_kg_m3: float
+) -> float:
+    """Mass [g] a gas volume rate injects over a time, at the gas's density.
+
+    The one conversion of volume rates to mass: mL/min times min times kg/m3.
+
+    Parameters
+    ----------
+    rate_ml_per_min : float or array
+        Volume rate [mL/min], e.g. a mass flow controller's setpoint in sccm.
+    duration_min : float
+        Duration [min].
+    density_kg_m3 : float or array
+        Density [kg/m3] of the gas, e.g. at the controller's reference conditions.
+
+    Returns
+    -------
+    float or array
+        The injected mass [g].
+
+    """
+    volume_ml = rate_ml_per_min * duration_min
+    return volume_ml * 1e-6 * density_kg_m3 * 1e3
+
+
+_VOLUME_RATES = {
+    "rate_sccm": 1.0,
+    "rate_ml/min": 1.0,
+    "rate_ml/s": 60.0,
+    "rate_ml/hr": 1.0 / 60.0,
+}
+"""Volume rate columns of an injection protocol and their factor to mL/min."""
+
+
 class InjectionProtocol:
     """Injection protocol: the sequence of injection events and their rates.
 
@@ -422,7 +457,35 @@ class InjectionProtocol:
     columns of the protocol file.
     """
 
-    def __init__(self, path: Path | tuple[Path, str]) -> None:
+    def __init__(
+        self,
+        path: Path | tuple[Path, str],
+        reference_density: float | None = None,
+    ) -> None:
+        """Read an injection protocol.
+
+        Parameters
+        ----------
+        path : Path or tuple of Path and str
+            The protocol file, or a workbook and its sheet.
+        reference_density : float, optional
+            Density [kg/m3] of the injected gas at the mass flow controller's
+            reference conditions, to which volume rates (sccm, mL/min, mL/s, mL/hr)
+            refer. Without it, the protocol's density column converts them.
+
+        Raises
+        ------
+        ValueError
+            If the reference density is not finite and positive.
+
+        """
+        if reference_density is not None and not 0.0 < reference_density < np.inf:
+            raise ValueError(
+                f"The reference density must be finite and positive: {reference_density}"
+            )
+        self.reference_density = reference_density
+        """Density [kg/m3] of the gas at the flow controller's reference, or None."""
+
         self.df = self._load_protocol(path)
         """DataFrame containing the protocol."""
 
@@ -600,37 +663,41 @@ class InjectionProtocol:
         assert "start" in df.columns, "Column 'Start' not found in the protocol."
         assert "end" in df.columns, "Column 'End' not found in the protocol file."
         # Mass rate in kg/s and volume rate in m3/s. Volumetric rates give a mass rate
-        # only if the density is provided (column 'density kg/m3'); mass rates give no
-        # volume rate. Missing rates are NaN.
+        # only with a density: the flow controller's reference density, else the
+        # protocol's column 'density kg/m3'; mass rates give no volume rate. Missing
+        # rates are NaN.
         nan_rate = pd.Series(np.nan, index=df.index)
         mass_rate_kg_s = nan_rate
         volume_rate_m3_s = nan_rate
-        density = (
-            df["density kg/m3"].astype(float) if "density kg/m3" in df.columns else None
-        )
-        if "rate_sccm" in df.columns:
-            # Standard cubic centimeters: the volume depends on the reference state,
-            # hence only a mass rate is defined, and it needs the density.
-            assert (
-                density is not None
-            ), "Column 'Density kg/m3' not found in the protocol file."
-            rate = df["rate_sccm"].astype(float)
-            mass_rate_kg_s = rate * density * 1e-6 / 60.0  # kg/s
-        elif "rate_ml/min" in df.columns:
-            rate = df["rate_ml/min"].astype(float)
-            volume_rate_m3_s = rate * 1e-6 / 60.0  # m3/s
+        volume = next((name for name in _VOLUME_RATES if name in df.columns), None)
+        if volume is not None:
+            density = self.reference_density
+            listed = (
+                df["density kg/m3"].astype(float) if "density kg/m3" in df else None
+            )
+            if density is None:
+                # Standard cubic centimeters: the volume depends on the reference
+                # state, hence only a mass rate is defined, and it needs the density.
+                assert (
+                    listed is not None or volume != "rate_sccm"
+                ), "Column 'Density kg/m3' not found in the protocol file."
+                density = listed
+            elif listed is not None and (listed != density).any():
+                warn(
+                    "The protocol's density differs from the reference density; "
+                    "the reference density is used."
+                )
+            raw = df[volume].astype(float)
             if density is not None:
-                mass_rate_kg_s = rate * density * 1e-6 / 60.0  # kg/s
-        elif "rate_ml/s" in df.columns:
-            rate = df["rate_ml/s"].astype(float)
-            volume_rate_m3_s = rate * 1e-6  # m3/s
-            if density is not None:
-                mass_rate_kg_s = rate * density * 1e-6  # kg/s
-        elif "rate_ml/hr" in df.columns:
-            rate = df["rate_ml/hr"].astype(float)
-            volume_rate_m3_s = rate * 1e-6 / 3600.0  # m3/s
-            if density is not None:
-                mass_rate_kg_s = rate * density * 1e-6 / 3600.0  # kg/s
+                rate = raw * _VOLUME_RATES[volume]  # mL/min
+                # The mass of one second (1/60 min), in kg
+                mass_rate_kg_s = injected_mass_g(rate, 1.0 / 60.0, density) * 1e-3
+            if volume == "rate_ml/min":
+                volume_rate_m3_s = raw * 1e-6 / 60.0  # m3/s
+            elif volume == "rate_ml/s":
+                volume_rate_m3_s = raw * 1e-6  # m3/s
+            elif volume == "rate_ml/hr":
+                volume_rate_m3_s = raw * 1e-6 / 3600.0  # m3/s
         elif "rate_g/min" in df.columns:
             rate = df["rate_g/min"].astype(float)
             mass_rate_kg_s = rate * 1e-3 / 60.0  # kg/s
