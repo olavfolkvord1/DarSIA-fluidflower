@@ -1,5 +1,6 @@
 """Unit tests for the Beer–Lambert response per sand on synthetic frames."""
 
+import dataclasses
 import tomllib
 
 import numpy as np
@@ -37,7 +38,59 @@ CONFIGURATION = tomllib.loads(
 SETTINGS = darsia.BeerLambertSettings(**CONFIGURATION["beer_lambert"])
 SHADOW = darsia.ShadowSettings(**CONFIGURATION["shadow_light"])
 
+DIRECTION = np.array([0.8, 0.58, 0.02]) / np.linalg.norm([0.8, 0.58, 0.02])
+"""Direction of the log colour change of dissolved CO2."""
+
 TONE = {1: (0.30, 0.28, 0.22), 2: (0.35, 0.33, 0.26), 5: (0.25, 0.23, 0.18)}
+
+
+def _path(background, ratio=1.0, amplitude=0.14):
+    """Signal of a sand's colour path: the change of its background at a log change
+    of ``ratio`` times the reference sand's, up to ``amplitude``."""
+    knots = [
+        background * np.expm1(ratio * amplitude * t * DIRECTION) for t in (0, 0.5, 1)
+    ]
+    path = darsia.ColorPath(colors=knots, base_color=np.zeros(3), mode="rgb")
+    return darsia.ColorPathSignal(
+        darsia.ColorPathInterpolation(path, darsia.ColorMode.RELATIVE, [0.0, 0.5, 1.0]),
+        darsia.PWTransformation([0.0, 1.0], [0.0, 1.0]),
+    )
+
+
+def test_a_uniform_background_reads_the_reference_sands_linear_change():
+    shape = (130, 140)
+    facies = np.full(shape, 5, np.uint8)
+    facies[:, 105:] = 1
+    sand_map = darsia.ScalarImage(facies, dimensions=[0.065, 0.07])
+    pitch = (0.5e-3, 0.5e-3)
+    baseline = np.array([TONE[label] for label in facies.ravel()]).reshape(shape + (3,))
+    ratio = np.where(facies == 1, 0.8, 1.0)[..., None]
+    current = baseline * np.exp(ratio * 0.07 * DIRECTION)
+    support = np.ones(shape, bool)
+    dissolved = support.copy()
+    dissolved[:20] = False
+    path = _path(np.array(TONE[5]))
+    settings = dataclasses.replace(SETTINGS, path_ratio={1: 0.8})
+    background = darsia.reference_background(
+        baseline, sand_map, pitch, support, np.ones(shape), settings
+    )
+    reading = darsia.BeerLambertReading(
+        path, 1.25, background, sand_map, pitch, settings
+    )
+
+    signal = reading(current, baseline, support, dissolved, facies)
+
+    own = facies == 5
+    reference = np.broadcast_to(TONE[5], baseline.shape)
+    np.testing.assert_allclose(background, reference, rtol=1e-12)
+    linear = darsia.SandColorPaths({5: path}, {5: 1.25})
+    expected = linear(current, baseline, support, dissolved, facies)
+    np.testing.assert_allclose(signal[own], expected[own], rtol=1e-12)
+    # The other sand's smaller change on its brighter background reads as the
+    # reference sand's change at the same concentration.
+    level = signal[dissolved & own].mean()
+    np.testing.assert_allclose(signal[dissolved & ~own], level, rtol=1e-12)
+    assert level > 0.6 and not signal[~dissolved].any()
 
 
 def test_an_empty_block_gives_no_block_mean():
