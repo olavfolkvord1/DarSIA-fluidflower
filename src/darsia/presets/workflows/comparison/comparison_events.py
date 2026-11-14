@@ -41,6 +41,7 @@ largest injected mass.
 
 from __future__ import annotations
 
+import csv
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -402,6 +403,32 @@ def write_events(path: Path, rows: Iterable[dict]) -> None:
 
     """
     write_rows(path, rows, COLUMNS)
+
+
+def read_events(path: Path) -> list[dict]:
+    """Read the event table written by :func:`write_events`.
+
+    Returns
+    -------
+    list of dict
+        The rows as :func:`event_table` gives them: None for an empty cell, the
+        injection a number and the hours numbers.
+
+    """
+    with Path(path).open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    kinds = dict(
+        injection=int,
+        case_id=str,
+        elapsed_h=float,
+        after_injection_h=float,
+        resolution_h=float,
+    )
+    for row in rows:
+        row.update(
+            {key: kind(row[key]) if row[key] else None for key, kind in kinds.items()}
+        )
+    return rows
 
 
 def integrated_events(
