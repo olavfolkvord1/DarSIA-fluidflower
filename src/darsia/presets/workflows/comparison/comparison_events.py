@@ -25,7 +25,12 @@ maximum and ``not`` one minus the state.
 The answer of a run (:func:`run_answer`) is its first frame where the question
 holds: its time in hours since the injection start, its hours after the start of
 the run's last injection, and its resolution, the hours since the frame before,
-at which the event had not yet happened.
+at which the event had not yet happened. Per injection (:func:`injection_answers`)
+it is the first frame in that injection's time, from its start to the next
+injection's start (the last one's to the run's end), counted from its start; the
+question is evaluated over the whole run, so one that already holds when the
+injection starts is answered at its first frame. :func:`event_table` gives both
+for every question and run, as the rows :func:`write_events` writes.
 
 The answers read the masses per domain of a run's frames (:class:`RunSeries`); no
 map is read.
@@ -35,8 +40,8 @@ map is read.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -45,7 +50,7 @@ import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
 from darsia.presets.workflows.analysis.domain_mass import RunSeries
-from darsia.presets.workflows.analysis.domains import COMPONENTS
+from darsia.presets.workflows.analysis.domains import COMPONENTS, write_rows
 from darsia.presets.workflows.config.multi_fluidflower_config import (
     MultiFluidFlowerConfig,
 )
@@ -57,6 +62,18 @@ EVENTS = ("detected", "reaches", "falls_below", "maximum", "gone")
 """What a condition can ask of a component's mass."""
 UNITS = ("g", "percent_injected")
 """Units of a threshold: grams, or percent of the CO2 injected up to the frame."""
+COLUMNS = (
+    "question",
+    "mode",
+    "run",
+    "injection",
+    "case_id",
+    "elapsed_h",
+    "after_injection_h",
+    "resolution_h",
+    "note",
+)
+"""Columns of the event table: a row per question, run and, per injection, injection."""
 _TRUE, _UNKNOWN, _FALSE = 1.0, 0.5, 0.0
 
 
@@ -297,6 +314,88 @@ def run_answer(
     frames = np.arange(len(series.case_ids))
     states = question_states(question, series)
     return _first(question, series, states, frames, last, "Never")
+
+
+def injection_answers(
+    question: EventQuestion, series: RunSeries, injections: pd.DataFrame
+) -> list[EventAnswer]:
+    """Per injection, the first frame in its time where a question holds.
+
+    Parameters
+    ----------
+    question : EventQuestion
+        The question, evaluated over the whole run.
+    series : RunSeries
+        The run's masses per domain.
+    injections : pd.DataFrame
+        The run's injections (:meth:`darsia.InjectionProtocol.injections`); each
+        one's time runs from its start to the next one's start.
+
+    """
+    states = question_states(question, series)
+    hours = series.elapsed_h
+    starts = [float(start) for start in injections["start_h"]]
+    answers = []
+    for number, start, end in zip(injections["number"], starts, starts[1:] + [np.inf]):
+        frames = np.flatnonzero((hours >= start) & (hours < end))
+        if frames.size:
+            never, injection = "Never in this injection's time", (int(number), start)
+            answers.append(_first(question, series, states, frames, injection, never))
+        else:
+            note = "No frame in this injection's time"
+            answers.append(
+                EventAnswer(question.name, series.run, int(number), note=note)
+            )
+    return answers
+
+
+def event_table(
+    questions: Sequence[EventQuestion],
+    series: Sequence[RunSeries],
+    injections: Mapping[str, pd.DataFrame],
+) -> list[dict]:
+    """Every question's answers per run and per injection, as rows of the table.
+
+    Parameters
+    ----------
+    questions : sequence of EventQuestion
+        The questions.
+    series : sequence of RunSeries
+        The runs' masses per domain.
+    injections : mapping
+        Each run's injections (:meth:`darsia.InjectionProtocol.injections`).
+
+    Returns
+    -------
+    list of dict
+        Per question, the answers of every run (``mode`` "run"), then those of
+        every run's injections (``mode`` "injection"), in the columns
+        :data:`COLUMNS`.
+
+    """
+    rows = []
+    for question in questions:
+        for run in series:
+            answer = run_answer(question, run, injections[run.run])
+            rows.append(dict(asdict(answer), mode="run"))
+        for run in series:
+            for answer in injection_answers(question, run, injections[run.run]):
+                rows.append(dict(asdict(answer), mode="injection"))
+    return rows
+
+
+def write_events(path: Path, rows: Iterable[dict]) -> None:
+    """Write the event table; a value that is None is an empty cell.
+
+    Parameters
+    ----------
+    path : Path
+        The CSV file.
+    rows : iterable of dict
+        Rows of :func:`event_table`.
+
+    """
+    write_rows(path, rows, COLUMNS)
 
 
 @required_sections("events")
