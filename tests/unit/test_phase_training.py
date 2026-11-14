@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import shutil
 import tomllib
 
 import numpy as np
@@ -196,11 +197,10 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path, canvas):
         pixel_size_mm=samples.pixel_size_mm,
         co2_threshold=trained.co2_threshold,
         cross_validation=trained.cross_validation,
-        canvas=samples.canvas,
         accepted_canvases=samples.accepted_canvases,
         moved_from=samples.moved_from,
     )
-    model = darsia.read_phase_model(tmp_path / "model")
+    model = darsia.read_phase_model(tmp_path / "model", canvas=canvas)
     assert model.texture_sigma_mm == SETTINGS.texture_sigma_mm
     assert model.gas_threshold == trained.model.gas_threshold
     for head in ("co2_presence", "gas_within_co2"):
@@ -317,3 +317,37 @@ def test_labels_move_between_corrected_canvases_of_a_rig(tmp_path):
     assert (samples.accepted_canvases, samples.moved_from) == ((), (coarse,))
     back = darsia.move_labels(moved, coarse)
     np.testing.assert_array_equal(back.masks[0], mask)
+
+
+def test_a_model_is_read_only_for_images_on_its_canvas(tmp_path, canvas):
+    """A model read for images on its canvas keeps it. Read for images of another
+    canvas, or as a delivered folder without one, it is refused with the differing
+    settings named; read by explicit choice it gives the same probabilities."""
+    trained = darsia.train_phase_model(_samples(canvas), SETTINGS)
+    folder = tmp_path / "model"
+    darsia.write_phase_model(
+        folder,
+        trained.model,
+        pixel_size_mm=PIXEL_MM,
+        co2_threshold=trained.co2_threshold,
+        cross_validation=trained.cross_validation,
+        accepted_canvases=(),
+        moved_from=(),
+    )
+    model = darsia.read_phase_model(folder, canvas=canvas)
+    other = _rig_canvas(tmp_path / "other", BULGE.format(1e-7))
+    bulge = r"settings: corrections\.curvature\.bulge\.horizontal_bulge, "
+    with pytest.raises(ValueError, match=bulge):
+        darsia.read_phase_model(folder, canvas=other)
+    delivered = tmp_path / "delivered"
+    shutil.copytree(folder, delivered)
+    (delivered / "canvas.json").unlink()
+    with pytest.raises(ValueError, match=r"settings: canvas\. "):
+        darsia.read_phase_model(delivered, canvas=canvas)
+    accepted = darsia.read_phase_model(folder, canvas=other, accept_canvas=True)
+    assert model.canvas == accepted.canvas == canvas
+    current, baseline, _, _ = _frame(7)
+    np.testing.assert_array_equal(
+        darsia.phase_probabilities(accepted, current, baseline, pixel_size_mm=0.5),
+        darsia.phase_probabilities(model, current, baseline, pixel_size_mm=0.5),
+    )

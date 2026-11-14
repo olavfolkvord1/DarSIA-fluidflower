@@ -20,6 +20,12 @@ and the reader converts it with that grid's pixel size. Inference converts it to
 pixels of the grid of the given images. All arithmetic runs in the floating
 dtype of the given images.
 
+A trained model also records the canvas it was trained on (``canvas.json``, the
+rig's description of its corrected images). The canvas is checked once, when a
+run's model is read for the canvas of its images: a model of another canvas is
+read only by the caller's explicit choice, as is a delivered model, which records
+none.
+
 """
 
 import json
@@ -30,6 +36,7 @@ import cv2
 import numpy as np
 
 import darsia
+from darsia.multiphase.label_set import check_canvas
 
 PHASE_FEATURE_NAMES = (
     "delta_r",
@@ -134,6 +141,9 @@ class PhaseModel:
     gas_threshold: float
     """Decision threshold of the gas head: CO2 is free gas where the gas head's
     probability reaches it."""
+    canvas: dict | None
+    """Canvas of the images the model was trained on (``Rig.canvas``); None for a
+    folder that records none, e.g. a delivered one."""
 
 
 def _head_path(folder: str | Path, role: str) -> Path:
@@ -142,14 +152,21 @@ def _head_path(folder: str | Path, role: str) -> Path:
 
 
 def read_phase_model(
-    folder: str | Path, pixel_size_mm: float | None = None
+    folder: str | Path,
+    pixel_size_mm: float | None = None,
+    *,
+    canvas: dict | None,
+    accept_canvas: bool = False,
 ) -> PhaseModel:
-    """Read the two heads of a phase model folder.
+    """Read the two heads of a phase model folder for images of a canvas.
 
     A trained folder (:func:`write_phase_model`) gives the texture scale in mm.
     A delivered folder gives it in pixels of the grid the model was trained on,
     whose pixel size must then be given. The gas threshold is the gas head's
-    presence threshold in the folder's ``phase_decision_policy.json``.
+    presence threshold in the folder's ``phase_decision_policy.json``, and the
+    model's canvas is that of ``canvas.json``, unknown (None) without one. The
+    model's canvas is checked once, here, against the canvas of the images it is
+    read for (:func:`~darsia.check_canvas`).
 
     Parameters
     ----------
@@ -157,18 +174,25 @@ def read_phase_model(
         Model folder holding the heads in ``models/generic``.
     pixel_size_mm : float, optional
         Pixel size of the training grid of a delivered folder.
+    canvas : dict or None
+        Canvas of the images the model is read for (``Rig.canvas``).
+    accept_canvas : bool
+        Whether to read a model of another canvas, or one recording none, by the
+        caller's explicit choice.
 
     Returns
     -------
     PhaseModel
-        The two heads, their texture scale and the gas threshold.
+        The two heads, their texture scale, the gas threshold and the canvas.
 
     Raises
     ------
     ValueError
         If a head uses other features than :data:`PHASE_FEATURE_NAMES`, was
         trained on other than linear RGB, the heads use different texture
-        scales, or a delivered folder is read without the pixel size.
+        scales, or a delivered folder is read without the pixel size. If the
+        model's canvas differs from the images' or is not recorded, without
+        ``accept_canvas``; the message names the differing settings.
 
     """
     heads = {}
@@ -186,6 +210,11 @@ def read_phase_model(
         (Path(folder) / "phase_decision_policy.json").read_text(encoding="utf-8")
     )
     gas = policy["models"]["generic"]["gas_within_co2"]
+    record = Path(folder) / "canvas.json"
+    recorded = None
+    if record.exists():
+        recorded = json.loads(record.read_text(encoding="utf-8"))["canvas"]
+    check_canvas(recorded, canvas, accept=accept_canvas, subject="the model")
     if "texture_sigma_mm" in heads["co2_presence"]:
         key, scale = "texture_sigma_mm", 1.0
     elif pixel_size_mm is None:
@@ -209,6 +238,7 @@ def read_phase_model(
         },
         texture_sigma_mm=float(sigmas.pop()) * scale,
         gas_threshold=float(gas["presence_threshold"]),
+        canvas=recorded,
     )
 
 
@@ -219,7 +249,6 @@ def write_phase_model(
     pixel_size_mm: float,
     co2_threshold: float,
     cross_validation: dict[str, dict],
-    canvas: dict | None,
     accepted_canvases: tuple[dict | None, ...],
     moved_from: tuple[dict, ...],
 ) -> None:
@@ -228,16 +257,15 @@ def write_phase_model(
     Each head records the texture scale in mm and the pixel size of the grid it
     was trained on. Beside the heads, ``phase_decision_policy.json`` holds each
     head's decision threshold, ``cross_validation.json`` the cross-validation
-    and ``canvas.json`` the canvas the model was trained on, with the canvases
-    of label sets the training accepted explicitly and those its label sets were
-    moved from.
+    and ``canvas.json`` the model's canvas, with the canvases of label sets the
+    training accepted explicitly and those its label sets were moved from.
 
     Parameters
     ----------
     folder : str or Path
         New model folder.
     model : PhaseModel
-        The two heads, their texture scale and the gas threshold.
+        The two heads, their texture scale, the gas threshold and the canvas.
     pixel_size_mm : float
         Pixel size of the training grid.
     co2_threshold : float
@@ -245,8 +273,6 @@ def write_phase_model(
         the model's.
     cross_validation : dict
         Cross-validation summary of each head, JSON serializable.
-    canvas : dict or None
-        Canvas of the training samples (``TrainingSamples.canvas``).
     accepted_canvases : tuple
         Canvases of the label sets accepted although they differ
         (``TrainingSamples.accepted_canvases``).
@@ -278,7 +304,7 @@ def write_phase_model(
         },
     }
     canvases = {
-        "canvas": canvas,
+        "canvas": model.canvas,
         "accepted_label_canvases": list(accepted_canvases),
         "labels_moved_from": list(moved_from),
     }

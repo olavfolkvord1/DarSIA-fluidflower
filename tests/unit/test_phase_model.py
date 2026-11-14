@@ -7,6 +7,9 @@ import numpy as np
 import darsia
 
 NAMES = darsia.PHASE_FEATURE_NAMES
+UNKNOWN = {"canvas": None, "accept_canvas": True}
+"""A delivered model, which records no canvas, read for images without one by
+explicit choice."""
 
 
 def _head(coefficients, intercept=0.0) -> dict:
@@ -30,7 +33,7 @@ def _model(folder, co2_head, gas_head):
         (heads / f"{role}_signal.json").write_text(json.dumps(head))
     policy = {"models": {"generic": {"gas_within_co2": {"presence_threshold": 0.66}}}}
     (folder / "phase_decision_policy.json").write_text(json.dumps(policy))
-    return darsia.read_phase_model(folder, pixel_size_mm=0.5)
+    return darsia.read_phase_model(folder, pixel_size_mm=0.5, **UNKNOWN)
 
 
 def _unit(name):
