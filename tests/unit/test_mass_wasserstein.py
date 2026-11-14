@@ -1,8 +1,9 @@
-"""Unit tests for the Wasserstein comparison cells of mass maps."""
+"""Unit tests for the Wasserstein distances of mass maps on metric cells."""
 
 import tomllib
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import darsia
@@ -15,6 +16,11 @@ SETTINGS = mw.WassersteinSettings(
         # The values our production ran with.
         cell_mm = 3.0
         hole_pixels = 3
+        empty_mass_kg = 1e-8
+        max_iterations = 60
+        distance_tolerance = 1e-4
+        increment_tolerance = 1e-2
+        bregman_updates = [0, 10, 20]
         """
     )
 )
@@ -91,6 +97,49 @@ def _cells(mass, reference, sand, labels=None):
     )
 
 
+def _scales(regions):
+    """Scales of one, with no injected mass in any region."""
+    return mw.DistanceScales(1.0, 1.0, {d.domain_id: np.nan for d in regions})
+
+
+def _plume(row, col, value=2.0):
+    """A mass map (g/L) with a 6 x 6 mm plume whose top left pixel is given."""
+    mass = np.zeros((ROWS, COLS))
+    mass[row : row + 6, col : col + 6] = value
+    return mass
+
+
+def test_unknown_mass_gives_a_stated_status_not_a_failure():
+    regions = [
+        AnalysisDomain("sand", "sand", "sand"),
+        AnalysisDomain("box", "lower", "lower", bounds_mm=(0.0, 45.0, 0.0, 15.0)),
+    ]
+    sand, reference = _reference(regions)
+    labels = np.ones((ROWS, COLS), np.uint8)
+    labels[4:6, 4:6] = darsia.PhaseLabel.UNKNOWN  # a hole of four pixels
+    frames = {
+        "a": _cells(_plume(18, 6), reference, sand),
+        "b": _cells(_plume(18, 9), reference, sand),
+        "c": None,
+        "d": _cells(_plume(18, 12), reference, sand, labels),
+    }
+    results = {
+        (r.run_1, r.run_2, r.domain_id): r
+        for r in mw.wasserstein_distances(
+            1.5, frames, reference, _scales(regions), SETTINGS
+        )
+    }
+    assert len(results) == 12
+    assert {r.status for key, r in results.items() if "c" in key} == {"missing"}
+    unknown = results["a", "d", "sand"]
+    assert unknown.status == "unknown" and unknown.unknown_pixels == (0, 4)
+    assert np.isnan(unknown.distance_kg_m) and np.isnan(unknown.mass_2_kg)
+    assert results["a", "d", "lower"].status == "success"
+    assert results["a", "d", "lower"].distance_kg_m > 0
+    assert results["a", "b", "sand"].status == "success"
+    assert results["a", "b", "sand"].distance_kg_m > 0
+
+
 def test_a_small_hole_borrows_the_mass_of_its_own_neighbours():
     density = np.arange(100, dtype=np.float32).reshape(10, 10)
     known = np.ones((10, 10), bool)
@@ -147,3 +196,71 @@ def test_the_sand_continues_under_the_colour_checker():
     box = AnalysisDomain("box", "box", "box", bounds_mm=(0.0, 45.0, 20.0, 30.0))
     _, reference = _reference([box])
     assert reference.weights["box"].porous[0].all()  # free water in the box
+
+
+def test_both_runs_are_scaled_to_their_mean_mass():
+    regions = [
+        AnalysisDomain("box", "lower", "lower", bounds_mm=(0.0, 45.0, 0.0, 15.0))
+    ]
+    sand, reference = _reference(regions)
+    frames = {
+        "a": _cells(_plume(18, 6, 2.0), reference, sand),
+        "b": _cells(_plume(18, 9, 4.0), reference, sand),
+        "c": _cells(np.zeros((ROWS, COLS)), reference, sand),
+        "d": _cells(np.zeros((ROWS, COLS)), reference, sand),
+    }
+    results = mw.wasserstein_distances(
+        1.5, frames, reference, _scales(regions), SETTINGS
+    )
+    moved = results[0]
+    assert (moved.run_1, moved.run_2, moved.status) == ("a", "b", "success")
+    mean = 0.5 * (moved.mass_1_kg + moved.mass_2_kg)
+    assert moved.mass_2_kg == pytest.approx(2 * moved.mass_1_kg, rel=1e-6)
+    assert moved.distance_kg_m == pytest.approx(mean * 0.003, rel=3e-3)
+    one_empty = next(r for r in results if (r.run_1, r.run_2) == ("a", "c"))
+    assert one_empty.status == "one_empty" and np.isnan(one_empty.distance_kg_m)
+    both_empty = next(r for r in results if (r.run_1, r.run_2) == ("c", "d"))
+    assert both_empty.distance_kg_m == both_empty.normalized_mass == 0.0
+
+
+def test_distances_are_normalised_by_the_scales_of_their_time(tmp_path):
+    protocol = tmp_path / "injection.csv"
+    times = [
+        (pd.Timestamp(0, unit="s") + pd.Timedelta(hours=h)).isoformat() for h in (0, 2)
+    ]
+    protocol.write_text(
+        "id,location_x,location_y,start,end,rate_kg/s\n"
+        f"1,0.010,0.005,{times[0]},{times[1]},2e-9\n"
+        f"2,0.030,0.025,{times[0]},{times[1]},3e-9\n"
+    )
+    injection = darsia.InjectionProtocol(protocol)
+    baseline = darsia.ScalarImage(np.zeros((ROWS, COLS)), dimensions=[0.03, 0.045])
+    co2 = darsia.CO2MassAnalysis(baseline, 1.0, 22.0)
+    depth = np.linspace(0.01, 0.02, ROWS * COLS).reshape(ROWS, COLS)
+    regions = [
+        AnalysisDomain("box", "lower", "lower", bounds_mm=(0.0, 45.0, 0.0, 15.0)),
+        AnalysisDomain("sand", "sand", "sand"),
+        AnalysisDomain("whole", "all", "all"),
+    ]
+    scales = mw.distance_scales(1.5, injection, co2, depth, [0.03, 0.045], regions)
+    mass = 5400 * 5e-9
+    radius = np.sqrt(mass / np.average(co2.solubility_co2) / np.average(depth) / np.pi)
+    assert scales.plume_kg_m == pytest.approx(radius * mass, rel=1e-12)
+    assert scales.rig_kg_m == pytest.approx(mass * 0.0375, rel=1e-12)
+    assert scales.injected_kg["lower"] == pytest.approx(5400 * 2e-9, rel=1e-12)
+    assert np.isnan(scales.injected_kg["sand"])
+    assert scales.injected_kg["all"] == pytest.approx(mass, rel=1e-12)
+
+    sand, reference = _reference(regions[:2])
+    frames = {
+        "a": _cells(_plume(18, 6, 2.0), reference, sand),
+        "b": _cells(_plume(18, 9, 4.0), reference, sand),
+    }
+    for r in mw.wasserstein_distances(1.5, frames, reference, scales, SETTINGS):
+        assert r.normalized_plume == r.distance_kg_m / scales.plume_kg_m
+        assert r.normalized_rig == r.distance_kg_m / scales.rig_kg_m
+        mean = 0.5 * (r.mass_1_kg + r.mass_2_kg)
+        assert r.normalized_mass == pytest.approx(r.distance_kg_m / mean, rel=1e-6)
+        assert r.expected_mass_kg == scales.injected_kg[r.domain_id] or (
+            r.domain_id == "sand" and np.isnan(r.expected_mass_kg)
+        )

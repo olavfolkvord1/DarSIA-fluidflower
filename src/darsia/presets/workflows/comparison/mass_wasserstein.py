@@ -1,8 +1,9 @@
-"""Wasserstein comparison of runs' mass maps: their mass and weight on metric cells.
+"""Wasserstein distances between runs' mass maps, on metric cells.
 
 At one time, each run's frame (its mass maps, e.g. of :func:`darsia.mass_maps`)
-goes onto square metric cells of one size by the one scaling method, region by
-region, beside the transport weight of a reference run on the same cells:
+goes onto square metric cells of one size by the one scaling method, and each pair
+of runs is compared in each region by the official Bregman solver of
+:func:`darsia.wasserstein_distance`, with the transport weight of a reference run:
 
 - A frame's mass is the mass of its counted pixels (:class:`darsia.RunGeometry`):
   the mass per pore volume times the pore volume, summed over each cell in double
@@ -22,16 +23,32 @@ region, beside the transport weight of a reference run on the same cells:
   row, with its label and weight. A cell's weight is the mean over the region's
   reference pixels in it, or over all its reference pixels where the reference has
   none of the region.
+- A region's cells are those holding a pixel of it in the reference or in either
+  run. Transport runs only through those with a known weight, and no flux leaves
+  them (the solver's ``region``); mass on a cell without a known weight, and
+  reference pixels of porous material without a known permeability (e.g., free
+  water), are refused.
+- Both runs' masses are scaled to their mean before the solve. Where neither run
+  holds mass the distance is zero.
+- As in the official comparison, each distance is also given over the mean mass
+  and over two scales of the time (:func:`distance_scales`): the injected mass
+  times the radius of a disc that holds it dissolved, and times the rig's mean
+  dimension.
 
-Every setting is a field of :class:`WassersteinSettings`. Masses are in kg here, as
-in the official comparison's table (the masses per domain are in g).
+A pair is ``"missing"`` when a run has no frame at the time, ``"unknown"`` when a
+run holds unknown mass in the region, ``"one_empty"`` when only one run holds
+mass there, and else ``"success"`` or ``"not_converged"``, as the solver reports
+(:class:`WassersteinDistance`). Every setting is a field of
+:class:`WassersteinSettings`. Masses are in kg here, as in the official comparison's
+table (the masses per domain are in g).
 
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from scipy import ndimage
@@ -39,8 +56,20 @@ from scipy import ndimage
 import darsia
 from darsia.multiphase.gas_allocation import NEIGHBOURS
 from darsia.multiphase.mass_maps import RunGeometry
-from darsia.presets.workflows.analysis.domains import AnalysisDomain, domain_pixels
+from darsia.presets.workflows.analysis.domains import (
+    AnalysisDomain,
+    domain_pixels,
+    injected_mass,
+)
 
+_SOLVER = {
+    "mobility_mode": darsia.MobilityMode.CELL_BASED,
+    "l1_mode": darsia.L1Mode.RAVIART_THOMAS,
+    "linear_solver": "direct",
+    "return_info": True,
+}
+"""Discretisation and linear solver of the Bregman solver, those of the official
+comparison."""
 _CLIP = 1e-6
 """Share of the smallest other permeability to which permeabilities close to zero
 are clipped, as in the official comparison."""
@@ -55,6 +84,16 @@ class WassersteinSettings:
     hole_pixels: int
     """Largest hole of unknown pixels that borrows its neighbours' mass; 0 fills
     none."""
+    empty_mass_kg: float
+    """A region's mass [kg] at most this counts as no mass."""
+    max_iterations: int
+    """Largest number of iterations of the solver."""
+    distance_tolerance: float
+    """Relative change of the distance at which the solver stops."""
+    increment_tolerance: float
+    """Relative Bregman increment at which the solver stops."""
+    bregman_updates: tuple[int, ...]
+    """Iterations at which the solver updates its Bregman regularisation."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +141,111 @@ class RegionMass:
     """Pixels of the region with unknown mass."""
     filled: int
     """Pixels of the region whose mass the hole rule estimated."""
+
+
+@dataclass(frozen=True)
+class WassersteinDistance:
+    """The Wasserstein distance of two runs' mass in one region at one time."""
+
+    time_h: float
+    """The time [h]."""
+    run_1: str
+    """The first run."""
+    run_2: str
+    """The second run, after the first in order."""
+    domain_id: str
+    """The compared region, by its domain identity."""
+    status: Literal["success", "not_converged", "missing", "unknown", "one_empty"]
+    """``"success"``; ``"not_converged"`` when the solver stopped at its largest
+    number of iterations; ``"missing"`` when a run has no frame at the time;
+    ``"unknown"`` when a run holds unknown mass in the region; ``"one_empty"``
+    when only one run holds mass in the region."""
+    distance_kg_m: float = np.nan
+    """Distance [kg m] of the two masses, each scaled to their mean; zero where
+    neither run holds mass, NaN without a distance."""
+    mass_1_kg: float = np.nan
+    """Mass [kg] of the first run in the region; NaN when missing or unknown."""
+    mass_2_kg: float = np.nan
+    """Mass [kg] of the second run in the region; NaN when missing or unknown."""
+    unknown_pixels: tuple[int, int] = (0, 0)
+    """Pixels of unknown mass of each run in the region."""
+    filled_pixels: tuple[int, int] = (0, 0)
+    """Pixels of each run in the region whose mass the hole rule estimated."""
+    normalized_plume: float = np.nan
+    """The distance over the plume scale of the time (:class:`DistanceScales`)."""
+    normalized_rig: float = np.nan
+    """The distance over the rig scale of the time."""
+    normalized_mass: float = np.nan
+    """The distance over the mean of the two masses [m]."""
+    expected_mass_kg: float = np.nan
+    """Mass [kg] injected into the region by the time; NaN for a region without an
+    injection of its own (a sand layer, the sand), and when missing."""
+
+
+@dataclass(frozen=True)
+class DistanceScales:
+    """What the distances of one time are normalised by, as in the official
+    comparison."""
+
+    plume_kg_m: float
+    """The injected mass [kg] times the radius [m] of a disc of the mean depth that
+    holds it dissolved at the mean solubility."""
+    rig_kg_m: float
+    """The injected mass [kg] times the mean of the rig's two dimensions [m]."""
+    injected_kg: dict[str, float]
+    """Mass [kg] injected into each region, by its domain identity; NaN for a region
+    without an injection of its own."""
+
+
+def distance_scales(
+    time_h: float,
+    injection: darsia.InjectionProtocol,
+    co2: darsia.CO2MassAnalysis,
+    depth: np.ndarray,
+    dimensions: Sequence[float],
+    domains: Sequence[AnalysisDomain],
+) -> DistanceScales:
+    """The scales of one time's distances, as the official comparison computes them.
+
+    Parameters
+    ----------
+    time_h : float
+        The time [h] since the first injection start.
+    injection : darsia.InjectionProtocol
+        The reference run's injection protocol.
+    co2 : darsia.CO2MassAnalysis
+        The reference run's CO2 at the experiment's start; its mean solubility
+        dissolves the injected mass.
+    depth : array
+        The reference rig's depth [m] of each pixel.
+    dimensions : sequence of float
+        The reference rig's two dimensions [m].
+    domains : sequence of AnalysisDomain
+        The compared regions. Each receives the domains' injected mass
+        (:func:`~darsia.presets.workflows.analysis.domains.injected_mass`): all of
+        it for the whole domain, that of the injection points inside a box (edges
+        included, the protocol's rule); NaN for a region without an injection of
+        its own (a sand layer, the sand).
+
+    Returns
+    -------
+    DistanceScales
+        The scales.
+
+    """
+    mass = injection.injected_mass(time=time_h)
+    volume = mass / np.average(co2.solubility_co2)
+    area = volume / np.average(depth)
+    radius = np.sqrt(area / np.pi)
+    injected = {}
+    for domain in domains:
+        own = injected_mass(domain, injection, time_h)
+        injected[domain.domain_id] = np.nan if own is None else own
+    return DistanceScales(
+        plume_kg_m=radius * mass,
+        rig_kg_m=mass * (0.5 * (dimensions[0] + dimensions[1])),
+        injected_kg=injected,
+    )
 
 
 def _horizontal_sources(chart: np.ndarray, sand: np.ndarray) -> np.ndarray:
@@ -382,3 +526,140 @@ def frame_cells(
             filled=int(np.count_nonzero(filled & inside)),
         )
     return result
+
+
+def _distance(
+    first: RegionMass,
+    second: RegionMass,
+    weight: RegionWeight,
+    reference: WassersteinReference,
+    scales: DistanceScales,
+    settings: WassersteinSettings,
+) -> dict:
+    """The status, distances and masses of one region of a pair of frames."""
+    region = weight.own | (first.pixels > 0) | (second.pixels > 0)
+    if np.any(region & weight.porous):
+        raise ValueError(
+            "A compared region holds porous material without a known permeability "
+            "(e.g., free water)"
+        )
+    active = region & np.isfinite(weight.weight)
+    if np.any(region & ~active & ((first.mass.img != 0) | (second.mass.img != 0))):
+        raise ValueError("A compared region has mass where no permeability is known")
+    if not active.any():
+        raise ValueError("A compared region has no cell with a known permeability")
+    rows, cols = np.nonzero(active)
+    crop = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
+    mass_1, mass_2 = first.mass.subregion(crop), second.mass.subregion(crop)
+    integral_1, integral_2 = mass_1.integral(), mass_2.integral()
+    empty_1, empty_2 = (
+        np.isclose(integral, 0, atol=settings.empty_mass_kg)
+        for integral in (integral_1, integral_2)
+    )
+    masses = {"mass_1_kg": float(integral_1), "mass_2_kg": float(integral_2)}
+    if empty_1 and empty_2:
+        return dict(
+            masses,
+            status="success",
+            distance_kg_m=0.0,
+            normalized_plume=0.0,
+            normalized_rig=0.0,
+            normalized_mass=0.0,
+        )
+    if empty_1 or empty_2:
+        return dict(masses, status="one_empty")
+    average = 0.5 * (integral_1 + integral_2)
+    mass_1 *= average / integral_1
+    mass_2 *= average / integral_2
+    cell_weight = darsia.ScalarImage(
+        weight.weight,
+        space_dim=2,
+        indexing="ij",
+        dimensions=reference.dimensions,
+        origin=reference.origin,
+    )
+    distance, info = darsia.wasserstein_distance(
+        mass_1,
+        mass_2,
+        weight=cell_weight.subregion(crop),
+        method="bregman",
+        options=dict(
+            _SOLVER,
+            num_iter=settings.max_iterations,
+            tol_distance=settings.distance_tolerance,
+            tol_increment=settings.increment_tolerance,
+            bregman_update=lambda iteration: iteration in settings.bregman_updates,
+            region=active[crop],
+        ),
+    )
+    return dict(
+        masses,
+        status="success" if info["converged"] else "not_converged",
+        distance_kg_m=float(distance),
+        normalized_plume=float(distance / scales.plume_kg_m),
+        normalized_rig=float(distance / scales.rig_kg_m),
+        normalized_mass=float(distance / average),
+    )
+
+
+def wasserstein_distances(
+    time_h: float,
+    frames: Mapping[str, Mapping[str, RegionMass] | None],
+    reference: WassersteinReference,
+    scales: DistanceScales,
+    settings: WassersteinSettings,
+) -> list[WassersteinDistance]:
+    """The Wasserstein distances of every pair of runs in every region at one time.
+
+    The pairs are each run with every later run in order (by name), and for each
+    pair every region, in that order.
+
+    Parameters
+    ----------
+    time_h : float
+        The time [h], e.g. a production time of the series.
+    frames : mapping of str to mapping or None
+        Each run's frame at the time (:func:`frame_cells`), by run; None for a run
+        without a frame at the time.
+    reference : WassersteinReference
+        The comparison cells and the weights of the regions.
+    scales : DistanceScales
+        The scales of the time (:func:`distance_scales`).
+    settings : WassersteinSettings
+        The empty mass and the solver's settings.
+
+    Returns
+    -------
+    list of WassersteinDistance
+        One distance per pair of runs and region.
+
+    """
+    results = []
+    for run_1, first in frames.items():
+        for run_2, second in frames.items():
+            if run_1 >= run_2:
+                continue
+            for name, weight in reference.weights.items():
+                if first is None or second is None:
+                    results.append(
+                        WassersteinDistance(time_h, run_1, run_2, name, "missing")
+                    )
+                    continue
+                one, two = first[name], second[name]
+                counts = {
+                    "unknown_pixels": (one.unknown, two.unknown),
+                    "filled_pixels": (one.filled, two.filled),
+                    "expected_mass_kg": float(scales.injected_kg[name]),
+                }
+                if one.unknown or two.unknown:
+                    results.append(
+                        WassersteinDistance(
+                            time_h, run_1, run_2, name, "unknown", **counts
+                        )
+                    )
+                    continue
+                fields = _distance(one, two, weight, reference, scales, settings)
+                results.append(
+                    WassersteinDistance(time_h, run_1, run_2, name, **fields, **counts)
+                )
+    return results
