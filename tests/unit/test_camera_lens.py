@@ -80,3 +80,42 @@ def test_camera_coordinates_move_radially_and_per_colour_onto_the_sensor():
         (cu + du).astype(np.float32), cv + dv.astype(np.float32), tables, settings, (1,)
     )
     assert single.dtype == np.float32 and single.shape == (3, 1)
+
+
+RADIAL = tomllib.loads(
+    """
+    # The values our production measured for a camera that records no lens tables.
+    [radial_lens]
+    centre = [4127.5, 2751.5]
+    radius = 4961.23855503845
+    coefficients = [[1.610066890659688, -0.8642695466479476], [0.0, 0.0], [0.0, 0.0]]
+    sensor_offset = [16, 8]
+    """
+)["radial_lens"]
+
+
+def test_a_file_without_recorded_tables_takes_the_configured_lens_model(tmp_path):
+    """Red moves radially by a r + b r^3 pixels; green and blue by the offset only."""
+    path = tmp_path / "frame.nef"
+    with tifffile.TiffWriter(path) as tiff:
+        tiff.write(np.zeros((4, 6), np.uint16), subifds=1)
+        tiff.write(np.zeros((2, 3), np.uint16))
+    models = [
+        darsia.CameraLensSettings(**SETTINGS),
+        darsia.RadialLensSettings(**RADIAL),
+    ]
+    # The centre, and points at 0.3 and 0.9 of the radius along two directions.
+    distance = np.array([0.0, 0.3, 0.9]) * RADIAL["radius"]
+    direction = np.array([[1.0, 0.0], [0.6, -0.8], [-0.8, 0.6]])
+    x, y = (RADIAL["centre"] + distance[:, None] * direction).T
+
+    columns, rows = darsia.lens_coordinates(path, models)(x, y)
+
+    a, b = RADIAL["coefficients"][0]
+    r = distance / RADIAL["radius"]
+    moved = (a * r + b * r**3)[:, None] * direction
+    np.testing.assert_allclose(columns[:, 0], x + 16 + moved[:, 0], atol=1e-9)
+    np.testing.assert_allclose(rows[:, 0], y + 8 + moved[:, 1], atol=1e-9)
+    for channel in (1, 2):
+        np.testing.assert_array_equal(columns[:, channel], x + 16)
+        np.testing.assert_array_equal(rows[:, channel], y + 8)
