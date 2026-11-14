@@ -46,6 +46,9 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
         # Cache solver options
         self.options = options
         """dict: options for the solver"""
+        if options.get("region") is not None:
+            # Its discretization has no blocked faces or per-part gauges.
+            raise NotImplementedError("A transport region is not supported by Gprox")
 
         self.verbose = self.options.get("verbose", False)
         """bool: verbosity"""
