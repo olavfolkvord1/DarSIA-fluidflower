@@ -29,6 +29,17 @@ class SandMapConfig:
         },
     )
     """Path to the drawing."""
+    adjustment: Path | None = field(
+        default=None,
+        metadata={
+            "name": "Run adjustment",
+            "help": (
+                "Path to this run's adjustment (.json): the anchors it moves, for a "
+                "run whose sand has settled. Leave empty for the common drawing."
+            ),
+        },
+    )
+    """Path to the run's moved anchors."""
     grid_to_rig: list[list[float]] | None = field(
         default=None,
         metadata={
@@ -59,6 +70,7 @@ class SandMapConfig:
     def load(self, sec: dict) -> "SandMapConfig":
         """Load the sand-map configuration from the [labeling.sand_map] section."""
         self.drawing = _get_key(sec, "drawing", required=True, type_=Path)
+        self.adjustment = _get_key(sec, "adjustment", required=False, type_=Path)
         if "rig_to_grid" in sec:
             raise ValueError(
                 "[labeling.sand_map] rig_to_grid is replaced by grid_to_rig, its "
