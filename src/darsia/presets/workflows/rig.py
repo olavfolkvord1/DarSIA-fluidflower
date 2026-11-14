@@ -1213,12 +1213,23 @@ class Rig:
             self.shape_corrected_baseline.save(folder / "shape_corrected_baseline.npz")
 
         # Save split correction pipelines.
+        saved_corrections = set()
         for i, correction in enumerate(self.shape_corrections):
             correction_name = type(correction).__name__.lower()
-            correction.save(folder / f"shape_correction_{i}_{correction_name}.npz")
+            path = folder / f"shape_correction_{i}_{correction_name}.npz"
+            correction.save(path)
+            saved_corrections.add(path)
         for i, correction in enumerate(self.color_corrections):
             correction_name = type(correction).__name__.lower()
-            correction.save(folder / f"color_correction_{i}_{correction_name}.npz")
+            path = folder / f"color_correction_{i}_{correction_name}.npz"
+            correction.save(path)
+            saved_corrections.add(path)
+
+        # An earlier save's split corrections must not outlive the pipeline.
+        for prefix in ("shape", "color"):
+            for path in folder.glob(f"{prefix}_correction_*.npz"):
+                if path not in saved_corrections and path.is_file():
+                    path.unlink()
 
         # The pixel areas, or none: an earlier save's areas must not outlive them.
         if getattr(self, "pixel_area", None) is not None:
