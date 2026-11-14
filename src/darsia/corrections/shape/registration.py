@@ -7,7 +7,8 @@ image by zero-mean normalized cross-correlation near its position under an
 initial homography, with a sub-pixel peak. A homography from the run grid to the
 camera image is then fitted to the matches by RANSAC with a refinement, checked for
 folds, and verified at held-out zones whose patches are found near their predicted
-positions.
+positions. The homography gives every run-grid pixel its camera coordinates; these
+are the sampling coordinates that :class:`darsia.ImageMappingCorrection` replays.
 
 All arithmetic runs in the floating precision of the given images (single precision
 at least). The RANSAC sample sequence and refinement follow OpenCV's
@@ -417,6 +418,64 @@ def ransac_homography(
         refinement_tolerance,
     )
     return h, inliers(h).astype(np.uint8).reshape(-1, 1)
+
+
+def registration_mapping(
+    homography: np.ndarray,
+    target_shape: tuple[int, int],
+    source_shape: tuple[int, int],
+    dimensions: list[float],
+    origin: Optional[list[float]] = None,
+    coordinates: Optional[
+        Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
+    ] = None,
+) -> darsia.ImageMappingCorrection:
+    """Image mapping that samples a registered image onto the run grid.
+
+    Every run-grid pixel centre is mapped through the homography, in its floating
+    precision (single precision at least). The resulting camera coordinates are
+    the sampling coordinates of the mapping, shared by all channels, or are first
+    passed through ``coordinates`` (e.g. a lens model giving each channel its
+    coordinates on the sensor of a raw decode).
+
+    Parameters
+    ----------
+    homography : array
+        3 x 3 homography from the run grid to the camera image, e.g.
+        :attr:`ProjectiveRegistration.homography`.
+    target_shape : tuple of int
+        Rows and columns of the run grid.
+    source_shape : tuple of int
+        Rows and columns of the images to be mapped.
+    dimensions : list of float
+        Physical height and width of the run grid.
+    origin : list of float, optional
+        Cartesian coordinates of the run grid's top-left pixel; see
+        :class:`darsia.ImageMappingCorrection`.
+    coordinates : callable, optional
+        Maps camera columns and rows (arrays of the run grid's shape) to the
+        source columns and rows to sample, of shape (rows, cols) or
+        (rows, cols, channels).
+
+    Returns
+    -------
+    ImageMappingCorrection
+        The mapping onto the run grid, to apply or to store.
+
+    """
+    homography = np.asarray(homography)
+    dtype = np.result_type(homography.dtype, np.float32)
+    rows, cols = target_shape
+    x, y = _project(
+        homography.astype(dtype),
+        np.arange(cols, dtype=dtype)[None, :],
+        np.arange(rows, dtype=dtype)[:, None],
+    )
+    if coordinates is not None:
+        x, y = coordinates(x, y)
+    return darsia.ImageMappingCorrection(
+        x, y, source_shape=source_shape, dimensions=dimensions, origin=origin
+    )
 
 
 # ! ---- Auxiliary routines
