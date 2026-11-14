@@ -2,9 +2,9 @@
 
 The ensemble reads what the runs' analyses finished (:class:`EnsembleRun`): each
 run's table of masses per domain (:class:`DomainMass`), the CO2 injected up to
-each frame, each frame's production target and the run's injection protocol. It
-computes no map or mass again. Its tables hold one observation per row, the unit
-in each column's name:
+each frame, each frame's production target and the run's injection protocol, and
+the event table (:func:`event_table`). It computes no map or mass again. Its
+tables hold one observation per row, the unit in each column's name:
 
 - ``mass_long``: every run, frame, domain and component: its mass, its injected
   reference and the fraction of it;
@@ -21,6 +21,8 @@ in each column's name:
   quantified mass per frame, domain and component, in mm of the grid; and per
   time the runs' mean and median centre, their standard deviation and the mean
   spread;
+- ``events_summary``: per question, the summary over the runs of the event times
+  and of the time resolution (:func:`event_summary`).
 
 A fraction divides by the domain's injected reference
 (:func:`injected_reference`): the CO2 injected up to the frame for the whole
@@ -545,6 +547,49 @@ def _centres(runs: Sequence[_Run], domains, axis) -> dict[str, list[dict]]:
                 )
             )
     return dict(centres_long=rows, centres_by_time=by_time)
+
+
+def event_summary(rows: Iterable[Mapping]) -> list[dict]:
+    """The summary over the runs of each question's event times.
+
+    Parameters
+    ----------
+    rows : iterable of mappings
+        Rows of the event table (:func:`event_table`, :func:`read_events`).
+
+    Returns
+    -------
+    list of dict
+        Per question and mode, and per injection for the answers per injection:
+        the summary of the hours since the injection start (per run only) and of
+        the hours after the injection's start, over the runs answered, with the
+        median and largest time resolution.
+
+    """
+    groups: dict[tuple, list[Mapping]] = {}
+    for row in rows:
+        injection = row["injection"] if row["mode"] == "injection" else None
+        groups.setdefault((row["question"], row["mode"], injection), []).append(row)
+    found = []
+    for (question, mode, injection), answers in groups.items():
+        resolution = summary(row["resolution_h"] for row in answers)
+        quantities = ["after_injection_h"]
+        if mode == "run":
+            quantities.insert(0, "elapsed_h")
+        for quantity in quantities:
+            found.append(
+                dict(
+                    question=question,
+                    mode=mode,
+                    injection=injection,
+                    quantity=quantity,
+                    n_runs=len({row["run"] for row in answers}),
+                    **summary(row[quantity] for row in answers),
+                    resolution_median_h=resolution["median"],
+                    resolution_max_h=resolution["max"],
+                )
+            )
+    return found
 
 
 def write_tables(folder: Path, tables: Mapping[str, list[dict]]) -> list[Path]:

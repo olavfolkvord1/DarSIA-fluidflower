@@ -8,12 +8,20 @@ import pandas as pd
 import pytest
 
 import darsia
+from darsia.presets.workflows.analysis.domain_mass import RunSeries
 from darsia.presets.workflows.analysis.domains import AnalysisDomain
+from darsia.presets.workflows.comparison.comparison_events import (
+    EventQuestion,
+    event_table,
+    read_events,
+    write_events,
+)
 from darsia.presets.workflows.comparison.ensemble import (
     EnsembleRun,
     EnsembleSettings,
     dose_difference,
     ensemble_tables,
+    event_summary,
     summary,
     write_tables,
 )
@@ -196,3 +204,26 @@ def test_centres_of_a_synthetic_ensemble(tmp_path):
     assert by_time[1.0]["mean_x_mm"] == pytest.approx(120.0)
     assert by_time[1.0]["median_y_mm"] == pytest.approx(60.0)
     assert by_time[3.0]["mean_spread_x_mm"] == 3.0
+
+
+def test_the_event_times_summarised_over_runs(tmp_path):
+    """Per question the event times over the runs answered, per run and per
+    injection, with the time resolution; the same from the event table's file."""
+    runs = ensemble(tmp_path)
+    series = [
+        RunSeries.from_domain_mass(r.rows, r.injected_g, "quantified") for r in runs
+    ]
+    condition = dict(component="gas", event="detected", domain_id="low")
+    injections = {s.run: r.protocol.injections() for s, r in zip(series, runs)}
+    rows = event_table([EventQuestion("gas", [condition])], series, injections)
+    found = event_summary(rows)
+
+    per_run = select(found, mode="run", injection=None)
+    assert [r["quantity"] for r in per_run] == ["elapsed_h", "after_injection_h"]
+    assert (per_run[0]["n_runs"], per_run[0]["median"]) == (3, 0.5)
+    assert per_run[1]["median"] == -0.5
+    assert per_run[0]["resolution_max_h"] == pytest.approx(0.5)
+    first = select(found, mode="injection", injection=1)[0]
+    assert (first["n"], first["min"], first["max"]) == (3, 0.01, 0.5)
+    write_events(tmp_path / "events.csv", rows)
+    assert event_summary(read_events(tmp_path / "events.csv")) == found
