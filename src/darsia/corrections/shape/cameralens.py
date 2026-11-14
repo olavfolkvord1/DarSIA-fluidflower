@@ -14,7 +14,9 @@ precision at least).
 """
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import tifffile
@@ -59,6 +61,26 @@ class CameraLensSettings:
     sensor_offset: tuple[int, int]
     """Column and row of the camera grid's origin on the sensor."""
 
+    def coordinates(self, path: Path) -> Optional[Callable]:
+        """The coordinate function of the tables recorded in a raw file.
+
+        Parameters
+        ----------
+        path : Path
+            Raw file.
+
+        Returns
+        -------
+        callable or None
+            :func:`camera_lens_coordinates` with the file's tables and these
+            settings; None if the file records no tables.
+
+        """
+        tables = read_camera_lens_tables(path, self)
+        if tables is None:
+            return None
+        return partial(camera_lens_coordinates, tables=tables, settings=self)
+
 
 @dataclass(frozen=True)
 class CameraLensTables:
@@ -74,7 +96,7 @@ class CameraLensTables:
 
 def read_camera_lens_tables(
     path: Path, settings: CameraLensSettings
-) -> CameraLensTables:
+) -> Optional[CameraLensTables]:
     """Read the lens tables that a camera recorded in a raw file.
 
     Parameters
@@ -86,8 +108,10 @@ def read_camera_lens_tables(
 
     Returns
     -------
-    CameraLensTables
-        The distortion table and the red and blue chromatic aberration tables.
+    CameraLensTables or None
+        The distortion table and the red and blue chromatic aberration tables;
+        None if the file records no tables there (e.g. a camera that records
+        none, or a file without TIFF structure).
 
     Raises
     ------
@@ -95,10 +119,27 @@ def read_camera_lens_tables(
         If a record does not start with its header or is too short.
 
     """
-    with tifffile.TiffFile(path) as tiff:
-        record = tiff.pages[settings.page].pages[settings.subpage]
-        distortion = tuple(int(v) for v in record.tags[settings.distortion_tag].value)
-        chromatic = tuple(int(v) for v in record.tags[settings.chromatic_tag].value)
+    try:
+        tiff = tifffile.TiffFile(path)
+    except tifffile.TiffFileError:
+        return None
+    with tiff:
+        pages = tiff.pages
+        subpages = pages[settings.page].pages if settings.page < len(pages) else None
+        record = (
+            subpages[settings.subpage]
+            if subpages is not None and settings.subpage < len(subpages)
+            else None
+        )
+        tags = [
+            None if record is None else record.tags.get(code)
+            for code in (settings.distortion_tag, settings.chromatic_tag)
+        ]
+        if tags == [None, None]:
+            return None
+        if None in tags:
+            raise ValueError(f"{path} records only one of the two lens tables.")
+        distortion, chromatic = (tuple(int(v) for v in tag.value) for tag in tags)
     if (
         distortion[0] != settings.distortion_header
         or len(distortion) < settings.distortion_entries[1]
