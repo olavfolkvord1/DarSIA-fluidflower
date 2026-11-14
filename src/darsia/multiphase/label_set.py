@@ -99,13 +99,38 @@ def canvas_differences(canvas: dict | None, other: dict | None) -> list[str]:
     )
 
 
+_RESOLUTION = (
+    "grid.shape",
+    "grid.dimensions",
+    "grid.origin",
+    "corrections.grid.pixel_size_mm",
+)
+"""Settings of the resolution of a canvas: the grid's shape and pixel size, and the
+dimensions and origin of its whole metric cells, which follow from them. The
+extent before the cells extend it (``grid.extent``) belongs to the canvas, so the
+cells' dimensions and origin pass only when both canvases record the same extent."""
+
+
+def _extent(record: dict | None) -> dict | None:
+    """The extent a canvas records before whole metric cells extend it, or None."""
+    return ((record or {}).get("grid") or {}).get("extent")
+
+
 def check_canvas(
-    recorded: dict | None, canvas: dict | None, *, accept: bool, subject: str
+    recorded: dict | None,
+    canvas: dict | None,
+    *,
+    accept: bool,
+    subject: str,
+    resolution: bool = False,
 ) -> bool:
     """Check the canvas recorded by labels or a model against the images' canvas.
 
-    A recorded canvas equal to the images' passes. One that differs, or is not
-    recorded, passes only by the caller's explicit choice.
+    A recorded canvas equal to the images' passes. With ``resolution``, so does
+    one that differs only in resolution: the grid's shape and pixel size, with the
+    same extent in rig metres (``grid.extent``), recorded by both, and every other
+    setting the same. Any other difference, or a canvas that is not recorded,
+    passes only by the caller's explicit choice.
 
     Parameters
     ----------
@@ -117,11 +142,15 @@ def check_canvas(
         Whether the caller accepts a canvas that differs or is not recorded.
     subject : str
         What recorded the canvas, for the message, e.g. "the labels".
+    resolution : bool
+        Whether another resolution passes, e.g. for a phase model, which carries
+        its sizes in mm.
 
     Returns
     -------
     bool
-        Whether the canvas differs and was accepted, so the caller can record it.
+        Whether the canvas passed only because the caller accepted it, so the
+        caller can record it.
 
     Raises
     ------
@@ -132,10 +161,18 @@ def check_canvas(
     """
     if recorded is not None and recorded == canvas:
         return False
+    differences = canvas_differences(recorded, canvas)
+    waived = set(_RESOLUTION)
+    if _extent(recorded) is None or _extent(recorded) != _extent(canvas):
+        # Without the same extent in both, other dimensions or another origin are
+        # another canvas, not another resolution.
+        waived -= {"grid.dimensions", "grid.origin"}
+    if resolution and set(differences) <= waived:
+        return False
     if not accept:
         raise ValueError(
             f"The canvas of {subject} differs from the images' canvas; differing "
-            f"settings: {', '.join(canvas_differences(recorded, canvas))}. "
+            f"settings: {', '.join(differences)}. "
             "Accept it explicitly only if this is intended."
         )
     return True

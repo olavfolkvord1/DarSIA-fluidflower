@@ -22,9 +22,10 @@ dtype of the given images.
 
 A trained model also records the canvas it was trained on (``canvas.json``, the
 rig's description of its corrected images). The canvas is checked once, when a
-run's model is read for the canvas of its images: a model of another canvas is
-read only by the caller's explicit choice, as is a delivered model, which records
-none.
+run's model is read for the canvas of its images. Another resolution of the
+canvas passes (the grid's shape and pixel size, with the same extent), since the
+model's sizes are in mm; a model of another canvas is read only by the caller's
+explicit choice, as is a delivered model, which records none.
 
 """
 
@@ -166,7 +167,7 @@ def read_phase_model(
     presence threshold in the folder's ``phase_decision_policy.json``, and the
     model's canvas is that of ``canvas.json``, unknown (None) without one. The
     model's canvas is checked once, here, against the canvas of the images it is
-    read for (:func:`~darsia.check_canvas`).
+    read for (:func:`~darsia.check_canvas`); another resolution of it passes.
 
     Parameters
     ----------
@@ -214,7 +215,9 @@ def read_phase_model(
     recorded = None
     if record.exists():
         recorded = json.loads(record.read_text(encoding="utf-8"))["canvas"]
-    check_canvas(recorded, canvas, accept=accept_canvas, subject="the model")
+    check_canvas(
+        recorded, canvas, accept=accept_canvas, subject="the model", resolution=True
+    )
     if "texture_sigma_mm" in heads["co2_presence"]:
         key, scale = "texture_sigma_mm", 1.0
     elif pixel_size_mm is None:
