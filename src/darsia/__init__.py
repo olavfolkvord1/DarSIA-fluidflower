@@ -163,6 +163,7 @@ from darsia.assistants.labels_assistant import *
 from darsia.multiphase.flash import *
 from darsia.multiphase.mass_analysis import *
 from darsia.multiphase.phase_model import *
+from darsia.multiphase.phase_training import *
 from darsia.multiphase.phase_rules import *
 from darsia.multiphase.gas_allocation import *
 from darsia.multiphase.mass_maps import *
