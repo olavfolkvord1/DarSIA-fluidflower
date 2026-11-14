@@ -170,6 +170,7 @@ from darsia.experiment.protocols import *
 from darsia.experiment.overflow import *
 from darsia.experiment.overflow_feed import *
 from darsia.experiment.overflow_circulation import *
+from darsia.experiment.overflow_evaporation import *
 
 from darsia.corrections.readcorrection import *
 

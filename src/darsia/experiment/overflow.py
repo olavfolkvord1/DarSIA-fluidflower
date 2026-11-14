@@ -28,6 +28,7 @@ from typing import Literal, Protocol
 import numpy as np
 
 from darsia.experiment.overflow_circulation import CirculationSettings
+from darsia.experiment.overflow_evaporation import EvaporationSettings
 from darsia.experiment.overflow_feed import FeedSettings
 
 
@@ -43,11 +44,16 @@ class OverflowVariant(Protocol):
     """Fewest readings a run needs."""
 
     def displaced_ml(
-        self, times_h: np.ndarray, weights_g: np.ndarray, baseline: np.ndarray
+        self,
+        times_h: np.ndarray,
+        weights_g: np.ndarray,
+        corrected_g: np.ndarray,
+        baseline: np.ndarray,
     ) -> tuple[np.ndarray | None, tuple[str, ...]]:
         """Displaced water [mL] at each reading, and why the readings are not
         usable (empty when they are), from the readings' times [h since the
-        injection start], their weights [g] and the baseline readings."""
+        injection start], their weights [g] as read and with any evaporated
+        water added back, and the baseline readings."""
 
 
 @dataclass(frozen=True)
@@ -72,14 +78,18 @@ class OverflowSettings:
     circulation: CirculationSettings | None = None
     """The circulation's settings, given with the circulation variant only."""
     baseline_window_h: float | None = None
-    """Hours before the injection whose readings are the baseline; without it,
-    all readings before the injection."""
+    """Hours before the injection whose readings are the baseline, for the
+    circulation's reference and the evaporation proposal; without it, all
+    readings before the injection."""
+    evaporation: EvaporationSettings | None = None
+    """The evaporation correction; without it no run is corrected."""
 
     def __post_init__(self) -> None:
         """Turn tables given as mappings into settings; check the variant."""
         for name, kind in (
             ("feed", FeedSettings),
             ("circulation", CirculationSettings),
+            ("evaporation", EvaporationSettings),
         ):
             table = getattr(self, name)
             if isinstance(table, Mapping):
@@ -138,16 +148,25 @@ class OverflowRun:
 
 
 def displaced_volume(
-    times_h: np.ndarray, weights_g: np.ndarray, settings: OverflowSettings
+    times_h: np.ndarray,
+    weights_g: np.ndarray,
+    settings: OverflowSettings,
+    evaporation_g_h: float | None = None,
 ) -> DisplacedVolume:
     """Displaced water volume of a run at its scale readings.
 
     The baseline readings are those before the injection, within
     ``baseline_window_h`` of it if that is given; the window scopes the
-    circulation's reference, while a feed counts from the last reading before
-    the injection and checks all readings before it. The readings are usable
-    with at least the variant's ``minimum_readings`` of them, one before the
-    injection, and as the variant requires. The fits are in float64.
+    circulation's reference and the evaporation proposal, while a feed counts
+    from the last reading before the injection and checks all readings before
+    it. The readings are usable with at least the variant's
+    ``minimum_readings`` of them, one before the injection, and as the variant
+    requires. With an evaporation rate, the water evaporated since the
+    injection start is added back to the weights the volume is computed from:
+    in a circulation the volume gains the rate times the time since the
+    baseline, and in a feed, whose stop, late window and checks read the
+    weights as read, a steady rate cancels exactly in the fitted feed (see
+    :mod:`overflow_evaporation`). The fits are in float64.
 
     Parameters
     ----------
@@ -157,6 +176,9 @@ def displaced_volume(
         Scale weights [g].
     settings : OverflowSettings
         The overflow's variant and its settings.
+    evaporation_g_h : float, optional
+        The run's approved evaporation rate [g/h]; without one, no correction.
+        A rate that is not finite is refused.
 
     Returns
     -------
@@ -164,6 +186,8 @@ def displaced_volume(
         The volume at each reading and why the readings are not usable, if so.
 
     """
+    if evaporation_g_h is not None and not np.isfinite(evaporation_g_h):
+        raise ValueError("The evaporation rate is not finite.")
     t = np.asarray(times_h, np.float64)
     w = np.asarray(weights_g, np.float64)
     before = t < 0
@@ -174,7 +198,8 @@ def displaced_volume(
     if t.size < variant.minimum_readings or not before.any():
         reasons = ("too few readings, or none before injection",)
         return DisplacedVolume(t, None, reasons, baseline)
-    volume, reasons = variant.displaced_ml(t, w, baseline)
+    corrected = w if evaporation_g_h is None else w + evaporation_g_h * t
+    volume, reasons = variant.displaced_ml(t, w, corrected, baseline)
     return DisplacedVolume(t, volume, reasons, baseline)
 
 
