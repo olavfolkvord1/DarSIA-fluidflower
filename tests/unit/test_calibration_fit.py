@@ -28,6 +28,7 @@ SETTINGS = darsia.CalibrationFitSettings(
         ]
         tolerance = 1e-10
         evaluations = 600
+        swi_limit = 1e-6
         """
     )["calibration_fit"]
 )
@@ -36,6 +37,7 @@ GAIN, BETA, GROWTH = 1.36, 0.53, 0.11
 """The calibration the synthetic frames follow."""
 INJECTION_H = [0.52, 0.67, 0.88, 1.16, 1.41, 1.72, 2.10]
 LATER_H = [2.57, 3.83, 6.10, 10.4, 20.0, 36.8, 59.1]
+NO_SWI = ({}, ())
 RUNS = ("a", "b", "c")
 
 
@@ -56,6 +58,8 @@ def _frame(run, index, hours, target, injected, volume, histogram, free=0.0):
             sands={},
         ),
         column=None,
+        overflow_m3=None,
+        measured=False,
     )
 
 
@@ -92,7 +96,7 @@ def _run(run, seed, dtype=np.float64):
 def test_a_fit_recovers_the_calibration_of_the_frames(dtype, rel):
     frames = [f for seed, run in enumerate("abc") for f in _run(run, seed, dtype)]
 
-    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS)
+    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS, *NO_SWI)
 
     assert calibration.gain == pytest.approx(GAIN, rel=rel)
     assert calibration.beta == pytest.approx(BETA, rel=rel)
@@ -124,7 +128,7 @@ def test_the_frames_used_and_left_out_are_reported():
     frames[1] = _frame("a", 1, 0.52, 0.52, 0.0, 1e-4, ([0.1], [0.1]))
     frames[2] = _frame("a", 2, 0.67, None, 1.0, 1e-4, ([0.1], [0.1]))
 
-    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS)
+    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS, *NO_SWI)
 
     decisions = {(d.run, d.index): d for d in calibration.decisions}
     assert len(decisions) == 3 * 14 - 1  # no anchor-only frame is a fit frame
@@ -146,7 +150,7 @@ def test_every_run_given_has_the_parameters_of_its_mass():
         mean_mm=5.0, zero_signal=0.0, saturation_signal=1.2, intervals=32768
     )
 
-    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS)
+    calibration = darsia.fit_calibration(frames, RUNS, SETTINGS, *NO_SWI)
     runs = darsia.mass_calibrations(calibration, statistics)
 
     assert calibration.gain == pytest.approx(GAIN, rel=1e-7)
@@ -184,8 +188,8 @@ def test_no_held_out_run_is_in_its_own_fold():
         if f.run == "b"
     ]
 
-    fold, predictions = darsia.calibration_fold(frames, RUNS, SETTINGS, "b")
-    other, _ = darsia.calibration_fold(off, RUNS, SETTINGS, "b")
+    fold, predictions = darsia.calibration_fold(frames, RUNS, SETTINGS, *NO_SWI, "b")
+    other, _ = darsia.calibration_fold(off, RUNS, SETTINGS, *NO_SWI, "b")
 
     assert (fold.gain, fold.beta, fold.beta_growth) == (
         other.gain,
@@ -198,3 +202,29 @@ def test_no_held_out_run_is_in_its_own_fold():
     assert [p.index for p in predictions] == list(range(15))
     assert {p.run for p in predictions} == {"b"}
     assert max(abs(p.residual) for p in predictions[1:]) < 1e-3
+
+
+def test_open_sands_take_the_swi_of_the_measured_free_gas():
+    swi, truth = {1: 0.2, 2: 0.2, 3: 0.1}, {1: 0.12, 2: 0.3, 3: 0.1}
+    rng = np.random.default_rng(4)
+    frames = []
+    for frame in [f for seed, run in enumerate("abc") for f in _run(run, seed)]:
+        pores = dict(zip(swi, rng.uniform(1e-7, 1e-6, 3)))
+        sands = {s: darsia.SandGas(p, 1.8e3 * p, 1.5e3 * p) for s, p in pores.items()}
+        gas = dataclasses.replace(frame.gas, sands=sands)
+        # Run a holds its own overflow measurement; runs b and c the model's gas.
+        overflow = sum(p * (1 - truth[s]) for s, p in pores.items())
+        own = dict(overflow_m3=overflow, measured=True) if frame.run == "a" else {}
+        frames.append(dataclasses.replace(frame, gas=gas, **own))
+
+    fold, predictions = darsia.calibration_fold(frames, RUNS, SETTINGS, swi, {3}, "c")
+
+    assert fold.swi.keys() == {1, 2}
+    assert fold.swi[1] == pytest.approx(truth[1])
+    assert fold.swi[2] == pytest.approx(truth[2])
+    # Frames without an overflow volume hold the gas of the fitted Swi.
+    for frame, prediction in zip([f for f in frames if f.run == "c"], predictions):
+        shift = sum(
+            (swi[s] - fold.swi[s]) * frame.gas.sands[s].gas_capacity_g for s in fold.swi
+        )
+        assert prediction.free_gas_g == pytest.approx(frame.gas.free_gas_g + shift)
