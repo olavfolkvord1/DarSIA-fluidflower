@@ -35,7 +35,7 @@ The summaries (:func:`summary`) are the count, median, quartiles (interpolated
 linearly), interquartile range, mean, sample standard deviation, coefficient of
 variation and range of the known values; they and the rates run in double
 precision, as our production summarised. The tables are written by
-:func:`write_tables`.
+:func:`write_tables`, their figures by :mod:`ensemble_figures`.
 
 """
 
