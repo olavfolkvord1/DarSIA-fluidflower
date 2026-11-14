@@ -25,6 +25,7 @@ def test_segment_colored_image_exports_labels_jpg(monkeypatch, tmp_path: Path) -
         rig=SimpleNamespace(dim=2, width=2.0, height=1.0),
         labeling=SimpleNamespace(
             colored_image=tmp_path / "colored.png",
+            sand_map=None,
             rtol=0.001,
             ensure_connectivity=True,
             unite_labels=None,

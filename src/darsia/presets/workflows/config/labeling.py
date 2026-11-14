@@ -10,6 +10,66 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SandMapConfig:
+    """Labels from the series' sand-map drawing, placed on the run's grid.
+
+    The run's grid is the target grid of the rig's image mapping
+    (``[corrections.mapping]``), so it is not repeated here.
+    """
+
+    drawing: Path = field(
+        default_factory=Path,
+        metadata={
+            "name": "Drawing",
+            "help": (
+                "Path to the series' sand-map drawing (.json): the layers as "
+                "polygons on shared anchors in rig coordinates (metres, x to the "
+                "right and y upwards from the rig's lower left inner corner)."
+            ),
+        },
+    )
+    """Path to the drawing."""
+    grid_to_rig: list[list[float]] | None = field(
+        default=None,
+        metadata={
+            "name": "Rig geometry",
+            "help": (
+                "The run's measured homography from the grid's pixel coordinates "
+                "(column, row; pixel centres at whole numbers) to rig coordinates "
+                "(metres), as three rows of three numbers; the sand map is placed "
+                "by its inverse. Leave empty for a grid in rig metres, e.g. the "
+                "rig mapping's metric grid."
+            ),
+        },
+    )
+    """Homography from the grid's pixel coordinates to rig coordinates."""
+    edge_fill_mm: float | None = field(
+        default=None,
+        metadata={
+            "name": "Edge fill [mm]",
+            "help": (
+                "Pixels inside the rig's frame that no polygon covers take the "
+                "nearest layer within this distance of the frame's edge; 0 for none."
+            ),
+            "placeholder": "e.g., 5.0",
+        },
+    )
+    """Distance from the frame's edge within which uncovered pixels are filled."""
+
+    def load(self, sec: dict) -> "SandMapConfig":
+        """Load the sand-map configuration from the [labeling.sand_map] section."""
+        self.drawing = _get_key(sec, "drawing", required=True, type_=Path)
+        if "rig_to_grid" in sec:
+            raise ValueError(
+                "[labeling.sand_map] rig_to_grid is replaced by grid_to_rig, its "
+                "inverse: the run's homography from the grid's pixels to rig metres."
+            )
+        self.grid_to_rig = _get_key(sec, "grid_to_rig", required=False, type_=list)
+        self.edge_fill_mm = _get_key(sec, "edge_fill_mm", required=True, type_=float)
+        return self
+
+
+@dataclass
 class LabelingConfig:
     colored_image: Path = field(
         default_factory=Path,
@@ -23,6 +83,17 @@ class LabelingConfig:
         },
     )
     """Path to the segmented file."""
+    sand_map: SandMapConfig | None = field(
+        default=None,
+        metadata={
+            "name": "Sand map",
+            "help": (
+                "Labels from the series' sand-map drawing instead of a colored "
+                "image."
+            ),
+        },
+    )
+    """Labels from a sand-map drawing (if any), in place of the colored image."""
     rtol: float = field(
         default=0.001,
         metadata={
@@ -93,7 +164,15 @@ class LabelingConfig:
     def load(self, path: Path, results: Path | None = None) -> "LabelingConfig":
         """Load labeling config from a toml file from [section]."""
         sec = _get_section_from_toml(path, "labeling")
-        self.colored_image = _get_key(sec, "colored_image", required=True, type_=Path)
+        if "sand_map" in sec:
+            self.sand_map = SandMapConfig().load(sec["sand_map"])
+        self.colored_image = _get_key(
+            sec,
+            "colored_image",
+            default=self.colored_image,
+            required=self.sand_map is None,
+            type_=Path,
+        )
         self.unite_labels = _get_key(sec, "unite_labels", required=False, type_=list)
         self.water_label = _get_key(sec, "water_label", required=False, type_=int)
         self.colorchecker_label = _get_key(
