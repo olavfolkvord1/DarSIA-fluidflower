@@ -22,9 +22,12 @@ the official analysis writes, so every later step reads either method's maps.
 
 The run's geometry (:class:`RunGeometry`: pore volume from pixel area, depth and
 porosity, the pixels that count, Swi) is computed once per run and serves every
-frame: a frame's mass is the integral of its maps (:meth:`RunGeometry.mass_g`).
+frame: a frame's mass is the integral of its maps (:meth:`RunGeometry.mass_g`),
+and :class:`MassCopy` copies them onto metric cells, e.g. 1 mm, by the one
+scaling method.
 
-The calibration's parameters are a :class:`darsia.MassCalibration`.
+Every setting is a field of :class:`MassCopySettings`; the calibration's
+parameters are a :class:`darsia.MassCalibration`.
 
 """
 
@@ -42,6 +45,16 @@ from darsia.pvt import data as pvt_data
 _GRAVITY = 9.81
 """Gravitational acceleration [m/s2], as in the official mass analysis."""
 _PA_TO_BAR = 1e-5
+_MAPS = {"mass_total": "mass", "mass_aqueous": "mass_aq", "mass_free_gas": "mass_g"}
+"""The field of the mass maps behind each mass."""
+
+
+@dataclass(frozen=True)
+class MassCopySettings:
+    """Settings of the mass maps' copy on metric cells; one configuration table."""
+
+    copy_mm: float
+    """Size [mm] of the metric cells of the maps' copy."""
 
 
 class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
@@ -423,3 +436,147 @@ def mass_maps(
     result.concentration_aq.img[unknown] = np.nan
     result.saturation_g.img[unknown & model] = np.nan
     return result
+
+
+def known_mass(
+    maps: darsia.SimpleMassAnalysisResults, labels: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Where each mass of a frame's maps is known.
+
+    A mass is known where it is finite, the pixel's phase is known and what it is
+    made of is finite: the concentration and the saturation for the total mass,
+    the concentration for the dissolved mass and the saturation for the free gas.
+    Unknown mass is never read as no mass.
+
+    Parameters
+    ----------
+    maps : darsia.SimpleMassAnalysisResults
+        A frame's mass maps, of either method.
+    labels : array
+        The frame's phase map (:class:`darsia.PhaseLabel`).
+
+    Returns
+    -------
+    dict of str to array
+        ``mass_total``, ``mass_aqueous`` and ``mass_free_gas``: where each is
+        known (bool).
+
+    """
+    concentration = np.isfinite(maps.concentration_aq.img)
+    saturation = np.isfinite(maps.saturation_g.img)
+    phase = labels != PhaseLabel.UNKNOWN
+    return {
+        name: np.isfinite(image.img) & phase & markers
+        for name, image, markers in (
+            ("mass_total", maps.mass, concentration & saturation),
+            ("mass_aqueous", maps.mass_aq, concentration),
+            ("mass_free_gas", maps.mass_g, saturation),
+        )
+    }
+
+
+class MassCopy:
+    """Copies of a run's mass maps on metric cells, e.g. 1 mm.
+
+    The cells and the run's pore volume and area per cell are set up once per run
+    (:attr:`static`); each frame's maps are then copied by the one scaling method
+    (:func:`darsia.cell_sums`, double precision): the masses are sums over each
+    cell, so every total is kept, the concentration and the saturation are
+    pore-volume weighted means, and the phase fractions are shares of the cell's
+    domain area.
+
+    """
+
+    def __init__(self, geometry: RunGeometry, settings: MassCopySettings) -> None:
+        """Set up the copy of a run's maps.
+
+        Parameters
+        ----------
+        geometry : RunGeometry
+            The run's geometry.
+        settings : MassCopySettings
+            The size of the cells.
+
+        """
+        shape = geometry.domain.shape
+        self.cells = darsia.metric_cells(shape, geometry.dimensions, settings.copy_mm)
+        """The cells (:func:`darsia.metric_cells`)."""
+        self.volume_l = np.asarray(geometry.pore_volume_m3, np.float64) * 1000
+        """Pore volume [L] of each pixel."""
+        self.area_m2 = np.where(geometry.domain, geometry.pixel_area_m2, 0.0)
+        """Domain area [m2] of each pixel."""
+        domain_area = darsia.cell_sums(self.cells, self.area_m2)
+        self.static = {
+            "pore_volume_l": darsia.cell_sums(self.cells, self.volume_l),
+            "domain_area_m2": domain_area,
+            "domain_area_fraction": domain_area / (settings.copy_mm / 1000) ** 2,
+        }
+        """Pore volume [L], domain area [m2] and its share of the cell's area, per
+        cell."""
+
+    def __call__(
+        self, maps: darsia.SimpleMassAnalysisResults, labels: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """A frame's maps on the cells.
+
+        A pixel of unknown mass adds nothing to its cell, and each mass comes with
+        the share of the cell's pore volume whose mass is known
+        (:func:`known_mass`), so that unknown is never read as no mass.
+
+        Parameters
+        ----------
+        maps : darsia.SimpleMassAnalysisResults
+            The frame's mass maps, of either method.
+        labels : array
+            The frame's phase map.
+
+        Returns
+        -------
+        dict of str to array
+            Per cell: ``mass_total_g``, ``mass_aqueous_g``, ``mass_free_gas_g`` and
+            their ``*_known_fraction``; ``concentration_aq`` and ``saturation_g``;
+            ``phase_water``, ``phase_dissolved`` and ``phase_gas_area_fraction``.
+
+        """
+        cells, volume = self.cells, self.volume_l
+        pore_volume = self.static["pore_volume_l"]
+        concentration = np.asarray(maps.concentration_aq.img, np.float64)
+        saturation = np.asarray(maps.saturation_g.img, np.float64)
+        copy = {}
+        for name, known in known_mass(maps, labels).items():
+            values = np.asarray(getattr(maps, _MAPS[name]).img, np.float64)
+            finite = np.isfinite(values)
+            copy[name + "_g"] = darsia.cell_sums(
+                cells, np.where(finite, values, 0.0) * volume
+            )
+            copy[name + "_known_fraction"] = cell_ratio(
+                darsia.cell_sums(cells, np.where(known, volume, 0.0)), pore_volume
+            )
+        for name, values in (
+            ("concentration_aq", concentration),
+            ("saturation_g", saturation),
+        ):
+            valid = np.isfinite(values)
+            copy[name] = cell_ratio(
+                darsia.cell_sums(cells, np.where(valid, values * volume, 0.0)),
+                darsia.cell_sums(cells, np.where(valid, volume, 0.0)),
+            )
+        domain_area = self.static["domain_area_m2"]
+        for name, label in (
+            ("water", PhaseLabel.WATER),
+            ("dissolved", PhaseLabel.DISSOLVED),
+            ("gas", PhaseLabel.GAS),
+        ):
+            area = np.where(labels == label, self.area_m2, 0.0)
+            copy["phase_" + name + "_area_fraction"] = cell_ratio(
+                darsia.cell_sums(cells, area), domain_area
+            )
+        return copy
+
+
+def cell_ratio(numerator, denominator):
+    """Ratio per cell in double precision; NaN where the denominator is not
+    positive."""
+    ratio = np.full(numerator.shape, np.nan)
+    np.divide(numerator, denominator, out=ratio, where=denominator > 0)
+    return ratio

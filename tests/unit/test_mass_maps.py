@@ -11,6 +11,10 @@ W, D, G, U = darsia.PhaseLabel
 
 TABLES = tomllib.loads(
     """
+    # The values our production ran with.
+    [mass_copy]
+    copy_mm = 1.0
+
     # A calibration record as the calibration delivers it (rounded values).
     [calibration]
     gain = 1.5
@@ -23,6 +27,7 @@ TABLES = tomllib.loads(
     anchor_pore_volume_m3 = 4e-4
     """
 )
+SETTINGS = darsia.MassCopySettings(**TABLES["mass_copy"])
 CALIBRATION = darsia.MassCalibration(**TABLES["calibration"])
 
 LABELS = np.array(
@@ -174,3 +179,32 @@ def test_mass_lies_only_in_the_co2_the_phase_map_measures():
     assert np.isnan(maps.concentration_aq.img[UNMEASURED])
     assert maps.mass.img[UNMEASURED] == 0
     assert np.isnan(maps.mass.img[NO_SWI]) and np.isnan(maps.saturation_g.img[NO_SWI])
+
+
+def test_the_official_route_and_ours_give_mass_maps_of_one_form():
+    """Swap test: a later step reads the official flash's maps and ours alike, and
+    the whole domain's mass equals the copy's total, summed in double precision."""
+    geometry, co2, _, ours = frame()
+    signal = darsia.ScalarImage(
+        np.full((6, 6), 0.6, np.float32), dimensions=[0.03, 0.03]
+    )
+    c_aq, s_g = darsia.SimpleFlash(0.0, 1.2, 1.2, 1.5)(signal)
+    official = darsia.CO2MassAnalysis(signal).mass_analysis(c_aq, s_g)
+    copy = darsia.MassCopy(geometry, SETTINGS)
+
+    for maps in (official, ours):
+        assert isinstance(maps, darsia.SimpleMassAnalysisResults)
+        cells = copy(maps, LABELS)
+        assert cells["mass_total_g"].shape == (30, 30)
+        assert cells["mass_total_g"].dtype == np.float64
+        assert cells["mass_total_g"].sum() == pytest.approx(
+            geometry.mass_g(maps.mass.img, geometry.domain), rel=1e-6
+        )
+    known = darsia.known_mass(ours, LABELS)
+    assert not any(mask[NO_SWI] for mask in known.values())
+    assert not known["mass_total"][UNMEASURED] and not known["mass_aqueous"][UNMEASURED]
+    assert known["mass_free_gas"][UNMEASURED]
+    cells = copy(ours, LABELS)
+    unknown = np.unravel_index(copy.cells.index.reshape(6, 6)[NO_SWI], (30, 30))
+    assert cells["mass_total_known_fraction"][unknown] == 0
+    assert copy.static["domain_area_m2"].sum() == pytest.approx(5 * 6 * 25e-6)
