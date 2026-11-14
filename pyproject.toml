@@ -91,6 +91,7 @@ dev = [
 ]
 raw = [
   "rawpy",
+  "tifffile",
 ]
 docs = [
   "sphinx>=7.2",

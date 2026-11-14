@@ -82,6 +82,7 @@ from darsia.corrections.shape.deformation import *
 from darsia.corrections.shape.resize import *
 from darsia.corrections.shape.imagemapping import *
 from darsia.corrections.shape.metricscaling import *
+from darsia.corrections.shape.cameralens import *
 from darsia.corrections.shape.registration import *
 from darsia.corrections.color.colorbalance import *
 from darsia.corrections.color.colorcheckerfinder import *
