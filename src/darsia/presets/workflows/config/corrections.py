@@ -19,6 +19,92 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class GridConfig:
+    """Precision, pixel size and pixel areas of the run grid, chosen once for a
+    setup.
+
+    The rig converts the images to the precision before all other corrections,
+    so every later correction and method computes in it, and scales them once
+    onto whole metric cells of the pixel size after the shape corrections. The
+    measured area of each pixel is its area on the coordinate plane times the
+    run's optical area factor, summed per cell.
+    """
+
+    precision: Literal["float32", "float64"] = field(
+        default="float64",
+        metadata={
+            "name": "Precision",
+            "help": "Floating type in which all corrections and methods compute.",
+            "options": ["float32", "float64"],
+        },
+    )
+    """Floating type of the corrected images."""
+    pixel_size_mm: float | None = field(
+        default=None,
+        metadata={
+            "name": "Pixel size (mm)",
+            "help": (
+                "Pixel size of the run grid in millimetres: whole cells from the "
+                "lower left corner, the image extended to whole cells. Images are "
+                "averaged over each cell's valid pixels; labels and facies take "
+                "each cell's majority. Empty keeps the grid of the shape corrections."
+            ),
+            "placeholder": "e.g., 1.0",
+        },
+    )
+    """Pixel size of the run grid in millimetres; None keeps the grid."""
+    area_factor: float | None = field(
+        default=None,
+        metadata={
+            "name": "Optical area factor",
+            "help": (
+                "Measured area of a pixel on the sand plane over its area on the "
+                "coordinate plane, for this run: the sand lies behind the plane of "
+                "the rig's coordinates, so each pixel sees a slightly larger area "
+                "there (e.g., 1.0337 for 14 mm behind). The pixel areas and the "
+                "optical lengths in millimetres follow from it."
+            ),
+            "placeholder": "e.g., 1.0337",
+        },
+    )
+    """Optical area factor of the run: sand-plane over coordinate-plane pixel area."""
+
+    def load(self, sec: dict) -> "GridConfig":
+        """Load the run grid configuration from a dictionary.
+
+        Parameters
+        ----------
+        sec : dict
+            Dictionary containing the run grid settings.
+
+        Returns
+        -------
+            Self with loaded configuration.
+
+        Raises
+        ------
+        ValueError
+            If the precision is not "float32" or "float64"; any other type
+            would be quantized silently by the type conversion. If the area
+            factor is missing, not finite or not positive.
+        """
+        self.precision = sec.get("precision", self.precision)
+        if self.precision not in ("float32", "float64"):
+            raise ValueError(
+                "[corrections.grid] precision must be 'float32' or 'float64', "
+                f"got {self.precision!r}."
+            )
+        self.pixel_size_mm = _get_key(sec, "pixel_size_mm", required=False, type_=float)
+        self.area_factor = _get_key(sec, "area_factor", required=True, type_=float)
+        if not 0 < self.area_factor < np.inf:
+            raise ValueError(
+                "[corrections.grid] area_factor must be finite and positive, "
+                f"got {self.area_factor!r}."
+            )
+        return self
+
+
+@dataclass
 class TypeCorrectionConfig:
     """Configuration for type conversion correction.
 
@@ -1492,6 +1578,7 @@ class PatchwiseIlluminationCorrectionConfig:
 
 
 _CORRECTION_CLASSES: dict[str, type] = {
+    "grid": GridConfig,
     "type": TypeCorrectionConfig,
     "resize": ResizeCorrectionConfig,
     "mapping": ImageMappingCorrectionConfig,
@@ -1515,6 +1602,10 @@ class CorrectionsConfig:
 
     Attributes
     ----------
+    grid
+        GridConfig for the precision and pixel size of the run grid (default:
+        None). Sets the type conversion, in place of ``type``, and scales once
+        onto whole metric cells of the pixel size.
     type
         TypeCorrectionConfig for type conversion correction (default: None).
         Converts image to a specified numpy floating-point type (e.g., float32, float64).
@@ -1549,6 +1640,9 @@ class CorrectionsConfig:
     """
 
     # Configuration objects for each correction type
+    grid: GridConfig | None = field(
+        default=None, metadata={"name": "Run grid", "active_list_key": "active"}
+    )
     type: TypeCorrectionConfig | None = field(
         default=None, metadata={"name": "Type correction", "active_list_key": "active"}
     )
@@ -1603,6 +1697,26 @@ class CorrectionsConfig:
     """Parsed sub-configs for corrections present in the TOML but deactivated via
     `active`. Kept so tuned parameters survive toggling a correction off
     (not consumed by the correction pipeline — see `get_parsed`)."""
+
+    @property
+    def precision(self) -> Type[np.floating] | None:
+        """The floating type every correction and method computes in, chosen once.
+
+        It is the precision of ``grid``, else the target type of ``type``; None
+        without either, where images keep the type they are read in.
+
+        Raises
+        ------
+        ValueError
+            If both ``grid`` and ``type`` are given.
+        """
+        if self.grid and self.type:
+            raise ValueError(
+                "[corrections.grid] sets the precision; remove [corrections.type]."
+            )
+        if self.grid:
+            return np.dtype(self.grid.precision).type
+        return self.type.target_type if self.type else None
 
     def get_parsed(self, name: str) -> Any | None:
         """Return the parsed sub-config for `name`, active or not (GUI use)."""

@@ -112,6 +112,7 @@ class Rig:
                 darsia.DriftCorrection,
                 darsia.CurvatureCorrection,
                 darsia.ImageMappingCorrection,
+                darsia.MetricScalingCorrection,
             ),
         )
 
@@ -185,13 +186,16 @@ class Rig:
         """Load persisted corrections from disk.
 
         Supports both split-format files (`shape_correction_*`, `color_correction_*`)
-        and legacy mixed-format files (`correction_*`).
+        and legacy mixed-format files (`correction_*`). The measured pixel areas of
+        the run grid are read with them; a rig saved without them has none.
         """
         if corrections_config is None:
             corrections_config = CorrectionsConfig()
 
         self.shape_corrections = []
         self.color_corrections = []
+        area = folder / "pixel_area.npz"
+        self.pixel_area = darsia.imread(area) if area.exists() else None
 
         shape_paths = sorted(folder.glob("shape_correction_*.npz"))
         color_paths = sorted(folder.glob("color_correction_*.npz"))
@@ -248,11 +252,13 @@ class Rig:
 
         baseline_for_setup = pre_baseline
 
-        if corrections_config.type:
+        # The precision of the run grid, or of the type correction.
+        grid = corrections_config.grid
+        target_type = corrections_config.precision
+
+        if target_type is not None:
             # Aux: needed for rescaling not leaving the range of color space
-            self.type_converter = darsia.TypeCorrection(
-                corrections_config.type.target_type
-            )
+            self.type_converter = darsia.TypeCorrection(target_type)
             """Type correction to convert images to float32."""
             baseline_for_setup = self.type_converter(baseline_for_setup)
 
@@ -367,6 +373,42 @@ class Rig:
             interpolation="inter_nearest",
         )
         """Final nearest-interpolation harmonizer for label/facies data."""
+
+        self.pixel_area = None
+        """Measured area [m2] of each pixel of the run grid; None without a grid."""
+        if grid:
+            # The coordinate plane's pixel area times the run's optical area factor.
+            area = np.full(
+                baseline_for_setup.shape[: baseline_for_setup.space_dim],
+                float(np.prod(baseline_for_setup.voxel_size)) * grid.area_factor,
+            )
+
+        if grid and grid.pixel_size_mm:
+            # Scale once onto whole metric cells of the chosen size, after the
+            # corrections that give the images their physical dimensions.
+            canvas = (
+                grid.pixel_size_mm,
+                baseline_for_setup.shape[: baseline_for_setup.space_dim],
+                baseline_for_setup.dimensions,
+                baseline_for_setup.origin,
+            )
+            self.resolution_correction = darsia.MetricScalingCorrection(*canvas)
+            """Scaling of the images onto the cells of the run grid."""
+            baseline_for_setup = self.resolution_correction(baseline_for_setup)
+            self.shape_corrections.append(self.resolution_correction)
+            # Labels and facies take the majority label of each cell.
+            self.resize_correction_inter_nearest_final = darsia.MetricScalingCorrection(
+                *canvas, labels=True
+            )
+            # A cell's area is the sum of its pixels' areas.
+            area = darsia.cell_sums(self.resolution_correction.cells, area)
+
+        if grid:
+            self.pixel_area = darsia.ScalarImage(
+                area.astype(target_type),
+                dimensions=baseline_for_setup.dimensions,
+                origin=baseline_for_setup.origin,
+            )
 
         logger.info("Shape corrections setup complete.")
 
@@ -1194,6 +1236,12 @@ class Rig:
         for i, correction in enumerate(self.color_corrections):
             correction_name = type(correction).__name__.lower()
             correction.save(folder / f"color_correction_{i}_{correction_name}.npz")
+
+        # The pixel areas, or none: an earlier save's areas must not outlive them.
+        if getattr(self, "pixel_area", None) is not None:
+            self.pixel_area.save(folder / "pixel_area.npz")
+        else:
+            (folder / "pixel_area.npz").unlink(missing_ok=True)
 
         # Save geometry information
         try:
