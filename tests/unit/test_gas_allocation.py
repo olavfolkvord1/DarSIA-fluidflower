@@ -44,6 +44,8 @@ TABLES = tomllib.loads(
     cone_rise_mm = 12.81
     seal_band_mm = 30.0
     cone_decay_mm = 10.0
+    end_gas_decay_mm = 10.0
+    end_gas_angle_deg = 30.0
     port_fade_mm = 10.0
     lattice_mm = 1.0
     cost_up_per_mm = 0.5
@@ -152,3 +154,15 @@ def test_removed_gas_peels_the_lower_edges_first(tmp_path):
     co2 = np.zeros(SHAPE, bool)
     co2[10:50, 20:60] = True
     assert (kept_co2 == co2).all() and (gone_co2 == co2).all()
+
+
+def test_end_gas_weights_the_gas_after_the_injection(tmp_path):
+    """After the injection, gas far from the free gas at its end is dissolved."""
+    left, right = np.s_[20:40, 10:30], np.s_[20:40, 52:72]
+    before = _frame(co2=[left], gas=[left])
+    after = _frame(co2=[left, right], gas=[left, right], level=0.7)
+    (_, _, saturation, _), (labels, _, _, _) = _run(
+        tmp_path, [before, after], [0.5, 3.0], [None, None], end_h=1.0
+    )
+    assert (saturation[left] == 1 - SWI).all()
+    assert (labels[left] == G).all() and (labels[right] == D).all()
