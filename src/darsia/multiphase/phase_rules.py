@@ -32,7 +32,7 @@ setting is a field of :class:`PhaseRuleSettings`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -205,7 +205,9 @@ def phase_labels(
     return labels
 
 
-def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshold):
+def _time_average(
+    labels, gas, neighbours, domain, chart, settings, gas_threshold, end_gas=None
+):
     """Decide free gas by the time-averaged gas probability; return the raw gas.
 
     The gas probability of the frame (weight one) and of each neighbour (weight
@@ -213,7 +215,9 @@ def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshol
     probabilities give CO2 and zero elsewhere, is averaged. Within the frame's
     CO2 the average decides free gas, except that gas the smallest-patch rule
     removed is not restored, nor is gas on the chart. The raw gas is the frame's
-    own gas decision before the smallest-patch rule.
+    own gas decision before the smallest-patch rule. A weight per pixel
+    (``end_gas``) multiplies the average and the raw gas probability before
+    their threshold.
     """
     dtype = gas.dtype.type
     scored = _co2(labels)
@@ -225,13 +229,18 @@ def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshol
             other = domain & (other_co2 >= settings.co2_threshold)
             total += dtype(weight) * np.where(other, other_gas, 0)
             weight_sum += weight
-    averaged = scored & (total / dtype(weight_sum) >= gas_threshold)
+    mean = total / dtype(weight_sum)
+    if end_gas is not None:
+        mean = (mean * end_gas).astype(mean.dtype)
+    averaged = scored & (mean >= gas_threshold)
     raw = scored & (gas >= gas_threshold)
     gained = (labels == PhaseLabel.DISSOLVED) & averaged & ~raw
     if chart is not None:
         gained &= ~chart
     labels[(labels == PhaseLabel.GAS) & ~averaged] = PhaseLabel.DISSOLVED
     labels[gained] = PhaseLabel.GAS
+    if end_gas is not None:
+        raw &= gas * end_gas >= dtype(gas_threshold)
     return raw
 
 
@@ -453,6 +462,7 @@ def phase_maps(
     protocol: darsia.InjectionProtocol,
     settings: PhaseRuleSettings,
     chart: np.ndarray | None = None,
+    end_gas: Callable[[int], np.ndarray | None] | None = None,
     *,
     gas_threshold: float,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -462,7 +472,10 @@ def phase_maps(
     in the module description. A frame's time average uses its nearest
     ``neighbours_per_side`` earlier and later frames, read from
     ``probabilities`` by index. Each frame's rule map records which rule last
-    changed each pixel's label.
+    changed each pixel's label. After an injection end, ``end_gas`` can weight
+    the averaged and the frame's own gas probability by the free gas the run
+    held at that end (:func:`darsia.free_gas` does); it is called with each
+    frame's index when the frame is due, so it can use the earlier frames.
 
     Parameters
     ----------
@@ -485,6 +498,9 @@ def phase_maps(
         Settings of the labels and rules.
     chart : array, optional
         The colour checker's pixels.
+    end_gas : callable, optional
+        Weight per pixel of a frame's gas probability, by the frame's index, or
+        None for no weight.
     gas_threshold : float
         Gas threshold of the phase model that gave the probabilities, as for
         :func:`phase_labels`.
@@ -543,8 +559,9 @@ def phase_maps(
             co2, gas, domain, pixel_area_mm2, settings, gas_threshold=gas_threshold
         )
         before = labels.copy()
+        weight = None if end_gas is None else end_gas(index)
         raw = _time_average(
-            labels, gas, neighbours, domain, chart, settings, gas_threshold
+            labels, gas, neighbours, domain, chart, settings, gas_threshold, weight
         )
         lowest = min((port[1] for port in started), default=None)
         _small_bubbles(labels, raw, lowest, y, pixel_area_mm2, settings)
