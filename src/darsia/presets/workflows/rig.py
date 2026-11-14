@@ -141,8 +141,18 @@ class Rig:
         # Cache experiment for protocol-based datetime lookup
         self.experiment = experiment
 
+        self.raw_decoding: dict = {}
+        """Settings of the raw decode of the photographs; empty if not raw."""
+        if corrections_config is not None and corrections_config.raw is not None:
+            # Decode in the rig's precision, chosen once (float64 without one).
+            precision = corrections_config.precision or np.float64
+            self.raw_decoding = {
+                "demosaic": corrections_config.raw.demosaic,
+                "dtype": np.dtype(precision).name,
+            }
+
         # Setup (based on baseline image without any corrections applied)
-        pre_baseline = darsia.imread(baseline_path)
+        pre_baseline = darsia.imread(baseline_path, **self.raw_decoding)
 
         if show_plot:
             # Allows to visually check the baseline image before any corrections
@@ -159,7 +169,7 @@ class Rig:
 
         # Define shape-corrected baseline.
         self.shape_corrected_baseline = darsia.imread(
-            baseline_path, transformations=self.shape_corrections
+            baseline_path, transformations=self.shape_corrections, **self.raw_decoding
         )
         self.baseline = self.shape_corrected_baseline.copy()
 
@@ -1204,6 +1214,8 @@ class Rig:
         meta_data = {
             "baseline_path": str(self.baseline_path),
         }
+        if getattr(self, "raw_decoding", {}):
+            meta_data["raw_decoding"] = self.raw_decoding
         with open(folder / "meta_data.json", "w") as f:
             json.dump(meta_data, f)
 
@@ -1301,6 +1313,7 @@ class Rig:
         with open(folder / "meta_data.json", "r") as f:
             meta_data = json.load(f)
         rig.baseline_path = Path(meta_data["baseline_path"])
+        rig.raw_decoding = meta_data.get("raw_decoding", {})
 
         # Load data for reading images
         rig.baseline = darsia.imread(folder / "baseline.npz")
@@ -1458,6 +1471,7 @@ class Rig:
             date=date,
             reference_date=self.reference_date,
             name=path.name,
+            **getattr(self, "raw_decoding", {}),
         )
 
         return img

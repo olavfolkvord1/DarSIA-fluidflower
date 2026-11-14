@@ -19,6 +19,45 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class RawDecodingConfig:
+    """Configuration for the decode of photographs in a camera raw format.
+
+    The rig decodes the photographs with :func:`darsia.imread_from_raw` in its
+    precision (:attr:`CorrectionsConfig.precision`; float64 without one).
+    """
+
+    demosaic: str | None = field(
+        default=None,
+        metadata={
+            "name": "Demosaic",
+            "help": (
+                "Interpolation of the sensor's colour filter array: 'edge_aware' is "
+                "OpenCV's edge-aware Bayer demosaic."
+            ),
+            "options": ["edge_aware"],
+        },
+    )
+    """Interpolation of the colour filter array."""
+
+    def load(self, sec: dict) -> "RawDecodingConfig":
+        """Load raw decoding configuration from a dictionary.
+
+        Parameters
+        ----------
+        sec : dict
+            Dictionary containing the raw decoding settings.
+
+        Returns
+        -------
+            Self with loaded configuration.
+        """
+        if "demosaic" not in sec:
+            raise ValueError("corrections.raw requires 'demosaic'.")
+        self.demosaic = str(sec["demosaic"])
+        return self
+
+
+@dataclass
 class GridConfig:
     """Precision, pixel size and pixel areas of the run grid, chosen once for a
     setup.
@@ -1494,6 +1533,7 @@ class PatchwiseIlluminationCorrectionConfig:
 
 
 _CORRECTION_CLASSES: dict[str, type] = {
+    "raw": RawDecodingConfig,
     "grid": GridConfig,
     "type": TypeCorrectionConfig,
     "resize": ResizeCorrectionConfig,
@@ -1518,6 +1558,9 @@ class CorrectionsConfig:
 
     Attributes
     ----------
+    raw
+        RawDecodingConfig for photographs in a camera raw format (default: None).
+        Decodes them into linear camera RGB before the corrections.
     grid
         GridConfig for the precision and pixel size of the run grid (default:
         None). Sets the type conversion, in place of ``type``, and scales once
@@ -1556,6 +1599,9 @@ class CorrectionsConfig:
     """
 
     # Configuration objects for each correction type
+    raw: RawDecodingConfig | None = field(
+        default=None, metadata={"name": "Raw decoding", "active_list_key": "active"}
+    )
     grid: GridConfig | None = field(
         default=None, metadata={"name": "Run grid", "active_list_key": "active"}
     )
