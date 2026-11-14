@@ -163,6 +163,7 @@ from darsia.multiphase.mass_analysis import *
 from darsia.multiphase.phase_model import *
 from darsia.multiphase.phase_rules import *
 from darsia.multiphase.gas_allocation import *
+from darsia.multiphase.mass_maps import *
 from darsia.multiphase.fluidflower_co2_meta import *
 from darsia.multiphase.multiphase_time_series_data import *
 from darsia.multiphase.multiphase_time_series_analysis import *
