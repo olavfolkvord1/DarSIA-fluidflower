@@ -5,7 +5,7 @@ against a baseline image of the same run and against the previous frame. It has
 two heads on one standardized feature matrix: the probability that a pixel holds
 CO2 (in any phase), and the probability that the CO2 in it is free gas.
 
-A delivered model is a folder holding the two heads and the decision policy::
+A model is a folder holding the two heads and the decision policy::
 
     models/generic/co2_presence_signal.json
     models/generic/gas_within_co2_signal.json
@@ -14,10 +14,11 @@ A delivered model is a folder holding the two heads and the decision policy::
 The model carries the decision threshold of its gas head, tuned with the model;
 the phase rules apply it. The CO2 threshold is a setting of the phase rules.
 
-The model carries its sizes in millimetres. A delivered head gives its texture
-scale in pixels of the grid it was trained on; the reader converts it with that
-grid's pixel size, and inference converts it to pixels of the grid of the given
-images. All arithmetic runs in the floating dtype of the given images.
+The model carries its sizes in millimetres. A trained head records its texture
+scale in mm; a delivered head gives it in pixels of the grid it was trained on,
+and the reader converts it with that grid's pixel size. Inference converts it to
+pixels of the grid of the given images. All arithmetic runs in the floating
+dtype of the given images.
 
 """
 
@@ -135,19 +136,27 @@ class PhaseModel:
     probability reaches it."""
 
 
-def read_phase_model(folder: str | Path, pixel_size_mm: float) -> PhaseModel:
-    """Read the two heads of a delivered phase model folder.
+def _head_path(folder: str | Path, role: str) -> Path:
+    """Path of one head in a model folder."""
+    return Path(folder) / "models" / "generic" / f"{role}_signal.json"
 
-    The gas threshold is the gas head's presence threshold in the folder's
-    ``phase_decision_policy.json``.
+
+def read_phase_model(
+    folder: str | Path, pixel_size_mm: float | None = None
+) -> PhaseModel:
+    """Read the two heads of a phase model folder.
+
+    A trained folder (:func:`write_phase_model`) gives the texture scale in mm.
+    A delivered folder gives it in pixels of the grid the model was trained on,
+    whose pixel size must then be given. The gas threshold is the gas head's
+    presence threshold in the folder's ``phase_decision_policy.json``.
 
     Parameters
     ----------
     folder : str or Path
         Model folder holding the heads in ``models/generic``.
-    pixel_size_mm : float
-        Pixel size of the grid the model was trained on; the heads give their
-        texture scale in its pixels.
+    pixel_size_mm : float, optional
+        Pixel size of the training grid of a delivered folder.
 
     Returns
     -------
@@ -158,14 +167,13 @@ def read_phase_model(folder: str | Path, pixel_size_mm: float) -> PhaseModel:
     ------
     ValueError
         If a head uses other features than :data:`PHASE_FEATURE_NAMES`, was
-        trained on other than linear RGB, or the heads use different texture
-        scales.
+        trained on other than linear RGB, the heads use different texture
+        scales, or a delivered folder is read without the pixel size.
 
     """
     heads = {}
     for role in ("co2_presence", "gas_within_co2"):
-        path = Path(folder) / "models" / "generic" / f"{role}_signal.json"
-        heads[role] = json.loads(path.read_text(encoding="utf-8"))
+        heads[role] = json.loads(_head_path(folder, role).read_text(encoding="utf-8"))
     for payload in heads.values():
         if (
             tuple(payload["feature_names"]) != PHASE_FEATURE_NAMES
@@ -178,7 +186,15 @@ def read_phase_model(folder: str | Path, pixel_size_mm: float) -> PhaseModel:
         (Path(folder) / "phase_decision_policy.json").read_text(encoding="utf-8")
     )
     gas = policy["models"]["generic"]["gas_within_co2"]
-    sigmas = {payload["texture_sigma"] for payload in heads.values()}
+    if "texture_sigma_mm" in heads["co2_presence"]:
+        key, scale = "texture_sigma_mm", 1.0
+    elif pixel_size_mm is None:
+        raise ValueError(
+            "A delivered phase model needs its training grid's pixel size."
+        )
+    else:
+        key, scale = "texture_sigma", pixel_size_mm
+    sigmas = {payload[key] for payload in heads.values()}
     if len(sigmas) != 1:
         raise ValueError("The two phase heads use different texture scales.")
     return PhaseModel(
@@ -191,9 +207,68 @@ def read_phase_model(folder: str | Path, pixel_size_mm: float) -> PhaseModel:
             )
             for role, payload in heads.items()
         },
-        texture_sigma_mm=float(sigmas.pop()) * pixel_size_mm,
+        texture_sigma_mm=float(sigmas.pop()) * scale,
         gas_threshold=float(gas["presence_threshold"]),
     )
+
+
+def write_phase_model(
+    folder: str | Path,
+    model: PhaseModel,
+    *,
+    pixel_size_mm: float,
+    co2_threshold: float,
+    cross_validation: dict[str, dict],
+) -> None:
+    """Write a trained phase model as a folder :func:`read_phase_model` reads.
+
+    Each head records the texture scale in mm and the pixel size of the grid it
+    was trained on. Beside the heads, ``phase_decision_policy.json`` holds each
+    head's decision threshold and ``cross_validation.json`` the cross-validation.
+
+    Parameters
+    ----------
+    folder : str or Path
+        New model folder.
+    model : PhaseModel
+        The two heads, their texture scale and the gas threshold.
+    pixel_size_mm : float
+        Pixel size of the training grid.
+    co2_threshold : float
+        Decision threshold of the CO2 head, tuned in training; the gas head's is
+        the model's.
+    cross_validation : dict
+        Cross-validation summary of each head, JSON serializable.
+
+    """
+    _head_path(folder, "co2_presence").parent.mkdir(parents=True)
+    for role in ("co2_presence", "gas_within_co2"):
+        head = getattr(model, role)
+        payload = {
+            "feature_names": list(PHASE_FEATURE_NAMES),
+            "feature_mean": [float(value) for value in head.feature_mean],
+            "feature_scale": [float(value) for value in head.feature_scale],
+            "coefficients": [float(value) for value in head.coefficients],
+            "intercept": float(head.intercept),
+            "texture_sigma_mm": float(model.texture_sigma_mm),
+            "training_pixel_size_mm": float(pixel_size_mm),
+            "feature_contract": {"input_color_space": _LINEAR_RGB},
+        }
+        _head_path(folder, role).write_text(json.dumps(payload, indent=1), "utf-8")
+    policy = {
+        "schema": 1,
+        "models": {
+            "generic": {
+                "co2_presence": {"presence_threshold": float(co2_threshold)},
+                "gas_within_co2": {"presence_threshold": float(model.gas_threshold)},
+            }
+        },
+    }
+    for name, document in (
+        ("phase_decision_policy.json", policy),
+        ("cross_validation.json", cross_validation),
+    ):
+        (Path(folder) / name).write_text(json.dumps(document, indent=1), "utf-8")
 
 
 def _log_ratios(rgb: np.ndarray, epsilon: np.floating) -> np.ndarray:

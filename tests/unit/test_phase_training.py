@@ -1,6 +1,7 @@
 """Unit tests for the phase-model training on synthetic labelled frames."""
 
 import dataclasses
+import json
 import tomllib
 
 import numpy as np
@@ -141,3 +142,49 @@ def test_train_phase_model_separates_the_labelled_phases():
     inner = _inner(truth, 8)
     assert all((truth[inner] == v).sum() > 100 for v in (0, 1, 2))
     np.testing.assert_array_equal(phases[inner], truth[inner])
+
+
+def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path):
+    """Samples and model are separate results; the folder needs no pixel size."""
+    darsia.write_training_samples(tmp_path / "samples.npz", _samples())
+    samples = darsia.read_training_samples(tmp_path / "samples.npz")
+    trained = darsia.train_phase_model(samples, SETTINGS)
+    darsia.write_phase_model(
+        tmp_path / "model",
+        trained.model,
+        pixel_size_mm=samples.pixel_size_mm,
+        co2_threshold=trained.co2_threshold,
+        cross_validation=trained.cross_validation,
+    )
+    model = darsia.read_phase_model(tmp_path / "model")
+    assert model.texture_sigma_mm == SETTINGS.texture_sigma_mm
+    assert model.gas_threshold == trained.model.gas_threshold
+    for head in ("co2_presence", "gas_within_co2"):
+        np.testing.assert_array_equal(
+            getattr(model, head).coefficients, getattr(trained.model, head).coefficients
+        )
+        assert getattr(model, head).intercept == getattr(trained.model, head).intercept
+    policy = json.loads((tmp_path / "model" / "phase_decision_policy.json").read_text())
+    assert policy["models"]["generic"]["co2_presence"]["presence_threshold"] == (
+        trained.co2_threshold
+    )
+
+
+def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another():
+    """On a grid of twice the pixel size the texture window keeps its width in mm,
+    and the phases 4 mm away from their boundaries are those of the training grid."""
+    training = darsia.train_phase_model(_samples(), SETTINGS)
+    current, baseline, plume, gas = _frame(7)
+    coarse = [i.reshape(60, 2, 80, 2, 3).mean(axis=(1, 3)) for i in (current, baseline)]
+    for images, pixel_size_mm in (((current, baseline), 0.5), (coarse, 1.0)):
+        invalid = images[0].copy()
+        invalid[20, 20, 1] = np.nan
+        co2, _ = darsia.phase_probabilities(
+            training.model, invalid, images[1], pixel_size_mm=pixel_size_mm
+        )
+        half_width = round(4 * SETTINGS.texture_sigma_mm / pixel_size_mm)
+        assert np.isnan(co2).sum() == (2 * half_width + 1) ** 2
+    fine = _phases(training, current, baseline, 0.5)[::2, ::2]
+    phases = _phases(training, *coarse, 1.0)
+    inner = _inner((plume.astype(int) + gas)[::2, ::2], 4)
+    np.testing.assert_array_equal(phases[inner], fine[inner])
