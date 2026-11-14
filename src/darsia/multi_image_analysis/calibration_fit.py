@@ -37,6 +37,9 @@ Every run given, fitted or not, has its anchor frame from its own frames, and
 :func:`mass_calibrations` gives each run the parameters the mass maps read;
 :func:`dilution_factor` is the dilution law both read.
 
+Leaving one run out fits the frames of all other runs and predicts the frames of
+the run left out.
+
 Every setting is a field of :class:`CalibrationFitSettings`.
 
 """
@@ -152,7 +155,8 @@ class FrameDecision:
     """"gain" or "dilution"."""
     used: bool
     reasons: tuple[str, ...]
-    """Why the frame is left out: "no_positive_dose" (no CO2 injected yet)."""
+    """Why the frame is left out: "leave_one_run_out" (its run is held out) or
+    "no_positive_dose" (no CO2 injected yet)."""
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,8 @@ class Calibration:
     """The anchor frame of each run given, fitted or not."""
     runs: tuple[str, ...]
     """The runs fitted."""
+    held_out: str | None
+    """The run left out, or None."""
     decisions: tuple[FrameDecision, ...]
     """The frames selected for a stage, used or left out."""
 
@@ -207,6 +213,26 @@ class MassCalibration:
         anchor = (self.anchor_h, self.anchor_pore_volume_m3)
         if not np.isfinite(anchor).all() or self.anchor_pore_volume_m3 <= 0:
             raise ValueError("The dilution anchor needs a positive pore volume")
+
+
+@dataclass(frozen=True)
+class Prediction:
+    """A frame's CO2 mass at a calibration."""
+
+    run: str
+    index: int
+    elapsed_h: float
+    target_h: float | None
+    mass_g: float
+    """CO2 mass."""
+    free_gas_g: float
+    """Free-gas mass."""
+    injected_g: float
+    """CO2 injected until the frame."""
+    residual: float | None
+    """Mass less the injected CO2, relative to the injected CO2; None without any."""
+    factor: float
+    """Dilution factor."""
 
 
 def dilution_factor(
@@ -288,7 +314,7 @@ def _stage(target_h, settings):
     return None
 
 
-def _selection(frames, settings):
+def _selection(frames, settings, held_out):
     """The frames of each stage and the decision on every frame of a stage."""
     stages, decisions = {"gain": [], "dilution": []}, []
     for frame in frames:
@@ -296,6 +322,8 @@ def _selection(frames, settings):
         if stage is None:
             continue
         reasons = []
+        if frame.run == held_out:
+            reasons.append("leave_one_run_out")
         if not (np.isfinite(frame.injected_g) and frame.injected_g > 0):
             reasons.append("no_positive_dose")
         if not reasons:
@@ -472,6 +500,55 @@ def _fit_dilution(residuals, settings, dtype):
     return scalar(x[0]), scalar(x[1])
 
 
+def _fit(frames, fit_runs, settings, held_out):
+    """The calibration without the held-out run, and the frames it applies to."""
+    identities = [(f.run, f.index) for f in frames]
+    if len(set(identities)) != len(identities):
+        raise ValueError("A frame of a run is given twice")
+    if held_out is not None and held_out not in fit_runs:
+        raise ValueError(f"The held-out run {held_out} is not a fit run")
+    runs = tuple(run for run in fit_runs if run != held_out)
+    fit = [f for f in frames if f.run in fit_runs]
+    dtype = next(iter(fit[0].dissolved.values())).weight.dtype
+    by_run = defaultdict(list)
+    for frame in frames:
+        by_run[frame.run].append(frame)
+    anchors = {run: _anchor(values, settings) for run, values in by_run.items()}
+    stages, decisions = _selection(fit, settings, held_out)
+    if not stages["gain"] or not stages["dilution"]:
+        raise ValueError("A stage of the calibration fit has no frames")
+    first = stages["gain"]
+    gain = _fit_gain(
+        _residuals(
+            first, _weights(first, settings, dtype, binned=False), anchors, dtype
+        ),
+        settings,
+        dtype,
+    )
+    second = stages["dilution"]
+    beta, growth = _fit_dilution(
+        _residuals(
+            second,
+            _weights(second, settings, dtype, binned=True),
+            anchors,
+            dtype,
+            gain=gain,
+        ),
+        settings,
+        dtype,
+    )
+    calibration = Calibration(
+        gain=float(gain),
+        beta=float(beta),
+        beta_growth=float(growth),
+        anchors=anchors,
+        runs=runs,
+        held_out=held_out,
+        decisions=tuple(decisions),
+    )
+    return calibration, frames
+
+
 def fit_calibration(
     frames: Sequence[CalibrationFrame],
     fit_runs: Sequence[str],
@@ -496,47 +573,87 @@ def fit_calibration(
         The calibration.
 
     """
-    identities = [(f.run, f.index) for f in frames]
-    if len(set(identities)) != len(identities):
-        raise ValueError("A frame of a run is given twice")
-    runs = tuple(fit_runs)
-    fit = [f for f in frames if f.run in fit_runs]
-    dtype = next(iter(fit[0].dissolved.values())).weight.dtype
-    by_run = defaultdict(list)
-    for frame in frames:
-        by_run[frame.run].append(frame)
-    anchors = {run: _anchor(values, settings) for run, values in by_run.items()}
-    stages, decisions = _selection(fit, settings)
-    if not stages["gain"] or not stages["dilution"]:
-        raise ValueError("A stage of the calibration fit has no frames")
-    first = stages["gain"]
-    gain = _fit_gain(
-        _residuals(
-            first, _weights(first, settings, dtype, binned=False), anchors, dtype
-        ),
-        settings,
-        dtype,
+    return _fit(frames, fit_runs, settings, None)[0]
+
+
+def _predictions(frames, calibration, run):
+    """The CO2 mass of a run's frames at a calibration, in frame order."""
+    values = sorted((f for f in frames if f.run == run), key=lambda f: f.index)
+    dtype = next(iter(values[0].dissolved.values())).weight.dtype
+    scalar = np.dtype(dtype).type
+    gain, beta, growth = (
+        scalar(calibration.gain),
+        scalar(calibration.beta),
+        scalar(calibration.beta_growth),
     )
-    second = stages["dilution"]
-    beta, growth = _fit_dilution(
-        _residuals(
-            second,
-            _weights(second, settings, dtype, binned=True),
-            anchors,
-            dtype,
-            gain=gain,
-        ),
-        settings,
-        dtype,
-    )
-    return Calibration(
-        gain=float(gain),
-        beta=float(beta),
-        beta_growth=float(growth),
-        anchors=anchors,
-        runs=runs,
-        decisions=tuple(decisions),
-    )
+    predictions = []
+    for frame in values:
+        tables = _tables(frame, gain, dtype)
+        factor = _factor(frame, calibration.anchors, beta, growth, dtype)
+        mass = _mass(tables, factor)
+        dose = tables[4]
+        predictions.append(
+            Prediction(
+                run=frame.run,
+                index=frame.index,
+                elapsed_h=frame.elapsed_h,
+                target_h=frame.target_h,
+                mass_g=float(mass),
+                free_gas_g=frame.gas.free_gas_g,
+                injected_g=frame.injected_g,
+                residual=float((mass - dose) / dose) if dose > 0 else None,
+                factor=float(factor),
+            )
+        )
+    return predictions
+
+
+def calibration_fold(
+    frames: Sequence[CalibrationFrame],
+    fit_runs: Sequence[str],
+    settings: CalibrationFitSettings,
+    held_out: str,
+) -> tuple[Calibration, list[Prediction]]:
+    """One fold of leaving one run out: the fit without a run, and its predictions.
+
+    Parameters
+    ----------
+    frames : sequence of CalibrationFrame
+        The frames of the fold, as for :func:`fit_calibration`; a run whose free
+        gas was estimated from the held-out run's overflow takes it from its next
+        donor.
+    fit_runs : sequence of str
+        The runs to fit.
+    settings : CalibrationFitSettings
+        Settings of the fit.
+    held_out : str
+        The fit run left out of the fit.
+
+    Returns
+    -------
+    tuple of Calibration and list of Prediction
+        The calibration fitted without the run, and the run's predicted frames.
+
+    """
+    calibration, frames = _fit(frames, fit_runs, settings, held_out)
+    return calibration, _predictions(frames, calibration, held_out)
+
+
+def leave_one_run_out(
+    folds: Mapping[str, Sequence[CalibrationFrame]],
+    fit_runs: Sequence[str],
+    settings: CalibrationFitSettings,
+) -> dict[str, tuple[Calibration, list[Prediction]]]:
+    """Every fold of leaving one run out (:func:`calibration_fold`).
+
+    ``folds`` holds the frames of each held-out run's fold. The folds are
+    independent of each other.
+
+    """
+    return {
+        run: calibration_fold(frames, fit_runs, settings, run)
+        for run, frames in folds.items()
+    }
 
 
 def mass_calibrations(
