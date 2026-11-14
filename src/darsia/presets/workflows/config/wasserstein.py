@@ -27,6 +27,14 @@ class WassersteinDistancesConfig:
     """ROIs to consider for Wasserstein computation."""
     times: list[tuple[float, float]] = field(default_factory=list)
     """List of times (with uncertainty) at which to compute Wasserstein distances."""
+    max_iterations: int = 20
+    """Largest number of iterations of the Wasserstein solver."""
+    distance_tolerance: float = 1e-4
+    """Relative change of the distance at which the solver stops."""
+    increment_tolerance: float = 1e-2
+    """Relative Bregman increment at which the solver stops."""
+    bregman_updates: list[int] = field(default_factory=lambda: [0, 10, 20])
+    """Iterations at which the solver updates its Bregman regularisation."""
 
     def load(
         self,
@@ -59,6 +67,25 @@ class WassersteinDistancesConfig:
         self.resize_factor = _get_key(
             data_section, "resize", required=False, type_=float
         )
+
+        # Solver settings
+        for key, type_ in (
+            ("max_iterations", int),
+            ("distance_tolerance", float),
+            ("increment_tolerance", float),
+            ("bregman_updates", list),
+        ):
+            setattr(
+                self,
+                key,
+                _get_key(
+                    data_section,
+                    key,
+                    default=getattr(self, key),
+                    required=False,
+                    type_=type_,
+                ),
+            )
 
         # Load times.
         try:

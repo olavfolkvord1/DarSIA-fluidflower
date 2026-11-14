@@ -220,11 +220,11 @@ def _compute_wasserstein_distances(
         "mobility_mode": darsia.MobilityMode.CELL_BASED,
         "l1_mode": darsia.L1Mode.RAVIART_THOMAS,  # Accuarate
         # Nonlinear solver
-        "bregman_update": lambda iter: iter in [0, 10, 20],
+        "bregman_update": lambda iter: iter in config.wasserstein.bregman_updates,
         # Performance control
-        "num_iter": 20,
-        "tol_distance": 1e-4,
-        "tol_increment": 1e-2,
+        "num_iter": config.wasserstein.max_iterations,
+        "tol_distance": config.wasserstein.distance_tolerance,
+        "tol_increment": config.wasserstein.increment_tolerance,
         # Linear solver
         "linear_solver": "direct",
         # Output
