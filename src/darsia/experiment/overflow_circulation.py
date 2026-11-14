@@ -26,7 +26,11 @@ class CirculationSettings:
     """Fewest readings a run needs."""
 
     def displaced_ml(
-        self, times_h: np.ndarray, weights_g: np.ndarray, baseline: np.ndarray
+        self,
+        times_h: np.ndarray,
+        weights_g: np.ndarray,
+        corrected_g: np.ndarray,
+        baseline: np.ndarray,
     ) -> tuple[np.ndarray | None, tuple[str, ...]]:
         """Displaced water [mL] at each reading: the weight above the baseline's mean.
 
@@ -35,7 +39,9 @@ class CirculationSettings:
         times_h : array
             Times of the readings [h since the injection start], increasing.
         weights_g : array
-            Scale weights [g].
+            Scale weights [g] as read; not read.
+        corrected_g : array
+            The weights with any evaporated water added back.
         baseline : array of bool
             The baseline readings, before the injection and within the
             baseline window.
@@ -49,4 +55,4 @@ class CirculationSettings:
         """
         if not baseline.any():
             return None, ("no baseline reading in the window",)
-        return weights_g - weights_g[baseline].mean(), ()
+        return corrected_g - corrected_g[baseline].mean(), ()

@@ -39,6 +39,9 @@ CIRCULATION = replace(
     feed=None,
     circulation=darsia.CirculationSettings(minimum_readings=30),
 )
+EVAPORATION = darsia.EvaporationSettings(
+    minimum_readings=3, rates_g_h={"run": "measured", "other": 0.5}
+)
 
 START = datetime.datetime(2000, 1, 1, 8, 0)
 
@@ -48,14 +51,15 @@ def _displaced(t):
     return np.interp(t, [0, 2, 6], [0, 200, 0])
 
 
-def _protocol(tmp_path, stop_h=11.4, circulation=False):
+def _protocol(tmp_path, stop_h=11.4, circulation=False, evaporation_g_h=0.0):
     """Scale readings every 6 minutes: displaced water on a feed or on 5 kg."""
     t = np.round(np.arange(-0.5, 14.0, 0.1), 1)
     feed = 30 + 400 * np.minimum(t, stop_h) + 0.2 * np.minimum(t, stop_h) ** 2
+    evaporated = evaporation_g_h * (t - t[0])
     rows = pd.DataFrame(
         {
             "image_time": [START + datetime.timedelta(hours=h) for h in t],
-            "weight_g": (5000.0 if circulation else feed) + _displaced(t),
+            "weight_g": (5000.0 if circulation else feed) + _displaced(t) - evaporated,
             "status": "Verified",
         }
     )
@@ -122,6 +126,63 @@ def test_a_circulation_reads_the_weight_above_the_baseline(tmp_path):
         darsia.OverflowSettings(**table, feed=SETTINGS.feed)
     with pytest.raises(ValueError, match="feed variant needs its"):
         darsia.OverflowSettings(**{**table, "variant": "feed"})
+
+
+def test_a_steady_evaporation_lies_inside_the_fitted_feed(tmp_path):
+    """Without the feed, the baseline proposes almost no rate; a rate cancels."""
+    times, weights = _protocol(tmp_path, evaporation_g_h=3.0).readings(
+        START, SETTINGS.statuses
+    )
+    volume = darsia.displaced_volume(times, weights, SETTINGS)
+    fed = times <= 11.4
+    assert np.allclose(volume.volume_ml[fed], _displaced(times[fed]), atol=1e-6)
+    proposal = darsia.proposed_evaporation(volume, EVAPORATION)
+    assert proposal.readings == 5 and abs(proposal.rate_g_h) < 1e-6
+    corrected = darsia.displaced_volume(times, weights, SETTINGS, 3.0)
+    assert np.allclose(corrected.volume_ml, volume.volume_ml, atol=1e-9)
+
+
+def test_an_evaporation_rate_leaves_the_feed_decisions_to_the_readings(tmp_path):
+    """The feed's stop, late window and checks read the weights as read."""
+    times, weights = _protocol(tmp_path).readings(START, SETTINGS.statuses)
+    feed = replace(SETTINGS.feed, maximum_pre_injection_rate_g_h=401.0)
+    tight = replace(SETTINGS, feed=feed)
+    volume = darsia.displaced_volume(times, weights, tight)
+    corrected = darsia.displaced_volume(times, weights, tight, 3.0)
+    assert volume.reasons == corrected.reasons == ()
+    assert np.allclose(corrected.volume_ml, volume.volume_ml, atol=1e-9)
+
+
+def test_a_circulation_proposes_its_evaporation_and_adds_it_back(tmp_path):
+    """The weight's fall over the baseline is the rate the approved setting adds."""
+    times, weights = _protocol(
+        tmp_path, circulation=True, evaporation_g_h=0.8
+    ).readings(START, SETTINGS.statuses)
+    volume = darsia.displaced_volume(times, weights, CIRCULATION)
+    assert volume.volume_ml[-1] == pytest.approx(-0.8 * (13.9 + 0.3))
+    proposal = darsia.proposed_evaporation(volume, EVAPORATION)
+    assert proposal.rate_g_h == pytest.approx(0.8) and proposal.sd_g_h < 1e-9
+    windowed = replace(CIRCULATION, baseline_window_h=0.35)
+    windowed = darsia.displaced_volume(times, weights, windowed)
+    assert darsia.proposed_evaporation(windowed, EVAPORATION).readings == 3
+
+    # Without the table, or for a run it does not list, nothing is corrected.
+    assert darsia.approved_evaporation("run", proposal, CIRCULATION.evaporation) is None
+    assert darsia.approved_evaporation("third", proposal, EVAPORATION) is None
+    assert darsia.approved_evaporation("other", proposal, EVAPORATION) == 0.5
+    with pytest.raises(ValueError, match="No evaporation rate"):
+        darsia.approved_evaporation("run", None, EVAPORATION)
+    rate = darsia.approved_evaporation("run", proposal, EVAPORATION)
+    corrected = darsia.displaced_volume(times, weights, CIRCULATION, rate)
+    assert np.allclose(corrected.volume_ml, _displaced(times), atol=1e-9)
+
+    # Minus the slope with its standard error: residuals 1/6, -1/3, 1/6.
+    t, v = np.array([-3.0, -2, -1, 1]), np.array([0.0, -1, -1, 5])
+    line = darsia.proposed_evaporation(
+        darsia.DisplacedVolume(t, v, (), t < 0), EVAPORATION
+    )
+    assert line.readings == 3 and line.rate_g_h == pytest.approx(0.5)
+    assert line.sd_g_h == pytest.approx(np.sqrt(1 / 12))
 
 
 def _run(volume, offset_bar=0.0, sand_map="map", alkalinity=0.01, cover=(-1.0, 18.0)):

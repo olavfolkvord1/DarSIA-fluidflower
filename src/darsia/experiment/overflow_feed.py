@@ -11,7 +11,9 @@ from ``late_window_h[0]`` to ``late_window_h[1]`` before that stop, the weight
 is the feed alone. The feed starts from the reference reading, the last before
 the injection, with a rate and a constant change of rate fitted over the late
 window. A steady evaporation lowers the weight as a slower feed would, so it
-lies inside the fitted rate.
+lies inside the fitted rate. The stop, the late window and the checks read the
+weights as read; the fit reads them with any evaporated water added back, where
+a steady rate cancels exactly.
 
 Every setting is a field of :class:`FeedSettings`.
 
@@ -51,7 +53,11 @@ class FeedSettings:
     """Readings before the injection must rise slower than this."""
 
     def displaced_ml(
-        self, times_h: np.ndarray, weights_g: np.ndarray, baseline: np.ndarray
+        self,
+        times_h: np.ndarray,
+        weights_g: np.ndarray,
+        corrected_g: np.ndarray,
+        baseline: np.ndarray,
     ) -> tuple[np.ndarray, tuple[str, ...]]:
         """Displaced water [mL] at each reading: the weight above the feed.
 
@@ -66,7 +72,11 @@ class FeedSettings:
         times_h : array
             Times of the readings [h since the injection start], increasing.
         weights_g : array
-            Scale weights [g].
+            Scale weights [g] as read; the stop, the late window and the checks
+            read them.
+        corrected_g : array
+            The weights with any evaporated water added back; the fit reads
+            them.
         baseline : array of bool
             The baseline readings. Not read: the feed counts from the last
             reading before the injection and checks all readings before it,
@@ -79,7 +89,7 @@ class FeedSettings:
             empty when they are.
 
         """
-        t, w = times_h, weights_g
+        t, w, c = times_h, weights_g, corrected_g
         pre = t < 0
         reference = np.flatnonzero(pre)[-1]
         stop = t[-1]
@@ -94,9 +104,9 @@ class FeedSettings:
 
         dt = t - t[reference]
         (rate, drift), *_ = np.linalg.lstsq(
-            np.c_[dt[late], 0.5 * dt[late] ** 2], w[late] - w[reference], rcond=None
+            np.c_[dt[late], 0.5 * dt[late] ** 2], c[late] - c[reference], rcond=None
         )
-        volume = w - (w[reference] + rate * dt + 0.5 * drift * dt**2)
+        volume = c - (c[reference] + rate * dt + 0.5 * drift * dt**2)
 
         reasons = []
         if stop < self.minimum_supply_h:
