@@ -49,6 +49,7 @@ MODULES = [
     "darsia/presets/workflows/comparison/comparison_events.py",
     "darsia/presets/workflows/comparison/ensemble.py",
     "darsia/presets/workflows/comparison/ensemble_figures.py",
+    "darsia/presets/workflows/comparison/mass_wasserstein.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
