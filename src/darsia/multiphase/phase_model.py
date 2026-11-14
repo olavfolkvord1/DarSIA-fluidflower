@@ -219,12 +219,16 @@ def write_phase_model(
     pixel_size_mm: float,
     co2_threshold: float,
     cross_validation: dict[str, dict],
+    canvas: dict | None,
+    accepted_canvases: tuple[dict | None, ...],
 ) -> None:
     """Write a trained phase model as a folder :func:`read_phase_model` reads.
 
     Each head records the texture scale in mm and the pixel size of the grid it
     was trained on. Beside the heads, ``phase_decision_policy.json`` holds each
-    head's decision threshold and ``cross_validation.json`` the cross-validation.
+    head's decision threshold, ``cross_validation.json`` the cross-validation
+    and ``canvas.json`` the canvas the model was trained on, with the canvases
+    of label sets the training accepted explicitly.
 
     Parameters
     ----------
@@ -239,6 +243,11 @@ def write_phase_model(
         the model's.
     cross_validation : dict
         Cross-validation summary of each head, JSON serializable.
+    canvas : dict or None
+        Canvas of the training samples (``TrainingSamples.canvas``).
+    accepted_canvases : tuple
+        Canvases of the label sets accepted although they differ
+        (``TrainingSamples.accepted_canvases``).
 
     """
     _head_path(folder, "co2_presence").parent.mkdir(parents=True)
@@ -264,9 +273,11 @@ def write_phase_model(
             }
         },
     }
+    canvases = {"canvas": canvas, "accepted_label_canvases": list(accepted_canvases)}
     for name, document in (
         ("phase_decision_policy.json", policy),
         ("cross_validation.json", cross_validation),
+        ("canvas.json", canvases),
     ):
         (Path(folder) / name).write_text(json.dumps(document, indent=1), "utf-8")
 

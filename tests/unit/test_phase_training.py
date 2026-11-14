@@ -5,9 +5,12 @@ import json
 import tomllib
 
 import numpy as np
+import pytest
 from scipy.ndimage import binary_erosion
 
 import darsia
+from darsia.presets.workflows.config.corrections import CorrectionsConfig
+from darsia.presets.workflows.rig import Rig
 
 SETTINGS = darsia.PhaseTrainingSettings(
     **tomllib.loads(
@@ -40,6 +43,41 @@ BOXES = {
     "mixed_gas_aqueous": np.s_[60:80, 60:100],
 }
 """Labelled boxes of each run's frame, on the 0.5 mm grid."""
+BULGE = (
+    "[corrections.curvature.bulge]\nhorizontal_bulge = {}\nvertical_bulge = 0.0\n"
+    "horizontal_center_offset = 0\nvertical_center_offset = 0\n"
+)
+"""A curvature correction's bulge, with its horizontal bulge to be given."""
+
+
+def _rig_canvas(folder, settings=""):
+    """Canvas of a rig that maps its photographs onto a grid of 120 x 160 pixels
+    and 0.06 x 0.08 m, with further correction settings."""
+    folder.mkdir()
+    rows, cols = np.mgrid[0:120, 0:160].astype(np.float32)
+    darsia.ImageMappingCorrection(
+        cols, rows, source_shape=(120, 160), dimensions=[0.06, 0.08]
+    ).save(folder / "grid.npz")
+    darsia.OpticalImage(np.full((120, 160, 3), 0.3), color_space="RGB").save(
+        folder / "baseline.npz"
+    )
+    (folder / "config.toml").write_text(
+        f'[corrections.mapping]\npath = "{(folder / "grid.npz").as_posix()}"\n'
+        + settings
+    )
+    rig = Rig()
+    rig.setup_reading(
+        folder / "baseline.npz",
+        experiment=None,
+        corrections_config=CorrectionsConfig().load(folder / "config.toml"),
+    )
+    return rig.canvas
+
+
+@pytest.fixture(scope="module")
+def canvas(tmp_path_factory):
+    """Canvas of the rig whose frames are labelled."""
+    return _rig_canvas(tmp_path_factory.mktemp("canvas") / "rig")
 
 
 def _frame(seed, shape=(120, 160)):
@@ -55,8 +93,8 @@ def _frame(seed, shape=(120, 160)):
     return current, baseline, plume, gas
 
 
-def _samples(runs=("a", "b", "c")):
-    """Joined training samples of one labelled frame per run."""
+def _samples(canvas, runs=("a", "b", "c")):
+    """Joined training samples of one labelled frame per run, on the canvas."""
     parts = []
     for seed, run in enumerate(runs):
         current, baseline, _, _ = _frame(seed)
@@ -69,10 +107,10 @@ def _samples(runs=("a", "b", "c")):
                 current.astype(np.float32),
                 baseline.astype(np.float32),
                 None,
-                regions,
-                masks,
+                darsia.LabelSet(regions, masks, canvas),
                 settings=SETTINGS,
                 pixel_size_mm=PIXEL_MM,
+                canvas=canvas,
             )
         )
     return darsia.join_samples(parts)
@@ -94,7 +132,7 @@ def _inner(phases, margin):
     )
 
 
-def test_frame_samples_take_supported_pixels_of_each_region():
+def test_frame_samples_take_supported_pixels_of_each_region(canvas):
     """A region gives its supported pixels, at most the set number, chosen by name."""
     current, baseline, _, _ = _frame(0)
     current[40, 40, 0] = np.nan
@@ -105,14 +143,12 @@ def test_frame_samples_take_supported_pixels_of_each_region():
     masks[2][60:80, 60:80] = True  # 400 pixels
     masks[3][60:80, 60:80] = True
     regions = [darsia.LabelledRegion(f"r{i}", "a", "water", 1.0) for i in range(4)]
-    samples = darsia.frame_samples(
-        current, baseline, None, regions, masks, settings=settings, pixel_size_mm=0.5
-    )
+    labels = darsia.LabelSet(regions, masks, canvas)
+    options = {"settings": settings, "pixel_size_mm": 0.5, "canvas": canvas}
+    samples = darsia.frame_samples(current, baseline, None, labels, **options)
     assert [region.name for region in samples.regions] == ["r1", "r2", "r3"]
     assert np.bincount(samples.owners).tolist() == [25, 50, 50]
-    again = darsia.frame_samples(
-        current, baseline, None, regions, masks, settings=settings, pixel_size_mm=0.5
-    )
+    again = darsia.frame_samples(current, baseline, None, labels, **options)
     np.testing.assert_array_equal(samples.features, again.features)
     assert not np.array_equal(samples.features[25:75], samples.features[75:])
     # A sample is the row of its pixel in the features of the whole frame.
@@ -125,10 +161,10 @@ def test_frame_samples_take_supported_pixels_of_each_region():
     )
 
 
-def test_train_phase_model_separates_the_labelled_phases():
+def test_train_phase_model_separates_the_labelled_phases(canvas):
     """Water, aqueous CO2 and free gas of a new frame are classified 4 mm away
     from their boundaries, in the dtype of the samples."""
-    training = darsia.train_phase_model(_samples(), SETTINGS)
+    training = darsia.train_phase_model(_samples(canvas), SETTINGS)
     assert training.model.co2_presence.coefficients.dtype == np.float32
     for head in ("co2_presence", "gas_within_co2"):
         summary = training.cross_validation[head]
@@ -144,9 +180,10 @@ def test_train_phase_model_separates_the_labelled_phases():
     np.testing.assert_array_equal(phases[inner], truth[inner])
 
 
-def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path):
-    """Samples and model are separate results; the folder needs no pixel size."""
-    darsia.write_training_samples(tmp_path / "samples.npz", _samples())
+def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path, canvas):
+    """Samples and model are separate results; the folder needs no pixel size and
+    records the canvas."""
+    darsia.write_training_samples(tmp_path / "samples.npz", _samples(canvas))
     samples = darsia.read_training_samples(tmp_path / "samples.npz")
     trained = darsia.train_phase_model(samples, SETTINGS)
     darsia.write_phase_model(
@@ -155,6 +192,8 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path):
         pixel_size_mm=samples.pixel_size_mm,
         co2_threshold=trained.co2_threshold,
         cross_validation=trained.cross_validation,
+        canvas=samples.canvas,
+        accepted_canvases=samples.accepted_canvases,
     )
     model = darsia.read_phase_model(tmp_path / "model")
     assert model.texture_sigma_mm == SETTINGS.texture_sigma_mm
@@ -168,12 +207,14 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path):
     assert policy["models"]["generic"]["co2_presence"]["presence_threshold"] == (
         trained.co2_threshold
     )
+    canvases = json.loads((tmp_path / "model" / "canvas.json").read_text())
+    assert canvases == {"canvas": canvas, "accepted_label_canvases": []}
 
 
-def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another():
+def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another(canvas):
     """On a grid of twice the pixel size the texture window keeps its width in mm,
     and the phases 4 mm away from their boundaries are those of the training grid."""
-    training = darsia.train_phase_model(_samples(), SETTINGS)
+    training = darsia.train_phase_model(_samples(canvas), SETTINGS)
     current, baseline, plume, gas = _frame(7)
     coarse = [i.reshape(60, 2, 80, 2, 3).mean(axis=(1, 3)) for i in (current, baseline)]
     for images, pixel_size_mm in (((current, baseline), 0.5), (coarse, 1.0)):
@@ -188,3 +229,41 @@ def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another():
     phases = _phases(training, *coarse, 1.0)
     inner = _inner((plume.astype(int) + gas)[::2, ::2], 4)
     np.testing.assert_array_equal(phases[inner], fine[inner])
+
+
+def test_labels_on_another_canvas_are_sampled_only_by_explicit_choice(tmp_path):
+    """A changed curvature parameter is named and refused, and so is a label set
+    without a canvas; accepting them is recorded with the samples."""
+    rig, drawn = (
+        _rig_canvas(tmp_path / name, BULGE.format(bulge))
+        for name, bulge in (("rig", 1e-7), ("drawn", 2e-7))
+    )
+    current, baseline, _, _ = _frame(0)
+    mask = np.zeros(current.shape[:2], bool)
+    mask[BOXES["water"]] = True
+    regions = [darsia.LabelledRegion("a:water", "a", "water", 1.0)]
+
+    def sample(labels_canvas, accept=False):
+        """Samples of the water box drawn on a canvas, from the rig's images."""
+        return darsia.frame_samples(
+            current,
+            baseline,
+            None,
+            darsia.LabelSet(regions, [mask], labels_canvas),
+            settings=SETTINGS,
+            pixel_size_mm=PIXEL_MM,
+            canvas=rig,
+            accept_canvas=accept,
+        )
+
+    bulge = r"settings: corrections\.curvature\.bulge\.horizontal_bulge\. "
+    with pytest.raises(ValueError, match=bulge):
+        sample(drawn)
+    with pytest.raises(ValueError, match=r"settings: canvas\. "):
+        sample(None)
+    parts = [sample(rig), sample(drawn, accept=True), sample(None, accept=True)]
+    darsia.write_training_samples(tmp_path / "samples.npz", darsia.join_samples(parts))
+    samples = darsia.read_training_samples(tmp_path / "samples.npz")
+    assert parts[0].accepted_canvases == ()
+    assert samples.canvas == rig
+    assert samples.accepted_canvases == (drawn, None)
