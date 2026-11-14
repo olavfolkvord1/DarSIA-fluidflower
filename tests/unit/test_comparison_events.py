@@ -15,10 +15,12 @@ from darsia.presets.workflows.comparison.comparison_events import (
     EventQuestion,
     event_table,
     injection_answers,
+    integrated_events,
     question_states,
     run_answer,
     write_events,
 )
+from darsia.presets.workflows.config.multi_fluidflower_config import EventConfig
 
 QUESTIONS = {
     row["name"]: EventQuestion(**row)
@@ -245,3 +247,36 @@ def test_answers_per_injection_count_from_each_start(tmp_path):
         ("injection", "2", "run-2"),
         ("injection", "3", ""),
     ]
+
+
+def test_the_official_events_are_unchanged():
+    """The official events of an integrated-mass table are the first times their
+    region's mass reaches the relative threshold of the largest injected mass."""
+    rng = np.random.default_rng(3)
+    table = pd.DataFrame(
+        {
+            "time": np.arange(12) * 0.25,
+            "exact_mass": np.linspace(0, 2.0, 12),
+            "box_a_detected_mass": np.cumsum(rng.uniform(0, 0.2, 12)),
+            "box_a_detected_mass_g": rng.uniform(0, 0.1, 12),
+            "box_a_detected_mass_aq": np.full(12, np.nan),
+        }
+    ).sample(frac=1, random_state=1)
+    events = [
+        EventConfig().load(key, dict(mode=mode, roi_name="box_a", relative_threshold=t))
+        for key, mode, t in (
+            ("a", "mass", 0.3),
+            ("b", "mass_g", 0.04),
+            ("c", "mass_aq", 0.01),
+            ("d", "mass", 9.0),
+        )
+    ]
+    found = integrated_events(table, events)
+
+    for event in events:
+        key = f"box_a_detected_{event.mode}"
+        mass = table[key] >= event.relative_threshold * np.max(table["exact_mass"])
+        official = np.min(table["time"][mass])
+        assert found[event.event_id] == (None if np.isnan(official) else official)
+    assert found["a"] is not None and found["c"] is None and found["d"] is None
+    assert integrated_events(table.assign(exact_mass=np.nan), events[:1]) == {"a": None}

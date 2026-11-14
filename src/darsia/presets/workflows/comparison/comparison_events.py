@@ -33,7 +33,9 @@ injection starts is answered at its first frame. :func:`event_table` gives both
 for every question and run, as the rows :func:`write_events` writes.
 
 The answers read the masses per domain of a run's frames (:class:`RunSeries`); no
-map is read.
+map is read. The official comparison's events (:func:`comparison_events`) are
+questions of one condition: the mass of a region reaches a fraction of the run's
+largest injected mass.
 
 """
 
@@ -52,6 +54,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from darsia.presets.workflows.analysis.domain_mass import RunSeries
 from darsia.presets.workflows.analysis.domains import COMPONENTS, write_rows
 from darsia.presets.workflows.config.multi_fluidflower_config import (
+    EventConfig,
     MultiFluidFlowerConfig,
 )
 from darsia.presets.workflows.config.sections import required_sections
@@ -75,6 +78,9 @@ COLUMNS = (
 )
 """Columns of the event table: a row per question, run and, per injection, injection."""
 _TRUE, _UNKNOWN, _FALSE = 1.0, 0.5, 0.0
+_OFFICIAL_MODES = {field: component for component, field in COMPONENTS.items()}
+"""The official events' modes, the fields of the mass maps, and the component each
+reads."""
 
 
 @dataclass(frozen=True)
@@ -398,12 +404,69 @@ def write_events(path: Path, rows: Iterable[dict]) -> None:
     write_rows(path, rows, COLUMNS)
 
 
+def integrated_events(
+    table: pd.DataFrame, events: Iterable[EventConfig]
+) -> dict[str, float | None]:
+    """The official events of one run's table of integrated masses.
+
+    Parameters
+    ----------
+    table : pd.DataFrame
+        The run's ``integrated_mass.csv``: a ``time`` column, the detected masses
+        of each region of interest (``<roi>_detected_mass``, ``_mass_g`` and
+        ``_mass_aq``) and an ``exact_mass`` column of the injected mass.
+    events : iterable of EventConfig
+        The events of the comparison's configuration.
+
+    Returns
+    -------
+    dict
+        Per event its first time where the detected mass of its region reaches its
+        relative threshold of the largest injected mass (of 1 g without an exact
+        mass column); None where it never does.
+
+    """
+    table = table.sort_values("time", kind="stable")
+    exact = [column for column in table.columns if "exact_mass" in column]
+    total = np.max(table[exact[0]]) if exact else 1.0
+    found = {}
+    for event in events:
+        if event.mode not in _OFFICIAL_MODES:
+            raise NotImplementedError(f"Event type {event.mode} not implemented.")
+        key = f"{event.roi_name}_detected_{event.mode}"
+        assert key in table.columns, f"Key {key} not found in mass results."
+        component = _OFFICIAL_MODES[event.mode]
+        series = RunSeries(
+            run="",
+            case_ids=tuple(map(str, table.index)),
+            elapsed_h=table["time"].to_numpy(np.float64),
+            injected_g=np.full(len(table), np.nan),
+            masses={event.roi_name: {component: table[key].to_numpy(np.float64)}},
+        )
+        threshold = event.relative_threshold * total
+        if np.isnan(threshold):  # no injected mass: the event's time is not known
+            found[event.event_id] = None
+            continue
+        condition = EventCondition(component, "reaches", event.roi_name, threshold, "g")
+        question = EventQuestion(event.event_id, (condition,))
+        found[event.event_id] = run_answer(question, series).elapsed_h
+    return found
+
+
 @required_sections("events")
 def comparison_events(
     path: Path,
 ):
-    # ! ---- LOAD CONFIG FOR COMPARISON OF RUNS ----
+    """Write the official comparison's events of each run (:func:`integrated_events`).
 
+    Parameters
+    ----------
+    path : Path
+        The comparison's configuration; its results are each run's
+        ``sparse_data/integrated_mass.csv``, and the events are written to the
+        events path, a row per run.
+
+    """
     # This script does not depend on raw data, only results
     config = MultiFluidFlowerConfig(path, require_results=True)
 
@@ -414,55 +477,13 @@ def comparison_events(
     # Prepare data frame to store results
     events = pd.DataFrame(columns=["run"] + list(config.events.events.keys()))
 
-    # Prepare overall data frame file
     for run, run_config in config.runs.config.items():
-        # Safety checks
         assert run_config.data is not None
-
-        # Loop over events
-        for event in config.events.events.values():
-            if event.mode in ["mass", "mass_g", "mass_aq"]:
-                # Fetch mass analysis results
-                mass_path = (
-                    run_config.data.results / "sparse_data" / "integrated_mass.csv"
-                )
-                mass_df = pd.read_csv(mass_path)
-                times = mass_df["time"]
-                # Find a column with "exact_mass" to get total injected mass
-                exact_mass_cols = [
-                    col for col in mass_df.columns if "exact_mass" in col
-                ]
-                if exact_mass_cols:
-                    total_mass = np.max(mass_df[exact_mass_cols[0]])
-                else:
-                    total_mass = 1.0  # fallback if no exact mass column found
-
-                # Fetch detected mass for the event's ROI
-                if event.mode == "mass":
-                    key = f"{event.roi_name}_detected_mass"
-                elif event.mode == "mass_g":
-                    key = f"{event.roi_name}_detected_mass_g"
-                elif event.mode == "mass_aq":
-                    key = f"{event.roi_name}_detected_mass_aq"
-                columns = mass_df.columns
-                assert key in columns, f"Key {key} not found in mass results."
-                detected_mass = mass_df[key]
-
-                # Determine event time based on relative threshold
-                all_event_times = times[
-                    detected_mass >= event.relative_threshold * total_mass
-                ]
-                earliest_event_time = np.min(all_event_times)
-                events.at[run, event.event_id] = earliest_event_time
-
-                print(detected_mass)
-
-            else:
-                raise NotImplementedError(f"Event type {event.mode} not implemented.")
-            logger.info(
-                f"""Event {event.event_id} for run {run} occurred at time """
-                f"""{events.at[run, event.event_id]}."""
-            )
+        mass_path = run_config.data.results / "sparse_data" / "integrated_mass.csv"
+        times = integrated_events(pd.read_csv(mass_path), config.events.events.values())
+        for event_id, time in times.items():
+            events.at[run, event_id] = np.nan if time is None else time
+            logger.info(f"Event {event_id} for run {run} occurred at time {time}.")
 
     # Store to file.
     events.to_csv(config.events.path)
