@@ -1,6 +1,7 @@
 """Configuration for corrections."""
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Type
 
@@ -1632,6 +1633,20 @@ _CORRECTION_CLASSES: dict[str, type] = {
 }
 
 
+def _set_settings(items: list[tuple[str, Any]]) -> dict:
+    """Settings of a configuration class, without unset and inactive parts."""
+    return {
+        key: value for key, value in items if value is not None and key != "inactive"
+    }
+
+
+def _plain_setting(value: Any) -> str:
+    """A path as its file name, a floating type as its name."""
+    if isinstance(value, Path):
+        return value.name
+    return np.dtype(value).name
+
+
 @dataclass
 class CorrectionsConfig:
     """Configuration for image corrections.
@@ -1767,6 +1782,23 @@ class CorrectionsConfig:
     def get_parsed(self, name: str) -> Any | None:
         """Return the parsed sub-config for `name`, active or not (GUI use)."""
         return getattr(self, name, None) or self.inactive.get(name)
+
+    def plain_settings(self) -> dict:
+        """The active corrections as plain settings, named as in the configuration.
+
+        Unset settings and inactive corrections are left out, and a floating type
+        is given by its name. A setting that names a file gives the file's name
+        only: the name identifies the file, while its folder only says where the
+        project lies, so a moved project keeps its settings. The rig records
+        these settings in its canvas.
+
+        Returns
+        -------
+        dict
+            Settings per active correction, of JSON types.
+        """
+        settings = asdict(self, dict_factory=_set_settings)
+        return json.loads(json.dumps(settings, default=_plain_setting))
 
     def load(
         self,

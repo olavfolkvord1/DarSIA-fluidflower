@@ -114,8 +114,8 @@ class RegionWeight:
 class WassersteinReference:
     """The comparison cells and the reference's weights, once per comparison."""
 
-    grid: tuple
-    """Shape, dimensions and origin of the grid every compared run shares."""
+    grid: dict
+    """The grid every compared run shares (:func:`darsia.grid_record`)."""
     cells: darsia.MetricCells
     """The comparison cells (:func:`darsia.metric_cells`)."""
     dimensions: list[float]
@@ -367,22 +367,13 @@ def wasserstein_reference(
     left, top = (float(value) for value in sand_map.origin)
     bottom = top - float(sand_map.dimensions[0])
     return WassersteinReference(
-        grid=_canvas(sand_map),
+        grid=darsia.grid_record(sand_map),
         cells=cells,
         dimensions=list(cells.dimensions),
         origin=[left, bottom + cells.dimensions[0]],
         sand_labels=tuple(int(label) for label in sand_labels),
         domains={domain.domain_id: domain for domain in domains},
         weights=weights,
-    )
-
-
-def _canvas(image: darsia.Image) -> tuple:
-    """Shape, dimensions and origin of an image's grid."""
-    return (
-        tuple(image.img.shape[:2]),
-        tuple(float(value) for value in image.dimensions),
-        tuple(float(value) for value in image.origin),
     )
 
 
@@ -498,7 +489,7 @@ def frame_cells(
         The frame's mass in each region, by its domain identity.
 
     """
-    if _canvas(sand_map) != reference.grid:
+    if darsia.grid_record(sand_map) != reference.grid:
         raise ValueError("A compared run is not on the reference's grid")
     mass = maps.mass.img
     known = darsia.known_mass(maps, labels)["mass_total"]

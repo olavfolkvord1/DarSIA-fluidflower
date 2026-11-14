@@ -173,6 +173,9 @@ class Rig:
         )
         self.baseline = self.shape_corrected_baseline.copy()
 
+        self.canvas = self._canvas(baseline_path, corrections_config)
+        """Canvas of the corrected images, which label sets and phase models record."""
+
         # Plot corrected baseline - show and/or log.
         plt.figure("Corrected baseline")
         plt.imshow(self.baseline.img)
@@ -187,6 +190,55 @@ class Rig:
         plt.close()
 
         logger.info("Reading setup completed.")
+
+    def _canvas(
+        self, baseline_path: Path, corrections_config: CorrectionsConfig | None
+    ) -> dict:
+        """The canvas of the corrected images, as a record of plain settings.
+
+        Labels are drawn on this canvas and phase models are trained on it. The
+        record has three parts:
+
+        - ``source``: the file format of the photographs;
+        - ``corrections``: the active corrections as plain settings, e.g. the
+          precision, the mapping and the curvature correction, and so the
+          decode of raw photographs or a lens model where the configuration
+          holds them;
+        - ``grid``: the shape, the physical dimensions (m) and the origin of the
+          corrected images in rig coordinates (:func:`darsia.grid_record`), and
+          under ``extent`` the dimensions and origin of the canvas before the
+          scaling onto whole metric cells extends it, which do not depend on the
+          resolution. It is None unless the corrections place the images in
+          metres: the curvature correction's crop in metres, or, without a crop,
+          the mapping onto its metric grid. Camera frames and a crop in pixels
+          have no grid.
+
+        The run's optical area factor is left out: it scales areas, not label pixels.
+
+        """
+        config = corrections_config or CorrectionsConfig()
+        # The crop follows the mapping and gives the images the size it states.
+        crop = config.curvature.crop if config.curvature else None
+        metres = crop.in_meters if crop else config.mapping is not None
+        grid = None
+        if metres:
+            grid = darsia.grid_record(self.shape_corrected_baseline)
+            extent = {"dimensions": grid["dimensions"], "origin": grid["origin"]}
+            for scaling in self.shape_corrections:
+                if isinstance(scaling, darsia.MetricScalingCorrection):
+                    # The canvas the scaling keeps, before whole cells extend it.
+                    extent = {
+                        "dimensions": list(scaling.native_dimensions),
+                        "origin": list(scaling.native_origin),
+                    }
+            grid["extent"] = extent
+        corrections = config.plain_settings()
+        corrections.get("grid", {}).pop("area_factor", None)
+        return {
+            "source": {"format": baseline_path.suffix.lstrip(".").upper()},
+            "corrections": corrections,
+            "grid": grid,
+        }
 
     def load_corrections(
         self,
@@ -1230,6 +1282,7 @@ class Rig:
         # TODO: Needed for what?
         meta_data = {
             "baseline_path": str(self.baseline_path),
+            "canvas": getattr(self, "canvas", None),
         }
         if getattr(self, "raw_decoding", {}):
             meta_data["raw_decoding"] = self.raw_decoding
@@ -1331,6 +1384,8 @@ class Rig:
             meta_data = json.load(f)
         rig.baseline_path = Path(meta_data["baseline_path"])
         rig.raw_decoding = meta_data.get("raw_decoding", {})
+        # A rig saved without a canvas has an unknown canvas.
+        rig.canvas = meta_data.get("canvas")
 
         # Load data for reading images
         with darsia.timed("baseline"):
