@@ -283,6 +283,75 @@ def test_rig_maps_baseline_and_reloads_the_mapping(tmp_path):
         darsia.imread(tmp_path / "rig" / "baseline.npz", transformations=corrections)
 
 
+@pytest.mark.parametrize(
+    "grid, factor, dtype",
+    [
+        ("", 1, np.float64),
+        (
+            '[corrections.grid]\nprecision = "float32"\npixel_size_mm = 300.0\n'
+            "area_factor = 1.25\n",
+            3,
+            np.float32,
+        ),
+    ],
+)
+def test_run_grid_sets_precision_and_scales_once(tmp_path, grid, factor, dtype):
+    """Without a grid nothing changes. With one, the images are converted first
+    and averaged once over the grid's cells, the facies take each cell's
+    majority, each cell's area sums its pixels' measured areas, and the saved
+    corrections give the same baseline."""
+    i, j = np.mgrid[0:6, 0:9].astype(np.float32)
+    mapping = darsia.ImageMappingCorrection(
+        j, i, source_shape=(7, 10), dimensions=[0.6, 0.9]
+    )
+    mapping.save(tmp_path / "mapping.npz")
+    source = np.random.default_rng(0).random((7, 10, 3))
+    darsia.OpticalImage(source, color_space="RGB").save(tmp_path / "baseline.npz")
+    facies = np.ones((6, 9), int)
+    facies[0::3, 0::3] = facies[1::3, 1::3] = 2
+    darsia.ScalarImage(facies, dimensions=[0.6, 0.9]).save(tmp_path / "facies.npz")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[corrections.mapping]\npath = "{(tmp_path / "mapping.npz").as_posix()}"\n'
+        + grid
+    )
+
+    rig = Rig()
+    rig.setup_reading(
+        tmp_path / "baseline.npz",
+        experiment=None,
+        corrections_config=CorrectionsConfig().load(config_path),
+    )
+    rig.setup_facies(tmp_path / "facies.npz", apply_corrections=True)
+    rig.baseline_path = tmp_path / "baseline.npz"
+    rig.color_corrections = []
+    with pytest.warns(UserWarning):
+        rig.save(tmp_path / "rig")
+    loaded = Rig()
+    loaded.load_corrections(tmp_path / "rig")
+    reread = darsia.imread(
+        tmp_path / "baseline.npz", transformations=loaded.corrections
+    )
+
+    rows, cols = 6 // factor, 9 // factor
+    blocks = source[:6, :9].astype(dtype).reshape(rows, factor, cols, factor, 3)
+    assert rig.baseline.img.dtype == dtype
+    assert rig.baseline.dimensions == [0.6, 0.9]
+    np.testing.assert_allclose(rig.baseline.img, blocks.mean(axis=(1, 3)), rtol=1e-6)
+    np.testing.assert_array_equal(
+        rig.facies.img, facies if factor == 1 else np.ones((2, 3))
+    )
+    np.testing.assert_array_equal(reread.img, rig.baseline.img)
+    if grid:
+        # Nine pixels of 0.1 m x 0.1 m per cell, at the optical area factor.
+        assert rig.pixel_area.img.dtype == dtype
+        np.testing.assert_allclose(rig.pixel_area.img, np.full((2, 3), 0.1125))
+        saved = darsia.imread(tmp_path / "rig" / "pixel_area.npz")
+        np.testing.assert_array_equal(saved.img, rig.pixel_area.img)
+    else:
+        assert rig.pixel_area is None
+
+
 FIT = (
     "[corrections.material_illumination.fit]\n"
     "spatial_ridge = 0.002\noffset_ridge = 0.02\nresidual_constant_ridge = 0.02\n"
@@ -375,3 +444,34 @@ def test_official_and_material_illumination_give_one_form(monkeypatch, tmp_path)
     np.testing.assert_allclose(
         official_rig.baseline.img, material_rig.baseline.img, rtol=1e-12
     )
+
+
+def test_a_rig_saved_again_without_a_grid_has_no_pixel_areas(tmp_path):
+    """Saving without pixel areas leaves none of an earlier save in the folder."""
+    i, j = np.mgrid[0:6, 0:9].astype(np.float32)
+    darsia.ImageMappingCorrection(
+        j, i, source_shape=(7, 10), dimensions=[0.6, 0.9]
+    ).save(tmp_path / "mapping.npz")
+    darsia.OpticalImage(np.ones((7, 10, 3)), color_space="RGB").save(
+        tmp_path / "baseline.npz"
+    )
+    mapping = (
+        f'[corrections.mapping]\npath = "{(tmp_path / "mapping.npz").as_posix()}"\n'
+    )
+    grid = '[corrections.grid]\nprecision = "float64"\narea_factor = 1.25\n'
+    for text in (mapping + grid, mapping):
+        (tmp_path / "config.toml").write_text(text)
+        rig = Rig()
+        rig.setup_reading(
+            tmp_path / "baseline.npz",
+            experiment=None,
+            corrections_config=CorrectionsConfig().load(tmp_path / "config.toml"),
+        )
+        rig.baseline_path = tmp_path / "baseline.npz"
+        rig.color_corrections = []
+        with pytest.warns(UserWarning):
+            rig.save(tmp_path / "rig")
+
+    loaded = Rig()
+    loaded.load_corrections(tmp_path / "rig")
+    assert loaded.pixel_area is None
