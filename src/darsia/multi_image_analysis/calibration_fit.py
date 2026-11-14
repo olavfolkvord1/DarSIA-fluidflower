@@ -1,0 +1,564 @@
+"""Calibration fit across runs: the gain of the dissolved CO2's signal and its dilution.
+
+The run statistics give, per frame and sand, a histogram of the relative signal of
+the dissolved CO2 (its signal on the concentration curve's range, from no
+dissolved CO2 to saturation) with each interval's capacity for dissolved CO2
+(:mod:`darsia.multi_image_analysis.run_statistics`); the gas statistics give the
+frame's free gas, the water in its gas and its CO2 pore volume
+(:mod:`darsia.multi_image_analysis.gas_statistics`). At a gain g and a dilution
+factor f, a frame holds the CO2 mass
+
+    f * sum over intervals of capacity * min(1, g * relative signal)
+    + free gas + gas water [+ f * column estimate],
+
+and its residual is that mass less the CO2 injected until the frame, relative to
+the injected CO2. The dilution law compares the frame's CO2 pore volume with that
+of the run's anchor frame, the frame nearest a set time: with x their ratio (at
+least one), f = x ** -(beta + beta_growth * ln x), and f = 1 up to the anchor's
+time. The calibration is the gain, beta and beta growth that fit the frames of
+the fit runs:
+
+1. the gain, on the frames selected at target times inside a window during the
+   injection, without dilution; each run weighs the same, shared equally by its
+   frames;
+2. beta and beta growth together, at that gain, on the frames selected from a
+   later target time; each run weighs the same, shared equally by the time bins
+   it occupies and within a bin by its frames.
+
+Each stage evaluates its objective (half the sum of the squared weighted
+residuals) on its search grid, the gain on a logarithmic one and every pair of
+the two dilution grids, and refines the lowest value by SciPy's bounded
+trust-region least squares (TRF, two-point Jacobian, with the tolerance and the
+limit of evaluations of the settings). The residuals, the tables and the
+parameters they read are in the dtype of the statistics; the solver works in
+double precision.
+
+Every run given, fitted or not, has its anchor frame from its own frames, and
+:func:`mass_calibrations` gives each run the parameters the mass maps read;
+:func:`dilution_factor` is the dilution law both read.
+
+Every setting is a field of :class:`CalibrationFitSettings`.
+
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.optimize import least_squares
+
+from darsia.multi_image_analysis.gas_statistics import GasStatistics
+from darsia.multi_image_analysis.run_statistics import (
+    RunStatisticsSettings,
+    SandHistogram,
+)
+
+_LOG_GAIN_BOUND = 700.0
+"""Bound of the logarithm of the gain in the solver, against an overflow of its
+exponential."""
+
+
+@dataclass(frozen=True)
+class CalibrationFitSettings:
+    """Settings of the calibration fit; one configuration table."""
+
+    gain_window_h: Sequence[float]
+    """First and last target time [h] of the frames that fit the gain."""
+    dilution_start_h: float
+    """Target time [h] from which the frames fit the dilution."""
+    dilution_bins_h: Sequence[float]
+    """Edges [h] of the time bins that share a run's weight in the dilution fit,
+    increasing; the first bin starts at the dilution start, the last has no end."""
+    anchor_h: float
+    """Time [h] of each run's anchor frame, the frame nearest it."""
+    anchor_tolerance_h: float
+    """Largest distance [h] of the anchor frame from that time."""
+    gain_grid: Sequence[Sequence[float]]
+    """Search grid of the gain: segments [first, last, points], evenly spaced in
+    the logarithm; a single value is a segment of one point."""
+    beta_grid: Sequence[Sequence[float]]
+    """Search grid of beta: segments [first, last, points], evenly spaced."""
+    beta_growth_grid: Sequence[Sequence[float]]
+    """Search grid of beta growth: segments [first, last, points], evenly spaced."""
+    tolerance: float
+    """Function, step and gradient tolerance of the least-squares solver."""
+    evaluations: int
+    """Most residual evaluations of one least-squares solve."""
+
+
+@dataclass(frozen=True)
+class ColumnEstimate:
+    """CO2 pixels without a measurement of their own, read from the pixels above.
+
+    Each such pixel takes the relative signal of the nearest measured CO2 pixel
+    above it in its column; pixels of equal signal and solubility ratio are summed.
+
+    """
+
+    relative: np.ndarray
+    """The relative signal taken from above."""
+    ratio: np.ndarray
+    """The solubility there over the pixel's own."""
+    weight: np.ndarray
+    """The pixels' summed capacity for dissolved CO2 [g]."""
+
+
+@dataclass(frozen=True)
+class CalibrationFrame:
+    """One frame of a run, as the calibration fit reads it."""
+
+    run: str
+    """The frame's run."""
+    index: int
+    """The frame's index in its run."""
+    elapsed_h: float
+    """Time [h] since the injection start."""
+    target_h: float | None
+    """The target time [h] the frame was selected for; None for a frame that can
+    only be an anchor."""
+    injected_g: float
+    """CO2 injected until the frame [g]."""
+    dissolved: Mapping[int, SandHistogram]
+    """Run statistics of the dissolved CO2 per sand; the weights are capacities [g]."""
+    gas: GasStatistics
+    """Gas statistics."""
+    column: ColumnEstimate | None
+    """CO2 pixels without a measurement of their own, or None without any."""
+
+
+@dataclass(frozen=True)
+class DilutionAnchor:
+    """A run's anchor frame of the dilution law."""
+
+    elapsed_h: float
+    """Time [h] since the injection start."""
+    pore_volume_m3: float
+    """CO2 pore volume."""
+    index: int
+    """The frame's index in its run."""
+
+
+@dataclass(frozen=True)
+class FrameDecision:
+    """Whether a frame selected at a target time of a stage entered the fit."""
+
+    run: str
+    index: int
+    target_h: float
+    stage: str
+    """"gain" or "dilution"."""
+    used: bool
+    reasons: tuple[str, ...]
+    """Why the frame is left out: "no_positive_dose" (no CO2 injected yet)."""
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """The fitted calibration.
+
+    The dissolved CO2 of a pixel is the share min(1, gain * relative signal) of
+    its water's capacity, times the frame's dilution factor (with beta and beta
+    growth, at its run's anchor).
+
+    """
+
+    gain: float
+    beta: float
+    beta_growth: float
+    anchors: dict[str, DilutionAnchor]
+    """The anchor frame of each run given, fitted or not."""
+    runs: tuple[str, ...]
+    """The runs fitted."""
+    decisions: tuple[FrameDecision, ...]
+    """The frames selected for a stage, used or left out."""
+
+
+@dataclass(frozen=True)
+class MassCalibration:
+    """Calibration parameters the mass maps read, for one run."""
+
+    gain: float
+    """Gain on the read signal relative to the concentration curve."""
+    zero_signal: float
+    """Signal of no dissolved CO2: the bottom of the concentration curve."""
+    saturation_signal: float
+    """Signal of saturated dissolved CO2: the top of the concentration curve."""
+    line_share: float
+    """Share of the straight line in the concentration curve; the curve is a
+    straight line (one), its titration part is not part of this method."""
+    beta: float
+    """Exponent of the dilution after the anchor."""
+    beta_growth: float
+    """Growth of the dilution exponent with the logarithm of the pore-volume ratio."""
+    anchor_h: float
+    """Time [h] of the run's anchor, up to which nothing is diluted."""
+    anchor_pore_volume_m3: float
+    """Pore volume [m3] of the run's CO2 at the anchor."""
+
+    def __post_init__(self) -> None:
+        """Refuse what would otherwise change the mass silently: a curve with a
+        titration part, and an anchor without a finite time and a finite positive
+        pore volume."""
+        if self.line_share != 1:
+            raise ValueError("Only a straight concentration curve (line_share 1)")
+        anchor = (self.anchor_h, self.anchor_pore_volume_m3)
+        if not np.isfinite(anchor).all() or self.anchor_pore_volume_m3 <= 0:
+            raise ValueError("The dilution anchor needs a positive pore volume")
+
+
+def dilution_factor(
+    elapsed_h: float,
+    pore_volume_m3: float,
+    anchor_h: float,
+    anchor_pore_volume_m3: float,
+    beta: float,
+    beta_growth: float,
+    dtype: type,
+) -> float:
+    """Dilution factor of the dissolved CO2 in a frame of a run.
+
+    One up to the run's anchor. After it, with x the pore volume of the frame's
+    CO2 over the anchor's, at least one, the factor is
+    ``x ** -(beta + beta_growth * ln x)``, at most one. It is computed in a
+    floating dtype, as our production computed it in its working precision; the
+    calibration fit and the mass maps read it alike.
+
+    Parameters
+    ----------
+    elapsed_h : float
+        Time of the frame [h], on the anchor's clock.
+    pore_volume_m3 : float
+        Pore volume of the frame's CO2.
+    anchor_h, anchor_pore_volume_m3 : float
+        Time [h] and CO2 pore volume of the run's anchor, e.g. of a
+        :class:`DilutionAnchor` or a :class:`MassCalibration`.
+    beta, beta_growth : float
+        Exponent of the dilution after the anchor, and its growth with ln x.
+    dtype : type
+        Floating dtype of the arithmetic, that of the statistics or the maps.
+
+    Returns
+    -------
+    float
+        The factor.
+
+    """
+    if elapsed_h <= anchor_h:
+        return 1.0
+    dtype = np.dtype(dtype).type
+    one = dtype(1)
+    ratio = max(dtype(pore_volume_m3) / dtype(anchor_pore_volume_m3), one)
+    exponent = dtype(beta)
+    if beta_growth:
+        exponent = exponent + dtype(beta_growth) * np.log(ratio)
+    return float(min(one, ratio**-exponent))
+
+
+def _anchor(frames, settings):
+    """A run's anchor: its frame nearest the anchor time (ties: the lower index).
+
+    The frame needs a finite time within the tolerance and a finite, positive CO2
+    pore volume, as in our production; otherwise the dilution factor would be one
+    or zero without notice.
+
+    """
+    frame = min(frames, key=lambda f: (abs(f.elapsed_h - settings.anchor_h), f.index))
+    volume = frame.gas.co2_pore_volume_m3
+    if not (
+        abs(frame.elapsed_h - settings.anchor_h) <= settings.anchor_tolerance_h
+        and np.isfinite(volume)
+        and volume > 0
+    ):
+        raise ValueError(f"No dilution anchor for run {frame.run}")
+    return DilutionAnchor(frame.elapsed_h, volume, frame.index)
+
+
+def _stage(target_h, settings):
+    """The stage of a frame selected at a target time, or None."""
+    if target_h is None:
+        return None
+    first, last = settings.gain_window_h
+    if first <= target_h <= last:
+        return "gain"
+    if target_h >= settings.dilution_start_h:
+        return "dilution"
+    return None
+
+
+def _selection(frames, settings):
+    """The frames of each stage and the decision on every frame of a stage."""
+    stages, decisions = {"gain": [], "dilution": []}, []
+    for frame in frames:
+        stage = _stage(frame.target_h, settings)
+        if stage is None:
+            continue
+        reasons = []
+        if not (np.isfinite(frame.injected_g) and frame.injected_g > 0):
+            reasons.append("no_positive_dose")
+        if not reasons:
+            stages[stage].append(frame)
+        decisions.append(
+            FrameDecision(
+                frame.run,
+                frame.index,
+                frame.target_h,
+                stage,
+                not reasons,
+                tuple(reasons),
+            )
+        )
+    return stages, decisions
+
+
+def _weights(frames, settings, dtype, *, binned):
+    """Each run the same weight, shared by its time bins (if binned) and frames."""
+    scalar = np.dtype(dtype).type
+    runs = Counter(frame.run for frame in frames)
+    if not binned:
+        return np.array(
+            [scalar(1) / np.sqrt(scalar(len(runs) * runs[f.run])) for f in frames],
+            dtype,
+        )
+    edges = settings.dilution_bins_h
+    bins = [(f.run, int(np.searchsorted(edges, f.target_h))) for f in frames]
+    count = Counter(bins)
+    occupied = defaultdict(set)
+    for run, time_bin in count:
+        occupied[run].add(time_bin)
+    return np.array(
+        [
+            scalar(1)
+            / np.sqrt(scalar(len(runs) * len(occupied[run]) * count[(run, time_bin)]))
+            for run, time_bin in bins
+        ],
+        dtype,
+    )
+
+
+def _tables(frame, gain, dtype):
+    """A frame's dissolved and column coefficients at a gain, and its masses."""
+    scalar = np.dtype(dtype).type
+    dissolved = None
+    for histogram in frame.dissolved.values():
+        value = scalar(
+            np.dot(histogram.weight, np.clip(histogram.relative * gain, 0, 1))
+        )
+        dissolved = value if dissolved is None else dissolved + value
+    column = frame.column
+    if column is not None:
+        share = column.ratio * np.clip(column.relative * gain, 0, 1)
+        column = scalar(np.sum(column.weight * share))
+    return (
+        dissolved,
+        column,
+        scalar(frame.gas.free_gas_g),
+        scalar(frame.gas.gas_water_g),
+        scalar(frame.injected_g),
+    )
+
+
+def _mass(tables, factor):
+    """A frame's CO2 mass at a dilution factor, from its tables."""
+    dissolved, column, gas, water, _ = tables
+    mass = dissolved * factor + gas + water
+    return mass if column is None else mass + column * factor
+
+
+def _factor(frame, anchors, beta, beta_growth, dtype):
+    """A frame's dilution factor at its run's anchor, in ``dtype``."""
+    anchor = anchors[frame.run]
+    factor = dilution_factor(
+        frame.elapsed_h,
+        frame.gas.co2_pore_volume_m3,
+        anchor.elapsed_h,
+        anchor.pore_volume_m3,
+        beta,
+        beta_growth,
+        dtype,
+    )
+    return np.dtype(dtype).type(factor)
+
+
+def _residuals(frames, weights, anchors, dtype, *, gain=None):
+    """The weighted residuals of the frames.
+
+    Without a gain, of the logarithm of the gain without dilution; with it, of
+    beta and beta growth at that gain.
+
+    """
+    scalar = np.dtype(dtype).type
+    fixed = None if gain is None else [_tables(f, gain, dtype) for f in frames]
+
+    def residuals(vector):
+        if fixed is None:
+            current = scalar(np.exp(scalar(vector[0])))
+            tables = [_tables(f, current, dtype) for f in frames]
+            beta, growth = scalar(0), scalar(0)
+        else:
+            tables = fixed
+            beta, growth = scalar(vector[0]), scalar(vector[1])
+        values = []
+        for frame, table in zip(frames, tables):
+            mass = _mass(table, _factor(frame, anchors, beta, growth, dtype))
+            dose = table[4]
+            values.append((mass - dose) / dose)
+        return weights * np.array(values, dtype)
+
+    return residuals
+
+
+def _grid(segments, logarithmic):
+    """The distinct values of a search grid's segments, increasing."""
+    space = np.geomspace if logarithmic else np.linspace
+    return np.unique(np.concatenate([space(a, b, int(n)) for a, b, n in segments]))
+
+
+def _objective(residuals, vector):
+    """Half the sum of the squared weighted residuals."""
+    value = residuals(vector)
+    return 0.5 * float(np.dot(value, value))
+
+
+def _solve(residuals, start, bounds, settings):
+    """The bounded least-squares refinement from a start."""
+    result = least_squares(
+        residuals,
+        start,
+        bounds=bounds,
+        max_nfev=settings.evaluations,
+        ftol=settings.tolerance,
+        xtol=settings.tolerance,
+        gtol=settings.tolerance,
+    )
+    if not (result.success and np.isfinite(result.cost)):
+        raise ValueError("The least-squares fit of the calibration failed")
+    return result.x
+
+
+def _fit_gain(residuals, settings, dtype):
+    """The gain: the lowest grid value, refined."""
+    scalar = np.dtype(dtype).type
+    coordinates = np.log(_grid(settings.gain_grid, logarithmic=True))
+    objectives = np.array([_objective(residuals, [c]) for c in coordinates])
+    best = int(np.argmin(np.where(np.isfinite(objectives), objectives, np.inf)))
+    x = _solve(
+        residuals,
+        [float(coordinates[best])],
+        ([-_LOG_GAIN_BOUND], [_LOG_GAIN_BOUND]),
+        settings,
+    )
+    return scalar(np.exp(scalar(x[0])))
+
+
+def _fit_dilution(residuals, settings, dtype):
+    """Beta and beta growth: the lowest pair of their grids, refined."""
+    scalar = np.dtype(dtype).type
+    betas = _grid(settings.beta_grid, logarithmic=False)
+    growths = _grid(settings.beta_growth_grid, logarithmic=False)
+    objectives = np.array(
+        [[_objective(residuals, [b, g]) for g in growths] for b in betas]
+    )
+    finite = np.where(np.isfinite(objectives), objectives, np.inf)
+    i, j = np.unravel_index(int(np.argmin(finite)), objectives.shape)
+    x = _solve(
+        residuals,
+        [float(betas[i]), float(growths[j])],
+        ([0.0, 0.0], [np.inf, np.inf]),
+        settings,
+    )
+    return scalar(x[0]), scalar(x[1])
+
+
+def fit_calibration(
+    frames: Sequence[CalibrationFrame],
+    fit_runs: Sequence[str],
+    settings: CalibrationFitSettings,
+) -> Calibration:
+    """The calibration fitted to the frames of the fit runs.
+
+    Parameters
+    ----------
+    frames : sequence of CalibrationFrame
+        The frames of the fit runs and of the other runs whose mass is wanted
+        (e.g. held-out runs), each run's anchor frame among them; the other runs
+        give only their anchors.
+    fit_runs : sequence of str
+        The runs to fit.
+    settings : CalibrationFitSettings
+        Settings of the fit.
+
+    Returns
+    -------
+    Calibration
+        The calibration.
+
+    """
+    identities = [(f.run, f.index) for f in frames]
+    if len(set(identities)) != len(identities):
+        raise ValueError("A frame of a run is given twice")
+    runs = tuple(fit_runs)
+    fit = [f for f in frames if f.run in fit_runs]
+    dtype = next(iter(fit[0].dissolved.values())).weight.dtype
+    by_run = defaultdict(list)
+    for frame in frames:
+        by_run[frame.run].append(frame)
+    anchors = {run: _anchor(values, settings) for run, values in by_run.items()}
+    stages, decisions = _selection(fit, settings)
+    if not stages["gain"] or not stages["dilution"]:
+        raise ValueError("A stage of the calibration fit has no frames")
+    first = stages["gain"]
+    gain = _fit_gain(
+        _residuals(
+            first, _weights(first, settings, dtype, binned=False), anchors, dtype
+        ),
+        settings,
+        dtype,
+    )
+    second = stages["dilution"]
+    beta, growth = _fit_dilution(
+        _residuals(
+            second,
+            _weights(second, settings, dtype, binned=True),
+            anchors,
+            dtype,
+            gain=gain,
+        ),
+        settings,
+        dtype,
+    )
+    return Calibration(
+        gain=float(gain),
+        beta=float(beta),
+        beta_growth=float(growth),
+        anchors=anchors,
+        runs=runs,
+        decisions=tuple(decisions),
+    )
+
+
+def mass_calibrations(
+    calibration: Calibration, statistics: RunStatisticsSettings
+) -> dict[str, MassCalibration]:
+    """The parameters the mass maps read, for every run with an anchor.
+
+    The concentration curve is that of the run statistics the calibration was
+    fitted on (``statistics``): a straight line from ``zero_signal`` to
+    ``saturation_signal``.
+
+    """
+    return {
+        run: MassCalibration(
+            gain=calibration.gain,
+            zero_signal=statistics.zero_signal,
+            saturation_signal=statistics.saturation_signal,
+            line_share=1.0,
+            beta=calibration.beta,
+            beta_growth=calibration.beta_growth,
+            anchor_h=anchor.elapsed_h,
+            anchor_pore_volume_m3=anchor.pore_volume_m3,
+        )
+        for run, anchor in calibration.anchors.items()
+    }
