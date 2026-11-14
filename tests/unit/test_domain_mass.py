@@ -1,5 +1,6 @@
 """Unit tests for the mass per analysis domain on a coarse synthetic rig."""
 
+import csv
 import tomllib
 
 import numpy as np
@@ -7,7 +8,12 @@ import pandas as pd
 import pytest
 
 import darsia
-from darsia.presets.workflows.analysis.domain_mass import DomainMass
+from darsia.presets.workflows.analysis.domain_mass import (
+    COLUMNS,
+    DomainMass,
+    RunSeries,
+    write_domain_mass,
+)
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, injected_mass
 
 DOMAINS = [
@@ -127,10 +133,11 @@ def frame(dtype=np.float32):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_the_whole_domain_holds_the_map_total(dtype):
+def test_the_whole_domain_holds_the_map_total(dtype, tmp_path):
     """The whole domain's mass is the map's total, and boxes sharing a side and the
     sand layers each split it with no pixel counted twice; the sand is its layers
-    without the free water."""
+    without the free water. The rows are written in the table's columns, a NumPy
+    number in full."""
     geometry, sand, maps, co2 = frame(dtype)
     rows = DomainMass(DOMAINS, geometry, sand, SAND)(maps, co2)
     row = {r["domain_id"]: r for r in rows}
@@ -154,6 +161,21 @@ def test_the_whole_domain_holds_the_map_total(dtype):
         )
     assert row["whole"]["pixels"] == geometry.domain.sum()
     assert row["box1"]["pixels"] == 15 * 89
+
+    path = tmp_path / "domain_mass.csv"
+    with np.printoptions(legacy="1.13"):
+        write_domain_mass(
+            path,
+            [
+                dict(r, run="run", case_id="frame", elapsed_h=np.float64(1 / 3))
+                for r in rows
+            ],
+        )
+    with path.open(encoding="utf-8") as stream:
+        table = list(csv.DictReader(stream))
+    assert list(table[0]) == list(COLUMNS) and len(COLUMNS) == 31
+    assert table[0]["total_mass_g"] == "" and table[3]["complete"] == "True"
+    assert table[0]["elapsed_h"] == repr(1 / 3)
 
 
 def test_an_unknown_pixel_leaves_its_domains_without_a_total():
@@ -219,6 +241,43 @@ def test_each_mass_has_its_centre_and_spread():
         rel=1e-9,
     )
     assert row["layer:5"]["gas_centre_x_mm"] is None
+
+
+def test_a_run_series_is_read_from_the_table(tmp_path):
+    """A run's rows, read from the table in any order, give its frames in time order,
+    each domain's complete or quantified masses, an empty cell as not known, and the
+    centres of its quantified masses."""
+    geometry, sand, maps, co2 = frame(np.float64)
+    rows = DomainMass(DOMAINS, geometry, sand, SAND)(maps, co2)
+    path = tmp_path / "domain_mass.csv"
+    write_domain_mass(
+        path,
+        [
+            dict(r, run="run", case_id=case, elapsed_h=hours)
+            for case, hours in (("late", 2.0), ("early", 0.5))
+            for r in rows
+        ],
+    )
+    with path.open(encoding="utf-8") as stream:
+        table = list(csv.DictReader(stream))
+    injected = {"early": 0.1, "late": 0.4}
+    complete = RunSeries.from_domain_mass(table, injected, "complete")
+    quantified = RunSeries.from_domain_mass(table, injected, "quantified")
+
+    row = {r["domain_id"]: r for r in rows}
+    assert complete.case_ids == ("early", "late")
+    assert complete.elapsed_h.tolist() == [0.5, 2.0]
+    assert complete.injected_g.tolist() == [0.1, 0.4]
+    assert np.isnan(complete.masses["whole"]["total"]).all()
+    whole = row["whole"]["total_quantified_mass_g"]
+    assert quantified.masses["whole"]["total"].tolist() == [whole, whole]
+    free_water = row["layer:2"]["gas_mass_g"]
+    assert complete.masses["layer:2"]["gas"].tolist() == [free_water, free_water]
+    ends = ("_quantified_mass_g", "_centre_x_mm", "_centre_y_mm")
+    ends += ("_spread_x_mm", "_spread_y_mm")
+    centre = [row["whole"]["gas" + end] for end in ends]
+    assert quantified.centres["whole"]["gas"][1].tolist() == centre
+    assert np.isnan(quantified.centres["layer:5"]["gas"][:, 1:]).all()
 
 
 def test_a_domain_receives_the_injection_of_its_own_points(tmp_path):

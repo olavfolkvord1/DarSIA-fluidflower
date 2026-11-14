@@ -17,12 +17,16 @@ rule of :meth:`darsia.InjectionProtocol.injected_mass`, edges included. A box wh
 edge passes through an injection point is refused (:func:`injected_mass`), so that
 the two rules never disagree.
 
+The tables of the analyses of domains are written by one writer (:func:`write_rows`).
+
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import csv
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -176,3 +180,29 @@ def injected_mass(
         )
     box = darsia.CoordinateArray(np.array([[x0, y0], [x1, y1]]))
     return protocol.injected_mass(time=time_h, roi=box)
+
+
+def write_rows(path: Path, rows: Iterable[Mapping], columns: Sequence[str]) -> None:
+    """Write rows as one CSV table in the given columns.
+
+    A value that is None is an empty cell, and a NumPy number is written as the
+    Python number it holds, in full: under the legacy printing that a dependency of
+    darsia sets, its text would keep only 12 digits.
+
+    Parameters
+    ----------
+    path : Path
+        The CSV file.
+    rows : iterable of mappings
+        The rows, each with no key but the columns.
+    columns : sequence of str
+        The table's columns, in order.
+
+    """
+    with Path(path).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(columns))
+        writer.writeheader()
+        writer.writerows(
+            {k: v.item() if isinstance(v, np.generic) else v for k, v in row.items()}
+            for row in rows
+        )
