@@ -29,13 +29,18 @@ For each frame and domain (:class:`DomainMass`):
 - each mass has its centre and its spread (one standard deviation) along each axis.
 
 The domains are set up once per run. The sums, means and centres run in double
-precision, as our production summed its domains.
+precision, as our production summed its domains. The rows are those of the table
+of masses per domain (:func:`write_domain_mass`), and a run's rows of it are read
+back as its series of masses and centres (:class:`RunSeries`).
 
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -45,9 +50,19 @@ from darsia.presets.workflows.analysis.domains import (
     COMPONENTS,
     AnalysisDomain,
     domain_pixels,
+    write_rows,
 )
 
 _CENTRE = ("_centre_x_mm", "_centre_y_mm", "_spread_x_mm", "_spread_y_mm")
+CENTRES = (
+    "quantified_mass_g",
+    "centre_x_mm",
+    "centre_y_mm",
+    "spread_x_mm",
+    "spread_y_mm",
+)
+"""Columns of a centre of :attr:`RunSeries.centres`: the quantified mass [g], and its
+centre and spread (one standard deviation) along each axis [mm]."""
 
 COLUMNS = (
     "run",
@@ -210,3 +225,108 @@ def _centre(key, grams, x, y):
         result[f"{key}_centre_{axis}_mm"] = centre * 1000
         result[f"{key}_spread_{axis}_mm"] = spread**0.5 * 1000
     return result
+
+
+def write_domain_mass(path: Path, rows: Iterable[dict]) -> None:
+    """Write the table of masses per domain, a row per frame and domain.
+
+    Parameters
+    ----------
+    path : Path
+        The CSV file.
+    rows : iterable of dict
+        Rows of :class:`DomainMass` with the frame's ``run``, ``case_id`` and
+        ``elapsed_h``; a value that is None is an empty cell (:func:`write_rows`).
+
+    """
+    write_rows(path, rows, COLUMNS)
+
+
+@dataclass(frozen=True)
+class RunSeries:
+    """A run's CO2 in each analysis domain over its frames, in time order."""
+
+    run: str
+    """The run."""
+    case_ids: tuple[str, ...]
+    """The frames."""
+    elapsed_h: np.ndarray
+    """Hours since the injection start of each frame."""
+    injected_g: np.ndarray
+    """CO2 injected up to each frame [g]; NaN where not known."""
+    masses: Mapping[str, Mapping[str, np.ndarray]]
+    """Per domain identity and component, the mass of each frame [g]; NaN where
+    not known."""
+    centres: Mapping[str, Mapping[str, np.ndarray]] = field(default_factory=dict)
+    """Per domain identity and component, a row per frame in the columns
+    :data:`CENTRES`; NaN where the table has no value."""
+
+    @classmethod
+    def from_domain_mass(
+        cls,
+        rows: Iterable[Mapping],
+        injected_g: Mapping[str, float],
+        masses: Literal["complete", "quantified"],
+    ) -> RunSeries:
+        """A run's series from its rows of the table of masses per domain.
+
+        Parameters
+        ----------
+        rows : iterable of mappings
+            The run's rows in any order, as :class:`DomainMass` gives them with
+            the frame's ``run``, ``case_id`` and ``elapsed_h``, or as read from the
+            table's file.
+        injected_g : mapping
+            CO2 injected up to each frame [g], by case id.
+        masses : "complete" or "quantified"
+            A domain's total, which a domain holding an unknown pixel lacks, or its
+            quantified mass, the known part.
+
+        Returns
+        -------
+        RunSeries
+            Its frames in the order of their time, with the masses and centres.
+
+        """
+        if masses not in ("complete", "quantified"):
+            raise ValueError(f"Unknown masses: {masses!r}")
+        rows = list(rows)
+        runs = {str(row["run"]) for row in rows}
+        if len(runs) != 1:
+            raise ValueError("The rows are not those of one run")
+        times: dict[str, float] = {}
+        for row in rows:
+            times.setdefault(str(row["case_id"]), float(row["elapsed_h"]))
+        case_ids = tuple(sorted(times, key=times.__getitem__))
+        index = {case: position for position, case in enumerate(case_ids)}
+        suffix = "_mass_g" if masses == "complete" else "_quantified_mass_g"
+        centre = ("_quantified_mass_g", *_CENTRE)
+        found: dict[str, dict[str, np.ndarray]] = {}
+        centres: dict[str, dict[str, np.ndarray]] = {}
+        for row in rows:
+            domain, frame = str(row["domain_id"]), index[str(row["case_id"])]
+            if domain not in found:
+                found[domain] = {
+                    key: np.full(len(case_ids), np.nan) for key in COMPONENTS
+                }
+                centres[domain] = {
+                    key: np.full((len(case_ids), len(centre)), np.nan)
+                    for key in COMPONENTS
+                }
+            for key in COMPONENTS:
+                found[domain][key][frame] = _number(row[key + suffix])
+                values = [_number(row.get(key + end)) for end in centre]
+                centres[domain][key][frame] = values
+        return cls(
+            run=runs.pop(),
+            case_ids=case_ids,
+            elapsed_h=np.array([times[case] for case in case_ids]),
+            injected_g=np.array([_number(injected_g.get(case)) for case in case_ids]),
+            masses=found,
+            centres=centres,
+        )
+
+
+def _number(value) -> float:
+    """A table cell as a number: NaN for an empty cell or None."""
+    return np.nan if value is None or value == "" else float(value)
