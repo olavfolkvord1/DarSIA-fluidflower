@@ -17,6 +17,10 @@ in each column's name:
 - ``mass_rates`` and ``mass_rates_summary``: each run's least-squares rate over
   the frames of each injection's time, from its start to its end; and their
   summary;
+- ``centres_long`` and ``centres_by_time``: each run's centre and spread of the
+  quantified mass per frame, domain and component, in mm of the grid; and per
+  time the runs' mean and median centre, their standard deviation and the mean
+  spread;
 
 A fraction divides by the domain's injected reference
 (:func:`injected_reference`): the CO2 injected up to the frame for the whole
@@ -264,7 +268,7 @@ def ensemble_tables(
     domains: Sequence[AnalysisDomain],
     settings: EnsembleSettings,
 ) -> dict[str, list[dict]]:
-    """The ensemble's tables of the masses of the runs' domains.
+    """The ensemble's tables of the masses and centres of the runs' domains.
 
     Parameters
     ----------
@@ -289,6 +293,7 @@ def ensemble_tables(
         mass_by_time=_by_time(read, domains, axis),
         **_marks(read, domains),
         **_rates(read, domains),
+        **_centres(read, domains, axis),
     )
 
 
@@ -471,6 +476,75 @@ def _rates(runs: Sequence[_Run], domains) -> dict[str, list[dict]]:
         for (label, domain, name, component), values in rates.items()
     ]
     return dict(mass_rates=rows, mass_rates_summary=summaries)
+
+
+def _centres(runs: Sequence[_Run], domains, axis) -> dict[str, list[dict]]:
+    """Each run's centres per frame, domain and component, and their summary."""
+    rows = []
+    for run in runs:
+        series = run.series
+        for index, case in enumerate(series.case_ids):
+            elapsed_h = float(series.elapsed_h[index])
+            for domain in domains:
+                if domain.domain_id not in series.centres:
+                    continue
+                for component in COMPONENTS:
+                    centre = series.centres[domain.domain_id][component][index]
+                    if not np.isfinite(centre[1:]).all():
+                        continue
+                    mass, x, y, spread_x, spread_y = (_value(v) for v in centre)
+                    rows.append(
+                        dict(
+                            run=series.run,
+                            case_id=case,
+                            elapsed_h=elapsed_h,
+                            target_h=run.targets.get(case),
+                            period=_period(elapsed_h, run.periods),
+                            domain=domain.domain_id,
+                            domain_label=domain.name,
+                            component=component,
+                            quantified_mass_g=mass,
+                            centre_x_mm=x,
+                            centre_y_mm=y,
+                            spread_x_mm=spread_x,
+                            spread_y_mm=spread_y,
+                        )
+                    )
+    frames = {run.series.run: run.series.case_ids for run in runs}
+    found = {(r["run"], r["case_id"], r["domain"], r["component"]): r for r in rows}
+    keys = dict.fromkeys((r["domain"], r["domain_label"], r["component"]) for r in rows)
+    by_time = []
+    for domain, name, component in keys:
+        for time, chosen in axis.items():
+            picked = [
+                found.get((run, frames[run][index], domain, component))
+                for run, index in chosen.items()
+            ]
+            picked = [row for row in picked if row is not None]
+            if not picked:
+                continue
+            x, y = (
+                summary(row[k] for row in picked)
+                for k in ("centre_x_mm", "centre_y_mm")
+            )
+            by_time.append(
+                dict(
+                    domain=domain,
+                    domain_label=name,
+                    component=component,
+                    time_h=time,
+                    n_runs=len(picked),
+                    mean_x_mm=x["mean"],
+                    mean_y_mm=y["mean"],
+                    median_x_mm=x["median"],
+                    median_y_mm=y["median"],
+                    sd_x_mm=x["sd"],
+                    sd_y_mm=y["sd"],
+                    mean_spread_x_mm=summary(r["spread_x_mm"] for r in picked)["mean"],
+                    mean_spread_y_mm=summary(r["spread_y_mm"] for r in picked)["mean"],
+                )
+            )
+    return dict(centres_long=rows, centres_by_time=by_time)
 
 
 def write_tables(folder: Path, tables: Mapping[str, list[dict]]) -> list[Path]:
