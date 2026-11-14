@@ -28,6 +28,9 @@ MODULES = [
     "darsia/signals/models/beer_lambert.py",
     "darsia/multi_image_analysis/run_statistics.py",
     "darsia/experiment/overflow.py",
+    "darsia/experiment/overflow_feed.py",
+    "darsia/experiment/overflow_circulation.py",
+    "darsia/experiment/overflow_evaporation.py",
     "darsia/multiphase/gas_allocation.py",
 ]
 """Modules under the rules, relative to the source folder."""
