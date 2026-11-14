@@ -16,6 +16,7 @@ from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
     grid_homographies,
     rasterize_sand_map,
+    read_moved_anchors,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ logger = logging.getLogger(__name__)
 def setup_sand_map(path: Path | list[Path], show: bool = False) -> None:
     """Place the sand-map drawing on the run's grid and save it as the labels.
 
-    The drawing is rasterized on the run's grid through the run's rig geometry
+    The drawing, with the run's adjustment if one is configured, is rasterized on
+    the run's grid through the run's rig geometry
     (:func:`rasterize_sand_map`). The run's grid is the target grid of the rig's
     image mapping, ``[corrections.mapping]``, on which the rig expects labels and
     facies; without a rig geometry, the grid's own metric pixel centres place
@@ -65,6 +67,8 @@ def setup_sand_map(path: Path | list[Path], show: bool = False) -> None:
     grid = darsia.Image(np.zeros(shape, np.uint8), **mapping.correct_metadata())
 
     drawing = SandMapDrawing.read(sand_map.drawing)
+    if sand_map.adjustment:
+        drawing = drawing.moved(read_moved_anchors(sand_map.adjustment))
     width, height = config.rig.width, config.rig.height
     _, rig_to_grid = grid_homographies(sand_map.grid_to_rig, grid)
     labels, inside = rasterize_sand_map(
