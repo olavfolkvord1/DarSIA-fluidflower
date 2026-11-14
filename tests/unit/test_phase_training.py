@@ -220,17 +220,43 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path, canvas):
     }
 
 
-def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another(canvas):
-    """On a grid of twice the pixel size the texture window keeps its width in mm,
-    and the phases 4 mm away from their boundaries are those of the training grid."""
+def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another(
+    tmp_path, canvas
+):
+    """Read for the rig's canvas at twice the pixel size, or for whole metric cells
+    that extend a canvas differently, also one whose origin is not at its height,
+    the model passes without an explicit choice. It keeps its texture window's
+    width in mm, and the phases 4 mm away from their boundaries are those of the
+    training grid."""
     training = darsia.train_phase_model(_samples(canvas), SETTINGS)
+    darsia.write_phase_model(
+        tmp_path / "model",
+        training.model,
+        pixel_size_mm=PIXEL_MM,
+        co2_threshold=training.co2_threshold,
+        cross_validation=training.cross_validation,
+        accepted_canvases=(),
+        moved_from=(),
+    )
+    on_coarse = _rig_canvas(tmp_path / "coarse", shape=(60, 80))
+    model = darsia.read_phase_model(tmp_path / "model", canvas=on_coarse)
+    cells = "[corrections.grid]\npixel_size_mm = {}\narea_factor = 1.0\n"
+    first, second = (
+        _rig_canvas(tmp_path / f"cells{size}", cells.format(size), origin=[0.0, 0.5])
+        for size in (0.7, 1.1)
+    )
+    assert first["grid"]["dimensions"] != second["grid"]["dimensions"]
+    assert first["grid"]["extent"] == second["grid"]["extent"]
+    assert not darsia.check_canvas(
+        first, second, accept=False, subject="the model", resolution=True
+    )
     current, baseline, plume, gas = _frame(7)
     coarse = [i.reshape(60, 2, 80, 2, 3).mean(axis=(1, 3)) for i in (current, baseline)]
     for images, pixel_size_mm in (((current, baseline), 0.5), (coarse, 1.0)):
         invalid = images[0].copy()
         invalid[20, 20, 1] = np.nan
         co2, _ = darsia.phase_probabilities(
-            training.model, invalid, images[1], pixel_size_mm=pixel_size_mm
+            model, invalid, images[1], pixel_size_mm=pixel_size_mm
         )
         half_width = round(4 * SETTINGS.texture_sigma_mm / pixel_size_mm)
         assert np.isnan(co2).sum() == (2 * half_width + 1) ** 2
@@ -238,6 +264,27 @@ def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another(canvas):
     phases = _phases(training, *coarse, 1.0)
     inner = _inner((plume.astype(int) + gas)[::2, ::2], 4)
     np.testing.assert_array_equal(phases[inner], fine[inner])
+
+
+def test_other_dimensions_without_a_recorded_extent_are_another_canvas():
+    """Canvases that record no extent before whole metric cells pass with other
+    dimensions and another origin only by explicit choice."""
+    record = {
+        "source": {"format": "NPZ"},
+        "corrections": {"mapping": {"path": "mapping.npz"}},
+        "grid": {"shape": [4, 5], "dimensions": [0.4, 0.5], "origin": [0.0, 0.4]},
+    }
+    other = {
+        **record,
+        "grid": {**record["grid"], "dimensions": [0.8, 1.0], "origin": [0.0, 0.8]},
+    }
+    check = dict(subject="the model", resolution=True)
+
+    with pytest.raises(
+        ValueError, match=r"settings: grid\.dimensions, grid\.origin\. "
+    ):
+        darsia.check_canvas(record, other, accept=False, **check)
+    assert darsia.check_canvas(record, other, accept=True, **check)
 
 
 def test_labels_on_another_canvas_are_sampled_only_by_explicit_choice(tmp_path):
@@ -321,8 +368,9 @@ def test_labels_move_between_corrected_canvases_of_a_rig(tmp_path):
 
 def test_a_model_is_read_only_for_images_on_its_canvas(tmp_path, canvas):
     """A model read for images on its canvas keeps it. Read for images of another
-    canvas, or as a delivered folder without one, it is refused with the differing
-    settings named; read by explicit choice it gives the same probabilities."""
+    canvas, also of another origin at another resolution, or as a delivered folder
+    without one, it is refused with the differing settings named; read by explicit
+    choice it gives the same probabilities."""
     trained = darsia.train_phase_model(_samples(canvas), SETTINGS)
     folder = tmp_path / "model"
     darsia.write_phase_model(
@@ -339,6 +387,10 @@ def test_a_model_is_read_only_for_images_on_its_canvas(tmp_path, canvas):
     bulge = r"settings: corrections\.curvature\.bulge\.horizontal_bulge, "
     with pytest.raises(ValueError, match=bulge):
         darsia.read_phase_model(folder, canvas=other)
+    shifted = _rig_canvas(tmp_path / "shifted", shape=(60, 80), origin=[0.001, 0.06])
+    moved = r"settings: grid\.extent\.origin, grid\.origin, grid\.shape\. "
+    with pytest.raises(ValueError, match=moved):
+        darsia.read_phase_model(folder, canvas=shifted)
     delivered = tmp_path / "delivered"
     shutil.copytree(folder, delivered)
     (delivered / "canvas.json").unlink()
