@@ -108,24 +108,30 @@ def _samples(count: int = 40):
 
 
 def test_fit_recovers_a_known_field():
-    """Noise-free samples give back the generating field up to the ridge bias."""
+    """Noise-free samples give back the generating field up to the ridge bias,
+    fitted in the positions' dtype."""
     positions, materials, measured, target, common, log_gain = _samples()
 
-    fitted, fields = darsia.fit_material_gain(
-        positions,
-        materials,
-        measured,
-        target,
-        fit_mask=np.ones(len(materials), dtype=bool),
-        materials=[1, 2, 3],
-        settings=FIT,
-    )
+    fits = {}
+    for dtype in (np.float64, np.float32):
+        fits[dtype], fields = darsia.fit_material_gain(
+            positions.astype(dtype),
+            materials,
+            measured,
+            target,
+            fit_mask=np.ones(len(materials), dtype=bool),
+            materials=[1, 2, 3],
+            settings=FIT,
+        )
 
-    np.testing.assert_allclose(fitted, common, atol=5e-3)
-    for material in (1, 2, 3):
-        keep = materials == material
-        predicted = _polynomial(positions[keep]) @ fields[material]
-        np.testing.assert_allclose(predicted, log_gain[keep], atol=1e-3)
+        assert fits[dtype].dtype == dtype
+        np.testing.assert_allclose(fits[dtype], common, atol=5e-3)
+        for material in (1, 2, 3):
+            keep = materials == material
+            predicted = _polynomial(positions[keep]) @ fields[material]
+            np.testing.assert_allclose(predicted, log_gain[keep], atol=1e-3)
+    # Single precision is solved in single precision, not rounded from double.
+    assert not np.array_equal(fits[np.float32], fits[np.float64].astype(np.float32))
 
 
 def test_fit_down_weights_an_outlying_sample():

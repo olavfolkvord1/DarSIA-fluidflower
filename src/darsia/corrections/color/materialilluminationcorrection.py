@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import scipy.linalg
 
 import darsia
 
@@ -81,7 +82,9 @@ def fit_material_gain(
     has the weight one over the sample count of its material. The second stage
     fits, per material, a quadratic residual around the common field plus its
     offset. Both stages use the robust ridge regression of
-    :func:`darsia.linalg.robust_ridge`.
+    :func:`darsia.linalg.robust_ridge`. The fit computes in the floating dtype of
+    the positions, at least single precision; the rank and condition of the
+    common design come from its singular values in that dtype.
 
     Parameters
     ----------
@@ -117,7 +120,8 @@ def fit_material_gain(
 
     """
     ids = [int(material) for material in materials]
-    positions = np.asarray(positions[fit_mask], dtype=np.float64)
+    dtype = np.result_type(positions, np.float32)
+    positions = np.asarray(positions[fit_mask], dtype=dtype)
     labels = np.asarray(materials_of_samples)[fit_mask]
     measured = np.asarray(measured_rgb)[fit_mask]
     targets = np.asarray(target_log_rgb)[fit_mask]
@@ -126,31 +130,32 @@ def fit_material_gain(
 
     # Design of the common stage: quadratic field and sum-zero material offsets.
     polynomial = _polynomial(positions)
-    effects = np.zeros((len(labels), len(ids) - 1), dtype=np.float64)
+    effects = np.zeros((len(labels), len(ids) - 1), dtype=dtype)
     for index, material in enumerate(ids[:-1]):
         effects[labels == material, index] = 1
     effects[labels == ids[-1]] = -1
     design = np.column_stack((polynomial, effects))
-    if (
-        len(design) < 32
-        or np.linalg.matrix_rank(design) != design.shape[1]
-        or np.linalg.cond(design) > 1000
-    ):
+    singular = scipy.linalg.svdvals(design, check_finite=False)
+    rank = np.count_nonzero(
+        singular > singular[0] * max(design.shape) * np.finfo(dtype).eps
+    )
+    if len(design) < 32 or rank != design.shape[1] or singular[0] / singular[-1] > 1000:
         raise ValueError("The common illumination field is not identifiable.")
 
-    response = targets - np.log(measured)
+    # Log ratios in the samples' dtype, fitted in the fit's dtype.
+    response = np.asarray(targets - np.log(measured), dtype=dtype)
     base = np.reciprocal(
         np.array(
             [np.count_nonzero(labels == material) for material in labels],
-            dtype=np.float64,
+            dtype=dtype,
         )
     )
     base /= base.sum()
-    penalty = np.zeros((design.shape[1], design.shape[1]), dtype=np.float64)
-    penalty[1:6, 1:6] = np.eye(5, dtype=np.float64) * settings.spatial_ridge
+    penalty = np.zeros((design.shape[1], design.shape[1]), dtype=dtype)
+    penalty[1:6, 1:6] = np.eye(5, dtype=dtype) * settings.spatial_ridge
     penalty[6:, 6:] = settings.offset_ridge * (
-        np.eye(len(ids) - 1, dtype=np.float64)
-        + np.ones((len(ids) - 1, len(ids) - 1), dtype=np.float64)
+        np.eye(len(ids) - 1, dtype=dtype)
+        + np.ones((len(ids) - 1, len(ids) - 1), dtype=dtype)
     )
     shared = darsia.linalg.robust_ridge(
         design, response, base, penalty, settings.iterations, settings.huber_threshold
@@ -164,7 +169,7 @@ def fit_material_gain(
                 settings.residual_constant_ridge,
                 *([settings.residual_spatial_ridge] * 5),
             ],
-            dtype=np.float64,
+            dtype=dtype,
         )
     )
     fields = {}
@@ -176,7 +181,7 @@ def fit_material_gain(
         delta = darsia.linalg.robust_ridge(
             z,
             response[keep] - z @ prior,
-            np.full(len(z), 1.0 / len(z), dtype=np.float64),
+            np.full(len(z), 1 / dtype.type(len(z)), dtype=dtype),
             residual_penalty,
             settings.iterations,
             settings.huber_threshold,

@@ -112,6 +112,7 @@ def collect_block_samples(
     block_size: int,
     dn_scale: float,
     settings: MaterialFitSettings,
+    dtype: np.dtype,
 ) -> dict:
     """Median colour of each block of pure material on the fitting grid.
 
@@ -119,7 +120,8 @@ def collect_block_samples(
     level in all channels, it lies farther than ``edge_margin`` from the grid's
     edge, and it holds pure material. Blocks with too few such cells of a
     material are skipped. Each block is assigned to one of five folds by its
-    position.
+    position. Positions and margins are computed in ``dtype``, so the fit of
+    :func:`fit_block_field` runs in it; the colours stay single precision.
 
     Parameters
     ----------
@@ -139,6 +141,8 @@ def collect_block_samples(
         white level in camera digital numbers.
     settings : MaterialFitSettings
         Settings of the fit; the dark level and the fewest cells of a block.
+    dtype : dtype
+        Floating dtype of the positions, e.g., the baseline's.
 
     Returns
     -------
@@ -156,9 +160,10 @@ def collect_block_samples(
 
     # Physical margin along the edges.
     height, width = shape
+    dtype = np.dtype(dtype)
     yy, xx = np.indices(shape)
-    y, x = yy.astype(np.float64), xx.astype(np.float64)
-    physical_h, physical_w = (np.float64(d) for d in dimensions)
+    y, x = yy.astype(dtype), xx.astype(dtype)
+    physical_h, physical_w = (dtype.type(d) for d in dimensions)
     keep &= ((x + 0.5) * physical_w / width > edge_margin) & (
         (width - x - 0.5) * physical_w / width > edge_margin
     )
@@ -180,8 +185,8 @@ def collect_block_samples(
                 columns, rows = xx[block][selected], yy[block][selected]
                 records.append(
                     (
-                        (columns.astype(np.float64).mean() + 0.5) * 2 / width - 1,
-                        (rows.astype(np.float64).mean() + 0.5) * 2 / height - 1,
+                        (columns.astype(dtype).mean() + 0.5) * 2 / width - 1,
+                        (rows.astype(dtype).mean() + 0.5) * 2 / height - 1,
                         material,
                         (3 * (row // block_size) + 7 * (col // block_size)) % 5,
                         np.median(
@@ -299,6 +304,10 @@ def fit_material_illumination(
 ) -> MaterialIlluminationCorrection:
     """Fit the material illumination correction on a baseline image.
 
+    The fit computes in the baseline's floating dtype (at least single
+    precision); the reduction to the fitting grid is single precision for every
+    baseline.
+
     Parameters
     ----------
     baseline : array
@@ -315,7 +324,7 @@ def fit_material_illumination(
     dimensions : tuple of float
         Physical height and width of the image.
     fit_shape : tuple of int
-        Rows and columns of the fitting grid.
+        Rows and columns of the fitting grid, each at most the baseline's.
     block_size : int
         Block side length in cells of the fitting grid.
     edge_margin : float
@@ -331,6 +340,8 @@ def fit_material_illumination(
         Correction for images on the grid of the baseline.
 
     """
+    # The fitting grid is no finer than the image, e.g., a coarse run grid.
+    fit_shape = tuple(min(int(n), m) for n, m in zip(fit_shape, np.shape(baseline)))
     materials = sorted(int(material) for material in targets)
     projection = project_to_fit_grid(
         baseline, material_map, fit_mask, fit_shape, materials, settings
@@ -343,6 +354,7 @@ def fit_material_illumination(
         block_size=block_size,
         dn_scale=dn_scale,
         settings=settings,
+        dtype=np.result_type(baseline, np.float32),
     )
     common, fields = fit_block_field(samples, materials, settings)
     return MaterialIlluminationCorrection(common, fields, material_map, fit_shape)

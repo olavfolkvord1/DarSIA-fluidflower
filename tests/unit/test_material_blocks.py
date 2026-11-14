@@ -79,6 +79,7 @@ def test_block_samples_positions_folds_and_margin():
             block_size=10,
             dn_scale=100.0,
             settings=FIT,
+            dtype=np.float64,
         )
 
     # Two block rows and three block columns, one material each.
