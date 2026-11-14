@@ -27,6 +27,8 @@ MODULES = [
     "darsia/signals/models/color_path_signal.py",
     "darsia/signals/models/beer_lambert.py",
     "darsia/multi_image_analysis/run_statistics.py",
+    "darsia/multi_image_analysis/gas_statistics.py",
+    "darsia/multi_image_analysis/calibration_fit.py",
     "darsia/experiment/overflow.py",
     "darsia/experiment/overflow_feed.py",
     "darsia/experiment/overflow_circulation.py",
