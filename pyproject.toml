@@ -87,6 +87,10 @@ dev = [
   "meshio",
   "deepdiff",
   "pyamg",
+  "rawpy",
+]
+raw = [
+  "rawpy",
 ]
 docs = [
   "sphinx>=7.2",

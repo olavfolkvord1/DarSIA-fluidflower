@@ -2,6 +2,7 @@
 are supported:
 
 * optical images: *jpg, *jpeg, *png, *tif, *tiff
+* camera raw files: *arw, *nef, *cr2, *dng, etc. (see :mod:`darsia.image.raw`)
 * DICOM images: *dcm
 * simulation data: anything which can be read by meshio, e.g. *vtu
 * numpy images: *npy
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Image:
     """Determine and call reading routine depending on filetype.
     Provide interface for numpy arrays, standard optical image formats,
-    dicom images, and vtu images.
+    camera raw files, dicom images, and vtu images.
 
     Parameters
     ----------
@@ -92,6 +93,8 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
         image = imread_from_npz(path, **kwargs)
     elif suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff"]:
         image = imread_from_optical(path, **kwargs)
+    elif suffix in darsia.RAW_SUFFIXES:
+        image = darsia.imread_from_raw(path, **kwargs)
     elif suffix in [".dcm"]:
         image = imread_from_dicom(path, **kwargs)
     elif suffix in [".vtu"]:
