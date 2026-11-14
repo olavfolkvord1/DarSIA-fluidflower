@@ -5,6 +5,12 @@ Training has two results. The *training samples* hold the optical features
 region of a run's corrected frames. The *phase model* is fitted on the samples
 and written as a folder that :func:`~darsia.read_phase_model` reads.
 
+The samples of a frame come from a label set (:class:`~darsia.LabelSet`) drawn on
+the canvas of the frame's images, the rig's. A set drawn on another canvas, or
+recording none, is sampled only by the caller's explicit choice, which the
+samples record; samples of different canvases are not joined. The model folder
+records the canvas and the accepted ones.
+
 A labelled region has a phase class. For each of the two heads (CO2 presence,
 and free gas within the CO2) a class gives a pixel target, a regional target, or
 neither. A pixel target labels every sampled pixel of the region (e.g. water,
@@ -32,12 +38,14 @@ All arithmetic runs in the floating dtype of the training features.
 """
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 import darsia
+from darsia.multiphase.label_set import LabelledRegion, LabelSet, canvas_differences
 from darsia.multiphase.phase_model import (
     PHASE_FEATURE_NAMES,
     LogisticHead,
@@ -110,20 +118,6 @@ class PhaseTrainingSettings:
 
 
 @dataclass(frozen=True)
-class LabelledRegion:
-    """A labelled region of one frame of a run."""
-
-    name: str
-    """Unique name of the region; it seeds the choice of its sampled pixels."""
-    run: str
-    """The run of the frame; the cross-validation leaves out whole runs."""
-    phase: str
-    """Phase class of the region, one of :data:`PHASE_CLASSES`."""
-    weight: float
-    """Total weight of the region (e.g. its label's confidence)."""
-
-
-@dataclass(frozen=True)
 class TrainingSamples:
     """Optical features of sampled pixels of labelled regions."""
 
@@ -137,6 +131,11 @@ class TrainingSamples:
     """Pixel size of the grid of the sampled frames."""
     texture_sigma_mm: float
     """Texture scale (mm) of the features."""
+    canvas: dict | None
+    """Canvas of the sampled frames' images (``Rig.canvas``)."""
+    accepted_canvases: tuple[dict | None, ...]
+    """Canvases of label sets sampled by the caller's explicit choice although
+    they differ from :attr:`canvas`; None for a set that records none."""
 
 
 @dataclass(frozen=True)
@@ -170,18 +169,20 @@ def frame_samples(
     current: np.ndarray,
     baseline: np.ndarray,
     previous: np.ndarray | None,
-    regions: list[LabelledRegion],
-    masks: list[np.ndarray],
+    labels: LabelSet,
     *,
     settings: PhaseTrainingSettings,
     pixel_size_mm: float,
+    canvas: dict | None,
+    accept_canvas: bool = False,
 ) -> TrainingSamples:
     """Training samples of the labelled regions of one frame.
 
-    Each region is sampled where its mask meets the support of the frame's
-    features: all pixels there, or a reproducible choice of
-    ``settings.pixels_per_region`` of them, seeded by the region's name. A region
-    without a supported pixel gives no samples and is left out.
+    The label set must be drawn on the canvas of the images. Each region is
+    sampled where its mask meets the support of the frame's features: all pixels
+    there, or a reproducible choice of ``settings.pixels_per_region`` of them,
+    seeded by the region's name. A region without a supported pixel gives no
+    samples and is left out.
 
     Parameters
     ----------
@@ -189,15 +190,17 @@ def frame_samples(
         Linear RGB images of shape (rows, cols, 3) on one grid.
     previous : array or None
         Linear RGB image of the run's previous frame on the same grid.
-    regions : list of LabelledRegion
-        The labelled regions of the frame.
-    masks : list of array
-        One boolean mask per region on the frame's grid: the pixels that may be
-        sampled (e.g. the drawn region within the porous sand).
+    labels : LabelSet
+        The labelled regions of the frame, with masks on the frame's grid.
     settings : PhaseTrainingSettings
         Number of sampled pixels per region and texture scale.
     pixel_size_mm : float
         Pixel size of the images' grid.
+    canvas : dict or None
+        Canvas of the images (``Rig.canvas``).
+    accept_canvas : bool
+        Whether to sample a label set drawn on another canvas, or recording
+        none, by the caller's explicit choice; the samples record its canvas.
 
     Returns
     -------
@@ -207,9 +210,21 @@ def frame_samples(
     Raises
     ------
     ValueError
-        If a region's phase class is not one of :data:`PHASE_CLASSES`.
+        If the label set is drawn on another canvas than the images, or records
+        none, without ``accept_canvas`` (the message names the differing
+        settings), or a region's phase class is not one of
+        :data:`PHASE_CLASSES`.
 
     """
+    accepted = ()
+    if labels.canvas is None or labels.canvas != canvas:
+        if not accept_canvas:
+            raise ValueError(
+                "The labels are drawn on another canvas than the images; differing "
+                f"settings: {', '.join(canvas_differences(labels.canvas, canvas))}. "
+                "Move them onto the images' canvas, or accept theirs explicitly."
+            )
+        accepted = (labels.canvas,)
     features = PhaseFeatures(
         current,
         baseline,
@@ -218,7 +233,7 @@ def frame_samples(
         pixel_size_mm=pixel_size_mm,
     )
     kept, rows, columns = [], [], []
-    for region, mask in zip(regions, masks, strict=True):
+    for region, mask in zip(labels.regions, labels.masks, strict=True):
         if region.phase not in _TARGETS:
             raise ValueError(f"Unknown phase class {region.phase!r} of {region.name}.")
         sampled = _sample(
@@ -238,6 +253,8 @@ def frame_samples(
         regions=tuple(kept),
         pixel_size_mm=pixel_size_mm,
         texture_sigma_mm=settings.texture_sigma_mm,
+        canvas=canvas,
+        accepted_canvases=accepted,
     )
 
 
@@ -247,7 +264,8 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
     Raises
     ------
     ValueError
-        If the parts differ in pixel size or texture scale.
+        If the parts differ in pixel size, texture scale or canvas (the message
+        names the differing settings).
 
     """
     first = parts[0]
@@ -257,6 +275,14 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
         for part in parts
     ):
         raise ValueError("Training samples of different grids or texture scales.")
+    accepted = []
+    for part in parts:
+        if part.canvas != first.canvas:
+            raise ValueError(
+                "Training samples of different canvases; differing settings: "
+                f"{', '.join(canvas_differences(first.canvas, part.canvas))}."
+            )
+        accepted += [c for c in part.accepted_canvases if c not in accepted]
     offsets = np.cumsum([0] + [len(part.regions) for part in parts])
     return TrainingSamples(
         features=np.concatenate([part.features for part in parts]),
@@ -266,11 +292,14 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
         regions=tuple(region for part in parts for region in part.regions),
         pixel_size_mm=first.pixel_size_mm,
         texture_sigma_mm=first.texture_sigma_mm,
+        canvas=first.canvas,
+        accepted_canvases=tuple(accepted),
     )
 
 
 def write_training_samples(path: str | Path, samples: TrainingSamples) -> None:
-    """Write training samples to one compressed NumPy archive."""
+    """Write training samples to one compressed NumPy archive; the canvases are
+    JSON text."""
     regions = samples.regions
     np.savez_compressed(
         path,
@@ -282,6 +311,8 @@ def write_training_samples(path: str | Path, samples: TrainingSamples) -> None:
         weights=np.array([region.weight for region in regions], dtype=float),
         pixel_size_mm=samples.pixel_size_mm,
         texture_sigma_mm=samples.texture_sigma_mm,
+        canvas=json.dumps(samples.canvas),
+        accepted_canvases=json.dumps(samples.accepted_canvases),
     )
 
 
@@ -302,6 +333,8 @@ def read_training_samples(path: str | Path) -> TrainingSamples:
             ),
             pixel_size_mm=float(archive["pixel_size_mm"]),
             texture_sigma_mm=float(archive["texture_sigma_mm"]),
+            canvas=json.loads(str(archive["canvas"])),
+            accepted_canvases=tuple(json.loads(str(archive["accepted_canvases"]))),
         )
 
 
