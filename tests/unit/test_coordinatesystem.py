@@ -300,3 +300,25 @@ def test_pixel_centres_lie_half_a_pixel_inside_the_top_left_corner():
 
     assert np.allclose(x, [1.1, 1.3, 1.5, 1.7])
     assert np.allclose(y, [2.95, 2.85])
+
+
+def test_optical_pitch_takes_the_area_factor_of_the_pixel_areas():
+    """The coordinate pitch times the root of the median area over the cell."""
+    area = np.full((2, 4), 0.1 * 0.2 * 1.21)
+    area[0, 0] = 1.0  # one outlier leaves the median
+    image = darsia.Image(area, dimensions=[0.2, 0.8])
+
+    pitch = darsia.optical_pitch_m(image, np.ones((2, 4), bool))
+
+    assert np.allclose(pitch, (0.11, 0.22))
+
+
+def test_optical_grid_sizes_the_pixels_with_the_pitch_in_the_given_dtype():
+    """The image's values on the dimensions of its pixels at the pitch."""
+    sand_map = darsia.Image(np.arange(8).reshape(2, 4), dimensions=[0.2, 0.8])
+
+    grid = darsia.optical_grid(sand_map, (0.11, 0.22), np.float32)
+
+    assert grid.dimensions == [np.float32(2 * 0.11), np.float32(4 * 0.22)]
+    assert all(type(length) is np.float32 for length in grid.dimensions)
+    np.testing.assert_array_equal(grid.img, sand_map.img)
