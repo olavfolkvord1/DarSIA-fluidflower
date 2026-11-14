@@ -221,6 +221,7 @@ def write_phase_model(
     cross_validation: dict[str, dict],
     canvas: dict | None,
     accepted_canvases: tuple[dict | None, ...],
+    moved_from: tuple[dict, ...],
 ) -> None:
     """Write a trained phase model as a folder :func:`read_phase_model` reads.
 
@@ -228,7 +229,8 @@ def write_phase_model(
     was trained on. Beside the heads, ``phase_decision_policy.json`` holds each
     head's decision threshold, ``cross_validation.json`` the cross-validation
     and ``canvas.json`` the canvas the model was trained on, with the canvases
-    of label sets the training accepted explicitly.
+    of label sets the training accepted explicitly and those its label sets were
+    moved from.
 
     Parameters
     ----------
@@ -248,6 +250,8 @@ def write_phase_model(
     accepted_canvases : tuple
         Canvases of the label sets accepted although they differ
         (``TrainingSamples.accepted_canvases``).
+    moved_from : tuple
+        Canvases the label sets were moved from (``TrainingSamples.moved_from``).
 
     """
     _head_path(folder, "co2_presence").parent.mkdir(parents=True)
@@ -273,7 +277,11 @@ def write_phase_model(
             }
         },
     }
-    canvases = {"canvas": canvas, "accepted_label_canvases": list(accepted_canvases)}
+    canvases = {
+        "canvas": canvas,
+        "accepted_label_canvases": list(accepted_canvases),
+        "labels_moved_from": list(moved_from),
+    }
     for name, document in (
         ("phase_decision_policy.json", policy),
         ("cross_validation.json", cross_validation),

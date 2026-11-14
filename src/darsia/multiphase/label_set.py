@@ -8,11 +8,19 @@ training samples a set only on the canvas of its images, or by the caller's
 explicit choice, since a set drawn on another canvas would label the wrong pixels
 or colours without notice.
 
+Labels are classes, not colours. A set therefore moves between two corrected
+canvases of one rig, e.g. from camera JPEGs to raw photographs, to another pixel
+size or another lens model, by the geometry of their grids alone
+(:func:`move_labels`).
+
 """
 
 from dataclasses import dataclass
 
 import numpy as np
+
+from darsia.image.coordinatesystem import pixel_centres
+from darsia.image.image import ScalarImage
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,9 @@ class LabelSet:
     canvas: dict | None
     """The canvas the regions are drawn on (``Rig.canvas``); None for a set that
     records none, e.g. a delivered one."""
+    moved_from: dict | None = None
+    """The canvas the set was moved from by :func:`move_labels`; None if it was
+    drawn on its canvas."""
 
 
 def _settings(record: dict, prefix: str = "") -> dict:
@@ -85,4 +96,72 @@ def canvas_differences(canvas: dict | None, other: dict | None) -> list[str]:
         name
         for name in first.keys() | second.keys()
         if name not in first or name not in second or first[name] != second[name]
+    )
+
+
+def _grid_image(grid: dict) -> ScalarImage:
+    """An image on a corrected grid, with the grid's coordinates."""
+    return ScalarImage(
+        np.zeros(grid["shape"], np.uint8),
+        dimensions=grid["dimensions"],
+        origin=grid["origin"],
+    )
+
+
+def move_labels(labels: LabelSet, canvas: dict) -> LabelSet:
+    """Move a label set onto another corrected canvas of the same rig.
+
+    Both grids are in rig metres. Each pixel centre of the new grid
+    (:func:`darsia.pixel_centres`) takes the label of the pixel of the set's grid
+    that holds it (nearest neighbour), and is unlabelled outside that grid. The
+    regions and their phase classes are kept, so a move between the formats, pixel
+    sizes or lens models of one rig is geometry alone.
+
+    Parameters
+    ----------
+    labels : LabelSet
+        Label set on a corrected canvas.
+    canvas : dict
+        Corrected canvas to move the set onto (``Rig.canvas``).
+
+    Returns
+    -------
+    LabelSet
+        The regions with their masks on the new canvas, recording the canvas
+        they came from.
+
+    Raises
+    ------
+    ValueError
+        If either canvas has no grid in rig metres. Labels on a camera frame, or
+        on a crop in pixels, must first be placed on a canvas in rig metres with
+        the rig's mapping (lens model and registration), which this function
+        does not do.
+
+    """
+    grids = [record and record["grid"] for record in (labels.canvas, canvas)]
+    if not all(grids):
+        raise ValueError(
+            "Labels move only between canvases in rig metres; labels on a camera "
+            "frame or a crop in pixels must first be placed on such a canvas with "
+            "the rig's mapping (lens model and registration)."
+        )
+    source, target = (_grid_image(grid) for grid in grids)
+    x, y = pixel_centres(target)
+    # The grids share the rig's axes, so the pixel centres along one axis of the
+    # new grid give the source pixels along that axis.
+    rows = np.column_stack((np.full_like(y, x[0]), y))
+    cols = np.column_stack((x, np.full_like(x, y[0])))
+    picked, inside = [], []
+    for axis, centres in enumerate((rows, cols)):
+        index = source.coordinatesystem.voxel(centres)[:, axis]
+        size = source.img.shape[axis]
+        picked.append(np.clip(index, 0, size - 1))
+        inside.append((index >= 0) & (index < size))
+    keep = np.outer(*inside)
+    return LabelSet(
+        labels.regions,
+        [mask[np.ix_(*picked)] & keep for mask in labels.masks],
+        canvas,
+        moved_from=labels.canvas,
     )
