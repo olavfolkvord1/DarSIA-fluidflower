@@ -99,6 +99,48 @@ def canvas_differences(canvas: dict | None, other: dict | None) -> list[str]:
     )
 
 
+def check_canvas(
+    recorded: dict | None, canvas: dict | None, *, accept: bool, subject: str
+) -> bool:
+    """Check the canvas recorded by labels or a model against the images' canvas.
+
+    A recorded canvas equal to the images' passes. One that differs, or is not
+    recorded, passes only by the caller's explicit choice.
+
+    Parameters
+    ----------
+    recorded : dict or None
+        Canvas recorded by a label set or a phase model; None if not recorded.
+    canvas : dict or None
+        Canvas of the images (``Rig.canvas``).
+    accept : bool
+        Whether the caller accepts a canvas that differs or is not recorded.
+    subject : str
+        What recorded the canvas, for the message, e.g. "the labels".
+
+    Returns
+    -------
+    bool
+        Whether the canvas differs and was accepted, so the caller can record it.
+
+    Raises
+    ------
+    ValueError
+        If the canvas differs or is not recorded and is not accepted; the message
+        names the differing settings.
+
+    """
+    if recorded is not None and recorded == canvas:
+        return False
+    if not accept:
+        raise ValueError(
+            f"The canvas of {subject} differs from the images' canvas; differing "
+            f"settings: {', '.join(canvas_differences(recorded, canvas))}. "
+            "Accept it explicitly only if this is intended."
+        )
+    return True
+
+
 def _grid_image(grid: dict) -> ScalarImage:
     """An image on a corrected grid, with the grid's coordinates."""
     return ScalarImage(

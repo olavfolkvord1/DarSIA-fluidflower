@@ -8,8 +8,8 @@ and written as a folder that :func:`~darsia.read_phase_model` reads.
 The samples of a frame come from a label set (:class:`~darsia.LabelSet`) drawn on
 the canvas of the frame's images, the rig's. A set drawn on another canvas, or
 recording none, is sampled only by the caller's explicit choice, which the
-samples record; samples of different canvases are not joined. The model folder
-records the canvas and the accepted ones.
+samples record; samples of different canvases are not joined. The model takes
+the samples' canvas, and its folder records it with the accepted ones.
 
 A labelled region has a phase class. For each of the two heads (CO2 presence,
 and free gas within the CO2) a class gives a pixel target, a regional target, or
@@ -45,7 +45,12 @@ from pathlib import Path
 import numpy as np
 
 import darsia
-from darsia.multiphase.label_set import LabelledRegion, LabelSet, canvas_differences
+from darsia.multiphase.label_set import (
+    LabelledRegion,
+    LabelSet,
+    canvas_differences,
+    check_canvas,
+)
 from darsia.multiphase.phase_model import (
     PHASE_FEATURE_NAMES,
     LogisticHead,
@@ -219,15 +224,10 @@ def frame_samples(
         :data:`PHASE_CLASSES`.
 
     """
-    accepted = ()
-    if labels.canvas is None or labels.canvas != canvas:
-        if not accept_canvas:
-            raise ValueError(
-                "The labels are drawn on another canvas than the images; differing "
-                f"settings: {', '.join(canvas_differences(labels.canvas, canvas))}. "
-                "Move them onto the images' canvas, or accept theirs explicitly."
-            )
-        accepted = (labels.canvas,)
+    differs = check_canvas(
+        labels.canvas, canvas, accept=accept_canvas, subject="the labels"
+    )
+    accepted = (labels.canvas,) if differs else ()
     moved = () if labels.moved_from is None else (labels.moved_from,)
     features = PhaseFeatures(
         current,
@@ -916,7 +916,7 @@ def train_phase_model(
     module description) and fitted on all runs with a regional target of the
     head at the selected regularization; the threshold of its held-out region
     scores is its decision threshold. The model takes the samples' texture
-    scale and the gas head's threshold.
+    scale and canvas, and the gas head's threshold.
 
     Parameters
     ----------
@@ -938,6 +938,7 @@ def train_phase_model(
             gas_within_co2=fits["gas_within_co2"][0],
             texture_sigma_mm=samples.texture_sigma_mm,
             gas_threshold=fits["gas_within_co2"][1],
+            canvas=samples.canvas,
         ),
         co2_threshold=fits["co2_presence"][1],
         cross_validation={head: fit[2] for head, fit in fits.items()},
