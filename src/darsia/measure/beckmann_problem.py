@@ -9,9 +9,39 @@ from typing import Optional
 
 import numpy as np
 import scipy.sparse as sps
+from scipy import ndimage
 from scipy.stats import hmean
 
 import darsia
+
+_PART_BALANCE_RTOL = 1e-5
+"""Relative tolerance to which each part of a transport region must hold the same
+mass in both distributions."""
+
+
+def transport_components(region: np.ndarray) -> tuple[np.ndarray, int]:
+    """The face-connected parts of a transport region.
+
+    Two cells belong to one part when a chain of region cells joins them through
+    shared faces (4 neighbours in 2D, 6 in 3D); cells sharing only a corner are not
+    connected, since flux crosses faces only.
+
+    Parameters
+    ----------
+    region : np.ndarray
+        Boolean mask of the cells that take part in transport.
+
+    Returns
+    -------
+    tuple
+        Labels (0 outside the region, 1 to n inside) and the number of parts n.
+
+    """
+    region = np.asarray(region, dtype=bool)
+    labels, count = ndimage.label(
+        region, structure=ndimage.generate_binary_structure(region.ndim, 1)
+    )
+    return labels, int(count)
 
 
 class L1Mode(StrEnum):
@@ -96,6 +126,9 @@ class BeckmannProblem(darsia.EMD):
                 aa_restart (int)             None    Anderson acceleration restart
                 regularization (float)       eps     avoid division by zero
                 lumping (bool)               True    lump the mass matrix
+                region (np.ndarray of bool)  None    cells that take part in
+                    transport; a face touching any other cell carries no flux
+                    (see _setup_region)
         """
         # Cache geometrical infos
         self.grid = grid
@@ -125,6 +158,7 @@ class BeckmannProblem(darsia.EMD):
         # Setup of method
         self._setup_dof_management()
         self._setup_l1_quadrature()
+        self._setup_region()
         self._setup_face_weights()
         self._setup_discretization()
         self._setup_linear_solver()
@@ -234,8 +268,84 @@ class BeckmannProblem(darsia.EMD):
         self.quad_weights = quad_weights
         """np.ndarray: quadrature weights in reference cell"""
 
+    def _setup_region(self) -> None:
+        """Cells that take part in transport, from the option ``region``.
+
+        Without a region, or with one that holds every cell, every inner face of
+        the grid carries flux, as before. Otherwise only faces between two cells of
+        the region do: a face touching a cell outside it drops out of the
+        divergence, so no flux leaves the region and no path crosses its boundary,
+        whatever the weights (a finite penalty weight would still allow such a
+        path). Pressures outside the region are decoupled (p = 0), and each
+        face-connected part of the region gets its own gauge (see
+        _region_operators), so each part must hold the same mass in both
+        distributions (see _check_region_masses).
+
+        """
+        region = self.options.get("region")
+        self.region = None
+        """np.ndarray or None: cells that take part in transport; None means all"""
+        if region is None:
+            return
+        region = np.asarray(region)
+        if region.dtype != bool or region.shape != tuple(self.grid.shape):
+            raise ValueError("A transport region is a boolean mask of the grid's cells")
+        if not region.any():
+            raise ValueError("A transport region needs at least one cell")
+        if region.all():
+            return
+        self.region = region.copy()
+        flat = np.ravel(region, "F")
+        self.open_faces = (
+            flat[self.grid.connectivity[:, 0]] & flat[self.grid.connectivity[:, 1]]
+        )
+        """np.ndarray: faces between two region cells; every other face carries no
+        flux"""
+        self.region_parts = transport_components(region)
+        """tuple: labels of the region's face-connected parts (0 outside) and their
+        count"""
+
+    def _check_region_masses(self, mass_1: np.ndarray, mass_2: np.ndarray) -> None:
+        """Refuse masses that the transport region cannot move.
+
+        Mass outside the region has no path, and each face-connected part of the
+        region moves only its own mass, so each part must hold the same mass in
+        both distributions, to a relative ``_PART_BALANCE_RTOL``.
+
+        Parameters
+        ----------
+        mass_1, mass_2 : np.ndarray
+            Cell values of the two distributions.
+
+        """
+        if np.any(mass_1[~self.region] != 0) or np.any(mass_2[~self.region] != 0):
+            raise ValueError(
+                "Mass lies outside the transport region, where it cannot move"
+            )
+        labels, count = self.region_parts
+        sum_1, sum_2 = (
+            np.bincount(
+                labels.ravel(),
+                weights=np.asarray(mass, float).ravel(),
+                minlength=count + 1,
+            )[1:]
+            for mass in (mass_1, mass_2)
+        )
+        if not np.allclose(sum_1, sum_2, rtol=_PART_BALANCE_RTOL, atol=0.0):
+            raise ValueError(
+                "The parts of the transport region hold different masses, and no mass "
+                f"can cross between them: {sum_1.tolist()} and {sum_2.tolist()}"
+            )
+
     def _setup_face_weights(self) -> None:
-        """Convert cell weights to face weights by harmonic averaging."""
+        """Convert cell weights to face weights by harmonic averaging.
+
+        With a transport region, the cells outside it carry no flux, so their weight
+        enters no distance; they take the stand-in 1, which keeps their decoupled
+        face equations finite. Inside, every weight must be finite, and a scalar
+        weight positive.
+
+        """
 
         if self.weight is None:
             self.cell_weights = np.ones(self.grid.shape, dtype=float)
@@ -244,6 +354,22 @@ class BeckmannProblem(darsia.EMD):
             """np.ndarray: face weights"""
         else:
             self.cell_weights = self.weight.img
+            if self.region is not None:
+                values = np.asarray(self.weight.img)
+                inside = np.broadcast_to(
+                    self.region.reshape(
+                        self.region.shape + (1,) * (values.ndim - self.region.ndim)
+                    ),
+                    values.shape,
+                )
+                if not np.all(np.isfinite(values[inside])) or (
+                    values.ndim == self.region.ndim and np.any(values[inside] <= 0)
+                ):
+                    raise ValueError(
+                        "The weight must be finite and positive on every cell of the "
+                        "transport region"
+                    )
+                self.cell_weights = np.where(inside, values, 1.0)
             self.face_weights = self._harmonic_average(self.cell_weights)
 
     def _setup_discretization(self) -> None:
@@ -273,6 +399,11 @@ class BeckmannProblem(darsia.EMD):
         self.div = darsia.FVDivergence(self.grid).mat
         """sps.csc_matrix: divergence operator: flat fluxes -> flat pressures"""
 
+        self.pressure_block = None
+        """sps.csc_matrix or None: pressure-pressure block; None without a region"""
+        if self.region is not None:
+            self.div, self.pressure_block = self._region_operators(self.div)
+
         self.mass_matrix_cells = darsia.FVMass(self.grid).mat
         """sps.csc_matrix: mass matrix on cells: flat pressures -> flat pressures"""
 
@@ -287,7 +418,7 @@ class BeckmannProblem(darsia.EMD):
         self.broken_darcy = sps.bmat(
             [
                 [None, -self.div.T, None],
-                [self.div, None, -self.pressure_constraint.T],
+                [self.div, self.pressure_block, -self.pressure_constraint.T],
                 [None, self.pressure_constraint, None],
             ],
             format="csc",
@@ -318,11 +449,46 @@ class BeckmannProblem(darsia.EMD):
         return sps.bmat(
             [
                 [flux_flux_block, -self.div.T, None],
-                [self.div, None, -self.pressure_constraint.T],
+                [self.div, self.pressure_block, -self.pressure_constraint.T],
                 [None, self.pressure_constraint, None],
             ],
             format="csc",
         )
+
+    def _region_operators(self, div: sps.csc_matrix) -> tuple:
+        """The divergence without blocked faces, and the region's pressure gauges.
+
+        A blocked face (touching a cell outside the region) drops out of the
+        divergence, so its flux is decoupled and stays zero. A cell outside the
+        region then has no flux at all and gets the pressure equation p = 0. The
+        pressure of each face-connected part of the region is defined only up to a
+        constant, so its first cell (in the solver's flat order) gets a gauge,
+        except in the part holding the cell that the Lagrange multiplier fixes.
+        With balanced parts the gauged pressures are zero and every mass
+        conservation equation holds.
+
+        Parameters
+        ----------
+        div : sps.csc_matrix
+            Divergence operator of the full grid.
+
+        Returns
+        -------
+        tuple
+            Divergence with the blocked faces removed, and the diagonal
+            pressure-pressure block of the gauges.
+
+        """
+        masked = (div @ sps.diags(self.open_faces.astype(float), format="csc")).tocsc()
+        masked.eliminate_zeros()
+        flat = np.ravel(self.region_parts[0], "F")
+        gauge = flat == 0
+        fixed = flat[self.constrained_cell_flat_index]
+        parts, first = np.unique(flat, return_index=True)
+        for part, index in zip(parts, first):
+            if part != 0 and part != fixed:
+                gauge[index] = True
+        return masked, sps.diags(gauge.astype(float), format="csc")
 
     def _setup_face_reconstruction(self) -> None:
         """Setup of face reconstruction via RT0 basis functions and arithmetic avg.
@@ -407,6 +573,8 @@ class BeckmannProblem(darsia.EMD):
         # Compatibilty check
         assert img_1.scalar and img_2.scalar
         self._compatibility_check(img_1, img_2)
+        if self.region is not None:
+            self._check_region_masses(img_1.img, img_2.img)
 
         # Determine difference of distributions and define corresponding rhs
         mass_diff_img = img_2.img - img_1.img

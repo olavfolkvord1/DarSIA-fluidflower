@@ -112,13 +112,8 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         shrink_factor = face_weights_inv
 
         # Update the Darcy system
-        l_scheme_mixed_darcy = sps.bmat(
-            [
-                [weight @ self.mass_matrix_faces, -self.div.T, None],
-                [self.div, None, -self.pressure_constraint.T],
-                [None, self.pressure_constraint, None],
-            ],
-            format="csc",
+        l_scheme_mixed_darcy = self.broken_darcy_with_custom_flux_block(
+            weight @ self.mass_matrix_faces
         )
 
         return l_scheme_mixed_darcy, weight, shrink_factor
@@ -183,13 +178,8 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         shrink_factor = self.L / self.face_weights
 
         # Initialize linear problem corresponding to Bregman regularization
-        l_scheme_mixed_darcy = sps.bmat(
-            [
-                [weight @ self.mass_matrix_faces, -self.div.T, None],
-                [self.div, None, -self.pressure_constraint.T],
-                [None, self.pressure_constraint, None],
-            ],
-            format="csc",
+        l_scheme_mixed_darcy = self.broken_darcy_with_custom_flux_block(
+            weight @ self.mass_matrix_faces
         )
 
         # Initialize Bregman variables
