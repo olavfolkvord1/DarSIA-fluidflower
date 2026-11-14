@@ -509,3 +509,45 @@ def test_a_rig_saved_again_without_a_grid_has_no_pixel_areas(tmp_path):
     loaded = Rig()
     loaded.load_corrections(tmp_path / "rig")
     assert loaded.pixel_area is None
+
+
+def test_a_rig_saved_again_drops_obsolete_split_corrections(tmp_path):
+    """Re-saving keeps only the current pipelines and leaves unrelated files alone."""
+    rig = Rig()
+    rig.baseline_path = tmp_path / "baseline.npz"
+    rig.baseline = darsia.OpticalImage(np.ones((4, 5, 3)), color_space="RGB")
+    i, j = np.mgrid[0:4, 0:5].astype(np.float32)
+    mapping = darsia.ImageMappingCorrection(
+        j, i, source_shape=(4, 5), dimensions=[0.4, 0.5]
+    )
+    rig.shape_corrections = [darsia.TypeCorrection(np.float32), mapping]
+    rig.color_corrections = [
+        darsia.MaterialIlluminationCorrection(
+            np.zeros((6, 3)), {}, np.zeros((4, 5), dtype=int), (4, 5)
+        )
+    ]
+    folder = tmp_path / "rig"
+    with pytest.warns(UserWarning):
+        rig.save(folder)
+    before = Rig()
+    before.load_corrections(folder)
+    assert len(before.shape_corrections) == 2
+    assert len(before.color_corrections) == 1
+    unrelated = folder / "unrelated.npz"
+    unrelated.write_bytes(b"unrelated saved data")
+
+    # Removing the first correction also changes the mapping's saved index.
+    rig.shape_corrections = [mapping]
+    rig.color_corrections = []
+    with pytest.warns(UserWarning):
+        rig.save(folder)
+
+    loaded = Rig()
+    loaded.load_corrections(folder)
+    assert len(loaded.shape_corrections) == 1
+    assert isinstance(loaded.shape_corrections[0], darsia.ImageMappingCorrection)
+    assert loaded.color_corrections == []
+    assert unrelated.read_bytes() == b"unrelated saved data"
+    np.testing.assert_array_equal(
+        loaded.shape_corrections[0](rig.baseline).img, mapping(rig.baseline).img
+    )
