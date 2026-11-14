@@ -1,6 +1,10 @@
 """Unit tests for reading colour changes along colour paths without a cap."""
 
+import dataclasses
+import tomllib
+
 import numpy as np
+import pytest
 
 import darsia
 
@@ -73,3 +77,59 @@ def test_each_sand_is_read_on_its_own_path_inside_the_dissolved_co2():
     # A pixel's signal does not depend on which other pixels are dissolved.
     more = reading(current, baseline, support, dissolved | ~dissolved, facies)
     np.testing.assert_array_equal(more[dissolved], signal[dissolved])
+
+
+RANGES = darsia.ColorRangeSettings(
+    **tomllib.loads(
+        """
+        # Our production's recipe (31, 16 and 30 pixels; at least 3,000 and 500
+        # pixels) on the sand plane of the two runs it measured, pixels of
+        # 0.0279495 and 0.0279564 mm²: 2,999.9 and 2,999.1 pixels inside, 499.47
+        # and 499.35 beside the gas, so that a count passes as in production.
+        [color_ranges]
+        mean_mm = 5.18
+        inner_mm = 2.67
+        gas_mm = 5.0
+        minimum_inner_mm2 = 83.845
+        minimum_gas_mm2 = 13.96
+        gas_percentile = 90.0
+        """
+    )["color_ranges"]
+)
+
+
+def test_the_colour_range_is_the_change_beside_the_free_gas():
+    shape = (80, 100)  # 0.5 mm pixels
+    sand_map = darsia.ScalarImage(np.ones(shape, np.uint8), dimensions=[0.04, 0.05])
+    baseline = np.full((*shape, 3), 0.3)
+    phase = np.zeros(shape, np.uint8)
+    phase[10:70, 10:90] = darsia.PhaseLabel.DISSOLVED
+    phase[36:44, 46:54] = darsia.PhaseLabel.GAS
+    support = np.ones(shape, bool)
+    end = KNOTS[2]
+
+    rules = np.zeros(shape, np.uint8)
+
+    def run(*reached, phase=phase, rules=rules):
+        frames = [(baseline + t * end, phase, rules, support) for t in reached]
+        return frames, baseline, sand_map, (0.5e-3, 0.5e-3), {1: _signal()}
+
+    ranges = darsia.color_ranges([run(0.5, 1.0), run(1.4, 0.7)], RANGES)
+
+    np.testing.assert_allclose(ranges[1], 1.2 * np.linalg.norm(end), rtol=1e-6)
+
+    # The model's gas that a peel made dissolved CO2 is free gas here too.
+    gas = phase == darsia.PhaseLabel.GAS
+    peeled = np.where(gas, darsia.PhaseLabel.DISSOLVED, phase).astype(np.uint8)
+    rule = np.where(gas, darsia.PhaseRule.PEELED, 0).astype(np.uint8)
+    model = [run(*t, phase=peeled, rules=rule) for t in ((0.5, 1.0), (1.4, 0.7))]
+    assert darsia.color_ranges(model, RANGES) == ranges
+
+    # A length that rounds to zero pixels takes no step (SciPy repeats a zero until
+    # nothing changes): no erosion, and no pixel beside the free gas.
+    no_depth = darsia.color_ranges(
+        [run(0.5, 1.0), run(1.4, 0.7)], dataclasses.replace(RANGES, inner_mm=0.2)
+    )
+    np.testing.assert_allclose(no_depth[1], ranges[1], rtol=1e-6)
+    with pytest.raises(ValueError, match="No positive colour range"):
+        darsia.color_ranges([run(1.0)], dataclasses.replace(RANGES, gas_mm=0.2))
