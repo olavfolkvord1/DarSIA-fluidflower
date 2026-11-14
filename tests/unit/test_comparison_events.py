@@ -1,0 +1,176 @@
+"""Unit tests for the events of analysis domains on a synthetic run."""
+
+import csv
+import tomllib
+from dataclasses import replace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from darsia.presets.workflows.analysis.domain_mass import RunSeries, write_domain_mass
+from darsia.presets.workflows.comparison.comparison_events import (
+    EventQuestion,
+    question_states,
+    run_answer,
+)
+
+QUESTIONS = {
+    row["name"]: EventQuestion(**row)
+    for row in tomllib.loads(
+        """
+        # Questions about the free gas of a box over a run: when it arrives, when it
+        # reaches a share of the injected CO2, falls below a mass it reached, peaks
+        # and is gone.
+        [[question]]
+        name = "arrival"
+        conditions = [{component = "gas", event = "detected", domain_id = "box2"}]
+
+        [[question]]
+        name = "share"
+        [[question.conditions]]
+        component = "gas"
+        event = "reaches"
+        domain_id = "box2"
+        threshold = 15.0
+        unit = "percent_injected"
+
+        [[question]]
+        name = "falls"
+        [[question.conditions]]
+        component = "gas"
+        event = "falls_below"
+        domain_id = "box2"
+        threshold = 0.05
+        unit = "g"
+
+        [[question]]
+        name = "peak"
+        conditions = [{component = "gas", event = "maximum", domain_id = "box2"}]
+
+        [[question]]
+        name = "gone"
+        conditions = [{component = "gas", event = "gone", domain_id = "box2"}]
+        """
+    )["question"]
+}
+HOURS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+GAS = [0.0, 0.0, 0.01, 0.05, 0.08, 0.06, 0.0, 0.0]
+INJECTED = [0.0, 0.1, 0.2, 0.3, 0.4, 0.4, 0.4, 0.4]
+INJECTIONS = pd.DataFrame(
+    {"number": [1, 2], "start_h": [0.0, 1.0], "end_h": [1.0, 2.0]}
+)
+
+
+def series(dtype=np.float64, gas=GAS, **masses):
+    """The synthetic run: free gas in box2 that arrives, peaks and leaves."""
+    values = {"gas": np.asarray(gas, dtype), **masses}
+    return RunSeries(
+        run="run",
+        case_ids=tuple(f"run-{n}" for n in range(len(HOURS))),
+        elapsed_h=np.asarray(HOURS, dtype),
+        injected_g=np.asarray(INJECTED, dtype),
+        masses={"box2": values},
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_the_events_of_a_synthetic_run(dtype):
+    """Arrival, a share of the injected CO2, falling below a mass reached, the peak
+    and the end, each at its frame, in single and double precision."""
+    run = series(dtype)
+    found = {name: run_answer(q, run, INJECTIONS) for name, q in QUESTIONS.items()}
+
+    frames = {name: answer.case_id for name, answer in found.items()}
+    assert frames == {
+        "arrival": "run-2",
+        "share": "run-3",
+        "falls": "run-6",
+        "peak": "run-4",
+        "gone": "run-6",
+    }
+    arrival = found["arrival"]
+    assert (arrival.elapsed_h, arrival.resolution_h) == (1.0, 0.5)
+    assert (arrival.injection, arrival.after_injection_h) == (2, 0.0)
+    assert found["share"].note == "" and found["falls"].after_injection_h == 3.0
+
+
+def test_unknown_frames_are_neither_true_nor_false(tmp_path):
+    """A domain that is not complete at a frame is unknown there with complete
+    masses: an answer after it says so, a question never found says why, and a
+    share of the injected CO2 is never reached before anything is injected."""
+    rows = [
+        dict(
+            run="run",
+            case_id=f"run-{n}",
+            elapsed_h=hours,
+            domain_id="box2",
+            gas_mass_g=None if n == 1 else gas,
+            gas_quantified_mass_g=gas,
+            total_mass_g=None,
+            total_quantified_mass_g=gas,
+            aqueous_mass_g=0.0,
+            aqueous_quantified_mass_g=0.0,
+        )
+        for n, (hours, gas) in reversed(list(enumerate(zip(HOURS, GAS))))
+    ]
+    path = tmp_path / "domain_mass.csv"
+    write_domain_mass(path, rows)
+    with path.open(encoding="utf-8") as stream:
+        table = list(csv.DictReader(stream))
+    injected = dict(zip((f"run-{n}" for n in range(8)), INJECTED))
+    complete = RunSeries.from_domain_mass(table, injected, "complete")
+    quantified = RunSeries.from_domain_mass(table, injected, "quantified")
+
+    assert complete.case_ids == series().case_ids
+    assert question_states(QUESTIONS["arrival"], complete)[:3].tolist() == [0, 0.5, 1]
+    after = run_answer(QUESTIONS["arrival"], complete)
+    assert (after.note, after.resolution_h) == ("1 earlier frame(s) unknown", None)
+    assert run_answer(QUESTIONS["arrival"], quantified).note == ""
+    total = EventQuestion(
+        "total", [dict(component="total", event="detected", domain_id="box2")]
+    )
+    assert run_answer(total, complete).note == "Not found; some frames are unknown"
+    early = replace(QUESTIONS["share"].conditions[0], threshold=0.0)
+    assert run_answer(EventQuestion("early", [early]), quantified).case_id == "run-1"
+
+
+def test_thresholds_are_not_rounded_to_the_masses_precision():
+    """A threshold just above a single-precision mass is not reached, in grams or
+    in percent of the injected CO2."""
+    run = series(np.float32, gas=np.ones(8))
+    run = RunSeries(
+        run.run, run.case_ids, run.elapsed_h, np.ones(8, np.float32), run.masses
+    )
+    above = 1 + 2**-25
+    for threshold, unit in ((above, "g"), (100 * above, "percent_injected")):
+        condition = dict(component="gas", event="reaches", domain_id="box2")
+        condition.update(threshold=threshold, unit=unit)
+        assert run_answer(EventQuestion("q", [condition]), run).case_id is None
+
+
+def test_conditions_combine_and_hold_with_the_noise_filter():
+    """Conditions combine with and and or; the noise limit and frames in a row
+    filter flickering mass."""
+    gas = [0.0, 0.002, 0.0, 0.01, 0.0, 0.02, 0.03, 0.03]
+    run = series(gas=gas, aqueous=np.asarray([0.0, 0, 0, 0, 0.2, 0.3, 0.3, 0.3]))
+    arrival = dict(component="gas", event="detected", domain_id="box2")
+    dissolved = dict(component="aqueous", event="detected", domain_id="box2")
+
+    def first(**settings):
+        return run_answer(EventQuestion("q", **settings), run).case_id
+
+    assert first(conditions=[arrival]) == "run-1"
+    assert first(conditions=[arrival], noise_min=0.005) == "run-3"
+    share = dict(noise_min=5.0, noise_unit="percent_injected")
+    assert first(conditions=[arrival], **share) == "run-6"
+    assert first(conditions=[arrival], hold_frames=2) == "run-5"
+    assert first(conditions=[arrival, dissolved], noise_min=0.005) == "run-5"
+    assert (
+        first(conditions=[arrival, dissolved], combine="any", noise_min=0.05) == "run-4"
+    )
+    assert first(conditions=[arrival], hold_frames=4) is None
+    gone = dict(arrival, event="gone")
+    assert first(conditions=[gone]) is None
+    held = question_states(EventQuestion("q", [arrival], hold_frames=4), run)
+    assert held[-3:].tolist() == [0.5, 0.5, 0.5]
