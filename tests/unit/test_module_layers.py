@@ -38,6 +38,7 @@ MODULES = [
     "darsia/multiphase/unknown_mass.py",
     "darsia/presets/workflows/analysis/domains.py",
     "darsia/presets/workflows/analysis/domain_mass.py",
+    "darsia/presets/workflows/comparison/comparison_events.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
