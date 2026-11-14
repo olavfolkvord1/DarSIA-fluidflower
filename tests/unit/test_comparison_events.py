@@ -8,11 +8,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import darsia
 from darsia.presets.workflows.analysis.domain_mass import RunSeries, write_domain_mass
 from darsia.presets.workflows.comparison.comparison_events import (
+    COLUMNS,
     EventQuestion,
+    event_table,
+    injection_answers,
     question_states,
     run_answer,
+    write_events,
 )
 
 QUESTIONS = {
@@ -72,6 +77,39 @@ def series(dtype=np.float64, gas=GAS, **masses):
         injected_g=np.asarray(INJECTED, dtype),
         masses={"box2": values},
     )
+
+
+def test_injections_are_each_ports_consecutive_steps(tmp_path):
+    """Steps at one port are one injection, numbered in start order, in hours since
+    the first step's start; a step at another port starts the next one."""
+    path = tmp_path / "injection.csv"
+    pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "location_x": [0.45, 0.45, 0.74, 0.45],
+            "location_y": [0.02, 0.02, 0.16, 0.02],
+            "start": [
+                "2023-01-31 09:51:00",
+                "2023-01-31 09:50:00",
+                "2023-01-31 10:20:00",
+                "2023-01-31 11:00:00",
+            ],
+            "end": [
+                "2023-01-31 10:05:00",
+                "2023-01-31 09:51:00",
+                "2023-01-31 11:00:00",
+                "2023-01-31 11:30:00",
+            ],
+            "rate_g/min": [0.1, 0.05, 0.1, 0.1],
+        }
+    ).to_csv(path, index=False)
+
+    injections = darsia.InjectionProtocol(path).injections()
+
+    assert injections["number"].tolist() == [1, 2, 3]
+    assert injections["location_x"].tolist() == [0.45, 0.74, 0.45]
+    assert injections["start_h"].tolist() == [0.0, 0.5, 70 / 60]
+    assert injections["end_h"].tolist() == [0.25, 70 / 60, 100 / 60]
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -174,3 +212,36 @@ def test_conditions_combine_and_hold_with_the_noise_filter():
     assert first(conditions=[gone]) is None
     held = question_states(EventQuestion("q", [arrival], hold_frames=4), run)
     assert held[-3:].tolist() == [0.5, 0.5, 0.5]
+
+
+def test_answers_per_injection_count_from_each_start(tmp_path):
+    """Each injection's answer is the first frame in its time, counted from its
+    start; a question that already holds is answered at its first frame, and an
+    injection without a frame says so. The table holds both modes."""
+    run = series()
+    injections = pd.DataFrame(
+        {"number": [1, 2, 3], "start_h": [0.0, 1.0, 9.0], "end_h": [1.0, 2.0, 9.5]}
+    )
+    answers = injection_answers(QUESTIONS["arrival"], run, injections)
+
+    assert [a.case_id for a in answers] == [None, "run-2", None]
+    assert answers[0].note == "Never in this injection's time"
+    assert answers[2].note == "No frame in this injection's time"
+    held = injection_answers(QUESTIONS["share"], run, injections.iloc[[0, 1]])
+    assert (held[1].case_id, held[1].after_injection_h) == ("run-3", 0.5)
+    boundary = pd.DataFrame({"number": [1, 2], "start_h": [0.0, 1.5]})
+    late = injection_answers(QUESTIONS["arrival"], run, boundary)[1]
+    assert (late.case_id, late.resolution_h) == ("run-3", None)
+
+    rows = event_table([QUESTIONS["arrival"]], [run], {"run": injections})
+    path = tmp_path / "events.csv"
+    write_events(path, rows)
+    with path.open(encoding="utf-8") as stream:
+        table = list(csv.DictReader(stream))
+    assert list(table[0]) == list(COLUMNS)
+    assert [(r["mode"], r["injection"], r["case_id"]) for r in table] == [
+        ("run", "3", "run-2"),
+        ("injection", "1", ""),
+        ("injection", "2", "run-2"),
+        ("injection", "3", ""),
+    ]
