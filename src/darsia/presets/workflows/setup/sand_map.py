@@ -26,6 +26,7 @@ pixel centres at whole numbers), and gives the layer of each pixel:
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -119,6 +120,36 @@ def rig_grid(grid: darsia.Image) -> np.ndarray:
     x, y = darsia.pixel_centres(grid)
     dy, dx = grid.voxel_size
     return np.array([[1 / dx, 0, -x[0] / dx], [0, -1 / dy, y[0] / dy], [0, 0, 1]])
+
+
+def grid_homographies(
+    grid_to_rig: Sequence[Sequence[float]] | np.ndarray | None,
+    grid: darsia.Image | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A run grid's homographies between its pixel coordinates (column, row, 1)
+    and rig metres: its measured model and the model's inverse where the run has
+    one (``[labeling.sand_map] grid_to_rig``), else those of a grid in rig metres
+    (:func:`rig_grid`), in double precision.
+
+    Parameters
+    ----------
+    grid_to_rig : array, optional
+        The run's measured homography from its grid's pixels to rig metres.
+    grid : darsia.Image, optional
+        An image on the run's grid; needed without a model.
+
+    Returns
+    -------
+    tuple of arrays
+        The homography from the grid's pixels to rig metres, and from rig metres
+        to the grid's pixels.
+
+    """
+    if grid_to_rig is None:
+        to_grid = rig_grid(grid)
+        return np.linalg.inv(to_grid), to_grid
+    to_rig = np.asarray(grid_to_rig, dtype=float)
+    return to_rig, np.linalg.inv(to_rig)
 
 
 def _project(points: np.ndarray, rig_to_grid: np.ndarray) -> np.ndarray:
