@@ -50,7 +50,7 @@ class VolumeAveraging:
         rev : REV
             Representative elementary volume.
         mask : Image
-            Mask.
+            Mask; a floating mask is averaged in its own dtype.
         labels : Image
             Labels; activating heterogeneous analysis, if not None.
         """
@@ -61,7 +61,9 @@ class VolumeAveraging:
         self.labels = labels
         """Labels."""
         self.mean_pore_volume = self._heterogeneous_uniform_filter(
-            self.mask.astype(float).img
+            self.mask.img
+            if np.issubdtype(self.mask.img.dtype, np.floating)
+            else self.mask.img.astype(float)
         )
         """Mean pore volume."""
         tol = 1e-12

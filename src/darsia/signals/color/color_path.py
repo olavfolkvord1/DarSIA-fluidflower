@@ -470,7 +470,8 @@ class ColorPath:
         """Parametrize colors in terms of the color path.
 
         Apply brute-force minimization to find the closest color representation
-        on the path for each pixel in the image.
+        on the path for each pixel in the image. Floating colors are parametrized
+        in their own dtype.
 
         Parameters
         ----------
@@ -482,18 +483,23 @@ class ColorPath:
         np.ndarray
             Parametrization of the input image in terms of the color path.
         """
+        dtype = colors.dtype if np.issubdtype(colors.dtype, np.floating) else float
+
         # Fetch the right supports
-        supports = (
-            self.colors
-            if color_mode == darsia.ColorMode.ABSOLUTE
-            else self.relative_colors
+        supports = np.asarray(
+            (
+                self.colors
+                if color_mode == darsia.ColorMode.ABSOLUTE
+                else self.relative_colors
+            ),
+            dtype=dtype,
         )
 
         # Fetch the distances along the path
         if mode == "equidistant":
-            distances = self.equidistant_distances
+            distances = np.asarray(self.equidistant_distances, dtype=dtype)
         elif mode == "relative":
-            distances = self.relative_distances
+            distances = np.asarray(self.relative_distances, dtype=dtype)
         else:
             raise ValueError(f"Unknown mode '{mode}' for color path parametrization.")
 
@@ -555,7 +561,7 @@ class ColorPath:
             min_distances[mask] = distances[mask]
 
         # Finalize minimization by taking the best-fit interpretation
-        best_fit_interpretation = np.zeros(colors.shape[:-1])
+        best_fit_interpretation = np.zeros(colors.shape[:-1], dtype=dtype)
         for segment in range(self.num_segments):
             mask = closest_segment == segment
             best_fit_interpretation[mask] = interpretations[segment][mask]
