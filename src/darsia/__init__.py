@@ -134,6 +134,7 @@ from darsia.multi_image_analysis.balancing_calibration import *
 from darsia.multi_image_analysis.imageregistration import *
 from darsia.multi_image_analysis.segmentationcomparison import *
 from darsia.multi_image_analysis.run_statistics import *
+from darsia.multi_image_analysis.gas_statistics import *
 from darsia.single_image_analysis.contouranalysis import *
 
 # Managers
