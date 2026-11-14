@@ -1,13 +1,19 @@
 """Tests of the sand map: a drawing of sand layers placed on a run's grid."""
 
+import json
+
 import numpy as np
+import pytest
 
 import darsia
+from darsia.presets.workflows.config.labeling import SandMapConfig
 from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
+    grid_homographies,
     rasterize_sand_map,
     rig_grid,
 )
+from darsia.presets.workflows.setup.setup_labeling import segment_colored_image
 
 WIDTH, HEIGHT = 0.4, 0.2
 """Inner frame of the test rig in metres."""
@@ -37,6 +43,11 @@ def _split_drawing() -> SandMapDrawing:
 def _rig_to_grid() -> np.ndarray:
     """The run's rig geometry: rig coordinates to the distorted grid."""
     return PERSPECTIVE @ rig_grid(_grid(SHAPE, WIDTH, HEIGHT))
+
+
+def _grid_to_rig() -> np.ndarray:
+    """The run's measured model of its grid: the distorted grid to rig coordinates."""
+    return np.linalg.inv(_rig_to_grid())
 
 
 def _rectangle(anchors: list, x0: float, x1: float, y0: float, y1: float) -> tuple:
@@ -103,3 +114,76 @@ def test_a_split_at_shared_anchors_leaves_no_gap_or_overlap():
     both = (upper > 0) & (lower > 0)
     assert both.any() and np.all(split[both] == 2)
     assert np.array_equal(split == 1, (upper > 0) & ~both)
+
+
+def _setup(tmp_path, name: str):
+    """Set up one run's labels by the labeling step of the setup; return them."""
+    folder = tmp_path / name
+    folder.mkdir()
+    sand_map = {
+        "drawing": (tmp_path / "drawing.json").as_posix(),
+        "grid_to_rig": _grid_to_rig().tolist(),
+        "edge_fill_mm": 5.0,
+    }
+    table = ", ".join(f"{key} = {json.dumps(value)}" for key, value in sand_map.items())
+    # The rig's mapping onto the run's grid gives the grid; its maps are not used.
+    zeros = np.zeros(SHAPE, np.float32)
+    mapping = darsia.ImageMappingCorrection(
+        zeros, zeros, source_shape=SHAPE, dimensions=[HEIGHT, WIDTH]
+    )
+    mapping.save(folder / "mapping.npz")
+    (folder / "config.toml").write_text(
+        f'[rig]\nwidth = {WIDTH}\nheight = {HEIGHT}\ndim = 2\npath = "{folder.as_posix()}"\n'
+        f'[labeling]\nlabels = "{(folder / "labels.npz").as_posix()}"\n'
+        f"sand_map = {{ {table} }}\n"
+        f'[corrections.mapping]\npath = "{(folder / "mapping.npz").as_posix()}"\n'
+    )
+    segment_colored_image(folder / "config.toml")
+    return darsia.imread(folder / "labels.npz")
+
+
+def _write_drawing(tmp_path) -> SandMapDrawing:
+    """Write the split drawing as a file and return it as read back."""
+    drawing = _split_drawing()
+    (tmp_path / "drawing.json").write_text(
+        json.dumps(
+            {
+                "anchors": drawing.anchors.tolist(),
+                "polygons": [
+                    [layer, list(indices)] for layer, indices in drawing.polygons
+                ],
+            }
+        )
+    )
+    return SandMapDrawing.read(tmp_path / "drawing.json")
+
+
+def test_the_saved_sand_map_equals_a_direct_rasterization(tmp_path):
+    """The labels saved by the setup are the drawing rasterized on the run's grid,
+    placed by the inverse of the run's measured model of its grid."""
+    drawing = _write_drawing(tmp_path)
+    saved = _setup(tmp_path, "run")
+    placed = np.linalg.inv(_grid_to_rig())
+    direct, _ = rasterize_sand_map(
+        drawing, SHAPE, placed, width=WIDTH, height=HEIGHT, edge_fill_mm=5.0
+    )
+    assert np.array_equal(saved.img, direct)
+    assert saved.dimensions == [HEIGHT, WIDTH]
+
+
+def test_a_run_grid_is_placed_by_its_measured_model_else_in_rig_metres():
+    """A run grid's homographies to and from rig metres are its measured model and
+    the model's inverse, else those of a grid in rig metres; the old key, the
+    inverse of the model, is refused, as a renamed matrix would place the map by
+    the wrong one."""
+    grid = _grid(SHAPE, WIDTH, HEIGHT)
+    to_rig, to_grid = grid_homographies(None, grid)
+    assert np.array_equal(to_grid, rig_grid(grid))
+    assert np.array_equal(to_rig, np.linalg.inv(rig_grid(grid)))
+    to_rig, to_grid = grid_homographies(_grid_to_rig().tolist(), None)
+    assert np.array_equal(to_rig, _grid_to_rig())
+    assert np.array_equal(to_grid, np.linalg.inv(_grid_to_rig()))
+    table = {"drawing": "drawing.json", "edge_fill_mm": 5.0}
+    assert SandMapConfig().load(table).grid_to_rig is None
+    with pytest.raises(ValueError, match="replaced by grid_to_rig, its inverse"):
+        SandMapConfig().load({**table, "rig_to_grid": _rig_to_grid().tolist()})
