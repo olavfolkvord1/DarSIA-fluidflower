@@ -330,3 +330,36 @@ def interpolate_to_image_from_csv(
         image,
         method=method,
     )
+
+
+def piecewise_linear(
+    values: np.ndarray, supports: np.ndarray, table: np.ndarray
+) -> np.ndarray:
+    """A table interpolated linearly at values, its end segments continued beyond it.
+
+    Between two supports the value is on the straight line through their table
+    values; below the first support it continues the first segment, above the
+    last the last segment. All arithmetic runs in the dtype of the values: the
+    supports and the table are converted to it.
+
+    Parameters
+    ----------
+    values : array
+        Floating values to interpolate at.
+    supports : array
+        Increasing supports of the table, at least two.
+    table : array
+        Values of the table at the supports.
+
+    Returns
+    -------
+    array
+        The interpolated values, in the dtype and shape of ``values``.
+
+    """
+    x = np.asarray(supports, values.dtype)
+    y = np.asarray(table, values.dtype)
+    upper = np.searchsorted(x, values, side="left").clip(1, len(x) - 1)
+    lower = upper - 1
+    slope = (y[upper] - y[lower]) / (x[upper] - x[lower])
+    return slope * (values - x[lower]) + y[lower]

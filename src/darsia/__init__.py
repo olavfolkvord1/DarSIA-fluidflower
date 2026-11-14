@@ -116,6 +116,7 @@ from darsia.signals.models.kernelinterpolation import *
 from darsia.signals.models.pwtransformation import *
 from darsia.signals.models.evaluation import *
 from darsia.signals.models.color_path_interpolation import *
+from darsia.signals.models.color_path_signal import *
 from darsia.restoration.tvd import *
 from darsia.restoration.median import *
 from darsia.restoration.resize import *
