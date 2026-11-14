@@ -25,10 +25,11 @@ For each frame and domain (:class:`DomainMass`):
   (unmeasured colour, excluded parts) is bounded per frame by the unknown-mass
   rule (:func:`darsia.unknown_bounds`), not here;
 - the free-gas saturation and the concentration of the dissolved CO2 are means
-  weighted by pore volume over the known pixels where they are finite.
+  weighted by pore volume over the known pixels where they are finite;
+- each mass has its centre and its spread (one standard deviation) along each axis.
 
-The domains are set up once per run. The sums and means run in double precision,
-as our production summed its domains.
+The domains are set up once per run. The sums, means and centres run in double
+precision, as our production summed its domains.
 
 """
 
@@ -46,6 +47,8 @@ from darsia.presets.workflows.analysis.domains import (
     domain_pixels,
 )
 
+_CENTRE = ("_centre_x_mm", "_centre_y_mm", "_spread_x_mm", "_spread_y_mm")
+
 COLUMNS = (
     "run",
     "case_id",
@@ -61,6 +64,7 @@ COLUMNS = (
     *(key + end for key in COMPONENTS for end in ("_mass_g", "_quantified_mass_g")),
     "gas_saturation_mean",
     "aqueous_concentration_mean_g_l",
+    *(key + end for key in COMPONENTS for end in _CENTRE),
 )
 """Columns of the table of masses per domain: a row per frame and domain."""
 
@@ -102,6 +106,7 @@ class DomainMass:
         self.domains = list(domains)
         """The domains, in the order of the rows."""
         self._shape = geometry.domain.shape
+        self._x, self._y = darsia.pixel_centres(sand_map)
         volume = np.asarray(geometry.pore_volume_m3, np.float64).ravel() * 1000
         self._volume_l = np.where(volume > 0, volume, 0.0)
         self._no_volume = ~(volume > 0)
@@ -136,7 +141,7 @@ class DomainMass:
             Per domain the table's columns (:data:`COLUMNS`) but the frame's
             ``run``, ``case_id`` and ``elapsed_h``, which the caller adds; None
             where a value is not defined (the total of a domain that is not
-            complete, a mean without pore volume).
+            complete, a mean without pore volume, a centre without mass).
 
         """
         if maps.mass.img.shape != self._shape:
@@ -175,10 +180,13 @@ class DomainMass:
                 area_m2=area,
                 pore_volume_l=volume,
             )
+            x = self._x[pixels % self._shape[1]]
+            y = self._y[pixels // self._shape[1]]
             for key, values in grams.items():
                 amount = float(values[pixels].sum())
                 row[key + "_mass_g"] = amount if complete else None
                 row[key + "_quantified_mass_g"] = amount
+                row.update(_centre(key, values[pixels], x, y))
             weight = self._volume_l[pixels]
             for key, values in means.items():
                 values = np.asarray(values[pixels], np.float64)
@@ -188,3 +196,17 @@ class DomainMass:
                     row[key] = float((values[known] * weight[known]).sum() / total)
             rows.append(row)
         return rows
+
+
+def _centre(key, grams, x, y):
+    """Centre [mm] of a mass along each axis and its spread; none without mass."""
+    total = float(grams.sum())
+    if not total > 0:
+        return {}
+    result = {}
+    for axis, values in (("x", x), ("y", y)):
+        centre = float((grams * values).sum() / total)
+        spread = float((grams * (values - centre) ** 2).sum() / total)
+        result[f"{key}_centre_{axis}_mm"] = centre * 1000
+        result[f"{key}_spread_{axis}_mm"] = spread**0.5 * 1000
+    return result

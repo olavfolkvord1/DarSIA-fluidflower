@@ -212,6 +212,25 @@ def test_means_are_weighted_by_pore_volume():
         )
 
 
+def test_each_mass_has_its_centre_and_spread():
+    """The centre of each mass in mm of the grid and its standard deviation along
+    each axis; none without mass."""
+    geometry, sand, maps, co2 = frame(np.float64)
+    row = {
+        r["domain_id"]: r for r in DomainMass(DOMAINS, geometry, sand, SAND)(maps, co2)
+    }
+
+    x, y = np.meshgrid(np.arange(90) * 10 + 5.0, 485.0 - np.arange(49) * 10)
+    grams = np.nan_to_num(maps.mass_g.img) * geometry.pore_volume_m3
+    centre = np.average(x, weights=grams)
+    assert row["whole"]["gas_centre_x_mm"] == pytest.approx(centre, rel=1e-12)
+    assert row["whole"]["gas_spread_y_mm"] == pytest.approx(
+        np.sqrt(np.average((y - np.average(y, weights=grams)) ** 2, weights=grams)),
+        rel=1e-9,
+    )
+    assert row["layer:5"]["gas_centre_x_mm"] is None
+
+
 def test_a_domain_receives_the_injection_of_its_own_points(tmp_path):
     """The whole domain receives all the injected CO2, a box what the points inside
     it inject and a sand layer none; a box whose edge passes through an injection
