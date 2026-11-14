@@ -207,6 +207,165 @@ def _log_ratios(rgb: np.ndarray, epsilon: np.floating) -> np.ndarray:
     )
 
 
+class PhaseFeatures:
+    """The optical features of one frame, from filters of the whole frame.
+
+    The features compare the current image with the baseline (colour,
+    chromaticity, log ratios, texture and its local statistics, bright grains)
+    and with the previous frame; without a previous frame the dynamic features
+    are zero. The filters run once on the whole frame; :meth:`matrix` gives the
+    feature rows of any pixels, so a frame's chunks and a training sample of its
+    pixels read the same values.
+
+    The texture scale is converted to pixels of the images' grid. A pixel with a
+    non-finite channel is invalid and enters the filters as zero. A pixel is
+    supported if all given images are valid in the square window of half-width
+    four texture sigmas (rounded) around it. All arithmetic runs in the floating
+    dtype of the given images.
+
+    Parameters
+    ----------
+    current, baseline : array
+        Linear RGB images of shape (rows, cols, 3) on one grid.
+    previous : array, optional
+        Linear RGB image of the run's previous frame on the same grid.
+    texture_sigma_mm : float
+        Standard deviation (mm) of the Gaussian defining the image texture.
+    pixel_size_mm : float
+        Pixel size of the images' grid.
+
+    Attributes
+    ----------
+    dtype : type
+        Floating dtype of the features.
+    support : array
+        Boolean mask of the supported pixels.
+
+    """
+
+    def __init__(
+        self,
+        current: np.ndarray,
+        baseline: np.ndarray,
+        previous: np.ndarray | None = None,
+        *,
+        texture_sigma_mm: float,
+        pixel_size_mm: float,
+    ) -> None:
+        given = [i for i in (current, baseline, previous) if i is not None]
+        dtype = np.result_type(*given).type
+        if len({image.shape for image in given}) != 1:
+            raise ValueError("The images of a frame differ in shape.")
+        valid = np.ones(current.shape[:2], dtype=bool)
+        images = []
+        for image in given:
+            finite = np.isfinite(image).all(axis=-1)
+            valid &= finite
+            images.append(
+                np.where(finite[..., None], image, 0).astype(dtype, copy=False)
+            )
+        current, baseline = images[:2]
+
+        sigma = texture_sigma_mm / pixel_size_mm
+        spatial = dtype(max(sigma, _SPATIAL_CONTEXT_FRACTION * min(current.shape[:2])))
+        gray = [np.mean(image, axis=2, dtype=dtype) for image in images]
+        self._smooth = [darsia.gaussian_blur(g, sigma) for g in gray]
+        self._contrast = [g - s for g, s in zip(gray, self._smooth)]
+        self._delta = current - baseline
+        self._norm = np.linalg.norm(self._delta, axis=-1)
+        self._local_mean = darsia.gaussian_blur(self._norm, spatial)
+        local_squared = darsia.gaussian_blur(np.square(self._norm), spatial)
+        self._local_std = np.sqrt(
+            np.maximum(local_squared - np.square(self._local_mean), 0)
+        )
+        self._dynamic = previous is not None
+        if self._dynamic:
+            self._dynamic_delta = current - images[2]
+            self._dynamic_norm = np.linalg.norm(self._dynamic_delta, axis=-1)
+            self._local_dynamic_mean = darsia.gaussian_blur(self._dynamic_norm, spatial)
+        self._images = images
+        self.dtype = dtype
+        width = 2 * round(4 * sigma) + 1
+        self.support = cv2.erode(
+            valid.astype(np.uint8), np.ones((width, width), np.uint8)
+        ).astype(bool)
+
+    def matrix(self, selection) -> np.ndarray:
+        """Feature matrix of the selected pixels.
+
+        Parameters
+        ----------
+        selection : slice or tuple of arrays
+            Pixels to read: a slice of image rows, or arrays of row and column
+            indices.
+
+        Returns
+        -------
+        array
+            Feature matrix of shape (pixels, 36), the columns in the order of
+            :data:`PHASE_FEATURE_NAMES`, pixels in row-major order of the
+            selection.
+
+        """
+        dtype = self.dtype
+        epsilon, floor = dtype(1e-4), dtype(0.05)
+        rgb = [image[selection] for image in self._images]
+        contrast = [c[selection] for c in self._contrast]
+        smooth = [s[selection] for s in self._smooth[:2]]
+        local_mean = self._local_mean[selection]
+        local_std = self._local_std[selection]
+        intensity = [np.mean(image, axis=-1, dtype=dtype) for image in rgb]
+        fractions = [i / (i.sum(axis=-1, keepdims=True) + epsilon) for i in rgb[:2]]
+        texture = [np.abs(c) for c in contrast]
+        texture_delta = texture[0] - texture[1]
+        bright = [np.maximum(c, 0) for c in contrast[:2]]
+        rel_current, rel_baseline = (
+            np.clip(c / np.maximum(s, floor), -1.0, 4.0)
+            for c, s in zip(contrast[:2], smooth)
+        )
+        rel_bright = [np.maximum(rel_current, 0), np.maximum(rel_baseline, 0)]
+        persistent = np.minimum(rel_bright[1], rel_bright[0])
+        columns = [
+            self._delta[selection],
+            intensity[0] - intensity[1],
+            fractions[0] - fractions[1],
+            _log_ratios(rgb[0], epsilon) - _log_ratios(rgb[1], epsilon),
+            texture_delta,
+            np.abs(texture_delta),
+            self._norm[selection],
+            local_mean,
+            local_std,
+            local_mean / (local_std + epsilon),
+            intensity[1],
+            contrast[1],
+            contrast[0],
+            contrast[0] - contrast[1],
+            np.minimum(bright[1], bright[0]),
+            np.maximum(bright[0] - bright[1], 0),
+            rel_baseline,
+            rel_current,
+            rel_current - rel_baseline,
+            persistent,
+            np.maximum(rel_bright[0] - rel_bright[1], 0),
+            persistent
+            * persistent
+            / (np.maximum(rel_bright[1], rel_bright[0]) + floor),
+        ]
+        count = intensity[0].size
+        if self._dynamic:
+            columns += [
+                np.ones(count, dtype),
+                self._dynamic_delta[selection],
+                intensity[0] - intensity[2],
+                texture[0] - texture[2],
+                self._dynamic_norm[selection],
+                self._local_dynamic_mean[selection],
+            ]
+        else:
+            columns.append(np.zeros((count, 8), dtype))
+        return np.column_stack([c.reshape(count, -1) for c in columns])
+
+
 def phase_probabilities(
     model: PhaseModel,
     current: np.ndarray,
@@ -217,16 +376,9 @@ def phase_probabilities(
 ) -> tuple[np.ndarray, np.ndarray]:
     """CO2-presence and gas-within-CO2 probabilities of one frame.
 
-    The features compare the current image with the baseline (colour,
-    chromaticity, log ratios, texture and its local statistics, bright grains)
-    and with the previous frame; without a previous frame the dynamic features
-    are zero. Both heads read one feature matrix, built in chunks of rows.
-
-    The model's texture scale is converted to pixels of the images' grid. A
-    pixel with a non-finite channel is invalid and enters the filters as zero.
-    A pixel is supported if all given images are valid in the square window of
-    half-width four texture sigmas (rounded) around it; elsewhere both
-    probabilities are NaN.
+    Both heads read the frame's :class:`PhaseFeatures` with the model's texture
+    scale, built in chunks of rows. Outside the features' support both
+    probabilities are NaN, so the support travels with the result.
 
     Parameters
     ----------
@@ -246,98 +398,23 @@ def phase_probabilities(
         outside the support.
 
     """
-    given = [image for image in (current, baseline, previous) if image is not None]
-    dtype = np.result_type(*given).type
-    if len({image.shape for image in given}) != 1:
-        raise ValueError("The images of a frame differ in shape.")
-    valid = np.ones(current.shape[:2], dtype=bool)
-    images = []
-    for image in given:
-        finite = np.isfinite(image).all(axis=-1)
-        valid &= finite
-        images.append(np.where(finite[..., None], image, 0).astype(dtype, copy=False))
-    current, baseline = images[:2]
-    dynamic = previous is not None
-
-    sigma = model.texture_sigma_mm / pixel_size_mm
-    spatial = dtype(max(sigma, _SPATIAL_CONTEXT_FRACTION * min(current.shape[:2])))
-    epsilon, floor = dtype(1e-4), dtype(0.05)
-    gray = [np.mean(image, axis=2, dtype=dtype) for image in images]
-    smooth = [darsia.gaussian_blur(g, sigma) for g in gray]
-    contrast = [g - s for g, s in zip(gray, smooth)]
-    delta = current - baseline
-    norm = np.linalg.norm(delta, axis=-1)
-    local_mean = darsia.gaussian_blur(norm, spatial)
-    local_squared = darsia.gaussian_blur(np.square(norm), spatial)
-    local_std = np.sqrt(np.maximum(local_squared - np.square(local_mean), 0))
-    if dynamic:
-        dynamic_delta = current - images[2]
-        dynamic_norm = np.linalg.norm(dynamic_delta, axis=-1)
-        local_dynamic_mean = darsia.gaussian_blur(dynamic_norm, spatial)
-
-    rows, cols = valid.shape
-    co2 = np.empty((rows, cols), dtype)
-    gas = np.empty((rows, cols), dtype)
+    features = PhaseFeatures(
+        current,
+        baseline,
+        previous,
+        texture_sigma_mm=model.texture_sigma_mm,
+        pixel_size_mm=pixel_size_mm,
+    )
+    rows, cols = features.support.shape
+    co2 = np.empty((rows, cols), features.dtype)
+    gas = np.empty((rows, cols), features.dtype)
     for start in range(0, rows, _ROWS_PER_CHUNK):
         chunk = np.s_[start : start + _ROWS_PER_CHUNK]
-        rgb = [image[chunk] for image in images]
-        intensity = [np.mean(image, axis=-1, dtype=dtype) for image in rgb]
-        fractions = [i / (i.sum(axis=-1, keepdims=True) + epsilon) for i in rgb[:2]]
-        texture = [np.abs(c[chunk]) for c in contrast]
-        texture_delta = texture[0] - texture[1]
-        bright = [np.maximum(c[chunk], 0) for c in contrast[:2]]
-        rel_current, rel_baseline = (
-            np.clip(c[chunk] / np.maximum(s[chunk], floor), -1.0, 4.0)
-            for c, s in zip(contrast[:2], smooth[:2])
-        )
-        rel_bright = [np.maximum(rel_current, 0), np.maximum(rel_baseline, 0)]
-        persistent = np.minimum(rel_bright[1], rel_bright[0])
-        columns = [
-            delta[chunk],
-            intensity[0] - intensity[1],
-            fractions[0] - fractions[1],
-            _log_ratios(rgb[0], epsilon) - _log_ratios(rgb[1], epsilon),
-            texture_delta,
-            np.abs(texture_delta),
-            norm[chunk],
-            local_mean[chunk],
-            local_std[chunk],
-            local_mean[chunk] / (local_std[chunk] + epsilon),
-            intensity[1],
-            contrast[1][chunk],
-            contrast[0][chunk],
-            contrast[0][chunk] - contrast[1][chunk],
-            np.minimum(bright[1], bright[0]),
-            np.maximum(bright[0] - bright[1], 0),
-            rel_baseline,
-            rel_current,
-            rel_current - rel_baseline,
-            persistent,
-            np.maximum(rel_bright[0] - rel_bright[1], 0),
-            persistent
-            * persistent
-            / (np.maximum(rel_bright[1], rel_bright[0]) + floor),
-        ]
-        count = intensity[0].size
-        if dynamic:
-            columns += [
-                np.ones(count, dtype),
-                dynamic_delta[chunk],
-                intensity[0] - intensity[2],
-                texture[0] - texture[2],
-                dynamic_norm[chunk],
-                local_dynamic_mean[chunk],
-            ]
-        else:
-            columns.append(np.zeros((count, 8), dtype))
-        features = np.column_stack([c.reshape(count, -1) for c in columns])
-        co2[chunk] = model.co2_presence.probability(features).reshape(-1, cols)
-        gas[chunk] = model.gas_within_co2.probability(features).reshape(-1, cols)
-
-    width = 2 * round(4 * sigma) + 1
-    support = cv2.erode(valid.astype(np.uint8), np.ones((width, width), np.uint8))
-    co2[support == 0] = np.nan
-    gas[support == 0] = np.nan
+        matrix = features.matrix(chunk)
+        co2[chunk] = model.co2_presence.probability(matrix).reshape(-1, cols)
+        gas[chunk] = model.gas_within_co2.probability(matrix).reshape(-1, cols)
+    co2[~features.support] = np.nan
+    gas[~features.support] = np.nan
     return co2, gas
 
 
