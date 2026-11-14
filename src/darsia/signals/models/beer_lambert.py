@@ -8,6 +8,17 @@ light and any shadow divide out. At equal concentration, sand k shows
 y_k = p_k y_ref, where p_k, the sand's path ratio, is its effective optical path
 relative to that of the reference sand.
 
+Every sand's log colour change, the reference sand's included (p = 1), is read as
+the reference sand's colour change at the same place on one smooth background B
+of the reference sand, B (exp(y_k / p_k) - 1) (:class:`BeerLambertReading`). The
+linear change a sand shows scales with its local background brightness: brighter
+mixed grains next to a boundary and the grain texture would read as
+concentration, and a shadow would need its own correction. Reading every sand
+from its log change on the same background removes all three alike, and applies
+p in the log space it is measured in. The change is read on the reference sand's
+colour path, without a cap at the path's end (:class:`darsia.ColorPathSignal`),
+and takes the reference sand's factor. No sand is divided by a shadow's light.
+
 The background (:func:`reference_background`) is one smooth field over the rig.
 The camera sees background = illumination x reflectance, and the light of the
 corrected images varies slowly, so the reference sand's background where another
@@ -43,6 +54,9 @@ import darsia
 _BLOCKS_PER_TERM = 4
 """Fewest block means per term of the background's surface; with fewer the fit is
 refused."""
+
+_DARKEST_MEAN = 1e-9
+"""Floor of the colour means before their logarithm."""
 
 
 @dataclass(frozen=True)
@@ -257,3 +271,114 @@ def reference_background(
         )
         field[..., channel] = np.exp(surface)
     return field
+
+
+class BeerLambertReading:
+    """Each sand's dissolved CO2 read from its log colour change as the reference
+    sand's change on the reference sand's background.
+
+    """
+
+    def __init__(
+        self,
+        path: darsia.ColorPathSignal,
+        factor: float,
+        background: np.ndarray,
+        sand_map: darsia.Image,
+        optical_pitch: tuple[float, float],
+        settings: BeerLambertSettings,
+    ) -> None:
+        """Reading of the sands named in the settings.
+
+        Parameters
+        ----------
+        path : darsia.ColorPathSignal
+            Colour path of the reference sand.
+        factor : float
+            Factor of the reference sand's signal: its path's scale over its
+            measured colour range. Every sand takes it.
+        background : array
+            The reference sand's background (:func:`reference_background`) for the
+            baseline of the frames read.
+        sand_map : darsia.Image
+            Facies ids of the grid.
+        optical_pitch : tuple of float
+            Pitch [m] of the grid on the sand plane, down a column and along a
+            row (:func:`darsia.optical_pitch_m`), which sizes the colour means.
+        settings : BeerLambertSettings
+            Settings of the response.
+
+        """
+        self.path = path
+        """Colour path of the reference sand."""
+        self.factor = float(factor)
+        """Factor of every sand's signal."""
+        self.background = background
+        """The reference sand's background."""
+        self.ratios = {
+            int(settings.reference_sand): 1.0,
+            **{int(k): float(v) for k, v in settings.path_ratio.items()},
+        }
+        """Path ratio of each sand read, the reference sand's included."""
+        self.sands = sorted(self.ratios)
+        """Facies ids of the sands read."""
+        optical = darsia.optical_grid(sand_map, optical_pitch, background.dtype.type)
+        self.rev = darsia.REV(size=settings.mean_mm / 1000, img=optical)
+        """Square of the colour means."""
+
+    def __call__(
+        self,
+        current: np.ndarray,
+        baseline: np.ndarray,
+        support: np.ndarray,
+        dissolved: np.ndarray,
+        facies: np.ndarray,
+    ) -> np.ndarray:
+        """Signal of the sands' dissolved CO2 in a frame; zero elsewhere.
+
+        The current and baseline colours are averaged over the square inside each
+        sand's dissolved pixels; their log change, the background's change at the
+        same log change over the sand's path ratio, is computed in double
+        precision and read on the reference sand's colour path in the dtype of
+        the images.
+
+        Parameters
+        ----------
+        current, baseline : array
+            RGB images of the frame and of the baseline, of shape (rows, cols, 3).
+        support : array
+            Pixels whose colour change is measured; the dissolved pixels lie in it.
+        dissolved : array
+            Pixels of dissolved CO2 read.
+        facies : array
+            Facies id of each pixel.
+
+        Returns
+        -------
+        array
+            The signal, in the dtype of the images.
+
+        """
+        dtype = current.dtype
+        masks = {sand: facies == sand for sand in self.sands}
+        means = [
+            darsia.sand_mean(
+                np.where(dissolved[..., None], rgb, 0), dissolved, masks, self.rev
+            )
+            for rgb in (current, baseline)
+        ]
+        signal = np.zeros(facies.shape, dtype)
+        for sand, ratio in self.ratios.items():
+            mask = dissolved & masks[sand]
+            if not mask.any():
+                continue
+            now, then = (
+                np.log(np.maximum(mean[mask].astype(np.float64), _DARKEST_MEAN))
+                for mean in means
+            )
+            change = self.background[mask].astype(np.float64) * np.expm1(
+                (now - then) / ratio
+            )
+            values = self.path(np.ascontiguousarray(change, dtype))
+            signal[mask] = values * values.dtype.type(self.factor)
+        return signal
