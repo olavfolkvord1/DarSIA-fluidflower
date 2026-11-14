@@ -157,3 +157,33 @@ def test_registration_recovers_the_homographies_of_a_setup_and_a_frame(images, d
         ex, ey = _project(H, x, y)
         rx, ry = _project(registration.homography.astype(float), x, y)
         assert np.hypot(rx - ex - dx, ry - ey - dy).max() < 0.1
+
+
+def test_the_mapping_of_a_registration_samples_the_image_onto_the_run_grid():
+    """Replayed by the image mapping, the homography gives the run-grid image, with
+    shared or per-channel coordinates."""
+    rows, cols = GRID
+    camera = np.mgrid[0:730, 0:1200].astype(np.float32)
+    # Each channel holds a linear function of the camera position (column, row).
+    image = np.stack([3 * camera[1] + camera[0], camera[1] - 2 * camera[0] + 900], -1)
+    y, x = np.mgrid[0:rows, 0:cols].astype(np.float64)
+    u, v = _project(H, x, y)
+
+    mapping = darsia.registration_mapping(
+        H.astype(np.float32), GRID, image.shape[:2], dimensions=[0.64, 1.1]
+    )
+    shifted = darsia.registration_mapping(
+        H.astype(np.float32),
+        GRID,
+        image.shape[:2],
+        dimensions=[0.64, 1.1],
+        coordinates=lambda u, v: (np.stack([u, u + 2], -1), np.stack([v, v], -1)),
+    )
+
+    # Bilinear sampling is exact on linear images, up to OpenCV's 1/32 pixel steps.
+    mapped = mapping.correct_array(image)
+    np.testing.assert_allclose(mapped[..., 0], 3 * u + v, atol=0.07)
+    np.testing.assert_allclose(mapped[..., 1], u - 2 * v + 900, atol=0.07)
+    channelwise = shifted.correct_array(image)
+    np.testing.assert_array_equal(channelwise[..., 0], mapped[..., 0])
+    np.testing.assert_allclose(channelwise[..., 1], u + 2 - 2 * v + 900, atol=0.07)
