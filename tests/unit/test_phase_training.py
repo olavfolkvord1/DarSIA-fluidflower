@@ -50,13 +50,17 @@ BULGE = (
 """A curvature correction's bulge, with its horizontal bulge to be given."""
 
 
-def _rig_canvas(folder, settings=""):
-    """Canvas of a rig that maps its photographs onto a grid of 120 x 160 pixels
-    and 0.06 x 0.08 m, with further correction settings."""
+def _rig_canvas(folder, settings="", shape=(120, 160), origin=None):
+    """Canvas of a rig that maps its photographs of 120 x 160 pixels onto a grid
+    of the shape over 0.06 x 0.08 m, at the origin, with further settings."""
     folder.mkdir()
-    rows, cols = np.mgrid[0:120, 0:160].astype(np.float32)
+    rows, cols = np.mgrid[0 : shape[0], 0 : shape[1]].astype(np.float32)
     darsia.ImageMappingCorrection(
-        cols, rows, source_shape=(120, 160), dimensions=[0.06, 0.08]
+        cols * (160 / shape[1]),
+        rows * (120 / shape[0]),
+        source_shape=(120, 160),
+        dimensions=[0.06, 0.08],
+        origin=origin,
     ).save(folder / "grid.npz")
     darsia.OpticalImage(np.full((120, 160, 3), 0.3), color_space="RGB").save(
         folder / "baseline.npz"
@@ -194,6 +198,7 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path, canvas):
         cross_validation=trained.cross_validation,
         canvas=samples.canvas,
         accepted_canvases=samples.accepted_canvases,
+        moved_from=samples.moved_from,
     )
     model = darsia.read_phase_model(tmp_path / "model")
     assert model.texture_sigma_mm == SETTINGS.texture_sigma_mm
@@ -208,7 +213,11 @@ def test_trained_folder_reads_back_with_its_sizes_in_mm(tmp_path, canvas):
         trained.co2_threshold
     )
     canvases = json.loads((tmp_path / "model" / "canvas.json").read_text())
-    assert canvases == {"canvas": canvas, "accepted_label_canvases": []}
+    assert canvases == {
+        "canvas": canvas,
+        "accepted_label_canvases": [],
+        "labels_moved_from": [],
+    }
 
 
 def test_a_model_trained_at_one_pixel_size_classifies_alike_at_another(canvas):
@@ -267,3 +276,44 @@ def test_labels_on_another_canvas_are_sampled_only_by_explicit_choice(tmp_path):
     assert parts[0].accepted_canvases == ()
     assert samples.canvas == rig
     assert samples.accepted_canvases == (drawn, None)
+
+
+def test_a_crop_in_pixels_gives_no_grid_in_rig_metres(tmp_path, canvas):
+    """A crop whose width and height are pixels leaves the images without rig
+    metres: its canvas has no grid, and labels are not moved onto it."""
+    crop = (
+        "[corrections.curvature.crop]\ntop_left = [0, 0]\nbottom_left = [119, 0]\n"
+        "bottom_right = [119, 159]\ntop_right = [0, 159]\nwidth = 160.0\n"
+        "height = 120.0\nin_meters = false\n"
+    )
+    pixels = _rig_canvas(tmp_path / "pixels", crop)
+    mask = np.zeros((120, 160), bool)
+    mask[BOXES["water"]] = True
+    regions = [darsia.LabelledRegion("a:water", "a", "water", 1.0)]
+    assert pixels["grid"] is None
+    with pytest.raises(ValueError, match="crop in pixels"):
+        darsia.move_labels(darsia.LabelSet(regions, [mask], canvas), pixels)
+
+
+def test_labels_move_between_corrected_canvases_of_a_rig(tmp_path):
+    """A region on a 1 mm canvas, moved to a 0.5 mm canvas shifted by a fraction
+    of a pixel, covers the same rig area within one target pixel and is sampled
+    there with its move recorded; moving it back returns the original."""
+    coarse = _rig_canvas(tmp_path / "coarse", shape=(60, 80))
+    fine = _rig_canvas(tmp_path / "fine", origin=[0.0003, 0.0598])
+    mask = np.zeros((60, 80), bool)
+    mask[20:35, 10:50] = True  # x from 10 to 50 mm, y from 25 to 40 mm
+    regions = [darsia.LabelledRegion("a:gas", "a", "gas", 1.0)]
+    moved = darsia.move_labels(darsia.LabelSet(regions, [mask], coarse), fine)
+    rows, cols = np.nonzero(moved.masks[0])
+    x = 0.3 + 0.5 * np.array([cols.min(), cols.max() + 1])
+    y = 59.8 - 0.5 * np.array([rows.max() + 1, rows.min()])
+    np.testing.assert_allclose([*x, *y], [10, 50, 25, 40], atol=0.5)
+    assert rows.size == (np.ptp(rows) + 1) * (np.ptp(cols) + 1)
+    assert (moved.regions, moved.canvas, moved.moved_from) == (regions, fine, coarse)
+    current, baseline, _, _ = _frame(0)
+    options = {"settings": SETTINGS, "pixel_size_mm": PIXEL_MM, "canvas": fine}
+    samples = darsia.frame_samples(current, baseline, None, moved, **options)
+    assert (samples.accepted_canvases, samples.moved_from) == ((), (coarse,))
+    back = darsia.move_labels(moved, coarse)
+    np.testing.assert_array_equal(back.masks[0], mask)
