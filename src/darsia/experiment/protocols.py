@@ -452,7 +452,8 @@ class InjectionProtocol:
         date : datetime
             Date to get the cumulative injected mass for.
         time : float
-            Time (in hours) to get the cumulative injected mass for.
+            Time [h] since the protocol's first injection start; each interval
+            counts from its own start, as for a date.
         roi : Optional[darsia.Image]
             Region of interest for the mass calculation.
 
@@ -482,7 +483,8 @@ class InjectionProtocol:
         date : datetime
             Date to get the cumulative injected volume for.
         time : float
-            Time (in hours) to get the cumulative injected volume for.
+            Time [h] since the protocol's first injection start; each interval
+            counts from its own start, as for a date.
         roi : Optional[darsia.Image]
             Region of interest for the volume calculation.
 
@@ -514,7 +516,8 @@ class InjectionProtocol:
         date : datetime
             Date to get the cumulative injected quantity for.
         time : float
-            Time (in hours) to get the cumulative injected quantity for.
+            Time [h] since the protocol's first injection start; each interval
+            counts from its own start, as for a date.
         roi : Optional[darsia.Image]
             Region of interest; only injections located inside are counted.
 
@@ -527,6 +530,8 @@ class InjectionProtocol:
             raise ValueError("Either date or time must be provided.")
         if date is not None and time is not None:
             raise ValueError("Only one of date or time must be provided.")
+
+        origin = self.df["start"].min() if time is not None else None
 
         # Loop over all injection intervals and sum up the contributions
         total = 0.0
@@ -569,7 +574,7 @@ class InjectionProtocol:
                     # Full time has passed in this interval
                     time_passed = (end - start).total_seconds()
             elif time is not None:
-                time_in_seconds = time * 3600
+                time_in_seconds = time * 3600 - (start - origin).total_seconds()
                 time_passed = np.clip(
                     time_in_seconds, 0.0, (end - start).total_seconds()
                 )
