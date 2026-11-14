@@ -116,7 +116,7 @@ def test_a_split_at_shared_anchors_leaves_no_gap_or_overlap():
     assert np.array_equal(split == 1, (upper > 0) & ~both)
 
 
-def _setup(tmp_path, name: str):
+def _setup(tmp_path, name: str, adjustment: dict | None = None):
     """Set up one run's labels by the labeling step of the setup; return them."""
     folder = tmp_path / name
     folder.mkdir()
@@ -125,6 +125,9 @@ def _setup(tmp_path, name: str):
         "grid_to_rig": _grid_to_rig().tolist(),
         "edge_fill_mm": 5.0,
     }
+    if adjustment is not None:
+        (folder / "adjustment.json").write_text(json.dumps({"anchors": adjustment}))
+        sand_map["adjustment"] = (folder / "adjustment.json").as_posix()
     table = ", ".join(f"{key} = {json.dumps(value)}" for key, value in sand_map.items())
     # The rig's mapping onto the run's grid gives the grid; its maps are not used.
     zeros = np.zeros(SHAPE, np.float32)
@@ -187,3 +190,27 @@ def test_a_run_grid_is_placed_by_its_measured_model_else_in_rig_metres():
     assert SandMapConfig().load(table).grid_to_rig is None
     with pytest.raises(ValueError, match="replaced by grid_to_rig, its inverse"):
         SandMapConfig().load({**table, "rig_to_grid": _rig_to_grid().tolist()})
+
+
+def test_a_run_adjustment_changes_only_that_run(tmp_path):
+    """Moving a shared anchor for one run moves both layers' boundary in that run
+    only; the drawing and the other run keep the common geometry."""
+    drawing = _write_drawing(tmp_path)
+    text = (tmp_path / "drawing.json").read_text()
+    moved = _setup(tmp_path, "settled", {"5": [0.15, 0.15]}).img
+    common = _setup(tmp_path, "common").img
+    expected = [
+        rasterize_sand_map(
+            d,
+            SHAPE,
+            np.linalg.inv(_grid_to_rig()),
+            width=WIDTH,
+            height=HEIGHT,
+            edge_fill_mm=5.0,
+        )
+        for d in (drawing, drawing.moved({5: [0.15, 0.15]}))
+    ]
+    assert np.array_equal(common, expected[0][0])
+    assert np.array_equal(moved, expected[1][0]) and np.any(moved != common)
+    assert np.array_equal(moved > 0, expected[1][1])
+    assert (tmp_path / "drawing.json").read_text() == text
