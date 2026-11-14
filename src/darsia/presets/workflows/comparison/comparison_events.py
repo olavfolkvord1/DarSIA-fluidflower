@@ -1,17 +1,302 @@
-"""Determine events of earliest occurence."""
+"""Events: the first frame where a question about an analysis domain's CO2 holds.
+
+A question (:class:`EventQuestion`) holds one or more conditions
+(:class:`EventCondition`), each on one component of the CO2 (``total``,
+``aqueous`` or ``gas``) in one analysis domain:
+
+- ``detected``: its mass is above the noise limit;
+- ``reaches``: its mass is at least a threshold;
+- ``falls_below``: its mass is below a threshold it reached at an earlier frame;
+- ``maximum``: the frame of its largest mass;
+- ``gone``: it had been detected, and is detected neither at this frame nor later.
+
+A threshold, and the noise limit, is in grams or in percent of the CO2 injected
+up to the frame; a percentage cannot be reached before anything is injected. The
+conditions combine with ``all`` (and) or ``any`` (or), and a question can be
+asked to hold for several frames in a row. Thresholds are formed in double
+precision, as configured, and compared with the masses as given.
+
+A frame is unknown where its mass, or the injected mass a percentage needs, is
+not known, e.g. in a domain that is not complete when the complete masses are
+read (:meth:`RunSeries.from_domain_mass`). The states follow Kleene's logic, true,
+false or unknown held as 1, 0 and 1/2, so that ``and`` is the minimum, ``or`` the
+maximum and ``not`` one minus the state.
+
+The answer of a run (:func:`run_answer`) is its first frame where the question
+holds: its time in hours since the injection start, its hours after the start of
+the run's last injection, and its resolution, the hours since the frame before,
+at which the event had not yet happened.
+
+The answers read the masses per domain of a run's frames (:class:`RunSeries`); no
+map is read.
+
+"""
+
+from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
+from darsia.presets.workflows.analysis.domain_mass import RunSeries
+from darsia.presets.workflows.analysis.domains import COMPONENTS
 from darsia.presets.workflows.config.multi_fluidflower_config import (
     MultiFluidFlowerConfig,
 )
 from darsia.presets.workflows.config.sections import required_sections
 
 logger = logging.getLogger(__name__)
+
+EVENTS = ("detected", "reaches", "falls_below", "maximum", "gone")
+"""What a condition can ask of a component's mass."""
+UNITS = ("g", "percent_injected")
+"""Units of a threshold: grams, or percent of the CO2 injected up to the frame."""
+_TRUE, _UNKNOWN, _FALSE = 1.0, 0.5, 0.0
+
+
+@dataclass(frozen=True)
+class EventCondition:
+    """One condition: what happens to a component of the CO2 in a domain."""
+
+    component: Literal["total", "aqueous", "gas"]
+    """The total CO2, the dissolved CO2 or the free gas."""
+    event: Literal["detected", "reaches", "falls_below", "maximum", "gone"]
+    """What happens to its mass."""
+    domain_id: str
+    """The analysis domain, by its identity."""
+    threshold: float | None = None
+    """``reaches`` and ``falls_below``: the threshold in ``unit``, 0 or more."""
+    unit: Literal["g", "percent_injected"] | None = None
+    """``reaches`` and ``falls_below``: the unit of the threshold."""
+
+    def __post_init__(self) -> None:
+        """Refuse a condition that would be read as another one."""
+        if self.component not in COMPONENTS or self.event not in EVENTS:
+            raise ValueError(f"Unknown component or event: {self}")
+        needs = self.event in ("reaches", "falls_below")
+        given = (self.threshold, self.unit) != (None, None)
+        if given and not needs:
+            raise ValueError(f"{self.event} takes no threshold")
+        if needs and not (self.unit in UNITS and self.threshold is not None):
+            raise ValueError(f"{self.event} needs a threshold and its unit")
+        if needs and not self.threshold >= 0:
+            raise ValueError(f"{self.event} needs a threshold of 0 or more")
+
+
+@dataclass(frozen=True)
+class EventQuestion:
+    """A named question: its conditions, how they combine and the noise filter.
+
+    Conditions given as mappings, as read from a TOML file, become conditions.
+
+    """
+
+    name: str
+    """Name of the question, unique in an analysis."""
+    conditions: tuple[EventCondition, ...]
+    """The conditions, at least one."""
+    combine: Literal["all", "any"] = "all"
+    """``all`` conditions hold (and), or ``any`` holds (or)."""
+    noise_min: float = 0.0
+    """The largest mass that does not count as detected, in ``noise_unit``."""
+    noise_unit: Literal["g", "percent_injected"] = "g"
+    """Unit of ``noise_min``."""
+    hold_frames: int = 1
+    """Frames in a row the question must hold; 1 takes its first frame."""
+
+    def __post_init__(self) -> None:
+        """Turn conditions given as mappings into conditions; check the rest."""
+        conditions = tuple(
+            EventCondition(**c) if isinstance(c, Mapping) else c
+            for c in self.conditions
+        )
+        object.__setattr__(self, "conditions", conditions)
+        if not self.name.strip() or not conditions:
+            raise ValueError("A question needs its name and a condition")
+        if self.combine not in ("all", "any") or self.noise_unit not in UNITS:
+            raise ValueError(f"Unknown combination or noise unit: {self.name}")
+        if not self.noise_min >= 0:
+            raise ValueError(f"The noise limit of {self.name} must be 0 or more")
+        if type(self.hold_frames) is not int or self.hold_frames < 1:
+            raise ValueError(f"{self.name} must hold for a whole number of frames")
+
+
+@dataclass(frozen=True)
+class EventAnswer:
+    """When a question first held in a run, or in one of its injections."""
+
+    question: str
+    """Name of the question."""
+    run: str
+    """The run."""
+    injection: int | None = None
+    """The injection ``after_injection_h`` counts from: the run's last one for an
+    answer per run, its own for one per injection; None without injections."""
+    case_id: str | None = None
+    """The frame of the answer; None where the question never held."""
+    elapsed_h: float | None = None
+    """Its hours since the injection start."""
+    after_injection_h: float | None = None
+    """Its hours after the injection's start, negative before it."""
+    resolution_h: float | None = None
+    """Hours since the frame before, at which the question did not hold; None at
+    the run's first frame and where the question held or was unknown there."""
+    note: str = ""
+    """Unknown frames before the answer, or why there is none."""
+
+
+def _limit(value: float, unit: str, injected: np.ndarray) -> np.ndarray:
+    """A threshold in grams per frame, in double precision as configured: NaN where
+    a percentage lacks the injected mass, infinite before anything is injected."""
+    injected = np.asarray(injected, np.float64)
+    if unit == "g":
+        return np.full(injected.shape, float(value))
+    share = float(value) / 100 * injected
+    return np.where(injected > 0, share, np.where(np.isnan(injected), np.nan, np.inf))
+
+
+def _compare(compare, amounts: np.ndarray, limits: np.ndarray) -> np.ndarray:
+    """Three-valued states of a comparison, unknown where a side is not known."""
+    states = compare(amounts, limits).astype(np.float64)
+    states[np.isnan(amounts) | np.isnan(limits)] = _UNKNOWN
+    return states
+
+
+def _earlier(states: np.ndarray) -> np.ndarray:
+    """Whether the states held at an earlier frame: ``or`` over the frames before."""
+    return np.r_[_FALSE, np.maximum.accumulate(states)][: states.size]
+
+
+def condition_states(
+    condition: EventCondition,
+    series: RunSeries,
+    noise_min: float = 0.0,
+    noise_unit: str = "g",
+) -> np.ndarray:
+    """Whether a condition holds at each frame of a run.
+
+    Parameters
+    ----------
+    condition : EventCondition
+        The condition.
+    series : RunSeries
+        The run's masses per domain.
+    noise_min : float
+        The largest mass that does not count as detected.
+    noise_unit : {"g", "percent_injected"}
+        Its unit.
+
+    Returns
+    -------
+    np.ndarray
+        Per frame 1 (true), 0 (false) or 1/2 (unknown).
+
+    """
+    if condition.domain_id not in series.masses:
+        raise ValueError(f"Run {series.run} has no masses of {condition.domain_id}")
+    amounts = series.masses[condition.domain_id][condition.component]
+    injected = series.injected_g
+    detected = _compare(np.greater, amounts, _limit(noise_min, noise_unit, injected))
+    if condition.event == "detected":
+        return detected
+    if condition.event in ("reaches", "falls_below"):
+        limits = _limit(condition.threshold, condition.unit, injected)
+        reached = _compare(np.greater_equal, amounts, limits)
+        if condition.event == "reaches":
+            return reached
+        return np.minimum(_earlier(reached), 1 - reached)
+    if condition.event == "maximum":
+        known = ~np.isnan(amounts)
+        states = np.full(amounts.size, _UNKNOWN)
+        if known.any():
+            states[known] = _FALSE
+            states[np.nanargmax(amounts)] = _TRUE
+        return states
+    later = np.maximum.accumulate(detected[::-1])[::-1]
+    return np.minimum(_earlier(detected), 1 - later)
+
+
+def question_states(question: EventQuestion, series: RunSeries) -> np.ndarray:
+    """Whether a question holds at each frame of a run, its noise filter applied.
+
+    Returns
+    -------
+    np.ndarray
+        Per frame 1 (true), 0 (false) or 1/2 (unknown); a frame where the question
+        must still hold at frames after the run's end is unknown.
+
+    """
+    states = [
+        condition_states(c, series, question.noise_min, question.noise_unit)
+        for c in question.conditions
+    ]
+    combine = np.min if question.combine == "all" else np.max
+    combined = combine(states, axis=0)
+    hold = question.hold_frames
+    if hold == 1:
+        return combined
+    padded = np.r_[combined, np.full(hold - 1, _UNKNOWN)]
+    return sliding_window_view(padded, hold).min(axis=1)
+
+
+def _first(question, series, states, frames, injection, never) -> EventAnswer:
+    """The first of ``frames`` where ``states`` hold, counted from ``injection``."""
+    number, start_h = (None, None) if injection is None else injection
+    found = np.flatnonzero(states[frames] == _TRUE)
+    if found.size == 0:
+        unknown = np.any(states[frames] == _UNKNOWN)
+        note = "Not found; some frames are unknown" if unknown else never
+        return EventAnswer(question.name, series.run, number, note=note)
+    frame = frames[found[0]]
+    unknown = int(np.count_nonzero(states[frames[: found[0]]] == _UNKNOWN))
+    hours = float(series.elapsed_h[frame])
+    return EventAnswer(
+        question=question.name,
+        run=series.run,
+        injection=number,
+        case_id=series.case_ids[frame],
+        elapsed_h=hours,
+        after_injection_h=None if start_h is None else hours - start_h,
+        resolution_h=(
+            hours - float(series.elapsed_h[frame - 1])
+            if frame and states[frame - 1] == _FALSE
+            else None
+        ),
+        note=f"{unknown} earlier frame(s) unknown" if unknown else "",
+    )
+
+
+def run_answer(
+    question: EventQuestion,
+    series: RunSeries,
+    injections: pd.DataFrame | None = None,
+) -> EventAnswer:
+    """The first frame of a run where a question holds.
+
+    Parameters
+    ----------
+    question : EventQuestion
+        The question.
+    series : RunSeries
+        The run's masses per domain.
+    injections : pd.DataFrame, optional
+        The run's injections (:meth:`darsia.InjectionProtocol.injections`); with
+        them the answer counts its hours after the start of the last one.
+
+    """
+    last = None
+    if injections is not None and len(injections):
+        row = injections.iloc[-1]
+        last = (int(row["number"]), float(row["start_h"]))
+    frames = np.arange(len(series.case_ids))
+    states = question_states(question, series)
+    return _first(question, series, states, frames, last, "Never")
 
 
 @required_sections("events")
