@@ -10,13 +10,19 @@ segment instead of being held at the path's end. Below its first support the
 signal function keeps its first value. All arithmetic runs in the floating dtype
 of the given colours.
 
+A sand's factor is its path's scale over its measured colour range: the change
+along its path that its dissolved CO2 reaches beside the free gas
+(:func:`color_ranges`, with the settings of :class:`ColorRangeSettings`).
+
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
+from scipy import ndimage
 
 import darsia
 
@@ -157,3 +163,119 @@ class SandColorPaths:
                 values = path(relative[pixels])[mask[pixels]]
                 signal[mask] = values * values.dtype.type(self.factors[sand])
         return signal
+
+
+@dataclass(frozen=True)
+class ColorRangeSettings:
+    """Settings of the colour-range measurement; one configuration table."""
+
+    mean_mm: float
+    """Side [mm] of the centred square, an odd number of pixels, over which the
+    change along the path is averaged inside the sand's dissolved CO2."""
+    inner_mm: float
+    """Depth [mm] inside the sand's dissolved CO2 of the pixels measured."""
+    gas_mm: float
+    """Distance [mm] from the free gas of the pixels that give the range."""
+    minimum_inner_mm2: float
+    """Smallest area [mm²] of a frame's pixels measured."""
+    minimum_gas_mm2: float
+    """Smallest area [mm²] of a frame's pixels that give the range."""
+    gas_percentile: float
+    """Percentile of their mean change that is the frame's range."""
+
+
+def color_ranges(
+    runs: Sequence[tuple], settings: ColorRangeSettings
+) -> dict[int, float]:
+    """Each sand's colour range: the change along its colour path that its
+    dissolved CO2 reaches beside the free gas.
+
+    In each frame, a sand's colour change is projected on the direction of its
+    colour path's end and averaged over the centred square inside the sand's
+    dissolved CO2 (beyond the grid counts as outside it). The frame's range is a
+    percentile of this mean over the pixels at least ``inner_mm`` inside the
+    dissolved CO2 and within ``gas_mm`` of the free gas (erosion and dilation in
+    steps of one pixel, none for a length that rounds to zero pixels), when both
+    sets of pixels are large enough. The free gas the phase model found
+    (:func:`darsia.model_gas`, which gravity or a peel made dissolved CO2) is free
+    gas here, not dissolved CO2, as in the run statistics. A run's range is the
+    largest of its frames', on the run's own colour paths, and the sand's range
+    the mean of the runs'. Lengths and areas are on the sand plane, converted to
+    pixels with the side of the cell of the run's optical pitch. Computed in the
+    dtype of the images.
+
+    Parameters
+    ----------
+    runs : sequence of (sequence, array, darsia.Image, tuple of float, mapping)
+        For each run: its frames, each an RGB image (rows, cols, 3), its phase map
+        (:class:`darsia.PhaseLabel`) and rule map (:class:`darsia.PhaseRule`) and
+        the pixels whose colour change is measured, read by index; the RGB image
+        of its baseline; its sand map; the pitch [m] of its grid on the sand
+        plane, down a column and along a row (:func:`darsia.optical_pitch_m`);
+        and the run's colour path of each sand measured (facies id to
+        ColorPathSignal).
+    settings : ColorRangeSettings
+        Settings of the measurement.
+
+    Returns
+    -------
+    dict of int to float
+        The colour range of each sand.
+
+    Raises
+    ------
+    ValueError
+        If a sand has no positive range in some run.
+
+    """
+    largest, sands = [], set()
+    for frames, baseline, sand_map, optical_pitch, paths in runs:
+        sands |= set(paths)
+        facies = sand_map.img
+        pixel_mm = float(np.sqrt(optical_pitch[0] * optical_pitch[1])) * 1000
+        pixel_mm2 = pixel_mm**2
+        size = 2 * int(round((settings.mean_mm / pixel_mm - 1) / 2)) + 1
+        inner_steps = int(round(settings.inner_mm / pixel_mm))
+        gas_steps = int(round(settings.gas_mm / pixel_mm))
+        run = {}
+        for index in range(len(frames)):
+            current, phase, rules, support = frames[index]
+            dtype = current.dtype
+            gas = darsia.model_gas(phase, rules)
+            dissolved = support & (phase == darsia.PhaseLabel.DISSOLVED) & ~gas
+            beside_gas = (
+                ndimage.binary_dilation(gas, iterations=gas_steps) if gas_steps else gas
+            )
+            for sand, path in paths.items():
+                mask = dissolved & (facies == sand)
+                inner = (
+                    ndimage.binary_erosion(mask, iterations=inner_steps)
+                    if inner_steps
+                    else mask
+                )
+                if inner.sum() < settings.minimum_inner_mm2 / pixel_mm2:
+                    continue
+                measured = beside_gas & inner
+                if measured.sum() < settings.minimum_gas_mm2 / pixel_mm2:
+                    continue
+                end = np.asarray(
+                    path.interpolation.color_path.relative_colors[-1], dtype
+                )
+                change = ((current - baseline) * (end / np.linalg.norm(end))).sum(-1)
+                weight = ndimage.uniform_filter(
+                    mask.astype(dtype), size, mode="constant"
+                )
+                mean = ndimage.uniform_filter(
+                    np.where(mask, change, 0).astype(dtype), size, mode="constant"
+                ) / np.maximum(weight, 1e-6)
+                value = float(np.percentile(mean[measured], settings.gas_percentile))
+                run[sand] = max(run.get(sand, value), value)
+        largest.append(run)
+    missing = [
+        sand for sand in sorted(sands) if any(run.get(sand, 0) <= 0 for run in largest)
+    ]
+    if missing:
+        raise ValueError(f"No positive colour range of sand(s) {missing} in every run")
+    return {
+        sand: float(np.mean([run[sand] for run in largest])) for sand in sorted(sands)
+    }
