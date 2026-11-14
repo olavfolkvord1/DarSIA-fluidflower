@@ -38,7 +38,10 @@ Every run given, fitted or not, has its anchor frame from its own frames, and
 :func:`dilution_factor` is the dilution law both read.
 
 Leaving one run out fits the frames of all other runs and predicts the frames of
-the run left out.
+the run left out. A sand without a measured Swi may take the Swi that makes the
+frames' free gas agree with their run's own overflow measurement
+(:func:`fit_swi`); the fit applies it to the frames whose free gas did not
+follow an overflow volume.
 
 Every setting is a field of :class:`CalibrationFitSettings`.
 
@@ -46,12 +49,13 @@ Every setting is a field of :class:`CalibrationFitSettings`.
 
 from __future__ import annotations
 
+import dataclasses
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, lsq_linear
 
 from darsia.multi_image_analysis.gas_statistics import GasStatistics
 from darsia.multi_image_analysis.run_statistics import (
@@ -62,6 +66,9 @@ from darsia.multi_image_analysis.run_statistics import (
 _LOG_GAIN_BOUND = 700.0
 """Bound of the logarithm of the gain in the solver, against an overflow of its
 exponential."""
+_SWI_CONDITION = 100.0
+"""Above this condition number of the column-scaled pore volumes the frames cannot
+tell the sands' gas apart, and no Swi is fitted."""
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,8 @@ class CalibrationFitSettings:
     """Function, step and gradient tolerance of the least-squares solver."""
     evaluations: int
     """Most residual evaluations of one least-squares solve."""
+    swi_limit: float
+    """A fitted gas share this close to 0 or 1 leaves the sand's Swi as assumed."""
 
 
 @dataclass(frozen=True)
@@ -130,6 +139,11 @@ class CalibrationFrame:
     """Gas statistics."""
     column: ColumnEstimate | None
     """CO2 pixels without a measurement of their own, or None without any."""
+    overflow_m3: float | None
+    """Free-gas volume [m3] the frame's gas allocation held, or None for the
+    model's gas."""
+    measured: bool
+    """Whether that volume is the run's own overflow measurement."""
 
 
 @dataclass(frozen=True)
@@ -165,7 +179,7 @@ class Calibration:
 
     The dissolved CO2 of a pixel is the share min(1, gain * relative signal) of
     its water's capacity, times the frame's dilution factor (with beta and beta
-    growth, at its run's anchor).
+    growth, at its run's anchor). Sands in ``swi`` take that Swi.
 
     """
 
@@ -174,6 +188,8 @@ class Calibration:
     beta_growth: float
     anchors: dict[str, DilutionAnchor]
     """The anchor frame of each run given, fitted or not."""
+    swi: dict[int, float]
+    """Swi fitted for sands without a measured value; empty without such a sand."""
     runs: tuple[str, ...]
     """The runs fitted."""
     held_out: str | None
@@ -300,6 +316,94 @@ def _anchor(frames, settings):
     ):
         raise ValueError(f"No dilution anchor for run {frame.run}")
     return DilutionAnchor(frame.elapsed_h, volume, frame.index)
+
+
+def fit_swi(
+    frames: Sequence[CalibrationFrame],
+    swi: Mapping[int, float],
+    measured: Collection[int],
+    settings: CalibrationFitSettings,
+) -> dict[int, float]:
+    """Swi of the sands without a measured value, from the overflow measurements.
+
+    In each frame with its run's own overflow measurement, the free gas of the
+    pixels labelled gas fills the share 1 - Swi of their pore volume. The shares
+    of the sands without a measured Swi are fitted to the measured volumes by
+    bounded linear least squares, the other sands at their Swi. A sand without gas
+    in those frames, a set of sands the frames cannot tell apart (by rank, or a
+    condition number above 100), and a share within ``swi_limit`` of 0 or 1 keep
+    the assumed Swi.
+
+    Parameters
+    ----------
+    frames : sequence of CalibrationFrame
+        The frames.
+    swi : mapping of int to float
+        Each sand's Swi, measured or assumed.
+    measured : collection of int
+        The sands whose Swi is measured.
+    settings : CalibrationFitSettings
+        Settings of the fit, its Swi limit.
+
+    Returns
+    -------
+    dict of int to float
+        The fitted Swi of each sand it places.
+
+    """
+    open_sands = sorted(sand for sand in swi if sand not in measured)
+    rows = [f for f in frames if f.measured and f.overflow_m3 is not None]
+    rows = [f for f in rows if f.gas.sands]
+
+    def pores(frame, sand):
+        cell = frame.gas.sands.get(sand)
+        return 0.0 if cell is None else cell.pore_volume_m3
+
+    used = [s for s in open_sands if any(pores(f, s) > 0 for f in rows)]
+    if not used:
+        return {}
+    matrix = np.array([[pores(f, s) for s in used] for f in rows], dtype=np.float64)
+    scaled = matrix / matrix.max(axis=0)
+    if (
+        np.linalg.matrix_rank(scaled) < len(used)
+        or np.linalg.cond(scaled) > _SWI_CONDITION
+    ):
+        return {}
+    known = [
+        sum(pores(f, s) * (1 - value) for s, value in swi.items() if s not in used)
+        for f in rows
+    ]
+    wanted = np.array([f.overflow_m3 - k for f, k in zip(rows, known)], np.float64)
+    shares = lsq_linear(matrix, wanted, bounds=(0.0, 1.0)).x
+    return {
+        sand: float(1 - share)
+        for sand, share in zip(used, shares)
+        if settings.swi_limit < share < 1 - settings.swi_limit
+    }
+
+
+def _apply_swi(frames, swi, fitted):
+    """The frames with each fitted Swi in place of the assumed one.
+
+    A frame whose free gas followed an overflow volume holds that volume and
+    stays; in the others the gas fills 1 - Swi of the gas pixels' pore volume,
+    and water the rest.
+
+    """
+    changed = []
+    for frame in frames:
+        if fitted and frame.overflow_m3 is None:
+            free, water = frame.gas.free_gas_g, frame.gas.gas_water_g
+            for sand, value in fitted.items():
+                cell = frame.gas.sands.get(sand)
+                if cell is not None:
+                    shift = swi[sand] - value
+                    free += shift * cell.gas_capacity_g
+                    water += -shift * cell.water_capacity_g
+            gas = dataclasses.replace(frame.gas, free_gas_g=free, gas_water_g=water)
+            frame = dataclasses.replace(frame, gas=gas)
+        changed.append(frame)
+    return changed
 
 
 def _stage(target_h, settings):
@@ -500,7 +604,7 @@ def _fit_dilution(residuals, settings, dtype):
     return scalar(x[0]), scalar(x[1])
 
 
-def _fit(frames, fit_runs, settings, held_out):
+def _fit(frames, fit_runs, settings, swi, measured, held_out):
     """The calibration without the held-out run, and the frames it applies to."""
     identities = [(f.run, f.index) for f in frames]
     if len(set(identities)) != len(identities):
@@ -510,10 +614,13 @@ def _fit(frames, fit_runs, settings, held_out):
     runs = tuple(run for run in fit_runs if run != held_out)
     fit = [f for f in frames if f.run in fit_runs]
     dtype = next(iter(fit[0].dissolved.values())).weight.dtype
+    fitted = fit_swi([f for f in fit if f.run != held_out], swi, measured, settings)
+    frames = _apply_swi(frames, swi, fitted)
     by_run = defaultdict(list)
     for frame in frames:
         by_run[frame.run].append(frame)
     anchors = {run: _anchor(values, settings) for run, values in by_run.items()}
+    fit = [f for f in frames if f.run in fit_runs]
     stages, decisions = _selection(fit, settings, held_out)
     if not stages["gain"] or not stages["dilution"]:
         raise ValueError("A stage of the calibration fit has no frames")
@@ -542,6 +649,7 @@ def _fit(frames, fit_runs, settings, held_out):
         beta=float(beta),
         beta_growth=float(growth),
         anchors=anchors,
+        swi=fitted,
         runs=runs,
         held_out=held_out,
         decisions=tuple(decisions),
@@ -553,6 +661,8 @@ def fit_calibration(
     frames: Sequence[CalibrationFrame],
     fit_runs: Sequence[str],
     settings: CalibrationFitSettings,
+    swi: Mapping[int, float],
+    measured_swi: Collection[int],
 ) -> Calibration:
     """The calibration fitted to the frames of the fit runs.
 
@@ -566,6 +676,10 @@ def fit_calibration(
         The runs to fit.
     settings : CalibrationFitSettings
         Settings of the fit.
+    swi : mapping of int to float
+        Each sand's Swi, measured or assumed, as the gas statistics were computed.
+    measured_swi : collection of int
+        The sands whose Swi is measured; the others may be fitted (:func:`fit_swi`).
 
     Returns
     -------
@@ -573,11 +687,11 @@ def fit_calibration(
         The calibration.
 
     """
-    return _fit(frames, fit_runs, settings, None)[0]
+    return _fit(frames, fit_runs, settings, swi, measured_swi, None)[0]
 
 
 def _predictions(frames, calibration, run):
-    """The CO2 mass of a run's frames at a calibration, in frame order."""
+    """The CO2 mass of a run's frames at a calibration (its Swi in place), in order."""
     values = sorted((f for f in frames if f.run == run), key=lambda f: f.index)
     dtype = next(iter(values[0].dissolved.values())).weight.dtype
     scalar = np.dtype(dtype).type
@@ -612,6 +726,8 @@ def calibration_fold(
     frames: Sequence[CalibrationFrame],
     fit_runs: Sequence[str],
     settings: CalibrationFitSettings,
+    swi: Mapping[int, float],
+    measured_swi: Collection[int],
     held_out: str,
 ) -> tuple[Calibration, list[Prediction]]:
     """One fold of leaving one run out: the fit without a run, and its predictions.
@@ -626,6 +742,10 @@ def calibration_fold(
         The runs to fit.
     settings : CalibrationFitSettings
         Settings of the fit.
+    swi : mapping of int to float
+        Each sand's Swi, measured or assumed, as the gas statistics were computed.
+    measured_swi : collection of int
+        The sands whose Swi is measured; the others may be fitted (:func:`fit_swi`).
     held_out : str
         The fit run left out of the fit.
 
@@ -635,14 +755,16 @@ def calibration_fold(
         The calibration fitted without the run, and the run's predicted frames.
 
     """
-    calibration, frames = _fit(frames, fit_runs, settings, held_out)
-    return calibration, _predictions(frames, calibration, held_out)
+    calibration, applied = _fit(frames, fit_runs, settings, swi, measured_swi, held_out)
+    return calibration, _predictions(applied, calibration, held_out)
 
 
 def leave_one_run_out(
     folds: Mapping[str, Sequence[CalibrationFrame]],
     fit_runs: Sequence[str],
     settings: CalibrationFitSettings,
+    swi: Mapping[int, float],
+    measured_swi: Collection[int],
 ) -> dict[str, tuple[Calibration, list[Prediction]]]:
     """Every fold of leaving one run out (:func:`calibration_fold`).
 
@@ -651,7 +773,7 @@ def leave_one_run_out(
 
     """
     return {
-        run: calibration_fold(frames, fit_runs, settings, run)
+        run: calibration_fold(frames, fit_runs, settings, swi, measured_swi, run)
         for run, frames in folds.items()
     }
 
