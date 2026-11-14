@@ -164,3 +164,37 @@ def test_every_run_given_has_the_parameters_of_its_mass():
         anchor_h=anchor.elapsed_h,
         anchor_pore_volume_m3=anchor.gas.co2_pore_volume_m3,
     )
+
+
+def test_no_held_out_run_is_in_its_own_fold():
+    frames = [f for seed, run in enumerate("abc") for f in _run(run, seed)]
+    off = [f for f in frames if f.run != "b"]
+    # The held-out run's frames say nothing about the calibration of its fold.
+    off += [
+        _frame(
+            "b",
+            f.index,
+            f.elapsed_h,
+            f.target_h,
+            1e-3,
+            f.gas.co2_pore_volume_m3,
+            (f.dissolved[1].relative, f.dissolved[1].weight),
+        )
+        for f in frames
+        if f.run == "b"
+    ]
+
+    fold, predictions = darsia.calibration_fold(frames, RUNS, SETTINGS, "b")
+    other, _ = darsia.calibration_fold(off, RUNS, SETTINGS, "b")
+
+    assert (fold.gain, fold.beta, fold.beta_growth) == (
+        other.gain,
+        other.beta,
+        other.beta_growth,
+    )
+    assert fold.runs == ("a", "c") and fold.held_out == "b"
+    held = [d for d in fold.decisions if d.run == "b"]
+    assert held and all(d.reasons == ("leave_one_run_out",) for d in held)
+    assert [p.index for p in predictions] == list(range(15))
+    assert {p.run for p in predictions} == {"b"}
+    assert max(abs(p.residual) for p in predictions[1:]) < 1e-3
