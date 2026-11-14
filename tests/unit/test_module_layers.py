@@ -49,6 +49,7 @@ MODULES = [
     "darsia/corrections/shape/lens.py",
     "darsia/presets/workflows/setup/sand_map.py",
     "darsia/presets/workflows/setup/setup_sand_map.py",
+    "darsia/multiphase/phase_training.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
