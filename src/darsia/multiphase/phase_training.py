@@ -136,6 +136,9 @@ class TrainingSamples:
     accepted_canvases: tuple[dict | None, ...]
     """Canvases of label sets sampled by the caller's explicit choice although
     they differ from :attr:`canvas`; None for a set that records none."""
+    moved_from: tuple[dict, ...]
+    """Canvases the sampled label sets were moved from (:func:`~darsia.move_labels`),
+    each once."""
 
 
 @dataclass(frozen=True)
@@ -225,6 +228,7 @@ def frame_samples(
                 "Move them onto the images' canvas, or accept theirs explicitly."
             )
         accepted = (labels.canvas,)
+    moved = () if labels.moved_from is None else (labels.moved_from,)
     features = PhaseFeatures(
         current,
         baseline,
@@ -255,6 +259,7 @@ def frame_samples(
         texture_sigma_mm=settings.texture_sigma_mm,
         canvas=canvas,
         accepted_canvases=accepted,
+        moved_from=moved,
     )
 
 
@@ -275,7 +280,7 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
         for part in parts
     ):
         raise ValueError("Training samples of different grids or texture scales.")
-    accepted = []
+    accepted, moved = [], []
     for part in parts:
         if part.canvas != first.canvas:
             raise ValueError(
@@ -283,6 +288,7 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
                 f"{', '.join(canvas_differences(first.canvas, part.canvas))}."
             )
         accepted += [c for c in part.accepted_canvases if c not in accepted]
+        moved += [c for c in part.moved_from if c not in moved]
     offsets = np.cumsum([0] + [len(part.regions) for part in parts])
     return TrainingSamples(
         features=np.concatenate([part.features for part in parts]),
@@ -294,6 +300,7 @@ def join_samples(parts: list[TrainingSamples]) -> TrainingSamples:
         texture_sigma_mm=first.texture_sigma_mm,
         canvas=first.canvas,
         accepted_canvases=tuple(accepted),
+        moved_from=tuple(moved),
     )
 
 
@@ -313,6 +320,7 @@ def write_training_samples(path: str | Path, samples: TrainingSamples) -> None:
         texture_sigma_mm=samples.texture_sigma_mm,
         canvas=json.dumps(samples.canvas),
         accepted_canvases=json.dumps(samples.accepted_canvases),
+        moved_from=json.dumps(samples.moved_from),
     )
 
 
@@ -335,6 +343,7 @@ def read_training_samples(path: str | Path) -> TrainingSamples:
             texture_sigma_mm=float(archive["texture_sigma_mm"]),
             canvas=json.loads(str(archive["canvas"])),
             accepted_canvases=tuple(json.loads(str(archive["accepted_canvases"]))),
+            moved_from=tuple(json.loads(str(archive["moved_from"]))),
         )
 
 
