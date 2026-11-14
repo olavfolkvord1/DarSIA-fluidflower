@@ -33,10 +33,28 @@ CONFIGURATION = tomllib.loads(
     smallest_mm2 = 2000.0
     darkest = 0.2
 
+    [path_ratios]
+    mean_mm = 5.0
+    tile_mm = 3.0
+    band_mm = [1.0, 3.0]
+    far_mm = 6.0
+    min_dissolved_share = 0.95
+    gas_free_mm = 5.0
+    min_band_mm2 = 0.55  # 20 pixels of 0.0279 mm²
+    flat_tol_per_mm = 0.02
+    arrived_share = 0.5
+    equalise_h = 2.5
+    min_level = 0.03
+    ceiling_margin = 0.95
+    min_tiles = 30
+    block_mm = 50.0
+    bootstrap = 400
+    seed = 0
     """
 )
 SETTINGS = darsia.BeerLambertSettings(**CONFIGURATION["beer_lambert"])
 SHADOW = darsia.ShadowSettings(**CONFIGURATION["shadow_light"])
+RATIO_SETTINGS = darsia.PathRatioSettings(**CONFIGURATION["path_ratios"])
 
 DIRECTION = np.array([0.8, 0.58, 0.02]) / np.linalg.norm([0.8, 0.58, 0.02])
 """Direction of the log colour change of dissolved CO2."""
@@ -142,3 +160,44 @@ def test_the_background_leaves_out_a_shadow():
     own = facies == 5
     np.testing.assert_allclose(background[own], unshaded[own], rtol=0.02)
     assert (followed[inside] / unshaded[inside]).mean() < 0.9
+
+
+def test_path_ratios_are_measured_where_two_sands_meet():
+    shape = (300, 500)  # 0.2 mm pixels
+    facies = np.full(shape, 1, np.uint8)
+    facies[100:, :] = 5
+    facies[200:, :] = 2
+    sand_map = darsia.ScalarImage(facies, dimensions=[0.06, 0.1])
+    ratio = {1: 0.8, 2: 0.9, 5: 1.0}
+    baseline = np.array([TONE[label] for label in facies.ravel()]).reshape(shape + (3,))
+    paths = {sand: _path(np.array(TONE[sand]), ratio[sand]) for sand in ratio}
+    reading = darsia.SandColorPaths(paths, {sand: 1.0 for sand in ratio})
+    path_ratio = np.vectorize(ratio.get)(facies)[..., None]
+    hours = [0.0, 1.0, 3.0, 4.0, 5.0]
+    frames = []
+    for hour in hours:
+        concentration = 0.5 * (1 - np.exp(-(hour + 0.5)))
+        current = baseline * np.exp(path_ratio * 0.14 * concentration * DIRECTION)
+        phase = np.full(shape, darsia.PhaseLabel.DISSOLVED, np.uint8)
+        rules = np.zeros(shape, np.uint8)
+        frames.append((current, phase, rules, np.ones(shape, bool)))
+
+    measured = darsia.path_ratios(
+        frames,
+        hours,
+        baseline,
+        sand_map,
+        (0.2e-3, 0.2e-3),
+        np.ones(shape, bool),
+        reading,
+        np.ones(shape),
+        5,
+        1.2,
+        RATIO_SETTINGS,
+    )
+
+    assert set(measured.pairs) == {(1, 5), (2, 5)}
+    assert all(pair.tiles == 3 * 34 for pair in measured.pairs.values())
+    np.testing.assert_allclose(
+        [measured.ratio[1], measured.ratio[2]], [0.8, 0.9], rtol=1e-9
+    )
