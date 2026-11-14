@@ -21,12 +21,15 @@ pixel centres at whole numbers), and gives the layer of each pixel:
    pixel lie within a set distance; polygons drawn up to the frame seldom reach it
    exactly. Any other uncovered pixel has no layer.
 
+A run whose sand has settled keeps its own geometry: its adjustment moves anchors
+of the common drawing for that run only (:meth:`SandMapDrawing.moved`).
+
 """
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -95,6 +98,58 @@ class SandMapDrawing:
             polygons=polygons,
             on_top=frozenset(int(layer) for layer in data.get("on_top", ())),
         )
+
+    def moved(self, anchors: Mapping[int, Sequence[float]]) -> "SandMapDrawing":
+        """The drawing with some anchors at new positions, e.g., a run's adjustment.
+
+        Every polygon that uses a moved anchor follows it, so neighbouring layers
+        stay joined.
+
+        Parameters
+        ----------
+        anchors : mapping
+            New position (x, y) in metres of each moved anchor, by index.
+
+        Returns
+        -------
+        SandMapDrawing
+            A new drawing; this one is unchanged.
+
+        Raises
+        ------
+        ValueError
+            If an index names an anchor the drawing does not have.
+
+        """
+        positions = self.anchors.copy()
+        for index, position in anchors.items():
+            if not 0 <= index < len(positions):
+                raise ValueError(
+                    f"The drawing has no anchor {index} ({len(positions)} anchors)."
+                )
+            positions[index] = position
+        return SandMapDrawing(positions, self.polygons, self.on_top)
+
+
+def read_moved_anchors(path: Path) -> dict[int, tuple[float, float]]:
+    """Read a run's adjustment, the anchors it moves, from a JSON file.
+
+    Parameters
+    ----------
+    path : Path
+        Path to a file holding ``anchors``, a mapping of anchor index to [x, y]
+        in metres.
+
+    Returns
+    -------
+    dict
+        New position of each moved anchor, by index.
+
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {
+        int(index): (float(x), float(y)) for index, (x, y) in data["anchors"].items()
+    }
 
 
 def rig_grid(grid: darsia.Image) -> np.ndarray:
@@ -210,7 +265,7 @@ def rasterize_sand_map(
     Parameters
     ----------
     drawing : SandMapDrawing
-        The drawing.
+        The drawing, possibly with a run's adjustment.
     shape : tuple of int
         Rows and columns of the run's grid.
     rig_to_grid : array
