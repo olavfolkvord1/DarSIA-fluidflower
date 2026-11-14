@@ -45,6 +45,8 @@ MODULES = [
     "darsia/image/raw.py",
     "darsia/corrections/shape/registration.py",
     "darsia/corrections/shape/cameralens.py",
+    "darsia/corrections/shape/radiallens.py",
+    "darsia/corrections/shape/lens.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
