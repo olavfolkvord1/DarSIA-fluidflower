@@ -16,6 +16,33 @@ import darsia
 logger = logging.getLogger(__name__)
 
 
+def _read_table(path: Path | tuple[Path, str]) -> pd.DataFrame:
+    """Read a protocol's table from a CSV file or from a sheet of a workbook.
+
+    Parameters
+    ----------
+    path : Path or tuple of Path and str
+        A CSV file or a workbook, or a workbook and the name of its sheet. A
+        workbook given without a sheet name is read from its first sheet.
+
+    Returns
+    -------
+    pd.DataFrame
+        The table as read.
+
+    """
+    if isinstance(path, list) or isinstance(path, tuple):
+        protocol_path, sheet = path[0], path[1]
+    else:
+        protocol_path, sheet = path, None
+    if protocol_path.suffix == ".csv":
+        assert sheet is None, "Sheet name should not be provided for CSV files."
+        return pd.read_csv(protocol_path)
+    if protocol_path.suffix in [".xls", ".xlsx"]:
+        return pd.read_excel(protocol_path, sheet_name=0 if sheet is None else sheet)
+    raise ValueError("Unsupported file format. Use CSV or Excel files.")
+
+
 @dataclass
 class ImagingInterval:
     """Right-open imaging interval."""
@@ -236,20 +263,7 @@ class ImagingProtocol:
         )
 
     def _load_protocol(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
-        if isinstance(path, list) or isinstance(path, tuple):
-            protocol_path = path[0]
-            sheet = path[1]
-        else:
-            protocol_path = path
-            sheet = None
-
-        if protocol_path.suffix == ".csv":
-            assert sheet is None, "Sheet name should not be provided for CSV files."
-            df = pd.read_csv(protocol_path)
-        elif protocol_path.suffix in [".xls", ".xlsx"]:
-            df = pd.read_excel(protocol_path, sheet_name=sheet)
-        else:
-            raise ValueError("Unsupported file format. Use CSV or Excel files.")
+        df = _read_table(path)
 
         # Make all columns lowercase
         df.columns = [col.lower() for col in df.columns]
@@ -271,20 +285,7 @@ class ImagingProtocol:
         return pd.DataFrame({"path": paths, "datetime": datetimes})
 
     def _load_blacklist(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
-        if isinstance(path, list) or isinstance(path, tuple):
-            protocol_path = path[0]
-            sheet = path[1]
-        else:
-            protocol_path = path
-            sheet = None
-
-        if protocol_path.suffix == ".csv":
-            assert sheet is None, "Sheet name should not be provided for CSV files."
-            df = pd.read_csv(protocol_path)
-        elif protocol_path.suffix in [".xls", ".xlsx"]:
-            df = pd.read_excel(protocol_path, sheet_name=sheet)
-        else:
-            raise ValueError("Unsupported file format. Use CSV or Excel files.")
+        df = _read_table(path)
 
         # Expect only one column without any header, listing image paths
         assert (
@@ -578,20 +579,7 @@ class InjectionProtocol:
         return total
 
     def _load_protocol(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
-        if isinstance(path, list) or isinstance(path, tuple):
-            protocol_path = path[0]
-            sheet = path[1]
-        else:
-            protocol_path = path
-            sheet = None
-
-        if protocol_path.suffix == ".csv":
-            assert sheet is None, "Sheet name should not be provided for CSV files."
-            df = pd.read_csv(protocol_path)
-        elif protocol_path.suffix in [".xls", ".xlsx"]:
-            df = pd.read_excel(protocol_path, sheet_name=sheet)
-        else:
-            raise ValueError("Unsupported file format. Use CSV or Excel files.")
+        df = _read_table(path)
 
         # Make columns all lowercase
         df.columns = [col.lower() for col in df.columns]
@@ -801,20 +789,7 @@ class PressureTemperatureProtocol:
             return ThermodynamicState(pressure=pressure, temperature=temperature)
 
     def _load_protocol(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
-        if isinstance(path, list) or isinstance(path, tuple):
-            protocol_path = path[0]
-            sheet = path[1]
-        else:
-            protocol_path = path
-            sheet = None
-
-        if protocol_path.suffix == ".csv":
-            assert sheet is None, "Sheet name should not be provided for CSV files."
-            df = pd.read_csv(protocol_path)
-        elif protocol_path.suffix in [".xls", ".xlsx"]:
-            df = pd.read_excel(protocol_path, sheet_name=sheet)
-        else:
-            raise ValueError("Unsupported file format. Use CSV or Excel files.")
+        df = _read_table(path)
 
         # Make columns all lowercase
         df.columns = [col.lower() for col in df.columns]
