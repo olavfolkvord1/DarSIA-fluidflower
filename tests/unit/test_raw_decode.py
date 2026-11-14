@@ -1,6 +1,7 @@
 """Tests of the decode of camera raw files."""
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -8,6 +9,8 @@ import pytest
 import tifffile
 
 import darsia
+from darsia.presets.workflows.config.corrections import CorrectionsConfig
+from darsia.presets.workflows.rig import Rig
 
 pytest.importorskip("rawpy")
 
@@ -112,3 +115,47 @@ def test_a_list_or_folder_of_raw_files_is_a_time_series(tmp_path):
         single = darsia.imread(path, demosaic="edge_aware", dtype=np.float32)
         np.testing.assert_array_equal(series.img[:, :, i], single.img)
     np.testing.assert_array_equal(darsia.imread(tmp_path, **options).img, series.img)
+
+
+def test_rig_decodes_raw_photographs_in_its_precision(tmp_path):
+    """With [corrections.raw], the rig decodes the baseline and, after a save and a
+    load, later photographs in its one precision, here that of the run grid."""
+    rng = np.random.default_rng(1)
+    for name in ("baseline", "frame"):
+        mosaic = rng.integers(600, 15000, (32, 48), dtype=np.uint16)
+        write_dng(tmp_path / f"{name}.dng", mosaic, LAYOUTS["RGGB"][0])
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[corrections.raw]\ndemosaic = "edge_aware"\n\n'
+        '[corrections.grid]\nprecision = "float32"\narea_factor = 1.0\n'
+    )
+    experiment = SimpleNamespace(get_datetime=lambda path: None)
+
+    rig = Rig()
+    rig.setup_reading(
+        tmp_path / "baseline.dng",
+        experiment=experiment,
+        corrections_config=CorrectionsConfig().load(config),
+    )
+    baseline = darsia.imread(
+        tmp_path / "baseline.dng", demosaic="edge_aware", dtype="float32"
+    )
+    np.testing.assert_array_equal(rig.baseline.img, baseline.img)
+    assert rig.raw_decoding == {"demosaic": "edge_aware", "dtype": "float32"}
+
+    rig.baseline_path, rig.color_corrections = tmp_path / "baseline.dng", []
+    ones = darsia.ScalarImage(np.ones((32, 48)), dimensions=rig.baseline.dimensions)
+    rig.depth = rig.porosity = rig.permeability = rig.image_porosity = ones
+    rig.labels = rig.facies = darsia.ScalarImage(
+        np.zeros((32, 48), dtype=int), dimensions=rig.baseline.dimensions
+    )
+    rig.save(tmp_path / "rig")
+    loaded = Rig.load(tmp_path / "rig")
+    loaded.experiment, loaded.reference_date = experiment, None
+
+    frame = darsia.imread(
+        tmp_path / "frame.dng", demosaic="edge_aware", dtype="float32"
+    )
+    np.testing.assert_array_equal(
+        loaded.read_image(tmp_path / "frame.dng").img, frame.img
+    )
