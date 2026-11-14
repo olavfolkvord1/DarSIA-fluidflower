@@ -26,6 +26,7 @@ SETTINGS = darsia.OverflowSettings(
         maximum_pre_injection_offset_ml = 50.0
         pre_injection_span_h = 0.05
         maximum_pre_injection_rate_g_h = 600.0
+        recipe_tolerance = {alkalinity_M = 0.03, btb_M = 0.03}
         """
     )["overflow"]
 )
@@ -93,3 +94,39 @@ def test_a_sheet_gives_its_own_injection_start(tmp_path):
     rows.assign(injection_start=two).to_csv(path, index=False)
     with pytest.raises(ValueError, match="2 injection starts"):
         darsia.OverflowProtocol(path)
+
+
+def _run(volume, offset_bar=0.0, sand_map="map", alkalinity=0.01, cover=(-1.0, 18.0)):
+    """A run with a steady pressure record and a recipe."""
+    hours = np.arange(cover[0], cover[1] + 0.25, 0.25)
+    return darsia.OverflowRun(
+        sand_map,
+        {"alkalinity_M": alkalinity, "btb_M": 1e-4, "salt": "none"},
+        hours,
+        1.0 + offset_bar + 0.002 * np.sin(hours),
+        (0.0, 3.0),
+        volume,
+    )
+
+
+def test_estimated_reference_scales_the_most_similar_run(tmp_path):
+    """The compatible run of nearest pressure lends its free-gas share of the mass."""
+    volume = darsia.displaced_volume(
+        *_protocol(tmp_path).readings(START, SETTINGS.statuses), SETTINGS
+    )
+    runs = {
+        "recipient": _run(None),
+        "far": _run(volume, offset_bar=0.01),
+        "near": _run(volume, offset_bar=0.002, alkalinity=0.0102),
+        "recipe": _run(volume, offset_bar=0.0, alkalinity=0.011),
+        "map": _run(volume, offset_bar=0.0, sand_map="other"),
+        "short": _run(volume, offset_bar=0.0, cover=(-1.0, 10.0)),
+    }
+    assert darsia.ranked_donors("recipient", runs, SETTINGS) == ["near", "far"]
+
+    # The donor's 175 mL at 2.5 h, at 1.8 kg/m3, is 0.315 g of its 1 g: 31.5 % of
+    # the frame's 2 g at 1.9 kg/m3.
+    share = darsia.estimated_reference(volume, 2.5, 1.0, 1.8, 2.0, 1.9)
+    assert share == pytest.approx(0.315 * 2.0 / 1.9 / 1000)
+    assert darsia.estimated_reference(volume, 2.5, 0.1, 1.8, 2.0, 1.9) is None
+    assert darsia.estimated_reference(volume, 15.0, 1.0, 1.8, 2.0, 1.9) is None

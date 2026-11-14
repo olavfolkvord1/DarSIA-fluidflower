@@ -5,7 +5,9 @@ the displaced water, together with a slowly drifting feed of water, to a scale.
 The overflow measures that displaced water, never CO2 leaving the rig. The
 displaced volume of a run is its scale weight above the feed (one gram of water
 per mL), and the free-gas volume of a frame is that volume at the frame's time,
-at least zero (:func:`measured_reference`).
+at least zero (:func:`measured_reference`). A frame without usable readings of
+its own takes the free-gas share of the injected CO2 mass from the most similar
+run with readings (:func:`ranked_donors`, :func:`estimated_reference`).
 
 The feed (:func:`displaced_volume`) stops where the readings stop rising: at
 the first reading, from ``supply_check_h`` on, after which the weight rises by
@@ -20,7 +22,7 @@ Every setting is a field of :class:`OverflowSettings`.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -52,6 +54,8 @@ class OverflowSettings:
     """Readings before the injection spanning this time [h] give their rate."""
     maximum_pre_injection_rate_g_h: float
     """Readings before the injection must rise slower than this."""
+    recipe_tolerance: Mapping[str, float]
+    """Recipe entries a donor may differ in, by this fraction of the larger value."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,24 @@ class DisplacedVolume:
     """Displaced water volume [mL] at each reading; None without a feed."""
     reasons: tuple[str, ...]
     """Why the readings are not usable; empty when they are."""
+
+
+@dataclass(frozen=True)
+class OverflowRun:
+    """A run as the estimated reference compares it with other runs."""
+
+    sand_map: str
+    """Identity of the run's sand map; a donor shares it."""
+    recipe: Mapping[str, object]
+    """The run's chemistry; a donor matches it within the recipe tolerance."""
+    pressure_h: np.ndarray
+    """Times [h since the injection start] of the atmospheric pressure record."""
+    pressure_bar: np.ndarray
+    """Atmospheric pressure [bar] at those times."""
+    injection_h: tuple[float, float]
+    """First start and last end [h] of the run's injection."""
+    volume: DisplacedVolume | None
+    """The run's displaced volume, if it has readings."""
 
 
 def displaced_volume(
@@ -172,3 +194,152 @@ def measured_reference(volume: DisplacedVolume, elapsed_h: float) -> float | Non
     if observed is None:
         return None
     return max(0.0, float(observed * 1e-6))
+
+
+def _compatible(recipient: OverflowRun, donor: OverflowRun, settings) -> bool:
+    """Same sand map and recipe, the tolerated entries within their tolerance."""
+    if (
+        donor.sand_map != recipient.sand_map
+        or donor.recipe.keys() != recipient.recipe.keys()
+    ):
+        return False
+    for key, value in recipient.recipe.items():
+        other = donor.recipe[key]
+        if key in settings.recipe_tolerance:
+            if abs(value - other) / max(value, other) > settings.recipe_tolerance[key]:
+                return False
+        elif value != other:
+            return False
+    return True
+
+
+def _mean_difference(recipient, donor, start, stop):
+    """Mean absolute pressure difference [bar] over [start, stop].
+
+    Both records are linear between their samples; between two knots the
+    absolute difference is integrated exactly, also where its sign changes.
+    """
+    (rt, rp), (dt, dp) = recipient, donor
+    knots = np.unique(
+        np.r_[
+            start, rt[(rt > start) & (rt < stop)], dt[(dt > start) & (dt < stop)], stop
+        ]
+    )
+    difference = np.interp(knots, rt, rp) - np.interp(knots, dt, dp)
+    a, b = np.abs(difference[:-1]), np.abs(difference[1:])
+    area = (a + b) / 2
+    crosses = difference[:-1] * difference[1:] < 0
+    area[crosses] = (a[crosses] ** 2 + b[crosses] ** 2) / (
+        2 * (a[crosses] + b[crosses])
+    )
+    return float(np.dot(area, np.diff(knots)) / (stop - start))
+
+
+def ranked_donors(
+    recipient: str, runs: Mapping[str, OverflowRun], settings: OverflowSettings
+) -> list[str]:
+    """Runs whose displaced volume can stand in for a run's, most similar first.
+
+    A donor has usable readings, the recipient's sand map and its recipe
+    (equal entries, except those in ``recipe_tolerance``, which may differ by
+    that fraction of the larger value). Donors are ranked by the mean absolute
+    difference of their atmospheric pressure from the recipient's over the
+    comparison window: from the recipient's injection start to the later of its
+    injection end and the last reading of any donor, within the recipient's
+    pressure record. A donor whose pressure record misses part of the window is
+    left out; ties go by name.
+
+    Parameters
+    ----------
+    recipient : str
+        Name of the run that needs a donor.
+    runs : mapping of str to OverflowRun
+        The runs by name, the recipient among them.
+    settings : OverflowSettings
+        The recipe tolerance.
+
+    Returns
+    -------
+    list of str
+        Names of the donors, most similar first.
+
+    """
+    own = runs[recipient]
+    compatible = {
+        name: run
+        for name, run in runs.items()
+        if name != recipient
+        and run.volume is not None
+        and not run.volume.reasons
+        and _compatible(own, run, settings)
+    }
+    if not compatible:
+        return []
+    start = max(float(own.pressure_h[0]), own.injection_h[0])
+    stop = min(
+        float(own.pressure_h[-1]),
+        max(
+            own.injection_h[1], *(run.volume.times_h[-1] for run in compatible.values())
+        ),
+    )
+    if stop <= start:
+        return []
+    record = (own.pressure_h, own.pressure_bar)
+    ranked = sorted(
+        (
+            _mean_difference(record, (run.pressure_h, run.pressure_bar), start, stop),
+            name,
+        )
+        for name, run in compatible.items()
+        if run.pressure_h[0] <= start and run.pressure_h[-1] >= stop
+    )
+    return [name for _, name in ranked]
+
+
+def estimated_reference(
+    donor: DisplacedVolume,
+    elapsed_h: float,
+    donor_mass_g: float,
+    donor_density: float,
+    mass_g: float,
+    density: float,
+) -> float | None:
+    """Free-gas volume [m3] of a frame from a donor run's displaced water.
+
+    The donor's free gas at the frame's time, as a share of its injected CO2
+    mass, is that share of the frame's injected mass, at the frame's gas
+    density.
+
+    Parameters
+    ----------
+    donor : DisplacedVolume
+        The donor's usable displaced volume; the interpolation runs in the
+        dtype of its arrays.
+    elapsed_h : float
+        The frame's time [h since the injection start].
+    donor_mass_g, donor_density : float
+        The donor's injected CO2 mass [g] and its gas density [kg/m3] at that
+        time.
+    mass_g, density : float
+        The frame's injected CO2 mass [g] and gas density [kg/m3].
+
+    Returns
+    -------
+    float or None
+        The volume; None outside the donor's readings, or where its share is
+        not between zero and one.
+
+    """
+    observed = _volume_at(donor, elapsed_h)
+    if observed is None or mass_g < 0:
+        return None
+    volume = max(0.0, float(observed * 1e-6))
+    if donor_mass_g > 0:
+        share = volume * donor_density * 1000 / donor_mass_g
+    elif volume == 0:
+        share = 0.0
+    else:
+        return None
+    if not 0 <= share <= 1:
+        return None
+    return share * mass_g / (density * 1000)
