@@ -302,6 +302,19 @@ def test_pixel_centres_lie_half_a_pixel_inside_the_top_left_corner():
     assert np.allclose(y, [2.95, 2.85])
 
 
+def test_grid_record_tells_images_on_one_grid():
+    """Images on one grid have one record, whatever their channels; another
+    origin is another grid."""
+    grid = {"dimensions": [0.2, 0.8], "origin": [1.0, 3.0]}
+    labels = darsia.Image(np.zeros((2, 4), np.uint8), **grid)
+    colours = darsia.Image(np.zeros((2, 4, 3)), **grid)
+    moved = darsia.Image(np.zeros((2, 4)), dimensions=[0.2, 0.8], origin=[1.0, 3.1])
+
+    assert darsia.grid_record(labels) == darsia.grid_record(colours)
+    assert darsia.grid_record(labels) == {"shape": [2, 4], **grid}
+    assert darsia.grid_record(moved) != darsia.grid_record(labels)
+
+
 def test_optical_pitch_takes_the_area_factor_of_the_pixel_areas():
     """The coordinate pitch times the root of the median area over the cell."""
     area = np.full((2, 4), 0.1 * 0.2 * 1.21)

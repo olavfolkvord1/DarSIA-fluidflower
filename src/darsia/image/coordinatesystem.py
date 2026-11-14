@@ -389,6 +389,32 @@ def pixel_centres(image: darsia.Image) -> tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
+def grid_record(image: darsia.Image) -> dict:
+    """The grid of an image as a plain record: its shape, dimensions and origin.
+
+    Two images lie on one grid when their records are equal, e.g. a phase map and
+    the image it masks, or the runs compared on one grid. A canvas
+    (``Rig.canvas``) holds the record of the rig's corrected images.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        An image with its physical dimensions and origin.
+
+    Returns
+    -------
+    dict
+        ``shape`` (pixels along each spatial axis), ``dimensions`` and ``origin``,
+        as lists of plain numbers.
+
+    """
+    return {
+        "shape": [int(n) for n in image.img.shape[: image.space_dim]],
+        "dimensions": [float(d) for d in image.dimensions],
+        "origin": [float(x) for x in image.origin],
+    }
+
+
 def optical_pitch_m(
     pixel_area: darsia.Image, domain: np.ndarray
 ) -> tuple[float, float]:

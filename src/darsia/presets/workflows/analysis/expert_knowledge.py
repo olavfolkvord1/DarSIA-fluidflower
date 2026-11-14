@@ -230,11 +230,7 @@ class ExpertKnowledgeAdapter:
             path = self.phase_maps / f"{Path(image.name).stem}.npz"
             self._last_phase_map = (image.name, darsia.imread(path))
         phase = self._last_phase_map[1]
-        if (
-            phase.img.shape != image.img.shape
-            or not np.array_equal(phase.dimensions, image.dimensions)
-            or not np.array_equal(phase.origin, image.origin)
-        ):
+        if darsia.grid_record(phase) != darsia.grid_record(image):
             raise ValueError(f"The phase map of {image.name} has another grid.")
         return phase.img
 
