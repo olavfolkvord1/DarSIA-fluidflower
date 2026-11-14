@@ -159,6 +159,7 @@ def test_the_tables_of_a_synthetic_ensemble(dtype, tmp_path):
     found = select(runs[1].rows, case_id="r2-3", domain_id="whole")[0]
     assert rig["mass_g"] == found["gas_quantified_mass_g"] > 0
     assert rig["fraction_of_injected"] == rig["mass_g"] / runs[1].injected_g["r2-3"]
+    assert "full_rig" not in {row["domain"] for row in tables["centres_long"]}
     layers = ensemble_tables(runs, DOMAINS[2:], complete)["mass_long"]
     assert "full_rig" not in {row["domain"] for row in layers}
 
@@ -191,3 +192,18 @@ def test_summary_statistics_of_the_known_values():
     assert found["sd"] == pytest.approx(np.std([1, 2, 4, 10], ddof=1))
     assert summary([1.0])["sd"] is None and summary([-1.0, 1.0])["cv"] is None
     assert summary([None])["n"] == 0
+
+
+def test_centres_of_a_synthetic_ensemble(tmp_path):
+    """Each run's centre per frame where it has one, and per target time the runs'
+    mean and median centre and mean spread."""
+    tables = ensemble_tables(ensemble(tmp_path), DOMAINS, SETTINGS)
+
+    long = select(tables["centres_long"], domain="low")
+    assert len(long) == 3 * 15 and long[0]["case_id"] == "r1-1"
+    centres = select(tables["centres_by_time"], domain="low", component="total")
+    by_time = {row["time_h"]: row for row in centres}
+    assert [by_time[t]["n_runs"] for t in (0.0, 1.0, 3.0)] == [1, 3, 2]
+    assert by_time[1.0]["mean_x_mm"] == pytest.approx(120.0)
+    assert by_time[1.0]["median_y_mm"] == pytest.approx(60.0)
+    assert by_time[3.0]["mean_spread_x_mm"] == 3.0
