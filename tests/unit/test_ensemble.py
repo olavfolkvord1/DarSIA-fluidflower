@@ -25,6 +25,7 @@ from darsia.presets.workflows.comparison.ensemble import (
     summary,
     write_tables,
 )
+from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 
 SETTINGS = EnsembleSettings(
     **tomllib.loads(
@@ -238,3 +239,21 @@ def test_the_event_times_summarised_over_runs(tmp_path):
     assert (first["n"], first["min"], first["max"]) == (3, 0.01, 0.5)
     write_events(tmp_path / "events.csv", rows)
     assert event_summary(read_events(tmp_path / "events.csv")) == found
+
+
+def test_the_figures_are_written(tmp_path):
+    """The mass, fraction and trajectory figures, each with and without title."""
+    runs = ensemble(tmp_path)
+    tables = ensemble_tables(runs, DOMAINS[:2], SETTINGS)
+    files = ensemble_figures(tmp_path, tables, runs, SETTINGS)
+
+    assert len(files) == 2 * (3 * 3 + 3 + 2)
+    assert "mass_whole-domain_gas_notitle.png" in files
+    assert "mass_whole-rig_gas_notitle.png" in files
+    assert "trajectory_low_total.png" in files
+    assert all((tmp_path / name).stat().st_size > 0 for name in files)
+    alike = [*DOMAINS[:2], AnalysisDomain("layer", "layer:3", "Low", label=3)]
+    with pytest.raises(ValueError, match="named alike"):
+        ensemble_figures(
+            tmp_path, ensemble_tables(runs, alike, SETTINGS), runs, SETTINGS
+        )
