@@ -4,9 +4,9 @@ A canvas of given physical dimensions is covered by whole square cells of one
 size, counted from the canvas' lower left corner; the canvas is extended upwards
 and to the right to whole cells. Each pixel belongs to the cell that holds its
 centre (half-open cells). Intensive values are averaged over the valid pixels of
-each cell, weighted by pixel area, and a label map takes the label of the largest
-area. Nothing is interpolated, so 1 mm, 5 mm or any other size is the same
-scaling.
+each cell, weighted by pixel area, extensive values (mass, volume, area) are
+summed over each cell, and a label map takes the label of the largest area.
+Nothing is interpolated, so 1 mm, 5 mm or any other size is the same scaling.
 
 """
 
@@ -86,6 +86,31 @@ def _cell_sums(cells: MetricCells, values: np.ndarray) -> np.ndarray:
     for channel, total in enumerate(sums):
         np.add.at(total, cells.index, values[:, channel])
     return sums.T
+
+
+def cell_sums(cells: MetricCells, values: np.ndarray) -> np.ndarray:
+    """Sum of an extensive quantity (e.g., mass, volume or area) over each cell.
+
+    The sums run in double precision whatever the dtype of the values, in pixel
+    order, as our production summed its cell copies, so that the cells of a
+    single-precision map add up to its total in double precision.
+
+    Parameters
+    ----------
+    cells : MetricCells
+        Cells of the values' canvas.
+    values : array
+        Values (rows, cols, ...) on the canvas: each pixel's share of the quantity.
+
+    Returns
+    -------
+    array
+        Sums (cell rows, cell cols, ...) in double precision; zero in an empty cell.
+
+    """
+    values = np.asarray(values)
+    value = values.reshape(len(cells.index), -1).astype(np.float64, copy=False)
+    return _cell_sums(cells, value).reshape(*cells.shape, *values.shape[2:])
 
 
 def cell_means(cells: MetricCells, values: np.ndarray) -> np.ndarray:

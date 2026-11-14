@@ -1,6 +1,7 @@
 """Unit tests for the scaling onto whole metric cells."""
 
 import numpy as np
+import pytest
 
 import darsia
 
@@ -55,3 +56,19 @@ def test_majority_takes_the_largest_area_and_the_lowest_label_on_a_tie():
     np.testing.assert_array_equal(
         darsia.cell_majority(cells, labels), [[7, 2, 7], [3, 7, 7]]
     )
+
+
+def test_cell_sums_add_single_precision_values_in_double_precision():
+    """Extensive values are summed per cell in float64 and keep the map's total."""
+    values = np.random.default_rng(2).random((6, 9)).astype(np.float32) * 1e-3
+    cells = darsia.metric_cells((6, 9), [0.6, 0.9], 400.0)
+
+    sums = darsia.cell_sums(cells, values)
+
+    assert sums.dtype == np.float64
+    expected = [
+        [values[rows, columns].astype(np.float64).sum() for columns in COLUMNS]
+        for rows in ROWS
+    ]
+    np.testing.assert_allclose(sums, expected, rtol=1e-15)
+    assert sums.sum() == pytest.approx(values.astype(np.float64).sum(), rel=1e-15)
