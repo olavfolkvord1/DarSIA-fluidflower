@@ -58,6 +58,7 @@ MODULES = [
     "darsia/presets/workflows/setup/sand_map.py",
     "darsia/presets/workflows/setup/setup_sand_map.py",
     "darsia/presets/workflows/setup/sand_map_snapping.py",
+    "darsia/presets/workflows/setup/sand_map_dye_edge.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
