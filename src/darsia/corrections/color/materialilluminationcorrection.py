@@ -55,13 +55,16 @@ def _polynomial(positions: np.ndarray) -> np.ndarray:
     return np.column_stack((np.ones_like(x), x, y, x * x, x * y, y * y))
 
 
-def _pixel_resize(source_shape: tuple, target_shape: tuple) -> np.ndarray:
-    """Homography of pixel centres under an area resize between two shapes."""
-    sy, sx = np.asarray(target_shape, dtype=np.float64) / np.asarray(
-        source_shape, dtype=np.float64
+def _pixel_resize(
+    source_shape: tuple, target_shape: tuple, dtype: np.dtype = np.float64
+) -> np.ndarray:
+    """Homography of pixel centres under an area resize between two shapes,
+    computed in ``dtype``."""
+    sy, sx = np.asarray(target_shape, dtype=dtype) / np.asarray(
+        source_shape, dtype=dtype
     )
     return np.asarray(
-        [[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]], dtype=np.float64
+        [[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]], dtype=dtype
     )
 
 
