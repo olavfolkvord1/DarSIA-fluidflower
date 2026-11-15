@@ -88,6 +88,9 @@ def load_curvature_correction_config_from_dict(
                 "height": float(sec_crop.get("height", 1.0)),
                 "in_meters": sec_crop.get("in_meters", True),
             }
+            if sec_crop.get("precision") is not None:
+                # The crop computed in this precision (extract_quadrilateral_ROI).
+                config["crop"]["precision"] = np.dtype(sec_crop["precision"])
     except KeyError:
         warn(f"No 'curvature.crop' section found in {source}.")
 

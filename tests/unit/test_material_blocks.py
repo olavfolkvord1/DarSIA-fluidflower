@@ -202,6 +202,33 @@ def test_a_run_fitted_on_its_own_grid_as_reference_is_unchanged(dtype):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_the_warp_onto_the_reference_grid_is_the_shared_warp_in_its_precision(dtype):
+    """The reduced image is warped onto the reference's fitting grid by
+    darsia.warp_perspective in the homography's precision: in single precision its
+    positions are mapped in single precision and sampled by OpenCV's remap, in
+    double precision it is OpenCV's perspective warp."""
+    from darsia.corrections.color.materialblocks import _warp
+
+    rng = np.random.default_rng(3)
+    values = rng.random((300, 450)).astype(np.float32)
+    angle = 0.01
+    matrix = np.array(
+        [
+            [1.002 * np.cos(angle), -np.sin(angle), 6.3],
+            [np.sin(angle), 0.998 * np.cos(angle), -4.1],
+            [2e-6, -1e-6, 1.0],
+        ],
+        dtype,
+    )
+    expected = darsia.warp_perspective(values, matrix, (450, 300), dtype)
+    np.testing.assert_array_equal(_warp(values, matrix), expected)
+    other = np.float64 if dtype == np.float32 else np.float32
+    assert not np.array_equal(
+        expected, darsia.warp_perspective(values, matrix, (450, 300), other)
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_projection_onto_another_fitting_grid(dtype):
     """A homography two cells to the right moves the image and its masks."""
     rgb = np.full((40, 60, 3), 0.5, dtype=dtype)
