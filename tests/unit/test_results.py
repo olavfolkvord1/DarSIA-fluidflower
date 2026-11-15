@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import darsia
 from darsia.utils import results
 
 DESCRIPTION = {"step": "phase-maps", "settings": {"co2_threshold": 0.8}}
@@ -387,6 +388,84 @@ def test_a_short_read_is_read_once_more(tmp_path, waits, case):
             results.read(location, reader)
     assert len(calls) == tries
     assert waits == [results.SHARE_CACHE] * (tries - 1)
+
+
+@pytest.mark.parametrize("found_again", [True, False])
+def test_an_image_the_share_does_not_find_is_read_once_more(
+    tmp_path, monkeypatch, found_again
+):
+    """An image of a complete result that darsia.imread does not find is a file
+    not found, never an assertion: it is looked for again after the share's cache
+    time, and not found twice the result is unavailable."""
+    location = tmp_path / "corrected-image"
+    image = darsia.Image(np.arange(6.0).reshape(2, 3), dimensions=[1.0, 1.5])
+    results.publish(
+        location,
+        lambda folder: image.save(folder / "image.npz"),
+        DESCRIPTION,
+        OURS,
+        root=tmp_path,
+    )
+    hidden = tmp_path / "hidden.npz"
+    (location / "image.npz").rename(hidden)
+    waits = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        if found_again:
+            hidden.rename(location / "image.npz")
+
+    monkeypatch.setattr(results, "sleep", wait)
+
+    def reader(folder):
+        return darsia.imread(folder / "image.npz")
+
+    if found_again:
+        assert np.array_equal(results.read(location, reader).img, image.img)
+    else:
+        with pytest.raises(results.Unavailable):
+            results.read(location, reader)
+    assert waits == [results.SHARE_CACHE]
+    with pytest.raises(FileNotFoundError):
+        darsia.imread([tmp_path / "hidden.npz", tmp_path / "missing.npz"])
+
+
+def test_a_share_out_under_imread_keeps_its_network_error(tmp_path, waits, monkeypatch):
+    """darsia.imread lets the system's own error of a file it cannot look up rise:
+    a share that is out keeps its network error, which a reader of a result rides
+    out as an interruption, not as a file not found."""
+    location = tmp_path / "corrected-image"
+    image = darsia.Image(np.arange(6.0).reshape(2, 3), dimensions=[1.0, 1.5])
+    results.publish(
+        location,
+        lambda folder: image.save(folder / "image.npz"),
+        DESCRIPTION,
+        OURS,
+        root=tmp_path,
+    )
+    target = location / "image.npz"
+    # A share that is out, as Windows reports it: a file not found with a network
+    # code, which a look-up by Path.exists takes for a missing file.
+    out = OSError(errno.ENOENT, "The network path was not found", str(target), 53)
+    if getattr(out, "winerror", None) != 53:
+        out = OSError(errno.ENETDOWN, "The network is down", str(target))
+    assert results.share_out(out)
+    stat, calls = os.stat, []
+
+    def outage(path, *args, **kwargs):
+        if Path(path) == target and len(calls) < 2:
+            calls.append(path)
+            raise out
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", outage)
+    with pytest.raises(OSError) as raised:
+        darsia.imread(target)
+    assert raised.value is out
+    found = results.read(location, lambda folder: darsia.imread(folder / "image.npz"))
+    assert np.array_equal(found.img, image.img)
+    # Ridden out as an interruption, never waited for as a file not yet seen.
+    assert len(calls) == 2 and results.SHARE_CACHE not in waits
 
 
 @pytest.mark.parametrize("failures", [1, 2])
