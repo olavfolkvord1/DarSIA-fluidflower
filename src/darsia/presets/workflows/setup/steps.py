@@ -9,6 +9,9 @@ map as its labels and the facies of those labels
 image is a photo read through the rig's corrections, once per Setup. A run whose
 ``[depth] interpolation`` is ``"triangulation"`` takes its depth from the rule
 evaluated on its own grid (:func:`grid_depth`), as our production's mass did.
+Where ``[material_reference]`` names a reference run, every other run's material
+light correction is fitted on the reference's fitting grid, from the reference's
+stored rig (:func:`reference_homography`), as our production fitted it.
 
 A step records the configuration sections it reads through the run's official
 configuration (:attr:`darsia.jobs.step.Step.sections`) and the content of the
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
@@ -39,6 +43,7 @@ from darsia.presets.workflows.config.depth import DepthConfig
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.sections import list_required_sections
 from darsia.presets.workflows.rig import Rig
+from darsia.presets.workflows.setup.sand_map import grid_homographies
 from darsia.presets.workflows.setup.setup_facies import make_facies
 from darsia.presets.workflows.setup.setup_rig import (
     make_experiment,
@@ -53,6 +58,9 @@ EXPERIMENT = ("data", "protocols")
 DEPTH = "depth"
 """The column of the measured depths in the depth measurements' table, as the
 official depth setup reads it."""
+MATERIAL_REFERENCE = "material_reference"
+"""The section naming the reference run of the material illumination fit
+(``run``): every other run is fitted on its fitting grid."""
 
 
 def _file(value: Any) -> str:
@@ -143,9 +151,15 @@ def protocol_files(
     return found
 
 
-def run_config(ctx: StepContext, run: str, folder: Path) -> list[Path]:
+def run_config(
+    ctx: StepContext,
+    run: str,
+    folder: Path,
+    made: Mapping[str, Any] | None = None,
+) -> list[Path]:
     """The configuration files of one run: the job's, then the run's own tables
-    (``[runs.<run>]``) as one more file written into a folder.
+    (``[runs.<run>]``) as one more file written into a folder, and then the tables
+    a step makes for the run, if any.
 
     Parameters
     ----------
@@ -154,7 +168,9 @@ def run_config(ctx: StepContext, run: str, folder: Path) -> list[Path]:
     run : str
         The run.
     folder : Path
-        A folder for the run's file.
+        A folder for the run's files.
+    made : Mapping[str, Any], optional
+        Tables the step makes for the run, e.g. of its reference run's files.
 
     Returns
     -------
@@ -164,20 +180,24 @@ def run_config(ctx: StepContext, run: str, folder: Path) -> list[Path]:
     """
     paths = list(ctx.config)
     own = ctx.tables.get(RUNS, {}).get(run)
-    if own:
-        paths.append(Path(folder) / "run.toml")
-        paths[-1].write_text(toml.dumps(own), encoding="utf-8")
+    for name, tables in (("run.toml", own), ("made.toml", made)):
+        if tables:
+            paths.append(Path(folder) / name)
+            paths[-1].write_text(toml.dumps(tables), encoding="utf-8")
     return paths
 
 
 def run_settings(
-    ctx: StepContext, run: str, sections: Sequence[str] = ()
+    ctx: StepContext,
+    run: str,
+    sections: Sequence[str] = (),
+    made: Mapping[str, Any] | None = None,
 ) -> FluidFlowerConfig:
     """The official configuration of one run (:func:`run_config`), with the
     sections it needs checked."""
     with TemporaryDirectory() as folder:
         config = FluidFlowerConfig(
-            run_config(ctx, run, Path(folder)),
+            run_config(ctx, run, Path(folder), made),
             require_data=False,
             require_results=False,
         )
@@ -243,6 +263,19 @@ def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
     )
 
 
+def reference_run(tables: Mapping[str, Any]) -> list[str]:
+    """The reference run of the material illumination fit that the configuration
+    names (``[material_reference] run``), if any."""
+    named = tables.get(MATERIAL_REFERENCE, {}).get("run")
+    return [] if named is None else [named]
+
+
+def grid_model(tables: Mapping[str, Any]) -> list[list[float]] | None:
+    """A run's measured model of its grid, the homography from its grid's pixels
+    to rig metres (``[labeling.sand_map] grid_to_rig``), if it has one."""
+    return tables.get("labeling", {}).get("sand_map", {}).get("grid_to_rig")
+
+
 def output_cells(
     tables, runs, context, cell_mm: float, edge_mm=None, reference=None
 ) -> int:
@@ -261,12 +294,92 @@ def output_cells(
     )
 
 
+def _grid_to_rig(tables: Mapping[str, Any], grid: darsia.Image | None) -> np.ndarray:
+    """A run's homography from its grid's pixels to rig metres: its measured model,
+    else that of its metric grid (:func:`grid_homographies`)."""
+    return grid_homographies(grid_model(tables), grid)[0]
+
+
+def reference_homography(
+    reference: np.ndarray, own: np.ndarray, dtype: np.dtype
+) -> np.ndarray:
+    """The homography from a run's grid pixels to its reference run's, from each
+    run's measured model of its grid: ``inverse(reference) @ own``, computed in
+    ``dtype`` (the inverse solved in it), as our production computed it in its
+    precision.
+
+    Parameters
+    ----------
+    reference, own : array
+        The reference run's and this run's homography from their grid's pixels
+        (column, row, 1) to rig metres.
+    dtype : numpy dtype
+        Floating precision of the calculation, e.g. the run grid's.
+
+    Returns
+    -------
+    array
+        3 x 3 homography in ``dtype``.
+
+    """
+    reference = np.asarray(reference, dtype)
+    inverse = darsia.linalg.solve(reference, np.eye(3, dtype=reference.dtype))
+    return inverse @ np.asarray(own, dtype)
+
+
+def _material_reference(
+    ctx: StepContext, run: str, labels: darsia.Image, folder: Path
+) -> dict[str, Any]:
+    """The tables of a run's reference run in its material illumination fit: the
+    reference run's stored shape-corrected baseline and facies, copied into a
+    folder of the task in the read of the reference's rig, the fit mask its own
+    fit read, and the homography from this run's grid to the reference's, in the
+    rig's precision; none for the reference run itself, or without one."""
+    named = reference_run(ctx.tables)
+    if not named or named[0] == run:
+        return {}
+    own, other = run_tables(ctx.tables, run), run_tables(ctx.tables, named[0])
+    configured = grid_model(other)
+
+    files = ("shape_corrected_baseline.npz", "facies.npz")
+
+    def stored(source) -> darsia.Image | None:
+        """Copy the files of the reference's rig that the fit reads into the
+        task's folder, and read the reference's grid (its labels) where no rig
+        geometry of the reference is configured."""
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            shutil.copyfile(Path(source) / name, folder / name)
+        return None if configured is not None else read_labels(Path(source))
+
+    grid = ctx.read("rig", stored, run=named[0])
+    precision = run_settings(ctx, run, ("corrections",)).corrections.precision
+    homography = reference_homography(
+        _grid_to_rig(other, grid),
+        _grid_to_rig(own, labels),
+        np.dtype(precision or np.float64),
+    )
+    table = {
+        "baseline": str(folder / files[0]),
+        "facies": str(folder / files[1]),
+        "homography": homography.tolist(),
+    }
+    fit = other.get("corrections", {}).get("material_illumination", {})
+    if fit.get("fit_mask") is not None:
+        table["fit_mask"] = str(fit["fit_mask"])
+    return {"corrections": {"material_illumination": {"reference": table}}}
+
+
 def _rig(ctx: StepContext) -> None:
-    """The run's rig, with its sand map as the labels and their facies, and with
-    the depth rule evaluated on its grid where the run's configuration chooses it."""
+    """The run's rig, with its sand map as the labels and their facies, fitted on
+    its reference run's grid where the configuration names one, and with the depth
+    rule evaluated on its grid where the run's configuration chooses it."""
+    run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
-    config = run_settings(ctx, ctx.task.run, list_required_sections(setup_rig))
     with TemporaryDirectory() as folder:
+        reference = Path(folder) / "reference"
+        made = _material_reference(ctx, run, darsia.imread(labels), reference)
+        config = run_settings(ctx, run, list_required_sections(setup_rig), made)
         facies = Path(folder) / "facies.npz"
         make_facies(config, darsia.imread(labels)).save(facies)
         # A depth rule evaluated on the grid needs no depth map.
@@ -310,9 +423,11 @@ def _rig_files(tables: Mapping[str, Any], project, folders) -> list[str]:
 def _rig_stamped(tables: Mapping[str, Any], project, folders) -> list[str]:
     """The rig's depth map, as its depth configuration names it (the depth
     setup's map in the results folder by default), unless its depth rule is
-    evaluated on the run's grid, and its image mapping."""
-    mapping = tables.get("corrections", {}).get("mapping") or {}
-    found = [mapping.get("path")]
+    evaluated on the run's grid, its image mapping and its material fit mask."""
+    corrections = tables.get("corrections", {})
+    mapping = corrections.get("mapping") or {}
+    mask = (corrections.get("material_illumination") or {}).get("fit_mask")
+    found = [mapping.get("path"), mask]
     rule = str(tables.get("depth", {}).get("interpolation", "")).lower()
     if "depth" in tables and rule != "triangulation":
         results = tables.get("data", {}).get("results")
@@ -336,15 +451,17 @@ SAND_MAP = Step(
 """The run's sand map (R2)."""
 RIG = Step(
     "rig",
-    {"sand-map": Scope.OWN},
+    {"sand-map": Scope.OWN, "rig": Scope.ALL},
     Order.RUN,
     Memory(camera=4.0, camera_bytes=164.0, photos=1, photo_bytes=darsia.decoded_bytes),
     _rig,
-    sections=tuple(list_required_sections(setup_rig)),
+    sections=(*list_required_sections(setup_rig), MATERIAL_REFERENCE),
     files=_rig_files,
     stamped=_rig_stamped,
+    runs=reference_run,
 )
-"""The run's rig."""
+"""The run's rig; a run other than the reference run of the material fit reads
+the reference's rig."""
 CORRECTED_IMAGE = Step(
     "corrected-image",
     {"rig": Scope.OWN},
