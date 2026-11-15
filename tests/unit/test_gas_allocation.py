@@ -120,7 +120,7 @@ def test_added_gas_joins_the_model_gas_by_its_score(tmp_path):
     probabilities = _frame(co2=[np.s_[20:52, 10:70]], gas=[np.s_[22:34, 34:46]])
     probabilities[1][20:40, 10:70] += np.linspace(0, 0.3, 60, dtype=np.float32)
     model = 144 * PORE * (1 - SWI)
-    labels, _, saturation, _ = _run(
+    labels, _, saturation, _, _ = _run(
         tmp_path, [probabilities], [0.0], [model + 6e-7], facies=facies
     )[0]
     assert np.isclose(np.sum(PORE * saturation.astype(float)), model + 6e-7, rtol=1e-6)
@@ -137,8 +137,8 @@ def test_removed_gas_peels_the_lower_edges_first(tmp_path):
     probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
     model = 400 * PORE * (1 - SWI)
     kept, gone = _run(tmp_path, [probabilities] * 2, [0.0, 3.0], [0.4 * model, 0.0])
-    kept, kept_rules, kept_saturation, kept_co2 = kept
-    gone, gone_rules, gone_saturation, gone_co2 = gone
+    kept, kept_rules, kept_saturation, kept_co2, kept_before = kept
+    gone, gone_rules, gone_saturation, gone_co2, gone_before = gone
     assert np.isclose(np.sum(PORE * kept_saturation.astype(float)), 0.4 * model)
     partial = (kept_saturation > 0) & (kept_saturation < 1 - SWI)
     assert partial.sum() <= 1
@@ -151,10 +151,14 @@ def test_removed_gas_peels_the_lower_edges_first(tmp_path):
     assert ((kept_rules == RULE.PEELED) == (gas & (kept == D))).all()
     assert (darsia.model_gas(kept, kept_rules) == gas).all()
     assert (darsia.model_gas(gone, gone_rules) == gas).all()
-    # The CO2 before the rules, which the dilution law reads, stays the model's.
+    # The CO2 before the rules, which the dilution law reads, stays the model's,
+    # and so do the labels before the rules, on which the colour is read.
     co2 = np.zeros(SHAPE, bool)
     co2[10:50, 20:60] = True
     assert (kept_co2 == co2).all() and (gone_co2 == co2).all()
+    model = np.where(gas, G, np.where(co2, D, W))
+    np.testing.assert_array_equal(kept_before, model)
+    np.testing.assert_array_equal(gone_before, model)
 
 
 def test_end_gas_weights_the_gas_after_the_injection(tmp_path):
@@ -162,7 +166,7 @@ def test_end_gas_weights_the_gas_after_the_injection(tmp_path):
     left, right = np.s_[20:40, 10:30], np.s_[20:40, 52:72]
     before = _frame(co2=[left], gas=[left])
     after = _frame(co2=[left, right], gas=[left, right], level=0.7)
-    (_, _, saturation, _), (labels, _, _, _) = _run(
+    (_, _, saturation, _, _), (labels, _, _, _, _) = _run(
         tmp_path, [before, after], [0.5, 3.0], [None, None], end_h=1.0
     )
     assert (saturation[left] == 1 - SWI).all()

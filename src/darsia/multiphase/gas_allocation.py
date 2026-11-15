@@ -505,15 +505,16 @@ def free_gas(
     gas_threshold: float,
     start: int = 0,
     anchor_saturation: Callable[[int], np.ndarray] | None = None,
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
     The phase maps are those of :func:`darsia.phase_maps`, with the end-gas
     weight described in the module; each frame's free gas then holds the
     frame's volume as described there, and the gas it peels is dissolved CO2;
-    the rule map records it (:attr:`darsia.PhaseRule.PEELED`). Beside them comes
-    the CO2 of the frame's labels before the rules (:func:`darsia.phase_labels`),
-    which neither the rules nor the allocation change.
+    the rule map records it (:attr:`darsia.PhaseRule.PEELED`). Beside them come
+    the frame's labels before the rules (:func:`darsia.phase_labels`) and their
+    CO2, which neither the rules nor the allocation change: the colour of the
+    frame's dissolved CO2 is read on these labels, as our production read it.
 
     A run resumes at its first missing frame (``start``). Across frames, the
     allocation keeps only the end-gas regions, each built from its anchor frame's
@@ -564,8 +565,9 @@ def free_gas(
     ------
     tuple of arrays
         The phase map (uint8), its rule map (uint8, :class:`darsia.PhaseRule`),
-        the free-gas saturation and the CO2 of the labels before the rules (bool)
-        of each frame from ``start`` on.
+        the free-gas saturation, the CO2 of the labels before the rules (bool) and
+        those labels (uint8, :func:`darsia.phase_labels`), on which the colour of
+        the frame's dissolved CO2 is read, of each frame from ``start`` on.
 
     Raises
     ------
@@ -750,7 +752,7 @@ def free_gas(
             found = end_region(saturation)
             if found is not None:
                 regions[index] = found
-        yield labels, rules, saturation, _co2(own)
+        yield labels, rules, saturation, _co2(own), own
 
 
 def _maps_file(held_out: str | None) -> str:
@@ -765,20 +767,21 @@ def write_phase_maps(
     rules: np.ndarray,
     saturation: np.ndarray,
     co2: np.ndarray,
+    before: np.ndarray,
     held_out: str | None = None,
 ) -> None:
     """Store a frame's maps as :func:`free_gas` yields them, in ``folder``
-    (:data:`PHASE_MAPS`): its phase and rule maps, its free-gas saturation and the
-    CO2 of its labels before the rules. With ``held_out``, the maps made without
-    that run's estimated free-gas volume, which a calibration fold leaving it out
-    reads, are stored beside them."""
+    (:data:`PHASE_MAPS`): its phase and rule maps, its free-gas saturation, the
+    CO2 of its labels before the rules and those labels. With ``held_out``, the
+    maps made without that run's estimated free-gas volume, which a calibration
+    fold leaving it out reads, are stored beside them."""
     arrays = dict(labels=labels, rules=rules, saturation=saturation, co2=co2)
-    np.savez(Path(folder) / _maps_file(held_out), **arrays)
+    np.savez(Path(folder) / _maps_file(held_out), **arrays, before=before)
 
 
 def read_phase_maps(folder: Path, held_out: str | None = None) -> dict[str, np.ndarray]:
     """A frame's stored maps (:func:`write_phase_maps`): ``labels``, ``rules``,
-    ``saturation`` and ``co2``; with ``held_out``, those made without that run's
-    estimate."""
+    ``saturation``, ``co2`` and ``before``; with ``held_out``, those made without
+    that run's estimate."""
     with np.load(Path(folder) / _maps_file(held_out)) as stored:
         return {name: stored[name] for name in stored.files}
