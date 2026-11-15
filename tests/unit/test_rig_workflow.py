@@ -486,6 +486,40 @@ def test_material_illumination_is_fitted_and_reloaded(tmp_path):
     )
 
 
+def test_material_illumination_reads_its_reference_run(tmp_path):
+    """The configured reference run is read and fits on its grid; the run as its
+    own reference gives the same correction, which is saved with that grid."""
+    rig, config, _ = _material_rig(tmp_path)
+    rig.setup_color_corrections(config)
+    rig.shape_corrected_baseline.save(tmp_path / "reference.npz")
+    rig.facies.save(tmp_path / "facies.npz")
+    referenced, _, _ = _material_rig(tmp_path)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        path.read_text()
+        + "[corrections.material_illumination.reference]\n"
+        + f'baseline = "{(tmp_path / "reference.npz").as_posix()}"\n'
+        + f'facies = "{(tmp_path / "facies.npz").as_posix()}"\n'
+        + "homography = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]\n"
+    )
+
+    referenced.setup_color_corrections(CorrectionsConfig().load(path))
+    correction = referenced.illumination_correction
+    correction.save(tmp_path / "correction.npz")
+    loaded = darsia.MaterialIlluminationCorrection()
+    loaded.load(tmp_path / "correction.npz")
+
+    assert loaded.grid_to_field is not None
+    np.testing.assert_array_equal(
+        correction.common_coefficients, rig.illumination_correction.common_coefficients
+    )
+    np.testing.assert_array_equal(referenced.baseline.img, rig.baseline.img)
+    np.testing.assert_array_equal(
+        loaded.correct_array(referenced.shape_corrected_baseline.img),
+        referenced.baseline.img,
+    )
+
+
 def test_official_and_material_illumination_give_one_form(monkeypatch, tmp_path):
     """Swapping the illumination method changes the correction, not the result form."""
     material_rig, config, _ = _material_rig(tmp_path)
