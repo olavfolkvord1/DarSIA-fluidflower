@@ -1,6 +1,7 @@
 """Unit tests for the one viewer of stored results."""
 
 import gc
+import json
 import threading
 import weakref
 from time import monotonic
@@ -14,8 +15,12 @@ from darsia.gui import result_viewer
 from darsia.gui.result_viewer import (
     OTHER,
     Category,
+    Curve,
+    Curves,
     Field,
+    Outline,
     ResultViewer,
+    RunCurves,
     Source,
     _class_colours,
 )
@@ -29,6 +34,16 @@ FIELDS = (
     Field("mass", "Total CO2 mass", "g/L"),
     Field("saturation_g", "Gas saturation", limit=1.0),
 )
+GAS = Outline("Gas", "mass-maps", "saturation_g", colour="#00e5ff")
+LINES = (
+    Curve("mass_g", "Mass in the maps", "#175aad"),
+    Curve("injected_g", "Injected", "black", dashed=True),
+)
+
+
+def _fit(run):
+    """Every run's curves are in the calibration's fit."""
+    return {"part": "fit"}
 
 
 def _maps(folder):
@@ -37,9 +52,17 @@ def _maps(folder):
         return {key: archive[key] for key in archive.files}
 
 
+def _predictions(folder, run):
+    """The calibration's reader of this test: a run's predicted and injected mass,
+    and its held-out score."""
+    rows = json.loads((folder / "predictions.json").read_text())[run]
+    return RunCurves(rows["hours"], rows, (f"Held-out score {rows['score']}",))
+
+
 def _project(folder, runs=("run",), skip=(), factor=1.0):
     """A project whose runs' frames have stored mass maps, the mass a frame's index
-    and its run's number apart, times ``factor``."""
+    and its run's number apart, times ``factor``, and a stored calibration of the
+    runs."""
     sessions = {"first": "photos/first", "second": "photos/second"}
     locations = Locations(folder, "results", {run: sessions for run in runs})
     for number, run in enumerate(runs, 1):
@@ -56,6 +79,15 @@ def _project(folder, runs=("run",), skip=(), factor=1.0):
                 location = locations.result("mass-maps", run=run, frame=frame)
                 token = f"{number}{index}" * 16
                 results.publish(location, write, {}, token, root=locations.results)
+    rows = {"hours": HOURS, "mass_g": [1, 2, 2.9], "injected_g": [1.1, 2, 3]}
+    text = json.dumps({run: rows | {"score": 0.03} for run in runs})
+    results.publish(
+        locations.result("calibration", part="fit"),
+        lambda folder: (folder / "predictions.json").write_text(text),
+        {},
+        "f" * 32,
+        root=locations.results,
+    )
     return locations
 
 
@@ -109,8 +141,9 @@ def test_a_read_in_progress_never_blocks_the_window_thread(qtbot, tmp_path):
 
 
 def test_a_new_run_shows_nothing_of_the_last_until_it_is_read(qtbot, tmp_path):
-    """While another run is read, no panel holds the last run's frame, its colour
-    scale cannot be changed, and no scale of the last run's values is kept."""
+    """While another run is read, no panel holds the last run's frame, nor are its
+    curves' notes shown, its colour scale cannot be changed, and no scale of the
+    last run's values is kept."""
     locations = _project(tmp_path, runs=("one", "two"))
     release = threading.Event()
     release.set()
@@ -119,17 +152,23 @@ def test_a_new_run_shows_nothing_of_the_last_until_it_is_read(qtbot, tmp_path):
         release.wait(10)
         return _maps(folder)
 
-    viewer = ResultViewer(locations, [Source("mass-maps", "Mass maps", gated, FIELDS)])
+    viewer = ResultViewer(
+        locations,
+        [Source("mass-maps", "Mass maps", gated, FIELDS)],
+        curves=Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit),
+    )
     qtbot.addWidget(viewer)
     viewer.set_runs(_runs(("one", "two")))
     _shown(qtbot, viewer)
     panel = viewer.panels[0]
     assert panel.values is not None and panel.fit_button.isEnabled()
+    assert not viewer.notes.isHidden()
     release.clear()
     try:
         viewer.select_run("two")
         assert panel.values is None and panel.pixels is None
         assert not panel.fit_button.isEnabled() and not panel.scale_edit.isEnabled()
+        assert viewer.notes.isHidden()
         panel.scale_set.emit(panel.number, 9.0)
     finally:
         release.set()
@@ -353,13 +392,87 @@ def test_categorical_fields_and_photographs_have_no_colour_scale(qtbot, tmp_path
     np.testing.assert_allclose(rgb[0, 2], to_rgb(OTHER[1]))
 
 
+def test_a_runs_curves_are_read_from_a_result_in_parts(qtbot, tmp_path):
+    """A run's curves come from the calibration's fit, a result stored in parts,
+    with its notes, and mark the frame shown."""
+    locations = _project(tmp_path)
+    viewer = ResultViewer(
+        locations,
+        [Source("mass-maps", "Mass maps", _maps, FIELDS)],
+        curves=Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit),
+        contents=("curves",),
+    )
+    qtbot.addWidget(viewer)
+    viewer.set_runs(_runs())
+    _shown(qtbot, viewer)
+    first = viewer.panels[0].pixels
+    assert first is not None and viewer.notes.text() == "Held-out score 0.03"
+    viewer.show_frame(2)
+    _shown(qtbot, viewer)
+    assert not np.array_equal(viewer.panels[0].pixels, first)
+
+
+def test_a_panel_that_cannot_be_drawn_says_so_beside_the_others(qtbot, tmp_path):
+    """Curves that cannot be drawn say so in their panel, and the map beside them
+    is drawn."""
+    locations = _project(tmp_path)
+
+    def uneven(folder, run):
+        return RunCurves(HOURS[:2], {"mass_g": [1, 2, 3]})
+
+    viewer = ResultViewer(
+        locations,
+        [Source("mass-maps", "Mass maps", _maps, FIELDS)],
+        curves=Curves("calibration", uneven, LINES, "CO2 mass (g)", _fit),
+        contents=("mass-maps/mass", "curves"),
+        layout="side_by_side",
+    )
+    qtbot.addWidget(viewer)
+    viewer.set_runs(_runs())
+    _shown(qtbot, viewer)
+    assert viewer.panels[0].pixels is not None
+    assert viewer.panels[1].pixels is None
+    assert viewer.panels[1].message.startswith("The curves could not be drawn")
+
+
+def test_an_outline_is_drawn_from_the_frame_already_read(qtbot, tmp_path):
+    """An outline chosen after its frame was read is drawn from that read, also of
+    an array no panel shows; other outlines replace its check box."""
+    locations = _project(tmp_path)
+    folders = []
+
+    def counted(folder):
+        folders.append(folder)
+        return _maps(folder)
+
+    maps = Source("mass-maps", "Mass maps", counted, FIELDS[:1])
+    viewer = ResultViewer(locations, [maps], outlines=[GAS])
+    qtbot.addWidget(viewer)
+    viewer.set_runs(_runs())
+    _shown(qtbot, viewer)
+    plain = viewer.panels[0].pixels
+    viewer.outline_boxes[0].setChecked(True)
+    _shown(qtbot, viewer)
+    assert len(folders) == 1 and viewer.panels[0].message == ""
+    assert not np.array_equal(viewer.panels[0].pixels, plain)
+    viewer.set_results([maps], outlines=[GAS, Outline("CO2", "mass-maps", "mass")])
+    _shown(qtbot, viewer)
+    assert [box.text() for box in viewer.outline_boxes] == ["Gas", "CO2"]
+    assert not any(box.isChecked() for box in viewer.outline_boxes)
+
+
 def test_a_viewer_without_parent_is_freed_at_once(qtbot, tmp_path):
     """No connection keeps a viewer alive: one without parent is gone as soon as it
     is no longer referenced, without the garbage collector, which could otherwise
     free it later in another thread."""
     locations = _project(tmp_path)
+    fit = Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit)
     viewer = ResultViewer(
-        locations, [Source("mass-maps", "Mass maps", _maps, FIELDS)], layout="pyramid"
+        locations,
+        [Source("mass-maps", "Mass maps", _maps, FIELDS)],
+        outlines=[GAS],
+        curves=fit,
+        layout="pyramid",
     )
     viewer.set_runs(_runs())
     _shown(qtbot, viewer)
@@ -374,13 +487,17 @@ def test_a_viewer_without_parent_is_freed_at_once(qtbot, tmp_path):
 
 
 def test_the_viewer_fits_a_laptop_screen(qtbot, tmp_path):
-    """Shown at 1,000 × 640 pixels with three panels of continuous fields and a
-    message, every wrapped line of text has its height and every map at least 150
-    pixels."""
+    """Shown at 1,000 × 640 pixels with three panels of continuous fields, their
+    outline notices, the curves' notes and a message, every wrapped line of text has
+    its height and every map at least 150 pixels."""
     locations = _project(tmp_path)
+    fit = Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit)
+    outlines = [GAS, Outline("CO2 region", "mass-maps", "area")]
     viewer = ResultViewer(
         locations,
         [Source("mass-maps", "Mass maps", _maps, FIELDS)],
+        outlines=outlines,
+        curves=fit,
         contents=("mass-maps/mass", "mass-maps/saturation_g", "mass-maps/mass"),
         layout="pyramid",
     )
@@ -388,9 +505,12 @@ def test_the_viewer_fits_a_laptop_screen(qtbot, tmp_path):
     viewer.resize(1000, 640)
     viewer.show()
     viewer.set_runs(_runs())
+    for box in viewer.outline_boxes:
+        box.setChecked(True)
     _shown(qtbot, viewer)
     viewer.status.setText("The frame could not be shown: " + "no answer. " * 6)
-    labels = [viewer.frame_label, viewer.status]
+    qtbot.waitUntil(lambda: viewer.panels[0].notice.isVisible())
+    labels = [viewer.frame_label, viewer.notes, viewer.status]
     labels += [panel.notice for panel in viewer.panels]
 
     def laid_out():

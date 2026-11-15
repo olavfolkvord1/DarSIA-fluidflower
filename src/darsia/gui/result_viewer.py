@@ -1,11 +1,13 @@
-"""One viewer of stored results: run, frame, field and colour scale.
+"""One viewer of stored results: run, frame, field, outlines, colour scale and curves.
 
 The Calibration page and the Mass page show their stored results in this one
 viewer. A page declares what it shows: each frame's stored results
-(:class:`Source`, e.g. the mass maps) with the fields they hold (:class:`Field`).
-The viewer lists the runs, steps through a run's frames and shows one to three
-panels, each a field of the shown frame, with a colour scale kept per run and
-field.
+(:class:`Source`, e.g. the mass maps) with the fields they hold (:class:`Field`),
+outlines over the maps (:class:`Outline`) and a run's curves over time
+(:class:`Curves`, e.g. the calibration's predicted and injected mass). The viewer
+lists the runs, steps through a run's frames and shows one to three panels, each
+a field of the shown frame or the run's curves, with a colour scale kept per run
+and field.
 
 It is display only: it computes no result, starts no job and writes nothing. Each
 result is read through :func:`darsia.utils.results.read` at its location
@@ -32,11 +34,13 @@ from matplotlib import colormaps
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import to_rgb
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from PySide6.QtCore import QLocale, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QDoubleValidator, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -62,7 +66,7 @@ cell."""
 PANEL_PX = (1280, 720)
 """Width and height in pixels of a drawn panel."""
 CACHED = 8
-"""Display copies of stored frames kept in memory."""
+"""Display copies of stored results kept in memory: frames and runs' curves."""
 SETTLE_MS = 120
 """Milliseconds the frame slider rests before its frame is read."""
 POLL_MS = 100
@@ -73,6 +77,8 @@ BACKGROUND = "#e6edf2"
 """Colour of cells without a value."""
 OTHER = ("Other label", "#555b61")
 """Legend name and colour of a categorical code the field does not declare."""
+CURVES = "curves"
+"""The content key of the run's curves."""
 LAYOUTS = {
     "one": ("One panel", ((0, 0, 1, 2),)),
     "side_by_side": ("Side by side", ((0, 0, 1, 1), (0, 1, 1, 1))),
@@ -125,6 +131,65 @@ class Source:
     """The method's own reader of the result's folder; it holds no Qt object, since
     it runs off the window thread."""
     fields: tuple[Field, ...]
+
+
+@dataclass(frozen=True)
+class Outline:
+    """An outline over the maps: where a field of a frame's stored result is
+    positive, or holds one of the given codes."""
+
+    label: str
+    kind: str
+    """The kind of the result holding the field, one of the viewer's sources."""
+    key: str
+    codes: tuple[int, ...] = ()
+    colour: str = "#ff8c00"
+    dashed: bool = False
+
+
+@dataclass(frozen=True)
+class Curve:
+    """One line of a run's curves."""
+
+    key: str
+    label: str
+    colour: str
+    dashed: bool = False
+
+
+@dataclass(frozen=True)
+class RunCurves:
+    """A run's curves over time, as a :class:`Curves` reader gives them."""
+
+    hours: Sequence[float]
+    """Time [h] of each point."""
+    values: Mapping[str, Sequence[float]]
+    """Each line's values, by its key."""
+    notes: tuple[str, ...] = ()
+    """Lines shown under the panels, e.g. the run's stored held-out scores."""
+
+
+def _own_run(run: str) -> dict[str, str]:
+    """The location keywords of a run's own result."""
+    return {"run": run}
+
+
+@dataclass(frozen=True)
+class Curves:
+    """A run's curves over time, read from a stored result."""
+
+    kind: str
+    reader: Callable[[Path, str], RunCurves]
+    """The method's own reader of the result's folder, for one run; it holds no Qt
+    object, since it runs off the window thread."""
+    lines: tuple[Curve, ...]
+    axis: str
+    """Label of the vertical axis."""
+    where: Callable[[str], Mapping[str, str]] = _own_run
+    """The location of a run's curves as keywords of
+    :meth:`~darsia.utils.locations.Locations.result`: the run's own result, or
+    e.g. ``{"part": "fit"}`` of a result stored in parts. It holds no Qt object,
+    e.g. no page, since it runs off the window thread."""
 
 
 def _nice_limit(value: float) -> float:
@@ -236,7 +301,12 @@ class _Request:
     run: str
     index: int
     frames: tuple[tuple[Frame, float | None], ...]
-    panels: tuple[tuple[Source, Field, float | None], ...]
+    panels: tuple[tuple[Source | None, Field | None, float | None], ...]
+    outlines: tuple[tuple[Outline, Source], ...]
+    """The outlines chosen, with the source holding each."""
+    keys: Mapping[str, tuple[str, ...]]
+    """Each source's arrays to keep: its fields and every outline on it."""
+    curves: Curves | None
     cache: OrderedDict
 
 
@@ -292,13 +362,25 @@ def _read_frame(request: _Request, source: Source, frame: Frame) -> dict | str:
 
     def read() -> dict:
         stored = results.read(location, source.reader)
-        values = {field.key: _value(stored, field.key) for field in source.fields}
+        values = {key: _value(stored, key) for key in request.keys[source.kind]}
         return {
             key: _display(value) for key, value in values.items() if value is not None
         }
 
     what = f"{source.label} of {request.run}, {frame.session}/{frame.name},"
     return _cached(request, (location,), what, read)
+
+
+def _read_curves(request: _Request) -> RunCurves | str:
+    """The run's curves, or the message why there are none."""
+    curves = request.curves
+    location = request.locations.result(curves.kind, **curves.where(request.run))
+
+    def read() -> RunCurves:
+        return results.read(location, lambda folder: curves.reader(folder, request.run))
+
+    what = f"The curves of {request.run}"
+    return _cached(request, (location, request.run), what, read)
 
 
 def _figure() -> tuple[Figure, Any]:
@@ -331,8 +413,8 @@ def _class_colours(codes: np.ndarray, classes: tuple[Category, ...]) -> tuple:
     return rgb, legend
 
 
-def _draw_map(values, extent, field, scale, title) -> np.ndarray:
-    """Draw one field: a continuous field on a fixed linear
+def _draw_map(values, extent, field, scale, lines, title) -> np.ndarray:
+    """Draw one field with its outlines: a continuous field on a fixed linear
     scale from 0 to ``scale``, a categorical one in its classes' colours and a
     photograph as it is. Cells without a value show :data:`BACKGROUND`."""
     with _RENDER:
@@ -365,6 +447,21 @@ def _draw_map(values, extent, field, scale, title) -> np.ndarray:
             unit = f" ({field.unit})" if field.unit else ""
             label = f"{field.label}{unit} · fixed scale 0 to {scale:g}"
             figure.colorbar(image, ax=axis, fraction=0.035, label=label)
+        for outline, mask in lines:
+            style = "dashed" if outline.dashed else "solid"
+            axis.contour(
+                mask.astype(np.float32),
+                levels=[0.5],
+                colors=[outline.colour],
+                linestyles=style,
+                linewidths=1.4,
+                **place,
+            )
+            legend.append(
+                Line2D(
+                    [], [], color=outline.colour, linestyle=style, label=outline.label
+                )
+            )
         if legend:
             figure.legend(handles=legend, loc="outside right upper", frameon=False)
         if extent:
@@ -374,8 +471,8 @@ def _draw_map(values, extent, field, scale, title) -> np.ndarray:
         return _pixels(figure)
 
 
-def _map_panel(read, source, field, scale, title) -> _Drawn:
-    """One panel of a field of the frame."""
+def _map_panel(request, read, source, field, scale, title) -> _Drawn:
+    """One panel of a field of the frame, with the chosen outlines over it."""
     found = read[source.kind]
     if isinstance(found, str):
         return _Drawn(None, found, scale)
@@ -385,32 +482,80 @@ def _map_panel(read, source, field, scale, title) -> _Drawn:
     continuous = not field.classes and not field.photo
     if continuous and scale is None:
         scale = field.limit or _fit(values)
+    lines, notes = [], []
+    for outline, holder in request.outlines:
+        other = read[holder.kind]
+        if isinstance(other, str) or outline.key not in other:
+            notes.append(f"{outline.label}: not stored for this frame.")
+        elif other[outline.key][0].shape[:2] != values.shape[:2]:
+            notes.append(f"{outline.label}: on another grid than this field.")
+        else:
+            mask = other[outline.key][0]
+            if outline.codes:
+                mask = np.isin(mask, outline.codes)
+            else:
+                mask = np.nan_to_num(mask.astype(np.float64)) > 0
+            if mask.any() and not mask.all():
+                lines.append((outline, mask))
     if step > 1:
         title += f"\nshown at 1/{step} of the stored resolution"
-    pixels = _draw_map(values, extent, field, scale, title)
+    pixels = _draw_map(values, extent, field, scale, lines, title)
     if not continuous:
-        return _Drawn(pixels)
-    return _Drawn(pixels, "", scale, values)
+        return _Drawn(pixels, " ".join(notes))
+    return _Drawn(pixels, " ".join(notes), scale, values)
 
 
-def _draw(request: _Request) -> list[_Drawn]:
-    """Read and draw one frame's panels, off the window thread."""
+def _curves_panel(request: _Request, found, hours: float | None) -> _Drawn:
+    """The run's curves, with a dotted line at the shown frame's time."""
+    if isinstance(found, str):
+        return _Drawn(None, found)
+    lines = []
+    for line in request.curves.lines:
+        values = np.asarray(found.values.get(line.key, ()), np.float64)
+        if values.size and np.isfinite(values).any():
+            lines.append((line, values))
+    if not lines:
+        return _Drawn(None, f"No curves of {request.run} are stored.")
+    with _RENDER:
+        figure, axis = _figure()
+        times = np.asarray(found.hours, np.float64)
+        for line, values in lines:
+            style = "--" if line.dashed else "-"
+            axis.plot(times, values, style, color=line.colour, label=line.label)
+        if hours is not None and math.isfinite(hours):
+            axis.axvline(hours, color="#667085", linestyle=":", label="Shown frame")
+        axis.set(xlabel="Elapsed time (h)", ylabel=request.curves.axis)
+        axis.set_title(request.run, fontsize=13)
+        axis.grid(alpha=0.25)
+        figure.legend(loc="outside right upper", frameon=False)
+        return _Drawn(_pixels(figure))
+
+
+def _draw(request: _Request) -> tuple[list[_Drawn], tuple[str, ...]]:
+    """Read and draw one frame's panels, off the window thread; also the notes of
+    the run's curves."""
     frame, hours = request.frames[request.index]
-    sources = {s.kind: s for s, _, _ in request.panels}
+    sources = {s.kind: s for s, _, _ in request.panels if s}
+    sources |= {s.kind: s for _, s in request.outlines}
     read = {kind: _read_frame(request, s, frame) for kind, s in sources.items()}
+    curves = _read_curves(request) if request.curves else None
     drawn = []
     for source, field, scale in request.panels:
         # A panel that cannot be drawn says why; the others are still drawn.
         try:
+            if source is None:
+                drawn.append(_curves_panel(request, curves, hours))
+                continue
             title = (
                 f"{request.run} · {field.label} · {_hours(hours)}\nframe {request.index + 1}"
                 f" of {len(request.frames)}, {frame.session}/{frame.name}"
             )
-            drawn.append(_map_panel(read, source, field, scale, title))
+            drawn.append(_map_panel(request, read, source, field, scale, title))
         except Exception as error:
-            message = f"{field.label} could not be drawn: {error}"
-            drawn.append(_Drawn(None, message, scale))
-    return drawn
+            what = "The curves" if source is None else field.label
+            drawn.append(_Drawn(None, f"{what} could not be drawn: {error}", scale))
+    notes = curves.notes if isinstance(curves, RunCurves) else ()
+    return drawn, tuple(notes)
 
 
 class _Canvas(ImageCanvas):
@@ -555,9 +700,13 @@ class ResultViewer(QWidget):
         The project's locations of results.
     sources : sequence of Source
         Each frame's stored results the viewer shows.
+    outlines : sequence of Outline, optional
+        Outlines the user can draw over the maps, all off at first.
+    curves : Curves, optional
+        A run's curves over time.
     contents : sequence of str, optional
-        The first content of each panel: ``<kind>/<key>`` of a field; by default
-        the fields in order.
+        The first content of each panel: ``<kind>/<key>`` of a field, or
+        :data:`CURVES`; by default the fields in order, then the curves.
     layout : str, optional
         The first panel layout, one of :data:`LAYOUTS`.
     parent : QWidget, optional
@@ -570,6 +719,8 @@ class ResultViewer(QWidget):
         locations: Locations,
         sources: Sequence[Source],
         *,
+        outlines: Sequence[Outline] = (),
+        curves: Curves | None = None,
         contents: Sequence[str] = (),
         layout: str = "one",
         parent: QWidget | None = None,
@@ -584,6 +735,7 @@ class ResultViewer(QWidget):
         self._runs: dict[str, tuple[tuple[Frame, float | None], ...]] = {}
         self._run: str | None = None
         self._scales: dict[tuple[str, str], float] = {}
+        self._notes_run: str | None = None
         self._layout = layout
 
         outer = QHBoxLayout(self)
@@ -614,6 +766,13 @@ class ResultViewer(QWidget):
         controls.addWidget(self.layout_choice)
         controls.addStretch(1)
         right.addLayout(controls)
+        self.outline_row = QWidget()
+        self._outline_layout = QHBoxLayout(self.outline_row)
+        self._outline_layout.setContentsMargins(0, 0, 0, 0)
+        self._outline_layout.addWidget(QLabel("Outlines"))
+        self._outline_layout.addStretch(1)
+        self.outline_boxes: list[QCheckBox] = []
+        right.addWidget(self.outline_row)
 
         self.panels = [_Panel(number, self) for number in range(3)]
         for panel in self.panels:
@@ -642,6 +801,10 @@ class ResultViewer(QWidget):
         self.frame_label = QLabel()
         self.frame_label.setWordWrap(True)
         right.addWidget(self.frame_label)
+        self.notes = QLabel()
+        self.notes.setWordWrap(True)
+        self.notes.hide()
+        right.addWidget(self.notes)
         status = QHBoxLayout()
         self.busy_bar = QProgressBar()
         self.busy_bar.setRange(0, 0)
@@ -666,7 +829,7 @@ class ResultViewer(QWidget):
         self._play.timeout.connect(self._play_step)
 
         self._fill_runs()
-        self.set_results(sources, contents=contents)
+        self.set_results(sources, outlines=outlines, curves=curves, contents=contents)
         with QSignalBlocker(self.layout_choice):
             self.layout_choice.setCurrentIndex(self.layout_choice.findData(layout))
         self.set_layout(layout)
@@ -687,6 +850,8 @@ class ResultViewer(QWidget):
         self,
         sources: Sequence[Source],
         *,
+        outlines: Sequence[Outline] = (),
+        curves: Curves | None = None,
         contents: Sequence[str] = (),
         locations: Locations | None = None,
     ) -> None:
@@ -697,23 +862,51 @@ class ResultViewer(QWidget):
         Raises
         ------
         ValueError
-            If a content is none of the sources' fields; the viewer is then left as
-            it was.
+            If an outline's kind is none of the sources', or a content is unknown;
+            the viewer is then left as it was.
 
         """
+        kinds = {source.kind: source for source in sources}
+        if any(outline.kind not in kinds for outline in outlines):
+            raise ValueError("An outline's field must be one of the sources'.")
         found = {
             f"{source.kind}/{field.key}": (source, field)
             for source in sources
             for field in source.fields
         }
+        if curves is not None:
+            found[CURVES] = (None, None)
         if any(key not in found for key in contents):
-            raise ValueError("Each content is a source's field.")
+            raise ValueError("Each content is a source's field or the curves.")
         if locations is not None:
             self.locations = locations
-        self.sources = tuple(sources)
+        self.sources, self.outlines, self.curves = (
+            tuple(sources),
+            tuple(outlines),
+            curves,
+        )
         self._contents = found
+        self._keys = {
+            source.kind: tuple(
+                dict.fromkeys(
+                    [field.key for field in source.fields]
+                    + [o.key for o in self.outlines if o.kind == source.kind]
+                )
+            )
+            for source in self.sources
+        }
         self._cache: OrderedDict = OrderedDict()
         self._scales = {}
+        for box in self.outline_boxes:
+            self._outline_layout.removeWidget(box)
+            box.deleteLater()
+        self.outline_boxes = []
+        for outline in self.outlines:
+            box = QCheckBox(outline.label)
+            box.toggled.connect(self._request)
+            self._outline_layout.insertWidget(self._outline_layout.count() - 1, box)
+            self.outline_boxes.append(box)
+        self.outline_row.setVisible(bool(self.outlines))
         keys = list(contents) + [key for key in found if key not in contents]
         for number, panel in enumerate(self.panels):
             key = keys[number % len(keys)] if keys else None
@@ -727,8 +920,10 @@ class ResultViewer(QWidget):
             panel.clear("")
         self._request()
 
-    def _content_label(self, source: Source, field: Field) -> str:
+    def _content_label(self, source: Source | None, field: Field | None) -> str:
         """The name of a panel content in its choice."""
+        if source is None:
+            return f"Curves: {self.curves.axis}"
         return (
             field.label if len(self.sources) == 1 else f"{field.label} · {source.label}"
         )
@@ -889,6 +1084,7 @@ class ResultViewer(QWidget):
                 message = f"{self._run} has no frames."
             for panel in self._shown():
                 panel.clear(message)
+            self.notes.hide()
             self.frame_label.setText("")
             self.status.setText("")
             return
@@ -899,11 +1095,27 @@ class ResultViewer(QWidget):
         for panel, key in zip(self._shown(), keys):
             if panel.shown != (self._run, key):
                 panel.clear(f"Reading {self._run}…")
+        if self._notes_run != self._run:
+            self.notes.hide()
         panels = tuple(
             (*self._contents[key], self._scales.get((self._run, key))) for key in keys
         )
+        kinds = {source.kind: source for source in self.sources}
+        outlines = tuple(
+            (outline, kinds[outline.kind])
+            for outline, box in zip(self.outlines, self.outline_boxes)
+            if box.isChecked()
+        )
         request = _Request(
-            self.locations, self._run, index, frames, panels, self._cache
+            self.locations,
+            self._run,
+            index,
+            frames,
+            panels,
+            outlines,
+            self._keys,
+            self.curves,
+            self._cache,
         )
         self._pending = self._worker.submit(partial(_draw, request))
         self._asked = (self._run, index, len(frames), keys)
@@ -931,10 +1143,14 @@ class ResultViewer(QWidget):
             for panel in self._shown():
                 panel.clear(f"The frame could not be shown: {error}")
             return
-        for panel, key, item in zip(self._shown(), keys, value):
+        drawn, notes = value
+        for panel, key, item in zip(self._shown(), keys, drawn):
             panel.show_drawn(item, (run, key))
             if item.scale is not None:
                 self._scales.setdefault((run, key), item.scale)
+        self._notes_run = run
+        self.notes.setText(" ".join(notes))
+        self.notes.setVisible(bool(notes))
 
     def stop_playing(self) -> None:
         """Stop Play; the frame shown stays."""
