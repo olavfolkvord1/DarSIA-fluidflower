@@ -14,11 +14,14 @@
   (:func:`darsia.backend_named`) and used for the step; each result records its
   device. It sets the threads and the storage of the results' arrays (the
   ``[storage]`` table of the job's configuration, :func:`darsia.use_storage`),
-  and renews the lease
-  every :data:`darsia.utils.results.BEAT`, runs the step and marks the task done,
-  naming its accepted tokens, or failed, with the traceback; the lease is not
-  renewed after the step has ended, so that nothing is written into the marker
-  between its mark and its move.
+  renews the lease every :data:`darsia.utils.results.BEAT`, runs the step and
+  marks the task done, naming its accepted tokens, or failed, with the traceback;
+  the lease is not renewed after the step has ended, so that nothing is written
+  into the marker between its mark and its move. A lease or mark is retried while
+  the share is out, up to :data:`darsia.utils.results.GRACE`; after a longer
+  outage the task stops and says why (:data:`darsia.jobs.service.OUTAGE`). A
+  terminal mark blocked by another process may retry until the last renewal's
+  lease deadline; its write and move share that deadline and never renew it.
 
 :data:`STEPS` holds the steps of the presets' Setup, Calibration, Analysis,
 Comparison and Media by the kind each makes. A task waits for the host's lock of a
@@ -198,13 +201,36 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
     )
 
 
+def _lost(error: OSError, what: str) -> int:
+    """Say that the share gave no answer within GRACE while doing something with
+    the claim, and give the exit code of a task stopped by an outage."""
+    service.say(
+        f"The share gave no answer within {results.GRACE:g} s while {what} "
+        f"({error}); this task stops. Its service returns it once it sees the share "
+        "again; another host takes it back once its lease is stale."
+    )
+    return service.OUTAGE
+
+
+def _out(error: BaseException) -> bool:
+    """Whether an error says that the share gave no answer within GRACE: not known
+    now, so the task stops and is run again later, never failed for it."""
+    return isinstance(error, OSError) and (
+        isinstance(error, results.Unavailable) or results.share_out(error)
+    )
+
+
 def _beats(
     claim: queue.Claim, stop: threading.Event, host: str, renewed: list[float]
 ) -> None:
     """Renew the lease every BEAT until stopped, naming this host
-    (:func:`darsia.jobs.service.host_identity`); a lost claim ends the process. A
-    beat that has begun ends before the thread does, and :func:`run` waits for
-    the thread before it marks the task."""
+    (:func:`darsia.jobs.service.host_identity`). A beat is retried through an
+    outage of the share up to GRACE; a longer outage ends the process
+    (:data:`darsia.jobs.service.OUTAGE`), and so does a lost claim
+    (:data:`REVOKED`): an owner whose marker is gone stays revoked. A beat that
+    has begun ends before the thread does, and :func:`run` waits for the thread
+    before it marks the task. The renewal's start is kept on the local monotonic
+    clock, so terminal marking cannot extend the last lease."""
     pid, born, number = os.getpid(), service.birth(os.getpid()), 1
     while not stop.wait(results.BEAT):
         number += 1
@@ -216,10 +242,7 @@ def _beats(
             service.say(f"{error}; this process stops.")
             os._exit(REVOKED)
         except OSError as error:
-            service.say(
-                f"The lease could not be renewed ({error}); this process stops."
-            )
-            os._exit(REVOKED)
+            os._exit(_lost(error, "renewing the lease"))
 
 
 def run(job: Path, task_name: str, token: str, machine: str) -> int:
@@ -242,13 +265,21 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
         The exit code: 0 when the task is marked done or failed,
         :data:`darsia.jobs.service.REFUSED` when its code is not of the job's
         revision or this host does not provide the job's kernel or backend (the
-        claim says why, and stays for its service to return), and :data:`REVOKED`
-        when the claim was taken back.
+        claim says why, and stays for its service to return), :data:`REVOKED`
+        when the claim was taken back, and :data:`darsia.jobs.service.OUTAGE`
+        when the share gave no answer within GRACE: about its job, its claim
+        or a result its step reads or stores (the task is then neither done nor
+        failed, and its service runs it again).
 
     """
     job = Path(job)
-    record = read_job(job)
     claim = queue.Claim(job, task_name, token, machine)
+    try:
+        record = read_job(job)
+    except OSError as error:
+        if not _out(error):
+            raise
+        return _lost(error, "reading its job")
     code = revision()
     why = other_revision(record, code) or refusal(record["environment"])
     if why is None:
@@ -263,6 +294,8 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
         except queue.Revoked as error:
             service.say(str(error))
             return REVOKED
+        except OSError as error:
+            return _lost(error, "saying why in the claim")
         return service.REFUSED
     threads, host = int(record["environment"]["threads"]), service.host_identity()
     cv2.setNumThreads(threads)
@@ -273,29 +306,38 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
+    except OSError as error:
+        return _lost(error, "writing the first lease")
     stop = threading.Event()
     beats = threading.Thread(
         target=_beats, args=(claim, stop, host, renewed), daemon=True
     )
     beats.start()
-    task = queue.task(job, task_name)
-    failure, adopted = None, ()
+    failure, adopted, out = None, (), None
     try:
+        task = queue.task(job, task_name)
         ctx = context(job, task, token, code)
         storage = ctx.tables.get("storage", {})
         use_storage(settings_from_table(StorageSettings, storage))
         ctx.step.run(ctx)
         adopted = tuple(ctx.adopted)
-    except Exception:
-        failure = traceback.format_exc()
-        service.say(f"Task {task_name} failed:\n{failure}")
+    except Exception as error:
+        if _out(error):
+            out = error
+        else:
+            failure = traceback.format_exc()
+            service.say(f"Task {task_name} failed:\n{failure}")
     stop.set()
     beats.join()  # A beat that has begun lands before the mark, never after it.
+    if out is not None:  # not known now: no mark; its service runs it again
+        return _lost(out, "running the step")
     try:
         queue.finish(claim, adopted, failure, deadline=renewed[0] + results.STALE)
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
+    except OSError as error:
+        return _lost(error, "marking the task")
     service.say(f"Task {task_name} {'failed' if failure else 'done'}.")
     return 0
 
@@ -314,6 +356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     serving.add_argument("--logs", type=Path)
     serving.add_argument("--poll", type=float, default=service.POLL)
     serving.add_argument("--until-settled", action="store_true")
+    serving.add_argument("--outages", type=int, default=3)
     running = commands.add_parser("run", help="Run one claimed task.")
     running.add_argument("job", type=Path)
     running.add_argument("task")
@@ -351,6 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             logs=args.logs,
             poll=args.poll,
             until=until,
+            outages=args.outages,
         )
     except service.ServiceRunning as error:
         service.say(str(error))

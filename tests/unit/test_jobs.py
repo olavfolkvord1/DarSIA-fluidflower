@@ -635,11 +635,21 @@ def test_a_retry_after_a_mend_of_its_inputs_needs_its_results_set_aside(tmp_path
 
 def test_a_share_outage_is_no_empty_state_folder(tmp_path, monkeypatch):
     """A state folder of a job the share gives no answer about within the grace,
-    also as a missing network path, is not known now: never an empty folder."""
+    also as a missing network path, is not known now: never an empty folder; nor
+    is a marker the share gives no answer about when it is moved ever gone."""
     config, selection = _project(tmp_path)
     job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
     monkeypatch.setattr(results, "GRACE", 0.2)
     monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+
+    def moved(source, destination, **kwargs):
+        raise network_error(path=str(source))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(results, "rename", moved)
+        with pytest.raises(results.Unavailable):
+            queue.claim(job, task, "here")
 
     def out(folder):
         raise network_error()
