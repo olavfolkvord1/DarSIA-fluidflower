@@ -820,24 +820,8 @@ def _array(values, dtype) -> list | None:
     return None if values is None else np.asarray(values, dtype).tolist()
 
 
-def write_frames(
-    folder: Path, run: str, frames: Sequence[CalibrationFrame], dtype
-) -> None:
-    """Store a run's frames as the fit reads them, in ``folder`` (:data:`STATISTICS`).
-
-    Parameters
-    ----------
-    folder : Path
-        The result's folder.
-    run : str
-        The run.
-    frames : sequence of CalibrationFrame
-        Its frames.
-    dtype : dtype
-        The dtype of the statistics' arrays, which :func:`read_frames` restores.
-
-    """
-    name = np.dtype(dtype).name
+def _rows(frames: Sequence[CalibrationFrame], name: str) -> list[dict]:
+    """A run's frames as plain values, the arrays in the dtype ``name``."""
     rows = []
     for frame in frames:
         row = dataclasses.asdict(frame)
@@ -851,15 +835,55 @@ def write_frames(
                 for key in ("relative", "ratio", "weight")
             }
         rows.append(row)
-    _write_json(folder, STATISTICS, {"run": run, "dtype": name, "frames": rows})
+    return rows
 
 
-def read_frames(folder: Path) -> list[CalibrationFrame]:
-    """A run's stored frames as the fit reads them (:func:`write_frames`)."""
+def write_frames(
+    folder: Path,
+    run: str,
+    frames: Sequence[CalibrationFrame],
+    dtype,
+    held_out: Mapping[str, Sequence[CalibrationFrame]] | None = None,
+) -> None:
+    """Store a run's frames as the fit reads them, in ``folder`` (:data:`STATISTICS`).
+
+    Parameters
+    ----------
+    folder : Path
+        The result's folder.
+    run : str
+        The run.
+    frames : sequence of CalibrationFrame
+        Its frames.
+    dtype : dtype
+        The dtype of the statistics' arrays, which :func:`read_frames` restores.
+    held_out : mapping of str to sequence of CalibrationFrame, optional
+        For a run held out of a calibration fold whose estimated free gas the
+        frames took, the frames without it, which that fold reads.
+
+    """
+    name = np.dtype(dtype).name
+    record = {
+        "run": run,
+        "dtype": name,
+        "frames": _rows(frames, name),
+        "held_out": {
+            other: _rows(alternative, name)
+            for other, alternative in (held_out or {}).items()
+        },
+    }
+    _write_json(folder, STATISTICS, record)
+
+
+def read_frames(folder: Path, held_out: str | None = None) -> list[CalibrationFrame]:
+    """A run's stored frames as the fit reads them (:func:`write_frames`); with
+    ``held_out``, those without that run's estimate where they are stored, as a
+    fold leaving it out reads them."""
     record = json.loads((Path(folder) / STATISTICS).read_text(encoding="utf-8"))
     dtype = np.dtype(record["dtype"]).type
+    rows = record["held_out"].get(held_out, record["frames"])
     frames = []
-    for row in record["frames"]:
+    for row in rows:
         gas = dict(row["gas"])
         gas["sands"] = {int(k): SandGas(**v) for k, v in gas["sands"].items()}
         column = row["column"]

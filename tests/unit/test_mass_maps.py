@@ -208,3 +208,22 @@ def test_the_official_route_and_ours_give_mass_maps_of_one_form():
     unknown = np.unravel_index(copy.cells.index.reshape(6, 6)[NO_SWI], (30, 30))
     assert cells["mass_total_known_fraction"][unknown] == 0
     assert copy.static["domain_area_m2"].sum() == pytest.approx(5 * 6 * 25e-6)
+
+
+def test_the_gas_density_at_no_head_is_our_productions():
+    """CO2's gas density at a pressure and temperature with no hydrostatic head
+    equals our production's (its phase split's, at zero height) in single and
+    double precision."""
+    states = [
+        (0.9851389500286174, 20.668747606192046),
+        (0.994208630395766, 22.141837002689577),
+        (1.028076467912384, 22.155780887760123),
+    ]
+    wanted = {
+        np.float32: [1.7839505672454834, 1.7913336753845215, 1.852557897567749],
+        np.float64: [1.7839506175841124, 1.7913337041055843, 1.8525579593140251],
+    }
+    for dtype, values in wanted.items():
+        assert [
+            darsia.atmospheric_gas_density(p, t, dtype) for p, t in states
+        ] == values

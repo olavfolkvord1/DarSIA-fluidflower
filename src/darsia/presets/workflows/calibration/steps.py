@@ -5,19 +5,27 @@ statistics, and the calibration fit with its folds.
   configuration, so that every phase map records the model it was made with; the
   folder's content is part of its identity, so a model trained again into the same
   folder is not taken for the stored one.
+- ``displaced-volume`` gives each run's displaced water from its own scale
+  readings, with its approved evaporation (:func:`darsia.approved_evaporation`),
+  and what another run compares it by as a donor: the sand map, the recipe, the
+  pressure record and the injection period.
 - ``overflow`` gives each frame of a run the free-gas volume of the water its
-  overflow displaced, from the run's own scale readings where they reach, else
-  none (the model's gas).
+  overflow displaced: from the run's own readings where they reach, else from
+  the most similar fit run with readings (:func:`darsia.ranked_donors`), else
+  none (the model's gas). Where that donor is held out of a calibration fold,
+  the frames also get the next donor's volumes, which the fold reads.
 - ``phase-maps`` (R4) runs the phase model on each frame and the phase rules and
   the gas allocation over the run in time order; each frame stores its phase and
   rule maps, its free-gas saturation and the CO2 of its labels before the rules,
-  and a run resumes at its first missing frame.
+  also without a held-out donor's volumes, and a run resumes at its first missing
+  frame.
 - ``run-statistics`` (R5) gives each frame the histograms of its sands' dissolved
   CO2 signal, its gas statistics and the column estimate of its CO2 pixels
   without a measurement of their own (:func:`darsia.unknown_statistics`), as the
   fit reads them.
 - ``calibration`` (R6) fits the gain and the dilution across the fit runs, and
-  each fold leaves one run out.
+  each fold leaves one run out, reading every run's frames without its
+  estimate.
 
 """
 
@@ -26,7 +34,7 @@ from __future__ import annotations
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 
 import numpy as np
@@ -189,16 +197,21 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
 
 def co2_state(grid: RunGrid, experiment, date) -> darsia.PrecisionCO2MassAnalysis:
     """Solubility and gas density of CO2 on a run's grid at a frame's pressure and
-    temperature (the run's pressure-temperature protocol)."""
-    state = experiment.pressure_temperature_protocol.get_state(date)
-    gradient = experiment.pressure_temperature_protocol.get_gradient(date)
+    temperature and their gradients: the run's atmosphere at the frame's hours
+    since the injection start, in the grid's dtype (:func:`run_atmosphere`), as
+    our production took it."""
+    hours, dtype = experiment.time_since_start(date), grid.rig.pixel_area.img.dtype
+    pressure, temperature = run_atmosphere(experiment, hours, dtype)
+    pressure_gradient, temperature_gradient = run_atmosphere(
+        experiment, hours, dtype, gradient=True
+    )
     return darsia.PrecisionCO2MassAnalysis(
         grid.rig.baseline,
         datum_m=grid.datum_m,
-        atmospheric_pressure=state.pressure,
-        atmospheric_temperature=state.temperature,
-        atmospheric_pressure_gradient=gradient.pressure,
-        atmospheric_temperature_gradient=gradient.temperature,
+        atmospheric_pressure=pressure,
+        atmospheric_temperature=temperature,
+        atmospheric_pressure_gradient=pressure_gradient,
+        atmospheric_temperature_gradient=temperature_gradient,
     )
 
 
@@ -269,21 +282,28 @@ def _overflow_file(tables: Mapping) -> str | None:
     return None if source is None else str(source)
 
 
-def _overflow_files(tables: Mapping, project, folders) -> list[str]:
-    """The run's protocols and its overflow workbook."""
+def _sand_map_identity(tables: Mapping) -> str:
+    """A run's sand map as a donor shares it: its drawing, as configured."""
+    return str(tables.get("labeling", {}).get("sand_map", {}).get("drawing", ""))
+
+
+def _displaced_files(tables: Mapping, project, folders) -> list[str]:
+    """The run's protocols, its overflow workbook and its sand map's drawing."""
     workbook = _overflow_file(tables)
+    drawing = tables.get("labeling", {}).get("sand_map", {}).get("drawing")
     found = protocol_files(tables, project, folders)
-    return found + ([workbook] if workbook is not None else [])
+    return found + [str(path) for path in (workbook, drawing) if path is not None]
 
 
-def _overflow(ctx: StepContext) -> None:
-    """Each frame's free-gas volume from the run's own scale readings."""
-    run = ctx.task.run
-    settings = ctx.settings["overflow"]
+def _displaced_volume(ctx: StepContext) -> None:
+    """The run's displaced volume from its scale readings, with its approved
+    evaporation, and what a recipient compares it by."""
+    run, settings = ctx.task.run, ctx.settings["overflow"]
+    tables = run_tables(ctx.tables, run)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     start = experiment.experiment_start
-    path = _overflow_workbook(run_tables(ctx.tables, run))
-    volume = None
+    path = _overflow_workbook(tables)
+    volume = proposal = rate = None
     if path is not None:
         protocol = darsia.OverflowProtocol(path)
         # The readings count from the injection start in their own clock, the
@@ -292,17 +312,116 @@ def _overflow(ctx: StepContext) -> None:
         origin = start if protocol.injection_start is None else protocol.injection_start
         times, weights = protocol.readings(origin, list(settings.statuses))
         volume = darsia.displaced_volume(times, weights, settings)
-    volumes = {}
-    for frame in ctx.task.frames:
-        hours = (experiment.get_datetime(ctx.photo(run, frame)) - start).total_seconds()
-        usable = (
-            volume is not None and volume.volume_ml is not None and not volume.reasons
+        if settings.evaporation is not None:
+            proposal = darsia.proposed_evaporation(volume, settings.evaporation)
+        rate = darsia.approved_evaporation(run, proposal, settings.evaporation)
+        if rate is not None:
+            volume = darsia.displaced_volume(times, weights, settings, rate)
+    pressure = experiment.pressure_temperature_protocol.df
+    steps = experiment.injection_protocol.df
+    steps = steps[steps["rate_kg_s"] > 0]
+    record = darsia.OverflowRun(
+        sand_map=_sand_map_identity(tables),
+        recipe=dict(tables.get("recipe", {})),
+        pressure_h=np.asarray(
+            [(date - start).total_seconds() / 3600 for date in pressure["datetime"]]
+        ),
+        pressure_bar=np.asarray(pressure["pressure_bar"], np.float64),
+        injection_h=(
+            (steps["start"].min() - start).total_seconds() / 3600,
+            (steps["end"].max() - start).total_seconds() / 3600,
+        ),
+        volume=volume,
+    )
+    ctx.publish(
+        lambda folder: darsia.write_overflow_run(folder, record, proposal, rate)
+    )
+
+
+def run_atmosphere(
+    experiment, hours: float, dtype, gradient: bool = False
+) -> tuple[float, float]:
+    """A run's atmospheric pressure [bar] and temperature [°C] at a time [h since
+    its injection start], or with ``gradient`` their upward gradients [bar/m] and
+    [°C/m]: its pressure-temperature record interpolated over the record's hours
+    since the start, those in the grid's dtype
+    (:func:`darsia.interpolated_atmosphere`), as our production did."""
+    record = experiment.pressure_temperature_protocol.df
+    times = [experiment.time_since_start(date) for date in record["datetime"]]
+    columns = ("pressure_bar", "temperature_celsius")
+    if gradient:
+        columns = ("pressure_gradient_bar", "temperature_gradient_celsius")
+    return darsia.interpolated_atmosphere(
+        times, *(record[column] for column in columns), hours, dtype
+    )
+
+
+def _gas_density(experiment, hours: float, dtype) -> float:
+    """The gas density [kg/m3] at a run's atmosphere at a time [h since its
+    injection start] (:func:`run_atmosphere`), at no hydrostatic head."""
+    pressure, temperature = run_atmosphere(experiment, hours, dtype)
+    return darsia.atmospheric_gas_density(pressure, temperature, dtype)
+
+
+def _overflow(ctx: StepContext) -> None:
+    """Each frame's free-gas volume: from the run's own readings, else from the
+    most similar fit run with readings; and, if that donor is left out of a fold,
+    from the next one. The readings are interpolated in the grid's dtype, as our
+    production interpolated them in the job's precision; the stored displaced
+    volumes keep theirs."""
+    run, frames = ctx.task.run, ctx.task.frames
+    settings, fits = ctx.settings["overflow"], ctx.settings["calibration_runs"]
+    runs = {
+        name: ctx.read("displaced-volume", darsia.read_overflow_run, run=name)
+        for name in ctx.selection.frames
+    }
+    dtype = ctx.read("rig", read_rig).pixel_area.img.dtype
+    experiments = {name: None for name in runs}
+
+    def experiment_of(name):
+        if experiments[name] is None:
+            experiments[name] = make_experiment(run_settings(ctx, name, EXPERIMENT))
+        return experiments[name]
+
+    own = experiment_of(run)
+    start = own.experiment_start
+    dates = [own.get_datetime(ctx.photo(run, frame)) for frame in frames]
+    hours = [(date - start).total_seconds() / 3600 for date in dates]
+    mass = [own.injection_protocol.injected_mass(time=h) * 1000 for h in hours]
+    density = [_gas_density(own, h, dtype) for h in hours]
+    candidates = {name: runs[name] for name in runs if name in fits.fit or name == run}
+    ranked = darsia.ranked_donors(run, candidates, settings)
+
+    def state(donor: str, h: float) -> tuple[float, float]:
+        other = experiment_of(donor)
+        mass_g = other.injection_protocol.injected_mass(time=h) * 1000
+        return mass_g, _gas_density(other, h, dtype)
+
+    def readings(name: str) -> darsia.DisplacedVolume | None:
+        volume = runs[name].volume
+        return None if volume is None else volume.astype(dtype)
+
+    def volumes(donor: str | None) -> dict[str, darsia.FrameVolume]:
+        found = darsia.frame_volumes(
+            readings(run),
+            hours,
+            None if donor is None else (donor, readings(donor)),
+            mass,
+            density,
+            None if donor is None else partial(state, donor),
         )
-        volumes[frame_key(frame)] = (
-            darsia.measured_reference(volume, hours / 3600) if usable else None
-        )
+        return {frame_key(frame): v for frame, v in zip(frames, found)}
+
+    primary = volumes(ranked[0] if ranked else None)
+    held_out = {}
+    if ranked and ranked[0] in fits.folds:
+        if any(v.source != darsia.MEASURED for v in primary.values()):
+            held_out[ranked[0]] = volumes(ranked[1] if len(ranked) > 1 else None)
+    volume = runs[run].volume
     reasons = [] if volume is None else list(volume.reasons)
-    ctx.publish(lambda folder: darsia.write_frame_volumes(folder, volumes, reasons))
+    ctx.publish(
+        lambda folder: darsia.write_frame_volumes(folder, primary, reasons, held_out)
+    )
 
 
 def previous_acquisition(
@@ -445,7 +564,7 @@ def _phase_maps(ctx: StepContext) -> None:
             accept_canvas=source.accept_canvas,
         ),
     )
-    volumes = ctx.read("overflow", darsia.read_frame_volumes)["volumes"]
+    variants = (None, *ctx.read("overflow", darsia.held_out_runs))
     start = next((k for k, frame in enumerate(frames) if not ctx.done(frame)), None)
     if start is None:
         return
@@ -455,100 +574,120 @@ def _phase_maps(ctx: StepContext) -> None:
     support = grid_mask(
         run_tables(ctx.tables, run), "phase_support", grid.rig.baseline.img.shape
     )
-    maps = darsia.free_gas(
-        _Probabilities(ctx, model, grid, frames, kept, rig, support),
-        dates,
-        grid.rig.facies,
-        grid.domain,
-        grid.pixel_area_mm2,
-        grid.permeability,
-        experiment.injection_protocol,
-        rules,
-        grid.geometry.pore_volume_m3,
-        grid.geometry.swi,
-        [volumes[frame_key(frame)] for frame in frames],
-        settings["gas_allocation"],
-        grid.chart,
-        gas_threshold=model.gas_threshold,
-        start=start,
-        anchor_saturation=lambda k: ctx.own(darsia.read_phase_maps, frame=frames[k])[
-            "saturation"
-        ],
-    )
-    for frame, arrays in zip(frames[start:], maps):
-        ctx.publish(lambda f: darsia.write_phase_maps(f, *arrays), frame=frame)
+    probabilities = _Probabilities(ctx, model, grid, frames, kept, rig, support)
+
+    def maps(held_out):
+        volumes = ctx.read("overflow", lambda f: darsia.read_frame_volumes(f, held_out))
+        return darsia.free_gas(
+            probabilities,
+            dates,
+            grid.rig.facies,
+            grid.domain,
+            grid.pixel_area_mm2,
+            grid.permeability,
+            experiment.injection_protocol,
+            rules,
+            grid.geometry.pore_volume_m3,
+            grid.geometry.swi,
+            [volumes[frame_key(frame)].volume_m3 for frame in frames],
+            settings["gas_allocation"],
+            grid.chart,
+            gas_threshold=model.gas_threshold,
+            start=start,
+            anchor_saturation=lambda k: ctx.own(
+                lambda f: darsia.read_phase_maps(f, held_out), frame=frames[k]
+            )["saturation"],
+        )
+
+    for frame, *found in zip(frames[start:], *(maps(v) for v in variants)):
+
+        def write(folder, found=found):
+            for held_out, arrays in zip(variants, found):
+                darsia.write_phase_maps(folder, *arrays, held_out=held_out)
+
+        ctx.publish(write, frame=frame)
 
 
 def _run_statistics(ctx: StepContext) -> None:
-    """Each frame's sand histograms and gas statistics, as the fit reads them."""
+    """Each frame's sand histograms, gas statistics and column estimate, as the
+    fit reads them; for a fold leaving out the donor of the run's free gas, also
+    from the frames' maps without it."""
     run, frames, settings = ctx.task.run, ctx.task.frames, ctx.settings
     statistics_settings = settings["run_statistics"]
     grid = run_grid(ctx.read("rig", read_rig), settings["material"])
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     protocol, start = experiment.injection_protocol, experiment.experiment_start
-    volumes = ctx.read("overflow", darsia.read_frame_volumes)
+    variants = (None, *ctx.read("overflow", darsia.held_out_runs))
+    volumes = {
+        held_out: ctx.read("overflow", lambda f: darsia.read_frame_volumes(f, held_out))
+        for held_out in variants
+    }
     reading = sand_reading(settings["reading"])
-    rows = []
+    rows = {held_out: [] for held_out in variants}
     for index, frame in enumerate(frames):
-        image = ctx.read("corrected-image", read_image, frame=frame)
-        maps = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
+        image = ctx.read("corrected-image", read_image, frame=frame).img
         date = experiment.get_datetime(ctx.photo(run, frame))
         co2 = co2_state(grid, experiment, date)
-        capacity = darsia.dissolved_capacity(
-            grid.geometry.pore_volume_m3, co2.solubility_co2, maps["saturation"]
-        )
-        support = grid.domain & np.isfinite(image.img).all(axis=-1)
-        histograms = next(
-            darsia.run_statistics(
-                [(image.img, maps["labels"], maps["rules"], support, capacity)],
-                grid.rig.baseline.img,
-                grid.rig.facies,
-                grid.optical_pitch,
-                grid.geometry.counted,
-                reading,
-                statistics_settings,
-            )
-        )
-        gas = darsia.gas_statistics(
-            maps["co2"],
-            darsia.model_gas(maps["labels"], maps["rules"]),
-            maps["saturation"],
-            grid.facies,
-            grid.geometry.counted,
-            grid.geometry.pore_volume_m3,
-            co2.density_gaseous_co2,
-            co2.solubility_co2,
-        )
-        signal, measured = read_signal(
-            grid, image.img, maps, reading, statistics_settings
-        )
-        unknown = darsia.unknown_statistics(
-            darsia.relative_signal(signal, statistics_settings),
-            maps["labels"],
-            maps["rules"],
-            measured,
-            grid.geometry,
-            co2,
-            settings["unknown_mass"],
-        )
+        support = grid.domain & np.isfinite(image).all(axis=-1)
         hours = (date - start).total_seconds() / 3600
-        volume = volumes["volumes"][frame_key(frame)]
-        rows.append(
-            darsia.CalibrationFrame(
-                run=run,
-                index=index,
-                elapsed_h=hours,
-                target_h=hours,
-                injected_g=protocol.injected_mass(time=hours) * 1000,
-                dissolved=histograms,
-                gas=gas,
-                column=unknown.column_estimate(),
-                overflow_m3=volume,
-                measured=volume is not None and volumes["measured"],
+        for held_out in variants:
+            maps = ctx.read(
+                "phase-maps", lambda f: darsia.read_phase_maps(f, held_out), frame=frame
             )
-        )
+            capacity = darsia.dissolved_capacity(
+                grid.geometry.pore_volume_m3, co2.solubility_co2, maps["saturation"]
+            )
+            histograms = next(
+                darsia.run_statistics(
+                    [(image, maps["labels"], maps["rules"], support, capacity)],
+                    grid.rig.baseline.img,
+                    grid.rig.facies,
+                    grid.optical_pitch,
+                    grid.geometry.counted,
+                    reading,
+                    statistics_settings,
+                )
+            )
+            gas = darsia.gas_statistics(
+                maps["co2"],
+                darsia.model_gas(maps["labels"], maps["rules"]),
+                maps["saturation"],
+                grid.facies,
+                grid.geometry.counted,
+                grid.geometry.pore_volume_m3,
+                co2.density_gaseous_co2,
+                co2.solubility_co2,
+            )
+            signal, measured = read_signal(
+                grid, image, maps, reading, statistics_settings
+            )
+            unknown = darsia.unknown_statistics(
+                darsia.relative_signal(signal, statistics_settings),
+                maps["labels"],
+                maps["rules"],
+                measured,
+                grid.geometry,
+                co2,
+                settings["unknown_mass"],
+            )
+            volume = volumes[held_out][frame_key(frame)]
+            rows[held_out].append(
+                darsia.CalibrationFrame(
+                    run=run,
+                    index=index,
+                    elapsed_h=hours,
+                    target_h=hours,
+                    injected_g=protocol.injected_mass(time=hours) * 1000,
+                    dissolved=histograms,
+                    gas=gas,
+                    column=unknown.column_estimate(),
+                    overflow_m3=volume.volume_m3,
+                    measured=volume.source == darsia.MEASURED,
+                )
+            )
     dtype = grid.rig.pixel_area.img.dtype
-    ctx.publish(lambda folder: darsia.write_frames(folder, run, rows, dtype))
+    primary = rows.pop(None)
+    ctx.publish(lambda folder: darsia.write_frames(folder, run, primary, dtype, rows))
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
@@ -558,22 +697,25 @@ def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]
 
 
 def _calibration(ctx: StepContext) -> None:
-    """The fit across the fit runs, or one fold leaving a run out."""
+    """The fit across the fit runs, or one fold leaving a run out; a fold reads
+    each run's frames without the held-out run's estimated free gas."""
     settings = ctx.settings
     runs, material = settings["calibration_runs"], settings["material"]
+    held = None if ctx.task.part == "fit" else ctx.task.part.removeprefix("fold-")
     frames = [
         frame
         for run in ctx.selection.frames
-        for frame in ctx.read("run-statistics", darsia.read_frames, run=run)
+        for frame in ctx.read(
+            "run-statistics", lambda f: darsia.read_frames(f, held), run=run
+        )
     ]
     swi = {int(k): float(v) for k, v in material.swi.items()}
     measured = [int(k) for k in material.measured_swi]
     arguments = (frames, list(runs.fit), settings["calibration_fit"], swi, measured)
     predictions = []
-    if ctx.task.part == "fit":
+    if held is None:
         calibration = darsia.fit_calibration(*arguments)
     else:
-        held = ctx.task.part.removeprefix("fold-")
         calibration, predictions = darsia.calibration_fold(*arguments, held)
     masses = darsia.mass_calibrations(calibration, settings["run_statistics"])
     ctx.publish(
@@ -594,17 +736,28 @@ PHASE_MODEL = Step(
     selected=False,
 )
 """The series' phase model (R3), made from no run of the selection."""
-OVERFLOW = Step(
-    "overflow",
+DISPLACED_VOLUME = Step(
+    "displaced-volume",
     {},
     Order.RUN,
     Memory(),
-    _overflow,
+    _displaced_volume,
     {"overflow": darsia.OverflowSettings},
-    sections=EXPERIMENT,
-    files=_overflow_files,
+    sections=(*EXPERIMENT, "recipe"),
+    files=_displaced_files,
 )
-"""Each run's free-gas volume per frame from its overflow."""
+"""Each run's displaced volume from its overflow, as a donor gives it."""
+OVERFLOW = Step(
+    "overflow",
+    {"displaced-volume": Scope.ALL, "rig": Scope.OWN},
+    Order.RUN,
+    Memory(),
+    _overflow,
+    {"overflow": darsia.OverflowSettings, "calibration_runs": FitRuns},
+    sections=EXPERIMENT,
+    files=protocol_files,
+)
+"""Each run's free-gas volume per frame, its own or a donor's."""
 PHASE_MAPS = Step(
     "phase-maps",
     {
@@ -663,5 +816,12 @@ CALIBRATION = Step(
     _calibration_parts,
 )
 """The calibration fit and its folds (R6)."""
-STEPS = (PHASE_MODEL, OVERFLOW, PHASE_MAPS, RUN_STATISTICS, CALIBRATION)
+STEPS = (
+    PHASE_MODEL,
+    DISPLACED_VOLUME,
+    OVERFLOW,
+    PHASE_MAPS,
+    RUN_STATISTICS,
+    CALIBRATION,
+)
 """The Calibration's steps."""
