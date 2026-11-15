@@ -1445,6 +1445,24 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
         assert np.array_equal(found.material_coefficients[material], coefficients)
     assert correction("r2").grid_to_field is None
 
+    # The first run's depth rule at its pixels' positions by its measured model:
+    # the model at each column and row, in the grid's precision.
+    depths = pd.read_csv(project / "depth.csv")
+    measurements = (depths["x"], depths["y"], depths["depth"])
+    columns = np.arange(180, dtype=f32)[None, :]
+    rows = np.arange(120, dtype=f32)[:, None]
+    x, y = darsia.project_xy(measured.astype(f32), columns, rows)
+    by_model, outside = darsia.interpolate_linear_in_hull(
+        measurements, np.column_stack((x.ravel(), y.ravel()))
+    )
+    assert outside.any() and not outside.all()
+    assert first.depth.img.dtype == f32
+    assert np.array_equal(first.depth.img, by_model.reshape(120, 180))
+    cx, cy = darsia.pixel_centres(first.baseline)
+    centres = np.stack(np.meshgrid(cx, cy), axis=-1).reshape(-1, 2).astype(f32)
+    nominal, _ = darsia.interpolate_linear_in_hull(measurements, centres)
+    assert not np.array_equal(first.depth.img, nominal.reshape(120, 180))
+
 
 def test_a_run_reads_its_reference_runs_files_in_the_read_of_its_rig(
     tmp_path, monkeypatch

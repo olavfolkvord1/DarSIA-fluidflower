@@ -8,7 +8,8 @@ map as its labels and the facies of those labels
 (:func:`darsia.presets.workflows.setup.setup_facies.make_facies`); each corrected
 image is a photo read through the rig's corrections, once per Setup. A run whose
 ``[depth] interpolation`` is ``"triangulation"`` takes its depth from the rule
-evaluated on its own grid (:func:`grid_depth`), as our production's mass did.
+evaluated on its own grid (:func:`grid_depth`), at its pixels' positions on the rig
+by its measured model where it has one, as our production's mass did.
 Where ``[material_reference]`` names a reference run, every other run's material
 light correction is fitted on the reference's fitting grid, from the reference's
 stored rig (:func:`reference_homography`), as our production fitted it.
@@ -187,12 +188,20 @@ def _sand_map(ctx: StepContext) -> None:
     ctx.publish(lambda folder: labels.save(Path(folder) / "labels.npz"))
 
 
-def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
+def grid_depth(
+    rig: Rig,
+    measurements: Path,
+    grid_to_rig: Sequence[Sequence[float]] | np.ndarray | None = None,
+) -> darsia.Image:
     """A rig's depth by the depth rule of its measurements: linear inside their
     hull and the nearest one outside (:func:`darsia.interpolate_linear_in_hull`),
-    at the pixel centres of the rig's grid (:func:`darsia.pixel_centres`, in
-    metres, cast to the grid's precision) and in that precision, the precision of
-    its pixel areas, as our production's mass evaluated it on its run grid.
+    in the precision of the rig's grid, that of its pixel areas, as our
+    production's mass evaluated it on its run grid. With the run's measured model
+    of its grid, the rule is evaluated at each pixel's position on the rig: the
+    model applied to its column and row (whole numbers) in the grid's precision
+    (:func:`darsia.project_xy`), as our production's mass placed its pixels in
+    metres; without one, at the pixel centres of the grid in metres
+    (:func:`darsia.pixel_centres`, cast to the grid's precision).
 
     Parameters
     ----------
@@ -200,6 +209,9 @@ def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
         The rig, on its run grid.
     measurements : Path
         The depth measurements' table: ``x``, ``y`` [m] and :data:`DEPTH`.
+    grid_to_rig : array, optional
+        The run's measured homography from its grid's pixels to rig metres
+        (:func:`grid_model`).
 
     Returns
     -------
@@ -209,12 +221,20 @@ def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
     """
     table = pd.read_csv(measurements)
     columns = ["x" if "x" in table else "X", "y" if "y" in table else "Y", DEPTH]
-    x, y = darsia.pixel_centres(rig.baseline)
-    xx, yy = np.meshgrid(x, y)
+    dtype = rig.pixel_area.img.dtype
+    if grid_to_rig is None:
+        x, y = darsia.pixel_centres(rig.baseline)
+        xx, yy = np.meshgrid(x, y)
+    else:
+        rows, cols = rig.baseline.img.shape[:2]
+        xx, yy = darsia.project_xy(
+            np.asarray(grid_to_rig, dtype),
+            np.arange(cols, dtype=dtype)[None, :],
+            np.arange(rows, dtype=dtype)[:, None],
+        )
     points = np.column_stack((xx.ravel(), yy.ravel()))
     values, _ = darsia.interpolate_linear_in_hull(
-        tuple(table[c].to_numpy() for c in columns),
-        points.astype(rig.pixel_area.img.dtype),
+        tuple(table[c].to_numpy() for c in columns), points.astype(dtype)
     )
     depth = rig.depth.copy()
     depth.img = values.reshape(xx.shape)
@@ -313,7 +333,8 @@ def _material_reference(
 def _rig(ctx: StepContext) -> None:
     """The run's rig, with its sand map as the labels and their facies, fitted on
     its reference run's grid where the configuration names one, and with the depth
-    rule evaluated on its grid where the run's configuration chooses it."""
+    rule evaluated on its grid, by its measured model where it has one, where the
+    run's configuration chooses it."""
     run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
     with TemporaryDirectory() as folder:
@@ -324,7 +345,8 @@ def _rig(ctx: StepContext) -> None:
         make_facies(config, darsia.imread(labels)).save(facies)
         rig = make_rig(Rig, config, labels=labels, facies=facies)
     if config.depth.interpolation == "triangulation":
-        rig.depth = grid_depth(rig, Path(config.depth.measurements))
+        model = grid_model(run_tables(ctx.tables, run))
+        rig.depth = grid_depth(rig, Path(config.depth.measurements), model)
         rig.setup_geometry()
     ctx.publish(lambda folder: rig.save(Path(folder)))
 
