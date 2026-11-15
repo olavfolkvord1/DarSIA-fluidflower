@@ -37,3 +37,27 @@ def test_settings_from_a_table():
         )
     named = settings_from_table(_Named, {"parts": {"a": {"minimum_readings": 3}}})
     assert named.parts == {"a": darsia.CirculationSettings(minimum_readings=3)}
+
+
+@dataclass(frozen=True)
+class _Listed:
+    """Settings with tuples, of settings and of numbers."""
+
+    parts: tuple[darsia.CirculationSettings, ...]
+    size: tuple[int, int]
+    limits: tuple[tuple[float, float], ...] | None = None
+
+
+def test_a_list_of_a_tuple_field_becomes_its_tuple():
+    """A list given for a tuple field becomes a tuple, its tables settings."""
+    table = tomllib.loads(
+        "parts = [{minimum_readings = 3}, {minimum_readings = 4}]\nsize = [2, 4]\n"
+        "limits = [[0.0, 1.0]]\n"
+    )
+    settings = settings_from_table(_Listed, table)
+    assert settings == _Listed(
+        (darsia.CirculationSettings(3), darsia.CirculationSettings(4)),
+        (2, 4),
+        ((0.0, 1.0),),
+    )
+    assert settings_from_table(_Listed, {**table, "limits": None}).limits is None
