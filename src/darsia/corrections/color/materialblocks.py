@@ -21,6 +21,7 @@ from darsia.corrections.color.materialilluminationcorrection import (
     _pixel_resize,
     fit_material_gain,
 )
+from darsia.image.subregions import warp_perspective
 from darsia.utils.linalg import solve
 
 _TRAINING_FOLDS = (0, 3, 4)
@@ -61,36 +62,13 @@ def _reduce_rgb(rgb: np.ndarray, size: tuple) -> np.ndarray:
 
 
 def _warp(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Bilinear warp of a single precision array onto a grid of its own shape.
-
-    In single precision, the source position of each pixel centre is computed in
-    single precision and sampled by OpenCV's remap; in double precision, OpenCV's
-    perspective warp maps the pixel centres. Positions outside give zero.
+    """Bilinear warp of a single precision array onto a grid of its own shape, in
+    the precision of the homography (:func:`darsia.warp_perspective`): positions
+    in single precision sampled by OpenCV's remap, or OpenCV's perspective warp in
+    double precision. Positions outside give zero.
     """
     height, width = values.shape[:2]
-    if matrix.dtype != np.float32:
-        return cv2.warpPerspective(
-            values,
-            matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-    inverse = solve(matrix, np.eye(3, dtype=matrix.dtype))
-    x = np.arange(width, dtype=matrix.dtype)[None, :]
-    y = np.arange(height, dtype=matrix.dtype)[:, None]
-    weight = inverse[2, 0] * x + inverse[2, 1] * y + inverse[2, 2]
-    map_x = (inverse[0, 0] * x + inverse[0, 1] * y + inverse[0, 2]) / weight
-    map_y = (inverse[1, 0] * x + inverse[1, 1] * y + inverse[1, 2]) / weight
-    return cv2.remap(
-        values,
-        map_x,
-        map_y,
-        cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
+    return warp_perspective(values, matrix, (width, height), matrix.dtype)
 
 
 def _warp_rgb(rgb: np.ndarray, matrix: np.ndarray) -> np.ndarray:

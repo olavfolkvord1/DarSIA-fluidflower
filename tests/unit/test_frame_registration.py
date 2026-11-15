@@ -185,7 +185,7 @@ def test_a_raw_photograph_is_registered_to_the_reference_and_sampled_once(
     # Every fit point matches: the clipped spot is not left out of the views.
     assert found.matches == 66 and found.homography.dtype == np.float32
     y, x = np.mgrid[0:698:20, 0:1200:20].astype(np.float32)
-    project = darsia.corrections.shape.registration._project
+    project = darsia.project_xy
     sx, sy = project(registration.homography.astype(float), x, y)
     fx, fy = project(found.homography.astype(float), x, y)
     # Within a quarter pixel: the move is demosaiced from the moved mosaic.
