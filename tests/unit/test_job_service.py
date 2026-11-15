@@ -67,7 +67,8 @@ def _end_task_processes() -> list[int]:
 def _serve(jobs, tmp_path, threads=2, seconds=300.0):
     """Serve a jobs folder in this process until every job is settled; after some
     seconds (a job the service refuses is never settled, a task may hang) the task
-    processes still running are ended and the test fails."""
+    processes still running are ended and the test fails. The host's free memory
+    is taken as ample, so that the test does not depend on this machine's."""
     deadline, overdue = time.monotonic() + seconds, []
 
     def until():
@@ -78,15 +79,18 @@ def _serve(jobs, tmp_path, threads=2, seconds=300.0):
             return True
         return False
 
-    service.serve(
-        jobs,
-        "here",
-        threads=threads,
-        lock=tmp_path / "service.lock",
-        logs=tmp_path / "logs",
-        poll=0.2,
-        until=until,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(service, "headroom", lambda: 2**40)
+        patch.setattr(service, "reserve", lambda: 0)
+        service.serve(
+            jobs,
+            "here",
+            threads=threads,
+            lock=tmp_path / "service.lock",
+            logs=tmp_path / "logs",
+            poll=0.2,
+            until=until,
+        )
     assert not overdue, f"The jobs did not settle within {seconds} s."
 
 
@@ -657,7 +661,8 @@ def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch
 def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(
     tmp_path, monkeypatch
 ):
-    """Legacy records stay uncached; retrying failed work stays visible."""
+    """Only fully done jobs are final. A retry of a failed job and a new job
+    remain visible while an older done job no longer costs marker/task reads."""
     jobs = tmp_path / "jobs"
 
     def make(name):
@@ -669,17 +674,18 @@ def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(
     queue.finish(queue.claim(first, "numbers.r2.0000", "here"))
     complete = set()
     assert service.settled(jobs, complete=complete)
-    assert not complete
+    assert complete == {first.name}
     failed = make("second")
     queue.finish(queue.claim(failed, "numbers.r2.0000", "here"), traceback="failed")
     tasks = queue.tasks
 
     def read(job):
+        assert Path(job) != first, "A fully done job was read again"
         return tasks(job)
 
     monkeypatch.setattr(queue, "tasks", read)
     assert service.settled(jobs, complete=complete)
-    assert not complete
+    assert complete == {first.name}
     task = "numbers.r2.0000"
     token = queue.markers(failed, queue.FAILED)[task]
     assert queue._transfer(
@@ -689,6 +695,6 @@ def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(
     assert not service.settled(jobs, complete=complete)
     queue.finish(queue.claim(failed, "numbers.r2.0000", "here"))
     assert service.settled(jobs, complete=complete)
-    assert not complete
+    assert complete == {first.name, failed.name}
     make("third")
     assert not service.settled(jobs, complete=complete)

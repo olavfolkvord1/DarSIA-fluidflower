@@ -12,19 +12,23 @@ says why. Every :data:`POLL` seconds the service
 - takes back stale claims of any host (:func:`darsia.jobs.queue.reclaim`);
 - counts the claims of its host whose process outlived an earlier service, each
   known by its claim's token, its process and that process's birth time, and
-  reserves their threads; it never takes them back, and returns a claim at once
-  when its process is gone, which a process that ended while it looked, or that it
-  may not look at, counts as;
-- starts the oldest job's first ready task, while the threads of its live tasks
-  and of the task are within the host's capacity, as a new process
-  (``python -m darsia.jobs run``) with its job's computing environment.
+  reserves their threads and bytes; it never takes them back, and returns a claim
+  at once when its process is gone, which a process that ended while it looked, or
+  that it may not look at, counts as;
+- starts ready tasks, the oldest job's first, each as a new process
+  (``python -m darsia.jobs run``) with its job's computing environment, while the
+  host admits them (:func:`admit`): the live tasks' threads and the task's are at
+  most the host's, and the task's declared bytes are at most the memory free now,
+  less the reserve, less what the live tasks may still take.
 
 Each part of a round that cannot read the jobs folder now, e.g. a job's file read
 short over the share, says why and is tried again in the next round.
 
-The machine's capacity is one number of threads, shared by every job of the
-project, the oldest job first; with none, the service takes no new tasks. Each
-job fixes the threads of its tasks (:class:`darsia.jobs.job.Environment`). A job
+The machine's threads and memory are shared by every job of the project, the
+oldest job first; a task that would not fit even on the idle host is passed over,
+so that it holds up no other task. With no threads, the service takes no new
+tasks. Each job fixes the threads of its tasks
+(:class:`darsia.jobs.job.Environment`). A job
 records the code's revision at its creation; a service whose code is of another
 revision takes none of its tasks, a service whose checkout has moved on since it
 started takes no new tasks, and a task process of another revision refuses its
@@ -44,7 +48,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +82,14 @@ HOST_MUTEX = "Global\\darsia-jobs-service"
 """The name of the service's lock of a Windows machine, seen by every account."""
 HOST_FILE = Path("/tmp/darsia-jobs-service.lock")
 """The service's lock file of a POSIX machine, the same for every account."""
+RESERVE = 0.10
+"""Share of the host's physical memory that no task is admitted into."""
+AUTO = "auto"
+"""The request of a host that takes as many tasks as its threads and memory
+admit."""
+PROCESS = 300 * 2**20
+"""Bytes a task process holds of its own beside the arrays its step declares: the
+interpreter with NumPy, OpenCV and DarSIA loaded, measured at about 0.3 GiB."""
 
 
 class ServiceRunning(RuntimeError):
@@ -324,6 +336,46 @@ def alive(pid: int | None, born: float | None) -> bool:
     return found is not None and abs(found - float(born)) < 0.01
 
 
+class _MemoryStatus(ctypes.Structure):
+    """Windows' ``MEMORYSTATUSEX``."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def headroom() -> int:
+    """The bytes free for a new task now, measured fresh: on Windows the smaller of
+    the available physical memory and the available commit, since an allocation
+    fails when either runs out; elsewhere the available physical memory."""
+    if os.name != "nt":
+        return int(psutil.virtual_memory().available)
+    status = _MemoryStatus()
+    status.dwLength = ctypes.sizeof(status)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(min(status.ullAvailPhys, status.ullAvailPageFile))
+
+
+def reserve() -> int:
+    """The bytes no task is admitted into: :data:`RESERVE` of the physical memory."""
+    return int(RESERVE * psutil.virtual_memory().total)
+
+
+def _size(value: int) -> str:
+    """Bytes as GiB, for what the service says."""
+    return f"{value / 2**30:.2f} GiB"
+
+
 @dataclass
 class Live:
     """A task running on this host: started by this service, or a survivor."""
@@ -338,6 +390,97 @@ class Live:
     """A survivor's process."""
     born: float | None = None
     """A survivor's birth time."""
+    bytes: int = 0
+    """The bytes it reserves: those it declares (:func:`darsia.jobs.job.task_bytes`)
+    and its process's own (:data:`PROCESS`)."""
+    held: int = 0
+    """The bytes its processes held when the service last looked
+    (:meth:`resident`), once per round."""
+
+    def resident(self) -> int:
+        """The bytes its process and the processes it started hold now (their
+        resident sets), e.g. the interpreter a launcher starts or a film's
+        encoder; none of a process that is gone or may not be looked at, so that
+        its declaration stays reserved."""
+        pid = self.process.pid if self.process is not None else self.pid
+        try:
+            process = psutil.Process(int(pid))
+            tree = [process, *process.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError, ValueError):
+            return 0
+        held = 0
+        for one in tree:
+            try:
+                held += one.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return int(held)
+
+
+def _reserved(record: dict, task: str) -> int:
+    """The bytes a task of a job reserves: those it declares and its process's
+    own (:data:`PROCESS`)."""
+    return record.get("bytes", {}).get(task, 0) + PROCESS
+
+
+def admit(
+    task_bytes: int,
+    task_threads: int,
+    live: Sequence[Live],
+    request: int | str,
+    threads: int,
+    free: int,
+    kept: int,
+) -> tuple[bool, str]:
+    """Whether a task may start beside a host's live tasks, and why not.
+
+    A task starts only when the live tasks' threads and its own are at most the
+    host's threads, and its bytes are at most the free memory, less the reserve,
+    less what the live tasks may still take: each one's reserved bytes beyond
+    what its processes held at the round's look (:attr:`Live.held`). The live
+    tasks include the survivors of an earlier service. A request of a number of
+    tasks is a ceiling, never more than these rules admit; 0 takes no new tasks.
+
+    Parameters
+    ----------
+    task_bytes : int
+        The bytes the task declares.
+    task_threads : int
+        Its threads (its job's).
+    live : Sequence[Live]
+        The tasks running on the host.
+    request : int or str
+        The host's request: :data:`AUTO`, or at most this many tasks.
+    threads : int
+        The host's threads: its logical cores less one, or fewer.
+    free : int
+        The bytes free now (:func:`headroom`).
+    kept : int
+        The reserve (:func:`reserve`).
+
+    Returns
+    -------
+    tuple of bool and str
+        Whether it starts, and why not; empty when it does.
+
+    """
+    if request != AUTO and len(live) >= int(request):
+        return False, f"the request caps the host at {int(request)} tasks"
+    used = sum(task.threads for task in live)
+    if used + task_threads > threads:
+        return False, (
+            f"its {task_threads} threads and the live tasks' {used} exceed the "
+            f"host's {threads}"
+        )
+    coming = sum(max(0, task.bytes - task.held) for task in live)
+    room = free - kept - coming
+    if task_bytes > room:
+        return False, (
+            f"it needs {_size(task_bytes)}; {_size(free)} free less the reserve "
+            f"{_size(kept)} and {_size(coming)} the live tasks may still take "
+            f"leave {_size(room)}"
+        )
+    return True, ""
 
 
 class Service:
@@ -350,7 +493,7 @@ class Service:
     machine : str
         This host's name in the leases.
     threads : int
-        The host's capacity: threads its live tasks may use at once.
+        The host's threads: its live tasks' threads together are at most these.
     logs : Path
         Local folder of the tasks' output.
 
@@ -362,11 +505,15 @@ class Service:
         self.machine = machine
         """This host's name."""
         self.threads = threads
-        """The host's capacity in threads."""
+        """The host's threads."""
         self.logs = Path(logs)
         """Local folder of the tasks' output."""
         self.revision = revision()
         """The code's revision of this service, when it started."""
+        self.request: int | str = AUTO
+        """The host's request: :data:`AUTO`, or at most this many tasks."""
+        self.reason = ""
+        """Why the host took no more tasks in its last round."""
         self.live: dict[Path, Live] = {}
         """The tasks running on this host, by claimed marker."""
         self.refused: dict[str, str] = {}
@@ -377,22 +524,30 @@ class Service:
         self._records: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
         self._idle: str | None = None
+        self._passed: set[tuple[str, str]] = set()
+        self._unknown: set[str] = set()
+        self._uncounted: str | None = None
 
     def _jobs(self) -> list[tuple[Path, dict]]:
-        """The jobs of the folder with their records, oldest first; a job whose
-        record cannot be read now is left for the next round."""
-        found = []
+        """The jobs of the folder with their records, oldest first. A job whose
+        record cannot be read now, or whose record's state cannot be known
+        through the share, is not known in this round (:attr:`_unknown`), never
+        taken for no job, and is read again in the next."""
+        found, self._unknown = [], set()
         names = sorted(results.retry_transient(lambda: os.listdir(self.jobs)))
         for name in names:
             folder = self.jobs / name
-            if name.startswith(".") or not (folder / JOB).is_file():
+            if name.startswith("."):
                 continue
-            if name not in self._records:
-                try:
+            try:
+                if name not in self._records:
+                    if not results.exists(folder / JOB):
+                        continue
                     self._records[name] = read_job(folder)
-                except (OSError, ValueError) as error:
-                    say(f"The job {name} cannot be read now; trying again: {error}")
-                    continue
+            except (OSError, ValueError) as error:
+                self._unknown.add(name)
+                say(f"The job {name} cannot be read now; trying again: {error}")
+                continue
             found.append((folder, self._records[name]))
         return found
 
@@ -401,7 +556,7 @@ class Service:
 
         A job's code revision is fixed at its creation; a service of another
         revision takes none of its tasks. A job whose tasks need more threads than
-        the host's capacity cannot start here.
+        the host has cannot start here.
 
         """
         if record["id"] in self.refused:
@@ -414,7 +569,7 @@ class Service:
         if self.threads and record["environment"]["threads"] > self.threads:
             return (
                 f"Its tasks need {record['environment']['threads']} threads; this "
-                f"host's capacity is {self.threads}."
+                f"host has {self.threads}."
             )
         return None
 
@@ -498,29 +653,54 @@ class Service:
         except (queue.Revoked, OSError) as error:
             say(f"Task {claim.task} could not be returned: {error}", log)
 
-    def _survivors(self, jobs: list[tuple[Path, dict]]) -> None:
-        """Count this host's claims whose process outlived an earlier service, and
-        return those whose process is gone (:func:`birth`) or never started (no
-        process in the lease), going on with the next claim."""
+    def _survivors(self, jobs: list[tuple[Path, dict]]) -> bool:
+        """Count this host's claims whose process outlived an earlier service,
+        reserving their threads and bytes, and return those whose process is gone
+        (:func:`birth`) or never started (no process in the lease), going on with
+        the next claim and the next job.
+
+        Returns
+        -------
+        bool
+            Whether every claim of every job was looked at: a job's claims that
+            cannot be listed now, or a lease that cannot be read now, leave the
+            count incomplete; a marker gone since the listing does not.
+
+        """
+        complete = True
         for job, record in jobs:
-            for task, token in queue.markers(job, queue.CLAIMED).items():
+            try:
+                claimed = queue.markers(job, queue.CLAIMED)
+            except OSError:
+                complete = False
+                continue
+            for task, token in claimed.items():
                 claim = queue.Claim(job, task, token, self.machine)
                 if claim.path in self.live:
                     continue
                 try:
                     lease = queue.lease(job, task, token)
+                except FileNotFoundError:
+                    continue  # Gone since the listing: not this host's to count.
                 except (OSError, ValueError):
-                    continue  # Gone, or unreadable now: never taken for dead.
+                    complete = False  # Unreadable now: never taken for dead.
+                    continue
                 if lease.get("machine") != self.machine:
                     continue
                 if alive(lease.get("pid"), lease.get("birth")):
                     threads = record["environment"]["threads"]
                     self.live[claim.path] = Live(
-                        claim, threads, None, lease["pid"], lease["birth"]
+                        claim,
+                        threads,
+                        None,
+                        lease["pid"],
+                        lease["birth"],
+                        _reserved(record, task),
                     )
                     say(f"Task {task} still runs in process {lease['pid']}", job / LOG)
                 else:
                     self._release(claim, job / LOG, "its process is gone")
+        return complete
 
     def _log(self, claim: queue.Claim) -> Path:
         """The local file of a task's output."""
@@ -556,27 +736,68 @@ class Service:
         finally:
             if output is not subprocess.DEVNULL:
                 output.close()
-        self.live[claim.path] = Live(claim, environment.threads, process)
+        need = _reserved(record, claim.task)
+        self.live[claim.path] = Live(claim, environment.threads, process, bytes=need)
         say(f"{self.machine} started task {claim.task}", job / LOG)
 
     def _admit(self, jobs: list[tuple[Path, dict]]) -> None:
-        """Start the oldest job's first ready task while the host's capacity
-        allows; a task whose process cannot start is returned, and the host takes
-        no more of its job's tasks."""
+        """Start ready tasks, the oldest job's first, while the host admits them
+        (:func:`admit`, with the free memory measured at each start).
+
+        A task that the host would admit with no live task waits, and so does
+        every task after it, so that the oldest job's tasks go first; one that it
+        would not admit even then is passed over, so that it holds up no other
+        task, and so is every later task of its job and step that declares at
+        least as much. A step passed over is said once, and again only after a
+        round that did not pass it over. What the live tasks' processes hold is
+        looked at once per round (:attr:`Live.held`). A task whose process cannot
+        start is returned, and the host takes no more of its job's tasks. Why the
+        host took no more tasks, a task waiting, a step passed over or a job
+        refused, is kept in :attr:`reason`.
+
+        """
+        self.reason = "No ready task waits."
+        passing, self._passed = self._passed, set()
         if not self._taking():
+            self.reason = f"It takes no new tasks: {self._idle}."
             return
-        used = sum(live.threads for live in self.live.values())
+        for live in self.live.values():
+            live.held = live.resident()
+        passed = refused = None
         for job, record in jobs:
             why = self._refusal(record)
             if why is not None:
                 self._refuse(job, record, why)
+                refused = refused or f"It takes no task of job {record['id']}: {why}"
                 continue
             threads = record["environment"]["threads"]
             if record["id"] not in self._tasks:
                 self._tasks[record["id"]] = queue.tasks(job)
+            smallest: dict[str, int] = {}
             for task in queue.ready(job, self._tasks[record["id"]]):
-                if used + threads > self.threads:
-                    return
+                need = _reserved(record, task.id)
+                if need >= smallest.get(task.step, need + 1):
+                    continue  # its step passed over a task that declares less
+                live = list(self.live.values())
+                free, kept = headroom(), reserve()
+                started, why = admit(
+                    need, threads, live, self.request, self.threads, free, kept
+                )
+                if not started:
+                    alone = free + sum(other.held for other in live)
+                    named = f"Task {task.id} of job {record['id']}"
+                    if admit(need, threads, (), AUTO, self.threads, alone, kept)[0]:
+                        self.reason = f"{named} waits: {why}."
+                        return
+                    smallest[task.step] = need
+                    unfit = f"{named} does not fit this host now: {why}."
+                    passed = passed or unfit
+                    step = (record["id"], task.step)
+                    if step not in passing:
+                        said = f"{self.machine} passes over step {step[1]}. {unfit}"
+                        say(said, job / LOG)
+                    self._passed.add(step)
+                    continue
                 claim = queue.claim(job, task.id, self.machine)
                 if claim is None:
                     continue
@@ -587,7 +808,7 @@ class Service:
                     self._release(claim, job / LOG, why)
                     self._refuse(job, record, why)
                     break
-                used += threads
+        self.reason = passed or refused or self.reason
 
     def _round(self, what: str, action: Callable[[], object]) -> object:
         """One part of a round; an error says why, and the part is tried again in
@@ -601,7 +822,8 @@ class Service:
     def poll(self) -> None:
         """One round of the service."""
         self._round("Noting the ended tasks", self._reap)
-        jobs = self._round("Reading the jobs folder", self._jobs) or []
+        jobs = self._round("Reading the jobs folder", self._jobs)
+        known, jobs = jobs is not None, jobs or []
         for job, record in jobs:
 
             def reclaim(job=job):
@@ -609,8 +831,26 @@ class Service:
                     say(f"Task {task} taken back: its lease went stale", job / LOG)
 
             self._round(f"Taking back the stale claims of {record['id']}", reclaim)
-        self._round("Counting this host's claims", lambda: self._survivors(jobs))
+        counted = self._round(
+            "Counting this host's claims", lambda: self._survivors(jobs)
+        )
+        if not known or counted is not True or self._unknown:
+            self._wait_for_count()
+            return
+        self._uncounted = None
         self._round("Starting ready tasks", lambda: self._admit(jobs))
+
+    def _wait_for_count(self) -> None:
+        """Take no new task in a round whose jobs or claims of this host could not
+        all be read: a survivor not counted would leave its threads and bytes
+        unreserved. Said once until a round counts them all."""
+        why = (
+            "Not every job or claim of this host can be read now; it takes no new "
+            "tasks until it has counted its live tasks."
+        )
+        if why != self._uncounted:
+            say(f"{self.machine}: {why}")
+        self.reason = self._uncounted = why
 
 
 def serve(
@@ -632,9 +872,9 @@ def serve(
     machine : str, optional
         This host's name in the leases; by default the host's network name.
     threads : int, optional
-        The host's capacity: threads its live tasks may use at once, shared by
-        every job of the folder, the oldest job first; 0 takes no new tasks; by
-        default the logical cores less one.
+        The host's threads: its live tasks' threads together are at most these,
+        shared by every job of the folder, the oldest job first; at most the
+        logical cores less one, which is the default; 0 takes no new tasks.
     lock : Path, optional
         A lock file instead of the machine's lock (:func:`host_lock`), e.g. a
         test's.
@@ -653,7 +893,8 @@ def serve(
 
     """
     machine = machine or socket.gethostname()
-    threads = threads if threads is not None else max(1, (os.cpu_count() or 2) - 1)
+    cores = max(1, (os.cpu_count() or 2) - 1)
+    threads = cores if threads is None else min(threads, cores)
     if logs is None:
         logs = Path(tempfile.gettempdir()) / "darsia-jobs" / "tasks"
     with host_lock(lock):
