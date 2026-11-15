@@ -371,16 +371,48 @@ def _rig(ctx: StepContext) -> None:
     ctx.publish(lambda folder: rig.save(Path(folder)))
 
 
+def corrected_photo(
+    rig: Rig, photo: Path
+) -> tuple[darsia.Image, darsia.ProjectiveRegistration | None]:
+    """A photo read through the rig's corrections, as the run's corrected images
+    are read: with the rig's registration, registered to the setup's reference.
+
+    Parameters
+    ----------
+    rig : Rig
+        The run's rig, its experiment loaded.
+    photo : Path
+        The photo.
+
+    Returns
+    -------
+    tuple
+        The corrected image, and its registration (None without the rig's).
+
+    """
+    if rig.registration is None:
+        return rig.read_image(photo), None
+    return rig.read_registered_image(photo)
+
+
 def _corrected_image(ctx: StepContext) -> None:
-    """The run's photos of the task read through the rig's corrections."""
+    """The run's photos of the task read through the rig's corrections; with the
+    rig's registration, each one registered to the setup's reference, its
+    homography stored beside it."""
     run = ctx.task.run
     rig = ctx.read("rig", read_rig)
     rig.load_experiment(make_experiment(run_settings(ctx, run, EXPERIMENT)))
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
-        image = rig.read_image(ctx.photo(run, frame))
-        ctx.publish(lambda folder: image.save(Path(folder) / "image.npz"), frame=frame)
+        image, found = corrected_photo(rig, ctx.photo(run, frame))
+
+        def write(folder, image=image, found=found):
+            image.save(Path(folder) / "image.npz")
+            if found is not None:
+                darsia.write_frame_registration(folder, found)
+
+        ctx.publish(write, frame=frame)
 
 
 def _drawing_files(tables: Mapping[str, Any], project, folders) -> list[str]:

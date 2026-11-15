@@ -10,10 +10,13 @@ import numpy as np
 from darsia.corrections.color.materialilluminationcorrection import (
     MaterialFitSettings,
 )
+from darsia.corrections.shape.cameralens import CameraLensSettings, CameraLensTables
+from darsia.corrections.shape.radiallens import RadialLensSettings
+from darsia.corrections.shape.registration import ProjectiveRegistrationSettings
 
 from ._key_list_sources import ROI_SOURCES
 from .roi_registry import _load_roi_key_list
-from .utils import _get_key, _get_section_from_toml
+from .utils import _get_key, _get_section_from_toml, settings_from_table
 
 if TYPE_CHECKING:
     from .roi_registry import RoiRegistry
@@ -524,6 +527,150 @@ class CropCorrectionConfig:
         self.in_meters = sec.get("in_meters", self.in_meters)
         if not isinstance(self.in_meters, bool):
             self.in_meters = bool(self.in_meters)
+        return self
+
+
+@dataclass
+class FrameRegistrationConfig:
+    """Configuration of the registration of each raw photograph onto the setup's
+    reference.
+
+    Every raw photograph, the baseline included, is registered by its camera view
+    (its sensor through its lens model on the camera grid) to the setup's reference
+    and sampled once from its sensor onto the reference's grid
+    (:func:`darsia.register_raw_frame`); the other corrections follow. The
+    reference is the baseline's camera view cropped to the run's rig points
+    (``crop``), registered from them, or without a crop the camera view itself.
+    It needs ``[corrections.raw]`` and replaces ``[corrections.mapping]``.
+    """
+
+    camera_shape: tuple[int, int] | None = field(
+        default=None,
+        metadata={
+            "name": "Camera grid",
+            "help": "Rows and columns of the camera grid the views are compared on.",
+            "placeholder": "e.g., 3080, 5472",
+        },
+    )
+    """Rows and columns of the camera grid."""
+    channel: int | None = field(
+        default=None,
+        metadata={
+            "name": "Registered channel",
+            "help": "The colour channel that is registered: 0 red, 1 green, 2 blue.",
+            "placeholder": "e.g., 1",
+        },
+    )
+    """The colour channel that is registered."""
+    crop: CropCorrectionConfig | None = field(
+        default=None,
+        metadata={
+            "name": "Rig points",
+            "help": (
+                "The run's four rig points in the camera grid and the rig's width "
+                "and height, in [corrections.registration.crop]: the reference is "
+                "the camera view cropped to them. Without it, the camera view."
+            ),
+        },
+    )
+    """The run's rig points and the physical size of the crop to them."""
+    camera_lens: CameraLensSettings | None = field(
+        default=None,
+        metadata={
+            "name": "Recorded lens tables",
+            "help": (
+                "Where the camera records its lens tables in each raw file and its "
+                "calibrated lens model, in [corrections.registration.camera_lens]."
+            ),
+            "hidden": True,
+        },
+    )
+    """The lens model of the tables recorded in each raw file, preferred."""
+    radial_lens: RadialLensSettings | None = field(
+        default=None,
+        metadata={
+            "name": "Configured lens model",
+            "help": (
+                "A radial lens model for raw files without recorded tables, in "
+                "[corrections.registration.radial_lens]."
+            ),
+            "hidden": True,
+        },
+    )
+    """A configured lens model, for raw files that record no tables."""
+    lens_tables: CameraLensTables | None = field(
+        default=None,
+        metadata={
+            "name": "Calibration tables",
+            "help": (
+                "The lens tables the recorded-table model was calibrated with "
+                "(distortion, red, blue); a baseline recording others is refused."
+            ),
+            "hidden": True,
+        },
+    )
+    """The lens tables of the calibration, which the baseline must record."""
+    settings: dict[str, ProjectiveRegistrationSettings] = field(
+        default_factory=dict,
+        metadata={
+            "name": "Registration settings",
+            "help": (
+                "One table of the registration's settings per grid size, in "
+                '[corrections.registration.settings."<rows>x<cols>"]; positions '
+                "and sizes are pixels of that grid."
+            ),
+            "hidden": True,
+        },
+    )
+    """The registration's settings for each grid size, by ``"<rows>x<cols>"``."""
+
+    @property
+    def lens(self) -> tuple:
+        """The configured lens models, the recorded tables first."""
+        return tuple(m for m in (self.camera_lens, self.radial_lens) if m is not None)
+
+    def load(self, sec: dict) -> "FrameRegistrationConfig":
+        """Load the registration from the [corrections.registration] table.
+
+        Parameters
+        ----------
+        sec : dict
+            The table's keys.
+
+        Returns
+        -------
+            Self with loaded configuration.
+        """
+        shape = _get_key(sec, "camera_shape", required=True, type_=list)
+        self.camera_shape = tuple(int(n) for n in shape)
+        self.channel = _get_key(sec, "channel", required=True, type_=int)
+        if "crop" in sec:
+            self.crop = CropCorrectionConfig().load(sec["crop"])
+        if "camera_lens" in sec:
+            self.camera_lens = settings_from_table(
+                CameraLensSettings, sec["camera_lens"]
+            )
+        if "radial_lens" in sec:
+            self.radial_lens = settings_from_table(
+                RadialLensSettings, sec["radial_lens"]
+            )
+        if not self.lens:
+            raise ValueError("corrections.registration requires a lens model.")
+        if "lens_tables" in sec:
+            if self.camera_lens is None:
+                raise ValueError(
+                    "corrections.registration.lens_tables are the tables of the "
+                    "camera_lens model, which is not configured."
+                )
+            tables = sec["lens_tables"]
+            self.lens_tables = CameraLensTables(
+                **{key: tuple(int(v) for v in tables[key]) for key in tables}
+            )
+        grids = _get_key(sec, "settings", required=True, type_=dict)
+        self.settings = {
+            str(grid): settings_from_table(ProjectiveRegistrationSettings, table)
+            for grid, table in grids.items()
+        }
         return self
 
 
@@ -1623,6 +1770,7 @@ _CORRECTION_CLASSES: dict[str, type] = {
     "type": TypeCorrectionConfig,
     "resize": ResizeCorrectionConfig,
     "mapping": ImageMappingCorrectionConfig,
+    "registration": FrameRegistrationConfig,
     "drift": DriftCorrectionConfig,
     "curvature": CurvatureCorrectionConfig,
     "color": ColorCorrectionConfig,
@@ -1673,6 +1821,9 @@ class CorrectionsConfig:
     mapping
         ImageMappingCorrectionConfig for an image mapping (default: None).
         Samples images onto a target grid at stored coordinates.
+    registration
+        FrameRegistrationConfig for the registration of each raw photograph onto
+        the setup's reference (default: None), in place of a stored mapping.
     drift
         DriftCorrectionConfig for drift correction (default: None).
         Corrects color drift based on color checker position.
@@ -1714,6 +1865,10 @@ class CorrectionsConfig:
     mapping: ImageMappingCorrectionConfig | None = field(
         default=None,
         metadata={"name": "Image mapping correction", "active_list_key": "active"},
+    )
+    registration: FrameRegistrationConfig | None = field(
+        default=None,
+        metadata={"name": "Frame registration", "active_list_key": "active"},
     )
     drift: DriftCorrectionConfig | None = field(
         default=None, metadata={"name": "Drift correction", "active_list_key": "active"}

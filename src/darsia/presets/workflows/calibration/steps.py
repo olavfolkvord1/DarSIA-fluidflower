@@ -67,6 +67,7 @@ from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
+    corrected_photo,
     grid_mask,
     protocol_files,
     read_image,
@@ -705,7 +706,7 @@ class _Probabilities(Sequence):
         )
         if previous is None:
             return None
-        return self.rig.read_image(previous).img
+        return corrected_photo(self.rig, previous)[0].img
 
     def _probabilities(self, index: int):
         return darsia.phase_probabilities(
