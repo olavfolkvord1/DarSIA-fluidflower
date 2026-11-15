@@ -488,8 +488,8 @@ def grid_positions(
             (dy * 1000, dx * 1000),
         )
     dtype = np.dtype(dtype or np.float64)
-    x, y = darsia.project_xy(
-        np.asarray(grid_to_rig, dtype),
+    x, y = _measured(
+        grid_to_rig,
         np.arange(cols, dtype=dtype)[None, :],
         np.arange(rows, dtype=dtype)[:, None],
     )
@@ -509,16 +509,67 @@ def _canvas_pitch(
     if not canvas.holds(rows, cols):
         raise ValueError("The measurement canvas does not hold the grid")
     (left, top), (height, width) = canvas.origin, canvas.shape
-    model = np.asarray(grid_to_rig, dtype)
     every_row = np.arange(top, top + height, stride, dtype=dtype)[:, None]
     all_cols = np.arange(left, left + width, dtype=dtype)[None, :]
     every_col = np.arange(left, left + width, stride, dtype=dtype)[None, :]
     all_rows = np.arange(top, top + height, dtype=dtype)[:, None]
-    x = darsia.project_xy(model, all_cols, every_row)[0]
-    y = darsia.project_xy(model, every_col, all_rows)[1]
+    x = _measured(grid_to_rig, all_cols, every_row)[0]
+    y = _measured(grid_to_rig, every_col, all_rows)[1]
     dx = float(np.median(np.abs(np.diff(x, axis=1)))) * 1000
     dy = float(np.median(np.abs(np.diff(y, axis=0)))) * 1000
     return dy, dx
+
+
+def _measured(grid_to_rig, columns: np.ndarray, rows: np.ndarray):
+    """Positions on the rig of pixels by a measured model, at their column and row
+    in the dtype of those (:func:`grid_positions`)."""
+    return darsia.project_xy(np.asarray(grid_to_rig, columns.dtype), columns, rows)
+
+
+def grid_corners(
+    image: darsia.Image,
+    grid_to_rig: np.ndarray | list | None = None,
+    dtype: np.dtype | type | str | None = None,
+    canvas: MeasurementCanvas | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The positions on the rig of the four corner pixels of the canvas a grid's
+    pixels were measured on (by default the grid), by the rule of
+    :func:`grid_positions`, without placing the others.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        A 2d image on the grid.
+    grid_to_rig : array, optional
+        The run's measured model of its grid.
+    dtype : numpy dtype, optional
+        Floating precision of the model's positions, as for :func:`grid_positions`.
+    canvas : MeasurementCanvas, optional
+        The canvas the run's pixels were measured on, with a model.
+
+    Returns
+    -------
+    tuple of arrays
+        x and y [m] of the top left, top right, bottom left and bottom right pixel.
+
+    Raises
+    ------
+    ValueError
+        If the canvas does not hold the grid.
+
+    """
+    rows, cols = image.img.shape[:2]
+    if grid_to_rig is None:
+        x, y = pixel_centres(image)
+        return x[[0, -1, 0, -1]], y[[0, 0, -1, -1]]
+    dtype = np.dtype(dtype or np.float64)
+    canvas = canvas or MeasurementCanvas((0, 0), (rows, cols))
+    if not canvas.holds(rows, cols):
+        raise ValueError("The measurement canvas does not hold the grid")
+    (left, top), (height, width) = canvas.origin, canvas.shape
+    right, bottom = left + width - 1, top + height - 1
+    columns = np.array([left, right, left, right], dtype)
+    return _measured(grid_to_rig, columns, np.array([top, top, bottom, bottom], dtype))
 
 
 def grid_record(image: darsia.Image) -> dict:

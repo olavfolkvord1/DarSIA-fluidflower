@@ -59,6 +59,7 @@ from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
     protocol_files,
+    read_grid_model,
     read_rig,
     run_settings,
 )
@@ -228,6 +229,21 @@ def _distances(ctx: StepContext) -> None:
     run = distances.reference_run
     grid = run_grid(ctx.read("rig", read_rig, run=run), material)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
+    # With measured models, the cells cover the measured corners of every compared
+    # run's measurement canvas.
+    models = {r: ctx.read("rig", read_grid_model, run=r) for r in ctx.selection.frames}
+    extent = None
+    if any(model is not None for model, _ in models.values()):
+        if settings.extent_edge_mm is None:
+            raise ValueError("Measured models need [wasserstein] extent_edge_mm")
+        dtype = grid.rig.pixel_area.img.dtype
+        corners = [
+            darsia.grid_corners(grid.rig.labels, model, dtype, canvas)
+            for model, canvas in models.values()
+        ]
+        extent = darsia.measured_extent(
+            corners, settings.cell_mm, settings.extent_edge_mm
+        )
     reference = wasserstein_reference(
         grid.rig.labels,
         grid.rig.permeability.img,
@@ -236,6 +252,8 @@ def _distances(ctx: StepContext) -> None:
         distances.chart_labels,
         domains,
         settings,
+        grid.positions,
+        extent,
     )
     scales = distance_scales(
         time_h,
@@ -270,6 +288,7 @@ def _distances(ctx: StepContext) -> None:
             grid.geometry,
             reference,
             settings,
+            grid.positions,
         )
     found = wasserstein_distances(time_h, frames, reference, scales, settings)
     rows = [asdict(distance) for distance in found]
