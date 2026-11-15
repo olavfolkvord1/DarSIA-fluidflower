@@ -11,8 +11,10 @@ From the tables of :func:`ensemble_tables` (:func:`ensemble_figures`):
   in mm of the grid (:func:`trajectory_figure`).
 
 Each figure is written as ``<name>.png`` with its title and ``<name>_notitle.png``
-without (:func:`save_figure`). Text is in English, one measure per axis. Runs are
-drawn thin in a quiet grey and the ensemble in the first series colour.
+without (:func:`save_figure`). Text is in English, one measure per axis. Colours,
+resolution and the time-axis rule are the shared figure style
+(:class:`~darsia.presets.workflows.media.style.FigureStyle`): runs are drawn thin
+in its muted colour and the ensemble in its series colour.
 
 """
 
@@ -38,38 +40,32 @@ from darsia.presets.workflows.comparison.ensemble import (
     EnsembleRun,
     EnsembleSettings,
 )
+from darsia.presets.workflows.media.style import FigureStyle
 
-DPI = 150
-SURFACE, INK, SECONDARY, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
-GRID, AXIS, WASHES = "#e1e0d9", "#c3c2b7", ("#ebeae4", "#dcdcd4")
-"""Grid and axis lines, and the two tones that shade neighbouring injections."""
-SERIES = "#2a78d6"
-"""The ensemble's colour."""
-LOG_SPAN = 50.0
-"""A time axis spanning more than this many times its first positive time is
-drawn logarithmic."""
 COMPONENT_LABELS = dict(total="Total CO2", aqueous="Dissolved CO2", gas="Free gas")
 """Names of the components in the figures."""
 
 
-def _figure(size_in: tuple[float, float]) -> Figure:
+def _figure(size_in: tuple[float, float], style: FigureStyle) -> Figure:
     """A figure on its own Agg canvas, without pyplot."""
-    figure = Figure(figsize=size_in, dpi=DPI, layout="constrained", facecolor=SURFACE)
+    figure = Figure(
+        figsize=size_in, dpi=style.dpi, layout="constrained", facecolor=style.surface
+    )
     FigureCanvasAgg(figure)
     return figure
 
 
-def _style(axis) -> None:
+def _style(axis, style: FigureStyle) -> None:
     """Recessive axes: hairline grid, muted spines and ticks, text in ink."""
-    axis.set_facecolor(SURFACE)
-    axis.grid(True, color=GRID, linewidth=0.6, linestyle="-")
+    axis.set_facecolor(style.surface)
+    axis.grid(True, color=style.grid, linewidth=0.6, linestyle="-")
     axis.set_axisbelow(True)
     for side, spine in axis.spines.items():
         spine.set_visible(side in ("left", "bottom"))
-        spine.set_color(AXIS)
-    axis.tick_params(colors=SECONDARY, labelcolor=INK, labelsize=8)
-    axis.xaxis.label.set_color(INK)
-    axis.yaxis.label.set_color(INK)
+        spine.set_color(style.axis)
+    axis.tick_params(colors=style.secondary, labelcolor=style.ink, labelsize=8)
+    axis.xaxis.label.set_color(style.ink)
+    axis.yaxis.label.set_color(style.ink)
 
 
 def _numbers(values) -> np.ndarray:
@@ -82,8 +78,11 @@ def _stem(text: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "-", str(text)).strip("-").lower() or "domain"
 
 
-def save_figure(figure: Figure, title: str, folder: Path, stem: str) -> list[str]:
-    """Write a figure as ``<stem>_notitle.png`` and, with its title, ``<stem>.png``.
+def save_figure(
+    figure: Figure, title: str, folder: Path, stem: str, style: FigureStyle
+) -> list[str]:
+    """Write a figure as ``<stem>_notitle.png`` and, with its title, ``<stem>.png``,
+    at the style's resolution.
 
     Returns
     -------
@@ -92,18 +91,20 @@ def save_figure(figure: Figure, title: str, folder: Path, stem: str) -> list[str
 
     """
     folder = Path(folder)
-    options = dict(dpi=DPI, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.15)
+    options = dict(
+        dpi=style.dpi, facecolor=style.surface, bbox_inches="tight", pad_inches=0.15
+    )
     figure.savefig(folder / f"{stem}_notitle.png", **options)
     figure.suptitle(title, fontsize=10)
     figure.savefig(folder / f"{stem}.png", **options)
     return [f"{stem}.png", f"{stem}_notitle.png"]
 
 
-def time_scale(times: np.ndarray) -> str:
-    """ "log" where the positive times span more than :data:`LOG_SPAN` times their
+def time_scale(times: np.ndarray, log_span: float) -> str:
+    """ "log" where the positive times span more than ``log_span`` times their
     smallest, else "linear"."""
     values = times[np.isfinite(times) & (times > 0)]
-    return "log" if values.size and values.max() / values.min() > LOG_SPAN else "linear"
+    return "log" if values.size and values.max() / values.min() > log_span else "linear"
 
 
 def _plain_log_ticks(axis, times: np.ndarray) -> None:
@@ -136,7 +137,9 @@ def injection_spans(runs: Sequence[EnsembleRun]) -> list[tuple[str, float, float
     ]
 
 
-def mass_figure(curves, band, spans, domain_label: str, component_label: str):
+def mass_figure(
+    curves, band, spans, domain_label: str, component_label: str, style: FigureStyle
+):
     """Every run's mass thin, the median bold in its interquartile band, and the
     coefficient of variation in a panel below.
 
@@ -150,6 +153,8 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
         The injections as (label, start, end) hours, shaded in both panels.
     domain_label, component_label : str
         Names of the domain and component.
+    style : FigureStyle
+        Colours, resolution and the time-axis rule.
 
     Returns
     -------
@@ -158,34 +163,40 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
         (:func:`time_scale`) leaves out the times at or before zero.
 
     """
-    figure = _figure((9.0, 5.8))
+    figure = _figure((9.0, 5.8), style)
     grid = figure.add_gridspec(2, 1, height_ratios=(3.3, 1.0))
     top = figure.add_subplot(grid[0])
     bottom = figure.add_subplot(grid[1], sharex=top)
     times = _numbers(row["time_h"] for row in band)
-    scale = time_scale(times)
+    scale = time_scale(times, style.log_span)
     shown = times > 0 if scale == "log" else np.isfinite(times)
     for axis in (top, bottom):
-        _style(axis)
+        _style(axis, style)
         axis.set_xscale(scale)
         for number, (_, start, end) in enumerate(spans):
             if scale == "log" and shown.any():
                 start = max(start, float(np.nanmin(times[shown])))
             if end > start:
                 axis.axvspan(
-                    start, end, color=WASHES[number % 2], linewidth=0, zorder=0
+                    start,
+                    end,
+                    color=style.washes[number % 2],
+                    linewidth=0,
+                    zorder=0,
                 )
     place = blended_transform_factory(top.transData, top.transAxes)
     for label, start, end in spans:
         log = scale == "log" and start > 0
         middle = math.sqrt(max(start, 1e-9) * end) if log else (start + end) / 2
         name = label.replace("Injection ", "I")
-        text = dict(ha="center", va="top", fontsize=7, color=SECONDARY)
+        text = dict(ha="center", va="top", fontsize=7, color=style.secondary)
         top.text(middle, 0.99, name, transform=place, **text)
     for points in curves.values():
         x, y = _numbers(p[0] for p in points), _numbers(p[1] for p in points)
         keep = (x > 0) if scale == "log" else np.isfinite(x)
-        top.plot(x[keep], y[keep], color=MUTED, linewidth=0.7, alpha=0.55, zorder=2)
+        top.plot(
+            x[keep], y[keep], color=style.muted, linewidth=0.7, alpha=0.55, zorder=2
+        )
     median, q25, q75 = (
         _numbers(row[k] for row in band) for k in ("median", "q25", "q75")
     )
@@ -193,7 +204,7 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
         times[shown],
         q25[shown],
         q75[shown],
-        color=SERIES,
+        color=style.series,
         alpha=0.16,
         linewidth=0,
         zorder=3,
@@ -201,7 +212,7 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
     top.plot(
         times[shown],
         median[shown],
-        color=SERIES,
+        color=style.series,
         linewidth=2.0,
         solid_capstyle="round",
         zorder=4,
@@ -209,7 +220,7 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
     top.set_ylabel(f"{component_label} mass (g)")
     top.tick_params(labelbottom=False)
     cv = _numbers(None if row["cv"] is None else 100.0 * row["cv"] for row in band)
-    bottom.plot(times[shown], cv[shown], color=SECONDARY, linewidth=1.5, zorder=3)
+    bottom.plot(times[shown], cv[shown], color=style.secondary, linewidth=1.5, zorder=3)
     bottom.set_ylim(bottom=0)
     bottom.set_ylabel("CV (%)")
     bottom.set_xlabel(
@@ -219,15 +230,19 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
         _plain_log_ticks(bottom, times)
     handles = [
         Line2D(
-            [], [], color=MUTED, linewidth=0.9, label=f"Each run (n = {len(curves)})"
+            [],
+            [],
+            color=style.muted,
+            linewidth=0.9,
+            label=f"Each run (n = {len(curves)})",
         ),
-        Line2D([], [], color=SERIES, linewidth=2.0, label="Median"),
-        Patch(facecolor=SERIES, alpha=0.16, label="Interquartile range"),
+        Line2D([], [], color=style.series, linewidth=2.0, label="Median"),
+        Patch(facecolor=style.series, alpha=0.16, label="Interquartile range"),
     ]
     if spans:
         names = ", ".join(label.replace("Injection ", "I") for label, _, _ in spans)
         label = f"Injections {names} (median start to end)"
-        handles.append(Patch(facecolor=WASHES[0], label=label))
+        handles.append(Patch(facecolor=style.washes[0], label=label))
     figure.legend(
         handles=handles,
         loc="outside lower center",
@@ -238,7 +253,7 @@ def mass_figure(curves, band, spans, domain_label: str, component_label: str):
     return figure, f"{domain_label} · {component_label}: mass across runs"
 
 
-def fraction_figure(rows, component_label: str):
+def fraction_figure(rows, component_label: str, style: FigureStyle):
     """Each run's fraction of the injected reference at each mark, and the median.
 
     Parameters
@@ -248,6 +263,8 @@ def fraction_figure(rows, component_label: str):
         column, in the order of the rows.
     component_label : str
         Name of the component.
+    style : FigureStyle
+        Colours and resolution.
 
     Returns
     -------
@@ -262,11 +279,11 @@ def fraction_figure(rows, component_label: str):
         if row["fraction_of_injected"] is not None:
             column = tuple(row[k] for k in keys)
             values[column].append(100.0 * row["fraction_of_injected"])
-    figure = _figure((max(5.5, 1.05 * len(columns) + 2.0), 4.6))
+    figure = _figure((max(5.5, 1.05 * len(columns) + 2.0), 4.6), style)
     axis = figure.subplots()
-    _style(axis)
+    _style(axis, style)
     axis.grid(False, axis="x")
-    axis.axhline(100.0, color=MUTED, linewidth=0.9, zorder=1)
+    axis.axhline(100.0, color=style.muted, linewidth=0.9, zorder=1)
     for position, column in enumerate(columns):
         points = np.asarray(values[column], np.float64)
         if points.size == 0:
@@ -276,16 +293,16 @@ def fraction_figure(rows, component_label: str):
             position + offsets,
             points,
             s=22,
-            color=SERIES,
+            color=style.series,
             alpha=0.8,
-            edgecolors=SURFACE,
+            edgecolors=style.surface,
             linewidths=0.8,
             zorder=3,
         )
         axis.plot(
             [position - 0.28, position + 0.28],
             [np.median(points)] * 2,
-            color=INK,
+            color=style.ink,
             linewidth=2.0,
             solid_capstyle="round",
             zorder=4,
@@ -298,9 +315,9 @@ def fraction_figure(rows, component_label: str):
     axis.set_xlim(-0.6, len(columns) - 0.4)
     axis.set_ylabel("Detected mass / injected (%)")
     handles = [
-        Line2D([], [], marker="o", linestyle="", color=SERIES, label="Each run"),
-        Line2D([], [], color=INK, linewidth=2.0, label="Median"),
-        Line2D([], [], color=MUTED, linewidth=0.9, label="100 % of injected"),
+        Line2D([], [], marker="o", linestyle="", color=style.series, label="Each run"),
+        Line2D([], [], color=style.ink, linewidth=2.0, label="Median"),
+        Line2D([], [], color=style.muted, linewidth=0.9, label="100 % of injected"),
     ]
     figure.legend(
         handles=handles, loc="outside lower center", ncol=3, frameon=False, fontsize=8
@@ -309,7 +326,9 @@ def fraction_figure(rows, component_label: str):
     return figure, title
 
 
-def trajectory_figure(paths, mean, domain_label: str, component_label: str):
+def trajectory_figure(
+    paths, mean, domain_label: str, component_label: str, style: FigureStyle
+):
     """The centre of mass over time: each run's path thin, the mean path bold.
 
     Parameters
@@ -320,6 +339,8 @@ def trajectory_figure(paths, mean, domain_label: str, component_label: str):
         The ensemble's mean centre (hours, x, y) per time.
     domain_label, component_label : str
         Names of the domain and component.
+    style : FigureStyle
+        Colours and resolution.
 
     Returns
     -------
@@ -327,41 +348,49 @@ def trajectory_figure(paths, mean, domain_label: str, component_label: str):
         The figure, without title, and its title.
 
     """
-    figure = _figure((7.2, 5.6))
+    figure = _figure((7.2, 5.6), style)
     axis = figure.subplots()
-    _style(axis)
+    _style(axis, style)
     for points in paths.values():
         points = sorted((p for p in points if p[0] is not None), key=lambda p: p[0])
         x, y = _numbers(p[1] for p in points), _numbers(p[2] for p in points)
-        axis.plot(x, y, color=MUTED, linewidth=0.8, alpha=0.6, zorder=2)
+        axis.plot(x, y, color=style.muted, linewidth=0.8, alpha=0.6, zorder=2)
         if x.size:
-            axis.scatter(x[-1:], y[-1:], s=10, color=MUTED, zorder=2)
+            axis.scatter(x[-1:], y[-1:], s=10, color=style.muted, zorder=2)
     mean = sorted(mean, key=lambda p: p[0])
     x, y = _numbers(p[1] for p in mean), _numbers(p[2] for p in mean)
-    axis.plot(x, y, color=SERIES, linewidth=2.2, solid_joinstyle="round", zorder=4)
+    axis.plot(
+        x, y, color=style.series, linewidth=2.2, solid_joinstyle="round", zorder=4
+    )
     if x.size:
-        first = dict(s=64, facecolors=SURFACE, edgecolors=SERIES, linewidths=2.0)
+        first = dict(
+            s=64, facecolors=style.surface, edgecolors=style.series, linewidths=2.0
+        )
         axis.scatter(x[:1], y[:1], zorder=5, **first)
-        last = dict(s=64, color=SERIES, edgecolors=SURFACE, linewidths=2.0)
+        last = dict(s=64, color=style.series, edgecolors=style.surface, linewidths=2.0)
         axis.scatter(x[-1:], y[-1:], zorder=5, **last)
     axis.set_aspect("equal", adjustable="datalim")
     axis.set_xlabel("x (mm)")
     axis.set_ylabel("y (mm)")
     handles = [
         Line2D(
-            [], [], color=MUTED, linewidth=0.9, label=f"Each run (n = {len(paths)})"
+            [],
+            [],
+            color=style.muted,
+            linewidth=0.9,
+            label=f"Each run (n = {len(paths)})",
         ),
-        Line2D([], [], color=SERIES, linewidth=2.2, label="Ensemble mean"),
+        Line2D([], [], color=style.series, linewidth=2.2, label="Ensemble mean"),
         Line2D(
             [],
             [],
             marker="o",
             linestyle="",
-            markerfacecolor=SURFACE,
-            color=SERIES,
+            markerfacecolor=style.surface,
+            color=style.series,
             label="First time",
         ),
-        Line2D([], [], marker="o", linestyle="", color=SERIES, label="Last time"),
+        Line2D([], [], marker="o", linestyle="", color=style.series, label="Last time"),
     ]
     figure.legend(
         handles=handles, loc="outside lower center", ncol=4, frameon=False, fontsize=8
@@ -386,6 +415,7 @@ def ensemble_figures(
     tables: Mapping[str, list[dict]],
     runs: Sequence[EnsembleRun],
     settings: EnsembleSettings,
+    style: FigureStyle,
 ) -> list[str]:
     """Write the ensemble's figures of its tables.
 
@@ -399,6 +429,8 @@ def ensemble_figures(
         The runs, whose injections the mass figures shade.
     settings : EnsembleSettings
         The component of the trajectory figures.
+    style : FigureStyle
+        Colours, resolution and the time-axis rule of the figures.
 
     Returns
     -------
@@ -437,9 +469,9 @@ def ensemble_figures(
                 and row["quantity"] == "mass_g"
             ]
             label = COMPONENT_LABELS[component]
-            figure, title = mass_figure(curves, band, spans, name, label)
+            figure, title = mass_figure(curves, band, spans, name, label, style)
             files += save_figure(
-                figure, title, folder, f"mass_{_stem(name)}_{component}"
+                figure, title, folder, f"mass_{_stem(name)}_{component}", style
             )
     for component in COMPONENTS:
         rows = [
@@ -448,8 +480,9 @@ def ensemble_figures(
             if row["component"] == component and row["mark"] != PEAK
         ]
         if any(row["fraction_of_injected"] is not None for row in rows):
-            figure, title = fraction_figure(rows, COMPONENT_LABELS[component])
-            files += save_figure(figure, title, folder, f"fractions_{component}")
+            label = COMPONENT_LABELS[component]
+            figure, title = fraction_figure(rows, label, style)
+            files += save_figure(figure, title, folder, f"fractions_{component}", style)
     component = settings.centre_component
     centres = [row for row in tables["centres_long"] if row["component"] == component]
     for domain, name in dict.fromkeys(
@@ -466,8 +499,8 @@ def ensemble_figures(
             if (row["domain"], row["component"]) == (domain, component)
         ]
         label = COMPONENT_LABELS[component]
-        figure, title = trajectory_figure(paths, mean, name, label)
+        figure, title = trajectory_figure(paths, mean, name, label, style)
         files += save_figure(
-            figure, title, folder, f"trajectory_{_stem(name)}_{component}"
+            figure, title, folder, f"trajectory_{_stem(name)}_{component}", style
         )
     return files
