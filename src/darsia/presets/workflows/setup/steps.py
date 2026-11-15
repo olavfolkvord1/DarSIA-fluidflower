@@ -6,7 +6,9 @@ folder, baseline, protocols and sand-map adjustment. The rig is the official one
 (:func:`darsia.presets.workflows.setup.setup_rig.make_rig`), with the run's sand
 map as its labels and the facies of those labels
 (:func:`darsia.presets.workflows.setup.setup_facies.make_facies`); each corrected
-image is a photo read through the rig's corrections, once per Setup.
+image is a photo read through the rig's corrections, once per Setup. A run whose
+``[depth] interpolation`` is ``"triangulation"`` takes its depth from the rule
+evaluated on its own grid (:func:`grid_depth`), as our production's mass did.
 
 A step records the configuration sections it reads through the run's official
 configuration (:attr:`darsia.jobs.step.Step.sections`) and the content of the
@@ -25,6 +27,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import numpy as np
+import pandas as pd
 import toml
 
 import darsia
@@ -44,6 +48,9 @@ from darsia.utils.locations import normal_path
 
 EXPERIMENT = ("data", "protocols")
 """The sections of a run's experiment: its photos and protocols."""
+DEPTH = "depth"
+"""The column of the measured depths in the depth measurements' table, as the
+official depth setup reads it."""
 
 
 def _file(value: Any) -> str:
@@ -161,14 +168,56 @@ def _sand_map(ctx: StepContext) -> None:
     ctx.publish(lambda folder: labels.save(Path(folder) / "labels.npz"))
 
 
+def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
+    """A rig's depth by the depth rule of its measurements: linear inside their
+    hull and the nearest one outside (:func:`darsia.interpolate_linear_in_hull`),
+    at the pixel centres of the rig's grid (:func:`darsia.pixel_centres`, in
+    metres, cast to the grid's precision) and in that precision, the precision of
+    its pixel areas, as our production's mass evaluated it on its run grid.
+
+    Parameters
+    ----------
+    rig : Rig
+        The rig, on its run grid.
+    measurements : Path
+        The depth measurements' table: ``x``, ``y`` [m] and :data:`DEPTH`.
+
+    Returns
+    -------
+    darsia.Image
+        The depth [m] of each pixel, on the rig's grid.
+
+    """
+    table = pd.read_csv(measurements)
+    columns = ["x" if "x" in table else "X", "y" if "y" in table else "Y", DEPTH]
+    x, y = darsia.pixel_centres(rig.baseline)
+    xx, yy = np.meshgrid(x, y)
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    values, _ = darsia.interpolate_linear_in_hull(
+        tuple(table[c].to_numpy() for c in columns),
+        points.astype(rig.pixel_area.img.dtype),
+    )
+    return darsia.ScalarImage(
+        values.reshape(xx.shape),
+        dimensions=rig.baseline.dimensions,
+        origin=rig.baseline.origin,
+    )
+
+
 def _rig(ctx: StepContext) -> None:
-    """The run's rig, with its sand map as the labels and their facies."""
+    """The run's rig, with its sand map as the labels and their facies, and with
+    the depth rule evaluated on its grid where the run's configuration chooses it."""
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
     config = run_settings(ctx, ctx.task.run, list_required_sections(setup_rig))
     with TemporaryDirectory() as folder:
         facies = Path(folder) / "facies.npz"
         make_facies(config, darsia.imread(labels)).save(facies)
-        rig = make_rig(Rig, config, labels=labels, facies=facies)
+        # A depth rule evaluated on the grid needs no depth map.
+        rule = config.depth.interpolation == "triangulation"
+        rig = make_rig(Rig, config, labels=labels, facies=facies, depth=not rule)
+    if rule:
+        rig.depth = grid_depth(rig, Path(config.depth.measurements))
+        rig.setup_geometry()
     ctx.publish(lambda folder: rig.save(Path(folder)))
 
 
@@ -191,18 +240,24 @@ def _drawing_files(tables: Mapping[str, Any], project, folders) -> list[str]:
 
 
 def _rig_files(tables: Mapping[str, Any], project, folders) -> list[str]:
-    """The run's protocols and the facies' properties."""
-    props = tables.get("facies", {}).get("props")
+    """The run's protocols, the facies' properties and the depth measurements of
+    a depth rule evaluated on the run's grid."""
+    depth = tables.get("depth", {})
+    named = [tables.get("facies", {}).get("props")]
+    if str(depth.get("interpolation", "")).lower() == "triangulation":
+        named.append(depth.get("measurements"))
     found = protocol_files(tables, project, folders)
-    return found + ([str(props)] if props is not None else [])
+    return found + [str(path) for path in named if path is not None]
 
 
 def _rig_stamped(tables: Mapping[str, Any], project, folders) -> list[str]:
     """The rig's depth map, as its depth configuration names it (the depth
-    setup's map in the results folder by default), and its image mapping."""
+    setup's map in the results folder by default), unless its depth rule is
+    evaluated on the run's grid, and its image mapping."""
     mapping = tables.get("corrections", {}).get("mapping") or {}
     found = [mapping.get("path")]
-    if "depth" in tables:
+    rule = str(tables.get("depth", {}).get("interpolation", "")).lower()
+    if "depth" in tables and rule != "triangulation":
         results = tables.get("data", {}).get("results")
         with TemporaryDirectory() as folder:
             path = Path(folder) / "depth.toml"

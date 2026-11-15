@@ -71,6 +71,7 @@ def make_rig(
     log: Path | None = None,
     show: bool = False,
     facies: Path | None = None,
+    depth: bool = True,
 ) -> Rig:
     """Set up a rig from its configuration, without storing it.
 
@@ -91,6 +92,10 @@ def make_rig(
         Whether to show intermediate results.
     facies : Path, optional
         The facies file of those labels; by default ``[facies] path``.
+    depth : bool
+        Whether the rig reads its depth map (``[depth] depth_map``); without, its
+        depth and geometry are the caller's to set, e.g. by a depth rule evaluated
+        on the rig's grid.
 
     Returns
     -------
@@ -136,7 +141,7 @@ def make_rig(
     rig.setup(
         experiment=experiment,
         baseline_path=baseline_path,
-        depth_map_path=config.depth.depth_map,
+        depth_map_path=config.depth.depth_map if depth else None,
         labels_path=labels if labels is not None else config.labeling.labels,
         facies_path=facies if facies is not None else config.facies.path,
         facies_props_path=config.facies.props,
