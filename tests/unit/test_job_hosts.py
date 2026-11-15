@@ -1,9 +1,12 @@
-"""Tests of the job engine on several hosts: admission by threads and memory, and
-the hosts' records and requests."""
+"""Tests of the job engine on several hosts: admission by threads and memory, the
+hosts' records and requests, and outages of the share."""
 
+import builtins
+import contextlib
 import errno
 import json
 import os
+import pathlib
 import socket
 import subprocess
 import sys
@@ -19,6 +22,7 @@ from darsia.jobs import queue, service
 from darsia.jobs.job import Sizes, create_job, read_job, task_bytes
 from darsia.jobs.step import Memory, Order, Scope, Selection, Step
 from darsia.utils import results
+from tests.unit.test_job_service import importable  # noqa: F401
 from tests.unit.test_jobs import no_share_wait  # noqa: F401
 from tests.unit.test_jobs import (
     NUMBERS,
@@ -27,6 +31,8 @@ from tests.unit.test_jobs import (
     _files,
     _numbers,
     _project,
+    _write,
+    read_values,
 )
 
 GIB = 2**30
@@ -49,6 +55,28 @@ def _step(name, grid):
 
 
 LIGHT, HEAVY = _step("light", 1.0), _step("heavy", 4.0)
+
+
+def _lingering(ctx):
+    """A number per frame, made once the project holds no file named "linger"."""
+    while (ctx.locations.project / "linger").exists():
+        time.sleep(0.1)
+    for frame in ctx.task.frames:
+        ctx.publish(lambda folder: _write(folder, value=1), frame=frame)
+
+
+LINGERING = Step("lingering", {}, Order.FRAMES, Memory(), _lingering)
+
+
+def _gathered(ctx):
+    """The values of a run's lingering frames."""
+    values = [ctx.read("lingering", read_values, frame=f) for f in ctx.task.frames]
+    ctx.publish(lambda folder: _write(folder, values=values))
+
+
+GATHERED = Step("gathered", {"lingering": Scope.OWN}, Order.RUN, Memory(), _gathered)
+STEPS = (LINGERING, GATHERED)
+"""The test steps a task process finds by their module."""
 
 
 class Process:
@@ -649,3 +677,371 @@ def test_the_request_command_refuses_what_is_no_request(tmp_path, capsys, value)
     assert jobs_main.main(["request", str(jobs), value, "--machine", "here"]) == 2
     assert f"or a number of tasks, not {value!r}" in capsys.readouterr().out
     assert not service.machine_files(jobs, "here")[1].exists()
+
+
+TASK = r"""
+import errno, os, pathlib, sys
+from darsia.utils import results
+results.BEAT, results.GRACE, results.RETRY_DELAYS = 0.2, 4.0, (0.05, 0.1, 0.2)
+from darsia.jobs import queue
+from darsia.jobs.__main__ import main
+flag, real = pathlib.Path(sys.argv[1]), open
+def out(kind, path):
+    try:
+        with real(flag, encoding="utf-8") as stream:
+            what, *roots = stream.read().split("|")
+    except OSError:
+        return False
+    return what == kind and any(os.fspath(path).startswith(r) for r in roots)
+def blind(call, kind="files"):
+    def blinded(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and out(kind, path):
+            if os.name == "nt":
+                raise OSError(errno.ENOENT, "The network path was not found", str(path), 53)
+            raise OSError(errno.EHOSTDOWN, "Host is down", str(path))
+        return call(path, *args, **kwargs)
+    return blinded
+queue.open = blind(real)
+os.stat, os.listdir = blind(os.stat), blind(os.listdir)
+pathlib.Path.read_bytes = blind(pathlib.Path.read_bytes)
+pathlib.Path.open = blind(pathlib.Path.open)
+results._move = blind(results._move, "renames")
+sys.exit(main(sys.argv[2:]))
+"""
+"""A task process with short guards (a beat of 0.2 s, a grace of 4 s) on a share
+that is out while its host's flag file exists: the file names what is out,
+``files|<root>|...`` (opening, reading, listing and looking at files under the
+roots, the claim's writes too) or ``renames|<root>|...`` (renaming from under
+them)."""
+
+
+@pytest.fixture
+def hosts(tmp_path, monkeypatch, importable):  # noqa: F811
+    """Task processes of the test's hosts (:data:`TASK`), the flag file of a host
+    being ``outage-<host>``; this process's services retry for 0.2 s and take a
+    claim back after 20 s, more than a task's grace and beat and the start of a
+    task process. Task processes still running at the end are ended."""
+    real, made = subprocess.Popen, []
+
+    def popen(command, **kwargs):
+        flag = tmp_path / f"outage-{command[command.index('--machine') + 1]}"
+        made.append(real([command[0], "-c", TASK, str(flag), *command[3:]], **kwargs))
+        return made[-1]
+
+    processes = SimpleNamespace(
+        Popen=popen, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT
+    )
+    monkeypatch.setattr(service, "subprocess", processes)
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05, 0.1, 0.2))
+    monkeypatch.setattr(results, "STALE", 20.0)
+    yield tmp_path
+    for process in made:
+        if process.poll() is None:
+            for child in psutil.Process(process.pid).children(recursive=True):
+                child.kill()
+            process.kill()
+            process.wait(30)
+
+
+@contextlib.contextmanager
+def _share_out(root):
+    """The share of ``root`` is out for this process: its files and folders give
+    the network's error."""
+    root = os.fspath(root)
+
+    def blind(call):
+        def blinded(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)):
+                if os.fspath(path).startswith(root):
+                    raise _network_error(path)
+            return call(path, *args, **kwargs)
+
+        return blinded
+
+    with pytest.MonkeyPatch.context() as patch:
+        for owner, name in (
+            (os, "listdir"),
+            (os, "stat"),
+            (builtins, "open"),
+            (pathlib.Path, "read_bytes"),
+        ):
+            patch.setattr(owner, name, blind(getattr(owner, name)))
+        yield
+
+
+def _until(condition, seconds=120.0):
+    """Wait until a condition holds, at most some seconds."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "the condition did not come"
+        time.sleep(0.1)
+
+
+def _lingering_job(root, jobs=None, steps=(LINGERING,)):
+    """A job of a frame that lingers while its project holds "linger", in a jobs
+    folder (by default the root's)."""
+    config, selection = _project(root)
+    one = Selection({"r2": selection.frames["r2"][:1]}, selection.sessions)
+    (root / "project" / "linger").touch()
+    return create_job(jobs or root / "jobs", steps, one, config)
+
+
+def _beat(job, task):
+    """The beat number of a task's lease, 0 when it is not claimed."""
+    claimed = queue.markers(job, queue.CLAIMED)
+    if task not in claimed:
+        return 0
+    return queue.lease(job, task, claimed[task]).get("beat", 0)
+
+
+def test_an_outage_shorter_than_grace_keeps_the_claim_and_the_capacity(hosts):
+    """The share is out for less than the grace, for a running task and for its
+    host's service: the task keeps its claim, no host takes it back, its service
+    keeps the task, its reservation and its request, and the task completes under
+    its claim. While the share is out, the queue's state is not known, never
+    empty."""
+    jobs, task = hosts / "jobs", "lingering.r2.0000"
+    job = _lingering_job(hosts)
+    one = service.Service(jobs, "one", 1, hosts / "logs")
+    other = service.Service(jobs, "other", 1, hosts / "logs")
+    service.write_request(jobs, "one", 1)
+    one.poll()
+    ((path, live),) = one.live.items()
+    _until(lambda: _beat(job, task) >= 3)
+    (hosts / "outage-one").write_text(f"files|{jobs}")
+    began = time.monotonic()
+    with _share_out(jobs):
+        one.poll()
+        with pytest.raises(results.Unavailable):
+            queue.accepted(job, task)
+    assert one.live == {path: live} and one.request == 1
+    while time.monotonic() - began < 2.0:  # less than the task's grace of 4 s
+        other.poll()
+        time.sleep(0.2)
+    beaten = _beat(job, task)
+    (hosts / "outage-one").unlink()
+    _until(lambda: _beat(job, task) > beaten)
+    other.poll()
+    (hosts / "project" / "linger").unlink()
+    assert live.process.wait(60) == 0
+    one.poll()
+    assert queue.accepted(job, task) == {live.claim.token}
+    assert not one.live and not one.exits and not other.live and one.held
+
+
+def test_an_outage_longer_than_grace_stops_the_task_and_it_is_taken_back_after_stale(
+    hosts,
+):
+    """The share is out for longer than the grace for a task and its host's
+    service: the task stops and says why; another host takes its claim back once
+    its lease is stale, and runs it. When the share is back, the first host frees
+    the task's reservation and counts no failure; the stopped owner's token is
+    never accepted."""
+    jobs, task = hosts / "jobs", "lingering.r2.0000"
+    job = _lingering_job(hosts)
+    one = service.Service(jobs, "one", 1, hosts / "logs")
+    other = service.Service(jobs, "other", 1, hosts / "logs")
+    service.write_request(jobs, "other", 0)
+    one.poll()
+    other.poll()
+    ((_, live),) = one.live.items()
+    _until(lambda: _beat(job, task) >= 2)
+    (hosts / "outage-one").write_text(f"files|{jobs}")
+    service.write_request(jobs, "other", "auto")
+    while not other.live:  # the first host sees nothing, the other takes it back
+        with _share_out(jobs):
+            one.poll()
+        other.poll()
+        time.sleep(0.2)
+    assert live.process.wait(60) == service.OUTAGE
+    output = (one.logs / job.name / f"{task}.{live.claim.token}.log").read_text()
+    assert "The share gave no answer within 4 s while" in output  # its lease or step
+    assert "this task stops" in output
+    with _share_out(jobs):
+        one.poll()
+    assert one.live  # its claim's state is not known yet
+    (hosts / "outage-one").unlink()
+    one.poll()
+    assert not one.live and not one.exits
+    ((_, taken),) = other.live.items()
+    (hosts / "project" / "linger").unlink()
+    assert taken.process.wait(60) == 0
+    other.poll()
+    accepted = queue.accepted(job, task)
+    assert accepted == {taken.claim.token} and live.claim.token not in accepted
+
+
+def test_a_paused_owner_returning_after_its_claim_was_taken_stays_revoked(hosts):
+    """A task process paused for longer than STALE, e.g. on a sleeping host, finds
+    its marker gone when it resumes: it stops, revoked, and commits nothing; the
+    host that took the claim back completes the task."""
+    jobs, task = hosts / "jobs", "lingering.r2.0000"
+    job = _lingering_job(hosts)
+    one = service.Service(jobs, "one", 1, hosts / "logs")
+    other = service.Service(jobs, "other", 1, hosts / "logs")
+    one.poll()
+    ((_, live),) = one.live.items()
+    _until(lambda: _beat(job, task) >= 2)
+    paused = psutil.Process(queue.lease(job, task, live.claim.token)["pid"])
+    paused.suspend()
+    try:
+        _until(lambda: other.poll() or other.live, 60)
+    finally:
+        paused.resume()
+    assert live.process.wait(60) == jobs_main.REVOKED
+    one.poll()
+    assert not one.live and not one.exits
+    ((_, taken),) = other.live.items()
+    (hosts / "project" / "linger").unlink()
+    assert taken.process.wait(60) == 0
+    other.poll()
+    assert queue.accepted(job, task) == {taken.claim.token}
+
+
+@pytest.mark.parametrize("ended", ["outage", "survivor"])
+def test_a_task_stopped_by_an_outage_is_returned_uncounted(tmp_path, ended):
+    """A task process that the share's outage stopped is returned to the queue by
+    its service once it sees the claim again, and counts as no unmarked exit; so
+    is a survivor of an earlier service, whose exit cannot be known."""
+    config, selection = _project(tmp_path)
+    one = Selection({"r2": selection.frames["r2"][:1]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), one, config)
+    running = service.Service(tmp_path / "jobs", "here", 0, tmp_path / "logs")
+    running.poll()
+    claim = queue.claim(job, "numbers.r2.0000", "here")
+    code = f"import os; os._exit({service.OUTAGE})"
+    process = subprocess.Popen([sys.executable, "-c", code])
+    assert process.wait(60) == service.OUTAGE
+    live = service.Live(claim, 1, process)
+    if ended == "survivor":
+        live = service.Live(claim, 1, None, process.pid, 1.0)
+    running.live[claim.path] = live
+    running.poll()
+    assert set(queue.markers(job, queue.QUEUE)) == {"numbers.r2.0000"}
+    assert not running.exits and not running.live
+
+
+def test_a_task_stopped_by_outages_in_a_row_is_shown_with_its_reason(tmp_path):
+    """A task whose process the share's outage stopped as many times in a row as
+    the host's setting says is shown in the host's record with the reason its
+    process gave, and is still run again, never failed; its next other end clears
+    it."""
+    config, selection = _project(tmp_path)
+    one = Selection({"r2": selection.frames["r2"][:1]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), one, config)
+    running = service.Service(tmp_path / "jobs", "here", 0, tmp_path / "logs", 3)
+    running.poll()
+    why = "The share gave no answer within 300 s while reading its job (53)."
+    shown = []
+    for code in (service.OUTAGE,) * 3 + (0,):
+        claim = queue.claim(job, "numbers.r2.0000", "here")
+        running._log(claim).parent.mkdir(parents=True, exist_ok=True)
+        running._log(claim).write_text(f"Starting\n2026-11-15 12:00:00 {why}\n")
+        if code == 0:
+            queue.finish(claim)
+        process = subprocess.Popen(
+            [sys.executable, "-c", f"import os; os._exit({code})"]
+        )
+        assert process.wait(60) == code
+        running.live[claim.path] = service.Live(claim, 1, process)
+        running.poll()
+        record = queue.read_marker(service.machine_files(tmp_path / "jobs", "here")[0])
+        shown.append(record["outages"])
+    entry = {"job": job.name, "task": "numbers.r2.0000", "times": 3}
+    assert shown == [[], [], [{**entry, "reason": f"2026-11-15 12:00:00 {why}"}], []]
+    assert not running.exits and not queue.markers(job, queue.FAILED)
+    assert queue.markers(job, queue.DONE)
+
+
+def test_a_host_record_out_of_reach_keeps_the_fence(tmp_path, monkeypatch, started):
+    """A service kept from its host's name by another's record stays so while
+    the share is out: a record it cannot read is not taken for none."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r2",))
+    path = service.machine_files(jobs, "here")[0]
+    path.parent.mkdir()
+    other = {"token": "0123456789abcdef", "host": "elsewhere", "pid": 8, "birth": 1.0}
+    path.write_text(json.dumps(other) + "\n")
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05, 0.1, 0.2))
+    running, _ = _service(tmp_path, monkeypatch)
+    running.poll()
+    assert not running.held
+    with _share_out(jobs):
+        running.poll()
+    assert not running.held and not started
+
+
+@pytest.mark.parametrize(
+    "where, what",
+    [
+        ("start", "reading its job"),
+        ("read", "running the step"),
+        ("mark", "marking the task"),
+    ],
+)
+def test_a_long_outage_at_a_tasks_start_read_or_mark_stops_it_uncounted(
+    hosts, where, what
+):
+    """The share is out for longer than the grace while a task process reads its
+    job, while its step reads an input, or while it moves its claim to done: the
+    task stops, says why and leaves no mark; its service returns it uncounted
+    once the share is back, and it then completes."""
+    jobs, flag = hosts / "jobs", hosts / "outage-one"
+    job = _lingering_job(hosts, steps=(LINGERING, GATHERED))
+    (hosts / "project" / "linger").unlink()
+    one = service.Service(jobs, "one", 1, hosts / "logs")
+    if where == "read":  # the input is stored before its reader starts
+        one.poll()
+        ((_, first),) = one.live.items()
+        assert first.process.wait(60) == 0
+    flag.write_text(
+        {
+            "start": f"files|{jobs}",
+            "read": f"files|{hosts / 'project' / 'results'}",
+        }.get(where, f"renames|{jobs}")
+    )
+    one.poll()
+    ((_, live),) = one.live.items()
+    assert live.process.wait(120) == service.OUTAGE
+    output = one.logs / job.name / f"{live.claim.task}.{live.claim.token}.log"
+    assert f"The share gave no answer within 4 s while {what}" in output.read_text()
+    assert not queue.markers(job, queue.DONE).get(live.claim.task)
+    flag.unlink()
+    _until(lambda: (one.poll(), service.settled(jobs))[1])
+    assert not one.exits and not queue.markers(job, queue.FAILED)
+    assert set(queue.markers(job, queue.DONE)) == {"lingering.r2.0000", "gathered.r2"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows' network errors")
+@pytest.mark.parametrize(
+    "code", [53, 64, 67, 70, 1167, 1201, 1203, 1222, 1226, 1229, 1232, 1233, 1235]
+)
+def test_the_networks_errors_are_retried_for_the_grace(monkeypatch, code):
+    """Each error Windows gives for a share that is out is retried until the
+    grace, not for the few seconds of another transient error."""
+    clock = [0.0]
+    monkeypatch.setattr(results, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        results, "sleep", lambda seconds: clock.append(clock.pop() + seconds)
+    )
+
+    def out():
+        raise OSError(None, "The share is out", "file", code)
+
+    with pytest.raises(OSError):
+        results.retry_transient(out)
+    assert results.GRACE - results.RETRY_DELAYS[-1] < clock[0] <= results.GRACE
+
+
+def test_a_folder_out_of_reach_is_not_settled(tmp_path, monkeypatch):
+    """While the jobs folder cannot be read, no job is settled."""
+    jobs, job = tmp_path / "jobs", _job(tmp_path, (LIGHT,), runs=("r2",))
+    assert not service.settled(jobs)  # its task waits
+    queue.finish(queue.claim(job, "light.r2.0000", "here"))
+    assert service.settled(jobs)
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05, 0.1, 0.2))
+    with _share_out(jobs):
+        assert not service.settled(jobs)

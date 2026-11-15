@@ -5,7 +5,9 @@ Each host runs one service, which holds a lock of the whole machine for its life
 says why. Every :data:`POLL` seconds the service
 
 - notes its task processes that exited: one that left its claim unmarked is
-  returned to the queue once and failed the second time, and one that refused its
+  returned to the queue once and failed the second time; one that the share's
+  outage stopped (:data:`OUTAGE`), and a survivor, whose exit cannot be known, are
+  returned, uncounted; and one that refused its
   job (its BLAS kernel, compute backend or code revision is not this host's) and
   said so in its claim is returned, and the host takes no more of that job's
   tasks;
@@ -33,7 +35,11 @@ claims of the host and takes no tasks until that record stays unchanged for
 gone.
 
 Each part of a round that cannot read the jobs folder now, e.g. a job's file read
-short over the share, says why and is tried again in the next round.
+short over the share, says why and is tried again in the next round. Through an
+outage of the share the service keeps its live tasks, their reservations and its
+request; a task process retries its lease for up to
+:data:`darsia.utils.results.GRACE`, which with a BEAT is less than STALE, so no
+host takes back its claim, and the task completes.
 
 The machine's threads and memory are shared by every job of the project, the
 oldest job first; a task that would not fit even on the idle host is passed over,
@@ -92,6 +98,11 @@ REFUSED = 75
 """Exit code of a task process that refused its job, having said why in its claim:
 its host does not provide the job's BLAS kernel or compute backend, or its code is
 of another revision. Not a code of the C runtime's ``abort`` (3) or of Python."""
+OUTAGE = 74
+"""Exit code of a task process stopped because the share gave no answer about its
+claim within :data:`darsia.utils.results.GRACE`: its lease could not be renewed,
+or its mark not written. Its service returns the task, counting no unmarked exit;
+another host takes it back once its lease is stale."""
 LOG = "log.txt"
 """The file of a job's log, in its folder."""
 HOST_MUTEX = "Global\\darsia-jobs-service"
@@ -210,13 +221,16 @@ def read_request(jobs: Path, machine: str) -> int | str:
     ValueError
         If the file holds no request.
     OSError
-        If it cannot be read now, e.g. the share is out or the file reads short
-        twice (:class:`darsia.utils.results.Unavailable`).
+        If it cannot be read now, e.g. the share is out, also when that is
+        reported as a missing path, or the file reads short twice
+        (:class:`darsia.utils.results.Unavailable`).
 
     """
     try:
         return _request(queue.read_json(machine_files(jobs, machine)[1]))
-    except FileNotFoundError:
+    except FileNotFoundError as error:
+        if results.share_out(error):
+            raise
         return AUTO
 
 
@@ -620,10 +634,16 @@ class Service:
         The host's threads: its live tasks' threads together are at most these.
     logs : Path
         Local folder of the tasks' output.
+    outages : int, optional
+        The exits stopped by the share's outage (:data:`OUTAGE`) in a row, on
+        this host, at which a task is shown in the host's record with its reason;
+        it is never failed for them.
 
     """
 
-    def __init__(self, jobs: Path, machine: str, threads: int, logs: Path) -> None:
+    def __init__(
+        self, jobs: Path, machine: str, threads: int, logs: Path, outages: int = 3
+    ) -> None:
         self.jobs = Path(jobs)
         """The jobs folder."""
         self.machine = machine
@@ -645,6 +665,12 @@ class Service:
         """Jobs this service takes no tasks of, and why."""
         self.exits: dict[tuple[str, str], int] = {}
         """Exits without a mark, by job and task."""
+        self.outages = outages
+        """The exits stopped by the share's outage in a row at which a task is
+        shown in the host's record."""
+        self.stopped: dict[tuple[str, str], tuple[int, str]] = {}
+        """Exits stopped by the share's outage in a row, by job and task, with the
+        last one's reason; another end of the task's process clears them."""
         self.token = queue.new_token()
         """This service's token in its host's record."""
         self.held = False
@@ -708,7 +734,9 @@ class Service:
         path = machine_files(self.jobs, self.machine)[0]
         try:
             raw = results.retry_transient(path.read_bytes)
-        except FileNotFoundError:
+        except FileNotFoundError as error:
+            if results.share_out(error):
+                raise
             return self._take(None)
         if not raw:
             return self._take(raw)  # An empty record is nobody's.
@@ -743,7 +771,8 @@ class Service:
 
     def _record(self) -> None:
         """Write the host's record: the live tasks with the threads and bytes they
-        reserve, the free memory, the reserve, the request and the reason. It is
+        reserve, the free memory, the reserve, the request, the reason and the
+        tasks stopped by the share's outage :attr:`outages` times in a row. It is
         created whole, by a partial file renamed without replacing another's, and
         then rewritten in place by its holder alone: through the one handle it
         reads the record, and writes only if it is still what :meth:`_hold` read
@@ -771,6 +800,11 @@ class Service:
             "reserve": reserve(),
             "live": live,
             "reason": self.reason,
+            "outages": [
+                {"job": job, "task": task, "times": times, "reason": why}
+                for (job, task), (times, why) in self.stopped.items()
+                if times >= self.outages
+            ],
         }
         text = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
         path = machine_files(self.jobs, self.machine)[0]
@@ -904,10 +938,21 @@ class Service:
                 say(f"The claim {claim.path} cannot be read now: {error}")
                 continue
             del self.live[path]
+            key = (claim.job.name, claim.task)
+            if code == OUTAGE:
+                self._stopped(claim, key)
+            elif live.process is not None:
+                self.stopped.pop(key, None)
             if marked:
                 continue
             record = self._records[claim.job.name]
             log = claim.job / LOG
+            if code == OUTAGE:
+                self._release(claim, log, "its process lost the share for GRACE")
+                continue
+            if live.process is None:  # a survivor: its exit cannot be known
+                self._release(claim, log, "its process, a survivor, ended")
+                continue
             if code == REFUSED and lease.get("refused"):
                 self._release(claim, log, "its process refused the job")
                 self._refuse(claim.job, record, lease["refused"])
@@ -926,6 +971,24 @@ class Service:
                 say(f"Task {claim.task} failed: its process ended twice unmarked", log)
             except (queue.Revoked, OSError) as error:
                 say(f"Task {claim.task} could not be marked failed: {error}", log)
+
+    def _stopped(self, claim: queue.Claim, key: tuple[str, str]) -> None:
+        """Count a task's exit stopped by the share's outage, with the reason its
+        process gave in its output; at :attr:`outages` in a row it is said once in
+        the job's log, and the host's record shows it."""
+        try:
+            lines = self._log(claim).read_text(errors="replace").splitlines()
+            why = next(line for line in reversed(lines) if line.strip())
+        except (OSError, StopIteration):
+            why = "Its process said nothing."
+        times = self.stopped.get(key, (0, ""))[0] + 1
+        self.stopped[key] = (times, why)
+        if times == self.outages:
+            say(
+                f"Task {claim.task} stopped {times} times in a row, the share giving "
+                f"no answer; it is run again each time. The last: {why}",
+                claim.job / LOG,
+            )
 
     def _release(self, claim: queue.Claim, log: Path, why: str) -> None:
         """Return a claim to the queue, saying why."""
@@ -1152,6 +1215,7 @@ def serve(
     logs: Path | None = None,
     poll: float = POLL,
     until: Callable[[], bool] | None = None,
+    outages: int = 3,
 ) -> None:
     """Run this host's service over a jobs folder (``python -m darsia.jobs serve``).
 
@@ -1175,6 +1239,9 @@ def serve(
     until : Callable[[], bool], optional
         Asked after every round; the service stops once it is true and no task of
         the service runs; by default never.
+    outages : int, optional
+        The exits of a task stopped by the share's outage in a row at which the
+        host's record shows it (:class:`Service`); 3 by default.
 
     Raises
     ------
@@ -1188,7 +1255,7 @@ def serve(
     if logs is None:
         logs = Path(tempfile.gettempdir()) / "darsia-jobs" / "tasks"
     with host_lock(lock):
-        service = Service(jobs, machine, threads, Path(logs))
+        service = Service(jobs, machine, threads, Path(logs), outages)
         say(f"{machine} serves {jobs} with {threads} threads ({service.revision})")
         while True:
             service.poll()
@@ -1199,9 +1266,14 @@ def serve(
 
 def settled(jobs: Path) -> bool:
     """Whether no task of any job of a folder can still run: each is done,
-    failed, or waits behind a failed task (:func:`darsia.jobs.queue.waiting`)."""
-    for name in sorted(os.listdir(jobs)):
-        if not name.startswith(".") and (Path(jobs) / name / JOB).is_file():
-            if queue.waiting(Path(jobs) / name):
-                return False
+    failed, or waits behind a failed task (:func:`darsia.jobs.queue.waiting`); a
+    folder that cannot be read now through the share is not settled."""
+    try:
+        for name in sorted(results.retry_transient(lambda: os.listdir(jobs))):
+            folder = Path(jobs) / name
+            if not name.startswith(".") and results.exists(folder / JOB):
+                if queue.waiting(folder):
+                    return False
+    except OSError:
+        return False
     return True
