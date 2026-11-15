@@ -13,6 +13,10 @@ from darsia.utils import results
 
 DESCRIPTION = {"step": "phase-maps", "settings": {"co2_threshold": 0.8}}
 OURS, THEIRS = "1" * 32, "2" * 32
+SHORT = (
+    "Failed to read all data for array. Expected (3,) = 3 elements, could only read "
+    "0 elements. (file seems not fully written?)"
+)
 
 
 def _writer(values):
@@ -299,5 +303,162 @@ def test_a_lost_acknowledgement_with_a_stale_source_is_ours(tmp_path, monkeypatc
     monkeypatch.setattr(os, "stat", stale)
     results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
     assert len(moves) == 2
+    assert _token(location) == OURS
+    assert np.array_equal(_values(location), np.arange(3.0))
+
+
+@pytest.mark.parametrize("case", ["short once", "short twice", "invalid"])
+def test_a_short_read_is_read_once_more(tmp_path, waits, case):
+    """A whole file read short once is read again after the share's cache time;
+    read short twice, the result is unavailable. A reader's other errors are raised
+    as they are."""
+    location = tmp_path / "phase-model"
+    results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
+    errors, tries = {
+        "short once": ([SHORT], 2),
+        "short twice": ([SHORT, SHORT], 2),
+        "invalid": (["The values have another shape"], 1),
+    }[case]
+    calls = []
+
+    def reader(folder):
+        calls.append(folder)
+        if len(calls) <= len(errors):
+            raise ValueError(errors[len(calls) - 1])
+        return _values(folder)
+
+    if case == "short once":
+        assert np.array_equal(results.read(location, reader), np.arange(3.0))
+    else:
+        failure = results.Unavailable if case == "short twice" else ValueError
+        with pytest.raises(failure):
+            results.read(location, reader)
+    assert len(calls) == tries
+    assert waits == [results.SHARE_CACHE] * (tries - 1)
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_a_file_not_found_in_a_complete_result_is_read_once_more(
+    tmp_path, waits, failures
+):
+    """A file of a complete result that the share's client does not find is looked
+    for again after the share's cache time; not found twice, the result is
+    unavailable, never missing."""
+    location = tmp_path / "phase-model"
+    results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
+    calls = []
+
+    def reader(folder):
+        calls.append(folder)
+        if len(calls) <= failures:
+            raise FileNotFoundError(errno.ENOENT, "Not found", str(folder))
+        return _values(folder)
+
+    if failures == 1:
+        assert np.array_equal(results.read(location, reader), np.arange(3.0))
+    else:
+        with pytest.raises(results.Unavailable):
+            results.read(location, reader)
+    assert len(calls) == 2
+    assert waits == [results.SHARE_CACHE]
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_a_committed_description_not_found_is_looked_for_once_more(
+    tmp_path, monkeypatch, waits, committed
+):
+    """The share's client answers «not found» once for the description of a result
+    whose commit is known: it is looked for again and the result reads. Without that
+    knowledge, a description not found is a plain answer."""
+    location = tmp_path / "phase-model"
+    results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
+    stat, cached = os.stat, []
+
+    def caches(path, *args, **kwargs):
+        if (
+            isinstance(path, (str, os.PathLike))
+            and Path(path) == location / "result.json"
+        ):
+            if not cached:
+                cached.append(path)
+                raise FileNotFoundError(errno.ENOENT, "Not found", str(path))
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", caches)
+    if committed:
+        assert np.array_equal(
+            results.read(location, _values, committed=True), np.arange(3.0)
+        )
+        assert waits == [results.SHARE_CACHE]
+    else:
+        with pytest.raises(FileNotFoundError):
+            results.read(location, _values)
+        assert waits == []
+
+
+@pytest.mark.parametrize("hidden", ["destination", "description"])
+def test_a_lost_acknowledgement_hidden_by_the_cache_is_ours(
+    tmp_path, monkeypatch, waits, hidden
+):
+    """The commit takes effect, its acknowledgement is lost, the retried move finds
+    the source gone, and the share's client answers «not found» once for the
+    location or its description: it is looked for again and recognised as this
+    publication."""
+    location = tmp_path / "phase-model"
+    concealed = location if hidden == "destination" else location / "result.json"
+    move, stat, moves, cached = results._move, os.stat, [], []
+
+    def loses(source, destination):
+        moves.append(source)
+        move(source, destination)
+        if len(moves) == 1:
+            raise _dropped()
+
+    def caches(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and len(moves) > 1 and not cached:
+            if Path(path).is_relative_to(concealed):
+                cached.append(path)
+                raise FileNotFoundError(errno.ENOENT, "Not found", str(path))
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(results, "_move", loses)
+    monkeypatch.setattr(os, "stat", caches)
+    results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
+    assert len(moves) == 2 and cached and results.SHARE_CACHE in waits
+    assert _token(location) == OURS
+    assert np.array_equal(_values(location), np.arange(3.0))
+
+
+def test_an_outage_is_unavailable_not_missing(tmp_path, monkeypatch, waits):
+    """The share goes out while a short read is read once more, for longer than the
+    grace period: the read and the completion mark are unavailable, never missing,
+    and the stored result keeps its files and token."""
+    location = tmp_path / "phase-maps" / "run" / "session" / "photo.ARW"
+    results.publish(location, _writer(np.arange(3.0)), DESCRIPTION, OURS, root=tmp_path)
+    calls = []
+
+    def reader(folder):
+        calls.append(folder)
+        if len(calls) == 1:
+            raise ValueError(SHORT)
+        raise _dropped()
+
+    with pytest.raises(results.Unavailable):
+        results.read(location, reader)
+    assert waits[0] == results.SHARE_CACHE
+    assert results.GRACE - 5.0 < sum(waits[1:]) <= results.GRACE
+
+    stat = os.stat
+
+    def out(path, *args, **kwargs):
+        if isinstance(path, os.PathLike) and Path(path).is_relative_to(location):
+            raise _dropped()
+        return stat(path, *args, **kwargs)
+
+    with monkeypatch.context() as outage:
+        outage.setattr(os, "stat", out)
+        with pytest.raises(results.Unavailable):
+            results.is_complete(location)
+    assert [path.name for path in location.parent.iterdir()] == ["photo.ARW"]
     assert _token(location) == OURS
     assert np.array_equal(_values(location), np.arange(3.0))
