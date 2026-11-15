@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import darsia
+from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.labeling import SandMapConfig
 from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
@@ -15,6 +16,7 @@ from darsia.presets.workflows.setup.sand_map import (
     rasterize_sand_map,
     rig_grid,
 )
+from darsia.presets.workflows.setup.setup_facies import make_facies
 from darsia.presets.workflows.setup.setup_labeling import segment_colored_image
 
 WIDTH, HEIGHT = 0.4, 0.2
@@ -345,3 +347,21 @@ def test_a_drawing_is_saved_only_as_a_closed_partition(tmp_path):
     with pytest.raises(ValueError, match="frame"):
         _split_drawing().write(tmp_path / "unframed.json")
     assert sorted(path.name for path in tmp_path.iterdir()) == ["drawing.json"]
+
+
+def test_the_facies_of_a_sand_map_follow_its_label_groups(tmp_path):
+    """A run's facies are its sand map's labels by their facies groups; a label of
+    no group is a facies of its own id."""
+    (tmp_path / "props.csv").write_text("id,porosity\n1,0.4\n2,0.4\n5,0.4\n")
+    (tmp_path / "config.toml").write_text(
+        f'[facies]\nprops = "{(tmp_path / "props.csv").as_posix()}"\n'
+        f'path = "{(tmp_path / "facies.npz").as_posix()}"\n'
+        "[facies.1]\nlabels = [1, 3]\n[facies.2]\nlabels = [2, 4]\n"
+    )
+    config = FluidFlowerConfig(
+        tmp_path / "config.toml", require_data=False, require_results=False
+    )
+    labels = darsia.ScalarImage(np.array([[1, 2, 3], [4, 5, 1]]), dimensions=[1, 1])
+    facies = make_facies(config, labels)
+    assert facies.img.tolist() == [[1, 2, 1], [2, 5, 1]]
+    assert facies.dimensions == labels.dimensions

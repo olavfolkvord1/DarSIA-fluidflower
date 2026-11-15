@@ -54,25 +54,58 @@ def setup_rig(cls: Type[Rig], path: Path | list[Path], show: bool = False) -> No
     # ! ---- LOAD RUN AND RIG ----
     config = FluidFlowerConfig(path, require_data=False, require_results=False)
     config.check(*list_required_sections(setup_rig))
+    rig = make_rig(cls, config, log=config.rig.path / "figures", show=show)
+    rig.save(config.rig.path)
 
+    # Monitoring time of execution
+    logger.info(f"Rig setup in {time.time() - tic:.2f} s.")
+
+    if show:
+        rig.baseline.show()
+
+
+def make_rig(
+    cls: Type[Rig],
+    config: FluidFlowerConfig,
+    labels: Path | None = None,
+    log: Path | None = None,
+    show: bool = False,
+    facies: Path | None = None,
+) -> Rig:
+    """Set up a rig from its configuration, without storing it.
+
+    The Setup's rig, as :func:`setup_rig` stores it and the Setup's rig step
+    publishes it.
+
+    Parameters
+    ----------
+    cls : Type[Rig]
+        Class of the rig to be setup.
+    config : FluidFlowerConfig
+        The configuration, with the sections :func:`setup_rig` requires.
+    labels : Path, optional
+        The labels file; by default ``[labeling] labels``.
+    log : Path, optional
+        Folder of the setup's figures; None for none.
+    show : bool
+        Whether to show intermediate results.
+    facies : Path, optional
+        The facies file of those labels; by default ``[facies] path``.
+
+    Returns
+    -------
+    Rig
+        The rig.
+
+    """
     # Mypy type checking
     assert config.data is not None
     assert config.depth is not None
     assert config.labeling is not None
     assert config.facies is not None
-    assert config.protocols is not None
-    assert config.protocols.imaging is not None
-    assert config.protocols.injection is not None
-    assert config.protocols.pressure_temperature is not None
 
     # Load imaging protocol
-    experiment = darsia.ProtocolledExperiment(
-        data=config.data.data,
-        imaging_protocol=config.protocols.imaging,
-        injection_protocol=config.protocols.injection,
-        pressure_temperature_protocol=config.protocols.pressure_temperature,
-        blacklist_protocol=config.protocols.blacklist,
-    )
+    experiment = make_experiment(config)
 
     # Determine effective baseline path, using cache when enabled.
     baseline_path = config.data.baseline
@@ -98,28 +131,51 @@ def setup_rig(cls: Type[Rig], path: Path | list[Path], show: bool = False) -> No
             original_baseline.save(cache_path)
             baseline_path = cache_path
 
-    # Setup and save rig
+    # Setup rig
     rig = cls()
     rig.setup(
         experiment=experiment,
         baseline_path=baseline_path,
         depth_map_path=config.depth.depth_map,
-        labels_path=config.labeling.labels,
-        facies_path=config.facies.path,
+        labels_path=labels if labels is not None else config.labeling.labels,
+        facies_path=facies if facies is not None else config.facies.path,
         facies_props_path=config.facies.props,
         corrections_config=config.corrections,
         roi_registry=config.roi_registry,
         image_porosity_config=config.image_porosity,
-        log=config.rig.path / "figures",
+        log=log,
         show_plot=show,
     )
-    rig.save(config.rig.path)
+    return rig
 
-    # Monitoring time of execution
-    logger.info(f"Rig setup in {time.time() - tic:.2f} s.")
 
-    if show:
-        rig.baseline.show()
+def make_experiment(config: FluidFlowerConfig) -> darsia.ProtocolledExperiment:
+    """The experiment of a configuration: its photos and protocols.
+
+    Parameters
+    ----------
+    config : FluidFlowerConfig
+        The configuration, with [data] and [protocols].
+
+    Returns
+    -------
+    darsia.ProtocolledExperiment
+        The experiment.
+
+    """
+    assert config.data is not None
+    assert config.protocols is not None
+    assert config.protocols.imaging is not None
+    assert config.protocols.injection is not None
+    assert config.protocols.pressure_temperature is not None
+    return darsia.ProtocolledExperiment(
+        data=config.data.data,
+        imaging_protocol=config.protocols.imaging,
+        injection_protocol=config.protocols.injection,
+        pressure_temperature_protocol=config.protocols.pressure_temperature,
+        blacklist_protocol=config.protocols.blacklist,
+        injection_reference_density=config.protocols.injection_reference_density,
+    )
 
 
 def delete_rig(cls: Type[Rig], path: Path | list[Path], show: bool = False) -> None:
