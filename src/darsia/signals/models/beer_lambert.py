@@ -48,9 +48,11 @@ setting is a field of :class:`BeerLambertSettings`, :class:`ShadowSettings` or
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 from numpy.polynomial import legendre
@@ -91,9 +93,6 @@ class BeerLambertSettings:
 
     reference_sand: int
     """Facies id of the reference sand, whose path ratio is one."""
-    path_ratio: Mapping[int, float]
-    """Path ratio of every other sand read, by facies id, as measured where two
-    sands meet."""
     mean_mm: float
     """Side [mm] of the square over which a sand's colours are averaged inside its
     dissolved CO2 before their log change, and of the background's blocks."""
@@ -111,6 +110,10 @@ class BeerLambertSettings:
     background_huber_threshold: float
     """Huber threshold of the background's robust fit, in robust standard
     deviations of its residuals."""
+    path_ratio: Mapping[int, float] | None = None
+    """Path ratio of every other sand read, by facies id, as measured where two
+    sands meet (:func:`path_ratios`); None until they are measured, which the
+    reading refuses."""
 
 
 def shadow_light(
@@ -315,7 +318,14 @@ class BeerLambertReading:
         settings : BeerLambertSettings
             Settings of the response.
 
+        Raises
+        ------
+        ValueError
+            If the settings hold no path ratios.
+
         """
+        if settings.path_ratio is None:
+            raise ValueError("The reading needs the sands' measured path ratios.")
         self.path = path
         """Colour path of the reference sand."""
         self.factor = float(factor)
@@ -846,5 +856,35 @@ def path_ratios(
         sd_rel={
             sand: float(np.sqrt(covariance[k, k])) for k, sand in enumerate(others)
         },
+        pairs=pairs,
+    )
+
+
+PATH_RATIOS = "path_ratios.json"
+"""The file of stored path ratios (:func:`write_path_ratios`)."""
+
+
+def write_path_ratios(folder: Path, ratios: PathRatios) -> None:
+    """Store path ratios (:func:`path_ratios`) in ``folder``, as JSON with every
+    digit kept; a pair is named ``<sand>/<sand>``."""
+    found = dict(
+        ratio={str(sand): value for sand, value in ratios.ratio.items()},
+        sd_rel={str(sand): value for sand, value in ratios.sd_rel.items()},
+        pairs={f"{a}/{b}": asdict(pair) for (a, b), pair in ratios.pairs.items()},
+    )
+    text = json.dumps(found, indent=1, allow_nan=False)
+    (Path(folder) / PATH_RATIOS).write_text(text + "\n", encoding="utf-8")
+
+
+def read_path_ratios(folder: Path) -> PathRatios:
+    """Stored path ratios (:func:`write_path_ratios`)."""
+    found = json.loads((Path(folder) / PATH_RATIOS).read_text(encoding="utf-8"))
+    pairs = {
+        tuple(int(sand) for sand in name.split("/")): PairRatio(**pair)
+        for name, pair in found["pairs"].items()
+    }
+    return PathRatios(
+        ratio={int(sand): float(v) for sand, v in found["ratio"].items()},
+        sd_rel={int(sand): float(v) for sand, v in found["sd_rel"].items()},
         pairs=pairs,
     )
