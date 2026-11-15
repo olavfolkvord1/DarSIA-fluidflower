@@ -272,6 +272,13 @@ def _move(source: Path, destination: Path) -> None:
         raise
 
 
+def write_json(path: Path, value) -> None:
+    """Write a stored result's JSON file, indented and with every digit of its
+    numbers (Python's ``repr``); NaN is refused."""
+    text = json.dumps(value, indent=1, allow_nan=False)
+    Path(path).write_text(text + "\n", encoding="utf-8")
+
+
 def rename(
     source: Path, destination: Path, ours: Callable[[Path], bool] | None = None
 ) -> None:

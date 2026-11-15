@@ -221,9 +221,8 @@ def _distances(ctx: StepContext) -> None:
     for run, run_frames in ctx.selection.frames.items():
         grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-        start = experiment.experiment_start
         hours = [
-            (experiment.get_datetime(ctx.photo(run, f)) - start).total_seconds() / 3600
+            experiment.time_since_start(experiment.get_datetime(ctx.photo(run, f)))
             for f in run_frames
         ]
         nearest = int(np.argmin([abs(h - time_h) for h in hours]))

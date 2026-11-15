@@ -86,7 +86,7 @@ def _mass_maps(ctx: StepContext) -> None:
             dimensions=image.dimensions,
             origin=image.origin,
         )
-        hours = (date - start).total_seconds() / 3600
+        hours = experiment.time_since_start(date)
         factor = darsia.dilution_factor(
             hours,
             grid.geometry.pore_volume(grid.domain & maps["co2"]),
@@ -140,12 +140,11 @@ def _domain_mass(ctx: StepContext) -> None:
     ]
     sums = DomainMass(domains, grid.geometry, grid.rig.labels, settings.sand_labels)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-    start = experiment.experiment_start
     rows = []
     for frame in ctx.task.frames:
         maps = ctx.read("mass-maps", darsia.read_mass_maps, frame=frame)
         date = experiment.get_datetime(ctx.photo(run, frame))
-        hours = (date - start).total_seconds() / 3600
+        hours = experiment.time_since_start(date)
         for row in sums(maps, co2_state(grid, experiment, date)):
             case = frame_key(frame)
             rows.append({**row, "run": run, "case_id": case, "elapsed_h": hours})
