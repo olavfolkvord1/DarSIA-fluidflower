@@ -13,7 +13,9 @@ statistics, and the calibration fit with its folds.
   rule maps, its free-gas saturation and the CO2 of its labels before the rules,
   and a run resumes at its first missing frame.
 - ``run-statistics`` (R5) gives each frame the histograms of its sands' dissolved
-  CO2 signal and its gas statistics, as the fit reads them.
+  CO2 signal, its gas statistics and the column estimate of its CO2 pixels
+  without a measurement of their own (:func:`darsia.unknown_statistics`), as the
+  fit reads them.
 - ``calibration`` (R6) fits the gain and the dilution across the fit runs, and
   each fold leaves one run out.
 
@@ -517,6 +519,18 @@ def _run_statistics(ctx: StepContext) -> None:
             co2.density_gaseous_co2,
             co2.solubility_co2,
         )
+        signal, measured = read_signal(
+            grid, image.img, maps, reading, statistics_settings
+        )
+        unknown = darsia.unknown_statistics(
+            darsia.relative_signal(signal, statistics_settings),
+            maps["labels"],
+            maps["rules"],
+            measured,
+            grid.geometry,
+            co2,
+            settings["unknown_mass"],
+        )
         hours = (date - start).total_seconds() / 3600
         volume = volumes["volumes"][frame_key(frame)]
         rows.append(
@@ -528,7 +542,7 @@ def _run_statistics(ctx: StepContext) -> None:
                 injected_g=protocol.injected_mass(time=hours) * 1000,
                 dissolved=histograms,
                 gas=gas,
-                column=None,
+                column=unknown.column_estimate(),
                 overflow_m3=volume,
                 measured=volume is not None and volumes["measured"],
             )
@@ -628,6 +642,7 @@ RUN_STATISTICS = Step(
         "run_statistics": darsia.RunStatisticsSettings,
         "reading": ReadingSettings,
         "material": MaterialSettings,
+        "unknown_mass": darsia.UnknownMassSettings,
     },
     sections=EXPERIMENT,
     files=protocol_files,
