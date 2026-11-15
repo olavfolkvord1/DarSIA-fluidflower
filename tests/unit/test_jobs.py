@@ -180,7 +180,22 @@ STAMPED = Step(
     {"toy": ToySettings},
     stamped=_depth,
 )
-STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY, STAMPED)
+
+
+def _halting(ctx: StepContext) -> None:
+    """A number per frame, halting at the second while the project holds a file
+    named "halt"."""
+    for k, frame in enumerate(ctx.task.frames):
+        if ctx.done(frame):
+            continue
+        if k == 1 and (ctx.locations.project / "halt").exists():
+            raise RuntimeError("Halted")
+        ctx.publish(lambda folder: _write(folder, value=k), frame=frame)
+
+
+HALTING = Step("halting", {}, Order.FRAMES, Memory(), _halting)
+HALTING_READ = Step("halting-read", {}, Order.FRAMES, Memory(), _halting, files=_files)
+STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY, STAMPED, HALTING, HALTING_READ)
 """The test steps, which a task process finds by their module."""
 
 
@@ -406,6 +421,70 @@ def test_a_retried_task_adopts_its_earlier_attempt(tmp_path, monkeypatch):
     ctx = context(job, sums, "reader")
     with pytest.raises(PermissionError, match="did not accept"):
         ctx.step.run(ctx)
+
+
+def test_a_failed_task_retried_in_its_job_adopts_what_it_stored(tmp_path):
+    """A failed task returned to its queue runs again once its cause is mended: it
+    adopts the frame its failed attempt stored, makes the others, and its done
+    marker names both tokens."""
+    config, selection = _project(tmp_path)
+    project = tmp_path / "project"
+    (project / "halt").write_text("", encoding="utf-8")
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (HALTING,), one, config)
+    work(job)
+    failed = queue.markers(job, queue.FAILED)
+    assert set(failed) == {"halting.r2.0000"} and queue.waiting(job) == set()
+    (project / "halt").unlink()
+    assert queue.retry_failed(job, "halting.r2.0000")
+    assert not queue.retry_failed(job, "halting.r2.0000")  # it is queued now
+    work(job)
+    accepted = queue.accepted(job, "halting.r2.0000")
+    assert failed["halting.r2.0000"] in accepted and len(accepted) == 2
+    first, _ = _stored(project, "halting/r2/day1/r2-00.npz")
+    later, _ = _stored(project, "halting/r2/day1/r2-02.npz")
+    assert first["token"] == failed["halting.r2.0000"] != later["token"]
+    assert queue.waiting(job) == set() and not queue.markers(job, queue.FAILED)
+
+
+def test_a_retry_after_a_mend_of_its_inputs_needs_its_results_set_aside(tmp_path):
+    """A mend of what a failed attempt's results are made from (here a protocol)
+    leaves them not serving, so the retry refuses them; once they are set aside,
+    never deleted, the retry makes them again."""
+    config, selection = _project(tmp_path)
+    project, name = tmp_path / "project", "halting-read.r2.0000"
+    (project / "halt").write_text("", encoding="utf-8")
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (HALTING_READ,), one, config)
+    work(job)
+    (project / "halt").unlink()
+    (project / "injection.csv").write_text("start,rate\n0,2\n", encoding="utf-8")
+    assert queue.retry_failed(job, name)
+    work(job)
+    assert set(queue.markers(job, queue.FAILED)) == {name}
+    found = job_module.discard_failed(job, HALTING_READ, name)
+    assert found == ["halting-read/r2/day1/r2-00.npz"]
+    assert queue.retry_failed(job, name)
+    work(job)
+    assert queue.waiting(job) == set() and not queue.markers(job, queue.FAILED)
+    day = project / "results" / "halting-read" / "r2" / "day1"
+    assert len(list(day.glob(".r2-00.npz.*.discarded"))) == 1
+
+
+def test_a_share_outage_is_no_empty_state_folder(tmp_path, monkeypatch):
+    """A state folder of a job the share gives no answer about within the grace,
+    also as a missing network path, is not known now: never an empty folder."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+
+    def out(folder):
+        raise network_error()
+
+    monkeypatch.setattr(queue.os, "listdir", out)
+    with pytest.raises(results.Unavailable):
+        queue.markers(job, queue.FAILED)
 
 
 def test_failed_parts_made_again_with_other_settings(tmp_path):

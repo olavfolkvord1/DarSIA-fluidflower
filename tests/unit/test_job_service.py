@@ -384,6 +384,27 @@ def test_an_exit_whose_claim_says_no_refusal_is_no_refusal(tmp_path, code):
     assert running.exits == {(job.name, "numbers.r2.0000"): 1}
 
 
+def test_a_retried_task_is_returned_once_more_after_an_unmarked_exit(tmp_path):
+    """A task failed after two unmarked exits and then retried starts its count
+    again: its next unmarked exit returns it to the queue once more."""
+    job = _one(tmp_path)
+    running = service.Service(tmp_path / "jobs", "here", 0, tmp_path / "logs")
+    running.poll()  # no threads: it reads the job and starts nothing
+    ended = subprocess.Popen([sys.executable, "-c", "import os; os._exit(1)"])
+    assert ended.wait(60) == 1
+    name = "numbers.r2.0000"
+    for _ in range(2):
+        claim = queue.claim(job, name, "here")
+        running.live[claim.path] = service.Live(claim, 1, ended)
+        running.poll()
+    assert set(queue.markers(job, queue.FAILED)) == {name}
+    assert queue.retry_failed(job, name)
+    claim = queue.claim(job, name, "here")
+    running.live[claim.path] = service.Live(claim, 1, ended)
+    running.poll()
+    assert set(queue.markers(job, queue.QUEUE)) == {name}
+
+
 def test_a_job_read_short_stops_nothing(tmp_path, capsys):
     """A job's record or task file read short, e.g. just published on the other
     host, is said, and read again in the next round; the service goes on."""
