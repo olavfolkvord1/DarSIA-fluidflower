@@ -1,11 +1,12 @@
 """Stored results: published whole without replacing, read through a share's interruptions.
 
 A result is one folder at its location: the files its method's own writer writes,
-then ``result.json``, its description, which records the publication's token, the
-claim token of the task that made it. The folder is written under a partial name
-beside its location, flushed to disk and committed in one step that never replaces,
-so a reader finds a result only when it is whole, and an interrupted write leaves
-only a partial, which no reader reads.
+then ``result.json``, its description. The description records the publication's
+token, which is the claim token of the task that made it, and what the result was
+made from, so that a later request can tell whether it serves (:func:`reusable`).
+The folder is written under a partial name beside its location, flushed to disk and
+committed in one step that never replaces, so a reader finds a result only when it
+is whole, and an interrupted write leaves only a partial, which no reader reads.
 
 Results are often stored on a network share. Its short interruptions are retried
 (:func:`retry_transient`), and a file of a complete result that reads short or is
@@ -49,6 +50,8 @@ RETRY_DELAYS = (0.5, 2.0, 5.0)
 delay repeats."""
 RESULT = "result.json"
 """The file of a result's description, written last."""
+REUSED = ("step", "settings", "scope", "environment", "inputs")
+"""What a stored result must share with a request to serve it (:func:`reusable`)."""
 
 # The errors of a share that is out: Windows network-path errors, which Python may
 # report as a missing file or path, and the network errors of POSIX.
@@ -416,9 +419,8 @@ def publish(
     write : Callable[[Path], None]
         The method's writer of the result's files into the folder it is given.
     description : Mapping
-        What the result was made from and by whom, e.g. its step, settings and
-        inputs, the job and the revision; plain JSON values without NaN, and no
-        token.
+        What the result was made from (:data:`REUSED`) and by whom, e.g. the job and
+        the revision; plain JSON values without NaN, and no token.
     token : str
         The claim token of the task that publishes, a name of letters and digits.
     root : Path
@@ -569,3 +571,48 @@ def read(location: Path, reader: Callable[[Path], T], committed: bool = False) -
             message = f"{location} does not read whole twice: {error}"
             raise Unavailable(message) from error
         raise
+
+
+def reusable(description: Mapping, wanted: Mapping) -> str | None:
+    """Why a stored result does not serve a request, or None if it does.
+
+    The request holds what a result made now would record (:data:`REUSED`): the
+    step, its settings, its scope (the frames or parts of the frozen selection it is
+    made from), the computing environment, and the token of each input it reads, by
+    the input's location. The stored description must record the same, compared as
+    JSON. A result made from other frames or parts, or from another publication of
+    an input, e.g. a phase model trained again with unchanged settings, does not
+    serve. The revision of the code is recorded, not compared.
+
+    Parameters
+    ----------
+    description : Mapping
+        The stored result's description (:func:`read_description`).
+    wanted : Mapping
+        The request.
+
+    Returns
+    -------
+    str or None
+        What differs, e.g. ``"Made with other inputs (phase-model)"``, or None.
+
+    Raises
+    ------
+    ValueError
+        If the request lacks one of :data:`REUSED`.
+
+    """
+    missing = [key for key in REUSED if key not in wanted]
+    if missing:
+        raise ValueError(f"A request names its {', '.join(missing)}.")
+    wanted = json.loads(json.dumps({key: wanted[key] for key in REUSED}))
+    other = []
+    for key in REUSED:
+        stored, asked = description.get(key), wanted[key]
+        if stored == asked:
+            continue
+        if key == "inputs" and isinstance(stored, dict) and isinstance(asked, dict):
+            names = sorted(n for n in stored | asked if stored.get(n) != asked.get(n))
+            key = f"inputs ({', '.join(names)})"
+        other.append(key)
+    return f"Made with other {', '.join(other)}" if other else None
