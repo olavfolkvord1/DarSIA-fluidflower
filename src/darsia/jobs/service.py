@@ -10,9 +10,11 @@ says why. Every :data:`POLL` seconds the service
   said so in its claim is returned, and the host takes no more of that job's
   tasks;
 - takes back stale claims of any host (:func:`darsia.jobs.queue.reclaim`);
-- counts the claims of its host whose process outlived an earlier service, by the
-  process and its birth time; it never takes them back, and returns a claim at
-  once when its process is gone;
+- counts the claims of its host whose process outlived an earlier service, each
+  known by its claim's token, its process and that process's birth time, and
+  reserves their threads; it never takes them back, and returns a claim at once
+  when its process is gone, which a process that ended while it looked, or that it
+  may not look at, counts as;
 - starts the oldest job's first ready task, while the threads of its live tasks
   and of the task are within the host's capacity, as a new process
   (``python -m darsia.jobs run``) with its job's computing environment.
@@ -234,7 +236,17 @@ def host_lock(lock: Path | None = None):
 
 
 def birth(pid: int) -> float | None:
-    """A process's birth time (``psutil.Process.create_time``), or None if gone."""
+    """A process's birth time (``psutil.Process.create_time``), or None if it is
+    gone, also if it ended while being looked at, or may not be looked at
+    (``NoSuchProcess``, ``AccessDenied``): every caller takes None for gone.
+
+    Unlike a file the share gives no answer about, a process the system will not
+    describe is taken for gone: its claim is returned, and the process, if it still
+    runs, is fenced by its claim's token, so that its next beat finds its marker
+    gone and its results count for nothing. psutil reads a birth time without
+    opening the process where it can (on Windows it falls back to
+    ``NtQuerySystemInformation``), so a task process of the service's own account
+    raises no ``AccessDenied``."""
     try:
         return psutil.Process(pid).create_time()
     except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
@@ -426,8 +438,8 @@ class Service:
 
     def _survivors(self, jobs: list[tuple[Path, dict]]) -> None:
         """Count this host's claims whose process outlived an earlier service, and
-        return those whose process is gone or never started (no process in the
-        lease)."""
+        return those whose process is gone (:func:`birth`) or never started (no
+        process in the lease), going on with the next claim."""
         for job, record in jobs:
             for task, token in queue.markers(job, queue.CLAIMED).items():
                 claim = queue.Claim(job, task, token, self.machine)
