@@ -1,12 +1,17 @@
 """Snapping a sand-map drawing into a closed partition of its frame.
 
-:func:`snap_to_frame` moves anchors of a drawing (:class:`SandMapDrawing`) so that
-its outer boundary lies on the frame's edge. It serves an editor, for an anchor
-being placed, and the conversion of a drawing made without links. It returns the
-new drawing and every anchor it moved or added (:class:`AnchorMove`), for a person
-to review; :func:`partition_faults` tells what is left. Anchor indices are kept:
-an anchor that joins another is no longer used by a polygon, and added anchors
-follow the others.
+Two helpers move anchors of a drawing (:class:`SandMapDrawing`) so that its
+boundaries are linked, each to a neighbouring polygon or to the frame's edge:
+
+- :func:`snap_to_frame` moves the drawing's outer boundary onto the frame's edge;
+- :func:`link_boundaries` joins near-coincident boundaries of neighbouring
+  polygons through shared anchors.
+
+They serve an editor, for an anchor being placed, and the conversion of a drawing
+made without links. Both return the new drawing and every anchor they moved or
+added (:class:`AnchorMove`), for a person to review; :func:`partition_faults`
+tells what is left. Anchor indices are kept: an anchor that joins another is no
+longer used by a polygon, and added anchors follow the others.
 
 """
 
@@ -214,6 +219,114 @@ def snap_to_frame(
         (layer, tuple(ring)) for (layer, _indices), ring in zip(drawing.polygons, rings)
     )
     return SandMapDrawing(points, polygons, drawing.on_top, drawing.frame), result
+
+
+def link_boundaries(
+    drawing: SandMapDrawing,
+    settings: SandMapSnapSettings,
+    anchors: Sequence[int] | None = None,
+) -> tuple[SandMapDrawing, list[AnchorMove]]:
+    """Join near-coincident boundaries of neighbouring polygons through shared
+    anchors.
+
+    An anchor of an unlinked edge (of a polygon not on top, neither shared with a
+    neighbour nor on the frame's edge) joins the nearest unlinked edge of a
+    polygon that does not use it, if that lies within ``boundary_mm``. At an end
+    of that edge, the anchor becomes the end's anchor; elsewhere it moves onto the
+    nearest point of the edge, which is split there to run through it. Every
+    polygon that uses the anchor follows it. The anchors are taken in the order of
+    their indices, in passes until one joins none; each join links an anchor to
+    one more polygon or takes it out of use, so the passes end.
+
+    Parameters
+    ----------
+    drawing : SandMapDrawing
+        The drawing, with its frame.
+    settings : SandMapSnapSettings
+        The snapping distances.
+    anchors : sequence of int, optional
+        The anchors that may join, e.g. one being placed in an editor; by default
+        all.
+
+    Returns
+    -------
+    SandMapDrawing
+        The linked drawing, its polygons counter-clockwise and without repeated
+        anchors.
+    list of AnchorMove
+        Every anchor moved, once, from its first position to where it ends.
+
+    Raises
+    ------
+    ValueError
+        If the drawing has no frame.
+
+    """
+    if drawing.frame is None:
+        raise ValueError("The drawing has no frame to link to.")
+    points = np.array(drawing.anchors, dtype=np.float64)
+    rings = [_ring(points, indices) for _layer, indices in drawing.polygons]
+    top = [layer in drawing.on_top for layer, _indices in drawing.polygons]
+    allowed = set(range(len(points)) if anchors is None else anchors)
+    tolerance = settings.boundary_mm / 1000
+    starts: dict[int, tuple[float, float]] = {}
+    joined: dict[int, int] = {}
+
+    changed = True
+    while changed:
+        changed = dirty = False
+        unlinked, _sides = _boundary(points, rings, top, drawing.frame)
+        for index in sorted({i for _k, *ends in unlinked for i in ends} & allowed):
+            if dirty:
+                unlinked, _sides = _boundary(points, rings, top, drawing.frame)
+                dirty = False
+            own = {k for k, ring in enumerate(rings) if index in ring}
+            edges = [(k, u, v) for k, u, v in unlinked if k not in own]
+            if not edges or not any(index in (u, v) for _k, u, v in unlinked):
+                continue
+            first = points[[u for _k, u, _v in edges]]
+            span = points[[v for _k, _u, v in edges]] - first
+            squared = np.einsum("ij,ij->i", span, span)
+            along = np.einsum("ij,ij->i", points[index] - first, span)
+            t = np.clip(
+                np.divide(along, squared, out=0 * along, where=squared > 0), 0, 1
+            )
+            distance = np.hypot(*(first + t[:, None] * span - points[index]).T)
+            best = int(np.argmin(distance))
+            if not distance[best] <= tolerance:
+                continue
+            starts.setdefault(index, tuple(points[index].tolist()))
+            k, u, v = edges[best]
+            if t[best] in (0, 1):
+                joined[index] = u if t[best] == 0 else v
+                for n in own:
+                    rings[n] = _ring(
+                        points, [joined[index] if i == index else i for i in rings[n]]
+                    )
+            else:
+                points[index] = first[best] + t[best] * span[best]
+                rings[k].insert(rings[k].index(u) + 1, index)
+            changed = dirty = True
+
+    def final(index: int) -> int:
+        """The anchor an anchor ends as, following its joins."""
+        while index in joined:
+            index = joined[index]
+        return index
+
+    moves = [
+        AnchorMove(
+            index,
+            start,
+            tuple(points[final(index)].tolist()),
+            None if final(index) == index else final(index),
+        )
+        for index, start in sorted(starts.items())
+    ]
+    polygons = tuple(
+        (layer, tuple(ring)) for (layer, _indices), ring in zip(drawing.polygons, rings)
+    )
+    return SandMapDrawing(points, polygons, drawing.on_top, drawing.frame), moves
 
 
 def _without_spikes(
