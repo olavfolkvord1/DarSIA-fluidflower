@@ -246,6 +246,30 @@ def _settings_class(hint: Any) -> type | None:
     return None
 
 
+def _tuple_items(hint: Any, count: int) -> tuple | None:
+    """The hints of the ``count`` items of a tuple field, alone or optional, or
+    None for a field that holds no tuple."""
+    if typing.get_origin(hint) in (typing.Union, types.UnionType):
+        kinds = [kind for kind in typing.get_args(hint) if kind is not type(None)]
+        return _tuple_items(kinds[0], count) if len(kinds) == 1 else None
+    if typing.get_origin(hint) is not tuple:
+        return None
+    items = typing.get_args(hint)
+    return (items[0],) * count if items[1:] == (Ellipsis,) else items
+
+
+def _field_value(hint: Any, value: Any) -> Any:
+    """A table's value as its field holds it: a table of a settings class becomes
+    that class, and a list of a tuple field a tuple of its items, each made so."""
+    kind = _settings_class(hint)
+    if kind is not None and isinstance(value, Mapping):
+        return settings_from_table(kind, value)
+    items = _tuple_items(hint, len(value)) if isinstance(value, list) else None
+    if items is not None and len(items) == len(value):
+        return tuple(_field_value(item, entry) for item, entry in zip(items, value))
+    return value
+
+
 def settings_from_table(cls: type[T], table: Mapping[str, Any]) -> T:
     """A method's settings made from its configuration table.
 
@@ -253,7 +277,9 @@ def settings_from_table(cls: type[T], table: Mapping[str, Any]) -> T:
     without a default must be in the table. A table given for a field that holds
     another settings class, e.g. the variant's table of an overflow, becomes that
     class, by the same rule, and so does each table of a field that maps names to
-    a settings class; every other value is passed as read.
+    a settings class; a list given for a tuple field becomes a tuple, its tables
+    of settings classes made so too, e.g. a film's panels; every other value is
+    passed as read.
 
     Parameters
     ----------
@@ -290,10 +316,8 @@ def settings_from_table(cls: type[T], table: Mapping[str, Any]) -> T:
     hints = typing.get_type_hints(cls)
     values = {}
     for name, value in table.items():
-        kind = _settings_class(hints[name])
-        if kind is not None and isinstance(value, Mapping):
-            value = settings_from_table(kind, value)
-        elif typing.get_origin(hints[name]) in (Mapping, dict):
+        value = _field_value(hints[name], value)
+        if typing.get_origin(hints[name]) in (Mapping, dict):
             entry = _settings_class(typing.get_args(hints[name])[-1])
             if entry is not None and isinstance(value, Mapping):
                 value = {
