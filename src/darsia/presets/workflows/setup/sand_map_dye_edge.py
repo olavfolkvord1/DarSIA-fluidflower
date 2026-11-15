@@ -12,7 +12,9 @@ steepest drop of brightness from the static side into the porous side.
 - :func:`measure_dye_edge` finds where the dye begins along one such boundary, in
   an image placed in the rig by a homography;
 - :func:`snap_to_dye_edge` moves the boundary onto the measured edge, so that a
-  closed partition of the drawing's frame stays one, or refuses.
+  closed partition of the drawing's frame stays one, or refuses;
+- :func:`dye_edge_stretches` lists where a drawing's boundary differs from the
+  measured edge.
 
 The method takes a boundary as straight over the chord that gives its direction,
 over the window of a station's profiles and over the running median along it. It
@@ -32,6 +34,7 @@ from scipy.ndimage import gaussian_filter1d
 from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
     _described,
+    _fill_order,
     _project,
     _ring,
     partition_faults,
@@ -101,6 +104,12 @@ class DyeEdgeSettings:
     simplify_mm: float
     """Largest distance of a snapped boundary from the measured edge, by which its
     new anchors are simplified."""
+    tolerance_mm: float
+    """Difference between a drawing's boundary and the edge beyond which a check
+    reports it."""
+    length_mm: float
+    """Shortest stretch of such differences along the boundary that a check
+    reports."""
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,25 @@ class DyeEdge:
         """The edge (n, 2) in metres: each station's point moved along its normal
         by the edge's offset."""
         return self.base + self.offset[:, None] * self.normal
+
+
+@dataclass(frozen=True)
+class EdgeStretch:
+    """Consecutive stations where a drawing's boundary differs from the measured
+    edge by more than the tolerance, all to the same side."""
+
+    first: int
+    """First station of the stretch; on a closed boundary, a stretch across its
+    first station has a first station after its last."""
+    last: int
+    """Last station of the stretch."""
+    mean: float
+    """Mean difference in metres; positive where the drawing's static element
+    reaches beyond the edge, i.e. where porous layers are drawn as static."""
+    largest: float
+    """Difference of the largest magnitude, in metres."""
+    layers: tuple[int, ...]
+    """Porous layers at the drawing's boundary along the stretch."""
 
 
 def static_boundaries(
@@ -620,6 +648,134 @@ def snap_to_dye_edge(
         )
     used = {index for _layer, indices in drawing.polygons for index in indices}
     return snapped, moves, sorted(used - {index for ring in rings for index in ring})
+
+
+def dye_edge_stretches(
+    drawing: SandMapDrawing,
+    edge: DyeEdge,
+    static: Collection[int],
+    settings: DyeEdgeSettings,
+) -> list[EdgeStretch]:
+    """Where a drawing's boundary of a static element differs from the measured
+    edge.
+
+    At each station with an edge, the drawing's boundary lies where, along the
+    station's normal through the edge and within the frame, the layer the drawing
+    shows turns porous: at the start of the porous stretch the edge lies in, or
+    else of the first one beyond it. A point shows the layer of the polygon filled
+    last over it, as the rasteriser fills them (larger polygons first, those on
+    top last); porous layers are neither static nor on top. The difference at a
+    station is the boundary's offset from the edge, positive into the porous side.
+    A stretch is a run of consecutive stations whose differences exceed
+    ``tolerance_mm``, all with the same sign, at least ``length_mm`` long (one
+    spacing per station); round a closed boundary, a run may pass its first
+    station. Stations without an edge, or along whose normal the drawing shows no
+    porous layer, are left out and end a run.
+
+    Parameters
+    ----------
+    drawing : SandMapDrawing
+        The drawing, with its frame; it need not be a partition.
+    edge : DyeEdge
+        The measured edge (:func:`measure_dye_edge`), possibly measured along
+        another drawing's boundary.
+    static : collection of int
+        The layers of static elements.
+    settings : DyeEdgeSettings
+        The method's settings.
+
+    Returns
+    -------
+    list of EdgeStretch
+        The stretches, in the order of their first stations, except that one
+        across a closed boundary's first station comes last.
+
+    Raises
+    ------
+    ValueError
+        If the drawing has no frame.
+
+    """
+    if drawing.frame is None:
+        raise ValueError("The drawing has no frame to look along.")
+    width, height = drawing.frame
+    points = np.asarray(drawing.anchors, dtype=np.float64)
+    origin, normal = edge.points, edge.normal
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ends = np.stack([-origin / normal, ([width, height] - origin) / normal])
+    ends = np.where(np.isnan(ends), [[[-np.inf]], [[np.inf]]], ends)
+    first, last = ends.min(axis=0).max(axis=1), ends.max(axis=0).min(axis=1)
+    stations = np.flatnonzero(np.isfinite(edge.offset) & (first < 0) & (0 < last))
+    if not stations.size:
+        return []
+    origin, normal = origin[stations], normal[stations]
+    first, last = first[stations], last[stations]
+    lines = shapely.linestrings(
+        np.stack(
+            [origin + first[:, None] * normal, origin + last[:, None] * normal], axis=1
+        )
+    )
+
+    order = _fill_order(drawing)
+    rings = [points[_ring(points, drawing.polygons[k][1])] for k in order]
+    shapes = [shapely.make_valid(shapely.Polygon(ring)) for ring in rings]
+    cuts = [[a, b] for a, b in zip(first, last)]
+    for ring in rings:
+        crossed = shapely.intersection(lines, shapely.LinearRing(ring))
+        coordinates, which = shapely.get_coordinates(crossed, return_index=True)
+        offsets = np.einsum("ij,ij->i", coordinates - origin[which], normal[which])
+        for n, value in zip(which.tolist(), offsets.tolist()):
+            cuts[n].append(value)
+    cuts = [np.unique(np.clip(values, a, b)) for values, a, b in zip(cuts, first, last)]
+    middles = np.concatenate([0.5 * (c[1:] + c[:-1]) for c in cuts])
+    which = np.repeat(np.arange(len(cuts)), [len(c) - 1 for c in cuts])
+    where = origin[which] + middles[:, None] * normal[which]
+    shown = np.full(len(middles), -1)
+    for k, shape in zip(order, shapes):
+        shown[shapely.contains_xy(shape, where[:, 0], where[:, 1])] = k
+    layer = np.array([layer for layer, _indices in drawing.polygons] + [0])[shown]
+    porous = (shown >= 0) & ~np.isin(layer, [*static, *drawing.on_top])
+
+    difference = np.full(len(edge.along), np.nan)
+    boundary = np.zeros(len(edge.along), dtype=int)
+    start = 0
+    for n, values in enumerate(cuts):
+        flags = porous[start : start + len(values) - 1]
+        layers = layer[start : start + len(values) - 1]
+        start += len(values) - 1
+        here = int(np.searchsorted(values, 0.0, side="right")) - 1
+        if not 0 <= here < len(flags):
+            continue
+        if flags[here]:
+            while here > 0 and flags[here - 1]:
+                here -= 1
+        else:
+            later = np.flatnonzero(flags[here:])
+            if not later.size:
+                continue
+            here += int(later[0])
+        difference[stations[n]] = values[here]
+        boundary[stations[n]] = layers[here]
+
+    tolerance = settings.tolerance_mm / 1000
+    side = np.where(np.abs(difference) > tolerance, np.sign(difference), 0)
+    runs = np.split(np.arange(len(side)), np.flatnonzero(np.diff(side)) + 1)
+    if edge.chain[0] == edge.chain[-1] and len(runs) > 1 and side[0] == side[-1]:
+        runs = runs[1:-1] + [np.concatenate([runs[-1], runs[0]])]
+    result = []
+    for run in runs:
+        if side[run[0]] and len(run) * settings.spacing_mm + 1e-9 >= settings.length_mm:
+            values = difference[run]
+            result.append(
+                EdgeStretch(
+                    int(run[0]),
+                    int(run[-1]),
+                    float(values.mean()),
+                    float(values[np.argmax(np.abs(values))]),
+                    tuple(sorted(set(boundary[run].tolist()))),
+                )
+            )
+    return result
 
 
 def _users(rings: list[list[int]]) -> dict[int, set[int]]:
