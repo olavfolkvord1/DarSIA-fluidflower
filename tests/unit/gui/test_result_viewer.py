@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from matplotlib.colors import to_rgb
 from PySide6.QtCore import QLocale, Qt, QTimer
+from PySide6.QtWidgets import QPushButton
 
 from darsia.gui import result_viewer
 from darsia.gui.result_viewer import (
@@ -104,6 +105,39 @@ def _shown(qtbot, viewer):
 def _stored(locations, index, run="run"):
     """The stored mass of a run's frame."""
     return _maps(locations.result("mass-maps", run=run, frame=FRAMES[index]))["mass"]
+
+
+def test_both_pages_open_the_same_saved_result_in_the_same_viewer(qtbot, tmp_path):
+    """The Calibration page, with its curves and run approval, and the Mass page,
+    with its outlines and film export, show one stored frame identically."""
+    locations = _project(tmp_path)
+    maps = Source("mass-maps", "Mass maps", _maps, FIELDS)
+    fit = Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit)
+    calibration = ResultViewer(locations, [maps], curves=fit, layout="side_by_side")
+    calibration.add_page_controls(QPushButton("Approve run"))
+    calibration.set_run_columns(("Role", "Review"), {"run": ("fit", "Not approved")})
+    approving = []
+    calibration.run_changed.connect(approving.append)
+    mass = ResultViewer(locations, [maps], outlines=[GAS])
+    films, frames = [], []
+    export = QPushButton("Export film…")
+    export.clicked.connect(lambda: films.append(mass.view()))
+    mass.add_page_controls(export)
+    mass.frame_shown.connect(lambda run, index: frames.append((run, index)))
+    for viewer in (calibration, mass):
+        qtbot.addWidget(viewer)
+        viewer.set_runs(_runs())
+        viewer.show_frame(1)
+        _shown(qtbot, viewer)
+
+    for viewer in (calibration, mass):
+        np.testing.assert_array_equal(viewer.panels[0].values, _stored(locations, 1))
+    np.testing.assert_array_equal(calibration.panels[0].pixels, mass.panels[0].pixels)
+    assert approving == ["run"] and frames[-1] == ("run", 1)
+    assert calibration.runs_table.item(0, 3).text() == "Not approved"
+    export.click()
+    assert (films[0].run, films[0].frame) == ("run", FRAMES[1])
+    assert films[0].panels == (("mass-maps/mass", 0.25),)
 
 
 def test_a_read_in_progress_never_blocks_the_window_thread(qtbot, tmp_path):
@@ -488,8 +522,9 @@ def test_a_viewer_without_parent_is_freed_at_once(qtbot, tmp_path):
 
 def test_the_viewer_fits_a_laptop_screen(qtbot, tmp_path):
     """Shown at 1,000 × 640 pixels with three panels of continuous fields, their
-    outline notices, the curves' notes and a message, every wrapped line of text has
-    its height and every map at least 150 pixels."""
+    outline notices, the curves' notes, the page's columns and controls and a
+    message, every wrapped line of text has its height and every map at least 150
+    pixels."""
     locations = _project(tmp_path)
     fit = Curves("calibration", _predictions, LINES, "CO2 mass (g)", _fit)
     outlines = [GAS, Outline("CO2 region", "mass-maps", "area")]
@@ -502,6 +537,9 @@ def test_the_viewer_fits_a_laptop_screen(qtbot, tmp_path):
         layout="pyramid",
     )
     qtbot.addWidget(viewer)
+    viewer.set_run_columns(("Role", "Review"), {"run": ("held-out", "Not approved")})
+    for text in ("Approve run", "Export film…", "Export figures…"):
+        viewer.add_page_controls(QPushButton(text))
     viewer.resize(1000, 640)
     viewer.show()
     viewer.set_runs(_runs())
