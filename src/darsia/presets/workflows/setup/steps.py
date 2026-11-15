@@ -25,6 +25,7 @@ that a result made before one of them was changed is not reused.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -214,6 +215,22 @@ def read_labels(folder: Path) -> darsia.Image:
 def read_rig(folder: Path) -> Rig:
     """A stored rig (:meth:`Rig.load`)."""
     return Rig.load(Path(folder))
+
+
+def read_grid_model(
+    folder: Path,
+) -> tuple[list[list[float]] | None, darsia.MeasurementCanvas | None]:
+    """A stored rig's measured model of its grid (``Rig.grid_to_rig``) and the
+    canvas its pixels were measured on (``Rig.measurement_canvas``), from its meta
+    data alone; None for a grid in rig metres and for the grid itself."""
+    with open(Path(folder) / "meta_data.json", "r") as f:
+        meta = json.load(f)
+    canvas = meta.get("measurement_canvas")
+    if canvas is not None:
+        canvas = darsia.MeasurementCanvas(
+            tuple(canvas["origin"]), tuple(canvas["shape"])
+        )
+    return meta.get("grid_to_rig"), canvas
 
 
 def read_image(folder: Path) -> darsia.Image:
