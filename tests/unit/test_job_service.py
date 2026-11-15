@@ -67,7 +67,8 @@ def _end_task_processes() -> list[int]:
 def _serve(jobs, tmp_path, threads=2, seconds=300.0):
     """Serve a jobs folder in this process until every job is settled; after some
     seconds (a job the service refuses is never settled, a task may hang) the task
-    processes still running are ended and the test fails."""
+    processes still running are ended and the test fails. The host's free memory
+    is taken as ample, so that the test does not depend on this machine's."""
     deadline, overdue = time.monotonic() + seconds, []
 
     def until():
@@ -78,15 +79,18 @@ def _serve(jobs, tmp_path, threads=2, seconds=300.0):
             return True
         return False
 
-    service.serve(
-        jobs,
-        "here",
-        threads=threads,
-        lock=tmp_path / "service.lock",
-        logs=tmp_path / "logs",
-        poll=0.2,
-        until=until,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(service, "headroom", lambda: 2**40)
+        patch.setattr(service, "reserve", lambda: 0)
+        service.serve(
+            jobs,
+            "here",
+            threads=threads,
+            lock=tmp_path / "service.lock",
+            logs=tmp_path / "logs",
+            poll=0.2,
+            until=until,
+        )
     assert not overdue, f"The jobs did not settle within {seconds} s."
 
 
