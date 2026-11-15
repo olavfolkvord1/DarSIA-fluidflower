@@ -61,8 +61,8 @@ class OverflowSettings:
     """Settings of the overflow reference; the ``[overflow]`` table.
 
     ``variant`` chooses the variant, and the table of that name holds its
-    settings. Tables given as mappings, as read from a TOML file, become their
-    settings.
+    settings; the configuration's loader makes the nested tables their settings
+    (:func:`darsia.presets.workflows.config.utils.settings_from_table`).
 
     """
 
@@ -85,15 +85,7 @@ class OverflowSettings:
     """The evaporation correction; without it no run is corrected."""
 
     def __post_init__(self) -> None:
-        """Turn tables given as mappings into settings; check the variant."""
-        for name, kind in (
-            ("feed", FeedSettings),
-            ("circulation", CirculationSettings),
-            ("evaporation", EvaporationSettings),
-        ):
-            table = getattr(self, name)
-            if isinstance(table, Mapping):
-                object.__setattr__(self, name, kind(**table))
+        """Check the variant and its table."""
         if self.variant not in ("feed", "circulation"):
             raise ValueError(f"The overflow variant {self.variant!r} is unknown.")
         for name in ("feed", "circulation"):

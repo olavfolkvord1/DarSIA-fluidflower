@@ -61,7 +61,7 @@ OVERFLOW = darsia.OverflowSettings(
     statuses=["Verified"],
     recipe_tolerance={"alkalinity_M": 0.03},
     variant="circulation",
-    circulation=dict(minimum_readings=3),
+    circulation=darsia.CirculationSettings(minimum_readings=3),
 )
 """Overflow settings of the tests: a circulating overflow, its weight read as is, and
 our production's recipe tolerance."""

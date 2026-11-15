@@ -1,9 +1,15 @@
 """Utility functions for TOML parsing"""
 
+import dataclasses
 import tomllib
+import types
+import typing
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 
 def _get_section(data: dict, section: str) -> dict:
@@ -227,3 +233,71 @@ def _normalize_time_string(value: float | str) -> str:
         If the input cannot be parsed as a time value.
     """
     return _format_hours(_convert_to_hours(value))
+
+
+def _settings_class(hint: Any) -> type | None:
+    """The settings class a field holds, alone or optional, or None."""
+    if isinstance(hint, type) and dataclasses.is_dataclass(hint):
+        return hint
+    if typing.get_origin(hint) in (typing.Union, types.UnionType):
+        kinds = [kind for kind in typing.get_args(hint) if kind is not type(None)]
+        if len(kinds) == 1:
+            return _settings_class(kinds[0])
+    return None
+
+
+def settings_from_table(cls: type[T], table: Mapping[str, Any]) -> T:
+    """A method's settings made from its configuration table.
+
+    Every key of the table must be a field of the settings class, and every field
+    without a default must be in the table. A table given for a field that holds
+    another settings class, e.g. the variant's table of an overflow, becomes that
+    class, by the same rule, and so does each table of a field that maps names to
+    a settings class; every other value is passed as read.
+
+    Parameters
+    ----------
+    cls : type
+        The settings class, a dataclass.
+    table : Mapping[str, Any]
+        Its table, e.g. a section of a TOML file.
+
+    Returns
+    -------
+    The settings.
+
+    Raises
+    ------
+    ValueError
+        If the table has a key the class does not know, or lacks one it needs,
+        naming them.
+
+    """
+    fields = {field.name: field for field in dataclasses.fields(cls) if field.init}
+    unknown = sorted(set(table) - set(fields))
+    missing = sorted(
+        name
+        for name, field in fields.items()
+        if name not in table
+        and field.default is dataclasses.MISSING
+        and field.default_factory is dataclasses.MISSING
+    )
+    if unknown or missing:
+        raise ValueError(
+            f"The table of {cls.__name__} has unknown keys {unknown} and lacks "
+            f"{missing}."
+        )
+    hints = typing.get_type_hints(cls)
+    values = {}
+    for name, value in table.items():
+        kind = _settings_class(hints[name])
+        if kind is not None and isinstance(value, Mapping):
+            value = settings_from_table(kind, value)
+        elif typing.get_origin(hints[name]) in (Mapping, dict):
+            entry = _settings_class(typing.get_args(hints[name])[-1])
+            if entry is not None and isinstance(value, Mapping):
+                value = {
+                    key: settings_from_table(entry, item) for key, item in value.items()
+                }
+        values[name] = value
+    return cls(**values)
