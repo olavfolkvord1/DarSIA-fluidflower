@@ -71,6 +71,7 @@ MODULES = [
     "darsia/presets/workflows/media/video.py",
     "darsia/presets/workflows/media/tiles.py",
     "darsia/presets/workflows/media/films.py",
+    "darsia/presets/workflows/export/simulator.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
