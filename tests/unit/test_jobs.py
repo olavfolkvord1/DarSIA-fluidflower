@@ -213,6 +213,48 @@ def _halting(ctx: StepContext) -> None:
 
 HALTING = Step("halting", {}, Order.FRAMES, Memory(), _halting)
 HALTING_READ = Step("halting-read", {}, Order.FRAMES, Memory(), _halting, files=_files)
+
+
+def _group_parts(selection, tables):
+    """A part per group of runs."""
+    return tuple(f"total-{name}" for name in tables["groups"])
+
+
+def _group_total(ctx: StepContext) -> None:
+    """The total of the sums of the part's group of runs."""
+    runs = ctx.tables["groups"][ctx.task.part.removeprefix("total-")]
+    total = sum(ctx.read("sums", read_values, run=run)["total"] for run in runs)
+    ctx.publish(lambda folder: _write(folder, total=total))
+
+
+def _group_of(run, tables):
+    """The part of a run's group."""
+    return next(f"total-{n}" for n, runs in tables["groups"].items() if run in runs)
+
+
+def _share(ctx: StepContext) -> None:
+    """A run's sum as a share of its group's total."""
+    total = ctx.read("group-totals", read_values)["total"]
+    own = ctx.read("sums", read_values)["total"]
+    ctx.publish(lambda folder: _write(folder, share=own / total))
+
+
+GROUP_TOTALS = Step(
+    "group-totals",
+    {"sums": Scope.ALL},
+    Order.PARTS,
+    Memory(),
+    _group_total,
+    parts=_group_parts,
+    run_part=_group_of,
+)
+SHARES = Step(
+    "shares",
+    {"sums": Scope.OWN, "group-totals": Scope.ONE},
+    Order.RUN,
+    Memory(),
+    _share,
+)
 STEPS = (
     NUMBERS,
     SUMS,
@@ -223,6 +265,8 @@ STEPS = (
     STAMPED,
     HALTING,
     HALTING_READ,
+    GROUP_TOTALS,
+    SHARES,
 )
 """The test steps, which a task process finds by their module."""
 
@@ -344,6 +388,26 @@ def test_a_step_reads_only_the_runs_its_configuration_names(tmp_path):
     other = Selection({"r1": selection.frames["r1"]}, selection.sessions)
     with pytest.raises(ValueError, match=r"\['r2'\], which are not selected"):
         create_job(jobs, steps, other, config)
+
+
+def test_a_run_reads_its_own_groups_part_and_never_another(tmp_path):
+    """A run's reader of a step in parts by one result reads the part the producer
+    names for its run, e.g. its calibration group's fit, and no other part."""
+    config, selection = _project(tmp_path)
+    config.write_text(config.read_text() + '[groups]\nb = ["r2"]\na = ["r1"]\n')
+    steps = (NUMBERS, SUMS, GROUP_TOTALS, SHARES)
+    job = create_job(tmp_path / "jobs", steps, selection, config)
+    tasks = queue.tasks(job)
+    for run, part in (("r1", "total-a"), ("r2", "total-b")):
+        keys = [i.key for i in tasks[f"shares.{run}"].inputs]
+        assert keys == [f"sums/{run}", f"group-totals/{part}"]
+        assert tasks[f"shares.{run}"].after == (f"group-totals.{part}", f"sums.{run}")
+    work(job)
+    for run, part in (("r1", "total-a"), ("r2", "total-b")):
+        description, values = _stored(tmp_path / "project", f"shares/{run}")
+        assert values["share"] == 1.0
+        read = [k for k in description["inputs"] if k.startswith("group-totals")]
+        assert read == [f"group-totals/{part}"]
 
 
 def test_an_input_made_outside_the_job_is_bound_by_its_token(tmp_path):
