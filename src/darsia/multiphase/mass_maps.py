@@ -306,15 +306,19 @@ def run_geometry(
     )
 
 
-def relative_signal(signal: np.ndarray, calibration: MassCalibration) -> np.ndarray:
+def relative_signal(
+    signal: np.ndarray, calibration: MassCalibration | darsia.RunStatisticsSettings
+) -> np.ndarray:
     """The read signal relative to the concentration curve's range, in [0, 1].
 
     Parameters
     ----------
     signal : array
         Read signal of the dissolved CO2.
-    calibration : MassCalibration
-        The curve's bottom and top.
+    calibration : MassCalibration or darsia.RunStatisticsSettings
+        The curve's bottom and top (``zero_signal``, ``saturation_signal``): a
+        calibration's, or before the calibration the run statistics' it is fitted
+        on.
 
     Returns
     -------
