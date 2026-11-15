@@ -12,6 +12,7 @@ are supported:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime
 from operator import itemgetter
@@ -48,6 +49,14 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
     -------
     Image, or list of such
         Image of collection of images.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a file does not exist.
+    OSError
+        The system's own error if a file cannot be looked up, e.g. that of a
+        share that is out.
     """
     # Monitor time for performance analysis
     tic = time.time()
@@ -67,11 +76,12 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
             tmp_path = tmp_path + list(p.glob("*"))
         path = sorted(tmp_path)
 
-    # Check if files exist
-    if isinstance(path, list):
-        assert all([p.exists() for p in path]), "Not all files exist."
-    else:
-        assert path.exists(), f"File {path} does not exist."
+    # Each file is looked up before it is read, and the system's own error rises:
+    # a file not found is a FileNotFoundError, which a reader of a just published
+    # result reads again, and a share that is out keeps its network error, which
+    # that reader rides out (darsia.utils.results.read).
+    for p in path if isinstance(path, list) else [path]:
+        os.stat(p)
 
     # Determine file type of images
     suffix = kwargs.get("suffix", None)

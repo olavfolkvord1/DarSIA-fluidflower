@@ -277,14 +277,11 @@ def test_a_rig_registers_its_photographs_and_the_step_stores_their_homography(
     assert kept.homography.dtype == np.float32 and kept.matches == found.matches
     assert stored["frame"] == frame
 
-    # A share that does not find the registration's files yet: the load raises,
-    # for the record as a file not found, which a result's read reads again.
-    for name, error in (
-        ("registration.json", FileNotFoundError),
-        ("registration_reference.npz", AssertionError),  # darsia.imread's
-    ):
+    # A share that does not find the registration's files yet: the load raises a
+    # file not found, which a result's read reads again.
+    for name in ("registration.json", "registration_reference.npz"):
         (tmp_path / "rig" / name).rename(tmp_path / f"hidden-{name}")
-        with pytest.raises(error):
+        with pytest.raises(FileNotFoundError):
             Rig.load(tmp_path / "rig")
         (tmp_path / f"hidden-{name}").rename(tmp_path / "rig" / name)
 
