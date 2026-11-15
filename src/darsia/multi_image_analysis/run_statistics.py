@@ -110,16 +110,12 @@ def sand_mean(
     """The signal averaged over ``rev`` inside each sand's dissolved CO2.
 
     Only the sand's dissolved pixels enter its mean, and only they change; the
-    signal elsewhere is kept. Computed in the dtype of the signal.
+    signal elsewhere is kept. Computed in the dtype of the signal, on the process's
+    compute backend (:func:`darsia.compute_backend`).
 
     """
-    result = signal.copy()
-    for sand_mask in sand_masks.values():
-        mask = dissolved & sand_mask
-        if mask.any():
-            weight = darsia.ScalarImage(mask.astype(result.dtype))
-            result[mask] = darsia.VolumeAveraging(rev=rev, mask=weight)(result)[mask]
-    return result
+    masks = [dissolved & sand_mask for sand_mask in sand_masks.values()]
+    return darsia.compute_backend().sand_means(signal, masks, rev)
 
 
 def _histogram(relative: np.ndarray, weight: np.ndarray, intervals: int):

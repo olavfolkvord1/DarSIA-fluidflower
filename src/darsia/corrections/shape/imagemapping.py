@@ -9,7 +9,6 @@ image is sampled. Nothing is estimated here.
 
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 import darsia
@@ -29,7 +28,8 @@ class ImageMappingCorrection(darsia.BaseCorrection):
     with a nonzero interpolation weight, or if its 2 x 2 interpolation footprint
     reaches outside the source image (this includes samples exactly on the last
     source row or column). Values are sampled in the image's floating dtype, at
-    least single precision.
+    least single precision, on the process's compute backend
+    (:func:`darsia.compute_backend`).
 
     """
 
@@ -118,22 +118,9 @@ class ImageMappingCorrection(darsia.BaseCorrection):
         invalid = ~np.isfinite(planes)
         values = np.where(invalid, 0, planes)
         indicator = invalid.astype(planes.dtype)
-        result = np.empty((*self.target_shape, planes.shape[2]), dtype=planes.dtype)
-        support = np.empty_like(result)
-        for channel in range(planes.shape[2]):
-            maps = (
-                (self.map_x, self.map_y)
-                if self.map_x.ndim == 2
-                else (self.map_x[..., channel], self.map_y[..., channel])
-            )
-            for source, target in ((values, result), (indicator, support)):
-                target[..., channel] = cv2.remap(
-                    source[..., channel],
-                    *maps,
-                    cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=np.nan,
-                )
+        backend = darsia.compute_backend()
+        result = backend.remap(values, self.map_x, self.map_y)
+        support = backend.remap(indicator, self.map_x, self.map_y)
         valid = (
             np.isfinite(result).all(axis=-1)
             & np.isfinite(support).all(axis=-1)
