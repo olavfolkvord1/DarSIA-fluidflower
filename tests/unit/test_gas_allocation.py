@@ -5,6 +5,7 @@ import tomllib
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import darsia
 
@@ -166,3 +167,46 @@ def test_end_gas_weights_the_gas_after_the_injection(tmp_path):
     )
     assert (saturation[left] == 1 - SWI).all()
     assert (labels[left] == G).all() and (labels[right] == D).all()
+
+
+def test_a_run_resumed_after_an_injection_end_equals_the_whole_run(tmp_path):
+    """Resumed at its first missing frame, after an injection-end anchor, with the
+    anchor's saved saturation: every later map and saturation is the whole run's."""
+    left, right = np.s_[20:40, 10:30], np.s_[20:40, 52:72]
+    frames = [
+        _frame(co2=[left], gas=[left]),
+        _frame(co2=[left], gas=[np.s_[22:38, 12:28]]),
+        _frame(co2=[left, right], gas=[left, right], level=0.7),
+        _frame(co2=[left, right], gas=[left, np.s_[24:36, 56:68]], level=0.7),
+        _frame(co2=[left, right], gas=[left, right], level=0.75),
+    ]
+    hours, volumes = [0.0, 0.5, 1.5, 2.0, 3.0], [None, 3e-7, 2e-7, None, 4e-7]
+    whole = _run(tmp_path, frames, hours, volumes, end_h=1.0)
+    csv = tmp_path / "protocol.csv"
+    args = (
+        frames,
+        [START + datetime.timedelta(hours=h) for h in hours],
+        darsia.Image(np.ones(SHAPE, int), dimensions=[0.06, 0.08]),
+        np.ones(SHAPE, bool),
+        1.0,
+        {1: 1.0, 2: 0.01},
+        darsia.InjectionProtocol(csv),
+        RULES,
+        np.full(SHAPE, PORE),
+        np.full(SHAPE, SWI),
+        volumes,
+        SETTINGS,
+    )
+    saved = {index: maps[2] for index, maps in enumerate(whole)}
+    resumed = list(
+        darsia.free_gas(
+            *args, gas_threshold=GAS_THRESHOLD, start=3, anchor_saturation=saved.get
+        )
+    )
+    assert len(resumed) == 2
+    for made, again in zip(whole[3:], resumed):
+        for array, other in zip(made, again):
+            np.testing.assert_array_equal(array, other)
+    assert (whole[3][0][right] == D).any()  # the anchor's end gas weighs here
+    with pytest.raises(ValueError, match="anchors' saturation"):
+        next(darsia.free_gas(*args, gas_threshold=GAS_THRESHOLD, start=3))
