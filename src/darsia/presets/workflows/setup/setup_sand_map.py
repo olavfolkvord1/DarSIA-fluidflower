@@ -76,32 +76,46 @@ def make_sand_map(config: FluidFlowerConfig) -> darsia.Image:
     ----------
     config : FluidFlowerConfig
         The configuration, with [labeling.sand_map], [rig] and
-        [corrections.mapping].
+        [corrections.mapping] or [corrections.registration].
 
     Returns
     -------
     darsia.Image
-        The labels, on the grid of the rig's image mapping.
+        The labels, on the grid of the rig's image mapping, or of its registration's
+        reference (:func:`darsia.reference_grid`).
 
     Raises
     ------
     ValueError
-        If the rig has no image mapping, or pixels inside the rig's frame lie in
-        no layer of the drawing.
+        If the rig has neither an image mapping nor a registration, or pixels
+        inside the rig's frame lie in no layer of the drawing.
 
     """
     assert config.labeling is not None and config.rig is not None
     sand_map = config.labeling.sand_map
     assert sand_map is not None and config.corrections is not None
-    if config.corrections.mapping is None:
-        raise ValueError(
-            "The sand map is placed on the run grid of the rig's image mapping; "
-            "configure [corrections.mapping]."
+    registration = config.corrections.registration
+    if registration is not None:
+        crop = registration.crop
+        grid = darsia.reference_grid(
+            registration.camera_shape,
+            None if crop is None else crop.pts_src,
+            None if crop is None else (crop.width, crop.height),
         )
-    mapping = darsia.ImageMappingCorrection()
-    mapping.load(config.corrections.mapping.path)
-    shape = mapping.target_shape
-    grid = darsia.Image(np.zeros(shape, np.uint8), **mapping.correct_metadata())
+        metadata = {"dimensions": grid.dimensions, "origin": grid.origin}
+    elif config.corrections.mapping is not None:
+        mapping = darsia.ImageMappingCorrection()
+        mapping.load(config.corrections.mapping.path)
+        shape = mapping.target_shape
+        metadata = mapping.correct_metadata()
+        grid = darsia.Image(np.zeros(shape, np.uint8), **metadata)
+    else:
+        raise ValueError(
+            "The sand map is placed on the run grid of the rig's image mapping or "
+            "registration; configure [corrections.mapping] or "
+            "[corrections.registration]."
+        )
+    shape = grid.shape[:2]
 
     drawing = SandMapDrawing.read(sand_map.drawing)
     if sand_map.adjustment:
@@ -123,4 +137,4 @@ def make_sand_map(config: FluidFlowerConfig) -> darsia.Image:
             "drawing; extend its polygons to cover the frame."
         )
 
-    return darsia.Image(labels, **mapping.correct_metadata())
+    return darsia.Image(labels, **metadata)

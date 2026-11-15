@@ -80,6 +80,7 @@ from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
+    corrected_photo,
     grid_mask,
     protocol_files,
     read_image,
