@@ -199,6 +199,56 @@ def locations_of(job: Path, record: Mapping) -> Locations:
     return Locations(project_of(job, record), record["results"], selection.sessions)
 
 
+def discard_failed(job: Path, step: Step, task: str) -> list[str]:
+    """Set aside the results a failed task's attempts stored, so that its retry
+    (:func:`darsia.jobs.queue.retry_failed`) makes them again after a mend of what
+    they are made from, e.g. a protocol or a configured file.
+
+    Only results that name this job and task are set aside, and none is deleted:
+    each is renamed beside its location (``.<name>.<token>.discarded``), never over
+    a publication. A failed task's results are accepted by no done marker, so no
+    consumer reads them. The Jobs page asks the owner before it calls this.
+
+    Parameters
+    ----------
+    job : Path
+        The job's folder.
+    step : Step
+        The task's step.
+    task : str
+        The task's name.
+
+    Returns
+    -------
+    list of str
+        The keys of the results set aside.
+
+    Raises
+    ------
+    ValueError
+        If the task is not failed.
+
+    """
+    if task not in queue.markers(job, queue.FAILED):
+        raise ValueError(f"Task {task} is not failed.")
+    record = read_job(job)
+    locations = locations_of(job, record)
+    found = []
+    for output in outputs(step, queue.tasks(job)[task]):
+        location = locations.result(
+            output.kind, run=output.run, frame=output.frame, part=output.part
+        )
+        if not results.is_complete(location):
+            continue
+        stored = results.read(location, results.read_description, committed=True)
+        if (stored.get("job"), stored.get("task")) != (record["id"], task):
+            continue
+        aside = location.with_name(f".{location.name}.{stored['token']}.discarded")
+        results.rename(location, aside)
+        found.append(output.key)
+    return found
+
+
 def _ordered(steps: Sequence[Step]) -> list[Step]:
     """The steps in an order where each comes after those whose kinds it reads."""
     left, ordered = {step.name: step for step in steps}, []
