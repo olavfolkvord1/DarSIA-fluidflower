@@ -26,18 +26,14 @@ from pathlib import Path
 
 import numpy as np
 
+import darsia
 from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext
-from darsia.presets.workflows.analysis.domain_mass import RunSeries
+from darsia.presets.workflows.analysis.domain_mass import RunSeries, read_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
-from darsia.presets.workflows.analysis.steps import (
-    DomainSettings,
-    read_domain_mass,
-    read_mass_maps,
-)
+from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
 from darsia.presets.workflows.calibration.steps import (
     MaterialSettings,
     co2_state,
-    read_maps,
     run_grid,
 )
 from darsia.presets.workflows.comparison.comparison_events import (
@@ -103,7 +99,11 @@ def _series(ctx: StepContext) -> dict:
     frame [g] by case id, and its injection protocol."""
     found = {}
     for run in ctx.selection.frames:
-        rows = ctx.read("domain-mass", read_domain_mass, run=run)
+        rows = ctx.read(
+            "domain-mass",
+            lambda f: read_domain_mass(Path(f) / DOMAIN_MASS_TABLE),
+            run=run,
+        )
         config = run_settings(ctx, run, EXPERIMENT)
         protocol = make_experiment(config).injection_protocol
         injected = {
@@ -209,8 +209,10 @@ def _distances(ctx: StepContext) -> None:
             frames[run] = None
             continue
         frame = run_frames[nearest]
-        maps = ctx.read("mass-maps", read_mass_maps, run=run, frame=frame)
-        labels = ctx.read("phase-maps", read_maps, run=run, frame=frame)["labels"]
+        maps = ctx.read("mass-maps", darsia.read_mass_maps, run=run, frame=frame)
+        labels = ctx.read("phase-maps", darsia.read_phase_maps, run=run, frame=frame)[
+            "labels"
+        ]
         frames[run] = frame_cells(
             maps,
             labels,

@@ -36,6 +36,7 @@ back as its series of masses and centres (:class:`RunSeries`).
 
 from __future__ import annotations
 
+import csv
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -236,6 +237,14 @@ def write_domain_mass(path: Path, rows: Iterable[dict]) -> None:
 
     """
     write_rows(path, rows, COLUMNS)
+
+
+def read_domain_mass(path: Path) -> list[dict]:
+    """A run's masses per domain as written (:func:`write_domain_mass`): a row per
+    frame and domain, each value as read from the table
+    (:meth:`RunSeries.from_domain_mass` reads them)."""
+    with open(path, newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
 
 
 @dataclass(frozen=True)

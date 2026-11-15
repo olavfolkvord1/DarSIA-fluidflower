@@ -50,14 +50,16 @@ Every setting is a field of :class:`CalibrationFitSettings`.
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy.optimize import least_squares, lsq_linear
 
-from darsia.multi_image_analysis.gas_statistics import GasStatistics
+from darsia.multi_image_analysis.gas_statistics import GasStatistics, SandGas
 from darsia.multi_image_analysis.run_statistics import (
     RunStatisticsSettings,
     SandHistogram,
@@ -69,6 +71,10 @@ exponential."""
 _SWI_CONDITION = 100.0
 """Above this condition number of the column-scaled pore volumes the frames cannot
 tell the sands' gas apart, and no Swi is fitted."""
+STATISTICS = "statistics.json"
+"""The file of a run's frames as the fit reads them (:func:`write_frames`)."""
+CALIBRATION = "calibration.json"
+"""The file of a stored calibration (:func:`write_calibration`)."""
 
 
 @dataclass(frozen=True)
@@ -801,3 +807,107 @@ def mass_calibrations(
         )
         for run, anchor in calibration.anchors.items()
     }
+
+
+def _write_json(folder: Path, name: str, value) -> None:
+    """Write a stored result's JSON file; NaN is refused."""
+    text = json.dumps(value, indent=1, allow_nan=False)
+    (Path(folder) / name).write_text(text, encoding="utf-8")
+
+
+def _array(values, dtype) -> list | None:
+    """An array as a list of plain numbers, or None."""
+    return None if values is None else np.asarray(values, dtype).tolist()
+
+
+def write_frames(
+    folder: Path, run: str, frames: Sequence[CalibrationFrame], dtype
+) -> None:
+    """Store a run's frames as the fit reads them, in ``folder`` (:data:`STATISTICS`).
+
+    Parameters
+    ----------
+    folder : Path
+        The result's folder.
+    run : str
+        The run.
+    frames : sequence of CalibrationFrame
+        Its frames.
+    dtype : dtype
+        The dtype of the statistics' arrays, which :func:`read_frames` restores.
+
+    """
+    name = np.dtype(dtype).name
+    rows = []
+    for frame in frames:
+        row = dataclasses.asdict(frame)
+        row["dissolved"] = {
+            str(sand): [_array(h.relative, name), _array(h.weight, name)]
+            for sand, h in frame.dissolved.items()
+        }
+        if frame.column is not None:
+            row["column"] = {
+                key: _array(getattr(frame.column, key), name)
+                for key in ("relative", "ratio", "weight")
+            }
+        rows.append(row)
+    _write_json(folder, STATISTICS, {"run": run, "dtype": name, "frames": rows})
+
+
+def read_frames(folder: Path) -> list[CalibrationFrame]:
+    """A run's stored frames as the fit reads them (:func:`write_frames`)."""
+    record = json.loads((Path(folder) / STATISTICS).read_text(encoding="utf-8"))
+    dtype = np.dtype(record["dtype"]).type
+    frames = []
+    for row in record["frames"]:
+        gas = dict(row["gas"])
+        gas["sands"] = {int(k): SandGas(**v) for k, v in gas["sands"].items()}
+        column = row["column"]
+        if column is not None:
+            column = ColumnEstimate(
+                **{key: np.asarray(value, dtype) for key, value in column.items()}
+            )
+        frames.append(
+            CalibrationFrame(
+                **{
+                    **row,
+                    "dissolved": {
+                        int(sand): SandHistogram(
+                            np.asarray(relative, dtype), np.asarray(weight, dtype)
+                        )
+                        for sand, (relative, weight) in row["dissolved"].items()
+                    },
+                    "gas": GasStatistics(**gas),
+                    "column": column,
+                }
+            )
+        )
+    return frames
+
+
+def write_calibration(
+    folder: Path,
+    calibration: Calibration,
+    masses: Mapping[str, MassCalibration],
+    predictions: Sequence[Prediction] = (),
+) -> None:
+    """Store a calibration in ``folder`` (:data:`CALIBRATION`): the fit's record,
+    the parameters of every run the mass maps read (:func:`mass_calibrations`) and,
+    for a fold, the held-out run's predictions."""
+    record = {
+        "calibration": dataclasses.asdict(calibration),
+        "mass": {run: dataclasses.asdict(value) for run, value in masses.items()},
+        "predictions": [dataclasses.asdict(p) for p in predictions],
+    }
+    _write_json(folder, CALIBRATION, record)
+
+
+def read_calibration(folder: Path) -> dict:
+    """A stored calibration's record as written (:func:`write_calibration`)."""
+    return json.loads((Path(folder) / CALIBRATION).read_text(encoding="utf-8"))
+
+
+def read_mass_calibrations(folder: Path) -> dict[str, MassCalibration]:
+    """The stored calibration's parameters of each run, as the mass maps read them."""
+    record = read_calibration(folder)
+    return {run: MassCalibration(**v) for run, v in record["mass"].items()}
