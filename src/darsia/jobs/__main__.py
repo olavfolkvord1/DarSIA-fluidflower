@@ -6,7 +6,10 @@
   own process, which its service started with the job's computing environment. It
   checks that its code is of the job's revision and that this host provides the
   job's BLAS kernel and compute backend, else it says why in its claim and exits
-  (:data:`darsia.jobs.service.REFUSED`). It sets the threads, renews the lease
+  (:data:`darsia.jobs.service.REFUSED`). The backend is the job's device class,
+  checked on this host with the job's phase-model heads
+  (:func:`darsia.backend_named`) and used for the step; each result records its
+  device. It sets the threads, renews the lease
   every :data:`darsia.utils.results.BEAT`, runs the step and marks the task done,
   naming its accepted tokens, or failed, with the traceback; the lease is not
   renewed after the step has ended, so that nothing is written into the marker
@@ -36,12 +39,20 @@ from threadpoolctl import threadpool_info, threadpool_limits
 from darsia.jobs import queue, service
 from darsia.jobs.job import locations_of, read_job, read_tables, revision
 from darsia.jobs.step import Selection, Step, StepContext, Task, table
+from darsia.multiphase.phase_model import LogisticHead, read_phase_model
 from darsia.presets.workflows.analysis import steps as analysis_steps
 from darsia.presets.workflows.calibration import steps as calibration_steps
 from darsia.presets.workflows.comparison import steps as comparison_steps
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.setup import steps as setup_steps
 from darsia.utils import results
+from darsia.utils.gpu.backend import (
+    ComputeBackend,
+    backend_named,
+    compute_backend,
+    use_compute_backend,
+)
+from darsia.utils.locations import normal_path
 
 STEPS: dict[str, Step] = {
     step.name: step
@@ -54,21 +65,13 @@ REVOKED = 4
 """Exit code of a task process whose claim was taken back."""
 
 
-BACKENDS = ("cpu",)
-"""The compute backends a task process provides."""
-
-
 def refusal(environment: Mapping) -> str | None:
-    """Why this process does not provide a job's environment, or None if it does.
+    """Why this process does not provide a job's BLAS kernel, or None if it does.
 
-    The BLAS kernel is set in the process's environment before NumPy loads; a name
-    the library does not know leaves it on its own choice, which this check finds.
-    The compute backend must be one this process provides (:data:`BACKENDS`).
+    The kernel is set in the process's environment before NumPy loads; a name the
+    library does not know leaves it on its own choice, which this check finds.
 
     """
-    backend = str(environment.get("backend", "cpu"))
-    if backend not in BACKENDS:
-        return f"This host provides the backends {list(BACKENDS)}, not the job's {backend}."
     wanted = str(environment["blas_kernel"])
     found = sorted(
         {
@@ -80,6 +83,41 @@ def refusal(environment: Mapping) -> str | None:
     if [kernel.casefold() for kernel in found] != [wanted.casefold()]:
         return f"This host runs the BLAS kernel {found}, not the job's {wanted}."
     return None
+
+
+def heads(job: Path, record: Mapping) -> tuple[LogisticHead, LogisticHead] | None:
+    """The heads of a job's phase model (``[phase_model]`` of its configuration),
+    with which a device's phase probabilities are checked; None for a job
+    without one."""
+    tables = read_tables([Path(job) / name for name in record["config"]])
+    source = tables.get("phase_model")
+    if source is None:
+        return None
+    folder = normal_path(source["folder"], locations_of(job, record).project)
+    model = read_phase_model(
+        folder, source.get("pixel_size_mm"), canvas=None, accept_canvas=True
+    )
+    return model.co2_presence, model.gas_within_co2
+
+
+def backend_of(job: Path, record: Mapping) -> ComputeBackend:
+    """A job's compute backend on this host, checked as its task starts
+    (:func:`darsia.backend_named`): the CPU, or the device of its class that gives
+    the CPU's numbers, for the phase probabilities with the job's heads.
+
+    Raises
+    ------
+    ValueError
+        If this host has no such backend, saying why.
+
+    """
+    label = str(record["environment"].get("backend", "cpu"))
+    try:
+        return backend_named(
+            label, heads=None if label == "cpu" else heads(job, record)
+        )
+    except ValueError as error:
+        raise ValueError(f"This host cannot run the job's backend {label}: {error}")
 
 
 def step_of(record: Mapping, name: str) -> Step:
@@ -112,7 +150,7 @@ def other_revision(record: Mapping, code: str | None) -> str | None:
 def context(job: Path, task: Task, token: str, code: str | None = None) -> StepContext:
     """The context of a claimed task (:class:`darsia.jobs.step.StepContext`), whose
     results record the revision of this process's code (by default looked at
-    now)."""
+    now) and the device of its compute backend."""
     record = read_job(job)
     step = step_of(record, task.step)
     config = [Path(job) / name for name in record["config"]]
@@ -133,6 +171,7 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
         record,
         functools.cache(lambda name: queue.accepted(job, name)),
         revision() if code is None else code,
+        compute_backend().device,
     )
 
 
@@ -184,6 +223,11 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     claim = queue.Claim(job, task_name, token, machine)
     code = revision()
     why = other_revision(record, code) or refusal(record["environment"])
+    if why is None:
+        try:
+            use_compute_backend(backend_of(job, record))
+        except ValueError as error:
+            why = str(error)
     if why is not None:
         service.say(why)
         try:
