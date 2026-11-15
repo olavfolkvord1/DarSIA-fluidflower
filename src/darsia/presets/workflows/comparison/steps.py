@@ -3,7 +3,8 @@
 - ``events`` answers each configured question about the selected runs' masses per
   domain, per run and per injection (:func:`event_table`).
 - ``ensemble`` summarises the selected runs' masses and centres per domain
-  (:func:`ensemble_tables`).
+  (:func:`ensemble_tables`) and draws its figures in the series' figure style
+  (:func:`ensemble_figures`).
 - ``distances`` (R9) gives, at each comparison time, the Wasserstein distance of
   every pair of selected runs in every domain, each run at its frame nearest the
   time (:func:`wasserstein_distances`); one part per time, named by the time as
@@ -50,6 +51,7 @@ from darsia.presets.workflows.comparison.ensemble import (
     ensemble_tables,
     write_tables,
 )
+from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 from darsia.presets.workflows.comparison.mass_wasserstein import (
     WassersteinSettings,
     distance_scales,
@@ -57,6 +59,7 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
     wasserstein_distances,
     wasserstein_reference,
 )
+from darsia.presets.workflows.media.style import FigureStyle
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
@@ -65,6 +68,9 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+
+FIGURES = "figures"
+"""The folder of the ensemble's figures, beside its tables."""
 
 
 def _distance_cell_bytes(tables, run, context) -> int:
@@ -171,7 +177,8 @@ def _events(ctx: StepContext) -> None:
 
 
 def _ensemble(ctx: StepContext) -> None:
-    """The ensemble's tables of the selected runs' domains."""
+    """The ensemble's tables of the selected runs' domains, and their figures in
+    :data:`FIGURES`."""
     runs = [
         EnsembleRun(
             rows,
@@ -181,8 +188,16 @@ def _ensemble(ctx: StepContext) -> None:
         )
         for rows, injected, protocol in _series(ctx).values()
     ]
-    tables = ensemble_tables(runs, _domains(ctx), ctx.settings["ensemble"])
-    ctx.publish(lambda folder: write_tables(Path(folder), tables))
+    settings = ctx.settings["ensemble"]
+    tables = ensemble_tables(runs, _domains(ctx), settings)
+
+    def write(folder):
+        write_tables(Path(folder), tables)
+        figures = Path(folder) / FIGURES
+        figures.mkdir()
+        ensemble_figures(figures, tables, runs, settings, ctx.settings["style"])
+
+    ctx.publish(write)
 
 
 def named_times(times_h: Sequence[float]) -> dict[str, float]:
@@ -315,12 +330,12 @@ ENSEMBLE = Step(
     Order.PARTS,
     Memory(camera_bytes=14.0),
     _ensemble,
-    {"ensemble": EnsembleSettings, "domains": DomainSettings},
+    {"ensemble": EnsembleSettings, "domains": DomainSettings, "style": FigureStyle},
     sections=EXPERIMENT,
     files=protocol_files,
     domains=True,
 )
-"""The ensemble's tables of the selected runs."""
+"""The ensemble's tables and figures of the selected runs."""
 DISTANCES = Step(
     "distances",
     {"rig": Scope.ALL, "mass-maps": Scope.ALL, "phase-maps": Scope.ALL},
