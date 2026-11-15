@@ -9,6 +9,7 @@ from scipy.special import erf
 from darsia.presets.workflows.setup.sand_map import SandMapDrawing, partition_faults
 from darsia.presets.workflows.setup.sand_map_dye_edge import (
     DyeEdgeSettings,
+    dye_edge_stretches,
     measure_dye_edge,
     snap_to_dye_edge,
     static_boundaries,
@@ -44,6 +45,8 @@ SETTINGS = DyeEdgeSettings(
     fewest_stations=5,
     crossing_mm=50.0,
     simplify_mm=0.05,
+    tolerance_mm=0.3,
+    length_mm=1.0,
 )
 """The settings a rig's side walls were drawn with."""
 
@@ -144,6 +147,18 @@ def _measured(drawing, photograph, settings=SETTINGS, static=(1,)):
     (chain,) = static_boundaries(drawing, set(static))
     return measure_dye_edge(
         drawing, chain, photograph, RIG_TO_IMAGE, settings, clip_level=1.0
+    )
+
+
+def _with(drawing: SandMapDrawing, layer: int, corners, first=False):
+    """The drawing with one more polygon, a rectangle (x0, y0, x1, y1 in mm) of the
+    layer, drawn first or last."""
+    x0, y0, x1, y1 = corners
+    square = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]) / 1000
+    new = (layer, tuple(range(len(drawing.anchors), len(drawing.anchors) + 4)))
+    polygons = (new,) + drawing.polygons if first else drawing.polygons + (new,)
+    return replace(
+        drawing, anchors=np.vstack([drawing.anchors, square]), polygons=polygons
     )
 
 
@@ -737,3 +752,72 @@ def test_snapping_refuses_an_edge_measured_on_other_anchors(wall):
     )
     with pytest.raises(ValueError, match=r"layers \[9\], drawn on top"):
         snap_to_dye_edge(over, edge, SETTINGS)
+
+
+def test_the_check_lists_where_a_boundary_leaves_the_edge(wall):
+    """The check measures a drawing's boundary along the normals through the edge,
+    as the rasteriser shows the layers, from where the porous layers begin, and
+    lists the stretches beyond the tolerance, of one sign, over at least the
+    length."""
+    drawing, edge = wall
+    patched = _with(drawing, 3, (6.4, 11, 6.6, 13))
+    (short,) = dye_edge_stretches(patched, edge, {1}, SETTINGS)
+    assert (short.first, short.last) == (0, len(edge.along) - 1)
+    assert short.layers == (2, 3)
+    corners = drawing.anchors[[1, 2, 3, 4, 5]]
+    drawn = np.interp(edge.points[:, 1], corners[:, 1], corners[:, 0])
+    assert abs(short.mean - np.mean(drawn - edge.points[:, 0])) < 1e-5
+    assert abs(short.largest - np.min(drawn - edge.points[:, 0])) < 1e-5
+
+    fine, moves, _removed = snap_to_dye_edge(
+        drawing, edge, replace(SETTINGS, simplify_mm=0.0)
+    )
+    assert dye_edge_stretches(fine, edge, {1}, SETTINGS) == []
+    unpainted = replace(fine, polygons=fine.polygons[1:])
+    assert dye_edge_stretches(unpainted, edge, {1}, SETTINGS) == []
+
+    at = {m.anchor: m.end for m in moves if m.start is None}
+    k = int(np.argmin(np.abs(edge.points[:, 1] - 0.019)))
+    on = [
+        next(a for a, end in at.items() if np.allclose(end, edge.points[n]))
+        for n in range(k, k + 4)
+    ]
+    shift = (8e-4, 8e-4, -6e-4, -6e-4)
+    bumps = {a: (at[a][0] + d, at[a][1]) for a, d in zip(on, shift)}
+    bumped = fine.moved(bumps)
+    wide, narrow = dye_edge_stretches(bumped, edge, {1}, SETTINGS)
+    assert (wide.first, wide.last, wide.layers) == (k, k + 1, (3,))
+    assert abs(wide.mean - 8e-4) < 2e-5 and abs(wide.largest - 8e-4) < 2e-5
+    assert (narrow.first, narrow.last) == (k + 2, k + 3)
+    assert abs(narrow.mean + 6e-4) < 2e-5
+    for change in ({"tolerance_mm": 1.0}, {"length_mm": 1.5}):
+        assert dye_edge_stretches(bumped, edge, {1}, replace(SETTINGS, **change)) == []
+    one = fine.moved({on[0]: bumps[on[0]]})
+    assert dye_edge_stretches(one, edge, {1}, SETTINGS) == []
+
+    rows = (edge.points[:, 1] > 0.0111) & (edge.points[:, 1] < 0.0129)
+    smaller = _with(fine, 2, (5.5, 11, 8, 13), first=True)
+    (under,) = dye_edge_stretches(smaller, edge, {1}, SETTINGS)
+    assert under.layers == (2,) and rows[under.first : under.last + 1].all()
+    assert abs(under.largest + (edge.points[rows, 0] - 0.0055).max()) < 1e-5
+    (over,) = dye_edge_stretches(_with(fine, 9, (5.5, 26, 8, 28)), edge, {1}, SETTINGS)
+    assert over.layers == (3,) and over.mean > 5e-4
+    with pytest.raises(ValueError, match="frame"):
+        dye_edge_stretches(replace(drawing, frame=None), edge, {1}, SETTINGS)
+
+
+def test_the_check_joins_a_stretch_across_a_closed_boundarys_first_station(disc):
+    """Round a closed boundary, a stretch that passes its first station is one
+    stretch, from a station after its last one, just as one elsewhere."""
+    drawing, edge = disc
+    fine, _moves, _removed = snap_to_dye_edge(
+        drawing, edge, replace(ROUND, simplify_mm=0.0)
+    )
+    assert dye_edge_stretches(fine, edge, {1}, ROUND) == []
+    count = len(edge.along)
+    for where in ([10, 11], [count - 1, 0]):
+        nearer = edge.offset.copy()
+        nearer[where] -= 6e-4
+        (stretch,) = dye_edge_stretches(fine, replace(edge, offset=nearer), {1}, ROUND)
+        assert (stretch.first, stretch.last) == (where[0], where[-1])
+        assert abs(stretch.mean - 6e-4) < 2e-5

@@ -501,6 +501,26 @@ def _project(points: np.ndarray, rig_to_grid: np.ndarray) -> np.ndarray:
     return projected[:, :2] / projected[:, 2:]
 
 
+def _fill_order(drawing: SandMapDrawing) -> list[int]:
+    """Indices of a drawing's polygons in the order they are filled, so that a later
+    one wins where they overlap: the larger polygon (by its area in the rig, in
+    double precision) first, those drawn on top last, and drawing order on ties."""
+    anchors = np.asarray(drawing.anchors, dtype=np.float64)
+
+    def area(indices: tuple[int, ...]) -> float:
+        """Area of a polygon in the rig (shoelace formula)."""
+        x, y = anchors[list(indices), 0], anchors[list(indices), 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    return sorted(
+        range(len(drawing.polygons)),
+        key=lambda k: (
+            drawing.polygons[k][0] in drawing.on_top,
+            -area(drawing.polygons[k][1]),
+        ),
+    )
+
+
 def _fill(target: np.ndarray, points: np.ndarray, value: int) -> None:
     """Fill a polygon given in pixel coordinates at 1/16 pixel."""
     fixed = np.rint(points * (1 << _SHIFT)).astype(np.int32).reshape(-1, 1, 2)
@@ -580,18 +600,9 @@ def rasterize_sand_map(
     inside = inside.astype(bool)
 
     pixels = _project(drawing.anchors.astype(dtype, copy=False), rig_to_grid)
-    anchors = np.asarray(drawing.anchors, dtype=np.float64)
-
-    def area(indices: tuple[int, ...]) -> float:
-        """Area of a polygon in the rig (shoelace formula)."""
-        x, y = anchors[list(indices), 0], anchors[list(indices), 1]
-        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
     labels = np.zeros(shape, dtype=np.uint8)
-    for layer, indices in sorted(
-        drawing.polygons,
-        key=lambda polygon: (polygon[0] in drawing.on_top, -area(polygon[1])),
-    ):
+    for k in _fill_order(drawing):
+        layer, indices = drawing.polygons[k]
         _fill(labels, pixels[list(indices)], layer)
     labels[~inside] = 0
 
