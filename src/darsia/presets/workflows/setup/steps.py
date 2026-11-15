@@ -188,20 +188,15 @@ def _sand_map(ctx: StepContext) -> None:
     ctx.publish(lambda folder: labels.save(Path(folder) / "labels.npz"))
 
 
-def grid_depth(
-    rig: Rig,
-    measurements: Path,
-    grid_to_rig: Sequence[Sequence[float]] | np.ndarray | None = None,
-) -> darsia.Image:
+def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
     """A rig's depth by the depth rule of its measurements: linear inside their
     hull and the nearest one outside (:func:`darsia.interpolate_linear_in_hull`),
     in the precision of the rig's grid, that of its pixel areas, as our
-    production's mass evaluated it on its run grid. With the run's measured model
-    of its grid, the rule is evaluated at each pixel's position on the rig: the
-    model applied to its column and row (whole numbers) in the grid's precision
-    (:func:`darsia.project_xy`), as our production's mass placed its pixels in
-    metres; without one, at the pixel centres of the grid in metres
-    (:func:`darsia.pixel_centres`, cast to the grid's precision).
+    production's mass evaluated it on its run grid, at each pixel's position on
+    the rig (:func:`darsia.grid_positions` by the rig's measured model of its
+    grid, ``Rig.grid_to_rig``, cast to the grid's precision): the model at the
+    pixel's column and row, as our production's mass placed its pixels in metres,
+    or without one the pixel centres.
 
     Parameters
     ----------
@@ -209,9 +204,6 @@ def grid_depth(
         The rig, on its run grid.
     measurements : Path
         The depth measurements' table: ``x``, ``y`` [m] and :data:`DEPTH`.
-    grid_to_rig : array, optional
-        The run's measured homography from its grid's pixels to rig metres
-        (:func:`grid_model`).
 
     Returns
     -------
@@ -222,16 +214,8 @@ def grid_depth(
     table = pd.read_csv(measurements)
     columns = ["x" if "x" in table else "X", "y" if "y" in table else "Y", DEPTH]
     dtype = rig.pixel_area.img.dtype
-    if grid_to_rig is None:
-        x, y = darsia.pixel_centres(rig.baseline)
-        xx, yy = np.meshgrid(x, y)
-    else:
-        rows, cols = rig.baseline.img.shape[:2]
-        xx, yy = darsia.project_xy(
-            np.asarray(grid_to_rig, dtype),
-            np.arange(cols, dtype=dtype)[None, :],
-            np.arange(rows, dtype=dtype)[:, None],
-        )
+    positions = darsia.grid_positions(rig.baseline, rig.grid_to_rig, dtype)
+    xx, yy = positions.x, positions.y
     points = np.column_stack((xx.ravel(), yy.ravel()))
     values, _ = darsia.interpolate_linear_in_hull(
         tuple(table[c].to_numpy() for c in columns), points.astype(dtype)
@@ -252,6 +236,32 @@ def grid_model(tables: Mapping[str, Any]) -> list[list[float]] | None:
     """A run's measured model of its grid, the homography from its grid's pixels
     to rig metres (``[labeling.sand_map] grid_to_rig``), if it has one."""
     return tables.get("labeling", {}).get("sand_map", {}).get("grid_to_rig")
+
+
+def grid_canvas(tables: Mapping[str, Any]) -> darsia.MeasurementCanvas | None:
+    """The canvas a run's pixels were measured on, in its grid's pixels
+    (``[labeling.sand_map] canvas_origin``, the column and row of its first
+    pixel, and ``canvas_shape``, its rows and columns), if it has one.
+
+    Raises
+    ------
+    ValueError
+        If one of the two is given without the other, or a canvas without the
+        grid's measured model.
+
+    """
+    table = tables.get("labeling", {}).get("sand_map", {})
+    origin, shape = table.get("canvas_origin"), table.get("canvas_shape")
+    if origin is None and shape is None:
+        return None
+    if origin is None or shape is None or table.get("grid_to_rig") is None:
+        raise ValueError(
+            "[labeling.sand_map] canvas_origin and canvas_shape go together, with "
+            "grid_to_rig."
+        )
+    return darsia.MeasurementCanvas(
+        (int(origin[0]), int(origin[1])), (int(shape[0]), int(shape[1]))
+    )
 
 
 def _grid_to_rig(tables: Mapping[str, Any], grid: darsia.Image | None) -> np.ndarray:
@@ -332,21 +342,35 @@ def _material_reference(
 
 def _rig(ctx: StepContext) -> None:
     """The run's rig, with its sand map as the labels and their facies, fitted on
-    its reference run's grid where the configuration names one, and with the depth
-    rule evaluated on its grid, by its measured model where it has one, where the
-    run's configuration chooses it."""
+    its reference run's grid where the configuration names one, and with the run's
+    measured model of its grid (``Rig.grid_to_rig``) and the canvas its pixels were
+    measured on (``Rig.measurement_canvas``), by which the depth rule is evaluated
+    on its grid where the run's configuration chooses it. The model is that of the
+    sand map's grid, so a rig on another grid (e.g. scaled to whole metric cells)
+    with a model is refused, as is a canvas that does not hold the grid."""
     run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
+    sand_map = darsia.imread(labels)
     with TemporaryDirectory() as folder:
         reference = Path(folder) / "reference"
-        made = _material_reference(ctx, run, darsia.imread(labels), reference)
+        made = _material_reference(ctx, run, sand_map, reference)
         config = run_settings(ctx, run, list_required_sections(setup_rig), made)
         facies = Path(folder) / "facies.npz"
-        make_facies(config, darsia.imread(labels)).save(facies)
+        make_facies(config, sand_map).save(facies)
         rig = make_rig(Rig, config, labels=labels, facies=facies)
+    rig.grid_to_rig = grid_model(run_tables(ctx.tables, run))
+    if rig.grid_to_rig is not None and rig.baseline.img.shape[:2] != sand_map.shape[:2]:
+        raise ValueError(
+            "[labeling.sand_map] grid_to_rig is the measured model of the sand "
+            "map's grid; the rig's grid is another one."
+        )
+    rig.measurement_canvas = grid_canvas(run_tables(ctx.tables, run))
+    if rig.measurement_canvas is not None and not rig.measurement_canvas.holds(
+        *sand_map.shape[:2]
+    ):
+        raise ValueError("[labeling.sand_map] the canvas does not hold the grid.")
     if config.depth.interpolation == "triangulation":
-        model = grid_model(run_tables(ctx.tables, run))
-        rig.depth = grid_depth(rig, Path(config.depth.measurements), model)
+        rig.depth = grid_depth(rig, Path(config.depth.measurements))
         rig.setup_geometry()
     ctx.publish(lambda folder: rig.save(Path(folder)))
 
