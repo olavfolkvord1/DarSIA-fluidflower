@@ -14,6 +14,14 @@ from darsia.presets.workflows.media.display_mean import (
     pooled_mean,
     shown_values,
 )
+from darsia.presets.workflows.media.layouts import (
+    SEPARATOR,
+    compose_grid,
+    compose_pyramid,
+    grid_layout,
+    held,
+    pyramid_layout,
+)
 from darsia.presets.workflows.media.panels import (
     PhotographSettings,
     graph_tile,
@@ -257,3 +265,96 @@ def test_the_graph_marks_the_frame_on_shared_axes():
 
     assert axes == ((0.0, 4 * 1.03), (0.0, 0.4 * 1.05))
     assert lines[1] > lines[0] + 50
+
+
+# -- layouts -----------------------------------------------------------------------
+
+
+def solid(colour, size=(112, 61)):
+    """A BGR tile of one colour."""
+    tile = np.empty((size[1], size[0], 3), np.uint8)
+    tile[...] = colour
+    return tile
+
+
+def centre(frame, cell):
+    """The pixel at a cell's centre."""
+    x, y, width, height = cell
+    return frame[y + height // 2, x + width // 2]
+
+
+def test_pyramid_and_grid_layouts():
+    """A pyramid: one cell centred on top of two that fill the frame's width, all of
+    one size. A grid: every run's cell, the largest that fit, beside a title column.
+    Each tile lands in its cell; a held tile is greyed, a missing one empty; a graph
+    below the top has its key in its corner."""
+    pyramid = pyramid_layout((1920, 1080), 1120 / 610)
+    top, left, right = pyramid.top, pyramid.left_cell, pyramid.right_cell
+
+    assert top[2:] == left[2:] == right[2:] == (958, 522)
+    assert left[0] + left[2] + SEPARATOR == right[0] and left[1] == right[1]
+    assert left[0] == 1920 - right[0] - right[2] and left[1] + left[3] == 1080
+    assert top[0] == (1920 - top[2]) // 2 and top[1] + top[3] + SEPARATOR == left[1]
+
+    grid = grid_layout(37, 1120 / 610, (3840, 2160))
+    cells = np.zeros((2160, 3840), int)
+    for x, y, width, height in grid.cells:
+        cells[y : y + height, x : x + width] += 1
+    assert (grid.columns, grid.rows, grid.tile) == (6, 7, (563, 306))
+    assert cells.max() == 1 and grid.side[0] >= max(x + w for x, _, w, _ in grid.cells)
+
+    colours = [(200, 30, 30), (30, 200, 30), (30, 30, 200)]
+    small = pyramid_layout((640, 360), 112 / 61)
+    frame = compose_pyramid(
+        [
+            (solid(colours[0]), False, ""),
+            (solid(colours[1]), True, "held"),
+            (None, True, ""),
+        ],
+        ["Mass graph", "Corrected image", "Total CO₂ mass (g/L)"],
+        small,
+        lines=["R1", "Elapsed 1.00 h"],
+        style=STYLE,
+        graph=0,
+        scale=(1.7, "g/L"),
+    )
+    np.testing.assert_array_equal(centre(frame, small.top), colours[0])
+    np.testing.assert_array_equal(
+        centre(frame, small.left_cell), held(solid(colours[1]))[0, 0]
+    )
+    np.testing.assert_array_equal(centre(frame, small.right_cell), bgr(STYLE.empty))
+    lower = compose_pyramid(
+        [
+            (solid(colours[1]), False, ""),
+            (solid(colours[0]), False, ""),
+            (None, True, ""),
+        ],
+        ["Corrected image", "Mass graph", "Total CO₂ mass (g/L)"],
+        small,
+        lines=["R1"],
+        style=STYLE,
+        graph=1,
+        scale=None,
+    )
+    x, y, width, _height = small.left_cell
+    corner = lower[y + 8 : y + 20, x + width - 40 : x + width - 8]
+    assert (np.abs(corner.astype(int) - colours[0]).max(axis=2) > 60).mean() > 0.5
+
+    runs = grid_layout(3, 112 / 61, (960, 360))
+    frame = compose_grid(
+        {
+            "r1": (solid(colours[0]), False, ""),
+            "r2": (None, True, ""),
+            "r3": (solid(colours[2]), True, ""),
+        },
+        runs,
+        lines=["Total CO₂ mass"],
+        style=STYLE,
+        graph=False,
+        scale=(1.7, "g/L"),
+    )
+    np.testing.assert_array_equal(centre(frame, runs.cells[0]), colours[0])
+    np.testing.assert_array_equal(centre(frame, runs.cells[1]), bgr(STYLE.empty))
+    np.testing.assert_array_equal(
+        centre(frame, runs.cells[2]), held(solid(colours[2]))[0, 0]
+    )
