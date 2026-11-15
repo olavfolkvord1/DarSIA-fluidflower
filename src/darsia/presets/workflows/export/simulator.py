@@ -1,7 +1,8 @@
 """Simulator export: a series' sand geometry, protocols and mass maps as plain files.
 
 A simulator reads the rig on a grid of metric cells: which sand lies in each cell,
-its porosity and depth, and the volumes that hold the CO2.
+its porosity and depth, and the volumes that hold the CO2. This module writes that
+package for the runs of a series (:func:`write_simulator_package`).
 
 **Geometry.** The series' sand-map drawing (:class:`SandMapDrawing`) is filled on
 the export canvas, a grid of the rig's measured inner frame in rig metres (the frame
@@ -23,26 +24,79 @@ simulator's porous domain is completed from it (:func:`complete_geometry`):
 
 The completed domain is scaled onto metric cells by the one scaling method
 (:func:`darsia.metric_cells`; areas and volumes summed in double precision by
-:func:`darsia.cell_sums`), per cell size (:func:`geometry_cells`). The arrays are
-written with their rows from the floor up (y increasing) and their columns from the
-left (x increasing), the origin at the rig's lower left inner corner, as a
-simulator's grid runs.
+:func:`darsia.cell_sums`), per cell size (:func:`geometry_cells`).
+
+**Each run's own geometry.** A run whose sand has settled has an adjustment, the
+anchors it moves (:meth:`SandMapDrawing.moved`). Its geometry is computed from its
+own drawing and written as its own; the other runs share the common geometry, and
+the README names the runs that differ.
+
+**Protocols.** Each run's injection, pressure and temperature, and overflow tables
+are copied as their files hold them, the overflow table in the chosen columns.
+Where the run's scale readings are usable, the displaced water at each reading
+(:func:`darsia.displaced_volume`) is written beside them, on the time axis of the
+readings' own injection start. A run without usable readings of its own borrows the
+curve of a donor by the rule of the mass maps' estimate (:func:`darsia.ranked_donors`):
+of the runs it may borrow from, e.g. its calibration's fit runs, those with usable
+readings, its sand map and a recipe within the overflow's tolerance, the one nearest
+in atmospheric pressure; without one, the run nearest in pressure alone. The package
+says that the curve is borrowed, from which run, and when no run matched its sand
+map and recipe.
+
+**Properties.** The facies table and the depth measurements as given, and the
+reference conditions of the mass flow controller with the gas density at them.
+
+**Mass maps** (optional). A run's mass maps on the same cells
+(:class:`darsia.MassCopy`).
+
+Every table is written by the analyses' one CSV writer (:func:`write_rows`), so that
+a number keeps all its digits. The arrays are written with their rows from the
+floor up (y increasing) and their columns from the left (x increasing), the origin
+at the rig's lower left inner corner, as a simulator's grid runs.
 
 """
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from __future__ import annotations
+
+import csv
+import json
+import shutil
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import openpyxl
+import pandas as pd
 
 import darsia
+from darsia.presets.workflows.analysis.domains import write_rows
 from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
     rasterize_sand_map,
     rig_grid,
 )
 
+FORMAT = "darsia-simulator-package"
+"""Format of the package's manifest."""
+ORIGIN = "injection_start"
+"""Column of an overflow table holding the injection start of its scale readings,
+from which their times are counted."""
+UNMATCHED = "no run with its sand map and recipe; the run nearest in pressure alone"
+"""Why a run borrows its overflow curve from a run of another sand map or recipe."""
+NO_PRESSURE = (
+    "the runs with its sand map and recipe lack atmospheric pressure over the "
+    "comparison window"
+)
+"""Why a run borrows no overflow curve although runs of its sand map and recipe have
+one, as the mass maps' estimate then has none."""
+NO_DONOR = (
+    "no run it may borrow from has usable readings and atmospheric pressure over the "
+    "comparison window"
+)
+"""Why a run borrows no overflow curve at all."""
 UNITS = {
     "facies_majority": "facies id",
     "facies_majority_area_fraction": "1 of the domain area",
@@ -63,8 +117,27 @@ UNITS = {
 
 
 @dataclass(frozen=True)
+class FlowReference:
+    """Reference conditions of the mass flow controller of the injection."""
+
+    gas: str
+    """The injected gas."""
+    flow_unit: str
+    """Unit of the controller's flow rates, e.g. mL/min at the reference."""
+    reference_temperature_c: float
+    """Reference temperature [Celsius] of the flow rates."""
+    reference_pressure_hpa: float
+    """Reference pressure [hPa] of the flow rates."""
+
+
+@dataclass(frozen=True)
 class SimulatorExportSettings:
-    """Settings of the simulator export; the ``[export.simulator]`` table."""
+    """Settings of the simulator export; the ``[export.simulator]`` table.
+
+    The flow reference, given as a mapping as read from a TOML file, becomes its
+    record.
+
+    """
 
     porous_facies: Sequence[int]
     """Facies of the sand, porous media and seals, which make the porous domain."""
@@ -81,6 +154,75 @@ class SimulatorExportSettings:
     precision: Literal["float32", "float64"]
     """Precision of the package's arrays; areas and volumes are summed in double
     precision."""
+    overflow_columns: Sequence[str]
+    """Columns of a run's overflow table written to the package, in this order."""
+    flow_reference: FlowReference
+    """Reference conditions of the mass flow controller."""
+    notes: Sequence[str] = ()
+    """Paragraphs the README adds about the series' package, e.g. how an earlier
+    package of the series differs."""
+
+    def __post_init__(self) -> None:
+        """Turn a flow reference given as a mapping into its record."""
+        if isinstance(self.flow_reference, Mapping):
+            object.__setattr__(
+                self, "flow_reference", FlowReference(**self.flow_reference)
+            )
+
+
+@dataclass(frozen=True)
+class MassFrames:
+    """A run's mass maps, frame by frame, with the run's geometry."""
+
+    geometry: darsia.RunGeometry
+    """The run's geometry (:func:`darsia.run_geometry`)."""
+    frames: Iterable[tuple[str, darsia.SimpleMassAnalysisResults, np.ndarray]]
+    """Each frame's name, its mass maps and its phase map."""
+
+
+@dataclass(frozen=True)
+class SimulatorRun:
+    """A run of the package: its protocols, its adjustment and its mass maps."""
+
+    injection: Path | tuple[Path, str]
+    """Its injection protocol: a CSV file, or a workbook and its sheet."""
+    pressure_temperature: Path | tuple[Path, str]
+    """Its pressure and temperature protocol, likewise."""
+    recipe: Mapping[str, float]
+    """Its chemistry, e.g. its alkalinity and indicator concentrations, which a run
+    it borrows an overflow curve from shares within the overflow's tolerance; it
+    holds every entry the tolerance compares."""
+    overflow: Path | tuple[Path, str] | None = None
+    """Its overflow table with the scale readings, likewise; None without one."""
+    donors: Sequence[str] | None = None
+    """The runs it may borrow an overflow curve from, e.g. the fit runs of its
+    calibration, as the mass maps' estimate does; None for every run of the
+    package. Those the package lacks are named in its manifest."""
+    adjustment: Mapping[int, Sequence[float]] | None = None
+    """The anchors its adjustment moves, by index, for a run whose sand has settled
+    (:func:`read_moved_anchors`); None for the common drawing."""
+    mass: MassFrames | None = None
+    """Its mass maps, if the package holds them."""
+
+
+@dataclass(frozen=True)
+class SimulatorSeries:
+    """What the runs of a series share in the package."""
+
+    drawing: SandMapDrawing
+    """The common sand-map drawing."""
+    facies_of_layer: Mapping[int, int]
+    """Facies of each layer of the drawing, e.g. the ``[facies]`` groups."""
+    canvas: darsia.Image
+    """Depth [m] of the rig on the export canvas, a grid of the rig's inner frame in
+    rig metres, e.g. the rig's depth map."""
+    facies_properties: Path
+    """The facies table (CSV): ``id`` and ``porosity`` of each facies, with any
+    further columns, copied as it is."""
+    reference_density: float
+    """Density [kg/m3] of the gas at the flow controller's reference."""
+    depth_measurements: Path | None = None
+    """The measurements the depth was made from, copied as they are; None for none."""
 
 
 @dataclass(frozen=True)
@@ -399,3 +541,550 @@ def geometry_cells(
     }
     arrays["drawn_behind"] = np.nan_to_num(arrays["drawn_behind_area_fraction"]) > 0
     return {name: arrays[name] for name in UNITS}
+
+
+def _table(path: Path | tuple[Path, str]) -> list[list]:
+    """A protocol's table as its file holds it, header first: a CSV file, or a
+    workbook's sheet (its first without a name); an empty cell is ''."""
+    path, sheet = (
+        (path[0], path[1]) if isinstance(path, (list, tuple)) else (path, None)
+    )
+    if Path(path).suffix.lower() == ".csv":
+        with Path(path).open(newline="", encoding="utf-8-sig") as stream:
+            return list(csv.reader(stream))
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = (book[sheet] if sheet is not None else book.worksheets[0]).iter_rows(
+            values_only=True
+        )
+        return [["" if value is None else value for value in row] for row in rows]
+    finally:
+        book.close()
+
+
+def _write_table(path: Path, rows: list[list], columns: Sequence | None = None) -> int:
+    """Write a table's rows, in the given columns of its header (all without), by the
+    one CSV writer; the number of rows below the header."""
+    header = [str(name) for name in rows[0]]
+    if len(set(header)) != len(header):
+        raise ValueError(f"{path.name}: the table repeats a column name: {header}")
+    columns = header if columns is None else list(columns)
+    missing = [name for name in columns if name not in header]
+    if missing:
+        raise ValueError(f"{path.name}: the table has no column {missing}")
+    uneven = [i for i, row in enumerate(rows[1:], start=2) if len(row) != len(header)]
+    if uneven:
+        raise ValueError(
+            f"{path.name}: rows {uneven} have another number of cells than the "
+            f"header's {len(header)}."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = [dict(zip(header, row)) for row in rows[1:]]
+    write_rows(
+        path, ({name: row[name] for name in columns} for row in records), columns
+    )
+    return len(records)
+
+
+def _reviewed_overflow(
+    path: Path | tuple[Path, str], rows: list[list], overflow: darsia.OverflowSettings
+) -> tuple[datetime, darsia.DisplacedVolume, list[dict]]:
+    """The displaced water at each scale reading of a run, counted from the readings'
+    own injection start (:data:`ORIGIN`): that start, the displaced volume, and the
+    rows of its curve, none where the readings are not usable."""
+    column = [str(name) for name in rows[0]].index(ORIGIN)
+    origins = {row[column] for row in rows[1:]} - {""}
+    if len(origins) != 1:
+        raise ValueError(f"The overflow table needs one {ORIGIN}; it has {origins}")
+    origin = datetime.fromisoformat(str(origins.pop()))
+    times, weights = darsia.OverflowProtocol(path).readings(
+        origin, list(overflow.statuses)
+    )
+    volume = darsia.displaced_volume(times, weights, overflow)
+    if volume.reasons:
+        return origin, volume, []
+    curve = [
+        dict(time_from_injection_h=t, weight_g=w, estimated_displaced_water_ml=v)
+        for t, w, v in zip(volume.times_h, weights, volume.volume_ml)
+    ]
+    return origin, volume, curve
+
+
+def _donor_run(
+    run: SimulatorRun,
+    sand_map: str,
+    injection: darsia.InjectionProtocol,
+    volume: darsia.DisplacedVolume | None,
+) -> darsia.OverflowRun:
+    """A run as the donor ranking compares it (:func:`darsia.ranked_donors`): its
+    sand map and recipe, its atmospheric pressure in hours from its injection start,
+    and the first start and last end of its injection at a positive rate."""
+    start = injection.df["start"].min()
+    pressure = darsia.PressureTemperatureProtocol(run.pressure_temperature).df
+    hours = ((pressure["datetime"] - start).dt.total_seconds() / 3600).to_numpy()
+    active = injection.df[injection.df["rate_kg_s"] > 0]
+    window = (
+        (active["start"].min() - start).total_seconds() / 3600,
+        (active["end"].max() - start).total_seconds() / 3600,
+    )
+    return darsia.OverflowRun(
+        sand_map,
+        dict(run.recipe),
+        hours,
+        pressure["pressure_bar"].to_numpy(),
+        window,
+        volume,
+    )
+
+
+def _check_pressure(name: str, run: darsia.OverflowRun) -> None:
+    """Refuse a run's atmospheric pressure record that the donor ranking cannot
+    compare: fewer than two times, times not increasing, or a pressure that is not
+    finite and positive."""
+    times, pressure = run.pressure_h, run.pressure_bar
+    if (
+        times.size < 2
+        or not np.isfinite(times).all()
+        or not np.isfinite(pressure).all()
+        or (pressure <= 0).any()
+        or (np.diff(times) <= 0).any()
+    ):
+        raise ValueError(
+            f"The atmospheric pressure record of {name} needs two or more increasing "
+            "times and finite, positive pressures to rank overflow donors."
+        )
+
+
+def _ranked_donors(
+    name: str, pool: Mapping[str, darsia.OverflowRun], overflow: darsia.OverflowSettings
+) -> tuple[list[str], str | None]:
+    """A run's donors by the mass maps' rule among a pool (:func:`darsia.ranked_donors`)
+    and the reason for a fallback or for none.
+
+    The runs of its sand map and recipe come first, nearest in pressure. Where some
+    match it but none has atmospheric pressure over the comparison window, it has no
+    donor (:data:`NO_PRESSURE`), as the mass maps' estimate has none. Where none
+    matches it, the runs nearest in pressure alone are its donors
+    (:data:`UNMATCHED`), and without those it has none (:data:`NO_DONOR`).
+    """
+    donors = darsia.ranked_donors(name, pool, overflow)
+    if donors:
+        return donors, None
+    own = pool[name]
+    # On the run's own pressure record, every run that matches it ranks.
+    alike = {
+        key: replace(run, pressure_h=own.pressure_h, pressure_bar=own.pressure_bar)
+        for key, run in pool.items()
+    }
+    if darsia.ranked_donors(name, alike, overflow):
+        return [], NO_PRESSURE
+    alone = {key: replace(run, sand_map="", recipe={}) for key, run in pool.items()}
+    donors = darsia.ranked_donors(name, alone, overflow)
+    return donors, UNMATCHED if donors else NO_DONOR
+
+
+def _write_geometry(
+    package: Path,
+    folder: Path,
+    drawing: SandMapDrawing,
+    series: SimulatorSeries,
+    porosity: Mapping[int, float],
+    settings: SimulatorExportSettings,
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Write one geometry, from its drawing, at each cell size into a folder of the
+    package; its files by cell size, relative to the package, and the number of
+    pixels no polygon covers by the layer they took."""
+    fixture_layers = [
+        layer
+        for layer, facies_id in series.facies_of_layer.items()
+        if facies_id in settings.fixture_facies
+    ]
+    canvas = series.canvas
+    layers, inside, behind, filled = sand_layers(drawing, canvas, fixture_layers)
+    filled_by_layer = {
+        str(layer): int(count)
+        for layer, count in zip(*np.unique(layers[filled], return_counts=True))
+    }
+    completed = complete_geometry(
+        layers, inside, behind, series.facies_of_layer, settings
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "sand_map.json").write_text(
+        json.dumps(
+            dict(
+                anchors=drawing.anchors.tolist(),
+                polygons=[
+                    [layer, list(indices)] for layer, indices in drawing.polygons
+                ],
+                on_top=sorted(drawing.on_top),
+                facies_of_layer={str(k): v for k, v in series.facies_of_layer.items()},
+            )
+        ),
+        encoding="utf-8",
+    )
+    files = {}
+    for size in settings.cell_sizes_mm:
+        arrays = geometry_cells(
+            completed,
+            canvas.img,
+            porosity,
+            canvas.dimensions,
+            size,
+            settings.precision,
+        )
+        stem = folder / f"simulator_geometry_{size:g}mm"
+        np.savez_compressed(stem.with_suffix(".npz"), **arrays)
+        shape = list(arrays["domain_area_m2"].shape)
+        document = dict(
+            cell_size_mm=float(size),
+            shape=shape,
+            extent_m=[0.0, shape[1] * size / 1000, 0.0, shape[0] * size / 1000],
+            axes="rows: y from the floor up; columns: x from the left",
+            canvas=dict(shape=list(layers.shape), dimensions_m=list(canvas.dimensions)),
+            filled_pixels_by_layer=filled_by_layer,
+            counts=completed.counts,
+            arrays={
+                name: dict(dtype=str(a.dtype), shape=list(a.shape), unit=UNITS[name])
+                for name, a in arrays.items()
+            },
+        )
+        stem.with_suffix(".json").write_text(
+            json.dumps(document, indent=1, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        files[f"{size:g}mm"] = stem.with_suffix(".npz").relative_to(package).as_posix()
+    return files, filled_by_layer
+
+
+def _write_mass(folder: Path, mass: MassFrames, canvas: darsia.Image, sizes) -> int:
+    """Write a run's mass maps on the cells of each size; the number of frames."""
+    copies = {
+        size: darsia.MassCopy(mass.geometry, darsia.MassCopySettings(copy_mm=size))
+        for size in sizes
+    }
+    for size, copy in copies.items():
+        target = folder / f"{size:g}mm"
+        target.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            target / "static.npz", **{k: v[::-1] for k, v in copy.static.items()}
+        )
+    count = 0
+    for name, maps, labels in mass.frames:
+        corner = (maps.mass.origin[0], maps.mass.origin[1] - maps.mass.dimensions[0])
+        lower_left = (canvas.origin[0], canvas.origin[1] - canvas.dimensions[0])
+        if not np.allclose(corner, lower_left):
+            raise ValueError(
+                f"The mass maps of {name} do not start at the canvas's lower left "
+                "corner, so their cells would not be the geometry's."
+            )
+        for size, copy in copies.items():
+            cells = copy(maps, labels)
+            np.savez_compressed(
+                folder / f"{size:g}mm" / f"{name}.npz",
+                **{k: v[::-1] for k, v in cells.items()},
+            )
+        count += 1
+    return count
+
+
+README = """# Simulator package
+
+{runs} runs; metric cells of {sizes} mm. Start with manifest.json.
+
+## Frame
+
+Every position is in the rig's measured frame, the frame of the mass maps: metres
+from the inner corner of the left wall and the floor, x to the right and y up, over
+the frame's {width:g} m by {height:g} m. Each cell holds the pixels whose
+coordinates lie in it, on the grid on which the drawing is filled.
+{notes}
+## Geometry
+
+geometry/simulator_geometry_<size>mm.npz holds the rig's porous domain on metric
+cells (read with numpy.load, allow_pickle=False); its JSON companion lists each
+array with its unit. Rows run from the floor up (y increasing) and columns from
+the left (x increasing); cell centres lie at (index + 0.5) x size from the rig's
+lower left inner corner. A cell with a positive domain_area_m2 holds porous medium;
+outside it the intensive values are NaN. Volumes are m3 per cell, depth m, porosity
+pore over bulk volume. Pixels are assigned to cells by their centres, so a cell's
+domain_area_fraction may exceed 1. The facies fractions are shares of the cell's
+domain area. Sand hidden behind fixtures is taken from the drawing beneath them
+(drawn_behind). A pixel inside the
+frame that no layer of the drawing covers, e.g. where the camera does not see the
+rig, takes the nearest layer; the manifest counts these pixels by the layer they
+took (filled_pixels_by_layer). A layer of an excluded facies, e.g. silicone
+along the walls, lies outside the domain.
+
+geometry/sand_map.json is the drawing the geometry is made from: anchors in metres
+(x right, y up from the lower left inner corner), the polygons of each layer on
+them, and the facies of each layer. geometry/facies_properties.csv is the facies
+table as given, and depth_measurements.csv, when given, the depth measurements.
+
+{own}
+
+## Protocols
+
+runs/<run>/ holds each run's injection, pressure_temperature and overflow tables as
+their sources hold them, and overflow_reviewed.csv: the water displaced at each
+usable scale reading in mL, against hours from the readings' own injection start
+(in the manifest). Keep each table's own time origin when aligning them. The
+manifest gives the flow controller's reference conditions and the gas density at
+them.
+{borrowed}{mass}"""
+"""The package's README, filled in by :func:`write_simulator_package`."""
+BORROWED_README = """
+A run without usable scale readings of its own borrows the reviewed curve of
+another run by the rule of the mass maps. Of the runs with usable readings that it
+may borrow from (overflow_donors_allowed in the manifest, else every run of the
+package), those with its sand map and a recipe within the overflow's tolerance
+qualify, and the one nearest to it in atmospheric pressure is taken: the least mean
+absolute difference of the two pressure records from its injection start on. A run
+that no run qualifies for borrows from the run nearest in pressure alone, and the
+manifest and the list below say so. Where runs qualify but none has atmospheric
+pressure over the comparison window, it borrows none, as the mass maps' estimate
+then has none. The curve is in overflow_reviewed_borrowed_from_<run>.csv, whose
+column borrowed_from names that run; its times count from that run's own injection
+start. Borrowed: {runs}. Without a curve: {none}.
+"""
+"""The README's paragraph on borrowed overflow curves, for a package with runs that
+lack their own."""
+MASS_README = """
+## Mass maps
+
+runs/<run>/mass/<size>mm/<frame>.npz holds the frame's masses per cell in g, each
+with the share of the cell's pore volume whose mass is known, the pore-volume
+weighted concentration and saturation, and the phase area fractions; static.npz
+holds the cells' pore volume and domain area.
+"""
+"""The README's section on mass maps, for a package that holds them."""
+
+
+def write_simulator_package(
+    folder: Path,
+    series: SimulatorSeries,
+    runs: Mapping[str, SimulatorRun],
+    settings: SimulatorExportSettings,
+    overflow: darsia.OverflowSettings,
+) -> dict:
+    """Write the simulator package of a series' runs into a folder.
+
+    The common geometry is made from the common drawing; a run with an adjustment
+    gets its own, from the drawing moved by it, in its own folder. Each geometry is
+    written at every cell size (:func:`geometry_cells`) with its drawing. Each run's
+    protocols are copied, and its reviewed overflow and mass maps are written where
+    it has them. A run without usable scale readings of its own borrows the reviewed
+    curve of a donor by the mass maps' rule (:func:`darsia.ranked_donors`): of the
+    runs with usable readings it may borrow from, those with its sand map and a
+    recipe within the overflow's tolerance, the one nearest in atmospheric pressure;
+    a run with an adjustment has a sand map of its own. Without such a run, it
+    borrows from the run nearest in pressure alone, and the manifest and README say
+    so; where such runs lack atmospheric pressure over the comparison window, it
+    borrows none, as the mass maps' estimate has none. The curve is written with the
+    donor's name in the file's name and in a column. The manifest records the frame,
+    which geometry each run has and the pixels its drawing does not cover by the
+    layer they took, its protocol files and their rows, the injection start, the
+    time origin of the scale readings, why unusable readings are not reviewed, the
+    runs that borrow, from which run and whether by pressure alone, the runs it may
+    borrow from that the package lacks, why a run borrows none, and the flow
+    reference.
+
+    Parameters
+    ----------
+    folder : Path
+        The package's folder, e.g. the partial folder of a result's publication.
+    series : SimulatorSeries
+        What the runs share.
+    runs : mapping
+        The runs, by name.
+    settings : SimulatorExportSettings
+        The settings of the export.
+    overflow : darsia.OverflowSettings
+        The settings of the overflow, which read the scale readings.
+
+    Returns
+    -------
+    dict
+        The manifest, also written as ``manifest.json``.
+
+    Raises
+    ------
+    ValueError
+        If a facies of the sand has no porosity in (0, 1] in the facies table, a
+        run's recipe lacks an entry the overflow's recipe tolerance compares, a
+        protocol's row has another number of cells than its header, or the
+        atmospheric pressure record of a run that borrows or may lend is not
+        increasing, finite and positive.
+
+    """
+    folder = Path(folder)
+    table = pd.read_csv(series.facies_properties)
+    porosity = dict(zip(table["id"].astype(int), table["porosity"].astype(float)))
+    lacking = [f for f in settings.porous_facies if not 0 < porosity.get(f, 0) <= 1]
+    if lacking:
+        raise ValueError(f"The sand facies {lacking} have no porosity in (0, 1].")
+    for name, run in runs.items():
+        unknown = sorted(set(overflow.recipe_tolerance) - set(run.recipe))
+        if unknown:
+            raise ValueError(
+                f"The recipe of {name} lacks {unknown}, which the overflow's recipe "
+                "tolerance compares."
+            )
+    shared = folder / "geometry"
+    common, filled = _write_geometry(
+        folder, shared, series.drawing, series, porosity, settings
+    )
+    shutil.copyfile(series.facies_properties, shared / "facies_properties.csv")
+    if series.depth_measurements is not None:
+        shutil.copyfile(series.depth_measurements, shared / "depth_measurements.csv")
+
+    entries, donor_runs, curves = {}, {}, {}
+    for name, run in runs.items():
+        target = folder / "runs" / name
+        entry = dict(own_geometry=run.adjustment is not None, geometry=common)
+        if run.adjustment is not None:
+            drawing = series.drawing.moved(run.adjustment)
+            entry["geometry"], entry["filled_pixels_by_layer"] = _write_geometry(
+                folder, target, drawing, series, porosity, settings
+            )
+        injection = darsia.InjectionProtocol(run.injection, series.reference_density)
+        entry["injection_start"] = injection.df["start"].min().isoformat()
+        protocols = dict(
+            injection=run.injection, pressure_temperature=run.pressure_temperature
+        )
+        if run.overflow is not None:
+            protocols["overflow"] = run.overflow
+        entry["protocols"], entry["rows"], tables = {}, {}, {}
+        for kind, source in protocols.items():
+            tables[kind] = _table(source)
+            columns = settings.overflow_columns if kind == "overflow" else None
+            path = target / f"{kind}.csv"
+            entry["rows"][kind] = _write_table(path, tables[kind], columns)
+            entry["protocols"][kind] = path.relative_to(folder).as_posix()
+        volume = None
+        if run.overflow is not None:
+            origin, volume, curve = _reviewed_overflow(
+                run.overflow, tables["overflow"], overflow
+            )
+            entry["overflow_time_origin"] = origin.isoformat()
+            if curve:
+                curves[name] = (curve, origin)
+                path = target / "overflow_reviewed.csv"
+                write_rows(path, curve, list(curve[0]))
+                entry["protocols"]["overflow_reviewed"] = path.relative_to(
+                    folder
+                ).as_posix()
+                entry["rows"]["overflow_reviewed"] = len(curve)
+            else:
+                entry["overflow_not_usable"] = list(volume.reasons)
+        # A run with an adjustment has a sand map of its own.
+        sand_map = "" if run.adjustment is None else name
+        donor_runs[name] = _donor_run(run, sand_map, injection, volume)
+        if run.mass is not None:
+            entry["mass_frames"] = _write_mass(
+                target / "mass", run.mass, series.canvas, settings.cell_sizes_mm
+            )
+        entries[name] = entry
+
+    # The mass maps' donor rule among the runs a run may borrow from; without a run
+    # of its sand map and recipe among them, the one nearest in pressure alone.
+    borrowed, unmatched, not_borrowed = {}, {}, {}
+    for name, entry in entries.items():
+        if name in curves:
+            continue
+        allowed = runs[name].donors
+        if allowed is not None:
+            entry["overflow_donors_allowed"] = sorted(set(allowed) & set(runs))
+            absent = sorted(set(allowed) - set(runs))
+            if absent:
+                entry["overflow_donors_not_in_package"] = absent
+        pool = {k: v for k, v in donor_runs.items() if allowed is None or k in allowed}
+        pool[name] = donor_runs[name]
+        for key, candidate in pool.items():
+            usable = candidate.volume is not None and not candidate.volume.reasons
+            if key == name or usable:
+                _check_pressure(key, candidate)
+        donors, reason = _ranked_donors(name, pool, overflow)
+        if not donors:
+            entry["overflow_not_borrowed"] = not_borrowed[name] = reason
+            continue
+        if reason is not None:
+            entry["overflow_donor_unmatched"] = unmatched[name] = reason
+        curve, origin = curves[donors[0]]
+        rows = [dict(row, borrowed_from=donors[0]) for row in curve]
+        path = (
+            folder / "runs" / name / f"overflow_reviewed_borrowed_from_{donors[0]}.csv"
+        )
+        write_rows(path, rows, list(rows[0]))
+        entry["protocols"]["overflow_reviewed"] = path.relative_to(folder).as_posix()
+        entry["rows"]["overflow_reviewed"] = len(rows)
+        entry["overflow_borrowed_from"] = borrowed[name] = donors[0]
+        entry["overflow_donor_time_origin"] = origin.isoformat()
+
+    own = sorted(name for name, entry in entries.items() if entry["own_geometry"])
+    height, width = series.canvas.dimensions
+    manifest = dict(
+        format=FORMAT,
+        frame=dict(
+            origin="inner corner of the left wall and the floor",
+            x="right",
+            y="up",
+            unit="m",
+            width=width,
+            height=height,
+        ),
+        cell_sizes_mm=[float(size) for size in settings.cell_sizes_mm],
+        geometry=common,
+        filled_pixels_by_layer=filled,
+        runs_with_own_geometry=own,
+        missing_own_overflow=sorted(set(entries) - set(curves)),
+        borrowed_overflow=borrowed,
+        borrowed_overflow_unmatched=dict(sorted(unmatched.items())),
+        not_borrowed_overflow=dict(sorted(not_borrowed.items())),
+        flow_reference=dict(
+            asdict(settings.flow_reference), gas_density_kg_m3=series.reference_density
+        ),
+        runs=entries,
+    )
+    (folder / "manifest.json").write_text(
+        json.dumps(manifest, indent=1, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    (folder / "README.md").write_text(
+        README.format(
+            runs=len(entries),
+            sizes=", ".join(f"{size:g}" for size in settings.cell_sizes_mm),
+            width=width,
+            height=height,
+            notes="".join(f"\n{note}\n" for note in settings.notes),
+            borrowed=(
+                BORROWED_README.format(
+                    runs=", ".join(
+                        f"{r} from {d}"
+                        + (f" ({unmatched[r]})" if r in unmatched else "")
+                        for r, d in sorted(borrowed.items())
+                    )
+                    or "none",
+                    none=", ".join(
+                        f"{r} ({why})" for r, why in sorted(not_borrowed.items())
+                    )
+                    or "none",
+                )
+                if borrowed or not_borrowed
+                else ""
+            ),
+            own=(
+                "Every run shares this geometry: no run has an adjustment of its own."
+                if not own
+                else "These runs differ from the common geometry, because their sand "
+                "settled; each has its own geometry and drawing in runs/<run>/: "
+                + ", ".join(own)
+                + "."
+            ),
+            mass=(
+                MASS_README
+                if any(entry.get("mass_frames") for entry in entries.values())
+                else ""
+            ),
+        ),
+        encoding="utf-8",
+    )
+    return manifest
