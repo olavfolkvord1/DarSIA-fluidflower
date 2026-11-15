@@ -2,8 +2,10 @@
 
 import builtins
 import errno
+import importlib.metadata
 import json
 import os
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass
@@ -503,18 +505,53 @@ def test_a_result_records_the_revision_that_made_it(tmp_path):
     assert stored["revision"] == "another-revision" != read_job(job)["revision"]
 
 
-def test_a_job_of_a_revision_not_known_is_refused(tmp_path, monkeypatch):
-    """Without git, the code's revision is not known, and no job is created: a
-    job locks the revision of its code."""
+def test_an_installed_package_has_a_revision_without_git(tmp_path, monkeypatch):
+    """Without git, or outside a checkout, the revision is the package's version
+    and the hash of its source files, so that a laptop install creates jobs; a
+    changed source file is another revision. A revision not known still refuses a
+    job: a job locks the revision of its code."""
 
     def no_git(*args, **kwargs):
         raise FileNotFoundError("git")
 
     config, selection = _project(tmp_path)
     monkeypatch.setattr(job_module.subprocess, "run", no_git)
+    package = tmp_path / "darsia"
+    (package / "jobs").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "jobs" / "job.py").write_text("A = 1\n", encoding="utf-8")
+    (package / "notes.txt").write_text("not source\n", encoding="utf-8")
+    installed = revision(package)
+    version, _, digest = installed.partition("+")
+    assert version == importlib.metadata.version("darsia") and len(digest) == 64
+    (package / "notes.txt").write_text("changed\n", encoding="utf-8")
+    assert revision(package) == installed
+    (package / "jobs" / "job.py").write_text("A = 2\n", encoding="utf-8")
+    assert revision(package) != installed
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    assert read_job(job)["revision"] == revision() != installed
+    monkeypatch.setattr(job_module, "installed_revision", no_git)
     assert revision() is None
     with pytest.raises(ValueError, match="revision is not known"):
         create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+
+
+def test_a_package_in_an_ignored_folder_of_a_checkout_has_its_own_revision(tmp_path):
+    """A package installed into an ignored folder of another checkout, e.g. a
+    virtual environment inside a clone, is known by its version and source files,
+    not by that checkout's commit: other code there is another revision."""
+    git = ["git", "-c", "user.name=test", "-c", "user.email=test@example.org"]
+    (tmp_path / ".gitignore").write_text("venv/\n", encoding="utf-8")
+    for command in (["init", "-q"], ["add", ".gitignore"], ["commit", "-q", "-m", "a"]):
+        subprocess.run(git + command, cwd=tmp_path, check=True, capture_output=True)
+    package = tmp_path / "venv" / "Lib" / "site-packages" / "darsia"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "x.py").write_text("A = 1\n", encoding="utf-8")
+    installed = revision(package)
+    assert installed == job_module.installed_revision(package)
+    (package / "x.py").write_text("A = 2\n", encoding="utf-8")
+    assert revision(package) != installed
 
 
 @pytest.mark.parametrize("failure", [None, "the task failed"])
