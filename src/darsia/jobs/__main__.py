@@ -16,7 +16,10 @@
   between its mark and its move.
 
 :data:`STEPS` holds the steps of the presets' Setup, Calibration, Analysis and
-Comparison by the kind each makes.
+Comparison by the kind each makes. A task waits for the host's lock of a name,
+e.g. around a film encoder's open, through its context
+(:meth:`darsia.jobs.step.StepContext.host_lock`, a
+:class:`darsia.jobs.service.WaitingLock`).
 
 """
 
@@ -150,7 +153,8 @@ def other_revision(record: Mapping, code: str | None) -> str | None:
 def context(job: Path, task: Task, token: str, code: str | None = None) -> StepContext:
     """The context of a claimed task (:class:`darsia.jobs.step.StepContext`), whose
     results record the revision of this process's code (by default looked at
-    now) and the device of its compute backend."""
+    now) and the device of its compute backend, and whose steps wait for the
+    host's locks (:class:`darsia.jobs.service.WaitingLock`)."""
     record = read_job(job)
     step = step_of(record, task.step)
     config = [Path(job) / name for name in record["config"]]
@@ -172,6 +176,7 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
         functools.cache(lambda name: queue.accepted(job, name)),
         revision() if code is None else code,
         compute_backend().device,
+        service.WaitingLock,
     )
 
 
