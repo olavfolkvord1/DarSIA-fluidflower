@@ -166,10 +166,21 @@ def _write(claim: Claim, value: Mapping) -> None:
 
 
 def _listing(folder: Path) -> list[str]:
-    """The names in a folder of a job, through the share's interruptions."""
+    """The names in a folder of a job, through the share's interruptions; none
+    when the folder is not there.
+
+    Raises
+    ------
+    Unavailable
+        If the share gave no answer within :data:`darsia.utils.results.GRACE`,
+        also as a missing path: an outage is not an empty folder.
+
+    """
     try:
         return results.retry_transient(lambda: os.listdir(folder))
-    except FileNotFoundError:
+    except FileNotFoundError as error:
+        if results.share_out(error):
+            raise results.Unavailable(f"No answer about {folder}: {error}") from error
         return []
 
 
@@ -421,6 +432,42 @@ def release(claim: Claim) -> None:
     destination = claim.job / QUEUE / f"{claim.task}.{new_token()}"
     if not _transfer(claim.path, destination):
         raise Revoked(f"Task {claim.task} is no longer claimed by {claim.token}")
+
+
+def retry_failed(job: Path, task: str) -> bool:
+    """Return a failed task of a job to the queue under a new token, e.g. from the
+    Jobs page once the cause of its failure is mended.
+
+    Its next attempt adopts the results an earlier attempt stored that still serve
+    (:meth:`darsia.jobs.step.StepContext.done`), and the tasks waiting for it can
+    run once it is done. So it serves a mend of what no result of the task is
+    identified by, e.g. a share that came back, a photo copied again or more
+    memory. A mend of what they are identified by (a setting, a protocol, a
+    configured file, an input) makes those results not serve, and the retry
+    refuses them, since a result is never replaced: set them aside first
+    (:func:`darsia.jobs.job.discard_failed`, which the Jobs page does only with
+    the owner's word). A job over other settings is a new job
+    (``Selection.parts``, ``basis``).
+
+    Parameters
+    ----------
+    job : Path
+        The job's folder.
+    task : str
+        The task's name.
+
+    Returns
+    -------
+    bool
+        Whether the task was failed and is queued now; False if it was not failed,
+        e.g. returned already.
+
+    """
+    token = markers(job, FAILED).get(task)
+    if token is None:
+        return False
+    failed = Path(job) / FAILED / f"{task}.{token}"
+    return _transfer(failed, Path(job) / QUEUE / f"{task}.{new_token()}")
 
 
 def lease(job: Path, task: str, token: str) -> dict:
