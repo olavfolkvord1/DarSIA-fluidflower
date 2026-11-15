@@ -248,6 +248,41 @@ def test_one_service_per_host_and_its_survivors(tmp_path, importable):
             _kill(pid)
 
 
+@pytest.mark.parametrize("hidden", [psutil.NoSuchProcess, psutil.AccessDenied])
+def test_a_survivor_gone_or_hidden_is_gone_and_a_live_one_keeps_its_threads(
+    tmp_path, monkeypatch, capsys, hidden
+):
+    """A restarted service's look at its host's claims takes a process that is
+    gone, or that it may not look at, for gone: it returns that task at once and
+    goes on. A claim whose process still runs is counted, and its threads leave
+    no room for a new task."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    gone = queue.claim(job, "numbers.r1.0000", "here")
+    kept = queue.claim(job, "numbers.r2.0000", "here")
+    queue.beat(gone, 1, 999_999, 1.0e9)
+    queue.beat(kept, 1, os.getpid(), service.birth(os.getpid()))
+    real = psutil.Process
+
+    class Hidden:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            raise hidden(self.pid)
+
+    def process(pid):
+        return Hidden(pid) if pid == 999_999 else real(pid)
+
+    monkeypatch.setattr(service.psutil, "Process", process)
+    again = service.Service(tmp_path / "jobs", "here", 1, tmp_path / "logs")
+    again.poll()
+    assert "cannot be done now" not in capsys.readouterr().out
+    assert [live.pid for live in again.live.values()] == [os.getpid()]
+    assert set(queue.markers(job, queue.CLAIMED)) == {"numbers.r2.0000"}
+    assert "numbers.r1.0000" in queue.markers(job, queue.QUEUE)
+
+
 def test_a_job_of_another_revision_is_not_taken(tmp_path, capsys):
     """A service whose code revision differs from the job's takes none of its
     tasks and says why."""
