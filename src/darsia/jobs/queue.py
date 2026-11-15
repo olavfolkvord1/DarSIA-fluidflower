@@ -11,9 +11,11 @@ destination name is the mover's own.
 The claimed marker holds the lease, which its owner rewrites every
 :data:`darsia.utils.results.BEAT`: the token, the machine, the identity of the
 host it runs on, the process and its birth time, a beat number and the time. A
-service takes a claim back when its lease stays unchanged for
-:data:`darsia.utils.results.STALE` by its own clock; the owner's next beat then
-finds its marker gone and the owner exits. Only the holder
+beat is retried while the share is out, for up to
+:data:`darsia.utils.results.GRACE`, so that a short outage loses no claim; GRACE
+and a BEAT are less than STALE. A service takes a claim back when its lease stays
+unchanged for :data:`darsia.utils.results.STALE` by its own clock; the owner's
+next beat then finds its marker gone and the owner exits. Only the holder
 of the current marker can move it to ``done/``, so a superseded or late owner
 commits no terminal state, and a result counts only when its task's done marker
 names its token (:func:`accepted`).
@@ -150,6 +152,9 @@ def _write(claim: Claim, value: Mapping) -> None:
     ------
     Revoked
         If the marker is gone.
+    OSError
+        If the share gave no answer within :data:`darsia.utils.results.GRACE`,
+        also as a missing path: an outage is not a lost claim.
 
     """
 
@@ -161,6 +166,8 @@ def _write(claim: Claim, value: Mapping) -> None:
     try:
         results.retry_transient(write)
     except FileNotFoundError as error:
+        if results.share_out(error):
+            raise
         raise Revoked(f"Task {claim.task} is no longer claimed by {claim.token}") from (
             error
         )
@@ -308,12 +315,24 @@ def waiting(job: Path, known: Mapping[str, Task] | None = None) -> set[str]:
 
 def _transfer(source: Path, destination: Path) -> bool:
     """Move a marker to a name of the mover's own token; False if the source was
-    gone, e.g. moved by another mover."""
+    gone, e.g. moved by another mover.
+
+    Raises
+    ------
+    Unavailable
+        If the share gave no answer within :data:`darsia.utils.results.GRACE`,
+        also as a missing path.
+
+    """
     try:
         results.rename(source, destination)
     except FileExistsError:
         pass  # A replay of the mover's own move: only it names the destination.
-    except FileNotFoundError:
+    except OSError as error:
+        if _no_answer(error):  # not known now, never «gone»
+            raise results.Unavailable(f"No answer about {source}: {error}") from error
+        if not isinstance(error, FileNotFoundError):
+            raise
         return results.exists(destination)
     return True
 
