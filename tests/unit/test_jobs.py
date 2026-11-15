@@ -16,6 +16,7 @@ from threadpoolctl import threadpool_info
 
 from darsia.jobs import job as job_module
 from darsia.jobs import queue
+from darsia.jobs import step as step_module
 from darsia.jobs.job import create_job, locations_of, read_job, read_tables, revision
 from darsia.jobs.step import (
     Memory,
@@ -148,7 +149,23 @@ FIT = Step(
     _parts,
 )
 SUMMARY = Step("summary", {"fit": Scope.ALL}, Order.PARTS, Memory(), _summary)
-STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY)
+
+
+def _depth(tables, project, folders):
+    """The toy's large file."""
+    return ["depth.npz"]
+
+
+STAMPED = Step(
+    "stamped",
+    {},
+    Order.FRAMES,
+    Memory(),
+    _numbers,
+    {"toy": ToySettings},
+    stamped=_depth,
+)
+STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY, STAMPED)
 """The test steps, which a task process finds by their module."""
 
 
@@ -435,6 +452,66 @@ def test_reuse_compares_what_a_step_reads(tmp_path):
     with pytest.raises(ValueError, match="domain-sums/r1 is stored and does not") as e:
         create_job(jobs, (NUMBERS, DOMAIN_SUMS), more, config)
     assert "Made with other scope" in str(e.value) and "numbers/" not in str(e.value)
+
+
+def test_a_large_file_is_known_by_its_size_and_time(tmp_path):
+    """A large file the configuration names is part of a result's identity by its
+    size and modification time, not its content: the job made again is reused
+    while the file is untouched, and refused once it is written again."""
+    config, selection = _project(tmp_path)
+    jobs, project = tmp_path / "jobs", tmp_path / "project"
+    depth = project / "depth.npz"
+    depth.write_bytes(b"0" * 64)
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    work(create_job(jobs, (STAMPED,), one, config))
+    stored, _ = _stored(project, "stamped/r2/day1/r2-00.npz")
+    found = depth.stat()
+    stamp = f"size 64, modified {found.st_mtime_ns}"
+    assert stored["inputs"]["file:depth.npz"] == stamp
+    assert queue.tasks(create_job(jobs, (STAMPED,), one, config)) == {}
+    os.utime(depth, ns=(found.st_atime_ns, found.st_mtime_ns + 10**9))
+    with pytest.raises(ValueError, match="r2-00.npz is stored and does not") as e:
+        create_job(jobs, (STAMPED,), one, config)
+    assert "Made with other inputs (file:depth.npz)" in str(e.value)
+
+
+def test_a_configured_file_the_share_gives_no_answer_about_is_not_missing(
+    tmp_path, monkeypatch
+):
+    """A configured file the share gives no answer about within the grace, also
+    as a missing network path (Windows' errors 53 and 67), is not known now:
+    neither its stamp nor its content is recorded as missing."""
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+    looks = (
+        ("stat", step_module.file_stamp),
+        ("read_bytes", step_module.file_identity),
+    )
+    for code in (53, 67):
+
+        def out(*args, code=code, **kwargs):
+            raise FileNotFoundError(2, "The network path was not found", None, code)
+
+        for name, look in looks:
+            with monkeypatch.context() as patched:
+                patched.setattr(Path, name, out)
+                with pytest.raises(results.Unavailable):
+                    look(tmp_path / "depth.npz")
+    assert step_module.file_stamp(tmp_path / "none.npz") == "missing"
+    assert step_module.file_identity(tmp_path / "none.csv") == "missing"
+
+
+def test_a_file_changed_while_its_task_runs_stops_the_task(tmp_path):
+    """A task takes the identities of its configured files when it starts; once
+    one of them changes, it publishes nothing more and names the file."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = queue.tasks(job)["numbers.r1.0000"]
+    ctx = context(job, task, queue.claim(job, task.id, "here").token)
+    (tmp_path / "project" / "injection.csv").write_text("start,rate\n0,2\n")
+    with pytest.raises(RuntimeError, match="file:injection.csv changed while"):
+        ctx.step.run(ctx)
+    assert not (tmp_path / "project" / "results" / "numbers").exists()
 
 
 def test_a_result_just_committed_elsewhere_is_reused(tmp_path, monkeypatch):

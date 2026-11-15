@@ -11,8 +11,9 @@ image is a photo read through the rig's corrections, once per Setup.
 A step records the configuration sections it reads through the run's official
 configuration (:attr:`darsia.jobs.step.Step.sections`) and the content of the
 small files they name that it reads (:attr:`darsia.jobs.step.Step.files`), e.g.
-the protocols of the run's photo folders, so that a result made before one of
-them was edited is not reused.
+the protocols of the run's photo folders, and the size and time of the large ones
+(:attr:`darsia.jobs.step.Step.stamped`), the depth map and the image mapping, so
+that a result made before one of them was changed is not reused.
 
 """
 
@@ -28,6 +29,7 @@ import toml
 
 import darsia
 from darsia.jobs.step import RUNS, Memory, Order, Scope, Step, StepContext
+from darsia.presets.workflows.config.depth import DepthConfig
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.sections import list_required_sections
 from darsia.presets.workflows.rig import Rig
@@ -194,6 +196,21 @@ def _rig_files(tables: Mapping[str, Any], project, folders) -> list[str]:
     return found + ([str(props)] if props is not None else [])
 
 
+def _rig_stamped(tables: Mapping[str, Any], project, folders) -> list[str]:
+    """The rig's depth map, as its depth configuration names it (the depth
+    setup's map in the results folder by default), and its image mapping."""
+    mapping = tables.get("corrections", {}).get("mapping") or {}
+    found = [mapping.get("path")]
+    if "depth" in tables:
+        results = tables.get("data", {}).get("results")
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "depth.toml"
+            path.write_text(toml.dumps({"depth": tables["depth"]}), encoding="utf-8")
+            depth = DepthConfig().load(path, None if results is None else Path(results))
+        found.insert(0, depth.depth_map)
+    return [str(path) for path in found if path is not None]
+
+
 SAND_MAP = Step(
     "sand-map",
     {},
@@ -212,6 +229,7 @@ RIG = Step(
     _rig,
     sections=tuple(list_required_sections(setup_rig)),
     files=_rig_files,
+    stamped=_rig_stamped,
 )
 """The run's rig."""
 CORRECTED_IMAGE = Step(

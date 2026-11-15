@@ -722,3 +722,12 @@ def test_a_comparison_time_keeps_its_digits():
     assert named == {"72.33333h": 72.33333, "72.333334h": 72.333334, "3.0h": 3.0}
     with pytest.raises(ValueError, match="configured twice"):
         comparison.named_times([3, 3.0])
+
+
+def test_the_rig_is_known_by_its_default_depth_map(tmp_path):
+    """A depth table that names no depth map names the depth setup's map in the
+    results folder, so that a map set up again is not taken for the one a stored
+    rig read."""
+    tables = {"data": {"results": "results"}, "depth": {"measurements": "depth.csv"}}
+    found = [Path(path).as_posix() for path in setup._rig_stamped(tables, tmp_path, [])]
+    assert found == ["results/setup/depth/depth_map.npz"]
