@@ -3,6 +3,7 @@
 import contextlib
 import errno
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -462,3 +463,38 @@ def test_an_outage_is_unavailable_not_missing(tmp_path, monkeypatch, waits):
     assert [path.name for path in location.parent.iterdir()] == ["photo.ARW"]
     assert _token(location) == OURS
     assert np.array_equal(_values(location), np.arange(3.0))
+
+
+def test_a_result_of_another_input_is_not_reusable(tmp_path):
+    """Phase maps made from one publication of the phase model serve a request
+    only while that publication is the model read; a model trained again with
+    unchanged settings makes them another result."""
+    model = tmp_path / "phase-model"
+    maps = tmp_path / "phase-maps" / "run" / "session" / "photo-2.ARW"
+    request = {
+        "step": "phase-maps",
+        "settings": {"co2_threshold": 0.8, "gas_threshold": 0.66},
+        "scope": {"run": [["session", "photo-1.ARW"], ["session", "photo-2.ARW"]]},
+        "environment": {"blas_kernel": "Haswell", "threads": 1},
+        "inputs": {"phase-model": OURS},
+    }
+    results.publish(
+        model, _writer(np.ones(2)), {"step": "phase-model"}, OURS, root=tmp_path
+    )
+    results.publish(
+        maps, _writer(np.arange(3.0)), dict(request, revision="a"), OURS, root=tmp_path
+    )
+    stored = results.read(maps, results.read_description)
+    assert results.reusable(stored, dict(request, revision="b")) is None
+
+    more = {"run": request["scope"]["run"] + [["session", "photo-3.ARW"]]}
+    assert results.reusable(stored, dict(request, scope=more)) == (
+        "Made with other scope"
+    )
+
+    shutil.rmtree(model)
+    results.publish(
+        model, _writer(np.ones(2)), {"step": "phase-model"}, THEIRS, root=tmp_path
+    )
+    request["inputs"] = {"phase-model": _token(model)}
+    assert results.reusable(stored, request) == "Made with other inputs (phase-model)"
