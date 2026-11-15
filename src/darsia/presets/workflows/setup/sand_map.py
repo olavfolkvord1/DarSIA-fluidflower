@@ -143,15 +143,10 @@ class SandMapDrawing:
             )
         faults = partition_faults(self)
         if faults:
-            counts = Counter(fault.kind for fault in faults)
-            largest = max(faults, key=lambda fault: fault.area)
-            x0, y0, x1, y1 = (1000 * value for value in largest.bounds)
             raise ValueError(
                 "The drawing is not a closed partition of the rig's frame: "
-                + ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
-                + f"; the largest is a {largest.kind} of "
-                f"{largest.area * 1e6:.3f} mm2 at x {x0:.1f} to {x1:.1f} mm, "
-                f"y {y0:.1f} to {y1:.1f} mm."
+                + _described(faults)
+                + "."
             )
         data = {
             "anchors": np.asarray(self.anchors, dtype=np.float64).tolist(),
@@ -354,6 +349,19 @@ def partition_faults(drawing: SandMapDrawing) -> list[PartitionFault]:
             bounds = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
             faults.append(PartitionFault("unlinked", 0.0, bounds, (layers[k],)))
     return sorted(faults, key=lambda fault: -fault.area)
+
+
+def _described(faults: Sequence[PartitionFault]) -> str:
+    """The faults of a drawing in words: how many of each kind, and the largest
+    with its area and place in millimetres."""
+    counts = Counter(fault.kind for fault in faults)
+    largest = max(faults, key=lambda fault: fault.area)
+    x0, y0, x1, y1 = (1000 * value for value in largest.bounds)
+    return (
+        ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+        + f"; the largest is a {largest.kind} of {largest.area * 1e6:.3f} mm2 "
+        f"at x {x0:.1f} to {x1:.1f} mm, y {y0:.1f} to {y1:.1f} mm"
+    )
 
 
 def _ring(points: np.ndarray, indices: Sequence[int]) -> list[int]:
