@@ -34,6 +34,7 @@ parameters are a :class:`darsia.MassCalibration`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -47,6 +48,8 @@ _GRAVITY = 9.81
 _PA_TO_BAR = 1e-5
 _MAPS = {"mass_total": "mass", "mass_aqueous": "mass_aq", "mass_free_gas": "mass_g"}
 """The field of the mass maps behind each mass."""
+MASS_FIELDS = ("mass", "mass_g", "mass_aq", "saturation_g", "concentration_aq")
+"""The fields of stored mass maps, one image each (:func:`write_mass_maps`)."""
 
 
 @dataclass(frozen=True)
@@ -580,3 +583,23 @@ def cell_ratio(numerator, denominator):
     ratio = np.full(numerator.shape, np.nan)
     np.divide(numerator, denominator, out=ratio, where=denominator > 0)
     return ratio
+
+
+def write_mass_maps(folder: Path, maps: darsia.SimpleMassAnalysisResults) -> None:
+    """Store a frame's mass maps in ``folder``: each field of :data:`MASS_FIELDS`
+    as an image (``<field>.npz``)."""
+    for name in MASS_FIELDS:
+        getattr(maps, name).save(Path(folder) / f"{name}.npz")
+
+
+def read_mass_maps(folder: Path) -> darsia.SimpleMassAnalysisResults:
+    """A frame's stored mass maps (:func:`write_mass_maps`)."""
+    images = {name: darsia.imread(Path(folder) / f"{name}.npz") for name in MASS_FIELDS}
+    first = images["mass"]
+    return darsia.SimpleMassAnalysisResults(
+        name=first.name,
+        date=first.date,
+        time=first.time,
+        color_signal=None,
+        **images,
+    )
