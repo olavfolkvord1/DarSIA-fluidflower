@@ -3,6 +3,7 @@
 """
 
 import numpy as np
+import pytest
 
 import darsia
 
@@ -300,6 +301,80 @@ def test_pixel_centres_lie_half_a_pixel_inside_the_top_left_corner():
 
     assert np.allclose(x, [1.1, 1.3, 1.5, 1.7])
     assert np.allclose(y, [2.95, 2.85])
+
+
+def test_grid_positions_are_the_measured_model_at_the_pixels_else_their_centres():
+    """With a measured model, each pixel's position is the model at its column and
+    row in the given precision, and with a stride the pitch the median spacing
+    along every stride-th row and down every stride-th column (none without a
+    stride); without one, the pixel centres and the voxel size."""
+    image = darsia.Image(np.zeros((130, 200)), dimensions=[0.13, 0.2])
+    plain = darsia.grid_positions(image)
+    x, y = darsia.pixel_centres(image)
+    np.testing.assert_array_equal(plain.x, np.broadcast_to(x[None, :], (130, 200)))
+    np.testing.assert_array_equal(plain.y, np.broadcast_to(y[:, None], (130, 200)))
+    assert plain.pitch_mm == (image.voxel_size[0] * 1000, image.voxel_size[1] * 1000)
+
+    angle = 0.004
+    model = np.array(
+        [
+            [1.003e-3 * np.cos(angle), -1e-3 * np.sin(angle), 0.0002],
+            [-1e-3 * np.sin(angle), -0.998e-3 * np.cos(angle), 0.1299],
+            [1e-6, -2e-6, 1.0],
+        ]
+    )
+    for dtype in (np.float32, np.float64):
+        assert darsia.grid_positions(image, model.tolist(), dtype).pitch_mm is None
+        found = darsia.grid_positions(image, model.tolist(), dtype, pitch_stride=64)
+        m = model.astype(dtype)
+        c = np.arange(200, dtype=dtype)[None, :]
+        r = np.arange(130, dtype=dtype)[:, None]
+        den = m[2, 0] * c + m[2, 1] * r + m[2, 2]
+        np.testing.assert_array_equal(
+            found.x, (m[0, 0] * c + m[0, 1] * r + m[0, 2]) / den
+        )
+        np.testing.assert_array_equal(
+            found.y, (m[1, 0] * c + m[1, 1] * r + m[1, 2]) / den
+        )
+        assert found.x.dtype == dtype and found.y.dtype == dtype
+        dx = float(np.median(np.abs(np.diff(found.x[::64], axis=1)))) * 1000
+        dy = float(np.median(np.abs(np.diff(found.y[:, ::64], axis=0)))) * 1000
+        assert found.pitch_mm == (dy, dx) and found.pitch_mm != plain.pitch_mm
+
+
+def test_the_pitch_is_taken_over_the_canvas_the_pixels_were_measured_on():
+    """On a measurement canvas around the grid (its first pixel at the grid's
+    column and row ``origin``), the pitch is the median spacing of the model at
+    the canvas' whole pixels along every stride-th canvas row and down every
+    stride-th canvas column, in the positions' precision; the positions stay
+    the grid's. A canvas that does not hold the grid is refused."""
+    image = darsia.Image(np.zeros((130, 200)), dimensions=[0.13, 0.2])
+    model = [
+        [0.000166, 4.3e-08, -6.0e-05],
+        [1.6e-09, -0.000166, 0.0467],
+        [2e-5, 1e-5, 1.0],
+    ]
+    canvas = darsia.MeasurementCanvas((-41, -23), (176, 282))
+    f32 = np.float32
+    found = darsia.grid_positions(image, model, f32, canvas, 64)
+    plain = darsia.grid_positions(image, model, f32, None, 64)
+    np.testing.assert_array_equal(found.x, plain.x)
+    np.testing.assert_array_equal(found.y, plain.y)
+    m = np.asarray(model, f32)
+    c = (np.arange(282, dtype=f32) - 41)[None, :]
+    r = (np.arange(176, dtype=f32) - 23)[:, None]
+    x, y = darsia.project_xy(m, c, r)  # the whole canvas, as measured
+    dx = float(np.median(np.abs(np.diff(x[::64], axis=1)))) * 1000
+    dy = float(np.median(np.abs(np.diff(y[:, ::64], axis=0)))) * 1000
+    assert found.pitch_mm == (dy, dx)
+    assert found.pitch_mm[0] != plain.pitch_mm[0]
+    assert found.pitch_mm[1] != plain.pitch_mm[1]
+    with pytest.raises(ValueError, match="does not hold the grid"):
+        darsia.grid_positions(
+            image, model, f32, darsia.MeasurementCanvas((1, 0), (130, 200)), 64
+        )
+    assert darsia.MeasurementCanvas((-41, -23), (176, 282)).holds(130, 200)
+    assert not darsia.MeasurementCanvas((0, 0), (129, 200)).holds(130, 200)
 
 
 def test_grid_record_tells_images_on_one_grid():
