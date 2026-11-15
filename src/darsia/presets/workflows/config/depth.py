@@ -9,6 +9,7 @@ from .utils import _get_key, _get_section_from_toml, _normalize_mode
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_MEASUREMENTS_MODES = {"constant", "Load from CSV"}
+_SUPPORTED_INTERPOLATIONS = {"rbf", "triangulation"}
 
 
 @dataclass
@@ -72,6 +73,20 @@ class DepthConfig:
         },
     )
     """Target grid resolution (height, width) for interpolating depth measurements."""
+    interpolation: str = field(
+        default="rbf",
+        metadata={
+            "name": "Interpolation",
+            "help": (
+                "'rbf' (default) interpolates the measurements by radial basis "
+                "functions. 'triangulation' interpolates linearly between the "
+                "measurements on their Delaunay triangles and takes the nearest "
+                "measurement outside their convex hull."
+            ),
+            "options": ["rbf", "triangulation"],
+        },
+    )
+    """Interpolation of the depth measurements: 'rbf' or 'triangulation'."""
 
     def load(self, path: Path, results: Path | None = None) -> "DepthConfig":
         """Load depth config from a toml file from [section]."""
@@ -94,6 +109,11 @@ class DepthConfig:
         assert self.depth_map is not None, "results is required if depth_map is not set"
         self.target_resolution = _get_key(
             sec, "resolution", default=(500, 1000), required=False, type_=tuple
+        )
+        self.interpolation = _normalize_mode(
+            sec.get("interpolation", "rbf"),
+            _SUPPORTED_INTERPOLATIONS,
+            key="[depth].interpolation",
         )
         return self
 

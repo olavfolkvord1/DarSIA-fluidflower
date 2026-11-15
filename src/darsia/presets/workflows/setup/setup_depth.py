@@ -143,7 +143,8 @@ def setup_depth_map(path: Path | list[Path], key="mean", show: bool = False) -> 
     """Set up depth map from measurements.
 
     NOTE: This function stores the depth map in npz format according to the
-    specifications in the config file.
+    specifications in the config file. The measurements are interpolated as
+    chosen in [depth].interpolation, by radial basis functions by default.
 
     Parameters
     ----------
@@ -179,7 +180,7 @@ def setup_depth_map(path: Path | list[Path], key="mean", show: bool = False) -> 
         csv_file=config.depth.measurements,
         key=key,
         image=proxy_image,
-        method="rbf",
+        method=config.depth.interpolation,
     )
     depth_map_path = config.depth.depth_map.with_suffix(".npz")
     depth_map.save(depth_map_path)
