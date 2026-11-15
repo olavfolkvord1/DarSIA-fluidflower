@@ -1,5 +1,6 @@
 """Tests of the job engine's service: task processes, environments and hosts."""
 
+import json
 import os
 import secrets
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import psutil
@@ -20,6 +22,7 @@ from darsia.jobs.step import Selection
 from darsia.utils import results
 from tests.unit.test_jobs import no_share_wait  # noqa: F401
 from tests.unit.test_jobs import NUMBERS, SUMS, _project, _stored
+from tests.unit.test_minimal_chain import _head
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = sorted(
@@ -234,7 +237,10 @@ def test_a_job_of_another_revision_is_not_taken(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     "kernel, backend, wanted",
-    [("NoSuchKernel", "cpu", "NoSuchKernel"), ("Haswell", "opencl-gpu", "opencl-gpu")],
+    [
+        ("NoSuchKernel", "cpu", "not the job's NoSuchKernel"),
+        ("Haswell", "opencl-gpu", "the job's backend opencl-gpu: No compute backend"),
+    ],
 )
 def test_a_host_without_the_job_environment_returns_the_task(
     tmp_path, importable, kernel, backend, wanted
@@ -251,7 +257,7 @@ def test_a_host_without_the_job_environment_returns_the_task(
     live.process.wait(120)
     again.poll()
     assert set(queue.markers(job, queue.QUEUE)) == {"numbers.r2.0000"}
-    assert f"not the job's {wanted}" in again.refused[job.name]
+    assert wanted in again.refused[job.name]
     assert not again.live
 
 
@@ -297,6 +303,52 @@ def test_a_beat_delayed_into_the_mark_lands_before_it(
     assert jobs_main.run(job, claim.task, claim.token, "here") == 0
     assert landed.is_set()
     assert queue.accepted(job, claim.task) == {claim.token}
+
+
+def test_a_task_runs_on_its_job_backend(tmp_path, monkeypatch, kept_threads):
+    """A task process takes its job's compute backend by its label, checked with
+    the job's phase-model heads, runs the step on it and records its device with
+    each result; a host whose device of that class fails the check refuses the
+    task, saying why."""
+    job = _one(tmp_path, kernel=HERE, backend="opencl:Device")
+    model = tmp_path / "project" / "model" / "models" / "generic"
+    model.mkdir(parents=True)
+    for role, intercept in (("co2_presence", -3.0), ("gas_within_co2", -2.5)):
+        (model / f"{role}_signal.json").write_text(json.dumps(_head(20, intercept)))
+    policy = {"models": {"generic": {"gas_within_co2": {"presence_threshold": 0.66}}}}
+    (model.parents[1] / "phase_decision_policy.json").write_text(json.dumps(policy))
+    config = tmp_path / "jobs" / job.name / "config-0.toml"
+    config.write_text(
+        config.read_text() + '[phase_model]\nfolder = "model"\npixel_size_mm = 0.5\n'
+    )
+    device = SimpleNamespace(label="opencl:Device", device="Device (driver 1)")
+    asked, used = [], []
+
+    def named(label, heads=None):
+        asked.append((label, heads))
+        if len(asked) > 1:
+            raise ValueError("none gives the CPU's numbers.")
+        return device
+
+    monkeypatch.setattr(jobs_main, "backend_named", named)
+    monkeypatch.setattr(jobs_main, "use_compute_backend", used.append)
+    monkeypatch.setattr(jobs_main, "compute_backend", lambda: used[-1])
+    claim = queue.claim(job, "numbers.r2.0000", "here")
+    assert jobs_main.run(job, claim.task, claim.token, "here") == 0
+    ((label, heads),) = asked
+    assert label == "opencl:Device" and used == [device]
+    assert [head.intercept for head in heads] == [-3.0, -2.5]
+    stored, _ = _stored(tmp_path / "project", "numbers/r2/day1/r2-00.npz")
+    assert stored["device"] == "Device (driver 1)"
+    assert stored["environment"]["backend"] == "opencl:Device"
+    again = _one(tmp_path / "again", kernel=HERE, backend="opencl:Device")
+    claim = queue.claim(again, "numbers.r2.0000", "here")
+    assert jobs_main.run(again, claim.task, claim.token, "here") == service.REFUSED
+    why = queue.lease(again, claim.task, claim.token)["refused"]
+    assert why == (
+        "This host cannot run the job's backend opencl:Device: none gives the CPU's "
+        "numbers."
+    )
 
 
 def test_a_task_process_of_another_revision_refuses_its_task(tmp_path, kept_threads):

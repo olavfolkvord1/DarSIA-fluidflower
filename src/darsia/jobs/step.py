@@ -645,6 +645,9 @@ class StepContext:
     revision : str
         The revision of the code this process runs, which its results record
         (:func:`darsia.jobs.job.revision`).
+    device : str, optional
+        The device of this process's compute backend, driver included, which its
+        results record (:attr:`darsia.ComputeBackend.device`).
 
     """
 
@@ -661,6 +664,7 @@ class StepContext:
         job: Mapping[str, Any],
         accepted: Callable[[str], frozenset[str]],
         revision: str,
+        device: str = "cpu",
     ) -> None:
         self.step = step
         """The step."""
@@ -682,6 +686,8 @@ class StepContext:
         """Tokens of an earlier attempt's results this task adopted."""
         self.revision = revision
         """The revision of the code that makes this task's results."""
+        self.device = device
+        """The device that makes this task's results."""
         self._job = job
         self._accepted = accepted
         self._tokens: dict[str, str] = {}
@@ -860,11 +866,11 @@ class StepContext:
     ) -> None:
         """Publish one of this task's results under its claim token.
 
-        The description records the request (:func:`request`), the job, the task
-        and the revision of the code that made it. A location that already holds an
-        earlier attempt's result of the same task that serves now is adopted
-        instead. Nothing is published once a configured file the task reads has
-        changed since it started.
+        The description records the request (:func:`request`), the job, the task,
+        the revision of the code that made it and the device it ran on. A location
+        that already holds an earlier attempt's result of the same task that serves
+        now is adopted instead. Nothing is published once a configured file the task
+        reads has changed since it started.
 
         Parameters
         ----------
@@ -904,6 +910,7 @@ class StepContext:
             "job": self._job["id"],
             "task": self.task.id,
             "revision": self.revision,
+            "device": self.device,
         }
         try:
             results.publish(
