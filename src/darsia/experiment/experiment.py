@@ -11,6 +11,7 @@ from typing import Optional
 import darsia
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.time_data import TimeWindow
+from darsia.utils.locations import normal_path
 
 
 # TODO rm.
@@ -278,9 +279,12 @@ class ProtocolledExperiment:
             self._parent_protocol_cache[resolved_parent] = cached
             return cached
 
+        # A path in another form than its folder's, e.g. outside a project folder
+        # by "..", is compared in its normal form (no call to the file system).
+        normal = normal_path(resolved_path)
         for resolved_folder, protocol in self._resolved_protocol_folders:
             try:
-                resolved_path.relative_to(resolved_folder)
+                normal.relative_to(resolved_folder)
                 self._path_protocol_cache[resolved_path] = protocol
                 self._parent_protocol_cache[resolved_parent] = protocol
                 return protocol
