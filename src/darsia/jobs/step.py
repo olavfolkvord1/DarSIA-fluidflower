@@ -23,7 +23,6 @@ e.g. a depth map. Photos are not identified: a photo is never changed, by rule.
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import math
@@ -420,6 +419,12 @@ class Step:
     protocols or a model folder, given a run's tables (the job's for a result of no
     run), the project folder and the run's photo folders; each one's content is
     part of its results' identity (:func:`file_identity`)."""
+    stamped: Callable[[Mapping[str, Any], Path, Sequence[Path]], Iterable] | None = None
+    """The large files its configuration names that it reads, given as for
+    :attr:`files`, e.g. a depth map or an image mapping; each one's size and
+    modification time are part of its results' identity (:func:`file_stamp`).
+    Photos and stored results are not named here: a photo is never changed, by
+    rule, and a result is bound by its token."""
     domains: bool = False
     """Whether its results are made from the selection's domains, which their scope
     then records."""
@@ -511,6 +516,12 @@ def file_identity(path: Path) -> str:
     str
         The identity.
 
+    Raises
+    ------
+    darsia.utils.results.Unavailable
+        If the share gave no answer within the retries, also as a missing path:
+        an outage is not a missing file.
+
     """
     path = Path(path)
 
@@ -524,10 +535,50 @@ def file_identity(path: Path) -> str:
             found.update(hashlib.sha256(file.read_bytes()).digest())
         return found.hexdigest()
 
+    return _known(path, lambda: results.retry_transient(digest))
+
+
+def file_stamp(path: Path) -> str:
+    """The identity of a large file that a configuration names: its size and
+    modification time, through the share's interruptions; ``"missing"`` if there
+    is none. A file written again, even with the same content, is another one.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+
+    Returns
+    -------
+    str
+        The identity, e.g. ``"size 1024, modified 1731628800123456789"``.
+
+    Raises
+    ------
+    darsia.utils.results.Unavailable
+        If the share gave no answer within the retries, also as a missing path.
+
+    """
+
+    def stamp() -> str:
+        found = results.retry_transient(lambda: Path(path).stat())
+        return f"size {found.st_size}, modified {found.st_mtime_ns}"
+
+    return _known(path, stamp)
+
+
+def _known(path: Path, look: Callable[[], str]) -> str:
+    """A file's identity by a look through the share's interruptions;
+    ``"missing"`` only for a file that is not there, :class:`Unavailable` when the
+    share is out (:func:`darsia.utils.results.share_out`)."""
     try:
-        return results.retry_transient(digest)
-    except FileNotFoundError:
-        return "missing"
+        return look()
+    except OSError as error:
+        if results.share_out(error):
+            raise results.Unavailable(f"No answer about {path}: {error}") from error
+        if isinstance(error, FileNotFoundError):
+            return "missing"
+        raise
 
 
 def _file_name(path: Path, project: Path) -> str:
@@ -547,14 +598,17 @@ def configured(
     tables: Mapping[str, Any],
     locations: Locations,
     identity: Callable[[Path], str] = file_identity,
+    files: Mapping[str, str] | None = None,
 ) -> tuple[dict, dict[str, str]]:
     """What of the configuration one result of a task is made from: the tables of
-    every section its step reads, and the identity of every small file its step
-    reads that the configuration names.
+    every section its step reads, and the identity of every file its step reads
+    that the configuration names: a small file's content, a large file's size and
+    time (:func:`file_stamp`).
 
     The sections of the step's settings are the job's; its other sections
-    (:attr:`Step.sections`) and its files (:attr:`Step.files`) are each run's, of
-    the task's run or of every selected run.
+    (:attr:`Step.sections`) and its files (:attr:`Step.files`,
+    :attr:`Step.stamped`) are each run's, of the task's run or of every selected
+    run.
 
     Parameters
     ----------
@@ -568,6 +622,9 @@ def configured(
         The project's results and photos.
     identity : Callable[[Path], str], optional
         The identity of a file (:func:`file_identity`), e.g. one remembered.
+    files : Mapping[str, str], optional
+        The identities of the configured files taken earlier, e.g. when the task
+        started; by default each file is looked at now.
 
     Returns
     -------
@@ -590,12 +647,15 @@ def configured(
             for run in runs
             if run is not None
         }
-    files: dict[str, str] = {}
-    for run in runs if step.files is not None else ():
-        folders = list(locations.sessions.get(run, {}).values()) if run else []
-        for path in step.files(own[run], locations.project, folders):
-            full = normal_path(path, locations.project)
-            files[_file_name(full, locations.project)] = identity(full)
+    if files is not None:
+        return plain(settings), dict(files)
+    files = {}
+    for named, known in ((step.files, identity), (step.stamped, file_stamp)):
+        for run in runs if named is not None else ():
+            folders = list(locations.sessions.get(run, {}).values()) if run else []
+            for path in named(own[run], locations.project, folders):
+                full = normal_path(path, locations.project)
+                files[_file_name(full, locations.project)] = known(full)
     return plain(settings), files
 
 
@@ -659,6 +719,7 @@ def request(
     *,
     locations: Locations,
     identity: Callable[[Path], str] = file_identity,
+    files: Mapping[str, str] | None = None,
 ) -> dict:
     """What one result of a task would record now (:data:`REUSED`), to publish it or
     to compare a stored result with it (:func:`darsia.utils.results.reusable`).
@@ -681,6 +742,8 @@ def request(
         The project's results and photos, where the configured files are found.
     identity : Callable[[Path], str], optional
         The identity of a file (:func:`file_identity`), e.g. one remembered.
+    files : Mapping[str, str], optional
+        The identities of the configured files taken earlier (:func:`configured`).
 
     Returns
     -------
@@ -692,7 +755,9 @@ def request(
 
     """
     used = made_from(step, task, frame)
-    settings, files = configured(step, task, selection, tables, locations, identity)
+    settings, files = configured(
+        step, task, selection, tables, locations, identity, files
+    )
     return {
         "step": step.name,
         "settings": settings,
@@ -774,7 +839,7 @@ class StepContext:
         self._accepted = accepted
         self._tokens: dict[str, str] = {}
         self._outputs = {i.key: i for i in outputs(step, task)}
-        self._identity = functools.cache(file_identity)
+        self._files = self._configured_files()
 
     def _input(self, kind, run, frame, part) -> Input:
         """The declared input of a kind, frame, part and run (by default the
@@ -855,8 +920,15 @@ class StepContext:
         self.token_of(i)
         return results.read(self._location(i), reader, committed=True)
 
+    def _configured_files(self) -> dict[str, str]:
+        """The identities of the configured files the task reads, looked at now."""
+        return configured(
+            self.step, self.task, self.selection, self.tables, self.locations
+        )[1]
+
     def _request(self, frame: Frame | None) -> dict:
-        """What one of this task's results records now."""
+        """What one of this task's results records now, with the identities of its
+        configured files as they were when the task started."""
         used = made_from(self.step, self.task, frame)
         tokens = {i.key: self.token_of(i) for i in used}
         return request(
@@ -868,7 +940,7 @@ class StepContext:
             tokens,
             frame,
             locations=self.locations,
-            identity=self._identity,
+            files=self._files,
         )
 
     def _own(self, output: Input, stored: Mapping, frame: Frame | None) -> None:
@@ -945,7 +1017,8 @@ class StepContext:
         The description records the request (:func:`request`), the job, the task
         and the revision of the code that made it. A location that already holds an
         earlier attempt's result of the same task that serves now is adopted
-        instead.
+        instead. Nothing is published once a configured file the task reads has
+        changed since it started.
 
         Parameters
         ----------
@@ -966,10 +1039,24 @@ class StepContext:
         ------
         FileExistsError
             If another's result is stored there.
+        RuntimeError
+            If a configured file the task reads changed since it started, naming
+            it.
 
         """
         output = self._output(run, frame, part)
         location = self._location(output)
+        now = self._configured_files()
+        changed = sorted(
+            k
+            for k in now.keys() | self._files.keys()
+            if now.get(k) != self._files.get(k)
+        )
+        if changed:
+            raise RuntimeError(
+                f"{', '.join(changed)} changed while task {self.task.id} read it; "
+                "it publishes nothing more."
+            )
         description = {
             **self._request(frame),
             "job": self._job["id"],
