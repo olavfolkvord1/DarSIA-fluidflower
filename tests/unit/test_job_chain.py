@@ -26,9 +26,10 @@ import toml
 
 import darsia
 import darsia.jobs.__main__ as jobs_main
+from darsia.jobs import job as job_module
 from darsia.jobs import queue
 from darsia.jobs.job import create_job
-from darsia.jobs.step import Selection, StepContext, run_tables, table
+from darsia.jobs.step import Selection, StepContext, missing_runs, run_tables, table
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
@@ -1435,6 +1436,88 @@ def test_a_fold_without_a_runs_donor_takes_the_next_donor(tmp_path, monkeypatch)
     own = stored["overflow", "r1"]
     assert {v.source for v in darsia.read_frame_volumes(own).values()} == {"measured"}
     assert darsia.held_out_runs(own) == ()
+    # With calibration groups, the donors are its group's fit runs alone.
+    groups = {"late": {"runs": ["r2", "r3"], "fit": ["r3"]}, "early": GROUP_EARLY}
+    fits = settings_from_table(calibration.FitRuns, {"groups": groups})
+    calibration._overflow(ctx("r2", "grouped"))
+    grouped = stored["grouped", "r2"]
+    assert {v.source for v in darsia.read_frame_volumes(grouped).values()} == {"r3"}
+    assert darsia.held_out_runs(grouped) == ()
+
+
+GROUP_EARLY = {"runs": ["r1"], "fit": ["r1"], "folds": ["r1"]}
+"""A calibration group of the first run, with its fold."""
+
+
+def test_each_calibration_group_fits_its_runs_and_a_run_reads_its_group(
+    tmp_path, monkeypatch
+):
+    """With calibration groups each group has its own fit and folds over its own
+    runs' frames, and a run's mass maps read its group's fit and no other."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    tables = tomllib.loads(config.read_text())
+    frames = {**selection.frames, "r3": selection.frames["r1"]}
+    selection = Selection(frames, selection.sessions)
+    groups = {"late": {"runs": ["r2", "r3"], "fit": ["r3"]}, "early": GROUP_EARLY}
+    tables["calibration_runs"] = {"groups": groups}
+    fits = settings_from_table(calibration.FitRuns, tables["calibration_runs"])
+    parts = calibration.CALIBRATION.parts(selection, tables)
+    assert parts == ("fit-late", "fit-early", "fold-early-r1")
+    with pytest.raises(ValueError, match="Run r4 is in 0 calibration groups"):
+        fits.group("r4")
+    for wrong in (
+        {**GROUP_EARLY, "fit": ["r1", "r2"]},
+        {**GROUP_EARLY, "folds": ["r2"]},
+    ):
+        with pytest.raises(ValueError, match=r"\['r2'\] of a calibration's fit"):
+            settings_from_table(calibration.FitRuns, {"groups": {"early": wrong}})
+    # A job needs the fit runs and folds of its selected runs' groups alone.
+    early = Selection({"r1": frames["r1"]}, selection.sessions)
+    assert missing_runs(calibration.CALIBRATION, early, tables) == []
+    late = Selection({"r2": frames["r2"]}, selection.sessions)
+    assert missing_runs(calibration.CALIBRATION, late, tables) == ["r3"]
+    assert missing_runs(calibration.OVERFLOW, late, tables) == ["r3"]
+
+    # A run's mass maps read its group's fit.
+    kinds = {step.name: step for step in STEPS}
+    for run, part in (("r1", "fit-early"), ("r2", "fit-late"), ("r3", "fit-late")):
+        inputs = job_module._reads(
+            analysis.MASS_MAPS, run, frames[run][:1], None, kinds, selection, tables
+        )
+        assert [i.part for i in inputs if i.kind == "calibration"] == [part]
+
+    # Each part fits its group's fit runs on its group's runs' frames alone.
+    fitted = {}
+
+    def fit(frames, runs, *args):
+        fitted.update(runs=sorted(set(frames)), fit=list(runs))
+        return SimpleNamespace(anchors={})
+
+    monkeypatch.setattr(
+        darsia, "read_frames", lambda folder, held, first_index=None: [folder.name]
+    )
+    monkeypatch.setattr(darsia, "fit_calibration", fit)
+    monkeypatch.setattr(darsia, "calibration_fold", lambda *a: (fit(*a[:-1]), []))
+    monkeypatch.setattr(darsia, "mass_calibrations", lambda c, s: {})
+    monkeypatch.setattr(darsia, "write_calibration", lambda *a: None)
+    material = settings_from_table(calibration.MaterialSettings, tables["material"])
+    settings = {"calibration_runs": fits, "material": material}
+    settings |= {"calibration_fit": None, "run_statistics": None}
+    for part, runs, fit_runs in (
+        ("fit-late", ["r2", "r3"], ["r3"]),
+        ("fit-early", ["r1"], ["r1"]),
+        ("fold-early-r1", ["r1"], ["r1"]),
+    ):
+        ctx = SimpleNamespace(
+            task=SimpleNamespace(part=part),
+            selection=selection,
+            settings=settings,
+            read=lambda kind, reader, run, frame: reader(tmp_path / run),
+            publish=lambda write: write(tmp_path),
+        )
+        calibration._calibration(ctx)
+        assert fitted == {"runs": runs, "fit": fit_runs}
 
 
 def test_the_readings_count_from_the_sheets_own_injection_start(tmp_path, monkeypatch):

@@ -438,11 +438,12 @@ class Step:
     """The selected runs a task of the step over the selection reads, named by the
     configuration's tables, e.g. the runs a measurement is made on; by default
     every selected run (:func:`read_runs`)."""
-    required: Callable[[Mapping[str, Any]], Iterable[str]] | None = None
-    """The runs the configuration names that a job of the step must select, e.g.
-    the fit runs among which a run's overflow ranks its donors and over which the
-    calibration fits, or the distances' reference run; a job without one of them
-    is refused (:func:`missing_runs`)."""
+    required: Callable[[Mapping[str, Any], Sequence[str]], Iterable[str]] | None = None
+    """The runs the configuration names that a job of the step must select, given
+    the configuration's tables and the selected runs, e.g. the fit runs among which
+    a run's overflow ranks its donors and over which the calibration fits (of the
+    calibration groups of the selected runs), or the distances' reference run; a
+    job without one of them is refused (:func:`missing_runs`)."""
     run_part: Callable[[str, Mapping[str, Any]], str] | None = None
     """For a step in parts, the part that a task of a run reads by
     :attr:`Scope.ONE`, given the run and the configuration's tables, e.g. the fit
@@ -488,7 +489,8 @@ def missing_runs(
 ) -> list[str]:
     """The runs a step needs, by its configuration (:attr:`Step.required`), that
     the selection lacks."""
-    named = [] if step.required is None else list(step.required(tables))
+    selected = list(selection.frames)
+    named = [] if step.required is None else list(step.required(tables, selected))
     return [run for run in dict.fromkeys(named) if run not in selection.frames]
 
 

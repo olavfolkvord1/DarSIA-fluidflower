@@ -36,7 +36,9 @@ statistics, and the calibration fit with its folds.
   result per frame, so an interrupted chunk resumes at its missing frames.
 - ``calibration`` (R6) fits the gain and the dilution across the fit runs, and
   each fold leaves one run out, reading every run's frames without its
-  estimate.
+  estimate. With calibration groups (:class:`FitRuns`), e.g. runs photographed
+  with other camera settings, each group has its own fit and folds over its own
+  runs, and a run's mass maps read its group's fit.
 
 """
 
@@ -45,7 +47,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -158,13 +160,95 @@ class ResponseRuns:
 
 
 @dataclass(frozen=True)
-class FitRuns:
-    """The runs of the calibration fit; the ``[calibration_runs]`` table."""
+class FitGroup:
+    """One calibration group; a table of ``[calibration_runs.groups]``."""
 
+    runs: Sequence[str]
+    """The runs of the group: their mass maps read its fit; none for the one
+    calibration of every run."""
     fit: Sequence[str]
-    """The runs fitted."""
+    """The runs fitted, of the group's runs."""
     folds: Sequence[str] = ()
     """The fit runs left out one at a time."""
+
+    def __post_init__(self) -> None:
+        """Refuse fit runs outside the group's runs, and folds outside its fit."""
+        outside = [run for run in self.fit if self.runs and run not in self.runs]
+        outside += [run for run in self.folds if run not in self.fit]
+        if outside:
+            raise ValueError(
+                f"Runs {outside} of a calibration's fit or folds are not its own."
+            )
+
+
+@dataclass(frozen=True)
+class FitRuns:
+    """The runs of the calibration fit; the ``[calibration_runs]`` table: the fit
+    runs and folds of one calibration of every run, or one group of runs per
+    calibration (``groups``), e.g. runs photographed with other camera settings.
+    """
+
+    fit: Sequence[str] = ()
+    """The runs fitted, without groups."""
+    folds: Sequence[str] = ()
+    """The fit runs left out one at a time, without groups."""
+    groups: Mapping[str, FitGroup] = field(default_factory=dict)
+    """Each calibration group by its name; none for one calibration."""
+
+    def __post_init__(self) -> None:
+        """Refuse a table that names both the fit runs and groups, or neither, and
+        folds outside the fit runs."""
+        if bool(self.groups) == bool(self.fit):
+            raise ValueError(
+                "[calibration_runs] names either the fit runs or the groups."
+            )
+        FitGroup((), self.fit, self.folds)
+
+    def group_of(self, run: str) -> str | None:
+        """The name of a run's calibration group; None without groups.
+
+        Raises
+        ------
+        ValueError
+            If the run is in no group, or in more than one.
+
+        """
+        if not self.groups:
+            return None
+        found = [name for name, group in self.groups.items() if run in group.runs]
+        if len(found) != 1:
+            raise ValueError(f"Run {run} is in {len(found)} calibration groups.")
+        return found[0]
+
+    def group(self, run: str) -> FitGroup:
+        """The calibration of a run: its group, or without groups the one fit
+        (with no runs of its own)."""
+        name = self.group_of(run)
+        return FitGroup((), self.fit, self.folds) if name is None else self.groups[name]
+
+    def parts(self, runs: Sequence[str]) -> dict[str, tuple[FitGroup, str | None]]:
+        """The parts of the calibration: each fit and each fold, by name, with its
+        group and its held-out run (None for the fit); a group is made only when
+        one of its runs is among ``runs``.
+
+        Without groups the parts are ``fit`` and ``fold-<run>``; with groups,
+        ``fit-<group>`` and ``fold-<group>-<run>``.
+
+        """
+        if not self.groups:
+            one = FitGroup((), self.fit, self.folds)
+            return {"fit": (one, None)} | {f"fold-{r}": (one, r) for r in self.folds}
+        found: dict[str, tuple[FitGroup, str | None]] = {}
+        for name, group in self.groups.items():
+            if any(run in group.runs for run in runs):
+                found[f"fit-{name}"] = (group, None)
+                found |= {f"fold-{name}-{r}": (group, r) for r in group.folds}
+        return found
+
+
+def fit_runs(tables: Mapping) -> FitRuns:
+    """The calibration's runs from the configuration's ``[calibration_runs]``."""
+    return settings_from_table(FitRuns, tables["calibration_runs"])
 
 
 def frame_key(frame: darsia.Frame) -> str:
@@ -483,12 +567,13 @@ def _gas_density(experiment, hours: float, dtype) -> float:
 
 def _overflow(ctx: StepContext) -> None:
     """Each frame's free-gas volume: from the run's own readings, else from the
-    most similar fit run with readings; and, if that donor is left out of a fold,
-    from the next one. The readings are interpolated in the grid's dtype, as our
-    production interpolated them in the job's precision; the stored displaced
-    volumes keep theirs."""
+    most similar fit run with readings of the run's calibration; and, if that donor
+    is left out of a fold, from the next one. The readings are interpolated in the
+    grid's dtype, as our production interpolated them in the job's precision; the
+    stored displaced volumes keep theirs."""
     run, frames = ctx.task.run, ctx.task.frames
-    settings, fits = ctx.settings["overflow"], ctx.settings["calibration_runs"]
+    settings = ctx.settings["overflow"]
+    fits = ctx.settings["calibration_runs"].group(run)
     runs = {
         name: ctx.read("displaced-volume", darsia.read_overflow_run, run=name)
         for name in ctx.selection.frames
@@ -1244,33 +1329,57 @@ def _run_statistics(ctx: StepContext) -> None:
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
-    """The global fit, then one fold per run left out."""
-    folds = tables.get("calibration_runs", {}).get("folds", ())
-    return ("fit",) + tuple(f"fold-{run}" for run in folds)
+    """The global fit, then one fold per run left out; with groups, each group's
+    fit and folds, of the groups with a selected run (:meth:`FitRuns.parts`)."""
+    if "calibration_runs" not in tables:
+        return ("fit",)
+    return tuple(fit_runs(tables).parts(list(selection.frames)))
+
+
+def _required_runs(tables: Mapping, selected: Sequence[str]) -> list[str]:
+    """The runs a calibration job must select: the fit runs and folds of each
+    calibration it makes (of each group with a selected run)."""
+    if "calibration_runs" not in tables:
+        return []
+    parts = fit_runs(tables).parts(list(selected)).values()
+    return [run for group, _ in parts for run in (*group.fit, *group.folds)]
+
+
+def _donor_runs(tables: Mapping, selected: Sequence[str]) -> list[str]:
+    """The runs an overflow job must select: the fit runs of each selected run's
+    calibration, among which its donors are ranked."""
+    fits = fit_runs(tables)
+    return [donor for run in selected for donor in fits.group(run).fit]
+
+
+def _run_part(run: str, tables: Mapping) -> str:
+    """The fit that a run's mass maps read: its group's, or the one fit."""
+    name = fit_runs(tables).group_of(run) if "calibration_runs" in tables else None
+    return "fit" if name is None else f"fit-{name}"
 
 
 def _calibration(ctx: StepContext) -> None:
-    """The fit across the fit runs, or one fold leaving a run out; a fold reads
-    each run's frames without the held-out run's estimated free gas."""
+    """The fit across the fit runs, or one fold leaving a run out, over the runs of
+    the part's group; a fold reads each run's frames without the held-out run's
+    estimated free gas."""
     settings = ctx.settings
     runs, material = settings["calibration_runs"], settings["material"]
-    held = None if ctx.task.part == "fit" else ctx.task.part.removeprefix("fold-")
-    frames = []
-    for run, selected in ctx.selection.frames.items():
-        for index, frame in enumerate(selected):
-            frames.extend(
-                ctx.read(
-                    "run-statistics",
-                    lambda folder, index=index: darsia.read_frames(
-                        folder, held, first_index=index
-                    ),
-                    run=run,
-                    frame=frame,
-                )
-            )
+    group, held = runs.parts(list(ctx.selection.frames))[ctx.task.part]
+    members = [r for r in ctx.selection.frames if not group.runs or r in group.runs]
+    frames = [
+        frame
+        for run in members
+        for index, selected in enumerate(ctx.selection.frames[run])
+        for frame in ctx.read(
+            "run-statistics",
+            lambda f: darsia.read_frames(f, held, first_index=index),
+            run=run,
+            frame=selected,
+        )
+    ]
     swi = {int(k): float(v) for k, v in material.swi.items()}
     measured = [int(k) for k in material.measured_swi]
-    arguments = (frames, list(runs.fit), settings["calibration_fit"], swi, measured)
+    arguments = (frames, list(group.fit), settings["calibration_fit"], swi, measured)
     predictions = []
     if held is None:
         calibration = darsia.fit_calibration(*arguments)
@@ -1315,7 +1424,7 @@ OVERFLOW = Step(
     {"overflow": darsia.OverflowSettings, "calibration_runs": FitRuns},
     sections=EXPERIMENT,
     files=protocol_files,
-    required=lambda tables: tables["calibration_runs"]["fit"],
+    required=_donor_runs,
 )
 """Each run's free-gas volume per frame, its own or a donor's."""
 PHASE_MAPS = Step(
@@ -1456,12 +1565,10 @@ CALIBRATION = Step(
         "run_statistics": darsia.RunStatisticsSettings,
     },
     _calibration_parts,
-    required=lambda tables: [
-        *tables["calibration_runs"]["fit"],
-        *tables["calibration_runs"].get("folds", ()),
-    ],
+    run_part=_run_part,
+    required=_required_runs,
 )
-"""The calibration fit and its folds (R6)."""
+"""The calibration fit and its folds (R6), or each group's."""
 STEPS = (
     PHASE_MODEL,
     DISPLACED_VOLUME,
