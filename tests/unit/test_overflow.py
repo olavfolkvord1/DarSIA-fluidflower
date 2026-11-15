@@ -9,9 +9,11 @@ import pandas as pd
 import pytest
 
 import darsia
+from darsia.presets.workflows.config.utils import settings_from_table
 
-SETTINGS = darsia.OverflowSettings(
-    **tomllib.loads(
+SETTINGS = settings_from_table(
+    darsia.OverflowSettings,
+    tomllib.loads(
         """
         # The values the overflow reference ran with in production.
         [overflow]
@@ -31,7 +33,7 @@ SETTINGS = darsia.OverflowSettings(
         pre_injection_span_h = 0.05
         maximum_pre_injection_rate_g_h = 600.0
         """
-    )["overflow"]
+    )["overflow"],
 )
 CIRCULATION = replace(
     SETTINGS,
@@ -121,11 +123,12 @@ def test_a_circulation_reads_the_weight_above_the_baseline(tmp_path):
         circulation = {minimum_readings = 30}
         """
     )
-    assert darsia.OverflowSettings(**table).variant_settings == CIRCULATION.circulation
+    settings = settings_from_table(darsia.OverflowSettings, table)
+    assert settings.variant_settings == CIRCULATION.circulation
     with pytest.raises(ValueError, match="does not match the circulation"):
-        darsia.OverflowSettings(**table, feed=SETTINGS.feed)
+        replace(settings, feed=SETTINGS.feed)
     with pytest.raises(ValueError, match="feed variant needs its"):
-        darsia.OverflowSettings(**{**table, "variant": "feed"})
+        settings_from_table(darsia.OverflowSettings, {**table, "variant": "feed"})
 
 
 def test_a_steady_evaporation_lies_inside_the_fitted_feed(tmp_path):
