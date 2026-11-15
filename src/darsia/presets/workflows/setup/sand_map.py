@@ -24,8 +24,8 @@ pixel centres at whole numbers), and gives the layer of each pixel:
 A run whose sand has settled keeps its own geometry: its adjustment moves anchors
 of the common drawing for that run only (:meth:`SandMapDrawing.moved`).
 
-A drawing is meant as a closed partition of the rig's frame, the rectangle of the
-rig's inner width and height that the rig's configuration gives: the polygons
+A drawing is saved only as a closed partition of the rig's frame, the rectangle of
+the rig's inner width and height that the rig's configuration gives: the polygons
 of the layers not drawn on top cover every point of the frame exactly once, also
 where the camera does not see, and each of their boundaries is shared with a
 neighbouring polygon along the same anchors or lies on the frame's edge. Layers
@@ -118,6 +118,47 @@ class SandMapDrawing:
             on_top=frozenset(int(layer) for layer in data.get("on_top", ())),
             frame=None if frame is None else (float(frame[0]), float(frame[1])),
         )
+
+    def write(self, path: Path) -> None:
+        """Save the drawing as a JSON file that :meth:`read` reads.
+
+        The frame is not written; the rig's configuration gives it.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the file.
+
+        Raises
+        ------
+        ValueError
+            If the drawing has no frame, or is not a closed partition of it
+            (:func:`partition_faults`).
+
+        """
+        if self.frame is None:
+            raise ValueError(
+                "A drawing is saved as a partition of the rig's frame; give it "
+                "the frame's width and height."
+            )
+        faults = partition_faults(self)
+        if faults:
+            counts = Counter(fault.kind for fault in faults)
+            largest = max(faults, key=lambda fault: fault.area)
+            x0, y0, x1, y1 = (1000 * value for value in largest.bounds)
+            raise ValueError(
+                "The drawing is not a closed partition of the rig's frame: "
+                + ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+                + f"; the largest is a {largest.kind} of "
+                f"{largest.area * 1e6:.3f} mm2 at x {x0:.1f} to {x1:.1f} mm, "
+                f"y {y0:.1f} to {y1:.1f} mm."
+            )
+        data = {
+            "anchors": np.asarray(self.anchors, dtype=np.float64).tolist(),
+            "polygons": [[layer, list(indices)] for layer, indices in self.polygons],
+            "on_top": sorted(self.on_top),
+        }
+        Path(path).write_text(json.dumps(data, indent=1), encoding="utf-8")
 
     def moved(self, anchors: Mapping[int, Sequence[float]]) -> "SandMapDrawing":
         """The drawing with some anchors at new positions, e.g., a run's adjustment.
