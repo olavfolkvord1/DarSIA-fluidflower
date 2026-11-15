@@ -19,10 +19,20 @@ statistics, and the calibration fit with its folds.
   rule maps, its free-gas saturation and the CO2 of its labels before the rules,
   also without a held-out donor's volumes, and a run resumes at its first missing
   frame.
+- ``color-ranges`` measures each sand's colour range on the configured runs'
+  frames (:func:`darsia.color_ranges`), each run on its own colour paths.
+- ``path-ratios`` measures each sand's path ratio to the reference sand where two
+  sands meet, on the configured run's frames (:func:`darsia.path_ratios`), read
+  on each sand's own path as a share of its measured colour range, in its
+  ordinary light (:func:`darsia.shadow_light`), up to the ceiling of the
+  concentration curve at the configured gain.
 - ``run-statistics`` (R5) gives each frame the histograms of its sands' dissolved
   CO2 signal, its gas statistics and the column estimate of its CO2 pixels
   without a measurement of their own (:func:`darsia.unknown_statistics`), as the
-  fit reads them.
+  fit reads them. Every sand is read by Beer–Lambert as the reference sand
+  (:func:`response_reading`): on the run's reference-sand background, with the
+  measured path ratios and the reference sand's factor, its path's scale over
+  its measured colour range.
 - ``calibration`` (R6) fits the gain and the dilution across the fit runs, and
   each fold leaves one run out, reading every run's frames without its
   estimate.
@@ -33,7 +43,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -50,6 +60,7 @@ from darsia.jobs.step import (
     StepContext,
     run_tables,
 )
+from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
@@ -60,6 +71,10 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+
+READING = ("reading",)
+"""The section of the sands' colour paths, which a step reads per run
+(:func:`run_reading`)."""
 
 
 @dataclass(frozen=True)
@@ -99,16 +114,31 @@ class SandPath:
     """Supports of the signal function."""
     table: Sequence[float]
     """Signal at the supports."""
-    factor: float
-    """The path's scale over the sand's measured colour range."""
+    scale: float
+    """The path's scale: the sand's factor is the scale over its measured colour
+    range (``color-ranges``)."""
 
 
 @dataclass(frozen=True)
 class ReadingSettings:
-    """The sands' reading of the dissolved CO2; the ``[reading]`` table."""
+    """The sands' colour paths; the ``[reading]`` table, a run's own
+    (``[runs.<run>.reading]``) merged over it."""
 
     sands: Mapping[str, SandPath]
     """Each sand's colour path, by facies id."""
+
+
+@dataclass(frozen=True)
+class ResponseRuns:
+    """The runs the sands' response is measured on; the ``[response]`` table."""
+
+    range_runs: Sequence[str]
+    """The runs whose frames give each sand's colour range."""
+    ratio_run: str
+    """The run whose frames give the sands' path ratios."""
+    ratio_gain: float
+    """The gain of the reading on the colour ranges alone: the top of the
+    concentration curve over it is the ceiling signal of the path ratios."""
 
 
 @dataclass(frozen=True)
@@ -215,9 +245,16 @@ def co2_state(grid: RunGrid, experiment, date) -> darsia.PrecisionCO2MassAnalysi
     )
 
 
-def sand_reading(settings: ReadingSettings) -> darsia.SandColorPaths:
-    """The sands' colour paths of the reading settings."""
-    paths, factors = {}, {}
+def run_reading(ctx: StepContext, run: str) -> ReadingSettings:
+    """A run's colour paths: the ``[reading]`` table with the run's own
+    (``[runs.<run>.reading]``) merged over it, which a step reading it records as
+    one of its sections."""
+    return settings_from_table(ReadingSettings, run_tables(ctx.tables, run)["reading"])
+
+
+def sand_paths(settings: ReadingSettings) -> dict[int, darsia.ColorPathSignal]:
+    """Each sand's colour path and signal function, by facies id."""
+    paths = {}
     for name, sand in settings.sands.items():
         colors = [np.asarray(c, float) for c in sand.colors]
         path = darsia.ColorPath(colors=colors, base_color=np.zeros(3), mode="rgb")
@@ -227,21 +264,77 @@ def sand_reading(settings: ReadingSettings) -> darsia.SandColorPaths:
             ),
             darsia.PWTransformation(list(sand.supports), list(sand.table)),
         )
-        factors[int(name)] = sand.factor
-    return darsia.SandColorPaths(paths, factors)
+    return paths
 
 
-def read_signal(grid, image, maps, reading, settings) -> tuple[np.ndarray, np.ndarray]:
-    """A frame's read signal of its dissolved CO2, averaged inside each sand's
-    dissolved CO2, as the run statistics read it, and the pixels whose colour is
-    measured (finite in the corrected image)."""
-    support = grid.domain & np.isfinite(image).all(axis=-1)
-    labels, rules = maps["labels"], maps["rules"]
-    dissolved = (
-        support
-        & (labels == darsia.PhaseLabel.DISSOLVED)
-        & ~darsia.model_gas(labels, rules)
+def range_reading(
+    settings: ReadingSettings, ranges: Mapping[int, float]
+) -> darsia.SandColorPaths:
+    """Each sand read on its own colour path as a share of its measured colour
+    range: its factor is its path's scale over the range."""
+    factors = {
+        int(k): sand.scale / ranges[int(k)] for k, sand in settings.sands.items()
+    }
+    return darsia.SandColorPaths(sand_paths(settings), factors)
+
+
+def response_reading(
+    ctx: StepContext, run: str, grid: RunGrid
+) -> darsia.BeerLambertReading:
+    """A run's reading of its sands' dissolved CO2, as our production read it for
+    the calibration and the mass: every sand by Beer–Lambert as the reference
+    sand, with the measured path ratios (``path-ratios``), on the reference sand's
+    background over the run's known pixels outside its shadows
+    (:func:`darsia.shadow_light` of the sands read), and with the reference sand's
+    factor, its path's scale over its measured colour range (``color-ranges``).
+
+    Raises
+    ------
+    ValueError
+        If the ``[beer_lambert]`` table gives path ratios: they are measured.
+
+    """
+    settings = ctx.settings["beer_lambert"]
+    if settings.path_ratio is not None:
+        raise ValueError("The path ratios are measured: [beer_lambert] names none.")
+    ratios = ctx.read("path-ratios", darsia.read_path_ratios).ratio
+    settings = replace(settings, path_ratio=ratios)
+    reading, reference = run_reading(ctx, run), settings.reference_sand
+    baseline, facies, pitch = grid.rig.baseline.img, grid.rig.facies, grid.optical_pitch
+    sands = [int(sand) for sand in reading.sands]
+    light = darsia.shadow_light(baseline, facies, pitch, sands, ctx.settings["shadow"])
+    background = darsia.reference_background(
+        baseline, facies, pitch, grid.geometry.known, light, settings
     )
+    ranges = ctx.read("color-ranges", darsia.read_color_ranges)
+    factor = reading.sands[str(reference)].scale / ranges[reference]
+    path = sand_paths(reading)[reference]
+    return darsia.BeerLambertReading(path, factor, background, facies, pitch, settings)
+
+
+def native_reading(ctx: StepContext, run: str) -> darsia.SandColorPaths:
+    """Each sand read on its own colour path with the factor one: the signal our
+    production kept on a sand's measured pixels outside the dissolved CO2 it
+    read (:func:`read_signal`)."""
+    reading = run_reading(ctx, run)
+    return darsia.SandColorPaths(
+        sand_paths(reading), {int(sand): 1.0 for sand in reading.sands}
+    )
+
+
+def read_signal(
+    grid, image, maps, reading, settings, native
+) -> tuple[np.ndarray, np.ndarray]:
+    """A frame's read signal, as our production read it, and the pixels whose
+    colour is measured (finite in the corrected image).
+
+    The dissolved CO2 of the frame's labels before the rules (``maps["before"]``,
+    :func:`darsia.free_gas`) is read by ``reading`` and averaged inside each
+    sand's dissolved CO2; every other measured pixel of a sand read keeps its own
+    path's signal (``native``, :func:`native_reading`). The statistics and the
+    mass maps take this signal on the dissolved CO2 of the phase map."""
+    support = grid.domain & np.isfinite(image).all(axis=-1)
+    dissolved = support & (maps["before"] == darsia.PhaseLabel.DISSOLVED)
     baseline = grid.rig.baseline.img
     signal = reading(image, baseline, support, dissolved, grid.facies)
     optical = darsia.optical_grid(
@@ -249,7 +342,10 @@ def read_signal(grid, image, maps, reading, settings) -> tuple[np.ndarray, np.nd
     )
     rev = darsia.REV(size=settings.mean_mm / 1000, img=optical)
     sands = {sand: grid.facies == sand for sand in reading.sands}
-    return darsia.sand_mean(signal, dissolved, sands, rev), support
+    signal = darsia.sand_mean(signal, dissolved, sands, rev)
+    sand_pixels = support & np.isin(grid.facies, reading.sands)
+    own = native(image, baseline, support, sand_pixels, grid.facies)
+    return np.where(dissolved, signal, own).astype(signal.dtype), support
 
 
 def _phase_model(ctx: StepContext) -> None:
@@ -608,6 +704,77 @@ def _phase_maps(ctx: StepContext) -> None:
         ctx.publish(write, frame=frame)
 
 
+class _RunFrames(Sequence):
+    """A run's selected frames as a measurement reads them, by index: each one's
+    corrected image, its phase and rule maps, and its pixels whose colour is
+    measured (in the domain and finite in the corrected image)."""
+
+    def __init__(self, ctx: StepContext, run: str, grid: RunGrid) -> None:
+        self.ctx, self.run, self.grid = ctx, run, grid
+        self.frames = ctx.selection.frames[run]
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def __getitem__(self, index):
+        frame, run = self.frames[int(index)], self.run
+        image = self.ctx.read("corrected-image", read_image, run=run, frame=frame).img
+        maps = self.ctx.read("phase-maps", darsia.read_phase_maps, run=run, frame=frame)
+        support = self.grid.domain & np.isfinite(image).all(axis=-1)
+        return image, maps["labels"], maps["rules"], support
+
+
+def _color_ranges(ctx: StepContext) -> None:
+    """Each sand's colour range on the configured runs, each run read on its own
+    colour paths."""
+    settings, runs = ctx.settings, []
+    for run in settings["response"].range_runs:
+        grid = run_grid(ctx.read("rig", read_rig, run=run), settings["material"])
+        rig, paths = grid.rig, sand_paths(run_reading(ctx, run))
+        frames = _RunFrames(ctx, run, grid)
+        runs.append((frames, rig.baseline.img, rig.facies, grid.optical_pitch, paths))
+    ranges = darsia.color_ranges(runs, settings["color_ranges"])
+    ctx.publish(lambda folder: darsia.write_color_ranges(folder, ranges))
+
+
+def _path_ratios(ctx: StepContext) -> None:
+    """The sands' path ratios on the configured run, read on the colour ranges
+    alone in each sand's ordinary light, up to the concentration curve's top at
+    the configured gain."""
+    settings = ctx.settings
+    response, statistics = settings["response"], settings["run_statistics"]
+    run = response.ratio_run
+    grid = run_grid(ctx.read("rig", read_rig, run=run), settings["material"])
+    ranges = ctx.read("color-ranges", darsia.read_color_ranges)
+    reading = range_reading(run_reading(ctx, run), ranges)
+    baseline, facies, pitch = grid.rig.baseline.img, grid.rig.facies, grid.optical_pitch
+    light = darsia.shadow_light(
+        baseline, facies, pitch, reading.sands, settings["shadow"]
+    )
+    experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
+    start = experiment.experiment_start
+    hours = [
+        (experiment.get_datetime(ctx.photo(run, frame)) - start).total_seconds() / 3600
+        for frame in ctx.selection.frames[run]
+    ]
+    span = statistics.saturation_signal - statistics.zero_signal
+    ceiling = statistics.zero_signal + span / response.ratio_gain
+    found = darsia.path_ratios(
+        _RunFrames(ctx, run, grid),
+        hours,
+        baseline,
+        facies,
+        pitch,
+        grid.geometry.known,
+        reading,
+        light,
+        settings["beer_lambert"].reference_sand,
+        ceiling,
+        settings["path_ratios"],
+    )
+    ctx.publish(lambda folder: darsia.write_path_ratios(folder, found))
+
+
 def _run_statistics(ctx: StepContext) -> None:
     """Each frame's sand histograms, gas statistics and column estimate, as the
     fit reads them; for a fold leaving out the donor of the run's free gas, also
@@ -622,13 +789,13 @@ def _run_statistics(ctx: StepContext) -> None:
         held_out: ctx.read("overflow", lambda f: darsia.read_frame_volumes(f, held_out))
         for held_out in variants
     }
-    reading = sand_reading(settings["reading"])
+    reading = response_reading(ctx, run, grid)
+    native = native_reading(ctx, run)
     rows = {held_out: [] for held_out in variants}
     for index, frame in enumerate(frames):
         image = ctx.read("corrected-image", read_image, frame=frame).img
         date = experiment.get_datetime(ctx.photo(run, frame))
         co2 = co2_state(grid, experiment, date)
-        support = grid.domain & np.isfinite(image).all(axis=-1)
         hours = (date - start).total_seconds() / 3600
         for held_out in variants:
             maps = ctx.read(
@@ -637,16 +804,22 @@ def _run_statistics(ctx: StepContext) -> None:
             capacity = darsia.dissolved_capacity(
                 grid.geometry.pore_volume_m3, co2.solubility_co2, maps["saturation"]
             )
-            histograms = next(
-                darsia.run_statistics(
-                    [(image, maps["labels"], maps["rules"], support, capacity)],
-                    grid.rig.baseline.img,
-                    grid.rig.facies,
-                    grid.optical_pitch,
-                    grid.geometry.counted,
-                    reading,
-                    statistics_settings,
-                )
+            signal, measured = read_signal(
+                grid, image, maps, reading, statistics_settings, native
+            )
+            dissolved = (
+                measured
+                & (maps["labels"] == darsia.PhaseLabel.DISSOLVED)
+                & ~darsia.model_gas(maps["labels"], maps["rules"])
+            )
+            histograms = darsia.signal_histograms(
+                signal,
+                dissolved,
+                grid.facies,
+                grid.geometry.counted,
+                capacity,
+                reading.sands,
+                statistics_settings,
             )
             gas = darsia.gas_statistics(
                 maps["co2"],
@@ -657,9 +830,6 @@ def _run_statistics(ctx: StepContext) -> None:
                 grid.geometry.pore_volume_m3,
                 co2.density_gaseous_co2,
                 co2.solubility_co2,
-            )
-            signal, measured = read_signal(
-                grid, image, maps, reading, statistics_settings
             )
             unknown = darsia.unknown_statistics(
                 darsia.relative_signal(signal, statistics_settings),
@@ -781,6 +951,50 @@ PHASE_MAPS = Step(
     files=_phase_map_files,
 )
 """Each frame's phase maps and free-gas saturation (R4)."""
+COLOR_RANGES = Step(
+    "color-ranges",
+    {"rig": Scope.ALL, "corrected-image": Scope.ALL, "phase-maps": Scope.ALL},
+    Order.PARTS,
+    Memory(grid=12.0),
+    _color_ranges,
+    {
+        "color_ranges": darsia.ColorRangeSettings,
+        "response": ResponseRuns,
+        "material": MaterialSettings,
+    },
+    sections=READING,
+    runs=lambda tables: tables["response"]["range_runs"],
+)
+"""Each sand's colour range, measured on the configured runs."""
+PATH_RATIOS = Step(
+    "path-ratios",
+    {
+        "rig": Scope.ALL,
+        "corrected-image": Scope.ALL,
+        "phase-maps": Scope.ALL,
+        "color-ranges": Scope.ONE,
+    },
+    Order.PARTS,
+    Memory(grid=24.0),
+    _path_ratios,
+    {
+        "path_ratios": darsia.PathRatioSettings,
+        "shadow": darsia.ShadowSettings,
+        "beer_lambert": darsia.BeerLambertSettings,
+        "response": ResponseRuns,
+        "run_statistics": darsia.RunStatisticsSettings,
+        "material": MaterialSettings,
+    },
+    sections=(*READING, *EXPERIMENT),
+    files=protocol_files,
+    runs=lambda tables: [tables["response"]["ratio_run"]],
+)
+"""The sands' path ratios, measured on the configured run."""
+RESPONSE = {
+    "beer_lambert": darsia.BeerLambertSettings,
+    "shadow": darsia.ShadowSettings,
+}
+"""The settings of the sands' Beer–Lambert response (:func:`response_reading`)."""
 RUN_STATISTICS = Step(
     "run-statistics",
     {
@@ -788,17 +1002,19 @@ RUN_STATISTICS = Step(
         "corrected-image": Scope.OWN,
         "phase-maps": Scope.OWN,
         "overflow": Scope.OWN,
+        "color-ranges": Scope.ONE,
+        "path-ratios": Scope.ONE,
     },
     Order.RUN,
     Memory(grid=24.0),
     _run_statistics,
     {
         "run_statistics": darsia.RunStatisticsSettings,
-        "reading": ReadingSettings,
         "material": MaterialSettings,
         "unknown_mass": darsia.UnknownMassSettings,
+        **RESPONSE,
     },
-    sections=EXPERIMENT,
+    sections=(*READING, *EXPERIMENT),
     files=protocol_files,
 )
 """Each run's statistics of its frames (R5)."""
@@ -826,6 +1042,8 @@ STEPS = (
     DISPLACED_VOLUME,
     OVERFLOW,
     PHASE_MAPS,
+    COLOR_RANGES,
+    PATH_RATIOS,
     RUN_STATISTICS,
     CALIBRATION,
 )

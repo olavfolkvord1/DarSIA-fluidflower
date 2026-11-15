@@ -2,8 +2,9 @@
 
 - ``mass-maps`` (R7) turns a frame's read signal, phase maps and free gas into its
   CO2 mass per pore volume (:func:`darsia.mass_maps`), with its run's calibration
-  and the CO2 tables at the frame's pressure and temperature; each field of the
-  maps is stored as an image.
+  and the CO2 tables at the frame's pressure and temperature; the signal is read
+  as the run statistics read it, every sand by Beer–Lambert as the reference sand
+  (:func:`response_reading`), and each field of the maps is stored as an image.
 - ``mass-copy`` copies each frame's mass maps onto metric cells, e.g. 1 mm
   (:class:`darsia.MassCopy`), a second result of the frame; each field of the copy,
   and the run's pore volume and domain area per cell, is stored as an image on
@@ -26,13 +27,15 @@ from darsia.jobs.step import Memory, Order, Scope, Step, StepContext
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain
 from darsia.presets.workflows.calibration.steps import (
+    READING,
+    RESPONSE,
     MaterialSettings,
-    ReadingSettings,
     co2_state,
     frame_key,
+    native_reading,
     read_signal,
+    response_reading,
     run_grid,
-    sand_reading,
 )
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
@@ -69,7 +72,8 @@ def _mass_maps(ctx: StepContext) -> None:
     run, settings = ctx.task.run, ctx.settings
     grid = run_grid(ctx.read("rig", read_rig), settings["material"])
     calibration = ctx.read("calibration", darsia.read_mass_calibrations)[run]
-    reading = sand_reading(settings["reading"])
+    reading = response_reading(ctx, run, grid)
+    native = native_reading(ctx, run)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     start = experiment.experiment_start
     for frame in ctx.task.frames:
@@ -78,7 +82,7 @@ def _mass_maps(ctx: StepContext) -> None:
         image = ctx.read("corrected-image", read_image, frame=frame)
         maps = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
         signal, measured = read_signal(
-            grid, image.img, maps, reading, settings["run_statistics"]
+            grid, image.img, maps, reading, settings["run_statistics"], native
         )
         date = experiment.get_datetime(ctx.photo(run, frame))
         relative = darsia.ScalarImage(
@@ -171,16 +175,18 @@ MASS_MAPS = Step(
         "corrected-image": Scope.OWN,
         "phase-maps": Scope.OWN,
         "calibration": Scope.ONE,
+        "color-ranges": Scope.ONE,
+        "path-ratios": Scope.ONE,
     },
     Order.FRAMES,
     Memory(grid=40.0),
     _mass_maps,
     {
         "material": MaterialSettings,
-        "reading": ReadingSettings,
         "run_statistics": darsia.RunStatisticsSettings,
+        **RESPONSE,
     },
-    sections=EXPERIMENT,
+    sections=(*READING, *EXPERIMENT),
     files=protocol_files,
 )
 """Each frame's mass maps (R7)."""
