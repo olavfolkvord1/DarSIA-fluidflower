@@ -11,6 +11,7 @@ modules of ``multiphase``, never across packages.
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,38 @@ def _imported(node: ast.AST, package: list[str]) -> list[str]:
         return [alias.name for alias in node.names]
     base = package[: len(package) - node.level + 1] if node.level else []
     return [".".join(base + ([node.module] if node.module else []))]
+
+
+ENGINE = (
+    "darsia/jobs/step.py",
+    "darsia/jobs/queue.py",
+    "darsia/jobs/job.py",
+    "darsia/jobs/service.py",
+)
+"""The job engine's modules: they import only the standard library, psutil, each
+other and the utilities of stored results and their locations."""
+
+
+@pytest.mark.parametrize("module", ENGINE)
+def test_the_engine_imports_only_its_own_layers(module):
+    """No module of the job engine imports a method, a preset or a third-party
+    package other than psutil."""
+    tree = ast.parse((SOURCE / module).read_text(encoding="utf-8"))
+    package = module.removesuffix(".py").split("/")[:-1]
+    own = ("darsia.jobs", "darsia.utils.results", "darsia.utils.locations")
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in _imported(node, package):
+            if name == "darsia.utils" and isinstance(node, ast.ImportFrom):
+                names = {alias.name for alias in node.names}
+                assert names <= {"results", "locations"}, f"{module} imports {names}"
+                continue
+            assert (
+                name.split(".")[0] in sys.stdlib_module_names
+                or name == "psutil"
+                or name.startswith(own)
+            ), f"{module} imports {name}"
 
 
 @pytest.mark.parametrize("module", MODULES)

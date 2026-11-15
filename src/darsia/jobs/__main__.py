@@ -284,7 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     serving.add_argument("jobs", type=Path)
     serving.add_argument("--machine")
     serving.add_argument("--threads", type=int)
-    serving.add_argument("--lock", type=Path)
+    # A test's own lock file in place of the machine's lock; hidden from the help,
+    # since the machine's lock is what keeps one service on a host.
+    serving.add_argument("--lock", type=Path, help=argparse.SUPPRESS)
     serving.add_argument("--logs", type=Path)
     serving.add_argument("--poll", type=float, default=service.POLL)
     serving.add_argument("--until-settled", action="store_true")
