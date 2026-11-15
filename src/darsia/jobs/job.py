@@ -22,6 +22,8 @@ marker's token, is looked at once more after the share's cache time.
 from __future__ import annotations
 
 import functools
+import hashlib
+import importlib.metadata
 import os
 import subprocess
 import tomllib
@@ -95,10 +97,24 @@ class Environment:
         }
 
 
-def revision() -> str | None:
+def _git(folder: Path, *arguments: str) -> str | None:
+    """What git answers in a folder, or None when it fails or is missing."""
+    try:
+        found = subprocess.run(
+            ["git", *arguments], cwd=folder, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+def revision(folder: Path | None = None) -> str | None:
     """The code's revision now: the commit of the checkout this package is run
-    from, marked ``-dirty`` when tracked files differ from it; None when it is not
-    known, e.g. without git or outside a checkout.
+    from, marked ``-dirty`` when tracked files differ from it; without a checkout
+    that tracks the package, e.g. a package installed on a computer without git or
+    into an ignored folder of another repository (a virtual environment inside a
+    clone), its version and a hash of its source files
+    (:func:`installed_revision`); None only when even those cannot be read.
 
     A job records the revision it was created at. A service whose code is of
     another revision takes none of its tasks, and a task process of another
@@ -106,21 +122,54 @@ def revision() -> str | None:
     the revision of the process that made it. Each call looks again, so that a
     service sees its checkout advanced.
 
+    Parameters
+    ----------
+    folder : Path, optional
+        The package's folder; by default this package's.
+
     """
-    folder = Path(__file__).resolve().parents[1]
-    try:
-        found = subprocess.run(
-            ["git", "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*"],
-            cwd=folder,
-            capture_output=True,
-            text=True,
-            timeout=60,
+    folder = Path(__file__).resolve().parents[1] if folder is None else Path(folder)
+    if _git(folder, "ls-files", "--error-unmatch", "__init__.py") is not None:
+        found = _git(
+            folder, "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*"
         )
-    except (OSError, subprocess.SubprocessError):
+        if found:
+            return found
+    try:
+        return installed_revision(folder)
+    except OSError:
         return None
-    if found.returncode != 0:
-        return None
-    return found.stdout.strip() or None
+
+
+def installed_revision(folder: Path) -> str:
+    """The revision of a package without a checkout: its installed version and the
+    SHA-256 of its Python source files (each file's path in the package and
+    content, in order of their paths), e.g. ``"1.1.0+3f2a..."``, so that two
+    installations of other code never share one.
+
+    Parameters
+    ----------
+    folder : Path
+        The package's folder.
+
+    Returns
+    -------
+    str
+        The revision.
+
+    """
+    try:
+        version = importlib.metadata.version(Path(folder).name)
+    except importlib.metadata.PackageNotFoundError:
+        version = "unversioned"
+    found = hashlib.sha256()
+    files = sorted(
+        Path(folder).rglob("*.py"), key=lambda p: p.relative_to(folder).as_posix()
+    )
+    for file in files:
+        found.update(file.relative_to(folder).as_posix().encode("utf-8") + b"\0")
+        found.update(hashlib.sha256(file.read_bytes()).digest())
+    return f"{version}+{found.hexdigest()}"
 
 
 def read_tables(paths: Sequence[Path]) -> dict[str, Any]:
@@ -344,8 +393,8 @@ def create_job(
     code = revision()
     if code is None:
         raise ValueError(
-            "The code's revision is not known (no git checkout of the package, or "
-            "no git on the PATH); a job locks the revision of its code."
+            "The code's revision is not known (no checkout, and its source files "
+            "cannot be read); a job locks the revision of its code."
         )
     results_folder = str(table(tables, "data.results"))
     locations = Locations(project, results_folder, selection.sessions)
