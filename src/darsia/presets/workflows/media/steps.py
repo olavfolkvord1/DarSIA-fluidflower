@@ -10,7 +10,10 @@
 - ``films`` makes one configured film from the selected runs' tiles
   (:func:`write_films`): a pyramid per run or one grid over the runs, each encoder
   opened under the host's waiting lock (:data:`ENCODER_LOCK`), and stores the
-  films' records beside them.
+  films' records beside them. A film is encoded into a local temporary folder of
+  the host, which an encoder writes without the share's retries, and its files
+  are then copied into its result, each copy, and the records, written through
+  the share's interruptions.
 
 """
 
@@ -18,6 +21,8 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -48,6 +53,7 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+from darsia.utils import results
 from darsia.utils.results import write_json
 
 UNIT = "g/L"
@@ -324,17 +330,22 @@ def _films(ctx: StepContext) -> None:
             wanted = dict(panel=asdict(panel), label_room=room)
             tiles[run].append(next(rows for d, rows in stored if d == wanted))
 
+    options = dict(
+        film=film,
+        tile_settings=settings["tiles"],
+        unit=UNIT,
+        style=settings["style"],
+        lock=ctx.host_lock(ENCODER_LOCK),
+    )
+
     def write(folder):
-        records = write_films(
-            tiles,
-            Path(folder),
-            film=film,
-            tile_settings=settings["tiles"],
-            unit=UNIT,
-            style=settings["style"],
-            lock=ctx.host_lock(ENCODER_LOCK),
-        )
-        write_json(Path(folder) / RECORDS, records)
+        with tempfile.TemporaryDirectory(prefix="darsia-films-") as local:
+            records = write_films(tiles, Path(local), **options)
+            for path in sorted(Path(local).iterdir()):
+                copy = Path(folder) / path.name
+                results.retry_transient(lambda p=path, c=copy: shutil.copyfile(p, c))
+        target = Path(folder) / RECORDS
+        results.retry_transient(lambda: write_json(target, records))
 
     ctx.publish(write)
 

@@ -14,6 +14,7 @@ missing frame with the same maps.
 import datetime
 import json
 import shutil
+import tempfile
 import tomllib
 import zipfile
 from dataclasses import asdict, replace
@@ -52,6 +53,7 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
 )
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.utils import settings_from_table
+from darsia.presets.workflows.media import films as media_films
 from darsia.presets.workflows.media import steps as media_steps
 from darsia.presets.workflows.media.films import write_films
 from darsia.presets.workflows.media.panels import PhotographSettings
@@ -1197,6 +1199,7 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         for record in records:
             figure = (project / "films" / name / record["figure"]).read_bytes()
             assert (folder / record["figure"]).read_bytes() == figure
+            assert (folder / record["movie"]).stat().st_size > 0
     figures = sorted(path.name for path in (project / "figures").iterdir())
     stored = results / "ensemble" / comparison.FIGURES
     assert figures and sorted(path.name for path in stored.iterdir()) == figures
@@ -1267,9 +1270,22 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
             def __exit__(self, *_):
                 pass
 
+        encoded = []
+
+        class Encoder(media_films.MovieWriter):
+            def __init__(self, path, *args, **kwargs):
+                encoded.append(Path(path))
+                super().__init__(path, *args, **kwargs)
+
         monkeypatch.setattr(jobs_main.service, "WaitingLock", Recorded)
+        monkeypatch.setattr(media_films, "MovieWriter", Encoder)
         _run(job)
         assert taken == [media_steps.ENCODER_LOCK] * 4  # two pyramids, two grids
+        # Each film is encoded on the host, then copied into its result.
+        assert len(encoded) == 4
+        local, stored = Path(tempfile.gettempdir()).resolve(), project / "results"
+        for path in encoded:  # on the host, outside the result's partial folder
+            assert local in path.resolve().parents and stored not in path.parents
     failed = queue.markers(job, queue.FAILED)
     assert not failed, [
         queue.read_marker(job / queue.FAILED / f"{t}.{k}")["traceback"]
