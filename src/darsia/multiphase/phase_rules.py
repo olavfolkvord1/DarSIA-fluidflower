@@ -465,6 +465,7 @@ def phase_maps(
     end_gas: Callable[[int], np.ndarray | None] | None = None,
     *,
     gas_threshold: float,
+    start: int = 0,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Phase maps of a run's frames, by its phase probabilities and the rules.
 
@@ -475,13 +476,16 @@ def phase_maps(
     changed each pixel's label. After an injection end, ``end_gas`` can weight
     the averaged and the frame's own gas probability by the free gas the run
     held at that end (:func:`darsia.free_gas` does); it is called with each
-    frame's index when the frame is due, so it can use the earlier frames.
+    frame's index when the frame is due, so it can use the earlier frames. A run
+    resumed at its first missing frame (``start``) gives the same maps: the earlier
+    frames' probabilities enter the later frames' time averages as before.
 
     Parameters
     ----------
     probabilities : sequence of (array, array)
         CO2-presence and gas-within-CO2 probabilities of each frame, in time
-        order, on the grid of the sand map.
+        order, on the grid of the sand map; read by index, so a lazy sequence
+        computes only the frames it is asked for.
     dates : sequence of datetime
         Acquisition time of each frame.
     sand_map : darsia.Image
@@ -504,13 +508,16 @@ def phase_maps(
     gas_threshold : float
         Gas threshold of the phase model that gave the probabilities, as for
         :func:`phase_labels`.
+    start : int, optional
+        Index of the first frame whose maps are made; the earlier frames are
+        read only as neighbours.
 
     Yields
     ------
     tuple of arrays
         The phase map (uint8) and the rule map (uint8, :class:`PhaseRule`) of
-        each frame, in order; the rule map is zero where no rule changed the
-        label.
+        each frame from ``start`` on, in order; the rule map is zero where no rule
+        changed the label.
 
     """
     facies = sand_map.img
@@ -546,7 +553,8 @@ def phase_maps(
         for port in first_start
     }
 
-    for index, ((co2, gas), date) in enumerate(zip(probabilities, dates)):
+    for index in range(start, len(dates)):
+        (co2, gas), date = probabilities[index], dates[index]
         started = [port for port, start in first_start.items() if start <= date]
         earlier = [j for j in range(index - 1, -1, -1) if dates[j] < date]
         later = [j for j in range(index + 1, len(dates)) if dates[j] > date]

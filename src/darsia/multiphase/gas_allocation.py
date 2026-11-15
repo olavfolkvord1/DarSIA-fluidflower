@@ -39,7 +39,7 @@ limit, and the phase model gives the gas threshold.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from math import ceil, hypot, radians, tan
@@ -500,6 +500,8 @@ def free_gas(
     chart: np.ndarray | None = None,
     *,
     gas_threshold: float,
+    start: int = 0,
+    anchor_saturation: Callable[[int], np.ndarray] | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
@@ -509,6 +511,12 @@ def free_gas(
     the rule map records it (:attr:`darsia.PhaseRule.PEELED`). Beside them comes
     the CO2 of the frame's labels before the rules (:func:`darsia.phase_labels`),
     which neither the rules nor the allocation change.
+
+    A run resumes at its first missing frame (``start``). Across frames, the
+    allocation keeps only the end-gas regions, each built from its anchor frame's
+    own free-gas saturation, so the regions of the anchors before ``start`` are
+    built again from their saved saturations (``anchor_saturation``); every later
+    map and saturation then equals the run's made whole.
 
     Parameters
     ----------
@@ -542,13 +550,24 @@ def free_gas(
         The colour checker's pixels.
     gas_threshold : float
         Gas threshold of the phase model, as for :func:`darsia.phase_maps`.
+    start : int, optional
+        Index of the first frame whose maps are made; the earlier frames are
+        read only as neighbours.
+    anchor_saturation : callable, optional
+        The free-gas saturation this allocation gave an earlier frame, by its
+        index; needed for each injection-end anchor before ``start``.
 
     Yields
     ------
     tuple of arrays
         The phase map (uint8), its rule map (uint8, :class:`darsia.PhaseRule`),
         the free-gas saturation and the CO2 of the labels before the rules (bool)
-        of each frame.
+        of each frame from ``start`` on.
+
+    Raises
+    ------
+    ValueError
+        If an anchor lies before ``start`` and no saved saturation is given.
 
     """
     facies = sand_map.img
@@ -568,6 +587,23 @@ def free_gas(
         if before:
             anchors[end] = before[-1]
     regions, stored = {}, {}
+
+    def end_region(saturation):
+        """The end-gas region of an anchor's saturation, its distance and weight."""
+        gas = _end_gas(saturation > 0, porous, seal, pitch_mm, settings)
+        if gas is None:
+            return None
+        distance = ndimage.distance_transform_edt(~gas, sampling=pitch_mm)
+        distance /= settings.end_gas_decay_mm
+        return distance, np.exp(-distance)
+
+    for index in sorted(set(anchors.values())):
+        if index < start:
+            if anchor_saturation is None:
+                raise ValueError("A resumed allocation needs its anchors' saturation")
+            found = end_region(anchor_saturation(index))
+            if found is not None:
+                regions[index] = found
 
     def end_gas(index):
         """Distance from the end-gas region that applies to a frame, and weight."""
@@ -606,8 +642,9 @@ def free_gas(
         chart,
         weight,
         gas_threshold=gas_threshold,
+        start=start,
     )
-    for index, (labels, rules) in enumerate(maps):
+    for index, (labels, rules) in enumerate(maps, start=start):
         date = dates[index]
         gas_probability = probabilities[index][1]
         own = stored_labels(index)
@@ -707,9 +744,7 @@ def free_gas(
                 _change(labels, rules, freed, PhaseLabel.DISSOLVED, PhaseRule.PEELED)
             saturation = np.minimum(saturation, cap)
         if index in anchors.values():
-            gas = _end_gas(saturation > 0, porous, seal, pitch_mm, settings)
-            if gas is not None:
-                distance = ndimage.distance_transform_edt(~gas, sampling=pitch_mm)
-                distance /= settings.end_gas_decay_mm
-                regions[index] = (distance, np.exp(-distance))
+            found = end_region(saturation)
+            if found is not None:
+                regions[index] = found
         yield labels, rules, saturation, _co2(own)
