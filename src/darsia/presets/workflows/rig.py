@@ -789,6 +789,7 @@ class Rig:
 
         The fit uses the shape-corrected baseline and the facies as materials.
         Pixels of facies without a target are corrected with the common field.
+        With a configured reference run, the fit uses the reference's fitting grid.
 
         Parameters
         ----------
@@ -805,6 +806,21 @@ class Rig:
             fit_mask = np.isin(facies, list(config.targets))
         else:
             fit_mask = darsia.imread(config.fit_mask).img.astype(bool)
+        reference = None
+        if config.reference is not None:
+            baseline = darsia.imread(config.reference.baseline)
+            reference_facies = darsia.imread(config.reference.facies).img
+            if config.reference.fit_mask is None:
+                reference_mask = np.isin(reference_facies, list(config.targets))
+            else:
+                reference_mask = darsia.imread(config.reference.fit_mask).img
+            reference = darsia.MaterialFitReference(
+                baseline=baseline.img,
+                material_map=reference_facies,
+                fit_mask=reference_mask.astype(bool),
+                dimensions=tuple(baseline.dimensions),
+                homography=np.asarray(config.reference.homography),
+            )
         return darsia.fit_material_illumination(
             self.shape_corrected_baseline.img,
             facies,
@@ -816,6 +832,7 @@ class Rig:
             edge_margin=config.edge_margin,
             dn_scale=config.dn_scale,
             settings=config.fit,
+            reference=reference,
         )
 
     # ! ---- ILLUMINATION CORRECTION ----
