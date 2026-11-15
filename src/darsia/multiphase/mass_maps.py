@@ -35,6 +35,7 @@ parameters are a :class:`darsia.MassCalibration`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -667,3 +668,30 @@ def read_mass_maps(folder: Path) -> darsia.SimpleMassAnalysisResults:
         color_signal=None,
         **images,
     )
+
+
+def write_mass_copy(
+    folder: Path,
+    fields: Mapping[str, np.ndarray],
+    grid: darsia.Image,
+    cells: darsia.MetricCells,
+    name: str,
+) -> None:
+    """Store a frame's copy on metric cells in ``folder``: each field
+    (:class:`MassCopy`, its ``static`` fields included) as an image on the cells'
+    grid, named ``name``, which extends the run's ``grid`` from its lower left
+    corner."""
+    bottom = grid.origin[1] - grid.dimensions[0]
+    metadata = {
+        "dimensions": cells.dimensions,
+        "origin": [grid.origin[0], bottom + cells.dimensions[0]],
+    }
+    for field, values in fields.items():
+        image = darsia.ScalarImage(values, name=name, **metadata)
+        image.save(Path(folder) / f"{field}.npz")
+
+
+def read_mass_copy(folder: Path) -> dict[str, darsia.Image]:
+    """A frame's stored copy of its mass maps on metric cells, by field
+    (:func:`write_mass_copy`)."""
+    return {f.stem: darsia.imread(f) for f in sorted(Path(folder).glob("*.npz"))}

@@ -545,21 +545,21 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
     direct calls'."""
     results = project / "results"
     for (run, frame), maps in direct["maps"].items():
-        stored = analysis.read_mass_maps(
+        stored = darsia.read_mass_maps(
             results / "mass-maps" / run / frame.session / frame.name
         )
-        for name in analysis.FIELDS:
+        for name in darsia.MASS_FIELDS:
             np.testing.assert_array_equal(
                 getattr(stored, name).img, getattr(maps, name).img
             )
             assert getattr(stored, name).img.dtype == getattr(maps, name).img.dtype
     for (run, frame), copy in direct["copies"].items():
         folder = results / "mass-copy" / run / frame.session / frame.name
-        stored = analysis.read_mass_copy(folder)
+        stored = darsia.read_mass_copy(folder)
         assert set(stored) == set(copy)
         for name, values in copy.items():
             np.testing.assert_array_equal(stored[name].img, values)
-    record = calibration.read_json(results / "calibration" / "fit", "calibration.json")
+    record = darsia.read_calibration(results / "calibration" / "fit")
     assert record["calibration"]["gain"] == direct["fit"].gain
     assert record["calibration"]["beta"] == direct["fit"].beta
     for run, rows in direct["domain_mass"].items():  # on each run's sand map
@@ -665,7 +665,7 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     _run(create_job(tmp_path / "jobs", early, one, config))
     folder = project / "results" / "phase-maps" / "r1"
     whole = {
-        f: calibration.read_maps(folder / f.session / f.name) for f in one.frames["r1"]
+        f: darsia.read_phase_maps(folder / f.session / f.name) for f in one.frames["r1"]
     }
     again = project / "config-again.toml"
     again.write_text(
@@ -697,7 +697,7 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     assert again_published == list(one.frames["r1"][4:])  # from the first missing
     folder = project / "again" / "phase-maps" / "r1"
     for frame, maps in whole.items():
-        resumed = calibration.read_maps(folder / frame.session / frame.name)
+        resumed = darsia.read_phase_maps(folder / frame.session / frame.name)
         for name, array in maps.items():
             np.testing.assert_array_equal(resumed[name], array)
 
