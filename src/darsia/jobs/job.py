@@ -2,8 +2,9 @@
 
 :func:`create_job` writes a job's folder in the jobs folder: ``job.json`` with its
 steps, selection, computing environment, results folder, the code's revision, the
-token of each input made outside the job (``bound``) and the earlier jobs it
-completes (``basis``); copies of its configuration files; one file per task in
+token of each input made outside the job (``bound``), the earlier jobs it
+completes (``basis``) and the bytes each task declares (``bytes``, in the Setup's
+``sizes``); copies of its configuration files; one file per task in
 ``tasks/``; and one marker per task in ``queue/`` (:mod:`darsia.jobs.queue`).
 
 Each task's inputs are enumerated from the frozen selection by the scope of each
@@ -108,6 +109,56 @@ def _git(folder: Path, *arguments: str) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return found.stdout.strip() if found.returncode == 0 else None
+
+
+@dataclass(frozen=True)
+class Sizes:
+    """The sizes a step's declared memory is counted in
+    (:class:`darsia.jobs.step.Memory`), from the Setup: the bytes of a value of its
+    precision and the pixels of a camera image and of the run grid."""
+
+    itemsize: int
+    """Bytes per value of the Setup's precision, e.g. 4 for float32."""
+    camera: int
+    """Pixels of a camera image."""
+    grid: int
+    """Pixels of the run grid."""
+
+    def to_json(self) -> dict:
+        """The sizes as plain JSON values."""
+        return {"itemsize": self.itemsize, "camera": self.camera, "grid": self.grid}
+
+
+def task_bytes(step: Step, task: Task, selection: Selection, sizes: Sizes) -> int:
+    """The bytes a task of a step holds at once by its declaration
+    (:meth:`darsia.jobs.step.Memory.bytes`), with the frames of its input scope:
+    its own frames and those its inputs cover, a run's result covering the run's
+    selected frames.
+
+    Parameters
+    ----------
+    step : Step
+        The task's step.
+    task : Task
+        The task.
+    selection : Selection
+        The job's selection.
+    sizes : Sizes
+        The Setup's sizes.
+
+    Returns
+    -------
+    int
+        The bytes.
+
+    """
+    frames = {(task.run, frame) for frame in task.frames}
+    for i in task.inputs:
+        if i.frame is not None:
+            frames.add((i.run, i.frame))
+        elif i.run is not None:
+            frames.update((i.run, frame) for frame in selection.frames.get(i.run, ()))
+    return step.memory.bytes(sizes.itemsize, sizes.camera, sizes.grid, len(frames))
 
 
 def revision(folder: Path | None = None) -> str | None:
@@ -393,8 +444,12 @@ def create_job(
     *,
     known: Sequence[Step] = (),
     project: Path | None = None,
+    sizes: Sizes | None = None,
 ) -> Path:
     """Create a job: its record, configuration, tasks and queue markers.
+
+    The record holds the bytes each task declares (:func:`task_bytes`), which a
+    host's service admits it by (:func:`darsia.jobs.service.admit`).
 
     Parameters
     ----------
@@ -416,6 +471,9 @@ def create_job(
         The steps of the kinds the job reads but does not make.
     project : Path, optional
         The project folder; by default the first configuration file's folder.
+    sizes : Sizes, optional
+        The Setup's sizes of the declared memory; without them the tasks declare
+        no bytes.
 
     Returns
     -------
@@ -493,6 +551,15 @@ def create_job(
         "revision": code,
         "bound": {key: token for key, token in bound.items() if token},
         "basis": list(basis),
+        "sizes": None if sizes is None else sizes.to_json(),
+        "bytes": {
+            task.id: (
+                0
+                if sizes is None
+                else task_bytes(kinds[task.step], task, selection, sizes)
+            )
+            for task in made_tasks
+        },
     }
     queue.write_json(partial / JOB, record)
     for state in queue.STATES:
