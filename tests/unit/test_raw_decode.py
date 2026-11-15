@@ -93,6 +93,25 @@ def test_decode_is_linear_camera_rgb_and_clipping_is_invalid(tmp_path, layout, d
     np.testing.assert_array_equal(img[:, [0, -1]], img[:, [1, -2]])
 
 
+def test_the_sensor_values_are_the_demosaic_before_the_division(tmp_path):
+    """The raw sensor read gives the 16-bit demosaic in camera units, the invalid
+    values the decode makes NaN, and the white range it divides by."""
+    mosaic = np.random.default_rng(4).integers(600, 15000, (32, 48), dtype=np.uint16)
+    mosaic[10, 20] = WHITE
+    write_dng(tmp_path / "image.dng", mosaic, LAYOUTS["RGGB"][0])
+
+    sensor = darsia.read_raw_sensor(tmp_path / "image.dng", "edge_aware")
+    image = darsia.imread(
+        tmp_path / "image.dng", demosaic="edge_aware", dtype="float32"
+    )
+
+    subtracted = np.maximum(mosaic.astype(int) - BLACK, 0).astype(np.uint16)
+    expected = cv2.demosaicing(subtracted, LAYOUTS["RGGB"][1])
+    assert sensor.values.dtype == np.uint16 and sensor.white_range == WHITE - BLACK
+    np.testing.assert_array_equal(sensor.values, expected)
+    np.testing.assert_array_equal(sensor.invalid, np.isnan(image.img))
+
+
 def test_a_list_or_folder_of_raw_files_is_a_time_series(tmp_path):
     """The decoded files along the time axis, with the given dates, transformed."""
     rng = np.random.default_rng(2)
