@@ -2,12 +2,14 @@
 
 import datetime
 import tomllib
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import darsia
+from darsia.multiphase import gas_allocation as allocation_module
 
 W, D, G, U = darsia.PhaseLabel
 RULE = darsia.PhaseRule
@@ -33,6 +35,7 @@ TABLES = tomllib.loads(
     port_zone_half_width_mm = 38.0
     port_zone_depth_mm = 10.0
     finger_width_mm = 10.0
+    pitch_stride = 64
 
     [gas_allocation]
     seed_mm2 = 100.0
@@ -76,7 +79,7 @@ def _frame(co2=(), gas=(), level=0.9):
     return tuple(probabilities)
 
 
-def _run(tmp_path, frames, hours, volumes, *, end_h=9.0, facies=None):
+def _run(tmp_path, frames, hours, volumes, *, end_h=9.0, facies=None, positions=None):
     """Phase and rule maps and saturations of a run, one port at height 4.5 mm."""
     csv = tmp_path / "protocol.csv"
     pd.DataFrame(
@@ -109,8 +112,107 @@ def _run(tmp_path, frames, hours, volumes, *, end_h=9.0, facies=None):
             volumes,
             SETTINGS,
             gas_threshold=GAS_THRESHOLD,
+            positions=positions,
         )
     )
+
+
+def test_the_seal_band_and_the_peel_read_the_measured_heights():
+    """Under a seal, a pixel's depth below its run's top is taken between the
+    measured heights of its own column; in a peel's cell, the pixel lowest by its
+    measured height goes first."""
+    rows, cols = 12, 4
+    y = np.broadcast_to(0.012 - np.arange(rows)[:, None] * 0.001, (rows, cols)).copy()
+    y[:, 2] = 0.012 - np.arange(rows) * 0.0015  # one column's pixels lie further apart
+    co2 = np.zeros((rows, cols), bool)
+    co2[3:, :] = True
+    seal = np.zeros((rows, cols), bool)
+    seal[2, :] = True
+    band = allocation_module._under_seal(co2, seal, y, 0.0046)
+    depth = y[3] - y
+    np.testing.assert_array_equal(band, co2 & (depth >= 0) & (depth <= 0.0046))
+    assert band[:, 2].sum() < band[:, 0].sum()
+
+    model = np.zeros((rows, cols), bool)
+    model[4:6, :] = True
+    tilted = y + np.arange(cols)[None, :] * -0.0012  # the right lies lower
+    room = np.ones((rows, cols))
+    order_rows, order_cols, _ = allocation_module._peel_order(
+        model, tilted, room, (1.0, 1.0), replace(SETTINGS, lattice_mm=50.0)
+    )
+    heights = tilted[order_rows, order_cols]
+    assert (order_rows[0], order_cols[0]) == np.unravel_index(
+        np.where(model, tilted, np.inf).argmin(), (rows, cols)
+    )
+    assert (np.diff(heights) >= 0).all()
+
+
+def test_the_gravity_zones_are_single_and_the_cones_zones_the_positions_precision():
+    """The gravity rule's port zones are taken in single precision, the cones'
+    bodies and lower zones in the positions' own, as our production took each;
+    positions in single precision give one set."""
+    rng = np.random.default_rng(3)
+    port, radius_m = (0.0405, 0.0245), RULES.port_radius_mm / 1000
+    angle, spread = rng.uniform(0, 2 * np.pi, 4096), rng.uniform(-3e-7, 3e-7, 4096)
+    x = (port[0] + radius_m * (1 + spread) * np.cos(angle)).reshape(64, 64)
+    y = (port[1] + radius_m * (1 + spread) * np.sin(angle)).reshape(64, 64)
+    positions = darsia.GridPositions(x, y, (1.0, 1.0))
+    (gravity, _), (body, _) = allocation_module._zones(positions, [port], RULES)
+    x32, y32 = x.astype(np.float32), y.astype(np.float32)
+    single = (x32 - port[0]) ** 2 + (y32 - port[1]) ** 2 <= radius_m**2
+    double = (x - port[0]) ** 2 + (y - port[1]) ** 2 <= radius_m**2
+    np.testing.assert_array_equal(gravity[port], single)
+    np.testing.assert_array_equal(body[port], double)
+    assert not np.array_equal(single, double)
+    narrow = darsia.GridPositions(x32, y32, (1.0, 1.0))
+    (gravity, lower), (body, body_lower) = allocation_module._zones(
+        narrow, [port], RULES
+    )
+    assert body is gravity and body_lower is lower
+
+
+def test_the_cones_follow_each_rows_ray_to_the_first_seal():
+    """A cone's first seal is the lowest seal above the port on the ray of each
+    row's pixel nearest to the port across: with positions sheared across, a seal
+    met only by that ray caps the cone."""
+    rows, cols = 40, 40
+    c, r = np.meshgrid(np.arange(cols), np.arange(rows))
+    x = ((c + 0.5) * 0.001 + (rows - 1 - r) * 0.00025).astype(np.float32)
+    y = (0.04 - (r + 0.5) * 0.001).astype(np.float32)
+    port = (0.0205, 0.0045)
+    column = np.abs(x - np.float32(port[0])).argmin(axis=1)
+    seal = np.zeros((rows, cols), bool)
+    seal[10, column[10]] = True  # on the ray of row 10 only
+    assert column[10] != column[35]
+    co2 = np.zeros((rows, cols), bool)
+    co2[2:39, 5:35] = True
+    radius, lower = allocation_module._port_zones(x, y, [port], RULES)
+    cones = allocation_module._cones(
+        co2, [port], [port], radius, lower, seal, x, y, SETTINGS
+    )
+    top = float(y[10, column[10]])
+    assert cones.any() and not cones[y >= top].any()
+
+
+def test_the_allocation_reads_the_measured_positions(tmp_path):
+    """At the pixel centres given as positions the allocation is the default's;
+    with measured positions it places the gas by them."""
+    frame = _frame([np.s_[10:60, 20:60]], [np.s_[30:40, 30:50]])
+    volumes = [3 * 10 * 20 * PORE * (1 - float(SWI))]
+    centres = darsia.grid_positions(
+        darsia.Image(np.zeros(SHAPE), dimensions=[0.06, 0.08])
+    )
+    plain = _run(tmp_path, [frame], [0.0], volumes)
+    same = _run(tmp_path, [frame], [0.0], volumes, positions=centres)
+    for a, b in zip(plain[0], same[0]):
+        np.testing.assert_array_equal(a, b)
+    sheared = darsia.GridPositions(
+        (centres.x + 0.004 * np.linspace(0, 1, SHAPE[0])[:, None]).astype(np.float32),
+        centres.y.astype(np.float32),
+        centres.pitch_mm,
+    )
+    moved = _run(tmp_path, [frame], [0.0], volumes, positions=sheared)
+    assert not np.array_equal(moved[0][2], plain[0][2])
 
 
 def test_added_gas_joins_the_model_gas_by_its_score(tmp_path):

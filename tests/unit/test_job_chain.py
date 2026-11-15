@@ -488,6 +488,7 @@ def _co2_state(grid, experiment, date) -> darsia.PrecisionCO2MassAnalysis:
         atmospheric_temperature=value["temperature_celsius"],
         atmospheric_pressure_gradient=value["pressure_gradient_bar"],
         atmospheric_temperature_gradient=value["temperature_gradient_celsius"],
+        y_m=grid.positions.y,
     )
 
 
@@ -518,10 +519,13 @@ def _direct(root: Path, selection: Selection) -> dict:
             facies=root / f"facies-{run}.npz",
         ).save(root / run)
         rig = Rig.load(root / run)
-        if run == "r1":  # the depth rule at the grid's pixel centres, in its dtype
+        sand_map = run_tables(tables, run).get("labeling", {}).get("sand_map", {})
+        rig.grid_to_rig = sand_map.get("grid_to_rig")
+        if run == "r1":  # the depth rule at the grid's positions, in its dtype
             depths = pd.read_csv(root / "depth.csv")
-            x, y = darsia.pixel_centres(rig.baseline)
-            points = np.stack(np.meshgrid(x, y), axis=-1).reshape(-1, 2)
+            dtype = rig.pixel_area.img.dtype
+            placed = darsia.grid_positions(rig.baseline, rig.grid_to_rig, dtype)
+            points = np.column_stack((placed.x.ravel(), placed.y.ravel()))
             values, outside = darsia.interpolate_linear_in_hull(
                 (depths["x"], depths["y"], depths["depth"]),
                 points.astype(rig.pixel_area.img.dtype),
@@ -635,6 +639,14 @@ def _direct(root: Path, selection: Selection) -> dict:
             for k, image in enumerate(images)
         ]
         variants[run] = {}
+        # The phase rules' pitch over the rig's canvas, by the rules' stride.
+        measured = darsia.grid_positions(
+            rig.facies,
+            rig.grid_to_rig,
+            rig.pixel_area.img.dtype,
+            rig.measurement_canvas,
+            rules.pitch_stride,
+        )
         for held_out, found in volumes[run].items():
             maps = darsia.free_gas(
                 probabilities,
@@ -651,6 +663,7 @@ def _direct(root: Path, selection: Selection) -> dict:
                 allocation,
                 grid.chart,
                 gas_threshold=model.gas_threshold,
+                positions=measured,
             )
             variants[run][held_out] = [
                 dict(zip(("labels", "rules", "saturation", "co2"), m)) for m in maps
@@ -859,7 +872,9 @@ def _direct(root: Path, selection: Selection) -> dict:
     domains = [AnalysisDomain(domain_id=n, **defined[n]) for n in selection.domains]
     domain_mass = {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
-        sums = DomainMass(domains, grid.geometry, grid.rig.labels, sand_labels)
+        sums = DomainMass(
+            domains, grid.geometry, grid.rig.labels, sand_labels, grid.positions
+        )
         start, rows = experiment.experiment_start, []
         for frame, date in zip(selection.frames[run], dates):
             h = (date - start).total_seconds() / 3600
@@ -1088,17 +1103,36 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         assert (stored / name).read_bytes() == (project / "figures" / name).read_bytes()
 
 
-@pytest.mark.parametrize("precision", ["float32", "float64"])
+@pytest.mark.parametrize("precision", ["float32", "float64", "measured"])
 def test_the_chain_as_jobs_equals_the_direct_calls(
     tmp_path, monkeypatch, importable, precision  # noqa: F811
 ):
     """Every frame's mass maps of the job equal the direct calls', and so do the
     comparisons' distances, the films' tiles and films and the ensemble's figures;
     each film's encoder opens under the host's waiting lock. Single precision runs
-    through the service's task processes, double precision in this process."""
+    through the service's task processes, double precision in this process. With
+    a measured model of the first run's grid (in single precision, in this
+    process, on the sand map's grid), every step places that run's pixels by it."""
     project = tmp_path / "project"
-    config, selection = _project(project, precision)
+    config, selection = _project(
+        project, "float32" if precision == "measured" else precision
+    )
     monkeypatch.chdir(project)
+    if precision == "measured":
+        grid = darsia.Image(np.zeros((120, 180)), dimensions=[0.3, 0.45])
+        angle, scale = 0.003, 1.0007
+        rotation = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0],
+                [np.sin(angle), np.cos(angle), 0],
+                [0, 0, 1],
+            ]
+        )
+        model = np.linalg.inv(np.diag([scale, scale, 1.0]) @ rotation @ rig_grid(grid))
+        config.write_text(
+            config.read_text().replace("pixel_size_mm = 5.0\n", "")
+            + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {model.tolist()}\n"
+        )
     direct = _direct(project, selection)
     jobs = tmp_path / "jobs"
     job = create_job(jobs, STEPS, selection, config)

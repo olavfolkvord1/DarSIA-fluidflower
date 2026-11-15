@@ -31,9 +31,12 @@ production kept the water of those pixels saturated. Beside each frame's maps,
 the allocation gives the CO2 of its labels before the rules, which the dilution
 law of the mass reads.
 
-Every setting is a field of :class:`GasAllocationSettings`; the phase rules'
-settings give the CO2 threshold, the seals, the port zones and the gravity
-limit, and the phase model gives the gas threshold.
+Distances and heights are taken from each pixel's position on the rig and the
+grid's pitch (:func:`darsia.grid_positions`), in the arithmetic our production's
+allocation used with its measured positions. Every setting is a field of
+:class:`GasAllocationSettings`; the phase rules' settings give the CO2 threshold,
+the seals, the port zones and the gravity limit, and the phase model gives the
+gas threshold.
 
 """
 
@@ -59,9 +62,9 @@ from darsia.multiphase.phase_rules import (
     _change,
     _co2,
     _gravity_limit,
-    _pitch_mm,
     _port_zones,
     _seal,
+    _single,
     _summed_areas,
     phase_labels,
     phase_maps,
@@ -164,18 +167,31 @@ def _ports(protocol):
 
 
 def _under_seal(co2, seal, y, depth_m):
-    """CO2 within a depth below the top of its vertical run, where a seal caps it."""
+    """CO2 within a depth below the top of its vertical run, where a seal caps it;
+    the depth between the pixels' heights (``y``), in their precision."""
     through = co2 & ~seal
     above_open = np.zeros_like(through)
     above_open[1:] = through[:-1]
     above_seal = np.zeros_like(through)
     above_seal[1:] = seal[:-1]
-    rows = np.arange(len(y))[:, None]
+    rows = np.arange(co2.shape[0])[:, None]
     top = np.maximum.accumulate(np.where(through & ~above_open, rows, -1), axis=0)
     first = np.maximum(top, 0)
-    depth = y[first] - y[:, None]
+    depth = np.take_along_axis(y, first, axis=0) - y
     contact = np.take_along_axis(above_seal, first, axis=0)
     return through & (top >= 0) & contact & (depth >= 0) & (depth <= depth_m)
+
+
+def _zones(positions, ports, settings):
+    """The ports' zones twice: in single precision for the gravity rule and its
+    allowance, and in the positions' own precision for the cones' bodies and lower
+    zones, as our production took each (:func:`darsia.multiphase.phase_rules._port_zones`).
+    """
+    gravity = _port_zones(*_single(positions), ports, settings)
+    x, y = positions.x, positions.y
+    if x.dtype == np.float32 and y.dtype == np.float32:
+        return gravity, gravity
+    return gravity, _port_zones(x, y, ports, settings)
 
 
 def _cones(co2, injecting, order, radius, lower, seal, x, y, settings):
@@ -184,29 +200,40 @@ def _cones(co2, injecting, order, radius, lower, seal, x, y, settings):
     A port's CO2 body (the CO2 reaching its radius) below the first seal above
     the port is kept within a half width that widens with the height from the
     port's base to its full width, and within the port's lower zone below it;
-    the band of the body under that seal joins where the cone reaches it.
+    the band of the body under that seal joins where the cone reaches it. The
+    first seal is the lowest seal above the port on the ray of each row's pixel
+    nearest to the port across; positions and heights are the pixels' (x, y),
+    as our production's cones took them.
     """
     components = _components(co2)
     cones = np.zeros(co2.shape, bool)
+    rows = np.arange(co2.shape[0])
     for port in injecting:
+        px, py = float(port[0]), float(port[1])
         base, width = (
             values[min(order.index(port), len(values) - 1)]
             for values in (settings.cone_base_mm, settings.cone_width_mm)
         )
         body = _touching(co2, radius[port], components)
-        column = int(np.abs(x - port[0]).argmin())
-        sealing = seal[:, column] & (y > port[1])
-        top = y[sealing].min() if sealing.any() else None
-        rise = y[:, None] - port[1]
-        scope = body if top is None else body & (y < top)[:, None]
-        height = np.maximum(rise, 0) * 1000 / settings.cone_rise_mm
-        half_width = base / 1000 - (width - base) / 1000 * np.expm1(-np.square(height))
-        cone = np.abs(x[None, :] - port[0]) <= half_width
+        column = np.abs(x - px).argmin(axis=1)
+        ray = y[rows, column]
+        sealing = seal[rows, column] & (ray > py)
+        top = float(ray[sealing].min()) if sealing.any() else None
+        rise = y - py
+        scope = body if top is None else body & (y < top)
+        with np.errstate(over="ignore", under="ignore"):
+            height = (
+                np.maximum(rise.astype(np.float64), 0) * 1000 / settings.cone_rise_mm
+            )
+            half_width = base / 1000 - (width - base) / 1000 * np.expm1(
+                -np.square(height)
+            )
+        cone = np.abs(x - px) <= half_width
         kept = body & (~scope | np.where(rise >= 0, cone, lower[port]))
         if top is not None and scope.any():
-            hit = np.flatnonzero(sealing & (y == top))[0]
+            hit = np.flatnonzero(seal[rows, column] & (ray == top))[0]
             seals = _components(seal)[1]
-            first = seals == seals[hit, column]
+            first = seals == seals[hit, column[hit]]
             band = _under_seal(
                 body & ~seal & (rise >= 0), first, y, settings.seal_band_mm / 1000
             )
@@ -429,7 +456,8 @@ def _peel_order(model, y, room, pitch_mm, settings):
 
     On a lattice of cells, each 8-connected piece's core is its cells deepest
     inside it; pixels go by the highest cost from the cores first, then by
-    cell, then the lowest first, then row-major.
+    cell, then the lowest first (by their heights ``y`` in double precision),
+    then row-major.
     """
     cell = tuple(max(1, int(round(settings.lattice_mm / pitch))) for pitch in pitch_mm)
     step = (cell[0] * pitch_mm[0], cell[1] * pitch_mm[1])
@@ -451,7 +479,7 @@ def _peel_order(model, y, room, pitch_mm, settings):
     order = np.lexsort(
         (
             rows * model.shape[1] + cols,
-            y[rows],
+            np.asarray(y, np.float64)[rows, cols],
             cell_rows * shape[1] + cell_cols,
             -value,
         )
@@ -505,6 +533,7 @@ def free_gas(
     gas_threshold: float,
     start: int = 0,
     anchor_saturation: Callable[[int], np.ndarray] | None = None,
+    positions: darsia.GridPositions | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
@@ -559,6 +588,10 @@ def free_gas(
     anchor_saturation : callable, optional
         The free-gas saturation this allocation gave an earlier frame, by its
         index; needed for each injection-end anchor before ``start``.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig and the grid's pitch, by the run's
+        measured model of its grid; by default the sand map's pixel centres
+        (:func:`darsia.grid_positions`).
 
     Yields
     ------
@@ -574,11 +607,13 @@ def free_gas(
 
     """
     facies = sand_map.img
-    x, y = darsia.pixel_centres(sand_map)
-    pitch_mm = _pitch_mm(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
+    x, y = positions.x, positions.y
+    pitch_mm = positions.pitch_mm
     ports = _ports(protocol)
     order = list(ports)
-    radius, lower = _port_zones(x, y, ports, rule_settings)
+    (radius, lower), (body_radius, body_lower) = _zones(positions, ports, rule_settings)
     seal = _seal(facies, domain, permeability, rule_settings)
     porous = [k for k in permeability if k not in rule_settings.free_water_facies]
     porous = domain & np.isin(facies, porous)
@@ -646,6 +681,7 @@ def free_gas(
         weight,
         gas_threshold=gas_threshold,
         start=start,
+        positions=positions,
     )
     for index, (labels, rules) in enumerate(maps, start=start):
         date = dates[index]
@@ -691,7 +727,15 @@ def free_gas(
                 cones = None
                 if region is None and injecting:
                     cones = _cones(
-                        co2, injecting, order, radius, lower, seal, x, y, settings
+                        co2,
+                        injecting,
+                        order,
+                        body_radius,
+                        body_lower,
+                        seal,
+                        x,
+                        y,
+                        settings,
                     )
 
                 def near(active):
