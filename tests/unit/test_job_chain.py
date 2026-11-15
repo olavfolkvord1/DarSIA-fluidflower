@@ -28,7 +28,7 @@ import darsia
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import job as job_module
 from darsia.jobs import queue
-from darsia.jobs.job import create_job
+from darsia.jobs.job import Sizes, create_job, read_job
 from darsia.jobs.step import Selection, StepContext, missing_runs, run_tables, table
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
@@ -73,6 +73,7 @@ from darsia.presets.workflows.setup.setup_rig import make_experiment, make_rig
 from darsia.presets.workflows.setup.setup_sand_map import make_sand_map
 from darsia.utils.locations import Frame, normal_path
 from tests.unit.test_gas_allocation import TABLES as RULE_TABLES
+from tests.unit.test_job_hosts import _record
 from tests.unit.test_job_service import _serve, importable, numpys_blas  # noqa: F401
 from tests.unit.test_minimal_chain import COLOURS, _head
 
@@ -1191,9 +1192,13 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
         )
     direct = _direct(project, selection)
     jobs = tmp_path / "jobs"
-    job = create_job(jobs, STEPS, selection, config)
+    itemsize = np.dtype("float32" if precision == "measured" else precision).itemsize
+    sizes = Sizes(itemsize, 121 * 181, 120 * 180)
+    job = create_job(jobs, STEPS, selection, config, sizes=sizes)
+    assert read_job(job)["bytes"]["mass-maps.r1.0000"] > 0  # admitted by its bytes
     if precision == "float32":
         _serve(jobs, tmp_path, seconds=1200.0)
+        assert _record(jobs, "here")["live"] == []
     else:
         taken = []
 
