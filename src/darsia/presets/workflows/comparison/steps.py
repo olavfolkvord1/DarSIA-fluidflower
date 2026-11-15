@@ -291,7 +291,7 @@ DISTANCES = Step(
     sections=EXPERIMENT,
     files=protocol_files,
     domains=True,
-    required=lambda tables: [tables["distances"]["reference_run"]],
+    required=lambda tables, runs: [tables["distances"]["reference_run"]],
 )
 """The distances at each comparison time (R9)."""
 STEPS = (EVENTS, ENSEMBLE, DISTANCES)
