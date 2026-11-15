@@ -24,6 +24,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import numpy as np
 import toml
 
 import darsia
@@ -57,6 +58,43 @@ def _holds(folder: Any, project: Path, folders: Sequence[Path]) -> bool:
         if found == base or found.startswith(base.rstrip(os.sep) + os.sep):
             return True
     return False
+
+
+def grid_mask(
+    tables: Mapping[str, Any], key: str, shape: tuple[int, ...]
+) -> np.ndarray | None:
+    """A boolean image on a run's grid that its configuration names
+    (``[labeling.sand_map] <key>``), if it names one: e.g. the pixels the run
+    reports on (``reporting_domain``) or those its phase step reads
+    (``phase_support``).
+
+    Parameters
+    ----------
+    tables : Mapping[str, Any]
+        The run's configuration tables.
+    key : str
+        The mask's key in ``[labeling.sand_map]``.
+    shape : tuple of int
+        The grid's shape; its first two entries are its rows and columns.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        The mask, or None if the run names none.
+
+    Raises
+    ------
+    ValueError
+        If the image is not a boolean mask of the grid.
+
+    """
+    path = tables.get("labeling", {}).get("sand_map", {}).get(key)
+    if path is None:
+        return None
+    mask = np.asarray(darsia.imread(Path(path)).img)
+    if mask.dtype != bool or mask.shape != tuple(shape[:2]):
+        raise ValueError(f"[labeling.sand_map] {key} is a boolean mask of the grid.")
+    return mask
 
 
 def protocol_files(
