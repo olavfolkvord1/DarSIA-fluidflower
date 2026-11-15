@@ -21,10 +21,9 @@ statistics, and the calibration fit with its folds.
 
 from __future__ import annotations
 
-import json
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -109,23 +108,6 @@ class FitRuns:
     """The runs fitted."""
     folds: Sequence[str] = ()
     """The fit runs left out one at a time."""
-
-
-def read_json(folder: Path, name: str = "result.json") -> dict:
-    """A stored result's JSON file."""
-    return json.loads((Path(folder) / name).read_text(encoding="utf-8"))
-
-
-def _write_json(folder: Path, name: str, value) -> None:
-    """Write a result's JSON file, NaN refused."""
-    text = json.dumps(value, indent=1, allow_nan=False)
-    (Path(folder) / name).write_text(text, encoding="utf-8")
-
-
-def read_maps(folder: Path) -> dict[str, np.ndarray]:
-    """A frame's stored phase maps: ``labels``, ``rules``, ``saturation``, ``co2``."""
-    with np.load(Path(folder) / "maps.npz") as stored:
-        return {name: stored[name] for name in stored.files}
 
 
 def frame_key(frame: darsia.Frame) -> str:
@@ -317,8 +299,7 @@ def _overflow(ctx: StepContext) -> None:
             darsia.measured_reference(volume, hours / 3600) if usable else None
         )
     reasons = [] if volume is None else list(volume.reasons)
-    record = {"volumes": volumes, "measured": True, "reasons": reasons}
-    ctx.publish(lambda folder: _write_json(folder, "overflow.json", record))
+    ctx.publish(lambda folder: darsia.write_frame_volumes(folder, volumes, reasons))
 
 
 def previous_acquisition(photo: Path, sessions: Sequence[Path]) -> Path | None:
@@ -427,7 +408,7 @@ def _phase_maps(ctx: StepContext) -> None:
             accept_canvas=source.accept_canvas,
         ),
     )
-    volumes = ctx.read("overflow", lambda f: read_json(f, "overflow.json"))["volumes"]
+    volumes = ctx.read("overflow", darsia.read_frame_volumes)["volumes"]
     start = next((k for k, frame in enumerate(frames) if not ctx.done(frame)), None)
     if start is None:
         return
@@ -450,11 +431,12 @@ def _phase_maps(ctx: StepContext) -> None:
         grid.chart,
         gas_threshold=model.gas_threshold,
         start=start,
-        anchor_saturation=lambda k: ctx.own(read_maps, frame=frames[k])["saturation"],
+        anchor_saturation=lambda k: ctx.own(darsia.read_phase_maps, frame=frames[k])[
+            "saturation"
+        ],
     )
-    for frame, (labels, rule_map, saturation, co2) in zip(frames[start:], maps):
-        arrays = dict(labels=labels, rules=rule_map, saturation=saturation, co2=co2)
-        ctx.publish(lambda f: np.savez(Path(f) / "maps.npz", **arrays), frame=frame)
+    for frame, arrays in zip(frames[start:], maps):
+        ctx.publish(lambda f: darsia.write_phase_maps(f, *arrays), frame=frame)
 
 
 def _run_statistics(ctx: StepContext) -> None:
@@ -464,12 +446,12 @@ def _run_statistics(ctx: StepContext) -> None:
     grid = run_grid(ctx.read("rig", read_rig), settings["material"])
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     protocol, start = experiment.injection_protocol, experiment.experiment_start
-    volumes = ctx.read("overflow", lambda f: read_json(f, "overflow.json"))
+    volumes = ctx.read("overflow", darsia.read_frame_volumes)
     reading = sand_reading(settings["reading"])
     rows = []
     for index, frame in enumerate(frames):
         image = ctx.read("corrected-image", read_image, frame=frame)
-        maps = ctx.read("phase-maps", read_maps, frame=frame)
+        maps = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
         date = experiment.get_datetime(ctx.photo(run, frame))
         co2 = co2_state(grid, experiment, date)
         capacity = darsia.dissolved_capacity(
@@ -500,52 +482,21 @@ def _run_statistics(ctx: StepContext) -> None:
         hours = (date - start).total_seconds() / 3600
         volume = volumes["volumes"][frame_key(frame)]
         rows.append(
-            {
-                "index": index,
-                "elapsed_h": hours,
-                "injected_g": protocol.injected_mass(time=hours) * 1000,
-                "dissolved": {
-                    str(sand): [h.relative.tolist(), h.weight.tolist()]
-                    for sand, h in histograms.items()
-                },
-                "gas": asdict(gas),
-                "overflow_m3": volume,
-                "measured": volume is not None and volumes["measured"],
-            }
-        )
-    dtype = np.dtype(grid.rig.pixel_area.img.dtype).name
-    record = {"run": run, "dtype": dtype, "frames": rows}
-    ctx.publish(lambda folder: _write_json(folder, "statistics.json", record))
-
-
-def calibration_frames(record: Mapping) -> list[darsia.CalibrationFrame]:
-    """A run's stored statistics as the fit reads them; every frame is selected at
-    its own time (each image a target)."""
-    dtype = np.dtype(record["dtype"]).type
-    frames = []
-    for row in record["frames"]:
-        gas = dict(row["gas"])
-        gas["sands"] = {int(k): darsia.SandGas(**v) for k, v in gas["sands"].items()}
-        frames.append(
             darsia.CalibrationFrame(
-                run=record["run"],
-                index=row["index"],
-                elapsed_h=row["elapsed_h"],
-                target_h=row["elapsed_h"],
-                injected_g=row["injected_g"],
-                dissolved={
-                    int(sand): darsia.SandHistogram(
-                        np.asarray(relative, dtype), np.asarray(weight, dtype)
-                    )
-                    for sand, (relative, weight) in row["dissolved"].items()
-                },
-                gas=darsia.GasStatistics(**gas),
+                run=run,
+                index=index,
+                elapsed_h=hours,
+                target_h=hours,
+                injected_g=protocol.injected_mass(time=hours) * 1000,
+                dissolved=histograms,
+                gas=gas,
                 column=None,
-                overflow_m3=row["overflow_m3"],
-                measured=row["measured"],
+                overflow_m3=volume,
+                measured=volume is not None and volumes["measured"],
             )
         )
-    return frames
+    dtype = grid.rig.pixel_area.img.dtype
+    ctx.publish(lambda folder: darsia.write_frames(folder, run, rows, dtype))
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
@@ -561,11 +512,7 @@ def _calibration(ctx: StepContext) -> None:
     frames = [
         frame
         for run in ctx.selection.frames
-        for frame in calibration_frames(
-            ctx.read(
-                "run-statistics", lambda f: read_json(f, "statistics.json"), run=run
-            )
-        )
+        for frame in ctx.read("run-statistics", darsia.read_frames, run=run)
     ]
     swi = {int(k): float(v) for k, v in material.swi.items()}
     measured = [int(k) for k in material.measured_swi]
@@ -577,18 +524,11 @@ def _calibration(ctx: StepContext) -> None:
         held = ctx.task.part.removeprefix("fold-")
         calibration, predictions = darsia.calibration_fold(*arguments, held)
     masses = darsia.mass_calibrations(calibration, settings["run_statistics"])
-    record = {
-        "calibration": asdict(calibration),
-        "mass": {run: asdict(value) for run, value in masses.items()},
-        "predictions": [asdict(p) for p in predictions],
-    }
-    ctx.publish(lambda folder: _write_json(folder, "calibration.json", record))
-
-
-def read_mass_calibrations(folder: Path) -> dict[str, darsia.MassCalibration]:
-    """The stored calibration's parameters of each run, as the mass maps read them."""
-    record = read_json(folder, "calibration.json")
-    return {run: darsia.MassCalibration(**v) for run, v in record["mass"].items()}
+    ctx.publish(
+        lambda folder: darsia.write_calibration(
+            folder, calibration, masses, predictions
+        )
+    )
 
 
 PHASE_MODEL = Step(

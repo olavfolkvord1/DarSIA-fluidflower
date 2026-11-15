@@ -21,8 +21,10 @@ settings.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
@@ -30,6 +32,9 @@ import numpy as np
 from darsia.experiment.overflow_circulation import CirculationSettings
 from darsia.experiment.overflow_evaporation import EvaporationSettings
 from darsia.experiment.overflow_feed import FeedSettings
+
+FRAME_VOLUMES = "overflow.json"
+"""The file of a run's stored free-gas volume per frame (:func:`write_frame_volumes`)."""
 
 
 class OverflowVariant(Protocol):
@@ -383,3 +388,24 @@ def estimated_reference(
     if not 0 <= share <= 1:
         return None
     return share * mass_g / (density * 1000)
+
+
+def write_frame_volumes(
+    folder: Path,
+    volumes: Mapping[str, float | None],
+    reasons: Sequence[str],
+    measured: bool = True,
+) -> None:
+    """Store a run's free-gas volume [m3] per frame in ``folder``
+    (:data:`FRAME_VOLUMES`): each frame's volume by its name, None for the model's
+    gas; why its readings are not usable; and whether the volumes are its own
+    measurement."""
+    record = {"volumes": dict(volumes), "measured": measured, "reasons": list(reasons)}
+    text = json.dumps(record, indent=1, allow_nan=False)
+    (Path(folder) / FRAME_VOLUMES).write_text(text, encoding="utf-8")
+
+
+def read_frame_volumes(folder: Path) -> dict:
+    """A run's stored free-gas volumes per frame (:func:`write_frame_volumes`):
+    ``volumes``, ``measured`` and ``reasons``."""
+    return json.loads((Path(folder) / FRAME_VOLUMES).read_text(encoding="utf-8"))
