@@ -23,6 +23,14 @@ of runs is compared in each region by the official Bregman solver of
   row, with its label and weight. A cell's weight is the mean over the region's
   reference pixels in it, or over all its reference pixels where the reference has
   none of the region.
+- With the runs' measured models of their grids, each run's pixels and the
+  reference's go onto the cells by their own measured positions
+  (:func:`darsia.grid_positions`), on cells covering the corners of every compared
+  run's measurement canvas (:func:`darsia.grid_corners`,
+  :func:`darsia.measured_extent`), and the boxes take those positions, as our
+  production's comparison placed its frames; the reference's first onto cells over
+  its own positions, then by whole cells onto these (:func:`darsia.placed_cells`).
+  Without one, by the grid's pixel centres.
 - A region's cells are those holding a pixel of it in the reference or in either
   run. Transport runs only through those with a known weight, and no flux leaves
   them (the solver's ``region``); mass on a cell without a known weight, and
@@ -95,6 +103,17 @@ class WassersteinSettings:
     """Relative Bregman increment at which the solver stops."""
     bregman_updates: tuple[int, ...]
     """Iterations at which the solver updates its Bregman regularisation."""
+    extent_edge_mm: int | None = None
+    """Step [mm] of the edges of the cells' measured extent before its whole cells
+    (:func:`darsia.measured_extent`), our production's 10; needed with measured
+    models."""
+
+
+def _edge_mm(settings: WassersteinSettings) -> int:
+    """The step of a measured extent's edges, refused without one."""
+    if settings.extent_edge_mm is None:
+        raise ValueError("Measured positions need [wasserstein] extent_edge_mm")
+    return settings.extent_edge_mm
 
 
 @dataclass(frozen=True)
@@ -128,6 +147,10 @@ class WassersteinReference:
     """The compared regions, by their domain identity."""
     weights: dict[str, RegionWeight]
     """The weight of each region, by its domain identity."""
+    extent: tuple[float, float, float, float] | None = None
+    """x0, x1, y0, y1 [m] of the cells where each run's pixels go onto them by
+    their measured positions (:func:`darsia.metric_cells`); None where they go by
+    the grid's pixel centres."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +280,8 @@ def wasserstein_reference(
     chart_labels: Sequence[int],
     domains: Sequence[AnalysisDomain],
     settings: WassersteinSettings,
+    positions: darsia.GridPositions | None = None,
+    extent: tuple[float, float, float, float] | None = None,
 ) -> WassersteinReference:
     """The comparison cells and the reference run's weight of each region.
 
@@ -282,6 +307,15 @@ def wasserstein_reference(
         The compared regions, each once.
     settings : WassersteinSettings
         The size of the cells.
+    positions : darsia.GridPositions, optional
+        The reference's pixels' positions on the rig, which its cells and boxes
+        read with an extent; by default its pixel centres.
+    extent : tuple of float, optional
+        The extent x0, x1, y0, y1 [m] of the cells, by which every run's pixels go
+        onto them by their positions (:func:`darsia.measured_extent`); by default
+        the cells of the grid. The reference's pixels go first onto the cells over
+        its own positions, then onto these (:func:`darsia.placed_cells`), as in our
+        production.
 
     Returns
     -------
@@ -310,12 +344,23 @@ def wasserstein_reference(
     ids = [domain.domain_id for domain in domains]
     if not ids or len(set(ids)) != len(ids):
         raise ValueError("Choose at least one region, each once")
-    cells = darsia.metric_cells(labels.shape, sand_map.dimensions, settings.cell_mm)
+    shape, dimensions, size = labels.shape, sand_map.dimensions, settings.cell_mm
+    if extent is None:
+        cells = darsia.metric_cells(shape, dimensions, size)
+    else:
+        # On cells over the reference's own positions, then onto the comparison's.
+        if positions is None:
+            positions = darsia.grid_positions(sand_map)
+        covering = darsia.measured_extent(
+            [(positions.x, positions.y)], size, _edge_mm(settings)
+        )
+        cells = darsia.metric_cells(shape, dimensions, size, positions, covering)
+        cells = darsia.placed_cells(cells, size, covering, extent)
     weight = weight.astype(np.float64)
     everywhere = darsia.cell_means(cells, weight)
     weights = {}
     for domain in domains:
-        inside = domain_pixels(domain, sand_map, placed, sand_labels)
+        inside = domain_pixels(domain, sand_map, placed, sand_labels, positions)
         own = darsia.cell_sums(cells, inside) > 0
         mean = darsia.cell_means(cells, np.where(inside, weight, np.nan))
         weights[domain.domain_id] = RegionWeight(
@@ -325,6 +370,8 @@ def wasserstein_reference(
         )
     left, top = (float(value) for value in sand_map.origin)
     bottom = top - float(sand_map.dimensions[0])
+    if extent is not None:
+        left, bottom = float(extent[0]), float(extent[2])
     return WassersteinReference(
         grid=darsia.grid_record(sand_map),
         cells=cells,
@@ -333,6 +380,7 @@ def wasserstein_reference(
         sand_labels=tuple(int(label) for label in sand_labels),
         domains={domain.domain_id: domain for domain in domains},
         weights=weights,
+        extent=None if extent is None else tuple(float(v) for v in extent),
     )
 
 
@@ -416,6 +464,7 @@ def frame_cells(
     geometry: RunGeometry,
     reference: WassersteinReference,
     settings: WassersteinSettings,
+    positions: darsia.GridPositions | None = None,
 ) -> dict[str, RegionMass]:
     """One frame's mass in each region, on the comparison cells.
 
@@ -441,6 +490,10 @@ def frame_cells(
         The comparison cells and regions.
     settings : WassersteinSettings
         The hole rule's largest hole.
+    positions : darsia.GridPositions, optional
+        The run's pixels' positions on the rig: with the reference's extent its
+        pixels go onto the cells by them (:func:`darsia.metric_cells`), and its
+        boxes read them; by default its pixel centres.
 
     Returns
     -------
@@ -467,13 +520,24 @@ def frame_cells(
         filled[rows, cols] = True
     unknown = counted & ~known & ~filled
 
+    cells = reference.cells
+    if reference.extent is not None:
+        if positions is None:
+            positions = darsia.grid_positions(sand_map)
+        cells = darsia.metric_cells(
+            mass.shape,
+            sand_map.dimensions,
+            settings.cell_mm,
+            positions,
+            reference.extent,
+        )
     area = (settings.cell_mm / 1000) ** 2
     result = {}
     for name, domain in reference.domains.items():
         inside = counted & domain_pixels(
-            domain, sand_map, sand_map.img, reference.sand_labels
+            domain, sand_map, sand_map.img, reference.sand_labels, positions
         )
-        kg = darsia.cell_sums(reference.cells, np.where(inside, grams, 0.0)) / 1000
+        kg = darsia.cell_sums(cells, np.where(inside, grams, 0.0)) / 1000
         result[name] = RegionMass(
             mass=darsia.ScalarImage(
                 (kg / area).astype(mass.dtype),
@@ -482,7 +546,7 @@ def frame_cells(
                 dimensions=reference.dimensions,
                 origin=reference.origin,
             ),
-            pixels=darsia.cell_sums(reference.cells, inside),
+            pixels=darsia.cell_sums(cells, inside),
             unknown=int(np.count_nonzero(unknown & inside)),
             filled=int(np.count_nonzero(filled & inside)),
         )
