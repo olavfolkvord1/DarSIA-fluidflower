@@ -30,6 +30,7 @@ from darsia.presets.workflows.media.panels import (
     shared_axes,
 )
 from darsia.presets.workflows.media.style import Curve, FigureStyle, bgr
+from darsia.presets.workflows.media.video import MovieWriter
 
 TABLES = tomllib.loads(
     """
@@ -58,6 +59,11 @@ TABLES = tomllib.loads(
         {column = "injected_mass_g", name = "Injected", colour = "black", line = "--"},
     ]
 
+    # Our production's films ran at 3 frames per second in H.264 ("avc1"), which
+    # not every OpenCV build writes; the tests write MPEG-4.
+    [video]
+    fps = 3.0
+    codec = "mp4v"
     """
 )
 STYLE = FigureStyle(
@@ -67,6 +73,7 @@ STYLE = FigureStyle(
         "curves": tuple(Curve(**curve) for curve in TABLES["style"]["curves"]),
     }
 )
+VIDEO = TABLES["video"]
 UNKNOWN = PhaseLabel.UNKNOWN
 
 
@@ -358,3 +365,36 @@ def test_pyramid_and_grid_layouts():
     np.testing.assert_array_equal(
         centre(frame, runs.cells[2]), held(solid(colours[2]))[0, 0]
     )
+
+
+# -- films -------------------------------------------------------------------------
+
+
+class Lock:
+    """A stand-in for a host lock that records when it is held."""
+
+    def __init__(self):
+        self.held = []
+
+    def __enter__(self):
+        self.held.append(True)
+
+    def __exit__(self, *_exception):
+        self.held.append(False)
+
+
+def test_a_film_is_refused_unless_it_decodes_to_the_frames_written(tmp_path):
+    """Three frames decode as three; a film that lost a frame is refused. The
+    caller's lock is held while the encoder opens, and only then."""
+    lock = Lock()
+    writer = MovieWriter(tmp_path / "a.mp4", (320, 180), **VIDEO, lock=lock)
+    assert lock.held == [True, False]
+    for level in (0, 120, 240):
+        writer.write(solid((level, level, level), (320, 180)))
+    assert writer.close() == dict(decoded_frames=3, fps=3.0, size=[320, 180])
+
+    lossy = MovieWriter(tmp_path / "b.mp4", (320, 180), **VIDEO)
+    lossy.writer.write(solid((0, 0, 0), (320, 180)))
+    lossy.count = 2
+    with pytest.raises(ValueError, match="2 frames"):
+        lossy.close()
