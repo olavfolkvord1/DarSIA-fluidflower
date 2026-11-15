@@ -4,9 +4,13 @@ sensor.
 A setup's reference is one colour channel of its baseline photograph on the grid
 the photographs are mapped onto: the baseline's camera view (its sensor values
 through the camera's lens model on the camera grid), or that view cropped to the
-four rig points by the official crop (:func:`darsia.extract_quadrilateral_ROI`),
-which places the rig in metres. The setup's homography registers the reference to
-the baseline's camera view, from the rig points for a crop
+four rig points by the official curvature correction's crop
+(:class:`darsia.CurvatureCorrection`) in the given precision, which places the rig
+in metres, as our production's setup cropped it: in single precision its transform
+is solved from the rig points and its positions are mapped in single precision, in
+double precision it is OpenCV's transform and warp
+(:func:`darsia.warp_perspective`). The setup's homography registers the reference
+to the baseline's camera view, from the rig points for a crop
 (:func:`darsia.rig_points_homography`) and the identity otherwise.
 
 Each photograph's camera view, through its own lens model (the tables recorded in
@@ -146,7 +150,8 @@ def setup_frame_registration(
     reference's grid.
 
     The baseline's camera view (all values, divided by the white range) is the
-    reference, or its official crop to the rig points (:func:`reference_grid`).
+    reference, or the official curvature correction's crop of it to the rig points
+    in the given precision (:func:`reference_grid`, :func:`darsia.warp_perspective`).
     With rig points, the reference is registered to the baseline's view from them;
     the baseline is then sampled once from its sensor through that homography.
 
@@ -206,9 +211,13 @@ def setup_frame_registration(
     reference = view / white
     found = darsia.ProjectiveRegistration(np.eye(3, dtype=dtype), 0, 1.0, {})
     if corners is not None:
-        reference = darsia.extract_quadrilateral_ROI(
-            reference, pts_src=darsia.make_voxel(corners), width=size[0], height=size[1]
+        names = ("top_left", "bottom_left", "bottom_right", "top_right")
+        crop = dict(
+            zip(names, (list(c) for c in corners)), width=size[0], height=size[1]
         )
+        crop.update(in_meters=True, precision=dtype)
+        stages = {"init": None, "crop": crop, "bulge": None, "stretch": None}
+        reference = darsia.CurvatureCorrection(config=stages).correct_array(reference)
         initial = darsia.rig_points_homography(np.asarray(corners), (rows, cols), dtype)
         found = darsia.projective_registration(reference * white, view, initial, chosen)
     registration = FrameRegistration(

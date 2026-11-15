@@ -137,8 +137,9 @@ def _sampled(path, homography, registration, divide_first=False):
 def test_a_raw_photograph_is_registered_to_the_reference_and_sampled_once(
     tmp_path, photos
 ):
-    """The reference is the official crop of the baseline's camera view, its
-    homography registered from the rig points; a photograph's camera view of all
+    """The reference is the official curvature correction's crop of the baseline's
+    camera view in single precision, its homography registered from the rig
+    points; a photograph's camera view of all
     its values is registered from it, and its sensor values are sampled once
     through its homography and lens model, divided by the white range after."""
     table = tomllib.loads(CONFIG)["corrections"]["registration"]
@@ -169,9 +170,10 @@ def test_a_raw_photograph_is_registered_to_the_reference_and_sampled_once(
         sensor.values[..., 1:2].astype(np.float32), lens, (730, 1200), (1,)
     )[..., 0]
     white = np.float32(sensor.white_range)
-    reference = darsia.extract_quadrilateral_ROI(
-        view / white, pts_src=darsia.make_voxel(corners), width=1.1, height=0.64
-    )
+    # The rig chain's crop, computed in single precision.
+    crop = {**crop, "precision": "float32"}
+    stages = {"init": None, "crop": crop, "bulge": None, "stretch": None}
+    reference = darsia.CurvatureCorrection(config=stages).correct_array(view / white)
     np.testing.assert_array_equal(registration.reference, reference)
     assert registration.dimensions == (0.64, 1.1) and setup_quality.matches == 66
     np.testing.assert_array_equal(
