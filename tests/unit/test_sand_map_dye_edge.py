@@ -10,6 +10,7 @@ from darsia.presets.workflows.setup.sand_map import SandMapDrawing, partition_fa
 from darsia.presets.workflows.setup.sand_map_dye_edge import (
     DyeEdgeSettings,
     measure_dye_edge,
+    snap_to_dye_edge,
     static_boundaries,
 )
 
@@ -41,10 +42,14 @@ SETTINGS = DyeEdgeSettings(
     median_mm=3.0,
     fewest_profiles=5,
     fewest_stations=5,
+    crossing_mm=50.0,
+    simplify_mm=0.05,
 )
 """The settings a rig's side walls were drawn with."""
 
-ROUND = replace(SETTINGS, window_mm=1.0, direction_mm=1.0, median_mm=1.0)
+ROUND = replace(
+    SETTINGS, window_mm=1.0, direction_mm=1.0, median_mm=1.0, crossing_mm=1.0
+)
 """The settings for a round fixture 8 mm in radius."""
 
 
@@ -454,3 +459,281 @@ def test_each_station_is_resampled_by_its_own_draws():
     far = np.abs(edge.base[:, 1] - 0.01505) > 0.0022
     for name in ("found", "spread", "rival"):
         assert np.array_equal(getattr(edge, name)[far], getattr(other, name)[far])
+
+
+def test_snapping_keeps_the_boundary_where_the_edge_is_unreadable(clipped):
+    """Where the edge is unreadable the boundary keeps its anchors, and the
+    drawing stays a closed partition."""
+    drawing, _photograph_, edge = clipped
+    snapped, _moves, removed = snap_to_dye_edge(drawing, edge, SETTINGS)
+    assert partition_faults(snapped) == []
+    assert 4 not in removed and 4 in snapped.polygons[0][1]
+    assert np.array_equal(snapped.anchors[4], drawing.anchors[4])
+
+
+def test_snapping_moves_the_boundary_onto_the_edge(wall, tmp_path):
+    """The joints move onto the edge at their own height, the ends along the
+    frame; the band and its neighbours share new anchors on the edge instead of
+    the old ones; the anchor of the sand layers' boundary now inside the band is
+    removed; the drawing stays a closed partition and saves."""
+    drawing, edge = wall
+    snapped, moves, removed = snap_to_dye_edge(drawing, edge, SETTINGS)
+    assert partition_faults(snapped) == []
+    snapped.write(tmp_path / "drawing.json")
+    assert removed == [2, 4, 9]
+
+    joints = {move.anchor: move for move in moves if move.start is not None}
+    assert sorted(joints) == [1, 3, 5]
+    for move in joints.values():
+        assert move.start == tuple(drawing.anchors[move.anchor])
+        assert abs(move.end[0] - _edge_x(move.end[1])) < 7e-5
+        assert abs(move.end[1] - move.start[1]) < 2e-5
+    assert joints[1].end[1] == 0.0 and joints[5].end[1] == HEIGHT
+
+    added = [move for move in moves if move.start is None]
+    assert [move.anchor for move in added] == list(range(15, 15 + len(added)))
+    assert len(added) < 10
+    points = np.array([move.end for move in added]).reshape(-1, 2)
+    assert np.all(np.abs(points[:, 0] - _edge_x(points[:, 1])) < 7e-5)
+    band, lower, upper = (set(indices) for _layer, indices in snapped.polygons[:3])
+    assert band & lower == {1, 3} | {m.anchor for m in added if m.end[1] < 0.015}
+    assert band & upper == {3, 5} | {m.anchor for m in added if m.end[1] > 0.015}
+    kept = [0, 6, 7, 8, 10, 11, 12, 13, 14]
+    assert np.array_equal(snapped.anchors[kept], drawing.anchors[kept])
+
+
+def test_anchors_a_frame_joint_moves_past_are_removed(wall):
+    """Where a joint moves along the frame past an anchor that its porous neighbour
+    has on that side, at the floor and at the top, the anchor is removed, and no
+    spike is left back along the frame."""
+    drawing, edge = wall
+    anchors = np.vstack([drawing.anchors, [[6.6e-3, 0], [6.9e-3, HEIGHT]]])
+    polygons = (
+        drawing.polygons[0],
+        (2, (1, 15, 7, 8, 9, 3, 2)),
+        (3, (3, 9, 8, 10, 16, 5, 4)),
+        drawing.polygons[3],
+    )
+    framed = replace(drawing, anchors=anchors, polygons=polygons)
+    assert partition_faults(framed) == []
+    snapped, _moves, removed = snap_to_dye_edge(framed, edge, SETTINGS)
+    assert partition_faults(snapped) == []
+    assert removed == [2, 4, 9, 15, 16]
+
+
+def test_a_layer_on_top_keeps_an_anchor_the_partition_drops(wall):
+    """A polygon drawn on top lies over the partition: where the band now covers
+    an anchor of the sand layers' boundary that it also uses, the anchor leaves
+    the sand layers and stays in use on top."""
+    drawing, edge = wall
+    anchors = np.vstack([drawing.anchors, [[9e-3, 0.017], [9e-3, 0.019]]])
+    over = replace(
+        drawing,
+        anchors=anchors,
+        polygons=drawing.polygons + ((9, (9, 15, 16)),),
+        on_top=frozenset({9}),
+    )
+    snapped, _moves, removed = snap_to_dye_edge(over, edge, SETTINGS)
+    assert removed == [2, 4]
+    assert 9 not in snapped.polygons[1][1] + snapped.polygons[2][1]
+    assert 9 in snapped.polygons[4][1]
+
+
+def test_snapping_refuses_to_leave_another_layers_anchor_in_the_static_polygon(
+    wall,
+):
+    """Along the sand layers' boundary from the moved joint, an anchor that would
+    lie in the band and that a third layer also uses would leave the layers
+    overlapping the band, so snapping refuses and names the anchor and the
+    joint."""
+    drawing, edge = wall
+    anchors = np.vstack([drawing.anchors, [[6.6e-3, 0.015], [8e-3, 0.015]]])
+    anchors = np.vstack([anchors, [[7.3e-3, 0.0156]]])
+    polygons = (
+        drawing.polygons[0],
+        (2, (1, 7, 8, 16, 15, 9, 3, 2)),
+        (3, (3, 9, 15, 17, 16, 8, 10, 5, 4)),
+        drawing.polygons[3],
+        (4, (15, 16, 17)),
+    )
+    third = replace(drawing, anchors=anchors, polygons=polygons)
+    assert partition_faults(third) == []
+    with pytest.raises(ValueError, match="Anchor 15 .* anchor 3 "):
+        snap_to_dye_edge(third, edge, SETTINGS)
+
+
+def test_snapping_refuses_to_cover_a_porous_polygon():
+    """A porous layer that pinches out against the band, narrower than the band
+    moves out, would be covered by it, so snapping refuses and names the layer; a
+    wider one keeps its tip, and the drawing stays a closed partition."""
+    photograph = _photograph(lambda x, y: x - 0.00705)
+    for width in (0.6, 1.2):
+        anchors = [[0, 0], [6.2, 0], [6.2, 10], [6.2, 20], [6.2, 30], [0, 30]]
+        anchors += [[40, 0], [40, 30], [6.2 + width, 15]]
+        polygons = ((1, (0, 1, 2, 3, 4, 5)), (2, (1, 6, 7, 4, 3, 8, 2)), (3, (2, 8, 3)))
+        lens = SandMapDrawing(np.array(anchors) / 1000, polygons, frame=(WIDTH, HEIGHT))
+        assert partition_faults(lens) == []
+        edge = _measured(lens, photograph)
+        if width < 1:
+            with pytest.raises(ValueError, match="polygon of layer 3"):
+                snap_to_dye_edge(lens, edge, SETTINGS)
+        else:
+            snapped, _moves, _removed = snap_to_dye_edge(lens, edge, SETTINGS)
+            assert partition_faults(snapped) == [] and 8 in snapped.polygons[2][1]
+
+
+def test_snapping_a_closed_boundary(disc):
+    """A fixture's boundary moves onto the circle the dye shows, both joints with
+    it, each once, and the sand layers follow; unsimplified, it has an anchor at
+    every station."""
+    drawing, edge = disc
+    snapped, moves, removed = snap_to_dye_edge(drawing, edge, ROUND)
+    assert partition_faults(snapped) == []
+    joints = [move for move in moves if move.start is not None]
+    assert [move.anchor for move in joints] == [0, 16]
+    assert all(move.start == tuple(drawing.anchors[move.anchor]) for move in joints)
+    assert removed == [i for i in range(32) if i not in (0, 16)]
+    ring = np.asarray(snapped.anchors)[list(snapped.polygons[0][1])]
+    assert np.abs(np.hypot(*(ring - [0.02, 0.015]).T) - 0.008).max() < 6e-5
+    joints = np.sort(ring[np.abs(ring[:, 1] - 0.015) < 1e-9, 0])
+    assert np.abs(joints - [0.012, 0.028]).max() < 6e-5
+    fine, _moves, _removed = snap_to_dye_edge(
+        drawing, edge, replace(ROUND, simplify_mm=0.0)
+    )
+    ring = fine.anchors[list(fine.polygons[0][1])]
+    assert np.hypot(*(edge.points[:, None] - ring[None]).T).min(axis=0).max() < 1e-12
+
+
+def test_a_joint_at_a_corner_of_the_frame_stays():
+    """A boundary that runs from one corner of the frame to the opposite one keeps
+    both corners, though the edge meets the sides elsewhere, and follows the edge
+    between them within the frame."""
+    anchors = np.array([[0, 0], [40, 0], [40, 30], [0, 30]]) / 1000
+    diagonal = SandMapDrawing(
+        anchors, ((1, (0, 1, 2)), (2, (0, 2, 3))), frame=(WIDTH, HEIGHT)
+    )
+    photograph = _photograph(lambda x, y: 0.8 * y - 0.6 * x + 5e-4, margin=30)
+    wider = RIG_TO_IMAGE + [[0, 0, 30], [0, 0, 30], [0, 0, 0]]
+    (chain,) = static_boundaries(diagonal, {1})
+    edge = measure_dye_edge(
+        diagonal, chain, photograph, wider, SETTINGS, clip_level=1.0
+    )
+    assert "unreadable" not in edge.kind
+    assert edge.points[:, 0].min() < 0 or edge.points[:, 1].min() < 0
+    snapped, moves, _removed = snap_to_dye_edge(diagonal, edge, SETTINGS)
+    assert partition_faults(snapped) == []
+    assert moves and all(move.start is None for move in moves)
+    assert np.array_equal(snapped.anchors[:4], anchors)
+
+
+def test_a_joint_another_static_polygon_uses_stays():
+    """A joint that a polygon not along the boundary also uses stays, since moving
+    it would redraw that polygon's boundaries, which the edge does not measure:
+    here the lower sand layer, taken as static too. The joint on the frame moves."""
+    step = np.where(np.arange(round(HEIGHT / PIXEL)) < 150, 0.007, 0.0085)[:, None]
+    drawing = _wall()
+    chain, _other = static_boundaries(drawing, {1, 2})
+    photograph = _photograph(lambda x, y: x - step)
+    edge = measure_dye_edge(
+        drawing, chain, photograph, RIG_TO_IMAGE, SETTINGS, clip_level=1.0
+    )
+    snapped, moves, removed = snap_to_dye_edge(drawing, edge, SETTINGS)
+    assert partition_faults(snapped) == []
+    assert [move.anchor for move in moves if move.start is not None] == [5]
+    assert np.array_equal(snapped.anchors[3], drawing.anchors[3])
+    assert removed == [4] and snapped.polygons[1] == drawing.polygons[1]
+
+
+def test_a_joint_moves_along_the_chords_normal_to_the_nearest_crossing():
+    """A joint at a notch of the drawn boundary moves along the normal of the
+    boundary's chord, not of the notch, so at its own height. The joints of a
+    fixture on the floor each move along the floor to the crossing with the edge
+    nearest them, though the search reaches the other."""
+    anchors = [[0, 0], [6.2, 0], [6.5, 14.5], [6.0, 15], [6.0, 16], [6.6, 30]]
+    anchors += [[0, 30], [40, 0], [40, 15], [40, 30]]
+    polygons = ((1, (0, 1, 2, 3, 4, 5, 6)), (2, (1, 7, 8, 3, 2)), (3, (3, 8, 9, 5, 4)))
+    notched = SandMapDrawing(np.array(anchors) / 1000, polygons, frame=(WIDTH, HEIGHT))
+    edge = _measured(notched, _photograph(lambda x, y: x - _edge_x(y)))
+    _snapped, moves, _removed = snap_to_dye_edge(notched, edge, SETTINGS)
+    (joint,) = [move for move in moves if move.anchor == 3]
+    assert abs(joint.end[0] - _edge_x(joint.end[1])) < 2e-5
+    assert abs(joint.end[1] - joint.start[1]) < 2e-5
+
+    angle = np.pi * np.arange(1, 16) / 16
+    arc = np.column_stack([20 + 7.6 * np.cos(angle), 7.6 * np.sin(angle)])
+    anchors = np.vstack([[[12.4, 0], [27.6, 0]], arc, [[0, 0], [40, 0], [40, 30]]])
+    anchors = np.vstack([anchors, [[0, 30]]]) / 1000
+    polygons = (
+        (1, (0, 1, *range(2, 17))),
+        (2, (17, 0, *range(16, 1, -1), 1, 18, 19, 20)),
+    )
+    mound = SandMapDrawing(anchors, polygons, frame=(WIDTH, HEIGHT))
+    photograph = _photograph(lambda x, y: np.hypot(x - 0.02, y) - 0.008)
+    far = replace(ROUND, crossing_mm=30.0)
+    snapped, moves, _removed = snap_to_dye_edge(
+        mound, _measured(mound, photograph, far), far
+    )
+    assert partition_faults(snapped) == []
+    ends = {move.anchor: move.end for move in moves if move.start is not None}
+    assert np.abs(np.subtract(ends[0], (0.012, 0))).max() < 5e-5
+    assert np.abs(np.subtract(ends[1], (0.028, 0))).max() < 5e-5
+
+
+def test_a_joints_crossing_is_sought_within_the_crossing_distance():
+    """Where the edge of a low fixture on the floor meets the floor 1.8 mm along
+    from the drawn ends, its joints move there when the crossing is sought within
+    3 mm of them along the boundary, and stay when it is sought within 1 mm."""
+    radius = np.hypot(10, 40)
+    angle = np.linspace(np.arctan2(40, 10), np.pi - np.arctan2(40, 10), 17)[1:-1]
+    arc = np.column_stack([20 + radius * np.cos(angle), radius * np.sin(angle) - 40])
+    anchors = np.vstack([[[10, 0], [30, 0]], arc, [[0, 0], [40, 0], [40, 30]]])
+    anchors = np.vstack([anchors, [[0, 30]]]) / 1000
+    sand = (17, 0, *range(16, 1, -1), 1, 18, 19, 20)
+    low = SandMapDrawing(
+        anchors, ((1, (0, 1, *range(2, 17))), (2, sand)), frame=(WIDTH, HEIGHT)
+    )
+    photograph = _photograph(
+        lambda x, y: np.hypot(x - 0.02, y + 0.04) - radius / 1000 + 4e-4, margin=30
+    )
+    wider = RIG_TO_IMAGE + [[0, 0, 30], [0, 0, 30], [0, 0, 0]]
+    (chain,) = static_boundaries(low, {1})
+    meets = np.sqrt((radius - 0.4) ** 2 - 40**2) / 1000
+    for crossing, ends in ((1.0, {}), (3.0, {0: 0.02 - meets, 1: 0.02 + meets})):
+        settings = replace(ROUND, crossing_mm=crossing)
+        edge = measure_dye_edge(low, chain, photograph, wider, settings, clip_level=1.0)
+        snapped, moves, _removed = snap_to_dye_edge(low, edge, settings)
+        assert partition_faults(snapped) == []
+        moved = {move.anchor: move.end for move in moves if move.start is not None}
+        assert sorted(moved) == sorted(ends)
+        for anchor, x in ends.items():
+            assert abs(moved[anchor][0] - x) < 6e-5 and moved[anchor][1] == 0.0
+
+
+def test_snapping_leaves_a_boundary_without_an_edge():
+    """Where the dye begins beyond the reach, no station has an edge, and snapping
+    moves, adds and removes no anchor."""
+    drawing = _band(6.2)
+    edge = _measured(drawing, _photograph(lambda x, y: x - 9e-3))
+    snapped, moves, removed = snap_to_dye_edge(drawing, edge, SETTINGS)
+    assert moves == [] and removed == []
+    assert np.array_equal(snapped.anchors, drawing.anchors)
+
+
+def test_snapping_refuses_an_edge_measured_on_other_anchors(wall):
+    """An edge snaps only the drawing whose boundary it was measured on, with its
+    frame, which must be a closed partition, and whose layers drawn on top use no
+    anchor of the boundary."""
+    drawing, edge = wall
+    with pytest.raises(ValueError, match="measured"):
+        snap_to_dye_edge(drawing.moved({3: (0.0061, 0.015)}), edge, SETTINGS)
+    with pytest.raises(ValueError, match="frame"):
+        snap_to_dye_edge(replace(drawing, frame=None), edge, SETTINGS)
+    with pytest.raises(ValueError, match="1 gap"):
+        snap_to_dye_edge(drawing.moved({10: (0.039, HEIGHT)}), edge, SETTINGS)
+    over = replace(
+        drawing,
+        anchors=np.vstack([drawing.anchors, [[8e-3, 11e-3]]]),
+        polygons=drawing.polygons + ((9, (3, 2, 15)),),
+    )
+    with pytest.raises(ValueError, match=r"layers \[9\], drawn on top"):
+        snap_to_dye_edge(over, edge, SETTINGS)
