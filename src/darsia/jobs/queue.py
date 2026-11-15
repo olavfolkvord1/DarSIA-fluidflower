@@ -9,10 +9,11 @@ named by its task and the token it moved under (``<task>.<token>``), so every
 destination name is the mover's own.
 
 The claimed marker holds the lease, which its owner rewrites every
-:data:`darsia.utils.results.BEAT`: the token, the machine, the process and its
-birth time, a beat number and the time. A service takes a claim back when its
-lease stays unchanged for :data:`darsia.utils.results.STALE` by its own clock; the
-owner's next beat then finds its marker gone and the owner exits. Only the holder
+:data:`darsia.utils.results.BEAT`: the token, the machine, the identity of the
+host it runs on, the process and its birth time, a beat number and the time. A
+service takes a claim back when its lease stays unchanged for
+:data:`darsia.utils.results.STALE` by its own clock; the owner's next beat then
+finds its marker gone and the owner exits. Only the holder
 of the current marker can move it to ``done/``, so a superseded or late owner
 commits no terminal state, and a result counts only when its task's done marker
 names its token (:func:`accepted`).
@@ -305,12 +306,12 @@ def _transfer(source: Path, destination: Path) -> bool:
     return True
 
 
-def claim(job: Path, task: str, machine: str) -> Claim | None:
+def claim(job: Path, task: str, machine: str, host: str | None = None) -> Claim | None:
     """Claim a queued task under a new token.
 
-    The claimed marker is then written once with the token and the machine, so
-    that what an earlier owner left in it is gone before the task's process starts
-    and becomes the marker's only writer.
+    The claimed marker is then written once with the token, the machine and the
+    host's identity, so that what an earlier owner left in it is gone before the
+    task's process starts and becomes the marker's only writer.
 
     Parameters
     ----------
@@ -320,6 +321,9 @@ def claim(job: Path, task: str, machine: str) -> Claim | None:
         The task's name.
     machine : str
         The claiming machine.
+    host : str, optional
+        The identity of the host it runs on, e.g.
+        :func:`darsia.jobs.service.host_identity`.
 
     Returns
     -------
@@ -335,16 +339,19 @@ def claim(job: Path, task: str, machine: str) -> Claim | None:
         return None
     try:
         with open(held.path, "r+b") as stream:  # once: no process writes it yet
-            stream.write(_text({"token": held.token, "machine": machine}))
+            first = {"token": held.token, "machine": machine}
+            stream.write(_text({**first, **({} if host is None else {"host": host})}))
             stream.truncate()
     except OSError:
         pass  # The task's first beat writes it.
     return held
 
 
-def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
-    """Renew a claim's lease: its token, machine, process and birth time, the beat
-    number and the time.
+def beat(
+    claim: Claim, number: int, pid: int, birth: float, host: str | None = None
+) -> None:
+    """Renew a claim's lease: its token, machine, host, process and birth time, the
+    beat number and the time.
 
     Parameters
     ----------
@@ -356,6 +363,9 @@ def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
         The task's process.
     birth : float
         The process's birth time (``psutil.Process.create_time``).
+    host : str, optional
+        The identity of the host it runs on, by which a service knows the claims
+        whose process it may look at.
 
     Raises
     ------
@@ -366,6 +376,7 @@ def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
     lease = {
         "token": claim.token,
         "machine": claim.machine,
+        **({} if host is None else {"host": host}),
         "pid": pid,
         "birth": birth,
         "beat": number,
