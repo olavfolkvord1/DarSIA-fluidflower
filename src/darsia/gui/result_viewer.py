@@ -7,7 +7,9 @@ outlines over the maps (:class:`Outline`) and a run's curves over time
 (:class:`Curves`, e.g. the calibration's predicted and injected mass). The viewer
 lists the runs, steps through a run's frames and shows one to three panels, each
 a field of the shown frame or the run's curves, with a colour scale kept per run
-and field.
+and field. A page adds its own parts, run approval on Calibration and film and
+figure export on Mass, through :meth:`ResultViewer.add_page_controls`,
+:meth:`ResultViewer.set_run_columns`, :meth:`ResultViewer.view` and the signals.
 
 It is display only: it computes no result, starts no job and writes nothing. Each
 result is read through :func:`darsia.utils.results.read` at its location
@@ -190,6 +192,21 @@ class Curves:
     :meth:`~darsia.utils.locations.Locations.result`: the run's own result, or
     e.g. ``{"part": "fit"}`` of a result stored in parts. It holds no Qt object,
     e.g. no page, since it runs off the window thread."""
+
+
+@dataclass(frozen=True)
+class View:
+    """What the viewer shows, e.g. for a page's film or figure export."""
+
+    run: str | None
+    index: int
+    frame: Frame | None
+    hours: float | None
+    layout: str
+    panels: tuple[tuple[str, float | None], ...]
+    """Each shown panel's content key and its colour scale's maximum."""
+    outlines: tuple[str, ...]
+    """The labels of the outlines shown."""
 
 
 def _nice_limit(value: float) -> float:
@@ -714,6 +731,11 @@ class ResultViewer(QWidget):
 
     """
 
+    run_changed = Signal(str)
+    """A run was chosen."""
+    frame_shown = Signal(str, int)
+    """A run's frame, by its index, is shown."""
+
     def __init__(
         self,
         locations: Locations,
@@ -734,6 +756,7 @@ class ResultViewer(QWidget):
         self._started = 0.0
         self._runs: dict[str, tuple[tuple[Frame, float | None], ...]] = {}
         self._run: str | None = None
+        self._columns: tuple[tuple[str, ...], dict] = ((), {})
         self._scales: dict[tuple[str, str], float] = {}
         self._notes_run: str | None = None
         self._layout = layout
@@ -805,6 +828,12 @@ class ResultViewer(QWidget):
         self.notes.setWordWrap(True)
         self.notes.hide()
         right.addWidget(self.notes)
+        self.page_controls = QWidget()
+        self._page_layout = QHBoxLayout(self.page_controls)
+        self._page_layout.setContentsMargins(0, 0, 0, 0)
+        self._page_layout.addStretch(1)
+        self.page_controls.hide()
+        right.addWidget(self.page_controls)
         status = QHBoxLayout()
         self.busy_bar = QProgressBar()
         self.busy_bar.setRange(0, 0)
@@ -959,14 +988,32 @@ class ResultViewer(QWidget):
             self._run = None
             self._request()
 
+    def set_run_columns(
+        self, headers: Sequence[str], values: Mapping[str, Sequence[str]]
+    ) -> None:
+        """Show a page's own columns in the run list, e.g. a run's role and review.
+
+        Parameters
+        ----------
+        headers : sequence of str
+            The columns' headers, after «Run» and «Frames».
+        values : mapping of str to sequence of str
+            Each run's texts in those columns.
+
+        """
+        self._columns = (tuple(headers), {run: tuple(v) for run, v in values.items()})
+        self._fill_runs()
+
     def _fill_runs(self) -> None:
-        """List the runs with their frame counts."""
+        """List the runs with their frame counts and the page's columns."""
+        headers, values = self._columns
         table = self.runs_table
         with QSignalBlocker(table):
-            table.setHorizontalHeaderLabels(["Run", "Frames"])
+            table.setColumnCount(2 + len(headers))
+            table.setHorizontalHeaderLabels(["Run", "Frames", *headers])
             table.setRowCount(len(self._runs))
             for row, (run, frames) in enumerate(self._runs.items()):
-                texts = (run, str(len(frames)))
+                texts = (run, str(len(frames)), *values.get(run, ()))
                 for column, text in enumerate(texts):
                     item = QTableWidgetItem(text)
                     item.setData(Qt.ItemDataRole.UserRole, run)
@@ -974,6 +1021,30 @@ class ResultViewer(QWidget):
                 if run == self._run:
                     table.selectRow(row)
             table.resizeColumnsToContents()
+
+    def add_page_controls(self, widget: QWidget) -> None:
+        """Add a page's own control under the panels, e.g. «Approve run» or «Export
+        film…»; the page reads what is shown through :meth:`view` and the
+        signals."""
+        self._page_layout.insertWidget(self._page_layout.count() - 1, widget)
+        self.page_controls.show()
+
+    def view(self) -> View:
+        """What is shown: the run, the frame, the layout, each panel's content and
+        colour scale, and the outlines."""
+        frames = self._runs.get(self._run, ())
+        index = self.slider.value()
+        frame, hours = frames[index] if frames else (None, None)
+        panels = tuple(
+            (key, self._scales.get((self._run, key)))
+            for key in (panel.content.currentData() for panel in self._shown())
+        )
+        chosen = tuple(
+            outline.label
+            for outline, box in zip(self.outlines, self.outline_boxes)
+            if box.isChecked()
+        )
+        return View(self._run, index, frame, hours, self._layout, panels, chosen)
 
     def select_run(self, run: str) -> None:
         """Show a run from its first frame."""
@@ -985,6 +1056,7 @@ class ResultViewer(QWidget):
         with QSignalBlocker(self.slider):
             self.slider.setRange(0, max(0, len(self._runs[run]) - 1))
             self.slider.setValue(0)
+        self.run_changed.emit(run)
         self._request()
 
     def _run_selected(self) -> None:
@@ -1151,6 +1223,7 @@ class ResultViewer(QWidget):
         self._notes_run = run
         self.notes.setText(" ".join(notes))
         self.notes.setVisible(bool(notes))
+        self.frame_shown.emit(run, index)
 
     def stop_playing(self) -> None:
         """Stop Play; the frame shown stays."""
