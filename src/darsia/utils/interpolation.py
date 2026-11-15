@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import isqrt
 from pathlib import Path
 from typing import Literal
 
@@ -9,8 +10,10 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import RBFInterpolator
 from scipy.optimize import least_squares
+from scipy.spatial import Delaunay
 
 import darsia
+from darsia.utils.linalg import solve
 
 
 def interpolate_measurements_2d(
@@ -53,6 +56,110 @@ def interpolate_measurements_2d(
     # Evaluate interpolation
     interpolated_data_vector = interpolator(coords_vector)
     return interpolated_data_vector.reshape((Ny, Nx), order="F")
+
+
+def interpolate_linear_in_hull(
+    measurements: tuple[np.ndarray, np.ndarray, np.ndarray],
+    coordinates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate scattered measurements linearly inside their convex hull, and
+    take the nearest measurement outside it.
+
+    The positions of the measurements are triangulated (Delaunay, in double
+    precision). A point inside a triangle, up to 100 double precision machine
+    epsilons in its barycentric coordinates, takes the linear interpolation of
+    the triangle's three values. Each point is looked up among the triangles whose
+    bounding boxes share its cell of a regular grid over the measurements, about
+    one cell per triangle, in the order of the triangulation; the first that holds
+    the point gives its value, e.g., on an edge of two triangles. A point outside
+    every triangle takes the value of the nearest measurement, the first one on
+    ties. All arithmetic runs in the floating dtype of the coordinates (at least
+    single precision); the measurements are converted to it.
+
+    Parameters
+    ----------
+    measurements : tuple of numpy.ndarray
+        ``(x, y, data)`` of the measurements, at least three not on one line.
+    coordinates : numpy.ndarray
+        Points (N, 2) of x and y at which to interpolate.
+
+    Returns
+    -------
+    values : numpy.ndarray
+        The interpolated value of each point, in the coordinates' dtype.
+    outside : numpy.ndarray
+        Boolean flag of the points outside the convex hull, which take the
+        nearest measurement's value.
+
+    """
+    x, y, data = (np.ravel(measurement) for measurement in measurements)
+    triangles = Delaunay(np.column_stack((x, y)).astype(np.float64)).simplices
+    points = np.asarray(coordinates)
+    dtype = np.result_type(points, np.float32)
+    points = points.astype(dtype, copy=False)
+    xy = np.column_stack((x, y)).astype(dtype)
+    data = data.astype(dtype)
+    vertices = xy[triangles]
+
+    # The triangles by the cells of a regular grid over the measurements.
+    origin = xy.min(axis=0)
+    span = xy.max(axis=0) - origin
+    count = max(1, isqrt(len(triangles)))
+
+    def cell(position: np.ndarray) -> np.ndarray:
+        """Column and row of the grid cell of each position (N, 2)."""
+        return np.clip((position - origin) / span * count, 0, count - 1).astype(np.intp)
+
+    cells = [[] for _ in range(count**2)]
+    for index, ((x0, y0), (x1, y1)) in enumerate(
+        zip(cell(vertices.min(axis=1)), cell(vertices.max(axis=1)))
+    ):
+        for row in range(y0, y1 + 1):
+            for col in range(x0, x1 + 1):
+                cells[row * count + col].append(index)
+
+    # Barycentric coordinates relative to the third vertex of each triangle.
+    edges = np.transpose(vertices[:, :2] - vertices[:, 2:3], (0, 2, 1))
+    inverses = np.stack([solve(edge, np.eye(2, dtype=dtype)) for edge in edges])
+    grid = cell(points)
+    ids = grid[:, 1] * count + grid[:, 0]
+    order = np.argsort(ids, kind="stable")
+    ordered = ids[order]
+    stops = np.r_[np.flatnonzero(np.diff(ordered)) + 1, len(ordered)]
+    values = np.empty(len(points), dtype)
+    outside = np.ones(len(points), dtype=bool)
+    eps = dtype.type(100 * np.finfo(np.float64).eps)
+    start = 0
+    for stop in stops:
+        group = order[start:stop]
+        for triangle in cells[ordered[start]]:
+            todo = group[outside[group]]
+            if not len(todo):
+                break
+            dx, dy = (points[todo] - vertices[triangle, 2]).T
+            inverse = inverses[triangle]
+            u = inverse[0, 0] * dx + inverse[0, 1] * dy
+            v = inverse[1, 0] * dx + inverse[1, 1] * dy
+            w = 1 - u - v
+            inside = (u >= -eps) & (v >= -eps) & (w >= -eps)
+            corner = data[triangles[triangle]]
+            values[todo[inside]] = (
+                u[inside] * corner[0] + v[inside] * corner[1] + w[inside] * corner[2]
+            )
+            outside[todo[inside]] = False
+        start = stop
+
+    # Outside the hull, the nearest measurement; the first one on ties.
+    far = points[outside]
+    distance = np.full(len(far), np.inf, dtype)
+    nearest = np.empty(len(far), dtype)
+    for (x0, y0), value in zip(xy, data):
+        squared = (far[:, 0] - x0) ** 2 + (far[:, 1] - y0) ** 2
+        closer = squared < distance
+        distance[closer] = squared[closer]
+        nearest[closer] = value
+    values[outside] = nearest
+    return values, outside
 
 
 def polynomial_interpolation(
@@ -203,7 +310,7 @@ def interpolate_to_image(
     data: tuple[np.ndarray, np.ndarray, np.ndarray],
     image: darsia.Image,
     method: Literal[
-        "rbf", "polynomial", "linear", "quadratic", "cubic", "quartic"
+        "rbf", "polynomial", "linear", "quadratic", "cubic", "quartic", "triangulation"
     ] = "rbf",
 ) -> darsia.Image:
     """Interpolate data to image.
@@ -229,6 +336,10 @@ def interpolate_to_image(
 
         - "quartic": Quartic interpolation.
 
+        - "triangulation": Linear on the Delaunay triangles of the measurements,
+          the nearest measurement outside their convex hull
+          (:func:`interpolate_linear_in_hull`).
+
     Returns
     -------
     darsia.Image
@@ -252,6 +363,13 @@ def interpolate_to_image(
             data,
             interpolated_image.coordinatesystem,
         )
+    elif method.lower() == "triangulation":
+        # Linear inside the measurements' convex hull, the nearest one outside.
+        Ny, Nx = interpolated_image.coordinatesystem.shape
+        values, _ = interpolate_linear_in_hull(
+            data, interpolated_image.coordinatesystem.coordinates
+        )
+        interpolated_image.img = values.reshape((Ny, Nx), order="F")
     elif method.lower() == "illumination":
         # Define array through polynomial interpolation
         interpolated_image.img = illumination_interpolation(
@@ -284,7 +402,7 @@ def interpolate_to_image_from_csv(
     key: str,
     image: darsia.Image,
     method: Literal[
-        "rbf", "polynomial", "linear", "quadratic", "cubic", "quartic"
+        "rbf", "polynomial", "linear", "quadratic", "cubic", "quartic", "triangulation"
     ] = "rbf",
 ) -> darsia.Image:
     """Interpolate data from CSV to image.
@@ -311,6 +429,10 @@ def interpolate_to_image_from_csv(
         - "cubic": Cubic interpolation.
 
         - "quartic": Quartic interpolation.
+
+        - "triangulation": Linear on the Delaunay triangles of the measurements,
+          the nearest measurement outside their convex hull
+          (:func:`interpolate_linear_in_hull`).
 
     Returns
     -------
