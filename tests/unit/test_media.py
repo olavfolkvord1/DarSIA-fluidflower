@@ -15,6 +15,13 @@ from darsia.presets.workflows.media.display_mean import (
     pooled_mean,
     shown_values,
 )
+from darsia.presets.workflows.media.films import (
+    DEPTH_NOTE,
+    FilmSettings,
+    film_targets,
+    tile_at,
+    write_films,
+)
 from darsia.presets.workflows.media.layouts import (
     SEPARATOR,
     compose_grid,
@@ -475,3 +482,76 @@ def test_a_film_is_refused_unless_it_decodes_to_the_frames_written(tmp_path):
     lossy.count = 2
     with pytest.raises(ValueError, match="2 frames"):
         lossy.close()
+
+
+def test_a_panel_without_a_tile_at_a_target_holds_its_last_earlier_tile():
+    """The tile of the target; else the last earlier one, held; else none."""
+    rows = [dict(target_h=1.0), dict(target_h=2.0), dict(target_h=None)]
+
+    assert tile_at(rows, 2.0) == (rows[1], False)
+    assert tile_at(rows, 3.5) == (rows[1], True)
+    assert tile_at(rows, 0.5) == (None, True)
+    assert film_targets([rows, [dict(target_h=0.5)]]) == [0.5, 1.0, 2.0]
+
+
+def saved_tiles(folder, colour, targets, drawn):
+    """Tiles of one colour saved at the targets, drawn as ``drawn`` says, as their
+    read-back rows."""
+    rows = [
+        save_tile(
+            folder,
+            Frame(f"c-{n}", t + 0.01, t, (61, 112), (0, 0, 112, 61)),
+            solid(colour)[..., ::-1],
+            drawn,
+        )
+        for n, t in enumerate(targets)
+    ]
+    write_tile_index(folder, rows)
+    return read_tile_index(folder)
+
+
+def test_pyramid_and_grid_films_from_saved_tiles(tmp_path):
+    """A run's pyramid and a grid of runs: one frame per target of any tile, a panel
+    without a tile at a target held, the depth-scaled maps' window in the caption,
+    the film decoded and its last frame saved, named by its setting and never over
+    another film."""
+    panels = (
+        Panel("graph", "Mass graph", "none"),
+        Panel("image", "Corrected image", "none"),
+        Panel("total_mass", "Total CO₂ mass", "depth"),
+    )
+    depth = dict(display_mean="depth", window_px=7)
+    tiles = [
+        saved_tiles(tmp_path / name, colour, targets, drawn)
+        for name, colour, targets, drawn in (
+            ("graph", (90, 90, 90), (1.0, 2.0, 3.0), dict(label_room=False)),
+            ("image", (40, 80, 120), (1.0, 3.0), {}),
+            ("map", (120, 40, 80), (1.0, 2.0, 3.0), dict(depth, window_mm=6.04)),
+            ("map10", (80, 120, 40), (1.0, 3.0), dict(depth, window_mm=6.26)),
+        )
+    ]
+    options = dict(tile_settings=SMALL, unit="g/L", style=STYLE)
+    film = FilmSettings("film", "pyramid", panels, (640, 360), **VIDEO, note="maps")
+    (record,) = write_films({"r1": tiles[:3]}, tmp_path, film=film, **options)
+
+    assert (record["movie"], record["figure"]) == ("film_r1.mp4", "film_r1.png")
+    assert record["frames"][0]["note"] == "maps; " + DEPTH_NOTE.format("6.0 mm")
+    assert [frame["target_h"] for frame in record["frames"]] == [1.0, 2.0, 3.0]
+    assert [panel["held"] for panel in record["frames"][1]["panels"]] == [
+        False,
+        True,
+        False,
+    ]
+    assert record["frames"][1]["panels"][1]["case_id"] == "c-0"
+    assert record["decoded_frames"] == 3
+    assert cv2.imread(str(tmp_path / record["figure"])).shape == (360, 640, 3)
+
+    grid = FilmSettings("grid", "grid", panels[2:], (640, 360), **VIDEO, note="maps")
+    runs = {"r10": [tiles[3]], "r9": [tiles[2]]}
+    (record,) = write_films(runs, tmp_path, film=grid, **options)
+    assert list(record["frames"][1]["runs"]) == ["r9", "r10"]
+    assert record["frames"][1]["runs"]["r10"]["held"] is True
+    assert record["frames"][1]["note"].endswith(DEPTH_NOTE.format("6.0 to 6.3 mm"))
+    assert record["decoded_frames"] == 3 and record["movie"] == "grid.mp4"
+    with pytest.raises(FileExistsError):
+        write_films(runs, tmp_path, film=grid, **options)
