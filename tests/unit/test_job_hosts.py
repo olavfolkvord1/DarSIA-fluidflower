@@ -31,6 +31,7 @@ from tests.unit.test_jobs import (
     _files,
     _numbers,
     _project,
+    _stored,
     _write,
     read_values,
 )
@@ -737,11 +738,7 @@ def hosts(tmp_path, monkeypatch, importable):  # noqa: F811
     monkeypatch.setattr(results, "STALE", 20.0)
     yield tmp_path
     for process in made:
-        if process.poll() is None:
-            for child in psutil.Process(process.pid).children(recursive=True):
-                child.kill()
-            process.kill()
-            process.wait(30)
+        _end(process)
 
 
 @contextlib.contextmanager
@@ -1045,3 +1042,83 @@ def test_a_folder_out_of_reach_is_not_settled(tmp_path, monkeypatch):
     monkeypatch.setattr(results, "RETRY_DELAYS", (0.05, 0.1, 0.2))
     with _share_out(jobs):
         assert not service.settled(jobs)
+
+
+def _end(process):
+    """End a process this test started, with the processes it started, if it
+    still runs."""
+    if process.poll() is not None:
+        return
+    try:
+        for child in psutil.Process(process.pid).children(recursive=True):
+            child.kill()
+    except psutil.NoSuchProcess:
+        pass
+    process.kill()
+    process.wait(30)
+
+
+def _record(jobs, machine):
+    """A host's record, read again while its service rewrites it in place."""
+    for _ in range(50):
+        try:
+            return queue.read_marker(service.machine_files(jobs, machine)[0])
+        except ValueError:
+            time.sleep(0.05)
+    raise AssertionError(f"The record of {machine} does not read whole")
+
+
+def _serving(jobs, tmp_path, machine):
+    """A host's service as its own process, with its own lock file and its output
+    in ``<machine>.out``, until every job is settled."""
+    command = [sys.executable, "-m", "darsia.jobs", "serve", str(jobs), "--machine"]
+    command += [machine, "--lock", str(tmp_path / f"{machine}.lock"), "--logs"]
+    command += [str(tmp_path / "logs"), "--poll", "0.2", "--threads", "1"]
+    with open(tmp_path / f"{machine}.out", "wb") as output:
+        return subprocess.Popen(
+            command + ["--until-settled"], stdout=output, stderr=subprocess.STDOUT
+        )
+
+
+def test_an_idle_host_takes_another_jobs_ready_tasks(
+    tmp_path, importable  # noqa: F811
+):
+    """Two hosts' services, each a process with its own lock file and name: while
+    the second host runs the older job's only ready task, which the rest of that
+    job waits for, the idle first host runs every task of a younger job, each in
+    that job's own environment. Then both jobs complete."""
+    jobs = tmp_path / "jobs"
+    older = _lingering_job(tmp_path / "older", jobs, (LINGERING, GATHERED))
+    config, selection = _project(tmp_path / "younger", kernel="SandyBridge")
+    runs = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    services = [_serving(jobs, tmp_path, "two")]
+    try:
+        _until(lambda: _beat(older, "lingering.r2.0000") >= 1)
+        younger = create_job(jobs, (NUMBERS,), runs, config)
+        services.append(_serving(jobs, tmp_path, "one"))
+        _until(lambda: not queue.waiting(younger), 240)
+        made = queue.markers(younger, queue.DONE)
+        for task, token in made.items():
+            marker = queue.read_marker(younger / queue.DONE / f"{task}.{token}")
+            assert marker["machine"] == "one"
+        assert set(made) == {"numbers.r1.0000", "numbers.r1.0001"}
+        claimed = queue.markers(older, queue.CLAIMED)
+        assert set(claimed) == {"lingering.r2.0000"}
+        lease = queue.lease(older, "lingering.r2.0000", claimed["lingering.r2.0000"])
+        assert lease["machine"] == "two"
+        record = _record(jobs, "two")
+        assert [live["task"] for live in record["live"]] == ["lingering.r2.0000"]
+        stored = _stored(tmp_path / "younger" / "project", "numbers/r1/day1/r1-00.npz")
+        assert stored[0]["environment"]["blas_kernel"] == "SandyBridge"
+        (tmp_path / "older" / "project" / "linger").unlink()
+        for machine, process in zip(("two", "one"), services):
+            output = (tmp_path / f"{machine}.out").read_text(errors="replace")
+            assert process.wait(240) == 0, output[-3000:]
+        assert set(queue.markers(older, queue.DONE)) == {
+            "lingering.r2.0000",
+            "gathered.r2",
+        }
+    finally:  # a lingering task ends by itself, also if its service died
+        (tmp_path / "older" / "project" / "linger").unlink(missing_ok=True)
+        for process in services:
+            _end(process)
