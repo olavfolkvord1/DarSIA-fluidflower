@@ -48,6 +48,7 @@ MODULES = [
     "darsia/corrections/shape/cameralens.py",
     "darsia/corrections/shape/radiallens.py",
     "darsia/corrections/shape/lens.py",
+    "darsia/corrections/shape/frameregistration.py",
     "darsia/presets/workflows/setup/sand_map.py",
     "darsia/presets/workflows/setup/setup_sand_map.py",
     "darsia/multiphase/phase_training.py",
