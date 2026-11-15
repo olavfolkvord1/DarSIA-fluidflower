@@ -35,10 +35,45 @@ def setup_facies(cls: Rig, path: Path, show: bool = False):
     labels = darsia.imread(config.labeling.labels)
 
     # ! ---- CONNECT LABELS TO FACIES ----
+    facies = make_facies(config, labels)
+
+    # ! ---- SAVE FACIES ----
+    facies.save(config.facies.path)
+    save_discrete_map_illustration(
+        facies.img,
+        config.facies.path.with_suffix(".jpg"),
+        title="Facies",
+        colorbar_label="Facies id",
+    )
+    if show:
+        facies.show(title="Facies")
+
+
+def make_facies(config: FluidFlowerConfig, labels: darsia.Image) -> darsia.Image:
+    """The facies of a run's labels, without storing them.
+
+    The facies :func:`setup_facies` stores and the Setup's rig step gives the rig:
+    each label takes the facies of its group in ``[facies]``, and a label of no
+    group is a facies of its own id.
+
+    Parameters
+    ----------
+    config : FluidFlowerConfig
+        The configuration, with [facies].
+    labels : darsia.Image
+        The labels, e.g. the run's sand map.
+
+    Returns
+    -------
+    darsia.Image
+        The facies, on the labels' grid.
+
+    """
+    assert config.facies is not None
 
     # Read facies groups from config
     all_label_ids = set(np.unique(labels.img))
-    label_to_facies_map = config.facies.label_to_facies_map
+    label_to_facies_map = dict(config.facies.label_to_facies_map)
 
     # Fill in missing labels with canonical facies ids.
     for label_id in all_label_ids:
@@ -58,14 +93,4 @@ def setup_facies(cls: Rig, path: Path, show: bool = False):
         assert (
             facies_id in facies_ids
         ), f"Facies id {facies_id} not found in facies properties."
-
-    # ! ---- SAVE FACIES ----
-    facies.save(config.facies.path)
-    save_discrete_map_illustration(
-        facies.img,
-        config.facies.path.with_suffix(".jpg"),
-        title="Facies",
-        colorbar_label="Facies id",
-    )
-    if show:
-        facies.show(title="Facies")
+    return facies
