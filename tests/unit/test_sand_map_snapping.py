@@ -6,6 +6,7 @@ import pytest
 from darsia.presets.workflows.setup.sand_map import SandMapDrawing, partition_faults
 from darsia.presets.workflows.setup.sand_map_snapping import (
     SandMapSnapSettings,
+    link_boundaries,
     snap_to_frame,
 )
 
@@ -107,11 +108,79 @@ def test_a_boundary_near_another_does_not_reach_the_frame():
         assert moves == [] and np.array_equal(snapped.anchors, drawing.anchors)
 
 
-def test_snapping_needs_the_frame():
+def _split() -> SandMapDrawing:
+    """The rig split into two layers along a zigzag of shared anchors."""
+    anchors = [[0, 0], [WIDTH, 0], [WIDTH, HEIGHT], [0, HEIGHT]]
+    anchors += [[0.13, 0.02], [0.17, 0.12], [0.27, 0.09], [0.31, 0.19]]
+    polygons = ((1, (0, 4, 5, 6, 7, 2, 3)), (2, (0, 1, 2, 7, 6, 5, 4)))
+    return SandMapDrawing(np.array(anchors), polygons, frame=(WIDTH, HEIGHT))
+
+
+def test_near_boundaries_link_through_shared_anchors():
+    """The lower layer's own anchors near the upper layer's boundary join it, at
+    its anchors or on its edges, and the drawing becomes a closed partition; a
+    boundary farther than the distance stays."""
+    split = _split()
+    anchors = np.vstack(
+        [split.anchors, [[0.17, 0.1997], [0.2702, 0.0902], [0.29, 0.1401]]]
+    )
+    anchors[8] = [0.17, 0.1197]
+    lower = (2, (0, 1, 2, 7, 10, 9, 8, 4))
+    drawing = SandMapDrawing(anchors, (split.polygons[0], lower), frame=split.frame)
+    assert {fault.kind for fault in partition_faults(drawing)} >= {"gap", "overlap"}
+
+    linked, moves = link_boundaries(drawing, SandMapSnapSettings(6.0, 0.5))
+    assert partition_faults(linked) == []
+    assert {move.anchor: move.joined for move in moves} == {
+        5: 8,
+        6: None,
+        9: None,
+        10: None,
+    }
+    for move in moves:
+        assert np.hypot(*np.subtract(move.end, move.start)) <= 5e-4
+    (_layer, upper), (_layer, lower) = linked.polygons
+    assert set(upper) & set(lower) == {0, 2, 4, 6, 7, 8, 9, 10}
+
+    kept, moves = link_boundaries(drawing, SandMapSnapSettings(6.0, 0.25))
+    assert 5 not in {move.anchor for move in moves}
+    assert [fault.kind for fault in partition_faults(kept)] == ["gap"]
+
+
+def test_a_crack_in_one_polygon_is_not_a_boundary_to_link():
+    """Both sides of a crack in one polygon are its own, so nothing joins them."""
+    anchors = [[0, 0], [0.2, 0], [0.2, 0.05], [0.2, 0.1], [0.2002, 0.1]]
+    anchors += [[0.2002, 0], [WIDTH, 0], [WIDTH, HEIGHT], [0, HEIGHT]]
+    cracked = SandMapDrawing(
+        np.array(anchors), ((1, tuple(range(9))),), frame=(WIDTH, HEIGHT)
+    )
+    assert [fault.kind for fault in partition_faults(cracked)] == ["gap"]
+    linked, moves = link_boundaries(cracked, SandMapSnapSettings(6.0, 0.5))
+    assert moves == [] and linked.polygons == cracked.polygons
+
+
+def test_a_boundary_through_a_neighbours_edge_is_linked_without_moving():
+    """An anchor lying on a neighbour's edge is added to that edge, unmoved; only
+    the anchors given may join."""
+    anchors = np.array(
+        [[0, 0], [WIDTH, 0], [WIDTH, 0.1], [0, 0.1], [WIDTH, HEIGHT], [0, HEIGHT]]
+        + [[0.2, 0.1]]
+    )
+    halves = ((1, (3, 6, 2, 4, 5)), (2, (0, 1, 2, 3)))
+    drawing = SandMapDrawing(anchors, halves, frame=(WIDTH, HEIGHT))
+    linked, moves = link_boundaries(drawing, SandMapSnapSettings(6.0, 0.5))
+    assert [(move.anchor, move.start, move.end) for move in moves] == [
+        (6, (0.2, 0.1), (0.2, 0.1))
+    ]
+    assert linked.polygons[1] == (2, (0, 1, 2, 6, 3))
+    assert partition_faults(linked) == []
+    same, moves = link_boundaries(drawing, SandMapSnapSettings(6.0, 0.5), anchors=[2])
+    assert moves == [] and same.polygons == drawing.polygons
+
+
+@pytest.mark.parametrize("helper", [snap_to_frame, link_boundaries])
+def test_snapping_needs_the_frame(helper):
     """Without a frame there is nothing to snap to."""
-    drawing = _short_of_the_frame()
+    drawing = SandMapDrawing(_split().anchors, _split().polygons)
     with pytest.raises(ValueError, match="frame"):
-        snap_to_frame(
-            SandMapDrawing(drawing.anchors, drawing.polygons),
-            SandMapSnapSettings(6.0, 0.5),
-        )
+        helper(drawing, SandMapSnapSettings(6.0, 0.5))
