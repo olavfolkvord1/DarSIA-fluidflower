@@ -138,7 +138,9 @@ def _domain_mass(ctx: StepContext) -> None:
         AnalysisDomain(domain_id=name, **settings.domains[name])
         for name in ctx.selection.domains
     ]
-    sums = DomainMass(domains, grid.geometry, grid.rig.labels, settings.sand_labels)
+    sums = DomainMass(
+        domains, grid.geometry, grid.rig.labels, settings.sand_labels, grid.positions
+    )
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     rows = []
     for frame in ctx.task.frames:

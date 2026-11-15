@@ -98,6 +98,7 @@ class DomainMass:
         geometry: RunGeometry,
         sand_map: darsia.Image,
         sand_labels: Sequence[int] = (),
+        positions: darsia.GridPositions | None = None,
     ) -> None:
         """Set up the domains of a run.
 
@@ -112,6 +113,10 @@ class DomainMass:
             name and whose coordinates the boxes read.
         sand_labels : sequence of int, optional
             The labels of the sand layers, which a domain of the sand reads.
+        positions : darsia.GridPositions, optional
+            Each pixel's position on the rig, which the boxes and the centres of
+            mass read; by default the sand map's pixel centres
+            (:func:`darsia.grid_positions`).
 
         """
         ids = [domain.domain_id for domain in domains]
@@ -120,7 +125,11 @@ class DomainMass:
         self.domains = list(domains)
         """The domains, in the order of the rows."""
         self._shape = geometry.domain.shape
-        self._x, self._y = darsia.pixel_centres(sand_map)
+        if positions is None:
+            positions = darsia.grid_positions(sand_map)
+        self._x, self._y = (
+            np.asarray(v, np.float64).ravel() for v in (positions.x, positions.y)
+        )
         volume = np.asarray(geometry.pore_volume_m3, np.float64).ravel() * 1000
         self._volume_l = np.where(volume > 0, volume, 0.0)
         self._no_volume = ~(volume > 0)
@@ -128,7 +137,7 @@ class DomainMass:
         self._pixels = [
             np.flatnonzero(
                 geometry.domain
-                & domain_pixels(domain, sand_map, sand_map.img, sand_labels)
+                & domain_pixels(domain, sand_map, sand_map.img, sand_labels, positions)
             )
             for domain in self.domains
         ]
@@ -192,8 +201,7 @@ class DomainMass:
                 area_m2=area,
                 pore_volume_l=volume,
             )
-            x = self._x[pixels % self._shape[1]]
-            y = self._y[pixels // self._shape[1]]
+            x, y = self._x[pixels], self._y[pixels]
             for key, values in grams.items():
                 amount = float(values[pixels].sum())
                 row[key + "_mass_g"] = amount if complete else None
