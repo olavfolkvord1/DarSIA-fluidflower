@@ -1,7 +1,10 @@
-"""Tests of the job engine on several hosts: admission by threads and memory."""
+"""Tests of the job engine on several hosts: admission by threads and memory, and
+the hosts' records and requests."""
 
 import errno
+import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -11,6 +14,7 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import queue, service
 from darsia.jobs.job import Sizes, create_job, read_job, task_bytes
 from darsia.jobs.step import Memory, Order, Scope, Selection, Step
@@ -272,7 +276,8 @@ def test_a_survivor_reserves_its_threads_and_bytes(tmp_path, monkeypatch, starte
     threads and declared bytes, before it starts any other."""
     job = _job(tmp_path, (HEAVY,), runs=("r1",))
     claim = queue.claim(job, "heavy.r1.0000", "here")
-    queue.beat(claim, 1, psutil.Process().pid, psutil.Process().create_time())
+    process, host = psutil.Process(), service.host_identity()
+    queue.beat(claim, 1, process.pid, process.create_time(), host)
     monkeypatch.setattr(service.Live, "resident", lambda live: 0)
     running, memory = _service(tmp_path, monkeypatch, free=8 * GIB)
     running.poll()
@@ -313,7 +318,8 @@ def test_a_restarted_service_admits_nothing_before_it_has_counted_its_survivors(
     leaves no room."""
     older = _job(tmp_path, (LIGHT,), runs=("r2",), name="older")
     claim = queue.claim(older, "light.r2.0000", "here")
-    queue.beat(claim, 1, psutil.Process().pid, psutil.Process().create_time())
+    process, host = psutil.Process(), service.host_identity()
+    queue.beat(claim, 1, process.pid, process.create_time(), host)
     _job(tmp_path, (LIGHT,), runs=("r2",), name="younger")
     running, _ = _service(tmp_path, monkeypatch, threads=1)
     monkeypatch.setattr(results, "GRACE", 0.2)
@@ -420,3 +426,226 @@ def test_a_task_reserves_its_process_beside_its_arrays(tmp_path, monkeypatch, st
     running.poll()
     ((_, live),) = running.live.items()
     assert live.bytes == service.PROCESS
+
+
+def test_a_host_record_shows_its_live_tasks_and_why(tmp_path, monkeypatch, started):
+    """A host's record holds its live tasks with the threads and bytes they
+    reserve, its free memory, its reserve, its request and why it took no more."""
+    job = _job(tmp_path, (HEAVY,), runs=("r1",))
+    running, _ = _service(tmp_path, monkeypatch, free=6 * GIB)
+    running.poll()
+    record = json.loads(service.machine_files(job.parent, "here")[0].read_text())
+    assert record["token"] == running.token and record["request"] == "auto"
+    assert (record["headroom"], record["reserve"], record["threads"]) == (
+        6 * GIB,
+        GIB,
+        4,
+    )
+    task = {"job": job.name, "task": "heavy.r1.0000", "threads": 1, "bytes": 4 * GIB}
+    assert record["live"] == [{**task, "resident": 0, "backend": "cpu"}]
+    assert record["reason"] == (
+        f"Task heavy.r1.0001 of job {job.name} waits: it needs 4.00 GiB; 6.00 GiB "
+        "free less the reserve 1.00 GiB and 4.00 GiB the live tasks may still take "
+        "leave 1.00 GiB."
+    )
+
+
+def test_a_request_caps_the_host_and_zero_takes_no_new_tasks(
+    tmp_path, monkeypatch, started, capsys
+):
+    """A host's request of a number of tasks caps it, 0 takes no new tasks, and a
+    request file that holds no request keeps the last, said once."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r1", "r2"))
+    running, _ = _service(tmp_path, monkeypatch)
+    assert jobs_main.main(["request", str(jobs), "1", "--machine", "here"]) == 0
+    running.poll()
+    assert (
+        len(started) == 1 and "the request caps the host at 1 tasks" in running.reason
+    )
+    service.write_request(jobs, "here", 0)
+    started[0].end()
+    running.poll()
+    assert len(started) == 1
+    assert running.reason == "It takes no new tasks: its request is 0."
+    with pytest.raises(ValueError, match="not -1"):
+        service.write_request(jobs, "here", -1)
+    service.machine_files(jobs, "here")[1].write_text('"many"\n')  # edited by hand
+    capsys.readouterr()
+    running.poll()
+    running.poll()
+    assert running.request == 0 and len(started) == 1
+    assert capsys.readouterr().out.count("here keeps its request 0") == 1
+    service.write_request(jobs, "here", "auto")
+    running.poll()
+    assert len(started) == 3
+
+
+def test_the_record_of_another_service_fences_the_host(
+    tmp_path, monkeypatch, started, capsys
+):
+    """A host's record written by another service of the host's name keeps this
+    service from counting the host's claims and taking tasks until the record
+    stays unchanged for STALE; then it is taken over. A record taken by another
+    stops this service again; an earlier service of this host that is gone is
+    taken over at once, but not one of another machine of the same network
+    name; an empty record is nobody's."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r2",))
+    path = service.machine_files(jobs, "here")[0]
+    path.parent.mkdir()
+    other = {"token": "0123456789abcdef", "host": "elsewhere", "pid": 8, "birth": 1.0}
+    path.write_text(json.dumps(other) + "\n")
+    monkeypatch.setattr(results, "STALE", 0.5)
+    running, _ = _service(tmp_path, monkeypatch)
+    running.poll()
+    assert not started and not running.held
+    assert "written by another service (host elsewhere, process 8)" in running.reason
+    path.write_text(json.dumps({**other, "time": 1.0}) + "\n")  # it writes again
+    time.sleep(0.3)
+    running.poll()
+    time.sleep(0.3)
+    running.poll()
+    assert not started  # unchanged for 0.3 s only
+    time.sleep(0.3)
+    running.poll()
+    assert len(started) == 1 and running.held
+    assert json.loads(path.read_text())["token"] == running.token
+    taken = {**other, "token": "fedcba9876543210", "time": 2.0}
+    path.write_text(json.dumps(taken) + "\n")
+    capsys.readouterr()
+    running.poll()
+    assert not running.held
+    assert capsys.readouterr().out.count("here takes no tasks: The record") == 1
+    earlier = {**other, "host": service.host_identity(), "pid": 999_999}
+    path.write_text(json.dumps(earlier) + "\n")
+    again = service.Service(jobs, "here", 4, tmp_path / "logs")
+    again.poll()
+    assert again.held
+    assert json.loads(path.read_text())["token"] == again.token
+    assert service.host_identity().startswith(f"{socket.gethostname()}/")
+    clone = f"{socket.gethostname()}/another-machine-id"
+    path.write_text(json.dumps({**earlier, "host": clone}) + "\n")
+    third = service.Service(jobs, "here", 4, tmp_path / "logs")
+    third.poll()
+    assert not third.held and f"(host {clone}, process 999999)" in third.reason
+    path.write_bytes(b"")  # a record whose creator could not write it
+    fourth = service.Service(jobs, "here", 4, tmp_path / "logs")
+    fourth.poll()
+    assert fourth.held
+
+
+def test_a_takeover_leaves_another_hosts_claims_to_their_leases(
+    tmp_path, monkeypatch, started
+):
+    """A service that takes over the record of another machine under its name
+    counts and returns only the claims of its own machine: another machine's
+    claim, whose process it cannot look at, is taken back only once its lease is
+    stale."""
+    jobs = tmp_path / "jobs"
+    job = _job(tmp_path, (LIGHT,), runs=("r2",))
+    claim = queue.claim(job, "light.r2.0000", "here", "elsewhere/another-machine")
+    queue.beat(claim, 1, 999_999, 1.0, "elsewhere/another-machine")
+    path = service.machine_files(jobs, "here")[0]
+    path.parent.mkdir()
+    other = {"token": "0123456789abcdef", "host": "elsewhere/another-machine"}
+    path.write_text(json.dumps({**other, "pid": 999_999, "birth": 1.0}) + "\n")
+    monkeypatch.setattr(results, "STALE", 0.3)
+    running, _ = _service(tmp_path, monkeypatch, threads=1)
+    running.poll()
+    time.sleep(0.4)
+    queue.beat(claim, 2, 999_999, 1.0, "elsewhere/another-machine")  # it beats on
+    running.poll()
+    assert running.held and results.exists(claim.path) and not running.live
+    time.sleep(0.4)  # its lease now stays unchanged for STALE
+    running.poll()
+    running.poll()
+    assert not results.exists(claim.path) and len(started) == 1
+
+
+def test_a_service_that_lost_its_record_while_paused_does_not_write_it(
+    tmp_path, monkeypatch, started
+):
+    """A service paused between its look at its host's record and its write finds
+    the record taken over by another when it writes: it writes nothing, takes no
+    tasks from then on, and the other keeps the record and its task."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r1", "r2"))
+    first, _ = _service(tmp_path, monkeypatch, threads=1)
+    first._identity["host"] = "first/machine"
+    first.poll()
+    second = service.Service(jobs, "here", 1, tmp_path / "logs-second")
+    second._identity["host"] = "second/machine"
+    monkeypatch.setattr(results, "STALE", 0.3)
+    second.poll()
+    first.held = False
+    first._hold()  # the first service looks, and is paused
+    assert first.held
+    time.sleep(0.4)
+    second.poll()
+    assert second.held and len(second.live) == 1
+    first._record()  # it goes on with the round
+    assert not first.held and "Another service wrote the record" in first.reason
+    found = queue.read_marker(service.machine_files(jobs, "here")[0])
+    assert found["token"] == second.token
+    second.poll()
+    assert second.held and all(results.exists(p) for p in second.live)
+
+
+def test_a_claim_whose_process_never_started_is_returned_by_the_next_service(
+    tmp_path, monkeypatch, started
+):
+    """A service that ends between a claim and its task's process leaves a claim
+    naming its machine and no process; the next service of the machine returns it
+    at once."""
+    jobs = tmp_path / "jobs"
+    job = _job(tmp_path, (LIGHT,), runs=("r2",))
+    first, _ = _service(tmp_path, monkeypatch, threads=1)
+    first._identity["pid"] = 999_999  # it ended, as its record will say
+    monkeypatch.setattr(first, "_start", lambda *args: None)  # it ends at the start
+    first.poll()
+    assert set(queue.markers(job, queue.CLAIMED)) == {"light.r2.0000"}
+    again = service.Service(jobs, "here", 0, tmp_path / "logs")
+    again.poll()
+    assert again.held and set(queue.markers(job, queue.QUEUE)) == {"light.r2.0000"}
+
+
+def test_a_record_that_cannot_be_read_takes_no_new_task(tmp_path, monkeypatch, started):
+    """A service that held its host's record and cannot read it now keeps its
+    live tasks but takes no new task in that round."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r1", "r2"))
+    running, _ = _service(tmp_path, monkeypatch, threads=1)
+    running.poll()
+    assert running.held and len(started) == 1
+    started[0].end()
+    path = service.machine_files(jobs, "here")[0]
+    path.write_bytes(path.read_bytes()[:-1])  # it reads short
+    running.poll()
+    assert not running.held and len(started) == 1
+
+
+def test_a_request_not_read_yet_takes_no_new_tasks(tmp_path, monkeypatch, started):
+    """A service whose first look at its host's request cannot read it takes no
+    new tasks, never taking it for «auto», until the request reads."""
+    jobs = tmp_path / "jobs"
+    _job(tmp_path, (LIGHT,), runs=("r2",))
+    service.write_request(jobs, "here", 0)
+    service.machine_files(jobs, "here")[1].write_text('"none"\n')  # edited by hand
+    running, _ = _service(tmp_path, monkeypatch, threads=1)
+    running.poll()
+    assert running.request is None and not started
+    assert running.reason == "It takes no new tasks: its request is not read yet."
+    service.write_request(jobs, "here", "auto")
+    running.poll()
+    assert len(started) == 1
+
+
+@pytest.mark.parametrize("value", ["AUTO", "1.5", "many"])
+def test_the_request_command_refuses_what_is_no_request(tmp_path, capsys, value):
+    """The request command says what a request is, and sets none, when given
+    something else."""
+    jobs = tmp_path / "jobs"
+    assert jobs_main.main(["request", str(jobs), value, "--machine", "here"]) == 2
+    assert f"or a number of tasks, not {value!r}" in capsys.readouterr().out
+    assert not service.machine_files(jobs, "here")[1].exists()

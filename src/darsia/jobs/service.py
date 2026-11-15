@@ -21,6 +21,17 @@ says why. Every :data:`POLL` seconds the service
   most the host's, and the task's declared bytes are at most the memory free now,
   less the reserve, less what the live tasks may still take.
 
+Each round it also reads its host's request (``machines/<machine>.request.json``,
+:func:`write_request`): :data:`AUTO`, or at most a number of tasks, 0 taking no new
+ones; a request that cannot be read now keeps the last. It writes its host's
+record (``machines/<machine>.json``): the live tasks with the threads and bytes
+they reserve, the free memory, the reserve and why it took no more tasks. The
+record is created once, never onto another's, and rewritten in place by the one
+service whose token it names; a service that finds another's token in it counts no
+claims of the host and takes no tasks until that record stays unchanged for
+:data:`darsia.utils.results.STALE`, unless that service was of this host and is
+gone.
+
 Each part of a round that cannot read the jobs folder now, e.g. a job's file read
 short over the share, says why and is tried again in the next round.
 
@@ -43,6 +54,7 @@ host, and its traceback into its failed marker.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import socket
 import subprocess
@@ -52,7 +64,7 @@ from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep, time
 
 import psutil
 
@@ -69,6 +81,10 @@ try:
     import fcntl
 except ImportError:  # Windows
     fcntl = None
+try:
+    import winreg
+except ImportError:  # POSIX
+    winreg = None
 
 POLL = 5.0
 """Seconds between two rounds of the service."""
@@ -92,8 +108,116 @@ PROCESS = 300 * 2**20
 interpreter with NumPy, OpenCV and DarSIA loaded, measured at about 0.3 GiB."""
 
 
+MACHINES = "machines"
+"""The folder of the hosts' records and requests, in the jobs folder."""
+
+
 class ServiceRunning(RuntimeError):
     """Another service holds this host's lock."""
+
+
+def host_identity() -> str:
+    """This machine's identity: its network name and its machine id (Windows'
+    ``MachineGuid``, else ``/etc/machine-id``; else its boot time), so that two
+    machines of one network name, e.g. cloned images, differ, while a machine is
+    the same one after a restart. A lease and a host's record name it."""
+    machine = None
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                machine = str(winreg.QueryValueEx(key, "MachineGuid")[0])
+        except OSError:
+            pass
+    for path in () if machine else ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            machine = Path(path).read_text(encoding="ascii").strip() or None
+        except OSError:
+            continue
+        if machine:
+            break
+    return f"{socket.gethostname()}/{machine or f'boot {int(psutil.boot_time())}'}"
+
+
+def machine_files(jobs: Path, machine: str) -> tuple[Path, Path]:
+    """A host's record (``machines/<machine>.json``), which its service writes
+    every round, and its request (``machines/<machine>.request.json``), which the
+    Jobs page writes."""
+    folder = Path(jobs) / MACHINES
+    return folder / f"{machine}.json", folder / f"{machine}.request.json"
+
+
+def _request(value) -> int | str:
+    """A request checked: :data:`AUTO`, or a number of tasks of at least 0.
+
+    Raises
+    ------
+    ValueError
+        If it is neither.
+
+    """
+    if value == AUTO or (type(value) is int and value >= 0):
+        return value
+    raise ValueError(
+        f"A host's request is {AUTO!r} or a number of tasks, not {value!r}."
+    )
+
+
+def _record_of(raw: bytes) -> dict:
+    """A host's record from its bytes; empty when they hold no record."""
+    try:
+        found = json.loads(raw)
+    except ValueError:
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def write_request(jobs: Path, machine: str, request: int | str) -> None:
+    """Set a host's request, e.g. from the Jobs page: :data:`AUTO` takes as many
+    tasks as the host's threads and memory admit, a number at most that many, and 0
+    no new tasks, so that the host drains. Its service reads it every round.
+
+    Parameters
+    ----------
+    jobs : Path
+        The jobs folder.
+    machine : str
+        The host's name.
+    request : int or str
+        :data:`AUTO`, or a number of tasks.
+
+    Raises
+    ------
+    ValueError
+        If the request is neither.
+
+    """
+    text = json.dumps(_request(request)) + "\n"
+    path = machine_files(jobs, machine)[1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    results.retry_transient(lambda: path.write_text(text, encoding="utf-8"))
+
+
+def read_request(jobs: Path, machine: str) -> int | str:
+    """A host's request (:func:`write_request`); :data:`AUTO` when none is set.
+
+    Raises
+    ------
+    ValueError
+        If the file holds no request.
+    OSError
+        If it cannot be read now, e.g. the share is out or the file reads short
+        twice (:class:`darsia.utils.results.Unavailable`).
+
+    """
+    try:
+        return _request(queue.read_json(machine_files(jobs, machine)[1]))
+    except FileNotFoundError:
+        return AUTO
 
 
 def say(text: str, log: Path | None = None) -> None:
@@ -510,8 +634,9 @@ class Service:
         """Local folder of the tasks' output."""
         self.revision = revision()
         """The code's revision of this service, when it started."""
-        self.request: int | str = AUTO
-        """The host's request: :data:`AUTO`, or at most this many tasks."""
+        self.request: int | str | None = None
+        """The host's request: :data:`AUTO`, or at most this many tasks; None
+        until it has been read once."""
         self.reason = ""
         """Why the host took no more tasks in its last round."""
         self.live: dict[Path, Live] = {}
@@ -520,6 +645,12 @@ class Service:
         """Jobs this service takes no tasks of, and why."""
         self.exits: dict[tuple[str, str], int] = {}
         """Exits without a mark, by job and task."""
+        self.token = queue.new_token()
+        """This service's token in its host's record."""
+        self.held = False
+        """Whether this service holds its host's record in this round
+        (:meth:`_hold`): only then does it count the host's claims, take tasks and
+        write the record."""
         self._seen: dict[str, tuple[bytes, float]] = {}
         self._records: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
@@ -527,6 +658,153 @@ class Service:
         self._passed: set[tuple[str, str]] = set()
         self._unknown: set[str] = set()
         self._uncounted: str | None = None
+
+        self._other: tuple[bytes, float] | None = None
+        self._expected: bytes | None = None
+        self._fence: str | None = None
+        self._unread: str | None = None
+        self._identity = {
+            "machine": machine,
+            "token": self.token,
+            "host": host_identity(),
+            "pid": os.getpid(),
+            "birth": birth(os.getpid()),
+        }
+
+    def _read_request(self) -> None:
+        """Read the host's request; one that cannot be read now, or holds no
+        request, keeps the last, said once. Before the first that is read the
+        host takes no new tasks."""
+        try:
+            found = read_request(self.jobs, self.machine)
+        except (OSError, ValueError) as error:
+            why = f"{self.machine} keeps its request {self.request!r}: {error}"
+            if self.request is None:
+                why = f"{self.machine} cannot read its request yet: {error}"
+            if why != self._unread:
+                say(why)
+            self._unread = why
+            return
+        self._unread = None
+        if found != self.request:
+            say(f"{self.machine}'s request is now {found!r}.")
+        self.request = found
+
+    def _hold(self) -> None:
+        """Whether this service holds its host's record in this round, which
+        fences the host's name: only one service counts the host's claims and
+        takes tasks under it.
+
+        The record is this service's when it names its token, or when there is
+        none yet or it is empty. A record of an earlier service of this machine
+        (:func:`host_identity`) whose process is gone is taken over at once, since
+        this service holds the host's lock; a record of another service is taken
+        over only once it stays unchanged for :data:`darsia.utils.results.STALE`
+        by this service's own clock, and until then this service takes no tasks
+        and says why. A record that cannot be read now holds nothing in this
+        round. What was read is what :meth:`_record` checks before it writes.
+
+        """
+        path = machine_files(self.jobs, self.machine)[0]
+        try:
+            raw = results.retry_transient(path.read_bytes)
+        except FileNotFoundError:
+            return self._take(None)
+        if not raw:
+            return self._take(raw)  # An empty record is nobody's.
+        if not raw.endswith(b"\n"):
+            raise results.Unavailable(f"The record {path} reads short")
+        found = _record_of(raw)
+        if found.get("token") == self.token:
+            return self._take(raw)
+        own = found.get("host") == self._identity["host"]
+        if own and not alive(found.get("pid"), found.get("birth")):
+            return self._take(raw)
+        now = monotonic()
+        if self._other is None or self._other[0] != raw:
+            self._other = (raw, now)
+        elif now - self._other[1] >= results.STALE:
+            return self._take(raw)
+        self._fenced(
+            f"The record of {self.machine} is written by another service (host "
+            f"{found.get('host')}, process {found.get('pid')}); this one takes no "
+            f"tasks until it stays unchanged for {results.STALE:g} s."
+        )
+
+    def _take(self, raw: bytes | None) -> None:
+        """Hold the host's record in this round, as it was read."""
+        self.held, self._expected, self._other, self._fence = True, raw, None, None
+
+    def _fenced(self, why: str) -> None:
+        """Take no tasks under the host's name, saying why once."""
+        if why != self._fence:
+            say(f"{self.machine} takes no tasks: {why}")
+        self.held, self.reason, self._fence = False, why, why
+
+    def _record(self) -> None:
+        """Write the host's record: the live tasks with the threads and bytes they
+        reserve, the free memory, the reserve, the request and the reason. It is
+        created whole, by a partial file renamed without replacing another's, and
+        then rewritten in place by its holder alone: through the one handle it
+        reads the record, and writes only if it is still what :meth:`_hold` read
+        or names this service's token; else this service stops holding it."""
+        live = []
+        for task in self.live.values():
+            environment = self._records[task.claim.job.name]["environment"]
+            live.append(
+                {
+                    "job": task.claim.job.name,
+                    "task": task.claim.task,
+                    "threads": task.threads,
+                    "bytes": task.bytes,
+                    "resident": task.held,
+                    "backend": environment.get("backend", "cpu"),
+                }
+            )
+        value = {
+            **self._identity,
+            "time": time(),
+            "revision": self.revision,
+            "request": self.request,
+            "threads": self.threads,
+            "headroom": headroom(),
+            "reserve": reserve(),
+            "live": live,
+            "reason": self.reason,
+        }
+        text = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+        path = machine_files(self.jobs, self.machine)[0]
+
+        def write() -> bool:
+            try:
+                with open(path, "r+b") as stream:
+                    found = stream.read()
+                    if found != self._expected:
+                        if _record_of(found).get("token") != self.token:
+                            return False
+                    stream.seek(0)
+                    stream.write(text)
+                    stream.truncate()
+                    return True
+            except FileNotFoundError:
+                if self._expected is not None:
+                    return False  # It was there at the look: another's move.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            partial = path.with_name(f".{path.name}.{self.token}.partial")
+            partial.write_bytes(text)
+            try:
+                results.rename(partial, path)
+            except FileExistsError:
+                return False
+            return True
+
+        if results.retry_transient(write):
+            self._expected = text
+        else:
+            self._fenced(
+                f"Another service wrote the record of {self.machine} since this "
+                "one looked at it; this one takes no tasks until it holds it again."
+            )
 
     def _jobs(self) -> list[tuple[Path, dict]]:
         """The jobs of the folder with their records, oldest first. A job whose
@@ -575,12 +853,16 @@ class Service:
 
     def _taking(self) -> bool:
         """Whether this service takes new tasks now, saying once when it does not:
-        it has threads, and its code is of a known revision, the one it started
-        with, which its checkout still holds."""
+        it has threads, its request is not 0, and its code is of a known revision,
+        the one it started with, which its checkout still holds."""
         now = revision()
         why = None
         if self.threads <= 0:
             why = "its capacity is no threads"
+        elif self.request is None:
+            why = "its request is not read yet"
+        elif self.request == 0:
+            why = "its request is 0"
         elif self.revision is None:
             why = "the revision of its code is not known"
         elif now != self.revision:
@@ -687,6 +969,8 @@ class Service:
                     continue
                 if lease.get("machine") != self.machine:
                     continue
+                if lease.get("host") != self._identity["host"]:
+                    continue  # Another machine's under this name: left to reclaim.
                 if alive(lease.get("pid"), lease.get("birth")):
                     threads = record["environment"]["threads"]
                     self.live[claim.path] = Live(
@@ -798,7 +1082,7 @@ class Service:
                         say(said, job / LOG)
                     self._passed.add(step)
                     continue
-                claim = queue.claim(job, task.id, self.machine)
+                claim = queue.claim(job, task.id, self.machine, self._identity["host"])
                 if claim is None:
                     continue
                 try:
@@ -831,14 +1115,20 @@ class Service:
                     say(f"Task {task} taken back: its lease went stale", job / LOG)
 
             self._round(f"Taking back the stale claims of {record['id']}", reclaim)
+        self._round("Reading this host's request", self._read_request)
+        self.held = False
+        self._round("Looking at this host's record", self._hold)
+        if not self.held:
+            return
         counted = self._round(
             "Counting this host's claims", lambda: self._survivors(jobs)
         )
         if not known or counted is not True or self._unknown:
             self._wait_for_count()
-            return
-        self._uncounted = None
-        self._round("Starting ready tasks", lambda: self._admit(jobs))
+        else:
+            self._uncounted = None
+            self._round("Starting ready tasks", lambda: self._admit(jobs))
+        self._round("Writing this host's record", self._record)
 
     def _wait_for_count(self) -> None:
         """Take no new task in a round whose jobs or claims of this host could not

@@ -264,8 +264,9 @@ def test_a_survivor_gone_or_hidden_is_gone_and_a_live_one_keeps_its_threads(
     job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
     gone = queue.claim(job, "numbers.r1.0000", "here")
     kept = queue.claim(job, "numbers.r2.0000", "here")
-    queue.beat(gone, 1, 999_999, 1.0e9)
-    queue.beat(kept, 1, os.getpid(), service.birth(os.getpid()))
+    host = service.host_identity()
+    queue.beat(gone, 1, 999_999, 1.0e9, host)
+    queue.beat(kept, 1, os.getpid(), service.birth(os.getpid()), host)
     real = psutil.Process
 
     class Hidden:
@@ -344,10 +345,10 @@ def test_a_beat_delayed_into_the_mark_lands_before_it(
     marked, landed = threading.Event(), threading.Event()
     beat, write, transfer = queue.beat, queue._write, queue._transfer
 
-    def held(claim, number, pid, born):
+    def held(claim, number, pid, born, *host):
         if number > 1:  # the beat thread's: the share holds it until the mark
             marked.wait(2.0)
-        beat(claim, number, pid, born)
+        beat(claim, number, pid, born, *host)
         if number > 1:
             landed.set()
 
@@ -654,7 +655,7 @@ def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch
         clock[0] = 20.0
 
     monkeypatch.setattr(queue, "beat", delayed)
-    jobs_main._beats(None, stop, renewed)
+    jobs_main._beats(None, stop, "here", renewed)
     assert renewed == [10.0]
 
 
