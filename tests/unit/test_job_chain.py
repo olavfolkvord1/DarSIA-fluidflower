@@ -3,10 +3,11 @@
 Two synthetic runs of six frames each (the minimal chain's sensor images, mapping,
 material light correction and delivered phase model) are set up, calibrated (the
 sands' colour ranges and path ratios measured, every sand read by Beer–Lambert),
-analysed and compared by the presets' steps. Their mass maps equal the methods
-called directly, in single precision through the service and in double precision
-in this process; a run whose phase maps were interrupted after the injection end
-resumes at its first missing frame with the same maps.
+analysed, compared and filmed by the presets' steps. Their mass maps, distances,
+film tiles, films and ensemble figures equal the methods called directly, in
+single precision through the service and in double precision in this process; a
+run whose phase maps were interrupted after the injection end resumes at its first
+missing frame with the same maps.
 
 """
 
@@ -32,6 +33,12 @@ from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_doma
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.calibration import steps as calibration
 from darsia.presets.workflows.comparison import steps as comparison
+from darsia.presets.workflows.comparison.ensemble import (
+    EnsembleRun,
+    EnsembleSettings,
+    ensemble_tables,
+)
+from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 from darsia.presets.workflows.comparison.mass_wasserstein import (
     WassersteinSettings,
     distance_scales,
@@ -41,6 +48,21 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
 )
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.utils import settings_from_table
+from darsia.presets.workflows.media import steps as media_steps
+from darsia.presets.workflows.media.films import write_films
+from darsia.presets.workflows.media.panels import PhotographSettings
+from darsia.presets.workflows.media.style import FigureStyle
+from darsia.presets.workflows.media.tiles import Frame as MediaFrame
+from darsia.presets.workflows.media.tiles import (
+    Panel,
+    SandGeometry,
+    TileSettings,
+    draw_tile,
+    graph_axes,
+    read_tile_index,
+    save_tile,
+    write_tile_index,
+)
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup import steps as setup
 from darsia.presets.workflows.setup.setup_facies import make_facies
@@ -53,7 +75,13 @@ from tests.unit.test_minimal_chain import COLOURS, _head
 
 START = datetime.datetime(2026, 1, 1, 12)
 HOUR = datetime.timedelta(hours=1)
-STEPS = setup.STEPS + calibration.STEPS + analysis.STEPS + comparison.STEPS
+STEPS = (
+    setup.STEPS
+    + calibration.STEPS
+    + analysis.STEPS
+    + comparison.STEPS
+    + media_steps.STEPS
+)
 KERNEL = sorted(
     {r["architecture"] for r in numpys_blas() if r.get("internal_api") == "openblas"}
 )[0]
@@ -251,6 +279,61 @@ copy_mm = 10.0
 times_h = [3.0]
 tolerance_h = 0.6
 reference_run = "r2"
+[style]
+dpi = 50
+log_span = 50.0
+surface = "#fcfcfb"
+ink = "#0b0b0b"
+secondary = "#52514e"
+muted = "#898781"
+grid = "#e1e0d9"
+axis = "#c3c2b7"
+washes = ["#ebeae4", "#dcdcd4"]
+series = "#2a78d6"
+frame = "#1e2226"
+empty = "#3e4246"
+no_value = "#e6edf2"
+colour_map = "viridis"
+marker = "#667085"
+curves = [
+    {{column = "total_quantified_mass_g", name = "Total", colour = "#175aad", line = "-"}},
+    {{column = "injected_mass_g", name = "Injected", colour = "black", line = "--"}},
+]
+[tiles]
+width_px = 320
+display_cells = 40
+colour_scale = 0.5
+[photograph]
+matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+invalid_grey = 128
+[[media.films]]
+name = "pyramid"
+layout = "pyramid"
+panels = [
+    {{content = "graph", label = "Mass", display_mean = "none"}},
+    {{content = "image", label = "Corrected image", display_mean = "none"}},
+    {{content = "mass", label = "Total CO2", display_mean = "depth"}},
+]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
+[[media.films]]
+name = "maps"
+layout = "grid"
+panels = [{{content = "mass", label = "Total CO2", display_mean = "depth"}}]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
+[[media.films]]
+name = "graphs"
+layout = "grid"
+panels = [{{content = "graph", label = "Mass", display_mean = "none"}}]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
 [runs.r2.data]
 folder = "photos-r2"
 [runs.r2.depth]
@@ -803,6 +886,93 @@ def _direct(root: Path, selection: Selection) -> dict:
             wasserstein,
         )
     distances = wasserstein_distances(3.0, found, reference, scales, wasserstein)
+    style = settings(FigureStyle, "style")
+    tile_settings = settings(TileSettings, "tiles")
+    films = settings(media_steps.MediaSettings, "media").films
+    drawings = media_steps.drawings(settings(media_steps.MediaSettings, "media"))
+    graphs, ensemble = {}, []
+    for run, (grid, experiment, images, maps, dates) in runs.items():
+        protocol = experiment.injection_protocol
+        rows = domain_mass[run]
+        injected = {
+            row["case_id"]: protocol.injected_mass(time=row["elapsed_h"]) * 1000
+            for row in rows
+        }
+        times = {row["case_id"]: row["elapsed_h"] for row in rows}
+        ensemble.append(EnsembleRun(rows, injected, times, protocol))
+        graphs[run] = [
+            {**row, "injected_mass_g": injected[row["case_id"]]}
+            for row in rows
+            if row["domain_id"] == "whole"
+        ]
+    axes = graph_axes(tile_settings, list(graphs.values()), style)
+    for run, (grid, experiment, images, maps, dates) in runs.items():
+        sand = SandGeometry(
+            grid.rig.labels.img,
+            sand_labels,
+            grid.geometry.pore_volume_m3,
+            grid.rig.depth.img,
+            grid.rig.pixel_area.img,
+        )
+        start, shape = experiment.experiment_start, grid.rig.facies.img.shape
+        rows = [[] for _ in drawings]
+        for frame, image, frame_maps, date in zip(
+            selection.frames[run], images, maps, dates
+        ):
+            h = (date - start).total_seconds() / 3600
+            shown = MediaFrame(
+                f"{frame.session}/{frame.name}",
+                h,
+                h,
+                shape,
+                (0, 0, shape[1], shape[0]),
+                image.img,
+                {k: getattr(made[(run, frame)], k).img for k in media_steps.MAPS},
+                "g/L",
+                frame_maps["labels"],
+                frame_maps["saturation"],
+                sand,
+            )
+            for k, drawing in enumerate(drawings):
+                tile, drawn = draw_tile(
+                    Panel(**drawing["panel"]),
+                    shown,
+                    tile_settings,
+                    style=style,
+                    photograph_settings=settings(PhotographSettings, "photograph"),
+                    rows=graphs[run],
+                    axes=axes,
+                    label_room=drawing["label_room"],
+                )
+                folder = root / "tiles" / run / f"{k:02d}"
+                rows[k].append(save_tile(folder, shown, tile, drawn))
+        for k, made_rows in enumerate(rows):
+            write_tile_index(root / "tiles" / run / f"{k:02d}", made_rows)
+    records = {}
+    for film in films:
+        grid_film = film.layout == "grid"
+        chosen = [
+            drawings.index(
+                {"panel": asdict(p), "label_room": p.content == "graph" and grid_film}
+            )
+            for p in film.panels
+        ]
+        tiles = {
+            run: [read_tile_index(root / "tiles" / run / f"{k:02d}") for k in chosen]
+            for run in runs
+        }
+        records[film.name] = write_films(
+            tiles,
+            root / "films" / film.name,
+            film=film,
+            tile_settings=tile_settings,
+            unit="g/L",
+            style=style,
+        )
+    ensemble_settings = settings(EnsembleSettings, "ensemble")
+    tables = ensemble_tables(ensemble, domains, ensemble_settings)
+    (root / "figures").mkdir()
+    ensemble_figures(root / "figures", tables, ensemble, ensemble_settings, style)
     return {
         "maps": made,
         "copies": copies,
@@ -811,12 +981,15 @@ def _direct(root: Path, selection: Selection) -> dict:
         "domain_mass": domain_mass,
         "distances": [asdict(distance) for distance in distances],
         "statistics": frames[None],
+        "drawings": len(drawings),
+        "films": records,
     }
 
 
 def _compare(project: Path, selection: Selection, direct: dict) -> None:
     """Every stored mass map, its copy on metric cells, each frame's histograms of
-    its sands' signal and the fit equal the direct calls'."""
+    its sands' signal and the fit equal the direct calls', and so do the films'
+    tiles, the films and the ensemble's figures."""
     results = project / "results"
     for (run, frame), maps in direct["maps"].items():
         stored = darsia.read_mass_maps(
@@ -861,15 +1034,38 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
     write_rows(project / "distances.csv", rows, list(rows[0]))
     stored = results / "distances" / "3.0h" / "distances.csv"
     assert stored.read_text() == (project / "distances.csv").read_text()
+    assert direct["drawings"] == 4  # the films' five panels, one shared
+    for run in selection.frames:  # each drawing of the films' tiles, once
+        for k in range(direct["drawings"]):
+            stored = results / "film-tiles" / run / f"{k:02d}"
+            made = project / "tiles" / run / f"{k:02d}"
+            index = (made / "tiles.json").read_text()
+            assert (stored / "tiles.json").read_text() == index
+            for row in read_tile_index(made):
+                tile = Path(row["path"]).read_bytes()
+                assert (stored / row["file"]).read_bytes() == tile
+    for name, records in direct["films"].items():
+        folder = results / "films" / name
+        stored = json.loads((folder / media_steps.RECORDS).read_text())
+        assert stored == json.loads(json.dumps(records))
+        for record in records:
+            figure = (project / "films" / name / record["figure"]).read_bytes()
+            assert (folder / record["figure"]).read_bytes() == figure
+    figures = sorted(path.name for path in (project / "figures").iterdir())
+    stored = results / "ensemble" / comparison.FIGURES
+    assert figures and sorted(path.name for path in stored.iterdir()) == figures
+    for name in figures:
+        assert (stored / name).read_bytes() == (project / "figures" / name).read_bytes()
 
 
 @pytest.mark.parametrize("precision", ["float32", "float64"])
 def test_the_chain_as_jobs_equals_the_direct_calls(
     tmp_path, monkeypatch, importable, precision  # noqa: F811
 ):
-    """Every frame's mass maps of the job equal the direct calls'; the comparisons
-    are made; single precision runs through the service's task processes, double
-    precision in this process."""
+    """Every frame's mass maps of the job equal the direct calls', and so do the
+    comparisons' distances, the films' tiles and films and the ensemble's figures;
+    each film's encoder opens under the host's waiting lock. Single precision runs
+    through the service's task processes, double precision in this process."""
     project = tmp_path / "project"
     config, selection = _project(project, precision)
     monkeypatch.chdir(project)
@@ -879,7 +1075,21 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     if precision == "float32":
         _serve(jobs, tmp_path, seconds=1200.0)
     else:
+        taken = []
+
+        class Recorded:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                taken.append(self.name)
+
+            def __exit__(self, *_):
+                pass
+
+        monkeypatch.setattr(jobs_main.service, "WaitingLock", Recorded)
         _run(job)
+        assert taken == [media_steps.ENCODER_LOCK] * 4  # two pyramids, two grids
     failed = queue.markers(job, queue.FAILED)
     assert not failed, [
         queue.read_marker(job / queue.FAILED / f"{t}.{k}")["traceback"]

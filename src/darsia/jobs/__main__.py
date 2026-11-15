@@ -15,9 +15,9 @@
   renewed after the step has ended, so that nothing is written into the marker
   between its mark and its move.
 
-:data:`STEPS` holds the steps of the presets' Setup, Calibration, Analysis and
-Comparison by the kind each makes. A task waits for the host's lock of a name,
-e.g. around a film encoder's open, through its context
+:data:`STEPS` holds the steps of the presets' Setup, Calibration, Analysis,
+Comparison and Media by the kind each makes. A task waits for the host's lock of a
+name, e.g. around a film encoder's open, through its context
 (:meth:`darsia.jobs.step.StepContext.host_lock`, a
 :class:`darsia.jobs.service.WaitingLock`).
 
@@ -47,6 +47,7 @@ from darsia.presets.workflows.analysis import steps as analysis_steps
 from darsia.presets.workflows.calibration import steps as calibration_steps
 from darsia.presets.workflows.comparison import steps as comparison_steps
 from darsia.presets.workflows.config.utils import settings_from_table
+from darsia.presets.workflows.media import steps as media_steps
 from darsia.presets.workflows.setup import steps as setup_steps
 from darsia.utils import results
 from darsia.utils.gpu.backend import (
@@ -59,7 +60,13 @@ from darsia.utils.locations import normal_path
 
 STEPS: dict[str, Step] = {
     step.name: step
-    for module in (setup_steps, calibration_steps, analysis_steps, comparison_steps)
+    for module in (
+        setup_steps,
+        calibration_steps,
+        analysis_steps,
+        comparison_steps,
+        media_steps,
+    )
     for step in module.STEPS
 }
 """The presets' steps, by the kind each makes."""

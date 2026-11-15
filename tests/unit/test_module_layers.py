@@ -76,6 +76,7 @@ MODULES = [
     "darsia/presets/workflows/calibration/steps.py",
     "darsia/presets/workflows/analysis/steps.py",
     "darsia/presets/workflows/comparison/steps.py",
+    "darsia/presets/workflows/media/steps.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
