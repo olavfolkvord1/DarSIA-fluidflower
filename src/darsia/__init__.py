@@ -63,6 +63,7 @@ from darsia.utils.standard_images import *
 from darsia.utils.approximations import *
 from darsia.utils.slices import *
 from darsia.utils.gpu.cpu import *
+from darsia.utils.gpu.opencl import *
 from darsia.utils.gpu.backend import *
 
 # Image subregions (required specific placing)

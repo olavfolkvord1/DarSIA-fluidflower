@@ -97,3 +97,49 @@ def test_methods_compute_on_the_process_backend(restore_backend):
     assert counting.calls == ["remap", "remap", "sand_means"]
     for ours, reference in zip(computed, expected):
         np.testing.assert_array_equal(ours, reference)
+
+
+@pytest.fixture(scope="module")
+def opencl_backends():
+    """A backend on each OpenCL device that can give the CPU's bits."""
+    backends = [darsia.OpenCLBackend(device) for device in darsia.opencl_devices()]
+    if not backends:
+        pytest.skip("No OpenCL device with IEEE single and double precision")
+    return backends
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_opencl_maps_images_with_the_cpus_bits(opencl_backends, restore_backend, dtype):
+    """The samples of the planes and of their invalid indicator, and so the mapped
+    image, are the CPU's, with shared and with channel-wise maps."""
+    for channel_maps in (False, True):
+        mapping, image = _mapping(dtype, channel_maps)
+        values = np.where(np.isfinite(image), image, 0).astype(dtype)
+        cpu = darsia.CpuBackend()
+        expected = cpu.remap(values, mapping.map_x, mapping.map_y)
+        darsia.use_compute_backend(cpu)
+        mapped = mapping.correct_array(image)
+        for backend in opencl_backends:
+            sampled = backend.remap(values, mapping.map_x, mapping.map_y)
+            np.testing.assert_array_equal(sampled, expected, err_msg=backend.device)
+            darsia.use_compute_backend(backend)
+            np.testing.assert_array_equal(
+                mapping.correct_array(image), mapped, err_msg=backend.device
+            )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_opencl_sand_means_have_the_cpus_bits(opencl_backends, dtype):
+    """RGB and scalar values, odd and even squares, a grid smaller than the square,
+    and an invalid value outside the masks, which spreads as on the CPU."""
+    cases = (
+        _means(dtype),
+        _means(dtype, size_mm=8.0, channels=1),
+        _means(dtype, shape=(7, 5)),
+    )
+    for values, dissolved, masks, rev in cases:
+        masks = [dissolved & mask for mask in masks.values()]
+        expected = darsia.CpuBackend().sand_means(values, masks, rev)
+        for backend in opencl_backends:
+            means = backend.sand_means(values, masks, rev)
+            np.testing.assert_array_equal(means, expected, err_msg=backend.device)
