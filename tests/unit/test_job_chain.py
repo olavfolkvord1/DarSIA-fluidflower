@@ -151,6 +151,9 @@ values = [0.0, 1.0]
 supports = [0.0, 1.0]
 table = [0.0, 1.0]
 factor = 1.0
+[unknown_mass]
+column_reach_mm = 20.0
+intervals = 32768
 [calibration_fit]
 gain_window_h = [1.0, 3.0]
 dilution_start_h = 3.5
@@ -400,6 +403,18 @@ def _direct(root: Path, selection: Selection) -> dict:
                     statistics,
                 )
             )
+            signal, measured = calibration.read_signal(
+                grid, image.img, frame_maps, reading, statistics
+            )
+            unknown = darsia.unknown_statistics(
+                darsia.relative_signal(signal, statistics),
+                frame_maps["labels"],
+                frame_maps["rules"],
+                measured,
+                grid.geometry,
+                co2,
+                settings(darsia.UnknownMassSettings, "unknown_mass"),
+            )
             gas = darsia.gas_statistics(
                 frame_maps["co2"],
                 darsia.model_gas(frame_maps["labels"], frame_maps["rules"]),
@@ -419,7 +434,7 @@ def _direct(root: Path, selection: Selection) -> dict:
                     experiment.injection_protocol.injected_mass(time=h) * 1000,
                     histograms,
                     gas,
-                    None,
+                    unknown.column_estimate(),
                     volumes[index],
                     volumes[index] is not None,
                 )
@@ -695,6 +710,69 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
         resumed = darsia.read_phase_maps(folder / frame.session / frame.name)
         for name, array in maps.items():
             np.testing.assert_array_equal(resumed[name], array)
+
+
+def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
+    tmp_path, monkeypatch
+):
+    """Dissolved CO2 whose colour is not measured, below measured CO2 in its
+    column, reaches the fit as the frame's column estimate: the stored statistics
+    hold the frame's unknown-mass statistics, read from above."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    monkeypatch.chdir(project)
+    one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    steps = setup.STEPS + calibration.STEPS[:4]
+    job = create_job(tmp_path / "jobs", steps, one, config)
+    _run(job, skip={"run-statistics.r1"})
+    frame = one.frames["r1"][-1]
+    results = project / "results"
+    maps = darsia.read_phase_maps(
+        results / "phase-maps" / "r1" / frame.session / frame.name
+    )
+    dissolved = maps["labels"] == darsia.PhaseLabel.DISSOLVED
+    rows, columns = np.nonzero(dissolved[1:] & dissolved[:-1])
+    row, column = rows[len(rows) // 2] + 1, columns[len(rows) // 2]
+    stored = results / "corrected-image" / "r1" / frame.session / frame.name
+    image = darsia.imread(stored / "image.npz")
+    image.img[row, column] = np.nan  # its colour is not measured
+    image.save(stored / "image.npz")
+    _run(job)
+    found = darsia.read_frames(results / "run-statistics" / "r1")[-1]
+    tables = tomllib.loads(config.read_text())
+    material = settings_from_table(calibration.MaterialSettings, tables["material"])
+    grid = calibration.run_grid(Rig.load(results / "rig" / "r1"), material)
+    statistics = settings_from_table(
+        darsia.RunStatisticsSettings, tables["run_statistics"]
+    )
+    reading = calibration.sand_reading(
+        settings_from_table(calibration.ReadingSettings, tables["reading"])
+    )
+    signal, measured = calibration.read_signal(
+        grid, image.img, maps, reading, statistics
+    )
+    assert not measured[row, column]
+    experiment = make_experiment(
+        FluidFlowerConfig([config], require_data=False, require_results=False)
+    )
+    co2 = calibration.co2_state(
+        grid, experiment, experiment.get_datetime(project / frame.session / frame.name)
+    )
+    wanted = darsia.unknown_statistics(
+        darsia.relative_signal(signal, statistics),
+        maps["labels"],
+        maps["rules"],
+        measured,
+        grid.geometry,
+        co2,
+        settings_from_table(darsia.UnknownMassSettings, tables["unknown_mass"]),
+    ).column_estimate()
+    assert wanted is not None and found.column is not None
+    assert wanted.weight.sum() > 0
+    for name in ("relative", "ratio", "weight"):
+        np.testing.assert_array_equal(
+            getattr(found.column, name), getattr(wanted, name)
+        )
 
 
 def test_phase_maps_refuse_frames_out_of_time_order(tmp_path, monkeypatch):
