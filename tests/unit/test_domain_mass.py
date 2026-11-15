@@ -257,6 +257,42 @@ def test_each_mass_has_its_centre_and_spread():
     assert row["layer:5"]["gas_centre_x_mm"] is None
 
 
+def test_boxes_and_centres_read_each_pixels_measured_position():
+    """With each pixel's measured position, a box holds the pixels whose position
+    lies in it, compared in double precision, and the centres of mass are taken
+    at the positions."""
+    geometry, sand, maps, co2 = frame(np.float64)
+    centres = darsia.grid_positions(sand)
+    x = (centres.x + 0.012 * np.linspace(0.0, 1.0, 49)[:, None]).astype(np.float32)
+    positions = darsia.GridPositions(x, centres.y.astype(np.float32), centres.pitch_mm)
+    measured = DomainMass(DOMAINS, geometry, sand, SAND, positions)(maps, co2)
+    plain = DomainMass(DOMAINS, geometry, sand, SAND)(maps, co2)
+    row = {r["domain_id"]: r for r in measured}
+    before = {r["domain_id"]: r for r in plain}
+
+    x64, y64 = (np.asarray(v, np.float64) for v in (positions.x, positions.y))
+    held = geometry.domain & (geometry.pore_volume_m3 > 0)  # the maps' numbers
+    left = held & (x64 >= 0) & (x64 < 0.455) & (y64 >= 0) & (y64 < 0.49)
+    assert row["left"]["pixels"] == int(left.sum()) != before["left"]["pixels"]
+    right = held & (x64 >= 0.455) & (x64 < 0.9) & (y64 >= 0) & (y64 < 0.49)
+    assert row["right"]["pixels"] == int(right.sum())
+    grams = np.nan_to_num(maps.mass_g.img) * geometry.pore_volume_m3
+    assert row["whole"]["gas_centre_x_mm"] == pytest.approx(
+        np.average(x64 * 1000, weights=grams), rel=1e-12
+    )
+    assert row["whole"]["gas_centre_x_mm"] != before["whole"]["gas_centre_x_mm"]
+
+    # A box edge just past a pixel's position in double precision, level with it
+    # in single precision: the pixel lies inside.
+    edge = float(positions.x[20, 30]) + 1e-12
+    box = AnalysisDomain(
+        kind="box", domain_id="edge", name="edge", bounds_mm=[0.0, edge * 1000, 0, 490]
+    )
+    (found,) = DomainMass([box], geometry, sand, SAND, positions)(maps, co2)
+    inside = held & (x64 >= 0) & (x64 < edge) & (y64 >= 0) & (y64 < 0.49)
+    assert inside[20, 30] and found["pixels"] == int(inside.sum())
+
+
 PARTS = [
     AnalysisDomain(**row)
     for row in tomllib.loads(
