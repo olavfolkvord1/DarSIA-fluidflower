@@ -1118,7 +1118,7 @@ class Rig:
         self,
         experiment: darsia.ProtocolledExperiment,
         baseline_path: Path,
-        depth_map_path: Path,
+        depth_map_path: Path | None,
         labels_path: Path,
         facies_path: Path | None = None,
         facies_props_path: Path | None = None,
@@ -1129,7 +1129,12 @@ class Rig:
         log: Path | None = None,
         show_plot: bool = False,
     ) -> None:
-        """Fast setup."""
+        """Fast setup.
+
+        Without a depth map (``depth_map_path`` None) the rig has no depth and no
+        geometry yet: the caller sets the depth, e.g. by a depth rule evaluated on
+        the rig's grid, and then the geometry (:meth:`setup_geometry`).
+        """
         # Create log directory if it doesn't exist
         if log:
             assert isinstance(log, Path), "Log path must be a Path object."
@@ -1152,10 +1157,11 @@ class Rig:
         )
 
         # Fetch depth map
-        self.setup_depth(
-            depth_map_path,
-            log=log,
-        )
+        if depth_map_path is not None:
+            self.setup_depth(
+                depth_map_path,
+                log=log,
+            )
 
         # Add labels
         self.setup_labels(
@@ -1184,7 +1190,8 @@ class Rig:
         self.setup_facies_props(facies_props_path)
 
         # Define geometry for integration
-        self.setup_geometry()
+        if depth_map_path is not None:
+            self.setup_geometry()
 
         # Pre-setup image and boolean porosity based on baseline (redo after color correction)
         self.setup_image_porosity(
