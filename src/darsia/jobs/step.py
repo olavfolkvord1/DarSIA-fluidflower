@@ -432,6 +432,15 @@ class Step:
     """Whether a result of no run is made from the selection's frames; False for a
     step that reads none of them, e.g. the copy of a configured model, whose scope
     is then its part alone."""
+    runs: Callable[[Mapping[str, Any]], Sequence[str]] | None = None
+    """The selected runs a task of the step over the selection reads, named by the
+    configuration's tables, e.g. the runs a measurement is made on; by default
+    every selected run (:func:`read_runs`)."""
+    required: Callable[[Mapping[str, Any]], Iterable[str]] | None = None
+    """The runs the configuration names that a job of the step must select, e.g.
+    the fit runs among which a run's overflow ranks its donors and over which the
+    calibration fits, or the distances' reference run; a job without one of them
+    is refused (:func:`missing_runs`)."""
 
     @property
     def stored(self) -> Each:
@@ -443,6 +452,37 @@ class Step:
         if self.order is Order.RUN:
             return Each.RUN
         return Each.PART if self.parts is not None else Each.ONE
+
+
+def read_runs(
+    step: Step, selection: Selection, tables: Mapping[str, Any]
+) -> dict[str, tuple[Frame, ...]]:
+    """The frames of the runs a step reads over the whole selection (each read of
+    :attr:`Scope.ALL`): every selected run's, or those of the runs its
+    configuration names (:attr:`Step.runs`).
+
+    Raises
+    ------
+    ValueError
+        If the configuration names a run the selection lacks.
+
+    """
+    if step.runs is None:
+        return dict(selection.frames)
+    named = list(step.runs(tables))
+    missing = [run for run in named if run not in selection.frames]
+    if missing:
+        raise ValueError(f"{step.name} reads run(s) {missing}, which are not selected.")
+    return {run: selection.frames[run] for run in named}
+
+
+def missing_runs(
+    step: Step, selection: Selection, tables: Mapping[str, Any]
+) -> list[str]:
+    """The runs a step needs, by its configuration (:attr:`Step.required`), that
+    the selection lacks."""
+    named = [] if step.required is None else list(step.required(tables))
+    return [run for run in dict.fromkeys(named) if run not in selection.frames]
 
 
 def result_key(
@@ -607,8 +647,8 @@ def configured(
 
     The sections of the step's settings are the job's; its other sections
     (:attr:`Step.sections`) and its files (:attr:`Step.files`,
-    :attr:`Step.stamped`) are each run's, of the task's run or of every selected
-    run.
+    :attr:`Step.stamped`) are each run's, of the task's run or of every run it
+    reads over the selection (:func:`read_runs`).
 
     Parameters
     ----------
@@ -639,7 +679,7 @@ def configured(
     if task.run is not None:
         runs: list[str | None] = [task.run]
     else:
-        runs = list(selection.frames) if step.selected else [None]
+        runs = list(read_runs(step, selection, tables)) if step.selected else [None]
     own = {run: tables if run is None else run_tables(tables, run) for run in runs}
     if step.sections:
         settings[RUNS] = {
@@ -673,15 +713,19 @@ def outputs(step: Step, task: Task) -> tuple[Input, ...]:
 
 
 def scope(
-    step: Step, task: Task, selection: Selection, frame: Frame | None = None
+    step: Step,
+    task: Task,
+    selection: Selection,
+    tables: Mapping[str, Any],
+    frame: Frame | None = None,
 ) -> dict:
     """What of the frozen selection one result of a task is made from.
 
     A frame's result of a step over frames is made from that frame alone; a result
     of a task per run from the run's frames; any other from its part and, unless
-    its step reads no selection (:attr:`Step.selected`), the whole selection's
-    frames. The selection's domains are recorded for a step that reads them
-    (:attr:`Step.domains`).
+    its step reads no selection (:attr:`Step.selected`), the frames of the runs it
+    reads (:func:`read_runs`, by default the whole selection's). The selection's
+    domains are recorded for a step that reads them (:attr:`Step.domains`).
 
     """
     if step.order is Order.FRAMES and frame is not None:
@@ -691,9 +735,8 @@ def scope(
     else:
         found = {"part": task.part}
         if step.selected:
-            found["frames"] = {
-                run: [list(f) for f in fs] for run, fs in selection.frames.items()
-            }
+            read = read_runs(step, selection, tables)
+            found["frames"] = {run: [list(f) for f in fs] for run, fs in read.items()}
     if step.domains:
         found["domains"] = list(selection.domains)
     return found
@@ -761,7 +804,7 @@ def request(
     return {
         "step": step.name,
         "settings": settings,
-        "scope": scope(step, task, selection, frame),
+        "scope": scope(step, task, selection, tables, frame),
         "environment": plain(dict(environment)),
         "inputs": {**{i.key: tokens[i.key] for i in used}, **files},
     }
