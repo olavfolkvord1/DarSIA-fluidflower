@@ -30,6 +30,125 @@ InterpolationOption = Literal["inter_nearest", "inter_linear", "inter_area"]
 """Interpolation options considered in below warp."""
 
 
+def quadrilateral_transform(
+    source: np.ndarray, target: np.ndarray, dtype: np.dtype | type
+) -> np.ndarray:
+    """The perspective transform mapping four points onto four others, solved from
+    its eight projective equations in a given floating precision.
+
+    Parameters
+    ----------
+    source, target : array
+        Four points each, as (column, row) rows.
+    dtype : numpy dtype or type
+        Floating precision of the equations and their solution.
+
+    Returns
+    -------
+    array
+        3 x 3 homography of (column, row, 1) from the source to the target points.
+
+    """
+    dtype = np.dtype(dtype)
+    source, target = np.asarray(source, dtype), np.asarray(target, dtype)
+    xy1 = np.column_stack((source, np.ones(4, dtype=dtype)))
+    system = np.zeros((8, 8), dtype=dtype)
+    system[::2, :3], system[1::2, 3:6] = xy1, xy1
+    system[::2, 6:] = -source * target[:, :1]
+    system[1::2, 6:] = -source * target[:, 1:]
+    values = darsia.linalg.solve(system, target.ravel())
+    return np.append(values, dtype.type(1)).reshape(3, 3)
+
+
+def project_xy(
+    matrix: np.ndarray, x: np.ndarray, y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map positions through a homography, elementwise and without homogeneous
+    arrays, in the precision of the matrix and the positions.
+
+    Parameters
+    ----------
+    matrix : array
+        3 x 3 homography of (x, y, 1).
+    x, y : array
+        Positions, broadcast against each other, e.g. a row of columns and a
+        column of rows.
+
+    Returns
+    -------
+    tuple of arrays
+        The mapped x and y; not finite where a position maps to infinity.
+
+    """
+    den = matrix[2, 0] * x + matrix[2, 1] * y + matrix[2, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (
+            (matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2]) / den,
+            (matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2]) / den,
+        )
+
+
+def warp_perspective(
+    image: np.ndarray,
+    matrix: np.ndarray,
+    size: tuple[int, int],
+    precision: np.dtype | type | str | None = None,
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
+    """Warp an image by a homography onto a grid of a given size, zero outside.
+
+    In single precision, the inverse of the homography is solved in single
+    precision, each pixel centre of the grid is mapped through it in single
+    precision (:func:`project_xy`), and the image is sampled there by OpenCV's
+    remap. In double precision or without a precision, it is OpenCV's perspective
+    warp, the calculation our production made without a chosen precision.
+
+    Parameters
+    ----------
+    image : array
+        Image (rows, cols) or (rows, cols, channels); single precision for the
+        remap.
+    matrix : array
+        3 x 3 homography from the image's pixel centres (column, row, 1) to the
+        grid's.
+    size : tuple of int
+        Width and height of the grid.
+    precision : numpy dtype, optional
+        Floating precision of the calculation.
+    interpolation : int
+        OpenCV's interpolation flag, bilinear by default.
+
+    Returns
+    -------
+    array
+        The warped image on the grid.
+
+    """
+    width, height = size
+    if precision is None or np.dtype(precision) != np.float32:
+        return cv2.warpPerspective(
+            image,
+            matrix,
+            (width, height),
+            flags=interpolation,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+    matrix = np.asarray(matrix, np.float32)
+    inverse = darsia.linalg.solve(matrix, np.eye(3, dtype=matrix.dtype))
+    x = np.arange(width, dtype=matrix.dtype)[None, :]
+    y = np.arange(height, dtype=matrix.dtype)[:, None]
+    map_x, map_y = project_xy(inverse, x, y)
+    return cv2.remap(
+        image,
+        map_x,
+        map_y,
+        interpolation,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
 def extract_quadrilateral_ROI(
     img_src: np.ndarray,
     pts_src: Optional[Union[list, darsia.VoxelArray, np.ndarray]] = None,
@@ -59,6 +178,12 @@ def extract_quadrilateral_ROI(
             height (int | float)     height of the physical object
             pts_src (array)          N >= 4 points in (col, row) pixel format
             pts_dst (array)          N >= 4 points in (col, row) pixel format
+            precision (dtype)        in single precision, the transform is
+                                     solved from its four corners in single
+                                     precision (quadrilateral_transform) and
+                                     the image warped in it (warp_perspective);
+                                     in double precision or by default,
+                                     OpenCV's perspective transform and warp
     """
 
     # FIXME: Implementation hardcoded for 2d.
@@ -144,9 +269,14 @@ def extract_quadrilateral_ROI(
         )
 
     assert pts_src.shape[0] == pts_dst.shape[0]
-    P = cv2.getPerspectiveTransform(
-        pts_src.astype(np.float32), pts_dst.astype(np.float32)
-    )
+    precision = kwargs.get("precision")
+    single = precision is not None and np.dtype(precision) == np.float32
+    if single:
+        P = quadrilateral_transform(pts_src, pts_dst, np.float32)
+    else:
+        P = cv2.getPerspectiveTransform(
+            pts_src.astype(np.float32), pts_dst.astype(np.float32)
+        )
 
     # ! ---- Warp image
 
@@ -170,14 +300,14 @@ def extract_quadrilateral_ROI(
 
     # Warp source image. Warping may convert a 3-tensor to a 2-tensor.
     # Force to use a 3-tensor structure.
-    img_dst = np.atleast_3d(
-        cv2.warpPerspective(
-            img_src.astype(np.float32),
-            P,
-            (width, height),
-            flags=interpolation_flag,  # type: ignore
-        )
-    ).astype(dtype)
+    warped = warp_perspective(
+        img_src.astype(np.float32),
+        P,
+        (width, height),
+        np.float32 if single else None,
+        interpolation_flag,  # type: ignore
+    )
+    img_dst = np.atleast_3d(warped).astype(dtype)
 
     # Reduce to scalar image array, if input provided in such format.
     if scalar:
