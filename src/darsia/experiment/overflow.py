@@ -103,15 +103,7 @@ class OverflowSettings:
     """Whether a fed overflow gives no reference after its feed stops."""
 
     def __post_init__(self) -> None:
-        """Turn tables given as mappings into settings; check the variant."""
-        for name, kind in (
-            ("feed", FeedSettings),
-            ("circulation", CirculationSettings),
-            ("evaporation", EvaporationSettings),
-        ):
-            table = getattr(self, name)
-            if isinstance(table, Mapping):
-                object.__setattr__(self, name, kind(**table))
+        """Check the variant and its table."""
         for name in ("outlier_factor", "tail_noise_factor"):
             value = getattr(self, name)
             if value is not None and not (np.isfinite(value) and value > 0):
