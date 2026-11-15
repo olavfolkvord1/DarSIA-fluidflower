@@ -255,6 +255,32 @@ SHARES = Step(
     Memory(),
     _share,
 )
+
+
+def _reference_run(tables):
+    """The reference run the configuration names, if any."""
+    return [tables["reference"]["run"]] if "reference" in tables else []
+
+
+def _relative(ctx: StepContext) -> None:
+    """A run's sum and the reference run's, read from the reference's own result;
+    the reference run reads none."""
+    own = ctx.read("sums", read_values)["total"]
+    named = _reference_run(ctx.tables)
+    reference = own
+    if named and named[0] != ctx.task.run:
+        reference = ctx.read("relative", read_values, run=named[0])["total"]
+    ctx.publish(lambda folder: _write(folder, total=own, reference=reference))
+
+
+RELATIVE = Step(
+    "relative",
+    {"sums": Scope.OWN, "relative": Scope.ALL},
+    Order.RUN,
+    Memory(),
+    _relative,
+    runs=_reference_run,
+)
 STEPS = (
     NUMBERS,
     SUMS,
@@ -267,6 +293,7 @@ STEPS = (
     HALTING_READ,
     GROUP_TOTALS,
     SHARES,
+    RELATIVE,
 )
 """The test steps, which a task process finds by their module."""
 
@@ -408,6 +435,28 @@ def test_a_run_reads_its_own_groups_part_and_never_another(tmp_path):
         assert values["share"] == 1.0
         read = [k for k in description["inputs"] if k.startswith("group-totals")]
         assert read == [f"group-totals/{part}"]
+
+
+def test_a_run_reads_a_reference_runs_result_of_its_own_step(tmp_path):
+    """A step per run that reads its own kind of the run its configuration names
+    (e.g. a reference run) waits for that run's task, which reads none; a job
+    without the reference run is refused."""
+    config, selection = _project(tmp_path)
+    config.write_text(config.read_text() + '[reference]\nrun = "r2"\n')
+    jobs, steps = tmp_path / "jobs", (NUMBERS, SUMS, RELATIVE)
+    job = create_job(jobs, steps, selection, config)
+    tasks = queue.tasks(job)
+    assert [i.key for i in tasks["relative.r2"].inputs] == ["sums/r2"]
+    assert [i.key for i in tasks["relative.r1"].inputs] == ["sums/r1", "relative/r2"]
+    assert tasks["relative.r1"].after == ("relative.r2", "sums.r1")
+    work(job)
+    project = tmp_path / "project"
+    reference = _stored(project, "relative/r2")[1]["total"]
+    assert _stored(project, "relative/r1")[1]["reference"] == reference
+    assert _stored(project, "relative/r2")[1]["reference"] == reference
+    one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    with pytest.raises(ValueError, match="not selected"):
+        create_job(jobs, steps, one, config)
 
 
 def test_an_input_made_outside_the_job_is_bound_by_its_token(tmp_path):
