@@ -166,6 +166,23 @@ FIT = Step(
 SUMMARY = Step("summary", {"fit": Scope.ALL}, Order.PARTS, Memory(), _summary)
 
 
+def _measured(ctx: StepContext) -> None:
+    """The total of the sums of the runs the configuration names."""
+    runs = ctx.tables["measured"]["runs"]
+    total = sum(ctx.read("sums", read_values, run=run)["total"] for run in runs)
+    ctx.publish(lambda folder: _write(folder, total=total))
+
+
+MEASURED = Step(
+    "measured",
+    {"sums": Scope.ALL},
+    Order.PARTS,
+    Memory(),
+    _measured,
+    runs=lambda tables: tables["measured"]["runs"],
+)
+
+
 def _depth(tables, project, folders):
     """The toy's large file."""
     return ["depth.npz"]
@@ -195,7 +212,17 @@ def _halting(ctx: StepContext) -> None:
 
 HALTING = Step("halting", {}, Order.FRAMES, Memory(), _halting)
 HALTING_READ = Step("halting-read", {}, Order.FRAMES, Memory(), _halting, files=_files)
-STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY, STAMPED, HALTING, HALTING_READ)
+STEPS = (
+    NUMBERS,
+    SUMS,
+    DOMAIN_SUMS,
+    FIT,
+    SUMMARY,
+    MEASURED,
+    STAMPED,
+    HALTING,
+    HALTING_READ,
+)
 """The test steps, which a task process finds by their module."""
 
 
@@ -295,6 +322,27 @@ def test_a_global_fit_waits_for_every_selected_run(tmp_path):
     work(job)
     assert queue.waiting(job) == set()
     assert _stored(tmp_path / "project", "fit/a")[1]["total"] == 324.0
+
+
+def test_a_step_reads_only_the_runs_its_configuration_names(tmp_path):
+    """A measurement on the runs its configuration names waits for those runs
+    alone and records their frames alone, so that it serves a job over other runs
+    beside them; a named run the selection lacks refuses the job."""
+    config, selection = _project(tmp_path)
+    config.write_text(config.read_text() + '[measured]\nruns = ["r2"]\n')
+    jobs, steps = tmp_path / "jobs", (NUMBERS, SUMS, MEASURED)
+    job = create_job(jobs, steps, selection, config)
+    task = queue.tasks(job)["measured"]
+    assert [i.key for i in task.inputs] == ["sums/r2"] and task.after == ("sums.r2",)
+    work(job)
+    description, values = _stored(tmp_path / "project", "measured")
+    assert list(description["scope"]["frames"]) == ["r2"]
+    assert values["total"] == _stored(tmp_path / "project", "sums/r2")[1]["total"]
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    assert queue.tasks(create_job(jobs, steps, one, config)) == {}
+    other = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"\['r2'\], which are not selected"):
+        create_job(jobs, steps, other, config)
 
 
 def test_an_input_made_outside_the_job_is_bound_by_its_token(tmp_path):

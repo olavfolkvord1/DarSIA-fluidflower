@@ -177,20 +177,12 @@ def _times(selection: Selection, tables: Mapping) -> tuple[str, ...]:
 
 def _distances(ctx: StepContext) -> None:
     """The distances of every pair of runs in every domain at one time, on the
-    configured reference run's sand map.
-
-    Raises
-    ------
-    ValueError
-        If the reference run is not one of the selection's.
-
-    """
+    configured reference run's sand map, which a job must select
+    (:attr:`Step.required`)."""
     settings, distances = ctx.settings["wasserstein"], ctx.settings["distances"]
     material, domains = ctx.settings["material"], _domains(ctx)
     time_h = named_times(distances.times_h)[ctx.task.part]
     run = distances.reference_run
-    if run not in ctx.selection.frames:
-        raise ValueError(f"The distances' reference run {run} is not selected.")
     grid = run_grid(ctx.read("rig", read_rig, run=run), material)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     reference = wasserstein_reference(
@@ -285,6 +277,7 @@ DISTANCES = Step(
     sections=EXPERIMENT,
     files=protocol_files,
     domains=True,
+    required=lambda tables: [tables["distances"]["reference_run"]],
 )
 """The distances at each comparison time (R9)."""
 STEPS = (EVENTS, ENSEMBLE, DISTANCES)

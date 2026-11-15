@@ -718,6 +718,7 @@ OVERFLOW = Step(
     {"overflow": darsia.OverflowSettings, "calibration_runs": FitRuns},
     sections=EXPERIMENT,
     files=protocol_files,
+    required=lambda tables: tables["calibration_runs"]["fit"],
 )
 """Each run's free-gas volume per frame, its own or a donor's."""
 PHASE_MAPS = Step(
@@ -776,6 +777,10 @@ CALIBRATION = Step(
         "run_statistics": darsia.RunStatisticsSettings,
     },
     _calibration_parts,
+    required=lambda tables: [
+        *tables["calibration_runs"]["fit"],
+        *tables["calibration_runs"].get("folds", ()),
+    ],
 )
 """The calibration fit and its folds (R6)."""
 STEPS = (

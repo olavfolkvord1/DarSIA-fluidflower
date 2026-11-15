@@ -46,7 +46,9 @@ from darsia.jobs.step import (
     Task,
     file_identity,
     merged,
+    missing_runs,
     outputs,
+    read_runs,
     request,
     table,
 )
@@ -278,8 +280,9 @@ def _units(step: Step, selection: Selection, tables: Mapping):
 def _reads(
     step: Step, run, frames, part, kinds: Mapping[str, Step], selection, tables
 ) -> list[Input]:
-    """The results one unit of a step reads, by the scope of each read."""
-    found = []
+    """The results one unit of a step reads, by the scope of each read: a read of
+    every run is of the runs the step reads over the selection (:func:`read_runs`)."""
+    found, every = [], read_runs(step, selection, tables)
     for kind, wanted in step.reads.items():
         if kind not in kinds:
             raise ValueError(f"No step makes {kind}, which {step.name} reads.")
@@ -292,10 +295,10 @@ def _reads(
         elif wanted is Scope.ONE:
             raise ValueError(f"{kind} is not a single result ({step.name}).")
         elif stored is Each.FRAME:
-            runs = selection.frames if wanted is Scope.ALL else {run: frames}
+            runs = every if wanted is Scope.ALL else {run: frames}
             found += [Input(kind, r, f) for r, fs in runs.items() for f in fs]
         elif stored is Each.RUN:
-            runs = selection.frames if wanted is Scope.ALL else [run]
+            runs = every if wanted is Scope.ALL else [run]
             found += [Input(kind, r) for r in runs]
         elif wanted is Scope.ALL:
             found += [Input(kind, part=p) for p in producer.parts(selection, tables)]
@@ -519,6 +522,12 @@ def _plan(steps, selection, tables, env, creation, kinds):
     refused: list[str] = []
     made_tasks: list[Task] = []
     for step in _ordered(steps):
+        missing = missing_runs(step, selection, tables)
+        if missing:
+            raise ValueError(
+                f"{step.name} needs run(s) {missing}, which its configuration names "
+                "and the selection lacks."
+            )
         kept: list[Task] = []
         for run, frames, part in _units(step, selection, tables):
             inputs = []
