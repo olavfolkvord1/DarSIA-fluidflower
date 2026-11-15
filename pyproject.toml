@@ -97,6 +97,9 @@ raw = [
   "rawpy",
   "tifffile",
 ]
+opencl = [
+  "pyopencl",
+]
 docs = [
   "sphinx>=7.2",
   "pydata-sphinx-theme>=0.15",
