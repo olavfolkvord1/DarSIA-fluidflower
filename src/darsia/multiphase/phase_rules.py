@@ -24,9 +24,12 @@ Beside each phase map, a rule map records which rule last changed each pixel's
 label (:class:`PhaseRule`). With it, :func:`model_gas` gives the free gas the
 phase model found before gravity (and a later peel) made it dissolved CO2.
 
-Distances are physical, taken from the grid of the sand map; the area of a
-component is the sum of its pixels' areas, which the caller gives. Every
-setting is a field of :class:`PhaseRuleSettings`.
+Distances are physical, taken from each pixel's position on the rig
+(:func:`darsia.grid_positions`: by the run's measured model of its grid, else the
+sand map's pixel centres) and the grid's pitch, in the arithmetic our production's
+rules used with its measured positions; the area of a component is the sum of its
+pixels' areas, which the caller gives. Every setting is a field of
+:class:`PhaseRuleSettings`.
 
 """
 
@@ -127,6 +130,10 @@ class PhaseRuleSettings:
     """Depth of that half-ellipse."""
     finger_width_mm: float
     """CO2 narrower than this, hanging below wider CO2, is a sinking lobe."""
+    pitch_stride: int | None = None
+    """Every how many rows and columns of the measurement canvas the grid's pitch
+    is taken from measured positions (:func:`darsia.grid_positions`), as our
+    production's phase rules took it; needed with a measured model."""
 
 
 def _co2(labels: np.ndarray) -> np.ndarray:
@@ -249,8 +256,9 @@ def _small_bubbles(labels, raw, lowest_port_y, y, pixel_area, settings):
 
     Averaged gas bodies below ``small_bubble_max_mm2`` become dissolved CO2. An
     8-connected piece of the frame's own gas below that area, touching no large
-    averaged body and lying wholly higher than ``small_bubble_min_height_mm``
-    above the lowest started port, is free gas where it is CO2.
+    averaged body and with each of its pixels' heights (``y``, in double
+    precision) more than ``small_bubble_min_height_mm`` above the lowest started
+    port, is free gas where it is CO2.
     """
     bodies, area = _areas(labels == PhaseLabel.GAS, 8, pixel_area)
     large = area >= settings.small_bubble_max_mm2
@@ -263,8 +271,12 @@ def _small_bubbles(labels, raw, lowest_port_y, y, pixel_area, settings):
     small = area < settings.small_bubble_max_mm2
     small[0] = False
     small[np.unique(pieces[(near > 0) & (pieces > 0)])] = False
-    bottom = [box[0].stop - 1 for box in ndimage.find_objects(pieces)]
-    lowest = np.concatenate(([np.inf], y[bottom]))
+    lowest = np.full(len(small), np.inf)
+    if len(small) > 1:
+        heights = np.ascontiguousarray(
+            np.broadcast_to(np.asarray(y, np.float64), pieces.shape)
+        )
+        lowest[1:] = ndimage.minimum(heights, pieces, np.arange(1, len(small)))
     small &= lowest > lowest_port_y + settings.small_bubble_min_height_mm / 1000
     labels[small[pieces] & _co2(labels)] = PhaseLabel.GAS
 
@@ -400,37 +412,56 @@ def _sinking_fingers(co2, anchors, width_mm, pitch_mm):
 def _gravity_limit(co2, started, radius, lower, y, pitch_mm, settings):
     """Where free gas breaks gravity: below the lowest started port, and lobes.
 
-    The started ports' lower zones are exempt from the first; CO2 reaching a
-    started port's radius or lower zone is no sinking lobe. Returns both masks.
+    A pixel is below a port when its height (``y``), in single precision as our
+    production's gravity rule took it, is. The started ports' lower zones are
+    exempt from the first; CO2 reaching a started port's radius or lower zone is
+    no sinking lobe. Returns both masks.
     """
     below = np.zeros(co2.shape, bool)
     anchors = np.zeros(co2.shape, bool)
     if started:
         exempt = np.logical_or.reduce([lower[port] for port in started])
         anchors = exempt | np.logical_or.reduce([radius[port] for port in started])
-        below = (y[:, None] < min(port[1] for port in started)) & ~exempt
+        source = np.float32(min(float(port[1]) for port in started))
+        below = (np.asarray(y, np.float32) < source) & ~exempt
     return below, _sinking_fingers(co2, anchors, settings.finger_width_mm, pitch_mm)
 
 
-def _pitch_mm(grid: darsia.Image) -> tuple[float, float]:
-    """The grid's pitch [mm] down a column and along a row."""
-    dy, dx = grid.voxel_size
-    return dy * 1000, dx * 1000
-
-
 def _port_zones(x, y, ports, settings):
-    """Each port's radius disc and the lower half-ellipse below it."""
+    """Each port's radius disc and the lower half-ellipse below it, clipped at the
+    rig's floor, from the pixels' positions (x, y [m]) in their precision, as our
+    production's port zones."""
+    radius_m = settings.port_radius_mm / 1000
+    across = 1000 / settings.port_zone_half_width_mm
+    down = 1000 / settings.port_zone_depth_mm
     radius, lower = {}, {}
     for port in ports:
-        lateral = (x[None, :] - port[0]) * 1000
-        height = (y[:, None] - port[1]) * 1000
-        radius[port] = lateral**2 + height**2 <= settings.port_radius_mm**2
-        lower[port] = (height <= 0) & (
-            (lateral / settings.port_zone_half_width_mm) ** 2
-            + (height / settings.port_zone_depth_mm) ** 2
-            <= 1
-        )
+        px, py = float(port[0]), float(port[1])
+        radius[port] = (x - px) ** 2 + (y - py) ** 2 <= radius_m**2
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            lateral = (x - px) * across
+            depth = (py - y) * down
+            lower[port] = (y <= py) & (y >= 0) & (lateral**2 + depth**2 <= 1)
     return radius, lower
+
+
+def _home_compartments(compartments, x, y, ports):
+    """Each port's compartment: that of the compartment pixel nearest to it, by
+    the squared distance in metres in double precision, the first in row-major
+    order on a tie, as our production found it; 0 without compartments."""
+    x, y = (np.asarray(v, np.float64) for v in (x, y))
+    inside = compartments > 0
+    home = {}
+    for port in ports:
+        d2 = (x - float(port[0])) ** 2 + (y - float(port[1])) ** 2
+        home[port] = compartments.flat[np.where(inside, d2, np.inf).argmin()]
+    return home
+
+
+def _single(positions: darsia.GridPositions) -> tuple[np.ndarray, np.ndarray]:
+    """The positions in single precision, as our production's gravity rule took
+    them."""
+    return np.asarray(positions.x, np.float32), np.asarray(positions.y, np.float32)
 
 
 def _seal(facies, domain, permeability, settings):
@@ -466,6 +497,7 @@ def phase_maps(
     *,
     gas_threshold: float,
     start: int = 0,
+    positions: darsia.GridPositions | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Phase maps of a run's frames, by its phase probabilities and the rules.
 
@@ -511,6 +543,10 @@ def phase_maps(
     start : int, optional
         Index of the first frame whose maps are made; the earlier frames are
         read only as neighbours.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig and the grid's pitch, by the run's
+        measured model of its grid; by default the sand map's pixel centres
+        (:func:`darsia.grid_positions`).
 
     Yields
     ------
@@ -519,14 +555,25 @@ def phase_maps(
         each frame from ``start`` on, in order; the rule map is zero where no rule
         changed the label.
 
+    Raises
+    ------
+    ValueError
+        If measured positions come without the grid's pitch.
+
     """
     facies = sand_map.img
-    x, y = darsia.pixel_centres(sand_map)
-    pitch_mm = _pitch_mm(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
+    if positions.pitch_mm is None:
+        raise ValueError(
+            "Measured positions need the grid's pitch: take them with a pitch stride"
+        )
+    x, y = positions.x, positions.y
+    pitch_mm = positions.pitch_mm
 
     injecting = protocol.df[protocol.df["rate_kg_s"] > 0]
     first_start = dict(injecting.groupby(["location_x", "location_y"])["start"].min())
-    radius, lower = _port_zones(x, y, first_start, settings)
+    radius, lower = _port_zones(*_single(positions), first_start, settings)
 
     free = np.isin(facies, settings.free_water_facies)
     region = None
@@ -541,17 +588,7 @@ def phase_maps(
     count, compartments = cv2.connectedComponents(
         open_.astype(np.uint8), connectivity=8
     )
-    home = {
-        port: compartments.flat[
-            np.where(
-                compartments > 0,
-                ((y[:, None] - port[1]) * 1000) ** 2
-                + ((x[None, :] - port[0]) * 1000) ** 2,
-                np.inf,
-            ).argmin()
-        ]
-        for port in first_start
-    }
+    home = _home_compartments(compartments, x, y, first_start)
 
     for index in range(start, len(dates)):
         (co2, gas), date = probabilities[index], dates[index]
