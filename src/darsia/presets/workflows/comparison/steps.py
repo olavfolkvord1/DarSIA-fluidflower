@@ -7,7 +7,8 @@
 - ``distances`` (R9) gives, at each comparison time, the Wasserstein distance of
   every pair of selected runs in every domain, each run at its frame nearest the
   time (:func:`wasserstein_distances`); one part per time, named by the time as
-  configured. The first selected run's sand map is the reference.
+  configured. The configured reference run's sand map and geometry are the
+  reference.
 
 Each frame's production target is its own time since the injection start, as in
 the run statistics. The comparisons' domains are the selection's, defined in the
@@ -84,6 +85,9 @@ class DistanceSettings:
     tolerance_h: float
     """Largest distance of a run's frame from a time; a run without one is
     missing at that time."""
+    reference_run: str
+    """The run whose sand map and geometry are the reference of every distance;
+    one of the selection's runs."""
     chart_labels: Sequence[int] = ()
     """Labels of the colour checker in the rig's labels."""
 
@@ -172,12 +176,41 @@ def _times(selection: Selection, tables: Mapping) -> tuple[str, ...]:
 
 
 def _distances(ctx: StepContext) -> None:
-    """The distances of every pair of runs in every domain at one time; the first
-    selected run's sand map is the reference."""
+    """The distances of every pair of runs in every domain at one time, on the
+    configured reference run's sand map.
+
+    Raises
+    ------
+    ValueError
+        If the reference run is not one of the selection's.
+
+    """
     settings, distances = ctx.settings["wasserstein"], ctx.settings["distances"]
     material, domains = ctx.settings["material"], _domains(ctx)
     time_h = named_times(distances.times_h)[ctx.task.part]
-    frames, reference, scales = {}, None, None
+    run = distances.reference_run
+    if run not in ctx.selection.frames:
+        raise ValueError(f"The distances' reference run {run} is not selected.")
+    grid = run_grid(ctx.read("rig", read_rig, run=run), material)
+    experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
+    reference = wasserstein_reference(
+        grid.rig.labels,
+        grid.rig.permeability.img,
+        grid.rig.porosity.img,
+        ctx.settings["domains"].sand_labels,
+        distances.chart_labels,
+        domains,
+        settings,
+    )
+    scales = distance_scales(
+        time_h,
+        experiment.injection_protocol,
+        co2_state(grid, experiment, experiment.experiment_start),
+        grid.rig.depth.img,
+        grid.rig.facies.dimensions,
+        domains,
+    )
+    frames = {}
     for run, run_frames in ctx.selection.frames.items():
         grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
@@ -186,24 +219,6 @@ def _distances(ctx: StepContext) -> None:
             (experiment.get_datetime(ctx.photo(run, f)) - start).total_seconds() / 3600
             for f in run_frames
         ]
-        if reference is None:
-            reference = wasserstein_reference(
-                grid.rig.labels,
-                grid.rig.permeability.img,
-                grid.rig.porosity.img,
-                ctx.settings["domains"].sand_labels,
-                distances.chart_labels,
-                domains,
-                settings,
-            )
-            scales = distance_scales(
-                time_h,
-                experiment.injection_protocol,
-                co2_state(grid, experiment, start),
-                grid.rig.depth.img,
-                grid.rig.facies.dimensions,
-                domains,
-            )
         nearest = int(np.argmin([abs(h - time_h) for h in hours]))
         if abs(hours[nearest] - time_h) > distances.tolerance_h:
             frames[run] = None

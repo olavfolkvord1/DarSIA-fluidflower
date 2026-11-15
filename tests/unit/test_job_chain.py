@@ -202,8 +202,11 @@ copy_mm = 10.0
 [distances]
 times_h = [3.0]
 tolerance_h = 0.6
+reference_run = "r2"
 [runs.r2.data]
 folder = "photos-r2"
+[runs.r2.depth]
+depth_map = "depth-r2.npz"
 [runs.r2.protocols]
 overflow = "overflow-r2.csv"
 [runs.r1.protocols]
@@ -255,6 +258,9 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     darsia.ScalarImage(labels, dimensions=[0.3, 0.45]).save(root / "labels.npz")
     depth = darsia.ScalarImage(np.full((120, 180), 0.01), dimensions=[0.3, 0.45])
     depth.save(root / "depth.npz")
+    # The second run's rig is deeper, so that the distances' reference run counts.
+    deeper = darsia.ScalarImage(np.full((120, 180), 0.012), dimensions=[0.3, 0.45])
+    deeper.save(root / "depth-r2.npz")
     (root / "props.csv").write_text("id,porosity,permeability\n1,0.44,100\n2,0.4,50\n")
     corners = [(x, y) for y in (0, 0.15, 0.3) for x in (0, 0.225, 0.45)]
     drawing = {
@@ -507,28 +513,28 @@ def _direct(root: Path, selection: Selection) -> dict:
         domain_mass[run] = rows
     wasserstein = settings(WassersteinSettings, "wasserstein")
     chart = settings(comparison.DistanceSettings, "distances").chart_labels
-    found, reference, scales = {}, None, None
+    grid, experiment = runs["r2"][:2]  # the configured reference run
+    reference = wasserstein_reference(
+        grid.rig.labels,
+        grid.rig.permeability.img,
+        grid.rig.porosity.img,
+        sand_labels,
+        chart,
+        domains,
+        wasserstein,
+    )
+    scales = distance_scales(
+        3.0,
+        experiment.injection_protocol,
+        calibration.co2_state(grid, experiment, experiment.experiment_start),
+        grid.rig.depth.img,
+        grid.rig.facies.dimensions,
+        domains,
+    )
+    found = {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
         start = experiment.experiment_start
         hours = [(date - start).total_seconds() / 3600 for date in dates]
-        if reference is None:  # the first run's sand map
-            reference = wasserstein_reference(
-                grid.rig.labels,
-                grid.rig.permeability.img,
-                grid.rig.porosity.img,
-                sand_labels,
-                chart,
-                domains,
-                wasserstein,
-            )
-            scales = distance_scales(
-                3.0,
-                experiment.injection_protocol,
-                calibration.co2_state(grid, experiment, start),
-                grid.rig.depth.img,
-                grid.rig.facies.dimensions,
-                domains,
-            )
         nearest = int(np.argmin([abs(h - 3.0) for h in hours]))
         frame = selection.frames[run][nearest]
         found[run] = frame_cells(
