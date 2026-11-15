@@ -98,6 +98,15 @@ def _resolve_named_roi_voxels(
 class Rig:
     """Rig object for CO2 analysis."""
 
+    grid_to_rig: list[list[float]] | None = None
+    """The run's measured model of its grid, the homography from the grid's pixels
+    to rig metres, by which each pixel is placed on the rig
+    (:func:`darsia.grid_positions`); None for a grid in rig metres."""
+
+    measurement_canvas: darsia.MeasurementCanvas | None = None
+    """The canvas the run's pixels were measured on, in the grid's pixels, with
+    the model (e.g. a padded canvas around the grid); None for the grid itself."""
+
     @property
     def corrections(self) -> list[darsia.BaseCorrection]:
         """Combined correction workflow in execution order."""
@@ -1388,6 +1397,13 @@ class Rig:
         }
         if getattr(self, "raw_decoding", {}):
             meta_data["raw_decoding"] = self.raw_decoding
+        if self.grid_to_rig is not None:
+            meta_data["grid_to_rig"] = np.asarray(self.grid_to_rig, float).tolist()
+        if self.measurement_canvas is not None:
+            meta_data["measurement_canvas"] = {
+                "origin": [int(v) for v in self.measurement_canvas.origin],
+                "shape": [int(v) for v in self.measurement_canvas.shape],
+            }
         # The setup's reference of each photograph's registration, or none; the
         # record says which, so that a file not found is not taken for none.
         registration = getattr(self, "registration", None)
@@ -1510,6 +1526,13 @@ class Rig:
             meta_data = json.load(f)
         rig.baseline_path = Path(meta_data["baseline_path"])
         rig.raw_decoding = meta_data.get("raw_decoding", {})
+        rig.grid_to_rig = meta_data.get("grid_to_rig")
+        canvas = meta_data.get("measurement_canvas")
+        rig.measurement_canvas = None
+        if canvas is not None:
+            rig.measurement_canvas = darsia.MeasurementCanvas(
+                tuple(canvas["origin"]), tuple(canvas["shape"])
+            )
         # A rig saved without a canvas has an unknown canvas.
         rig.canvas = meta_data.get("canvas")
         rig.registration = None

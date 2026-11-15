@@ -253,6 +253,9 @@ class RunGrid:
     pixel_mm: float
     datum_m: float
     optical_pitch: tuple[float, float]
+    positions: darsia.GridPositions
+    """Each pixel's position on the rig and the grid's pitch, by the rig's measured
+    model of its grid (:func:`darsia.grid_positions`), in the grid's precision."""
     pixel_area_mm2: np.ndarray
     """Each pixel's area [mm2], the rig's pixel areas in double precision times a
     million, as our production's phase rules took them."""
@@ -261,10 +264,11 @@ class RunGrid:
 def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
     """A run's grid: its facies and their permeability, the domain of the facies
     with one, the geometry with each facies' Swi, the colour checker, the pixel
-    size, the datum of the hydrostatic head and the pitch on the sand plane.
+    size, the datum of the hydrostatic head, the pitch on the sand plane, and each
+    pixel's position on the rig by the rig's measured model of its grid.
 
-    Depth, porosity and Swi take the precision of the rig's pixel areas, the run
-    grid's.
+    Depth, porosity, Swi and the measured positions take the precision of the
+    rig's pixel areas, the run grid's.
 
     """
     facies = rig.facies.img
@@ -305,6 +309,9 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
         float(rig.baseline.voxel_size[0]) * 1000,
         float(datum),
         darsia.optical_pitch_m(rig.pixel_area, domain),
+        darsia.grid_positions(
+            rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas
+        ),
         np.asarray(rig.pixel_area.img, np.float64) * 1e6,
     )
 

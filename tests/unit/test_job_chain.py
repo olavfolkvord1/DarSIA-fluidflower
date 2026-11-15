@@ -1382,7 +1382,8 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     fitting grid: with the reference's stored baseline and facies, the fit mask the
     reference's own fit read, and the homography between the runs' grids built in
     the rig's precision; the reference run itself is fitted on its own grid and is
-    made first."""
+    made first. A run's rig keeps its measured model, by which its depth rule and
+    its run grid's positions place each pixel."""
     project = tmp_path / "project"
     config, selection = _project(project, "float32")
     monkeypatch.chdir(project)
@@ -1405,6 +1406,7 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
         + '[material_reference]\nrun = "r2"\n'
         + '[runs.r2.corrections.material_illumination]\nfit_mask = "mask-r2.npz"\n'
         + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {measured.tolist()}\n"
+        + "canvas_origin = [-5, -3]\ncanvas_shape = [126, 190]\n"
     )
     job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
     tasks = queue.tasks(job)
@@ -1470,6 +1472,53 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     centres = np.stack(np.meshgrid(cx, cy), axis=-1).reshape(-1, 2).astype(f32)
     nominal, _ = darsia.interpolate_linear_in_hull(measurements, centres)
     assert not np.array_equal(first.depth.img, nominal.reshape(120, 180))
+    # The rig keeps its model, and its run grid places each pixel by it.
+    assert first.grid_to_rig == measured.tolist() and reference.grid_to_rig is None
+    # It keeps the canvas its pixels were measured on.
+    canvas = darsia.MeasurementCanvas((-5, -3), (126, 190))
+    assert first.measurement_canvas == canvas and reference.measurement_canvas is None
+    material = settings_from_table(
+        calibration.MaterialSettings, table(tables, "material")
+    )
+    placed = calibration.run_grid(first, material).positions
+    assert np.array_equal(placed.x, x) and np.array_equal(placed.y, y)
+
+
+def test_a_measurement_canvas_goes_with_a_model_and_holds_the_grid():
+    """A run's measurement canvas is its first pixel's column and row on the grid
+    and its rows and columns, given together and with the grid's measured model;
+    without them there is none."""
+    model = np.eye(3).tolist()
+    table = {"grid_to_rig": model, "canvas_origin": [-4, -2], "canvas_shape": [9, 12]}
+    found = setup.grid_canvas({"labeling": {"sand_map": table}})
+    assert found == darsia.MeasurementCanvas((-4, -2), (9, 12))
+    assert setup.grid_canvas({"labeling": {"sand_map": {"grid_to_rig": model}}}) is None
+    for wrong in (
+        {"grid_to_rig": model, "canvas_origin": [-4, -2]},
+        {"grid_to_rig": model, "canvas_shape": [9, 12]},
+        {"canvas_origin": [-4, -2], "canvas_shape": [9, 12]},
+    ):
+        with pytest.raises(ValueError, match="go together"):
+            setup.grid_canvas({"labeling": {"sand_map": wrong}})
+
+
+def test_a_measured_model_of_another_grid_than_the_rigs_is_refused(
+    tmp_path, monkeypatch
+):
+    """A measured model is that of the sand map's grid: a rig scaled to whole
+    metric cells, another grid, with a model is refused."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float32")
+    monkeypatch.chdir(project)
+    grid = darsia.Image(np.zeros((120, 180)), dimensions=[0.3, 0.45])
+    model = np.linalg.inv(rig_grid(grid))
+    config.write_text(
+        config.read_text()
+        + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {model.tolist()}\n"
+    )
+    job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
+    with pytest.raises(ValueError, match="the rig's grid is another one"):
+        _run(job)
 
 
 def test_a_run_reads_its_reference_runs_files_in_the_read_of_its_rig(
