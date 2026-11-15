@@ -21,10 +21,18 @@ simulator's porous domain is completed from it (:func:`complete_geometry`):
 3. a pixel of the domain that is neither sand nor sand drawn beneath a fixture is
    refused.
 
+The completed domain is scaled onto metric cells by the one scaling method
+(:func:`darsia.metric_cells`; areas and volumes summed in double precision by
+:func:`darsia.cell_sums`), per cell size (:func:`geometry_cells`). The arrays are
+written with their rows from the floor up (y increasing) and their columns from the
+left (x increasing), the origin at the rig's lower left inner corner, as a
+simulator's grid runs.
+
 """
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -34,6 +42,24 @@ from darsia.presets.workflows.setup.sand_map import (
     rasterize_sand_map,
     rig_grid,
 )
+
+UNITS = {
+    "facies_majority": "facies id",
+    "facies_majority_area_fraction": "1 of the domain area",
+    "facies_ids": "facies id",
+    "facies_area_fractions": "1 of the domain area (one layer per facies id)",
+    "porosity": "1 (pore over bulk volume)",
+    "depth_m": "m",
+    "pore_volume_m3": "m3",
+    "bulk_volume_m3": "m3",
+    "domain_area_m2": "m2",
+    "domain_area_fraction": "1 of the cell",
+    "drawn_behind_area_fraction": "1 of the cell",
+    "drawn_behind": "flag",
+    "drawn_behind_facies_ids": "facies id",
+    "drawn_behind_facies_area_fractions": "1 of the cell (one layer per facies id)",
+}
+"""The arrays of a geometry on metric cells and their units."""
 
 
 @dataclass(frozen=True)
@@ -50,6 +76,11 @@ class SimulatorExportSettings:
     excluded_facies: Sequence[int]
     """Facies outside the porous domain wherever they lie, e.g. silicone along the
     walls."""
+    cell_sizes_mm: Sequence[float]
+    """Sizes [mm] of the metric cells of the package, one geometry each."""
+    precision: Literal["float32", "float64"]
+    """Precision of the package's arrays; areas and volumes are summed in double
+    precision."""
 
 
 @dataclass(frozen=True)
@@ -256,3 +287,115 @@ def complete_geometry(
     return CompletedGeometry(
         np.where(drawn, drawn_facies, facies), domain, drawn, counts
     )
+
+
+def geometry_cells(
+    completed: CompletedGeometry,
+    depth_m: np.ndarray,
+    porosity: Mapping[int, float],
+    dimensions: Sequence[float],
+    cell_size_mm: float,
+    precision: str,
+) -> dict[str, np.ndarray]:
+    """The completed geometry on metric cells (:func:`darsia.metric_cells`).
+
+    Each pixel's area, bulk volume (area times depth) and pore volume (times the
+    porosity of its facies, taken in the depth's floating dtype) are formed and
+    summed over each cell in double precision, as our production formed them with
+    its double-precision pixel areas and summed them. Per cell (:data:`UNITS`): the
+    domain's area and its fraction of the cell; the area fraction of each facies of
+    the domain and the majority facies (the lowest on a tie; 0 without domain); bulk
+    and pore volume, porosity (pore over bulk volume) and depth (bulk volume over
+    area); and the area drawn behind fixtures,
+    also outside the domain, per drawn facies. Ratios are NaN in a cell without
+    domain. Rows run from the floor up.
+
+    Parameters
+    ----------
+    completed : CompletedGeometry
+        The domain on the export canvas (:func:`complete_geometry`).
+    depth_m : array
+        Depth [m] of each pixel of the canvas.
+    porosity : mapping
+        Porosity of each facies of the domain.
+    dimensions : sequence of float
+        Height and width [m] of the canvas.
+    cell_size_mm : float
+        Size [mm] of the cells.
+    precision : str
+        Precision of the arrays (``"float32"`` or ``"float64"``).
+
+    Returns
+    -------
+    dict of str to array
+        The arrays of :data:`UNITS`.
+
+    """
+    domain = completed.domain
+    cells = darsia.metric_cells(domain.shape, list(dimensions), cell_size_mm)
+    area = np.float64(cells.pixel_area)
+    facies = np.where(domain, completed.facies, 0)
+    present = [int(value) for value in np.unique(facies[domain])]
+    depth_m = np.asarray(depth_m)
+    phi = np.zeros(domain.shape, np.result_type(depth_m, np.float32))
+    for facies_id in present:
+        phi[domain & (facies == facies_id)] = porosity[facies_id]
+    depth = np.where(domain, depth_m, 0).astype(np.float64)
+    phi = phi.astype(np.float64)
+
+    def sums(values):
+        """Sums over each cell, the rows from the floor up."""
+        return darsia.cell_sums(cells, values)[::-1]
+
+    def stored(values):
+        """The values in the package's precision."""
+        return np.asarray(values).astype(precision)
+
+    domain_area = sums(np.where(domain, area, 0.0))
+    bulk = sums(area * depth)
+    pore = sums(area * depth * phi)
+    by_facies = [sums(np.where(domain & (facies == f), area, 0.0)) for f in present]
+    majority = np.zeros(domain_area.shape, np.int32)
+    largest = np.zeros(domain_area.shape)
+    for facies_id, weights in zip(present, by_facies):
+        larger = weights > largest
+        majority[larger] = facies_id
+        largest[larger] = weights[larger]
+    cell_area = (cell_size_mm / 1000.0) * (cell_size_mm / 1000.0)
+    drawn = completed.drawn_behind
+    drawn_ids = [int(value) for value in np.unique(completed.facies[drawn])]
+    arrays = {
+        "facies_majority": majority,
+        "facies_majority_area_fraction": stored(
+            darsia.cell_ratio(largest, domain_area)
+        ),
+        "facies_ids": np.asarray(present, np.int32),
+        "facies_area_fractions": stored(
+            np.stack([darsia.cell_ratio(w, domain_area) for w in by_facies])
+            if present
+            else np.zeros((0, *domain_area.shape))
+        ),
+        "porosity": stored(darsia.cell_ratio(pore, bulk)),
+        "depth_m": stored(darsia.cell_ratio(bulk, domain_area)),
+        "pore_volume_m3": stored(pore),
+        "bulk_volume_m3": stored(bulk),
+        "domain_area_m2": stored(domain_area),
+        "domain_area_fraction": stored(domain_area / cell_area),
+        "drawn_behind_area_fraction": stored(
+            sums(np.where(drawn, area, 0.0)) / cell_area
+        ),
+        "drawn_behind_facies_ids": np.asarray(drawn_ids, np.int32),
+        "drawn_behind_facies_area_fractions": stored(
+            np.stack(
+                [
+                    sums(np.where(drawn & (completed.facies == f), area, 0.0))
+                    / cell_area
+                    for f in drawn_ids
+                ]
+            )
+            if drawn_ids
+            else np.zeros((0, *domain_area.shape))
+        ),
+    }
+    arrays["drawn_behind"] = np.nan_to_num(arrays["drawn_behind_area_fraction"]) > 0
+    return {name: arrays[name] for name in UNITS}

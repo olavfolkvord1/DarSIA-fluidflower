@@ -1,13 +1,15 @@
-"""Tests of the simulator export: the sand map filled to the frame and the completed
-geometry."""
+"""Tests of the simulator export: the sand map filled to the frame, the completed
+geometry and its cells."""
 
 import numpy as np
 import pytest
 
 import darsia
 from darsia.presets.workflows.export.simulator import (
+    CompletedGeometry,
     SimulatorExportSettings,
     complete_geometry,
+    geometry_cells,
     sand_layers,
 )
 from darsia.presets.workflows.setup.sand_map import (
@@ -21,8 +23,11 @@ SETTINGS = dict(
     free_water_facies=[1],
     fixture_facies=[9],
     excluded_facies=[10],
+    cell_sizes_mm=[1.0],
+    precision="float32",
 )
-"""Export settings of the tests: the facies of the test rig."""
+"""Export settings of the tests: our production's cell size and precision, and the
+facies of the test rig."""
 
 
 def test_sand_behind_a_fixture_is_the_sand_drawn_beneath_it():
@@ -114,3 +119,38 @@ def test_every_pixel_no_layer_covers_takes_the_nearest_layer():
     shifted = darsia.Image(np.zeros(shape), dimensions=[0.1, 0.2], origin=[0.01, 0.11])
     with pytest.raises(ValueError, match="lower left corner"):
         sand_layers(drawing, shifted, [9])
+
+
+def test_cells_sum_the_domain_s_volumes_and_take_the_lowest_majority():
+    """On metric cells, bulk and pore volume are sums over the domain's pixels,
+    porosity is pore over bulk volume and depth bulk volume over domain area, both
+    NaN without domain; the majority goes to the lower facies on a tie, the rows run
+    from the floor up, and the arrays are stored in the chosen precision."""
+    facies = np.array([[2, 2, 5, 5], [2, 5, 5, 5], [2, 2, 5, 5], [5, 5, 2, 2]])
+    domain = np.ones((4, 4), bool)
+    domain[0, 0] = False  # a pixel outside in the upper left cell
+    domain[:2, 2:] = False  # and no domain in the upper right cell
+    depth = np.broadcast_to(np.float32([0.010, 0.011, 0.012, 0.013]), (4, 4))
+    none = np.zeros((4, 4), bool)
+    completed = CompletedGeometry(np.where(domain, facies, -1), domain, none, {})
+
+    cells = geometry_cells(
+        completed, depth, {2: 0.4, 5: 0.2}, [0.004, 0.004], 2.0, "float32"
+    )
+
+    assert cells["porosity"].dtype == np.float32
+    assert np.array_equal(cells["facies_majority"], [[2, 2], [2, 0]])
+    np.testing.assert_allclose(cells["domain_area_fraction"], [[1, 1], [0.75, 0]])
+    d = depth[0].astype(np.float64)
+    # Lower left cell: sand 2 over sand 5 in columns 0 and 1; upper left: three pixels.
+    bulk = [1e-6 * 2 * (d[0] + d[1]), 1e-6 * (d[1] + d[0] + d[1])]
+    pore = [1e-6 * 0.6 * (d[0] + d[1]), 1e-6 * (0.4 * d[1] + 0.4 * d[0] + 0.2 * d[1])]
+    np.testing.assert_allclose(cells["bulk_volume_m3"][:, 0], bulk, rtol=1e-6)
+    np.testing.assert_allclose(cells["pore_volume_m3"][:, 0], pore, rtol=1e-6)
+    np.testing.assert_allclose(
+        cells["porosity"][:, 0], np.divide(pore, bulk), rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        cells["depth_m"][:, 0], np.divide(bulk, [4e-6, 3e-6]), rtol=1e-6
+    )
+    assert np.isnan(cells["porosity"][1, 1]) and np.isnan(cells["depth_m"][1, 1])
