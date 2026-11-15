@@ -68,7 +68,8 @@ class Scope(Enum):
     an ensemble, a comparison time or a donor."""
     ONE = "one"
     """The single result, e.g. the phase model; of a step in parts, its first
-    part, e.g. the global fit before the folds."""
+    part, e.g. the global fit before the folds, or the part it names for the
+    reader's run (:attr:`Step.run_part`), e.g. the fit of the run's group."""
 
 
 class Each(Enum):
@@ -288,6 +289,11 @@ class Step:
     the fit runs among which a run's overflow ranks its donors and over which the
     calibration fits, or the distances' reference run; a job without one of them
     is refused (:func:`missing_runs`)."""
+    run_part: Callable[[str, Mapping[str, Any]], str] | None = None
+    """For a step in parts, the part that a task of a run reads by
+    :attr:`Scope.ONE`, given the run and the configuration's tables, e.g. the fit
+    of the run's calibration group; by default, and for a task of no run, the
+    step's first part."""
 
     @property
     def stored(self) -> Each:

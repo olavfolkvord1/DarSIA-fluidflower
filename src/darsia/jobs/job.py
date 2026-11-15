@@ -281,7 +281,9 @@ def _reads(
     step: Step, run, frames, part, kinds: Mapping[str, Step], selection, tables
 ) -> list[Input]:
     """The results one unit of a step reads, by the scope of each read: a read of
-    every run is of the runs the step reads over the selection (:func:`read_runs`)."""
+    every run is of the runs the step reads over the selection (:func:`read_runs`);
+    a unit of a run reads the single part of a step in parts that the producer
+    names for its run (:attr:`Step.run_part`), any other unit its first part."""
     found, every = [], read_runs(step, selection, tables)
     for kind, wanted in step.reads.items():
         if kind not in kinds:
@@ -291,7 +293,11 @@ def _reads(
         if stored is Each.ONE:
             found.append(Input(kind))
         elif wanted is Scope.ONE and stored is Each.PART:
-            found.append(Input(kind, part=producer.parts(selection, tables)[0]))
+            if producer.run_part is not None and run is not None:
+                one = producer.run_part(run, tables)
+            else:
+                one = producer.parts(selection, tables)[0]
+            found.append(Input(kind, part=one))
         elif wanted is Scope.ONE:
             raise ValueError(f"{kind} is not a single result ({step.name}).")
         elif stored is Each.FRAME:
