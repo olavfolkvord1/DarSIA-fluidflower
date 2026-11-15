@@ -2,6 +2,7 @@
 
 import tomllib
 
+import cv2
 import numpy as np
 import pytest
 from matplotlib import colormaps
@@ -30,6 +31,17 @@ from darsia.presets.workflows.media.panels import (
     shared_axes,
 )
 from darsia.presets.workflows.media.style import Curve, FigureStyle, bgr
+from darsia.presets.workflows.media.tiles import (
+    Frame,
+    Panel,
+    SandGeometry,
+    TileSettings,
+    draw_tile,
+    graph_axes,
+    read_tile_index,
+    save_tile,
+    write_tile_index,
+)
 from darsia.presets.workflows.media.video import MovieWriter
 
 TABLES = tomllib.loads(
@@ -59,6 +71,13 @@ TABLES = tomllib.loads(
         {column = "injected_mass_g", name = "Injected", colour = "black", line = "--"},
     ]
 
+    # Our production's films: 1120 pixel wide tiles on a display grid of at most
+    # 1280 cells, every map from 0 to 1.7 g/L, the graphs on axes shared by the runs.
+    [tiles]
+    width_px = 1120
+    display_cells = 1280
+    colour_scale = 1.7
+
     # Our production's films ran at 3 frames per second in H.264 ("avc1"), which
     # not every OpenCV build writes; the tests write MPEG-4.
     [video]
@@ -73,7 +92,10 @@ STYLE = FigureStyle(
         "curves": tuple(Curve(**curve) for curve in TABLES["style"]["curves"]),
     }
 )
+TILES = TileSettings(**TABLES["tiles"], graph_axes=None)
 VIDEO = TABLES["video"]
+SMALL = TileSettings(width_px=160, display_cells=40, colour_scale=1.7, graph_axes=None)
+"""Small tiles for quick tests."""
 UNKNOWN = PhaseLabel.UNKNOWN
 
 
@@ -271,7 +293,62 @@ def test_the_graph_marks_the_frame_on_shared_axes():
         lines.append(int(np.argmax(near.sum(axis=0))))
 
     assert axes == ((0.0, 4 * 1.03), (0.0, 0.4 * 1.05))
+    assert graph_axes(TILES, runs, STYLE) == axes
+    fixed = TileSettings(**TABLES["tiles"], graph_axes=((0.0, 9.0), (0.0, 1.0)))
+    assert graph_axes(fixed, runs, STYLE) == fixed.graph_axes
     assert lines[1] > lines[0] + 50
+
+
+def test_each_panel_is_drawn_as_its_settings_choose(tmp_path):
+    """A depth-scaled map differs from the plain one; a grid's graph keeps room at
+    the top; each tile is saved, listed and read back."""
+    values, phase, saturation, layers, volume = layers_frame()
+    sand = SandGeometry(layers, [10, 20], volume, np.full((10, 16), 0.005), 1e-6)
+    frame = Frame(
+        case="r-1",
+        elapsed_h=1.0,
+        target_h=1.0,
+        shape=(10, 16),
+        box=(0, 0, 16, 10),
+        maps={"total_mass": values / 100},
+        unit="g/L",
+        phase=phase,
+        saturation=saturation,
+        sand=sand,
+    )
+    (plain, as_plain), (depth, as_depth) = (
+        draw_tile(
+            Panel("total_mass", "Total CO₂ mass", mean), frame, SMALL, style=STYLE
+        )
+        for mean in ("none", "depth")
+    )
+    wide = TileSettings(400, 40, 1.7, None)
+    (graph, _), (roomy, as_roomy) = (
+        draw_tile(
+            Panel("graph", "Mass graph", "none"),
+            frame,
+            wide,
+            style=STYLE,
+            rows=mass_rows(),
+            axes=((0, 5), (0, 1)),
+            label_room=room,
+        )
+        for room in (False, True)
+    )
+    rows = [save_tile(tmp_path, frame, depth, as_depth)]
+    write_tile_index(tmp_path, rows)
+
+    assert plain.shape == (100, 160, 3) and as_plain == dict(display_mean="none")
+    assert not np.array_equal(plain, depth)
+    assert as_depth == dict(display_mean="depth", window_px=5, window_mm=5.0)
+    assert as_roomy == dict(label_room=True)
+    drawn = [np.argmax((tile < 255).any(axis=(1, 2))) for tile in (graph, roomy)]
+    assert drawn[1] > drawn[0] + 0.1 * graph.shape[0]
+    (row,) = read_tile_index(tmp_path)
+    assert (row["case_id"], row["target_h"], row["size"]) == ("r-1", 1.0, [160, 100])
+    assert (row["display_mean"], row["window_px"]) == ("depth", 5)
+    shown = cv2.cvtColor(cv2.imread(row["path"]), cv2.COLOR_BGR2RGB)
+    np.testing.assert_array_equal(shown, depth)
 
 
 # -- layouts -----------------------------------------------------------------------
