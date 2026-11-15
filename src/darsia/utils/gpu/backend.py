@@ -6,16 +6,23 @@ on the CPU. The CPU backend (:class:`darsia.CpuBackend`) is the reference and th
 default. The backend is set once per process (:func:`use_compute_backend`), before
 the work starts. A backend's label names its device class, which a job records and
 locks; its device names the device and its driver, which each result records.
+A machine's backend is proposed by a check and a short timing
+(:func:`choose_compute_backend`), and a recorded one is found again, checked, by its
+label (:func:`backend_named`).
 
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection
+from statistics import median
+from time import perf_counter
 from typing import Protocol
 
 import numpy as np
 
 import darsia
+from darsia.utils.gpu import opencl
 from darsia.utils.gpu.cpu import CpuBackend
 
 
@@ -76,3 +83,195 @@ def use_compute_backend(backend: ComputeBackend) -> None:
 
     """
     _current[0] = backend
+
+
+_CHECK_SHAPE = (64, 97)
+"""Rows and columns of the frame on which a device is checked against the CPU; the
+last column lies beyond OpenCV's vectors of eight."""
+_TIMED_PIXELS = 1 << 21
+"""Most pixels of the frame on which devices are timed."""
+_TIMED_SQUARE = 30
+"""Side in pixels of the timed sand means (5 mm on a 0.17 mm grid)."""
+
+
+def _square(shape: tuple[int, int], size: int) -> darsia.REV:
+    """The square of a sand mean of ``size`` pixels on a grid of a shape."""
+    grid = darsia.ScalarImage(
+        np.zeros(shape, np.uint8), dimensions=[float(n) for n in shape]
+    )
+    return darsia.REV(size=float(size), img=grid)
+
+
+def _masks(shape: tuple[int, int], rng: np.random.Generator) -> list[np.ndarray]:
+    """Four disjoint masks of blocks, each of a random 60 % of its block's pixels."""
+    rows, cols = np.indices(shape)
+    region = (rows // 5 + cols // 7) % 4
+    dissolved = rng.uniform(size=shape) < 0.6
+    return [dissolved & (region == k) for k in range(4)]
+
+
+def _check_frame(dtype: type):
+    """The check's frame: planes of a smooth light and grains with invalid values,
+    the maps of a turned, scaled and jittered remap with entries that are not
+    finite, and the masks and square of the sand means."""
+    rng = np.random.default_rng(0)
+    rows, cols = np.indices(_CHECK_SHAPE)
+    light = 0.4 + 0.1 * np.sin(3 * cols / 100) * np.cos(2 * rows / 100)
+    grains = rng.uniform(0.85, 1.15, (*_CHECK_SHAPE, 3))
+    planes = (light[..., None] * grains * np.array([0.9, 0.8, 0.6])).astype(dtype)
+    planes[5, 7] = np.nan
+    planes[20, 30, 1] = np.inf
+    jitter = rng.normal(0, 0.3, _CHECK_SHAPE)
+    map_x = np.asarray(cols * 1.03 + rows * 0.02 - 1 + jitter, np.float32)
+    map_y = np.asarray(rows * 1.04 - cols * 0.01 + 1 - jitter, np.float32)
+    map_x[3, 4], map_y[6, 8] = np.nan, np.inf
+    return planes, map_x, map_y, _masks(_CHECK_SHAPE, rng), _square(_CHECK_SHAPE, 7)
+
+
+def _timing_frame(shape: tuple[int, int], dtype: type):
+    """Values, masks and the square of the timed sand means, on a frame of the
+    grid's aspect with at most :data:`_TIMED_PIXELS` pixels."""
+    scale = min(1.0, (_TIMED_PIXELS / (shape[0] * shape[1])) ** 0.5)
+    small = tuple(max(1, int(n * scale)) for n in shape)
+    rng = np.random.default_rng(1)
+    values = rng.uniform(0, 1, (*small, 3)).astype(dtype)
+    return values, _masks(small, rng), _square(small, _TIMED_SQUARE)
+
+
+def _identical(backend: ComputeBackend) -> bool:
+    """Whether a backend gives the CPU's values and NaN positions on the check's
+    frame, in single and double precision."""
+    cpu = CpuBackend()
+    for dtype in (np.float32, np.float64):
+        planes, map_x, map_y, masks, rev = _check_frame(dtype)
+        for operation, args in (
+            ("remap", (planes, map_x, map_y)),
+            ("sand_means", (planes, masks, rev)),
+        ):
+            ours = getattr(backend, operation)(*args)
+            reference = getattr(cpu, operation)(*args)
+            if not np.array_equal(ours, reference, equal_nan=True):
+                return False
+    return True
+
+
+def backend_named(label: str) -> ComputeBackend:
+    """The checked backend of a recorded device class, as a task starts on it.
+
+    ``"cpu"`` gives the CPU backend. ``"opencl:<device name>"`` gives a backend on
+    this machine's device of that name once it has passed the check of
+    :func:`choose_compute_backend`; nothing is timed.
+
+    Parameters
+    ----------
+    label : str
+        The backend's label (:attr:`ComputeBackend.label`), e.g. a job's.
+
+    Returns
+    -------
+    ComputeBackend
+        The backend.
+
+    Raises
+    ------
+    ValueError
+        If the label names no backend, no device of that name is on this machine,
+        or none of them gives the CPU's numbers.
+
+    """
+    if label == "cpu":
+        return CpuBackend()
+    kind, _, name = label.partition(":")
+    if kind != "opencl" or not name:
+        raise ValueError(f"No compute backend is labelled {label!r}.")
+    found = [device for device in opencl.opencl_devices() if device.name == name]
+    for device in found:
+        backend = opencl.OpenCLBackend(device)
+        if _identical(backend):
+            return backend
+    reason = "none gives the CPU's numbers" if found else "no such device here"
+    raise ValueError(f"{label}: {reason}.")
+
+
+def choose_compute_backend(
+    shape: tuple[int, int],
+    dtype: type = np.float32,
+    *,
+    measured: Collection[str] = (),
+) -> tuple[ComputeBackend, str]:
+    """A machine's proposed backend: the fastest checked OpenCL device of a class
+    measured on real frames, or the CPU.
+
+    Each device of :func:`darsia.opencl_devices` first runs every operation on a
+    small synthetic frame, in single and double precision, against the CPU, and must give the
+    CPU's bits.
+    A device that differs or fails is not used: its difference would otherwise
+    enter every result unnoticed. The devices that pass are timed on the sand means
+    of a synthetic RGB frame of the grid's aspect with at most
+    :data:`_TIMED_PIXELS` pixels (one warm-up, then the median of three). Only a
+    device whose class (its label) has been measured on real frames is proposed,
+    the fastest of them; otherwise the proposal is the CPU.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Rows and columns of the frames the machine will compute, e.g. a run grid.
+    dtype : type
+        Floating dtype of those frames.
+    measured : collection of str
+        Labels of the device classes measured on real frames, e.g. from the
+        machine's record.
+
+    Returns
+    -------
+    ComputeBackend
+        The proposed backend.
+    str
+        Why, for the machine's record: the proposed device and its time, and each
+        device not used with its reason.
+
+    """
+    if opencl.cl is None:
+        return CpuBackend(), "cpu: PyOpenCL is not installed"
+    devices = opencl.opencl_devices()
+    if not devices:
+        return CpuBackend(), "cpu: no OpenCL GPU with IEEE single and double precision"
+    timed, refused, timing = [], [], None
+    for device in devices:
+        try:
+            backend = opencl.OpenCLBackend(device)
+            if not _identical(backend):
+                refused.append(f"{backend.device} differs from the CPU")
+                continue
+            if timing is None:
+                timing = _timing_frame(shape, dtype)
+            seconds = []
+            for _ in range(4):
+                start = perf_counter()
+                backend.sand_means(*timing)
+                seconds.append(perf_counter() - start)
+            timed.append((median(seconds[1:]), backend))
+        except Exception as error:  # a failing driver must not stop the choice
+            refused.append(f"{device.name} failed: {error}")
+    timed.sort(key=lambda entry: entry[0])
+    rows, cols = timing[0].shape[:2] if timing else shape
+    notes = {}
+    for seconds, backend in timed:
+        note = (
+            f"{backend.device}: {seconds:.3f} s for the sand means of a {rows} x {cols}"
+        )
+        unmeasured = backend.label not in measured
+        notes[backend] = note + (
+            " frame, not yet measured on real frames" if unmeasured else " frame"
+        )
+    proposed = next((b for _, b in timed if b.label in measured), None)
+    others = "".join(f"; not used: {n}" for b, n in notes.items() if b is not proposed)
+    others += "".join(f"; not used: {reason}" for reason in refused)
+    if proposed is None:
+        why = (
+            "no checked OpenCL device of a measured class"
+            if timed
+            else ("no OpenCL device gives the CPU's numbers")
+        )
+        return CpuBackend(), f"cpu: {why}" + others
+    return proposed, f"opencl: {notes[proposed]}" + others

@@ -143,3 +143,53 @@ def test_opencl_sand_means_have_the_cpus_bits(opencl_backends, dtype):
         for backend in opencl_backends:
             means = backend.sand_means(values, masks, rev)
             np.testing.assert_array_equal(means, expected, err_msg=backend.device)
+
+
+def test_choice_without_a_device_is_the_cpu(monkeypatch):
+    """Without an OpenCL device the machine computes on the CPU, and says why."""
+    monkeypatch.setattr(darsia.utils.gpu.opencl, "cl", object())
+    monkeypatch.setattr(darsia.utils.gpu.opencl, "opencl_devices", lambda: [])
+
+    backend, reason = darsia.choose_compute_backend((60, 80))
+
+    assert backend.name == "cpu"
+    assert reason == "cpu: no OpenCL GPU with IEEE single and double precision"
+
+
+def test_choice_proposes_a_checked_device_of_a_measured_class(
+    opencl_backends, monkeypatch
+):
+    """A device with the CPU's numbers is proposed only once its class has been
+    measured on real frames, and is found again by its label; one that differs in
+    a single value of the check is not used, and the reason names it."""
+    labels = [backend.label for backend in opencl_backends]
+    backend, reason = darsia.choose_compute_backend((60, 80))
+    assert backend.name == "cpu" and "not yet measured on real frames" in reason
+    backend, reason = darsia.choose_compute_backend((60, 80), measured=labels)
+    assert backend.name == "opencl" and reason.startswith("opencl:")
+    for label in labels:
+        assert darsia.backend_named(label).label == label
+
+    def nudged(self, values, masks, rev):
+        means = sand_means(self, values, masks, rev)
+        means.flat[0] = np.nextafter(means.flat[0], np.inf)
+        return means
+
+    sand_means = darsia.OpenCLBackend.sand_means
+    monkeypatch.setattr(darsia.OpenCLBackend, "sand_means", nudged)
+    backend, reason = darsia.choose_compute_backend((60, 80), measured=labels)
+
+    assert backend.name == "cpu"
+    assert reason.count("differs from the CPU") == len(opencl_backends)
+    with pytest.raises(ValueError, match="none gives the CPU's numbers"):
+        darsia.backend_named(labels[0])
+
+
+def test_a_backend_is_found_by_its_label():
+    """The CPU by its label; a label of no backend, and a device not on this
+    machine, are refused."""
+    assert darsia.backend_named("cpu").name == "cpu"
+    with pytest.raises(ValueError, match="No compute backend"):
+        darsia.backend_named("cuda:0")
+    with pytest.raises(ValueError, match="no such device here"):
+        darsia.backend_named("opencl:no such device")
