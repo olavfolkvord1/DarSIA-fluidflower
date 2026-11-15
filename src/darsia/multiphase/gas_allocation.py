@@ -813,22 +813,32 @@ def free_gas(
         yield labels, rules, saturation, _co2(own), own
 
 
+def _maps_file(held_out: str | None) -> str:
+    """The file of a frame's stored maps, or of its maps without a held-out run's
+    estimate (:func:`write_phase_maps`)."""
+    return PHASE_MAPS if held_out is None else f"maps.without-{held_out}.npz"
+
+
 def write_phase_maps(
     folder: Path,
     labels: np.ndarray,
     rules: np.ndarray,
     saturation: np.ndarray,
     co2: np.ndarray,
+    held_out: str | None = None,
 ) -> None:
     """Store a frame's maps as :func:`free_gas` yields them, in ``folder``
     (:data:`PHASE_MAPS`): its phase and rule maps, its free-gas saturation and the
-    CO2 of its labels before the rules."""
+    CO2 of its labels before the rules. With ``held_out``, the maps made without
+    that run's estimated free-gas volume, which a calibration fold leaving it out
+    reads, are stored beside them."""
     arrays = dict(labels=labels, rules=rules, saturation=saturation, co2=co2)
-    np.savez(Path(folder) / PHASE_MAPS, **arrays)
+    np.savez(Path(folder) / _maps_file(held_out), **arrays)
 
 
-def read_phase_maps(folder: Path) -> dict[str, np.ndarray]:
+def read_phase_maps(folder: Path, held_out: str | None = None) -> dict[str, np.ndarray]:
     """A frame's stored maps (:func:`write_phase_maps`): ``labels``, ``rules``,
-    ``saturation`` and ``co2``."""
-    with np.load(Path(folder) / PHASE_MAPS) as stored:
+    ``saturation`` and ``co2``; with ``held_out``, those made without that run's
+    estimate."""
+    with np.load(Path(folder) / _maps_file(held_out)) as stored:
         return {name: stored[name] for name in stored.files}
