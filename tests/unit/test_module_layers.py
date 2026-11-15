@@ -55,6 +55,13 @@ MODULES = [
     "darsia/utils/locations.py",
     "darsia/presets/workflows/setup/sand_map_snapping.py",
     "darsia/presets/workflows/setup/sand_map_dye_edge.py",
+    "darsia/presets/workflows/media/style.py",
+    "darsia/presets/workflows/media/display_mean.py",
+    "darsia/presets/workflows/media/panels.py",
+    "darsia/presets/workflows/media/layouts.py",
+    "darsia/presets/workflows/media/video.py",
+    "darsia/presets/workflows/media/tiles.py",
+    "darsia/presets/workflows/media/films.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
