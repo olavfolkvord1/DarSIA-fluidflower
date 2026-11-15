@@ -411,6 +411,7 @@ class Service:
                     claim,
                     traceback=f"Its process ended twice without a mark ({code}).",
                 )
+                del self.exits[key]  # a retry of the task is returned once again
                 say(f"Task {claim.task} failed: its process ended twice unmarked", log)
             except (queue.Revoked, OSError) as error:
                 say(f"Task {claim.task} could not be marked failed: {error}", log)
