@@ -6,8 +6,10 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import darsia
+from darsia.multiphase import phase_rules as rules_module
 
 W, D, G, U = darsia.PhaseLabel
 RULE = darsia.PhaseRule
@@ -34,6 +36,7 @@ SETTINGS = darsia.PhaseRuleSettings(
         port_zone_half_width_mm = 38.0
         port_zone_depth_mm = 10.0
         finger_width_mm = 10.0
+        pitch_stride = 64
         """
     )["phase_rules"]
 )
@@ -196,6 +199,129 @@ def test_gravity_dissolves_gas_below_the_port_and_in_sinking_lobes(tmp_path):
     assert (rules[11:25, 62:65] == RULE.GRAVITY).all()
     gas = darsia.model_gas(labels, rules)
     assert gas[below].all() and gas[zone].all() and not gas[11:25, 50:62].any()
+
+
+def _tilted(shape=SHAPE, dimensions=(0.06, 0.08)):
+    """Measured positions in single precision, tilted and stretched against the
+    pixel centres: no row and no column has one height or one x."""
+    grid = darsia.Image(np.zeros(shape), dimensions=list(dimensions))
+    rows, cols = shape
+    dy, dx = dimensions[0] / rows, dimensions[1] / cols
+    model = np.array(
+        [
+            [1.002 * dx, 0.03 * dy, 0.4 * dx],
+            [0.02 * dx, -0.997 * dy, dimensions[0] - 2.0 * dy],
+            [0, 0, 1.0],
+        ]
+    )
+    return darsia.grid_positions(grid, model, np.float32, None, SETTINGS.pitch_stride)
+
+
+def test_the_port_zones_and_compartments_take_the_measured_positions():
+    """A port's radius disc and its lower half-ellipse, clipped at the floor, are
+    taken at each pixel's measured position in its precision, in metres as our
+    production's; a port's compartment is that of the nearest compartment pixel
+    by the squared distance in metres in double precision."""
+    positions = _tilted()
+    x, y = positions.x, positions.y
+    port = (0.0405, 0.0035)
+    radius, lower = rules_module._port_zones(x, y, [port], SETTINGS)
+    r = SETTINGS.port_radius_mm / 1000
+    np.testing.assert_array_equal(
+        radius[port], (x - port[0]) ** 2 + (y - port[1]) ** 2 <= r**2
+    )
+    lateral = (x - port[0]) * (1000 / SETTINGS.port_zone_half_width_mm)
+    depth = (port[1] - y) * (1000 / SETTINGS.port_zone_depth_mm)
+    expected = (y <= port[1]) & (y >= 0) & (lateral**2 + depth**2 <= 1)
+    np.testing.assert_array_equal(lower[port], expected)
+    assert (y < 0).any() and not lower[port][y < 0].any()  # the floor clip
+
+    compartments = np.zeros(SHAPE, np.int32)
+    compartments[:, :40], compartments[:, 44:] = 1, 2
+    home = rules_module._home_compartments(compartments, x, y, [port])
+    d2 = (x.astype(np.float64) - port[0]) ** 2 + (y.astype(np.float64) - port[1]) ** 2
+    nearest = np.where(compartments > 0, d2, np.inf).argmin()
+    assert home[port] == compartments.flat[nearest]
+
+    # Pixels on the disc's rim in single precision: the disc in metres, not in
+    # millimetres; two pixels nearly as near: the nearer in double precision.
+    rng = np.random.default_rng(3)
+    radius_m = SETTINGS.port_radius_mm / 1000
+    angle, spread = rng.uniform(0, 2 * np.pi, 4096), rng.uniform(-3e-7, 3e-7, 4096)
+    rim_x = (port[0] + radius_m * (1 + spread) * np.cos(angle)).astype(np.float32)
+    rim_y = (port[1] + radius_m * (1 + spread) * np.sin(angle)).astype(np.float32)
+    rim, _ = rules_module._port_zones(rim_x, rim_y, [port], SETTINGS)
+    metres = (rim_x - port[0]) ** 2 + (rim_y - port[1]) ** 2 <= r**2
+    millimetres = ((rim_x - port[0]) * 1000) ** 2 + (
+        (rim_y - port[1]) * 1000
+    ) ** 2 <= SETTINGS.port_radius_mm**2
+    np.testing.assert_array_equal(rim[port], metres)
+    assert not np.array_equal(metres, millimetres)
+    d64 = (rim_x.astype(np.float64) - port[0]) ** 2 + (
+        rim_y.astype(np.float64) - port[1]
+    ) ** 2
+    d32 = (rim_x - np.float32(port[0])) ** 2 + (rim_y - np.float32(port[1])) ** 2
+    i, j = next(
+        (i, j)
+        for i in range(len(d64))
+        for j in range(i + 1, len(d64))
+        if d64[i] < d64[j] and d32[i] > d32[j]
+    )
+    pair = np.array([[1, 2]], np.int32)
+    two = rules_module._home_compartments(
+        pair, rim_x[[[i, j]]], rim_y[[[i, j]]], [port]
+    )
+    assert two[port] == 1
+
+
+def test_gravity_and_small_bubbles_read_the_measured_heights(tmp_path):
+    """Gas lies below a port by its measured height in single precision, and a
+    small bubble is high enough by the lowest measured height of its pixels."""
+    positions = _tilted()
+    y = positions.y
+    exempt = {(0.04, 0.03): np.zeros(SHAPE, bool)}
+    co2 = np.zeros(SHAPE, bool)
+    below, _ = rules_module._gravity_limit(
+        co2, list(exempt), exempt, exempt, y, positions.pitch_mm, SETTINGS
+    )
+    np.testing.assert_array_equal(below, y.astype(np.float32) < np.float32(0.03))
+    assert below.any() and not below.all()
+    # A height just below the port in double precision is level with it in single.
+    heights = np.array(y, np.float64)
+    heights[5, 5] = 0.02999999966
+    below, _ = rules_module._gravity_limit(
+        co2, list(exempt), exempt, exempt, heights, positions.pitch_mm, SETTINGS
+    )
+    assert heights[5, 5] < 0.03 and not below[5, 5]
+
+    labels = np.full(SHAPE, D, np.uint8)
+    raw = np.zeros(SHAPE, bool)
+    raw[10:13, 20:27] = True  # a piece of 21 mm2
+    lowest = float(np.min(y.astype(np.float64)[10:13, 20:27]))
+    for port, kept in ((lowest - 0.0301, True), (lowest - 0.0299, False)):
+        found = labels.copy()
+        rules_module._small_bubbles(found, raw, port, y, 1.0, SETTINGS)
+        assert (found[raw] == G).all() == kept
+
+
+def test_the_maps_read_the_measured_positions(tmp_path):
+    """With measured positions the phase maps follow them: gas that the pixel
+    centres put below the port lies above it by the measured heights."""
+    below = np.s_[50:60, 70:80]
+    frame = _frame([np.s_[:, :]], [below])
+    centres = darsia.grid_positions(
+        darsia.Image(np.zeros(SHAPE), dimensions=[0.06, 0.08])
+    )
+    lifted = darsia.GridPositions(centres.x, centres.y + 0.02, centres.pitch_mm)
+    (plain,), _ = _maps(tmp_path, [frame], port=(0.075, 0.025))
+    (moved,), _ = _maps(tmp_path, [frame], port=(0.075, 0.025), positions=lifted)
+    (same,), _ = _maps(tmp_path, [frame], port=(0.075, 0.025), positions=centres)
+    assert (plain[below] == D).all() and (moved[below] == G).all()
+    np.testing.assert_array_equal(same, plain)
+    # Measured positions without the grid's pitch are refused.
+    unpitched = darsia.GridPositions(centres.x, centres.y + 0.02, None)
+    with pytest.raises(ValueError, match="pitch"):
+        _maps(tmp_path, [frame], port=(0.075, 0.025), positions=unpitched)
 
 
 def test_areas_sum_the_pixel_areas(tmp_path):

@@ -261,11 +261,15 @@ class RunGrid:
     million, as our production's phase rules took them."""
 
 
-def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
+def run_grid(
+    rig: Rig, material: MaterialSettings, pitch_stride: int | None = None
+) -> RunGrid:
     """A run's grid: its facies and their permeability, the domain of the facies
     with one, the geometry with each facies' Swi, the colour checker, the pixel
     size, the datum of the hydrostatic head, the pitch on the sand plane, and each
-    pixel's position on the rig by the rig's measured model of its grid.
+    pixel's position on the rig by the rig's measured model of its grid, with the
+    grid's pitch over the rig's measurement canvas where a pitch stride is given
+    (:func:`darsia.grid_positions`; the phase maps take it).
 
     Depth, porosity, Swi and the measured positions take the precision of the
     rig's pixel areas, the run grid's.
@@ -285,7 +289,7 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
     if material.chart_label is not None:
         chart = rig.labels.img == material.chart_label
     positions = darsia.grid_positions(
-        rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas
+        rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas, pitch_stride
     )
     geometry = darsia.run_geometry(
         rig.facies,
@@ -716,7 +720,7 @@ def _phase_maps(ctx: StepContext) -> None:
     if late:
         raise ValueError(f"The frames of run {run} are not in time order: {late}.")
     rules, source = settings["phase_rules"], settings["phase_model"]
-    grid = run_grid(ctx.read("rig", read_rig), settings["material"])
+    grid = run_grid(ctx.read("rig", read_rig), settings["material"], rules.pitch_stride)
     model = ctx.read(
         "phase-model",
         lambda folder: darsia.read_phase_model(
@@ -756,6 +760,7 @@ def _phase_maps(ctx: StepContext) -> None:
             anchor_saturation=lambda k: ctx.own(
                 lambda f: darsia.read_phase_maps(f, held_out), frame=frames[k]
             )["saturation"],
+            positions=grid.positions,
         )
 
     for frame, *found in zip(frames[start:], *(maps(v) for v in variants)):
