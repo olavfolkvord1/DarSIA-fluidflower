@@ -70,6 +70,30 @@ def test_coarse_fitting_grid_gives_the_same_gain():
     )
 
 
+def test_a_given_fitting_grid_places_the_field(tmp_path):
+    """A homography to another grid evaluates the field there, and is saved."""
+    plain = _correction()
+    # The fitting grid of the same shape, two pixel columns to the right.
+    shifted = darsia.MaterialIlluminationCorrection(
+        plain.common_coefficients,
+        plain.material_coefficients,
+        plain.material_map,
+        (4, 6),
+        grid_to_field=np.array([[1.0, 0, 2], [0, 1, 0], [0, 0, 1]]),
+    )
+    shifted.save(tmp_path / "correction.npz")
+    loaded = darsia.MaterialIlluminationCorrection()
+    loaded.load(tmp_path / "correction.npz")
+
+    x = (np.arange(6) + 2.5) * 2 / 6 - 1
+    np.testing.assert_allclose(
+        loaded.gain(np.float64)[2], 0.5 * np.exp(np.outer(x, [0.1, 0, -0.1]))
+    )
+    np.testing.assert_array_equal(loaded.gain(np.float64), shifted.gain(np.float64))
+    plain.save(tmp_path / "plain.npz")
+    assert "grid_to_field" not in np.load(tmp_path / "plain.npz").files
+
+
 def test_invalid_pixels_become_nan_and_zero_stays_zero():
     """A non-finite or negative channel invalidates the whole pixel."""
     image = np.ones((4, 6, 3))

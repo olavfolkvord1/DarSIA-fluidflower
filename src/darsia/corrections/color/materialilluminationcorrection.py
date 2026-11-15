@@ -197,7 +197,8 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
     the normalized position of the pixel on the fitting grid and ``B`` the
     coefficients of the pixel's material, or the common coefficients if the
     pixel's material has no field of its own (e.g., water). Pixel centres are
-    mapped to the fitting grid as by an area resize. Pixels with a non-finite or
+    mapped to the fitting grid as by an area resize, or by a given homography,
+    e.g., when the fitting grid is another run's. Pixels with a non-finite or
     negative channel become NaN; there is no clipping and no additive term. The
     gain is evaluated in the image's floating dtype.
 
@@ -209,6 +210,7 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
         material_coefficients: dict[int, np.ndarray] | None = None,
         material_map: np.ndarray | None = None,
         field_shape: tuple[int, int] | None = None,
+        grid_to_field: np.ndarray | None = None,
     ) -> None:
         """Initialize the correction, or an empty object to be loaded from file.
 
@@ -222,6 +224,10 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
             Integer material of each pixel of the images to be corrected.
         field_shape : tuple of int, optional
             Rows and columns of the fitting grid.
+        grid_to_field : array, optional
+            Homography (3, 3) from the pixel centres (column, row, 1) of the
+            material map to those of the fitting grid. Defaults to an area resize
+            of the material map onto the fitting grid.
 
         """
         if common_coefficients is None:
@@ -237,7 +243,15 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
         """Material of each pixel of the images to be corrected."""
         self.field_shape = tuple(int(n) for n in field_shape)
         """Rows and columns of the fitting grid."""
-        self._grid_to_field = _pixel_resize(self.material_map.shape, self.field_shape)
+        self.grid_to_field = (
+            None if grid_to_field is None else np.asarray(grid_to_field)
+        )
+        """Given homography from the material map to the fitting grid, if any."""
+        self._grid_to_field = (
+            _pixel_resize(self.material_map.shape, self.field_shape)
+            if grid_to_field is None
+            else self.grid_to_field
+        )
         self._gain = None
 
     def _gain_rows(self, first: int, last: int, dtype: np.dtype) -> np.ndarray:
@@ -330,6 +344,11 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
             ),
             material_map=self.material_map,
             field_shape=np.array(self.field_shape),
+            **(
+                {}
+                if self.grid_to_field is None
+                else {"grid_to_field": self.grid_to_field}
+            ),
         )
 
     def load(self, path: Path) -> None:
@@ -349,4 +368,5 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
                 ),
                 material_map=data["material_map"],
                 field_shape=tuple(data["field_shape"]),
+                grid_to_field=data.get("grid_to_field"),
             )
