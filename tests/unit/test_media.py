@@ -1,7 +1,10 @@
 """Unit tests of films and figures: display means, tiles, layouts and MP4 films."""
 
+import tomllib
+
 import numpy as np
 import pytest
+from matplotlib import colormaps
 
 from darsia.multiphase.phase_rules import PhaseLabel
 from darsia.presets.workflows.media.display_mean import (
@@ -11,8 +14,57 @@ from darsia.presets.workflows.media.display_mean import (
     pooled_mean,
     shown_values,
 )
+from darsia.presets.workflows.media.panels import (
+    PhotographSettings,
+    graph_tile,
+    map_tile,
+    photograph,
+    shared_axes,
+)
+from darsia.presets.workflows.media.style import Curve, FigureStyle, bgr
 
+TABLES = tomllib.loads(
+    """
+    # Our production's figure style: the films' colours and mass curves, and the
+    # ensemble figures' palette, resolution and rule for a logarithmic time axis.
+    [style]
+    dpi = 150
+    log_span = 50.0
+    surface = "#fcfcfb"
+    ink = "#0b0b0b"
+    secondary = "#52514e"
+    muted = "#898781"
+    grid = "#e1e0d9"
+    axis = "#c3c2b7"
+    washes = ["#ebeae4", "#dcdcd4"]
+    series = "#2a78d6"
+    frame = "#1e2226"
+    empty = "#3e4246"
+    no_value = "#e6edf2"
+    colour_map = "viridis"
+    marker = "#667085"
+    curves = [
+        {column = "total_mass_g", name = "Total", colour = "#175aad", line = "-"},
+        {column = "aqueous_mass_g", name = "Dissolved", colour = "#169879", line = "-"},
+        {column = "gas_mass_g", name = "Free gas", colour = "#dc398b", line = "-"},
+        {column = "injected_mass_g", name = "Injected", colour = "black", line = "--"},
+    ]
+
+    """
+)
+STYLE = FigureStyle(
+    **{
+        **TABLES["style"],
+        "washes": tuple(TABLES["style"]["washes"]),
+        "curves": tuple(Curve(**curve) for curve in TABLES["style"]["curves"]),
+    }
+)
 UNKNOWN = PhaseLabel.UNKNOWN
+
+
+def rgb(colour: str) -> tuple:
+    """A colour as 8-bit (red, green, blue)."""
+    return bgr(colour)[::-1]
 
 
 def layers_frame():
@@ -137,3 +189,71 @@ def test_shown_cells_of_the_depth_mean_are_weighted_by_pore_volume():
         np.sum(shown[known] * volume[known]), rel=1e-13
     )
     assert pooled_mean(shown, volume, 1) is shown
+
+
+# -- tiles -------------------------------------------------------------------------
+
+
+def test_a_photograph_follows_the_colour_transfer_in_8_bits():
+    """Linear light through the matrix and the sRGB transfer, rounded to 8 bits;
+    pixels without a value are grey."""
+    settings = PhotographSettings(
+        matrix=((0.5, 0, 0), (0, 1, 0), (0, 0, 2)), invalid_grey=128
+    )
+    linear = np.array([[[0.002, 0.0, 0.2], [2.0, 0.5, np.nan]]])
+    shown = photograph(linear, settings)
+
+    srgb = 12.92 * 0.001, 1.055 * 0.4 ** (1 / 2.4) - 0.055
+    expected = np.round(255 * np.array([srgb[0], 0.0, srgb[1]])) / 255
+    np.testing.assert_allclose(shown[0, 0], expected, rtol=1e-6)
+    np.testing.assert_allclose(shown[0, 1], 128 / 255, rtol=1e-6)
+
+
+def test_a_map_tile_shows_the_colour_scale_and_cells_without_a_value():
+    """A value in the scale's colour map, a missing value in the no-value colour."""
+    values = np.full((20, 40), 0.85)
+    values[:, 20:] = np.nan
+    tile = map_tile(
+        values,
+        (0, 0, 40, 20),
+        1,
+        (160, 80),
+        scale=1.7,
+        label="Total CO₂ mass",
+        unit="g/L",
+        style=STYLE,
+    )
+    middle = np.round(255 * np.array(colormaps["viridis"](0.5)[:3]))
+
+    assert tile.shape == (80, 160, 3)
+    np.testing.assert_allclose(tile[40, 40], middle, atol=1)
+    np.testing.assert_allclose(tile[40, 120], rgb(STYLE.no_value), atol=1)
+
+
+def mass_rows(count=5, hours=1.0):
+    """A run's mass records, one per hour."""
+    return [
+        dict(
+            case_id=f"r-{n}",
+            elapsed_h=hours * n,
+            total_mass_g=0.1 * n,
+            aqueous_mass_g=0.08 * n,
+            gas_mass_g=0.02 * n,
+            injected_mass_g=0.1 * n,
+        )
+        for n in range(count)
+    ]
+
+
+def test_the_graph_marks_the_frame_on_shared_axes():
+    """The frame's line moves with its time; the shared axes cover every run."""
+    runs = [mass_rows(5), mass_rows(3, hours=2.0)]
+    axes = shared_axes(runs, STYLE)
+    lines = []
+    for case in ("r-1", "r-3"):
+        tile = graph_tile(runs[0], case, (320, 180), axes=axes, style=STYLE)
+        near = np.abs(tile.astype(int) - rgb(STYLE.marker)).max(axis=2) < 30
+        lines.append(int(np.argmax(near.sum(axis=0))))
+
+    assert axes == ((0.0, 4 * 1.03), (0.0, 0.4 * 1.05))
+    assert lines[1] > lines[0] + 50
