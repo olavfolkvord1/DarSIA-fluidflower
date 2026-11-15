@@ -314,17 +314,11 @@ def rig_points_homography(
     target = np.array(
         [[0, 0], [0, rows - 1], [cols - 1, rows - 1], [cols - 1, 0]], dtype=dtype
     )
-    xy1 = np.column_stack((source, np.ones(4, dtype=dtype)))
-    system = np.zeros((8, 8), dtype=dtype)
-    system[::2, :3], system[1::2, 3:6] = xy1, xy1
-    system[::2, 6:] = -source * target[:, :1]
-    system[1::2, 6:] = -source * target[:, 1:]
     with warnings.catch_warnings():
         # In single precision the system is ill-conditioned in pixel units; the
         # homography only centres whole-pixel searches.
         warnings.simplefilter("ignore", scipy.linalg.LinAlgWarning)
-        values = darsia.linalg.solve(system, target.ravel())
-    to_grid = np.append(values, dtype.type(1)).reshape(3, 3)
+        to_grid = darsia.quadrilateral_transform(source, target, dtype)
     return darsia.linalg.solve(to_grid, np.eye(3, dtype=dtype))
 
 
@@ -386,7 +380,7 @@ def ransac_homography(
 
     def inliers(h):
         """Matches within the threshold of their forward projection."""
-        x, y = _project(h, source[:, 0], source[:, 1])
+        x, y = darsia.project_xy(h, source[:, 0], source[:, 1])
         return (x - target[:, 0]) ** 2 + (y - target[:, 1]) ** 2 <= dtype.type(
             threshold
         ) ** 2
@@ -466,7 +460,7 @@ def registration_mapping(
     homography = np.asarray(homography)
     dtype = np.result_type(homography.dtype, np.float32)
     rows, cols = target_shape
-    x, y = _project(
+    x, y = darsia.project_xy(
         homography.astype(dtype),
         np.arange(cols, dtype=dtype)[None, :],
         np.arange(rows, dtype=dtype)[:, None],
@@ -481,19 +475,11 @@ def registration_mapping(
 # ! ---- Auxiliary routines
 
 
-def _project(matrix: np.ndarray, x: np.ndarray, y: np.ndarray):
-    """Map pixel centres through a homography, without homogeneous arrays."""
-    den = matrix[2, 0] * x + matrix[2, 1] * y + matrix[2, 2]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return (
-            (matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2]) / den,
-            (matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2]) / den,
-        )
-
-
 def _project_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     """Map (x, y) rows through a homography in the points' precision."""
-    x, y = _project(np.asarray(matrix, points.dtype), points[:, 0], points[:, 1])
+    x, y = darsia.project_xy(
+        np.asarray(matrix, points.dtype), points[:, 0], points[:, 1]
+    )
     return np.column_stack((x, y))
 
 
