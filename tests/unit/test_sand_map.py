@@ -328,3 +328,20 @@ def test_the_faults_of_a_drawing_have_their_area_and_place():
     )
     assert {fault.kind for fault in faults} == {"unlinked"} and len(faults) == 3
     assert all(fault.area == 0 for fault in faults)
+
+
+def test_a_drawing_is_saved_only_as_a_closed_partition(tmp_path):
+    """A closed partition is written and read back with its frame; a drawing with a
+    gap, or without a frame, is refused and nothing is written."""
+    drawing = _framed(_split_drawing(), on_top=frozenset({3}))
+    drawing.write(tmp_path / "drawing.json")
+    read = SandMapDrawing.read(tmp_path / "drawing.json", frame=(WIDTH, HEIGHT))
+    assert np.array_equal(read.anchors, drawing.anchors)
+    assert read.polygons == drawing.polygons and read.on_top == drawing.on_top
+    assert read.frame == (WIDTH, HEIGHT)
+    assert SandMapDrawing.read(tmp_path / "drawing.json").frame is None
+    with pytest.raises(ValueError, match="1 gap"):
+        drawing.moved({2: [WIDTH, 0.198]}).write(tmp_path / "gap.json")
+    with pytest.raises(ValueError, match="frame"):
+        _split_drawing().write(tmp_path / "unframed.json")
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["drawing.json"]
