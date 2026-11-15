@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePath
@@ -691,6 +692,10 @@ class StepContext:
     device : str, optional
         The device of this process's compute backend, driver included, which its
         results record (:attr:`darsia.ComputeBackend.device`).
+    locks : Callable[[str], AbstractContextManager], optional
+        The host's lock of a name that its taker waits for
+        (:class:`darsia.jobs.service.WaitingLock`); by default none, e.g. for a
+        task run in a test's process.
 
     """
 
@@ -708,6 +713,7 @@ class StepContext:
         accepted: Callable[[str], frozenset[str]],
         revision: str,
         device: str = "cpu",
+        locks: Callable[[str], AbstractContextManager] | None = None,
     ) -> None:
         self.step = step
         """The step."""
@@ -733,9 +739,29 @@ class StepContext:
         """The device that makes this task's results."""
         self._job = job
         self._accepted = accepted
+        self._locks = locks
         self._tokens: dict[str, str] = {}
         self._outputs = {i.key: i for i in outputs(step, task)}
         self._files = self._configured_files()
+
+    def host_lock(self, name: str) -> AbstractContextManager:
+        """The host's lock of a name, which a task waits for while another holds
+        it, e.g. around a film encoder's open; none for a task run in a test's
+        process.
+
+        Parameters
+        ----------
+        name : str
+            The lock's name.
+
+        Returns
+        -------
+        AbstractContextManager
+            The lock, to be held with ``with`` (also more than once, one after the
+            other).
+
+        """
+        return nullcontext() if self._locks is None else self._locks(name)
 
     def _input(self, kind, run, frame, part) -> Input:
         """The declared input of a kind, frame, part and run (by default the
