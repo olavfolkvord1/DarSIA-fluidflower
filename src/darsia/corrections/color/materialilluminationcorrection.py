@@ -321,9 +321,8 @@ class MaterialIlluminationCorrection(darsia.BaseCorrection):
         """
         values = np.asarray(image)
         dtype = np.result_type(values, np.float32)
-        valid = np.isfinite(values).all(axis=-1) & (values >= 0).all(axis=-1)
-        result = np.full(values.shape, np.nan, dtype)
-        result[valid] = values[valid] * self.gain(dtype)[valid]
+        result = values * self.gain(dtype)
+        result[~(np.isfinite(values) & (values >= 0)).all(axis=-1)] = np.nan
         return result
 
     # ! ---- I/O ----
