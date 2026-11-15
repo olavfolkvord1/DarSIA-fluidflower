@@ -1,7 +1,8 @@
 """The minimal chain on a coarse run grid run as one job, against the direct calls.
 
 Two synthetic runs of six frames each (the minimal chain's sensor images, mapping,
-material light correction and delivered phase model) are set up, calibrated,
+material light correction and delivered phase model) are set up, calibrated (the
+sands' colour ranges and path ratios measured, every sand read by Beer–Lambert),
 analysed and compared by the presets' steps. Their mass maps equal the methods
 called directly, in single precision through the service and in double precision
 in this process; a run whose phase maps were interrupted after the injection end
@@ -26,7 +27,7 @@ import darsia
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import queue
 from darsia.jobs.job import create_job
-from darsia.jobs.step import Selection, StepContext, table
+from darsia.jobs.step import Selection, StepContext, run_tables, table
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
@@ -149,13 +150,57 @@ colors = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]]
 values = [0.0, 1.0]
 supports = [0.0, 1.0]
 table = [0.0, 1.0]
-factor = 1.0
+scale = 0.3
 [reading.sands.2]
 colors = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]]
 values = [0.0, 1.0]
 supports = [0.0, 1.0]
 table = [0.0, 1.0]
-factor = 1.0
+scale = 0.3
+[response]
+range_runs = ["r1", "r2"]
+ratio_run = "r2"
+ratio_gain = 1.0
+[color_ranges]
+mean_mm = 5.0
+inner_mm = 0.0
+gas_mm = 5.0
+minimum_inner_mm2 = 25.0
+minimum_gas_mm2 = 25.0
+gas_percentile = 90.0
+[shadow]
+fine_mm = 10.0
+broad_mm = 50.0
+below = 0.75
+reach_mm = 10.0
+smallest_mm2 = 2000.0
+darkest = 0.2
+[path_ratios]
+mean_mm = 10.0
+tile_mm = 15.0
+band_mm = [5.0, 15.0]
+far_mm = 30.0
+min_dissolved_share = 0.8
+gas_free_mm = 5.0
+min_band_mm2 = 25.0
+flat_tol_per_mm = 1.0
+arrived_share = 0.5
+equalise_h = 0.5
+min_level = 0.01
+ceiling_margin = 0.99
+min_tiles = 1
+block_mm = 50.0
+bootstrap = 20
+seed = 0
+[beer_lambert]
+reference_sand = 1
+mean_mm = 10.0
+background_degree = 1
+background_margin_mm = 5.0
+unshaded_light = 0.95
+background_fill = 0.5
+background_iterations = 4
+background_huber_threshold = 1.5
 [unknown_mass]
 column_reach_mm = 20.0
 intervals = 32768
@@ -216,6 +261,8 @@ depth_map = "depth-r2.npz"
 alkalinity = 1.04
 [runs.r1.protocols]
 overflow = "overflow-r1.csv"
+[runs.r2.reading.sands.1]
+colors = [[0.0, 0.0, 0.0], [0.3, 0.02, 0.0]]
 """
 
 
@@ -355,7 +402,6 @@ def _direct(root: Path, selection: Selection) -> dict:
 
     material = settings(calibration.MaterialSettings, "material")
     statistics = settings(darsia.RunStatisticsSettings, "run_statistics")
-    reading = calibration.sand_reading(settings(calibration.ReadingSettings, "reading"))
     overflow = settings(darsia.OverflowSettings, "overflow")
     runs, donors = {}, {}
     for run, run_frames in selection.frames.items():
@@ -501,6 +547,80 @@ def _direct(root: Path, selection: Selection) -> dict:
             variants[run][held_out] = [
                 dict(zip(("labels", "rules", "saturation", "co2"), m)) for m in maps
             ]
+    # Each run's colour paths; the second run's reference sand has its own.
+    paths, own_paths = {}, {}
+    for run in runs:
+        own_paths[run] = settings_from_table(
+            calibration.ReadingSettings, run_tables(tables, run)["reading"]
+        )
+        paths[run] = calibration.sand_paths(own_paths[run])
+
+    def measured_frames(run):
+        grid, _, images, _ = runs[run]
+        return [
+            (
+                image.img,
+                m["labels"],
+                m["rules"],
+                grid.domain & np.isfinite(image.img).all(-1),
+            )
+            for image, m in zip(images, variants[run][None])
+        ]
+
+    ranges = darsia.color_ranges(
+        [
+            (
+                measured_frames(run),
+                runs[run][0].rig.baseline.img,
+                runs[run][0].rig.facies,
+                runs[run][0].optical_pitch,
+                paths[run],
+            )
+            for run in ("r1", "r2")
+        ],
+        settings(darsia.ColorRangeSettings, "color_ranges"),
+    )
+    shadow = settings(darsia.ShadowSettings, "shadow")
+    grid, experiment, images, dates = runs["r2"]  # the run of the path ratios
+    plain = darsia.SandColorPaths(
+        paths["r2"],
+        {k: own_paths["r2"].sands[str(k)].scale / ranges[k] for k in paths["r2"]},
+    )
+    baseline, facies, pitch = grid.rig.baseline.img, grid.rig.facies, grid.optical_pitch
+    ratios = darsia.path_ratios(
+        measured_frames("r2"),
+        [(date - experiment.experiment_start).total_seconds() / 3600 for date in dates],
+        baseline,
+        facies,
+        pitch,
+        grid.geometry.known,
+        plain,
+        darsia.shadow_light(baseline, facies, pitch, [1, 2], shadow),
+        1,
+        1.2,  # the curve's top at the gain 1
+        settings(darsia.PathRatioSettings, "path_ratios"),
+    )
+    assert set(ratios.ratio) == {2}
+    response = replace(
+        settings(darsia.BeerLambertSettings, "beer_lambert"), path_ratio=ratios.ratio
+    )
+    readings = {}
+    for run, (grid, experiment, images, dates) in runs.items():
+        baseline, facies = grid.rig.baseline.img, grid.rig.facies
+        pitch = grid.optical_pitch
+        light = darsia.shadow_light(baseline, facies, pitch, [1, 2], shadow)
+        readings[run] = darsia.BeerLambertReading(
+            paths[run][1],
+            own_paths[run].sands["1"].scale / ranges[1],
+            darsia.reference_background(
+                baseline, facies, pitch, grid.geometry.known, light, response
+            ),
+            facies,
+            pitch,
+            response,
+        )
+    for run, (grid, experiment, images, dates) in runs.items():
+        rig, start, reading = grid.rig, experiment.experiment_start, readings[run]
         for held_out in (None, "r1"):
             found = volumes[run].get(held_out, volumes[run][None])
             maps = variants[run].get(held_out, variants[run][None])
@@ -585,7 +705,7 @@ def _direct(root: Path, selection: Selection) -> dict:
     made, copies = {}, {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
         copy = darsia.MassCopy(grid.geometry, darsia.MassCopySettings(10.0))
-        start = experiment.experiment_start
+        start, reading = experiment.experiment_start, readings[run]
         for frame, image, frame_maps, date in zip(
             selection.frames[run], images, maps, dates
         ):
@@ -683,12 +803,13 @@ def _direct(root: Path, selection: Selection) -> dict:
         "fold": (fold, predictions),
         "domain_mass": domain_mass,
         "distances": [asdict(distance) for distance in distances],
+        "statistics": frames[None],
     }
 
 
 def _compare(project: Path, selection: Selection, direct: dict) -> None:
-    """Every stored mass map, its copy on metric cells and the fit equal the
-    direct calls'."""
+    """Every stored mass map, its copy on metric cells, each frame's histograms of
+    its sands' signal and the fit equal the direct calls'."""
     results = project / "results"
     for (run, frame), maps in direct["maps"].items():
         stored = darsia.read_mass_maps(
@@ -705,6 +826,16 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         assert set(stored) == set(copy)
         for name, values in copy.items():
             np.testing.assert_array_equal(stored[name].img, values)
+    for run in selection.frames:  # each frame's histograms of its sands' signal
+        made = [frame for frame in direct["statistics"] if frame.run == run]
+        stored = darsia.read_frames(results / "run-statistics" / run)
+        assert len(stored) == len(made)
+        for one, other in zip(stored, made):
+            assert one.dissolved.keys() == other.dissolved.keys()
+            for sand, histogram in other.dissolved.items():
+                found = one.dissolved[sand]
+                np.testing.assert_array_equal(found.relative, histogram.relative)
+                np.testing.assert_array_equal(found.weight, histogram.weight)
     record = darsia.read_calibration(results / "calibration" / "fit")
     assert record["calibration"]["gain"] == direct["fit"].gain
     assert record["calibration"]["beta"] == direct["fit"].beta
@@ -871,7 +1002,7 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     project = tmp_path / "project"
     config, selection = _project(project, "float64")
     monkeypatch.chdir(project)
-    steps = setup.STEPS + calibration.STEPS[:5]
+    steps = setup.STEPS + calibration.STEPS[:7]
     job = create_job(tmp_path / "jobs", steps, selection, config)
     statistics = {"run-statistics.r1", "run-statistics.r2"}
     _run(job, skip=statistics)
@@ -895,9 +1026,9 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     statistics = settings_from_table(
         darsia.RunStatisticsSettings, tables["run_statistics"]
     )
-    reading = calibration.sand_reading(
-        settings_from_table(calibration.ReadingSettings, tables["reading"])
-    )
+    task = queue.tasks(job)["run-statistics.r1"]
+    ctx = jobs_main.context(job, task, "")  # its reading, as the step makes it
+    reading = calibration.response_reading(ctx, "r1", grid)
     signal, measured = calibration.read_signal(
         grid, image.img, maps, reading, statistics
     )
