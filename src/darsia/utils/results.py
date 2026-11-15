@@ -1,4 +1,4 @@
-"""Stored results: published whole without replacing.
+"""Stored results: published whole without replacing, read through a share's interruptions.
 
 A result is one folder at its location: the files its method's own writer writes,
 then ``result.json``, its description, which records the publication's token, the
@@ -7,10 +7,13 @@ beside its location, flushed to disk and committed in one step that never replac
 so a reader finds a result only when it is whole, and an interrupted write leaves
 only a partial, which no reader reads.
 
-Results are often stored on a network share, whose short interruptions are
-retried (:func:`retry_transient`). A commit whose acknowledgement a dropped
-connection lost is done when the location records this publication's token;
-another token there is refused.
+Results are often stored on a network share. Its short interruptions are retried
+(:func:`retry_transient`), and a file of a complete result that reads short or is
+not found is read once more after the share's cache time (:func:`read`). When the
+retries run out, the result is :class:`Unavailable`, not known now, which no caller
+may take for missing. A commit whose acknowledgement a dropped connection lost is
+done when the location records this publication's token; another token there is
+refused.
 
 """
 
@@ -19,6 +22,7 @@ import errno
 import json
 import logging
 import os
+import zipfile
 from collections.abc import Callable, Mapping
 from itertools import chain, repeat
 from pathlib import Path
@@ -36,6 +40,10 @@ STALE = 600.0
 taken back."""
 GRACE = 300.0
 """Seconds an operation is retried while the share is out."""
+SHARE_CACHE = 10.0
+"""Seconds the share's client may keep a file's size, a folder's contents and a
+name it did not find (the file information, folder and not-found caches of an SMB
+client); a retry wait, which proves nothing about ownership."""
 RETRY_DELAYS = (0.5, 2.0, 5.0)
 """Seconds before each retry of a transient error; while the share is out, the last
 delay repeats."""
@@ -56,6 +64,17 @@ _NETWORK_ERRNOS = frozenset(
         errno.ETIMEDOUT,
     }
 )
+
+
+class Unavailable(OSError):
+    """No answer about a stored result within the retries: not known now.
+
+    The share stayed out for longer than :data:`GRACE`, or a file of the result read
+    short or was not found twice. The result is neither missing nor incomplete, so a
+    caller must not compute, publish or requeue in its place; the task fails with
+    this error.
+
+    """
 
 
 def share_out(error: OSError) -> bool:
@@ -83,9 +102,10 @@ def _transient(error: OSError) -> bool:
     """Whether a file error is a short interruption, worth waiting for.
 
     The answers of the file system keep their meaning: an existing name (a lost
-    exclusive create or rename), a missing file or folder, and a wrong file type. A
-    network error is transient even where Python reports it as a missing file, and
-    so is every other file error, e.g. a sharing violation.
+    exclusive create or rename), a missing file or folder, and a wrong file type,
+    and so does :class:`Unavailable`. A network error is transient even where
+    Python reports it as a missing file, and so is every other file error, e.g. a
+    sharing violation.
 
     """
     if share_out(error):
@@ -97,6 +117,7 @@ def _transient(error: OSError) -> bool:
             FileNotFoundError,
             NotADirectoryError,
             IsADirectoryError,
+            Unavailable,
         ),
     )
 
@@ -150,6 +171,17 @@ def _exists(path: Path) -> bool:
             raise
         return False
     return True
+
+
+def _observe(location: Path, look: Callable[[], T]) -> T:
+    """Look at a stored result through the share's interruptions; when they
+    outlast :data:`GRACE`, the result is :class:`Unavailable`, never missing."""
+    try:
+        return retry_transient(look)
+    except OSError as error:
+        if not _transient(error):
+            raise
+        raise Unavailable(f"No answer about {location}: {error}") from error
 
 
 class _RenameInfo(ctypes.Structure):
@@ -253,7 +285,8 @@ def rename(
     caller then says first whether the destination is its own, which is done, or
     not, which is refused; only then is the source looked at, which the share's
     client may still show after the move. Nothing is accepted for its existence
-    alone.
+    alone, and nothing is refused for a destination the share's client does not
+    show yet: the caller looks again, as a read of a committed result does.
 
     Parameters
     ----------
@@ -296,7 +329,7 @@ def rename(
 
 
 def read_description(folder: Path) -> dict:
-    """Read a stored result's description from its folder.
+    """Read a stored result's description from its folder; a reader for :func:`read`.
 
     The description is one line of JSON and its newline, so a read that ends before
     the newline is short (EOFError).
@@ -364,7 +397,10 @@ def publish(
     Windows, also on an SMB share, the flush of the files is what the platform
     offers. A location that already
     holds a result is this publication if it records this token, e.g. after a lost
-    acknowledgement, and is refused if it records another.
+    acknowledgement, and is refused if it records another. Its description is read
+    as a committed result's (:func:`read`), so a location that the share's client
+    does not show yet is looked for once more, and is :class:`Unavailable` if it
+    stays unreadable.
 
     The writer runs once. If it fails, also through a share's error, nothing is
     stored and the partial is kept, never read; a new claim publishes into a new
@@ -393,6 +429,8 @@ def publish(
     ------
     FileExistsError
         If the location holds a result with another token.
+    Unavailable
+        If the commit's outcome cannot be read within the retries.
 
     """
     # Lexically, without resolving links, so that «..» cannot leave the folder.
@@ -419,9 +457,7 @@ def publish(
         _flush(partial)
 
     def ours(found: Path) -> bool:
-        if not is_complete(found):
-            return False
-        return read_description(found).get("token") == token
+        return read(found, read_description, committed=True).get("token") == token
 
     retry_transient(create)
     write(partial)
@@ -448,5 +484,88 @@ def is_complete(location: Path) -> bool:
     bool
         True if the result is stored whole, False if it is not.
 
+    Raises
+    ------
+    Unavailable
+        If the share gives no answer within :data:`GRACE`.
+
     """
-    return retry_transient(lambda: _exists(Path(location) / RESULT))
+    return _observe(location, lambda: _exists(Path(location) / RESULT))
+
+
+def _cached(error: Exception) -> bool:
+    """Whether a reader's error on a complete result can be the share's cache.
+
+    A whole file read short: NumPy's «Failed to read all data» and «EOF:», an
+    EOFError, or a truncated npz archive. Or a file of the result not found, which
+    the share's client may answer for a name it did not find a moment before.
+
+    """
+    if isinstance(error, (EOFError, zipfile.BadZipFile, FileNotFoundError)):
+        return True
+    return isinstance(error, ValueError) and str(error).startswith(
+        ("Failed to read all data", "EOF:")
+    )
+
+
+def _read_committed(location: Path, reader: Callable[[Path], T]) -> T:
+    """Read a result whose commit is known; its description not found is a
+    FileNotFoundError, which the share's client may answer for a moment."""
+    if not is_complete(location):
+        raise FileNotFoundError(errno.ENOENT, "No description found", str(location))
+    return _observe(location, lambda: reader(location))
+
+
+def read(location: Path, reader: Callable[[Path], T], committed: bool = False) -> T:
+    """Read a complete result with its method's own reader.
+
+    Transient errors of the share are retried (:func:`retry_transient`). The share's
+    client may for a few seconds give a file of a just published result short, or
+    not find it, so a short read or a file not found is read once more after
+    :data:`SHARE_CACHE`, again through the share's interruptions. Any other error of
+    the reader is raised as it is. The client may also not find the description of
+    a result just committed elsewhere: a result known to be committed, e.g. by the
+    token its producer's done marker names, is therefore looked for once more too.
+
+    Parameters
+    ----------
+    location : Path
+        Folder of the result.
+    reader : Callable[[Path], T]
+        The method's reader of the result's files from its folder.
+    committed : bool, optional
+        Whether the result is known to be committed. Without it, a result without
+        its description is not complete.
+
+    Returns
+    -------
+    T
+        What the reader returns.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no complete result is stored at the location, and it is not known to be
+        committed.
+    Unavailable
+        If the share gives no answer within :data:`GRACE`, or the result's
+        description or a file of it reads short or is not found twice.
+
+    """
+    location = Path(location)
+    if not committed and not is_complete(location):
+        raise FileNotFoundError(errno.ENOENT, "No complete result", str(location))
+    try:
+        return _read_committed(location, reader)
+    except Exception as error:
+        if not _cached(error):
+            raise
+        logger.warning("%s does not read whole, reading it again: %s", location, error)
+    sleep(SHARE_CACHE)
+    try:
+        return _read_committed(location, reader)
+    except Exception as error:
+        if _cached(error):
+            message = f"{location} does not read whole twice: {error}"
+            raise Unavailable(message) from error
+        raise
