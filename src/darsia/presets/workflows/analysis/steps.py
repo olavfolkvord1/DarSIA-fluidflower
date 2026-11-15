@@ -167,6 +167,7 @@ def _domain_mass(ctx: StepContext) -> None:
         grid.geometry,
         grid.rig.labels,
         settings.sand_labels,
+        grid.positions,
         chart_labels=settings.chart_labels,
         min_part_area_cm2=settings.min_part_area_cm2,
     )

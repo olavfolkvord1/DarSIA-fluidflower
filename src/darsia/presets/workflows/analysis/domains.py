@@ -18,9 +18,10 @@ its largest piece is part 1, every other piece of at least a set area its next
 part, and its smaller pieces (``part = "pieces"``) are summed in a domain of their
 own. Without a part, a layer domain holds all of the layer.
 
-A pixel lies in a box by its centre (:func:`darsia.pixel_centres`), each interval
-half-open, so that boxes sharing a side count no pixel twice: the rule of the metric
-cells (:func:`darsia.metric_cells`). An injection point lies in a box by the closed
+A pixel lies in a box by its position on the rig (:func:`darsia.grid_positions`: by
+the run's measured model of its grid, else its centre), each interval half-open, so
+that boxes sharing a side count no pixel twice: the rule of the metric cells
+(:func:`darsia.metric_cells`). An injection point lies in a box by the closed
 rule of :meth:`darsia.InjectionProtocol.injected_mass`, edges included. A box whose
 edge passes through an injection point is refused (:func:`injected_mass`), so that
 the two rules never disagree.
@@ -218,26 +219,31 @@ def domain_pixels(
     grid: darsia.Image,
     labels: np.ndarray,
     sand_labels: Sequence[int] = (),
+    positions: darsia.GridPositions | None = None,
     parts: np.ndarray | None = None,
 ) -> np.ndarray:
     """The pixels of a domain on a run's grid.
 
-    A pixel lies in a box when its centre does, each interval half-open
-    (``x0 <= x < x1``, ``y0 <= y < y1``); a sand layer holds the pixels of its
-    label, a part of it those of its part (``parts``), and the sand those of the
-    sand layers' labels.
+    A pixel lies in a box when its position does, each interval half-open
+    (``x0 <= x < x1``, ``y0 <= y < y1``), compared in double precision, as our
+    production compared its measured pixel positions; a sand layer holds the
+    pixels of its label, a part of it those of its part (``parts``), and the sand
+    those of the sand layers' labels.
 
     Parameters
     ----------
     domain : AnalysisDomain
         The domain.
     grid : darsia.Image
-        An image on the run's grid, e.g. its sand map, whose pixel centres
-        (:func:`darsia.pixel_centres`) the boxes read.
+        An image on the run's grid, e.g. its sand map, whose pixel centres the
+        boxes read without positions.
     labels : array
         The label of each pixel, e.g. the sand map's.
     sand_labels : sequence of int
         The labels of the sand layers, which the sand reads.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig, by the run's measured model of its grid;
+        by default the grid's pixel centres (:func:`darsia.grid_positions`).
     parts : array, optional
         Each pixel's part of its sand layer (:func:`layer_parts`), which a part of
         a layer reads.
@@ -274,9 +280,11 @@ def domain_pixels(
     else:
         inside = np.ones(labels.shape, bool)
     if domain.bounds_mm is not None:
-        x, y = darsia.pixel_centres(grid)
+        if positions is None:
+            positions = darsia.grid_positions(grid)
+        x, y = (np.asarray(v, np.float64) for v in (positions.x, positions.y))
         x0, x1, y0, y1 = domain.bounds_m
-        inside &= ((y >= y0) & (y < y1))[:, None] & ((x >= x0) & (x < x1))[None, :]
+        inside &= (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
     return inside
 
 
