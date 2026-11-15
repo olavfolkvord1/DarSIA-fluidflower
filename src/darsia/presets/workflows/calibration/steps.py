@@ -312,6 +312,12 @@ def response_reading(
     return darsia.BeerLambertReading(path, factor, background, facies, pitch, settings)
 
 
+def measured_pixels(grid: RunGrid, image: np.ndarray) -> np.ndarray:
+    """A frame's pixels whose colour change is measured: in the run's domain and
+    finite in the frame's corrected image."""
+    return grid.domain & np.isfinite(image).all(axis=-1)
+
+
 def native_reading(ctx: StepContext, run: str) -> darsia.SandColorPaths:
     """Each sand read on its own colour path with the factor one: the signal our
     production kept on a sand's measured pixels outside the dissolved CO2 it
@@ -333,7 +339,7 @@ def read_signal(
     sand's dissolved CO2; every other measured pixel of a sand read keeps its own
     path's signal (``native``, :func:`native_reading`). The statistics and the
     mass maps take this signal on the dissolved CO2 of the phase map."""
-    support = grid.domain & np.isfinite(image).all(axis=-1)
+    support = measured_pixels(grid, image)
     dissolved = support & (maps["before"] == darsia.PhaseLabel.DISSOLVED)
     baseline = grid.rig.baseline.img
     signal = reading(image, baseline, support, dissolved, grid.facies)
@@ -420,12 +426,12 @@ def _displaced_volume(ctx: StepContext) -> None:
         sand_map=_sand_map_identity(tables),
         recipe=dict(tables.get("recipe", {})),
         pressure_h=np.asarray(
-            [(date - start).total_seconds() / 3600 for date in pressure["datetime"]]
+            [experiment.time_since_start(date) for date in pressure["datetime"]]
         ),
         pressure_bar=np.asarray(pressure["pressure_bar"], np.float64),
         injection_h=(
-            (steps["start"].min() - start).total_seconds() / 3600,
-            (steps["end"].max() - start).total_seconds() / 3600,
+            experiment.time_since_start(steps["start"].min()),
+            experiment.time_since_start(steps["end"].max()),
         ),
         volume=volume,
     )
@@ -480,9 +486,8 @@ def _overflow(ctx: StepContext) -> None:
         return experiments[name]
 
     own = experiment_of(run)
-    start = own.experiment_start
     dates = [own.get_datetime(ctx.photo(run, frame)) for frame in frames]
-    hours = [(date - start).total_seconds() / 3600 for date in dates]
+    hours = [own.time_since_start(date) for date in dates]
     mass = [own.injection_protocol.injected_mass(time=h) * 1000 for h in hours]
     density = [_gas_density(own, h, dtype) for h in hours]
     candidates = {name: runs[name] for name in runs if name in fits.fit or name == run}
@@ -720,7 +725,7 @@ class _RunFrames(Sequence):
         frame, run = self.frames[int(index)], self.run
         image = self.ctx.read("corrected-image", read_image, run=run, frame=frame).img
         maps = self.ctx.read("phase-maps", darsia.read_phase_maps, run=run, frame=frame)
-        support = self.grid.domain & np.isfinite(image).all(axis=-1)
+        support = measured_pixels(self.grid, image)
         return image, maps["labels"], maps["rules"], support
 
 
@@ -752,9 +757,8 @@ def _path_ratios(ctx: StepContext) -> None:
         baseline, facies, pitch, reading.sands, settings["shadow"]
     )
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-    start = experiment.experiment_start
     hours = [
-        (experiment.get_datetime(ctx.photo(run, frame)) - start).total_seconds() / 3600
+        experiment.time_since_start(experiment.get_datetime(ctx.photo(run, frame)))
         for frame in ctx.selection.frames[run]
     ]
     span = statistics.saturation_signal - statistics.zero_signal
@@ -783,7 +787,7 @@ def _run_statistics(ctx: StepContext) -> None:
     statistics_settings = settings["run_statistics"]
     grid = run_grid(ctx.read("rig", read_rig), settings["material"])
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-    protocol, start = experiment.injection_protocol, experiment.experiment_start
+    protocol = experiment.injection_protocol
     variants = (None, *ctx.read("overflow", darsia.held_out_runs))
     volumes = {
         held_out: ctx.read("overflow", lambda f: darsia.read_frame_volumes(f, held_out))
@@ -796,7 +800,7 @@ def _run_statistics(ctx: StepContext) -> None:
         image = ctx.read("corrected-image", read_image, frame=frame).img
         date = experiment.get_datetime(ctx.photo(run, frame))
         co2 = co2_state(grid, experiment, date)
-        hours = (date - start).total_seconds() / 3600
+        hours = experiment.time_since_start(date)
         for held_out in variants:
             maps = ctx.read(
                 "phase-maps", lambda f: darsia.read_phase_maps(f, held_out), frame=frame

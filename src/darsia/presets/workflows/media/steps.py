@@ -42,6 +42,7 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+from darsia.utils.results import write_json
 
 UNIT = "g/L"
 """The unit of the mass maps a film shows: CO2 mass per pore volume (R7)."""
@@ -147,7 +148,6 @@ def _film_tiles(ctx: StepContext) -> None:
         rig.pixel_area.img,
     )
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-    start = experiment.experiment_start
     shape = rig.facies.img.shape
 
     def write(folder):
@@ -156,9 +156,8 @@ def _film_tiles(ctx: StepContext) -> None:
         for frame in ctx.task.frames:
             maps = ctx.read("mass-maps", darsia.read_mass_maps, frame=frame)
             phase = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
-            hours = (
-                experiment.get_datetime(ctx.photo(run, frame)) - start
-            ).total_seconds() / 3600
+            date = experiment.get_datetime(ctx.photo(run, frame))
+            hours = experiment.time_since_start(date)
             shown = media.Frame(
                 case=frame_key(frame),
                 elapsed_h=hours,
@@ -187,8 +186,7 @@ def _film_tiles(ctx: StepContext) -> None:
         for part, made in zip(parts, rows):
             part.mkdir(parents=True, exist_ok=True)
             media.write_tile_index(part, made)
-        text = json.dumps(found, indent=1, allow_nan=False)
-        (Path(folder) / DRAWINGS).write_text(text + "\n", encoding="utf-8")
+        write_json(Path(folder) / DRAWINGS, found)
 
     ctx.publish(write)
 
@@ -232,8 +230,7 @@ def _films(ctx: StepContext) -> None:
             style=settings["style"],
             lock=ctx.host_lock(ENCODER_LOCK),
         )
-        text = json.dumps(records, indent=1, allow_nan=False)
-        (Path(folder) / RECORDS).write_text(text + "\n", encoding="utf-8")
+        write_json(Path(folder) / RECORDS, records)
 
     ctx.publish(write)
 
