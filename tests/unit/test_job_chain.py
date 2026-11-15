@@ -816,6 +816,9 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     at the first missing frame; every map and saturation equals the whole run's."""
     project = tmp_path / "project"
     config, selection = _project(project, "float32")
+    config.write_text(  # the first run alone, the one fit run
+        config.read_text().replace('fit = ["r1", "r2"]', 'fit = ["r1"]')
+    )
     monkeypatch.chdir(project)
     one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
     early = setup.STEPS + (
@@ -873,11 +876,11 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     project = tmp_path / "project"
     config, selection = _project(project, "float64")
     monkeypatch.chdir(project)
-    one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
     steps = setup.STEPS + calibration.STEPS[:5]
-    job = create_job(tmp_path / "jobs", steps, one, config)
-    _run(job, skip={"run-statistics.r1"})
-    frame = one.frames["r1"][-1]
+    job = create_job(tmp_path / "jobs", steps, selection, config)
+    statistics = {"run-statistics.r1", "run-statistics.r2"}
+    _run(job, skip=statistics)
+    frame = selection.frames["r1"][-1]
     results = project / "results"
     maps = darsia.read_phase_maps(
         results / "phase-maps" / "r1" / frame.session / frame.name
@@ -889,7 +892,7 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     image = darsia.imread(stored / "image.npz")
     image.img[row, column] = np.nan  # its colour is not measured
     image.save(stored / "image.npz")
-    _run(job)
+    _run(job, skip={"run-statistics.r2"})
     found = darsia.read_frames(results / "run-statistics" / "r1")[-1]
     tables = tomllib.loads(config.read_text())
     material = settings_from_table(calibration.MaterialSettings, tables["material"])
@@ -1279,3 +1282,17 @@ def test_the_rig_is_known_by_its_default_depth_map(tmp_path):
     tables = {"data": {"results": "results"}, "depth": {"measurements": "depth.csv"}}
     found = [Path(path).as_posix() for path in setup._rig_stamped(tables, tmp_path, [])]
     assert found == ["results/setup/depth/depth_map.npz"]
+
+
+def test_a_job_without_a_fit_run_or_the_reference_run_is_refused(tmp_path):
+    """A job over runs without one of the configured fit runs, among which the
+    overflow ranks its donors and over which the fit is made, is refused, naming
+    it; so is a job of distances without their configured reference run."""
+    config, selection = _project(tmp_path / "project", "float64")
+    jobs, frames = tmp_path / "jobs", selection.frames
+    alone = Selection({"r2": frames["r2"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"overflow needs run\(s\) \['r1'\]"):
+        create_job(jobs, STEPS, alone, config)
+    alone = Selection({"r1": frames["r1"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"distances needs run\(s\) \['r2'\]"):
+        create_job(jobs, (comparison.DISTANCES,), alone, config)
