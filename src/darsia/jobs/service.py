@@ -109,6 +109,28 @@ def say(text: str, log: Path | None = None) -> None:
             pass
 
 
+def _lock_file(path: Path):
+    """A lock file opened to be locked: for writing, or only for reading where
+    another account made it, since a lock needs reading only."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        return open(path, "a+b")
+    except PermissionError:
+        return open(path, "rb")
+
+
+def _kernel32():
+    """Windows' kernel32 with the types of its mutex calls set."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel32
+
+
 class HostLock:
     """An operating-system lock on a local file, held for the life of a service;
     the system releases it when the process ends.
@@ -134,11 +156,7 @@ class HostLock:
             If another process holds it.
 
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            stream = open(self.path, "a+b")
-        except PermissionError:  # another account's file: a lock needs reading only
-            stream = open(self.path, "rb")
+        stream = _lock_file(self.path)
         try:
             if msvcrt is not None:
                 stream.seek(0)
@@ -187,14 +205,7 @@ class HostMutex:
             If another process holds it, also under another account.
 
         """
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.restype = wintypes.HANDLE
-        kernel32.CreateMutexW.argtypes = (
-            wintypes.LPVOID,
-            wintypes.BOOL,
-            wintypes.LPCWSTR,
-        )
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32 = _kernel32()
         handle = kernel32.CreateMutexW(None, False, self.name)
         error = ctypes.get_last_error()
         if handle and error != self._EXISTS:
@@ -212,6 +223,57 @@ class HostMutex:
         """Release the mutex."""
         self._close(self._handle)
         self._handle = None
+
+
+class WaitingLock:
+    """A lock of the whole machine that its taker waits for, held for a short
+    while, e.g. while a film's encoder opens: on Windows a named mutex of the
+    ``Global\\`` namespace, which every account sees and the system hands on when
+    its holder dies, and on POSIX an exclusive lock of a fixed file. One thread
+    takes and releases it, and may take it again once released.
+
+    Parameters
+    ----------
+    name : str
+        The lock's name, e.g. ``"film-encoder"``.
+
+    """
+
+    _INFINITE, _OWNED, _ABANDONED = 0xFFFFFFFF, 0, 0x80
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        """The lock's name."""
+        self._held = None
+
+    def __enter__(self) -> WaitingLock:
+        """Wait until the lock is free, and take it."""
+        if msvcrt is None:
+            stream = _lock_file(Path(f"/tmp/darsia-{self.name}.lock"))
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            self._held = stream
+            return self
+        kernel32 = _kernel32()
+        handle = kernel32.CreateMutexW(None, False, f"Global\\darsia-{self.name}")
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        state = kernel32.WaitForSingleObject(handle, self._INFINITE)
+        if state not in (self._OWNED, self._ABANDONED):  # abandoned: its holder died
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        self._held = (kernel32, handle)
+        return self
+
+    def __exit__(self, *_) -> None:
+        """Release the lock."""
+        if msvcrt is None:
+            self._held.close()
+        else:
+            kernel32, handle = self._held
+            kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        self._held = None
 
 
 def host_lock(lock: Path | None = None):

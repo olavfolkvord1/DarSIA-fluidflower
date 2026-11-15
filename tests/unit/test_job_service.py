@@ -580,6 +580,63 @@ def test_the_host_lock_is_the_machines(tmp_path, monkeypatch):
         pass
 
 
+def test_a_waiting_lock_waits_for_its_holder():
+    """A second taker of a host's waiting lock waits until the first releases it,
+    and the first may then take it again."""
+    name = f"jobs-test-{secrets.token_hex(8)}"
+    first, second = service.WaitingLock(name), service.WaitingLock(name)
+    held, times = threading.Event(), {}
+
+    def other():
+        held.wait(30)
+        with second:
+            times["taken"] = time.monotonic()
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    with first:
+        held.set()
+        time.sleep(0.5)
+        times["released"] = time.monotonic()
+    thread.join(30)
+    assert times["taken"] >= times["released"]
+    with first:
+        pass
+
+
+_HOLD = """
+import os, sys, time
+from darsia.jobs import service
+lock = service.WaitingLock(sys.argv[1])
+lock.__enter__()
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+if sys.argv[3] == "abandon":
+    os._exit(0)
+lock.__exit__()
+"""
+
+
+@pytest.mark.parametrize("ending", ["release", "abandon"])
+def test_a_waiting_lock_held_by_another_process_is_taken_once_it_lets_go(
+    importable, ending
+):
+    """A waiting lock held by another process is taken once that process releases
+    it, or dies holding it: a dead holder hands it on."""
+    name = f"jobs-test-{secrets.token_hex(8)}"
+    command = [sys.executable, "-c", _HOLD, name, "1.0", ending]
+    holder = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        began = time.monotonic()
+        with service.WaitingLock(name):
+            waited = time.monotonic() - began
+        assert waited > 0.5
+    finally:
+        holder.wait(60)
+        holder.stdout.close()
+
+
 def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch):
     """A blocked lease write cannot extend the later terminal commit deadline
     by the time its own retries consumed."""
