@@ -43,6 +43,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from math import ceil, hypot, radians, tan
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -72,6 +73,8 @@ _FADE_REACH = 8
 """Beyond this many fade lengths the fade weight is one."""
 _STEP_ROUNDING = 1e-12
 """Rounding guard of the sideways steps of the upward widening."""
+PHASE_MAPS = "maps.npz"
+"""The file of a frame's stored phase maps (:func:`write_phase_maps`)."""
 NEIGHBOURS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 """The eight neighbours of a pixel as (row, column) steps, in one fixed order, so
 that a sum over them is reproducible."""
@@ -748,3 +751,24 @@ def free_gas(
             if found is not None:
                 regions[index] = found
         yield labels, rules, saturation, _co2(own)
+
+
+def write_phase_maps(
+    folder: Path,
+    labels: np.ndarray,
+    rules: np.ndarray,
+    saturation: np.ndarray,
+    co2: np.ndarray,
+) -> None:
+    """Store a frame's maps as :func:`free_gas` yields them, in ``folder``
+    (:data:`PHASE_MAPS`): its phase and rule maps, its free-gas saturation and the
+    CO2 of its labels before the rules."""
+    arrays = dict(labels=labels, rules=rules, saturation=saturation, co2=co2)
+    np.savez(Path(folder) / PHASE_MAPS, **arrays)
+
+
+def read_phase_maps(folder: Path) -> dict[str, np.ndarray]:
+    """A frame's stored maps (:func:`write_phase_maps`): ``labels``, ``rules``,
+    ``saturation`` and ``co2``."""
+    with np.load(Path(folder) / PHASE_MAPS) as stored:
+        return {name: stored[name] for name in stored.files}
