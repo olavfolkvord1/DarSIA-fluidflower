@@ -19,10 +19,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from darsia.utils import results
-
 from math import hypot
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -46,7 +44,7 @@ from darsia.multiphase.phase_rules import (
     _gravity_limit,
     _port_zones,
     _seal,
-    _pitch_mm,
+    _single,
     _summed_areas,
     phase_labels,
     phase_maps,
@@ -333,7 +331,8 @@ def _peel_order(model, y, room, pitch_mm, settings):
 
     On a lattice of cells, each 8-connected piece's core is its cells deepest
     inside it; pixels go by the highest cost from the cores first, then by
-    cell, then the lowest first, then row-major.
+    cell, then the lowest first (by their heights ``y`` in double precision),
+    then row-major.
     """
     cell = tuple(max(1, int(round(settings.lattice_mm / pitch))) for pitch in pitch_mm)
     step = (cell[0] * pitch_mm[0], cell[1] * pitch_mm[1])
@@ -355,7 +354,7 @@ def _peel_order(model, y, room, pitch_mm, settings):
     order = np.lexsort(
         (
             rows * model.shape[1] + cols,
-            y[rows],
+            np.asarray(y, np.float64)[rows, cols],
             cell_rows * shape[1] + cell_cols,
             -value,
         )
@@ -403,6 +402,7 @@ def gas_model_frames(
     chart=None,
     *,
     gas_threshold,
+    positions=None,
 ):
     """Yield the model's preallocation state once for every selected frame.
 
@@ -432,6 +432,8 @@ def gas_model_frames(
         Colour checker mask.
     gas_threshold : float
         Conditional gas probability threshold of the phase model.
+    positions : darsia.GridPositions, optional
+        Measured pixel positions and metric pitch.
 
     Yields
     ------
@@ -450,7 +452,7 @@ def gas_model_frames(
         chart,
         None,
         gas_threshold=gas_threshold,
-
+        positions=positions,
     )
     for index, (labels, rules) in enumerate(made):
         probability = probabilities[index]
@@ -482,6 +484,7 @@ def free_gas(
     gas_threshold: float,
     depth_m: np.ndarray | None = None,
     start: int = 0,
+    positions: darsia.GridPositions | None = None,
     record: Callable[[int, GasAllocationRecord], None] | None = None,
     model_frames: Sequence[GasModelFrame] | None = None,
     zones: Sequence[GasZone] | None = None,
@@ -539,6 +542,10 @@ def free_gas(
     start : int, optional
         Index of the first frame to allocate. The complete run remains the
         source of the contour, neighbours and any active-injection signal.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig and the grid's pitch, by the run's
+        measured model of its grid; by default the sand map's pixel centres
+        (:func:`darsia.grid_positions`).
     record : callable, optional
         Receives a frame index and its numeric :class:`GasAllocationRecord`
         before that frame is yielded. The iterator still yields five arrays.
@@ -584,7 +591,7 @@ def free_gas(
                 rule_settings,
                 chart,
                 gas_threshold=gas_threshold,
-
+                positions=positions,
             )
             made = gas_model_zones(
                 prepared.store(originals),
@@ -595,7 +602,7 @@ def free_gas(
                 protocol,
                 rule_settings,
                 settings,
-
+                positions=positions,
                 chart=chart,
                 depth_m=depth_m,
             )
@@ -617,7 +624,7 @@ def free_gas(
                 chart,
                 gas_threshold=gas_threshold,
                 start=start,
-
+                positions=positions,
                 record=record,
                 model_frames=prepared,
                 zones=contours,
@@ -630,10 +637,11 @@ def free_gas(
     if not 0 <= start <= len(dates):
         raise ValueError("Allocation start lies outside the selected run")
     facies = sand_map.img
-    x, y = darsia.pixel_centres(sand_map)
-    pitch_mm = _pitch_mm(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
+    y, pitch_mm = positions.y, positions.pitch_mm
     ports = injection_ports(protocol)
-    radius, lower = _port_zones(x, y, ports, rule_settings)
+    radius, lower = _port_zones(*_single(positions), ports, rule_settings)
     seal = _seal(facies, domain, permeability, rule_settings)
     eligible = pore_volume_m3 > 0
 
@@ -813,6 +821,7 @@ def free_gas(
                 ),
             )
         yield labels, rules, saturation, _co2(own), own
+
 
 def _maps_file(held_out: str | None) -> str:
     """The file of a frame's stored maps, or of its maps without a held-out run's

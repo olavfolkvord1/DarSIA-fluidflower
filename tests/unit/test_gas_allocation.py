@@ -37,6 +37,7 @@ TABLES = tomllib.loads(
     port_zone_half_width_mm = 38.0
     port_zone_depth_mm = 10.0
     finger_width_mm = 10.0
+    pitch_stride = 64
 
     [gas_allocation]
     seed_mm2 = 100.0
@@ -81,7 +82,7 @@ def _run(
     *,
     end_h=9.0,
     facies=None,
-
+    positions=None,
     record=None,
 ):
     """Phase and rule maps and saturations of a run, one port at height 4.5 mm."""
@@ -117,14 +118,71 @@ def _run(
             BASE_SETTINGS,
             gas_threshold=GAS_THRESHOLD,
             depth_m=np.full(SHAPE, 0.02),
-
+            positions=positions,
             record=record,
         )
     )
 
 
+def test_the_peel_reads_the_measured_heights():
+    """Under a seal, a pixel's depth below its run's top is taken between the
+    measured heights of its own column; in a peel's cell, the pixel lowest by its
+    measured height goes first."""
+    rows, cols = 12, 4
+    y = np.broadcast_to(0.012 - np.arange(rows)[:, None] * 0.001, (rows, cols)).copy()
+    y[:, 2] = 0.012 - np.arange(rows) * 0.0015  # one column's pixels lie further apart
+    model = np.zeros((rows, cols), bool)
+    model[4:6, :] = True
+    tilted = y + np.arange(cols)[None, :] * -0.0012  # the right lies lower
+    room = np.ones((rows, cols))
+    order_rows, order_cols, _ = allocation_module._peel_order(
+        model, tilted, room, (1.0, 1.0), replace(SETTINGS, lattice_mm=50.0)
+    )
+    heights = tilted[order_rows, order_cols]
+    assert (order_rows[0], order_cols[0]) == np.unravel_index(
+        np.where(model, tilted, np.inf).argmin(), (rows, cols)
+    )
+    assert (np.diff(heights) >= 0).all()
 
 
+def test_the_allocation_reads_the_measured_positions(tmp_path, monkeypatch):
+    """Identical centres give identical maps; calibrated centres locate the port.
+
+    Moving a port inside a wide depth margin need not change the final mass.
+    Check its actual physical endpoint instead of requiring such a change.
+    """
+    from darsia.multiphase import gas_zone
+
+    endpoints = []
+    original = gas_zone._injector_link
+
+    def observed_endpoint(*args, **kwargs):
+        result = original(*args, **kwargs)
+        endpoints.append(tuple(result[2]["port_pixel"]))
+        return result
+
+    monkeypatch.setattr(gas_zone, "_injector_link", observed_endpoint)
+    frame = _frame([np.s_[10:60, 20:60]], [np.s_[30:40, 30:50]])
+    volumes = [3 * 10 * 20 * PORE * (1 - float(SWI))]
+    centres = darsia.grid_positions(
+        darsia.Image(np.zeros(SHAPE), dimensions=[0.06, 0.08])
+    )
+    plain = _run(tmp_path, [frame], [0.0], volumes)
+    same = _run(tmp_path, [frame], [0.0], volumes, positions=centres)
+    for a, b in zip(plain[0], same[0]):
+        np.testing.assert_array_equal(a, b)
+    sheared = darsia.GridPositions(
+        (centres.x + 0.004 * np.linspace(0, 1, SHAPE[0])[:, None]).astype(np.float32),
+        centres.y.astype(np.float32),
+        centres.pitch_mm,
+    )
+    _run(tmp_path, [frame], [0.0], volumes, positions=sheared)
+    assert endpoints[0] == endpoints[1] != endpoints[2]
+    row, col = endpoints[2]
+    distance_mm = 1000 * np.hypot(
+        sheared.x[row, col] - 0.0405, sheared.y[row, col] - 0.0045
+    )
+    assert distance_mm <= np.sqrt(0.5)
 
 
 def test_added_gas_joins_the_model_gas_by_its_score(tmp_path):
