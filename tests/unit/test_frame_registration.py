@@ -1,12 +1,22 @@
 """Tests of the registration of raw photographs onto a setup's reference."""
 
+import json
 import tomllib
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
 import darsia
+from darsia.presets.workflows.config.corrections import CorrectionsConfig
+from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
+from darsia.presets.workflows.rig import Rig
+from darsia.presets.workflows.setup import steps as setup
+from darsia.presets.workflows.setup.setup_sand_map import make_sand_map
+from darsia.utils.locations import Frame
+from tests.unit.test_camera_lens import BLUE, DISTORTION, RED
+from tests.unit.test_camera_lens import SETTINGS as LENS
 from tests.unit.test_raw_decode import BLACK, LAYOUTS, WHITE, write_dng
 
 pytest.importorskip("rawpy")
@@ -95,6 +105,12 @@ def photos(tmp_path_factory):
     write_dng(folder / "baseline.dng", _mosaic(scene), LAYOUTS["RGGB"][0])
     write_dng(folder / "frame.dng", mosaic, LAYOUTS["RGGB"][0])
     return folder
+
+
+def _config(tmp_path) -> CorrectionsConfig:
+    """The corrections of the test photographs."""
+    (tmp_path / "config.toml").write_text(CONFIG)
+    return CorrectionsConfig().load(tmp_path / "config.toml")
 
 
 def _sampled(path, homography, registration, divide_first=False):
@@ -190,3 +206,174 @@ def test_a_raw_photograph_is_registered_to_the_reference_and_sampled_once(
             "edge_aware",
             np.float32,
         )
+
+
+def test_a_rig_registers_its_photographs_and_the_step_stores_their_homography(
+    tmp_path, photos, monkeypatch
+):
+    """With [corrections.registration], the rig's baseline and photographs are
+    registered to its reference, also after a save and a load; the corrected-image
+    step stores each photograph's homography beside its image. A stored rig records
+    that it has a registration, so a registration not found is not read as none."""
+    experiment = SimpleNamespace(
+        get_datetime=lambda path: None,
+        injection_protocol=None,
+        pressure_temperature_protocol=None,
+        experiment_start=None,
+    )
+    rig = Rig()
+    rig.setup_reading(
+        photos / "baseline.dng",
+        experiment=experiment,
+        corrections_config=_config(tmp_path),
+    )
+    registration = rig.registration
+    np.testing.assert_array_equal(
+        rig.baseline.img,
+        _sampled(photos / "baseline.dng", registration.homography, registration),
+    )
+    assert rig.baseline.dimensions == [0.64, 1.1]
+    assert rig.canvas["grid"]["dimensions"] == [0.64, 1.1]
+
+    rig.baseline_path, rig.color_corrections = photos / "baseline.dng", []
+    ones = darsia.ScalarImage(np.ones((698, 1200)), dimensions=rig.baseline.dimensions)
+    rig.depth = rig.porosity = rig.permeability = rig.image_porosity = ones
+    rig.labels = rig.facies = darsia.ScalarImage(
+        np.zeros((698, 1200), dtype=int), dimensions=rig.baseline.dimensions
+    )
+    rig.save(tmp_path / "rig")
+    loaded = Rig.load(tmp_path / "rig")
+    np.testing.assert_array_equal(loaded.registration.reference, registration.reference)
+    np.testing.assert_array_equal(
+        loaded.registration.homography, registration.homography
+    )
+    assert loaded.registration.settings == registration.settings
+    assert loaded.registration.lens == registration.lens
+    meta_data = json.loads((tmp_path / "rig" / "meta_data.json").read_text())
+    assert meta_data["registration"] is True
+
+    stored = {}
+    frame = Frame("photos", "frame.dng")
+    ctx = SimpleNamespace(
+        task=SimpleNamespace(run="r1", frames=(frame,)),
+        read=lambda kind, reader: loaded,
+        done=lambda frame: False,
+        photo=lambda run, frame: photos / frame.name,
+        publish=lambda write, frame: write(tmp_path) or stored.update(frame=frame),
+    )
+    monkeypatch.setattr(setup, "run_settings", lambda ctx, run, sections: None)
+    monkeypatch.setattr(setup, "make_experiment", lambda config: experiment)
+    loaded.reference_date = None
+    setup._corrected_image(ctx)
+    values, found = darsia.register_raw_frame(
+        photos / "frame.dng", registration, "float32"
+    )
+    np.testing.assert_array_equal(setup.read_image(tmp_path).img, values)
+    np.testing.assert_array_equal(loaded.read_image(photos / "frame.dng").img, values)
+    kept = darsia.read_frame_registration(tmp_path)
+    np.testing.assert_array_equal(kept.homography, found.homography)
+    assert kept.homography.dtype == np.float32 and kept.matches == found.matches
+    assert stored["frame"] == frame
+
+    # A share that does not find the registration's files yet: the load raises,
+    # for the record as a file not found, which a result's read reads again.
+    for name, error in (
+        ("registration.json", FileNotFoundError),
+        ("registration_reference.npz", AssertionError),  # darsia.imread's
+    ):
+        (tmp_path / "rig" / name).rename(tmp_path / f"hidden-{name}")
+        with pytest.raises(error):
+            Rig.load(tmp_path / "rig")
+        (tmp_path / f"hidden-{name}").rename(tmp_path / "rig" / name)
+
+
+SHAPE_CHAIN = {
+    "mapping": '[corrections.mapping]\npath = "mapping.npz"\n',
+    "resize": '[corrections.resize]\nmode = "scale"\nscale = 0.5\n',
+    "drift": '[corrections.drift]\nmode = "colorchecker"\ncolorchecker = "upper_left"\n',
+    "curvature": "[corrections.curvature.crop]\ntop_left = [43, 57]\n"
+    "bottom_left = [679, 60]\nbottom_right = [672, 1145]\ntop_right = [42, 1143]\n"
+    "width = 1.1\nheight = 0.64\n",
+}
+"""A table of each shape correction that the registration replaces."""
+
+
+@pytest.mark.parametrize("name", ["raw", *SHAPE_CHAIN])
+def test_a_registration_needs_raw_photographs_and_replaces_the_shape_chain(
+    tmp_path, photos, name
+):
+    """The registration needs raw photographs, and a stored mapping, a resize, a
+    drift correction or a curvature correction beside it is refused: its reference
+    already is the camera grid cropped to the rig points."""
+    raw = '[corrections.raw]\ndemosaic = "edge_aware"\n'
+    text = CONFIG.replace(raw, "") if name == "raw" else CONFIG + SHAPE_CHAIN[name]
+    (tmp_path / "config.toml").write_text(text)
+    config = CorrectionsConfig().load(tmp_path / "config.toml")
+    refusal = (
+        r"needs \[corrections.raw\]"
+        if name == "raw"
+        else rf"replaces the shape chain: \[corrections.{name}\] cannot"
+    )
+    with pytest.raises(ValueError, match=refusal):
+        Rig().setup_reading(
+            photos / "baseline.dng",
+            experiment=SimpleNamespace(get_datetime=lambda path: None),
+            corrections_config=config,
+        )
+
+
+def test_a_baseline_with_other_lens_tables_than_the_calibrations_is_refused(
+    tmp_path, photos, monkeypatch
+):
+    """A baseline that records other lens tables than those the recorded-table
+    model was calibrated with is refused; tables without that model are refused
+    when the configuration loads."""
+    tables = "[corrections.registration.lens_tables]\n" + "".join(
+        f"{key} = {list(values)}\n"
+        for key, values in zip(("distortion", "red", "blue"), (DISTORTION, RED, BLUE))
+    )
+    (tmp_path / "config.toml").write_text(CONFIG + tables)
+    with pytest.raises(ValueError, match="camera_lens model, which is not configured"):
+        CorrectionsConfig().load(tmp_path / "config.toml")
+
+    config = _config(tmp_path)
+    registration = config.registration
+    registration.camera_lens = darsia.CameraLensSettings(**LENS)
+    registration.lens_tables = darsia.CameraLensTables(DISTORTION, RED, BLUE)
+    read = []
+
+    def recorded(path, settings):
+        read.append((path, settings))
+        return darsia.CameraLensTables(DISTORTION, RED, BLUE[::-1])
+
+    monkeypatch.setattr(darsia, "read_camera_lens_tables", recorded)
+    with pytest.raises(ValueError, match="records other lens tables"):
+        Rig().setup_reading(
+            photos / "baseline.dng",
+            experiment=SimpleNamespace(get_datetime=lambda path: None),
+            corrections_config=config,
+        )
+    assert read == [(photos / "baseline.dng", registration.camera_lens)]
+
+
+def test_a_sand_map_is_placed_on_the_registrations_reference_grid(
+    tmp_path, monkeypatch
+):
+    """Without a stored mapping, the sand map lies on the registration's grid: the
+    official crop of the camera grid to the rig points, in metres."""
+    monkeypatch.chdir(tmp_path)
+    corners = [[0, 0], [0, 0.64], [1.1, 0], [1.1, 0.64]]
+    drawing = {"anchors": corners, "polygons": [[1, [0, 1, 3, 2]]]}
+    (tmp_path / "drawing.json").write_text(json.dumps(drawing))
+    (tmp_path / "config.toml").write_text(
+        CONFIG
+        + '[labeling]\nlabels = "labels.npz"\n'
+        + '[labeling.sand_map]\ndrawing = "drawing.json"\nedge_fill_mm = 0.0\n'
+        + '[rig]\npath = "rig"\nwidth = 1.1\nheight = 0.64\ndim = 2\n'
+    )
+    config = FluidFlowerConfig(
+        tmp_path / "config.toml", require_data=False, require_results=False
+    )
+    labels = make_sand_map(config)
+    assert labels.img.shape == (698, 1200) and labels.dimensions == [0.64, 1.1]
+    assert list(labels.origin) == [0.0, 0.64] and set(np.unique(labels.img)) == {1}

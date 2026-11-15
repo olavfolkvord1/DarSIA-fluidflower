@@ -4,6 +4,7 @@
 
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 from warnings import warn
@@ -16,11 +17,13 @@ import darsia
 from darsia.presets.analysis.porosity import patched_porosity_analysis
 from darsia.presets.workflows.config.corrections import (
     CorrectionsConfig,
+    FrameRegistrationConfig,
     IlluminationCorrectionConfig,
     MaterialIlluminationCorrectionConfig,
     PatchwiseIlluminationCorrectionConfig,
 )
 from darsia.presets.workflows.config.image_porosity import ImagePorosityConfig
+from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.facies_props import FaciesProps
 from darsia.presets.workflows.setup.illustrations import save_scalar_map_illustration
 
@@ -151,8 +154,14 @@ class Rig:
                 "dtype": np.dtype(precision).name,
             }
 
-        # Setup (based on baseline image without any corrections applied)
-        pre_baseline = darsia.imread(baseline_path, **self.raw_decoding)
+        self.registration: darsia.FrameRegistration | None = None
+        """The setup's reference of each photograph's registration, if any."""
+        if corrections_config is not None and corrections_config.registration:
+            # The baseline registered as a frame, on the reference's grid.
+            pre_baseline = self.setup_registration(baseline_path, corrections_config)
+        else:
+            # Setup (based on baseline image without any corrections applied)
+            pre_baseline = darsia.imread(baseline_path, **self.raw_decoding)
 
         if show_plot:
             # Allows to visually check the baseline image before any corrections
@@ -168,9 +177,20 @@ class Rig:
         )
 
         # Define shape-corrected baseline.
-        self.shape_corrected_baseline = darsia.imread(
-            baseline_path, transformations=self.shape_corrections, **self.raw_decoding
-        )
+        if self.registration is not None:
+            self.shape_corrected_baseline = darsia.OpticalImage(
+                pre_baseline.img.copy(),
+                transformations=self.shape_corrections,
+                color_space="RGB",
+                dimensions=list(pre_baseline.dimensions),
+                origin=list(pre_baseline.origin),
+            )
+        else:
+            self.shape_corrected_baseline = darsia.imread(
+                baseline_path,
+                transformations=self.shape_corrections,
+                **self.raw_decoding,
+            )
         self.baseline = self.shape_corrected_baseline.copy()
 
         self.canvas = self._canvas(baseline_path, corrections_config)
@@ -190,6 +210,80 @@ class Rig:
         plt.close()
 
         logger.info("Reading setup completed.")
+
+    def setup_registration(
+        self, baseline_path: Path, corrections_config: CorrectionsConfig
+    ) -> darsia.OpticalImage:
+        """Set up each raw photograph's registration from the baseline's raw file:
+        the setup's reference and homography (:func:`darsia.setup_frame_registration`)
+        for :meth:`read_image`; the baseline registered as a frame.
+
+        The registration replaces the shape chain: its reference is the camera
+        grid cropped to the rig points, so a stored mapping, a resize, a drift
+        correction and a curvature correction are refused beside it. A baseline
+        that records other lens tables than those the configured model was
+        calibrated with (``lens_tables``) is refused.
+
+        Parameters
+        ----------
+        baseline_path : Path
+            The baseline's raw file.
+        corrections_config : CorrectionsConfig
+            The corrections, with [corrections.registration] and
+            [corrections.raw], and without another shape correction.
+
+        Returns
+        -------
+        darsia.OpticalImage
+            The baseline on the reference's grid, NaN where invalid.
+
+        Raises
+        ------
+        ValueError
+            If the photographs are not raw, another shape correction is configured
+            too, or the baseline's lens tables are not the calibration's.
+
+        """
+        config: FrameRegistrationConfig = corrections_config.registration
+        if not self.raw_decoding:
+            raise ValueError("[corrections.registration] needs [corrections.raw].")
+        chain = [
+            f"[corrections.{name}]"
+            for name in ("mapping", "resize", "drift", "curvature")
+            if getattr(corrections_config, name)
+        ]
+        if chain:
+            raise ValueError(
+                "[corrections.registration] replaces the shape chain: "
+                f"{', '.join(chain)} cannot be configured beside it."
+            )
+        if config.lens_tables is not None:
+            recorded = darsia.read_camera_lens_tables(baseline_path, config.camera_lens)
+            if recorded != config.lens_tables:
+                raise ValueError(
+                    f"{baseline_path} records other lens tables than the lens model "
+                    "was calibrated with."
+                )
+        crop = config.crop
+        self.registration, baseline, self.setup_registration_quality = (
+            darsia.setup_frame_registration(
+                baseline_path,
+                config.settings,
+                config.lens,
+                config.camera_shape,
+                config.channel,
+                self.raw_decoding["demosaic"],
+                self.raw_decoding["dtype"],
+                corners=None if crop is None else crop.pts_src,
+                size=None if crop is None else (crop.width, crop.height),
+            )
+        )
+        return darsia.OpticalImage(
+            baseline,
+            color_space="RGB",
+            dimensions=list(self.registration.dimensions),
+            origin=list(self.registration.origin),
+        )
 
     def _canvas(
         self, baseline_path: Path, corrections_config: CorrectionsConfig | None
@@ -219,6 +313,7 @@ class Rig:
         config = corrections_config or CorrectionsConfig()
         # The crop follows the mapping and gives the images the size it states.
         crop = config.curvature.crop if config.curvature else None
+        crop = crop or (config.registration.crop if config.registration else None)
         metres = crop.in_meters if crop else config.mapping is not None
         grid = None
         if metres:
@@ -1286,8 +1381,32 @@ class Rig:
         }
         if getattr(self, "raw_decoding", {}):
             meta_data["raw_decoding"] = self.raw_decoding
+        # The setup's reference of each photograph's registration, or none; the
+        # record says which, so that a file not found is not taken for none.
+        registration = getattr(self, "registration", None)
+        meta_data["registration"] = registration is not None
         with open(folder / "meta_data.json", "w") as f:
             json.dump(meta_data, f)
+
+        if registration is not None:
+            darsia.Image(
+                registration.reference,
+                dimensions=list(registration.dimensions),
+                origin=list(registration.origin),
+            ).save(folder / "registration_reference.npz")
+            record = {
+                "homography": registration.homography.tolist(),
+                "settings": asdict(registration.settings),
+                "lens": [[type(m).__name__, asdict(m)] for m in registration.lens],
+                "camera_shape": list(registration.camera_shape),
+                "channel": registration.channel,
+                "demosaic": registration.demosaic,
+            }
+            with open(folder / "registration.json", "w") as f:
+                json.dump(record, f)
+        else:
+            (folder / "registration.json").unlink(missing_ok=True)
+            (folder / "registration_reference.npz").unlink(missing_ok=True)
 
         # Save reading information
         self.baseline.save(folder / "baseline.npz")
@@ -1386,6 +1505,27 @@ class Rig:
         rig.raw_decoding = meta_data.get("raw_decoding", {})
         # A rig saved without a canvas has an unknown canvas.
         rig.canvas = meta_data.get("canvas")
+        rig.registration = None
+        if meta_data.get("registration", False):
+            with open(folder / "registration.json", "r") as f:
+                record = json.load(f)
+            reference = darsia.imread(folder / "registration_reference.npz")
+            rig.registration = darsia.FrameRegistration(
+                reference=reference.img,
+                homography=np.asarray(record["homography"], reference.img.dtype),
+                settings=settings_from_table(
+                    darsia.ProjectiveRegistrationSettings, record["settings"]
+                ),
+                lens=tuple(
+                    settings_from_table(getattr(darsia, name), values)
+                    for name, values in record["lens"]
+                ),
+                camera_shape=tuple(record["camera_shape"]),
+                channel=record["channel"],
+                demosaic=record["demosaic"],
+                dimensions=tuple(reference.dimensions),
+                origin=tuple(float(v) for v in reference.origin),
+            )
 
         # Load data for reading images
         rig.baseline = darsia.imread(folder / "baseline.npz")
@@ -1533,6 +1673,9 @@ class Rig:
         assert hasattr(
             self, "experiment"
         ), "Experiment not defined. Run load_experiment() first."
+        if getattr(self, "registration", None) is not None:
+            return self.read_registered_image(path)[0]
+
         # Convert date from path
         date = self.experiment.get_datetime(path)
 
@@ -1547,6 +1690,42 @@ class Rig:
         )
 
         return img
+
+    def read_registered_image(
+        self, path: Path
+    ) -> tuple[darsia.Image, darsia.ProjectiveRegistration]:
+        """Read a raw photograph registered to the setup's reference and sampled once
+        from its sensor onto the reference's grid (:func:`darsia.register_raw_frame`),
+        then apply the rig's corrections.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the raw file.
+
+        Returns
+        -------
+        darsia.Image
+            Image object with applied corrections.
+        darsia.ProjectiveRegistration
+            The photograph's homography from the reference's grid to its camera
+            view, and the registration's quality.
+        """
+        registration = self.registration
+        values, found = darsia.register_raw_frame(
+            path, registration, self.raw_decoding["dtype"]
+        )
+        img = darsia.OpticalImage(
+            values,
+            transformations=self.corrections,
+            date=self.experiment.get_datetime(path),
+            reference_date=self.reference_date,
+            name=path.name,
+            color_space="RGB",
+            dimensions=list(registration.dimensions),
+            origin=list(registration.origin),
+        )
+        return img, found
 
     # ! ---- EXPERIMENT AND PROTOCOLS ----
 

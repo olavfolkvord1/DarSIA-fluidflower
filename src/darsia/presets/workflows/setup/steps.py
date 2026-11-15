@@ -330,15 +330,27 @@ def _rig(ctx: StepContext) -> None:
 
 
 def _corrected_image(ctx: StepContext) -> None:
-    """The run's photos of the task read through the rig's corrections."""
+    """The run's photos of the task read through the rig's corrections; with the
+    rig's registration, each one registered to the setup's reference, its
+    homography stored beside it."""
     run = ctx.task.run
     rig = ctx.read("rig", read_rig)
     rig.load_experiment(make_experiment(run_settings(ctx, run, EXPERIMENT)))
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
-        image = rig.read_image(ctx.photo(run, frame))
-        ctx.publish(lambda folder: image.save(Path(folder) / "image.npz"), frame=frame)
+        found = None
+        if rig.registration is None:
+            image = rig.read_image(ctx.photo(run, frame))
+        else:
+            image, found = rig.read_registered_image(ctx.photo(run, frame))
+
+        def write(folder, image=image, found=found):
+            image.save(Path(folder) / "image.npz")
+            if found is not None:
+                darsia.write_frame_registration(folder, found)
+
+        ctx.publish(write, frame=frame)
 
 
 def _drawing_files(tables: Mapping[str, Any], project, folders) -> list[str]:
