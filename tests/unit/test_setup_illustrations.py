@@ -133,6 +133,7 @@ def test_setup_depth_map_exports_depth_jpg(monkeypatch, tmp_path: Path) -> None:
             measurements=tmp_path / "depth.csv",
             depth_map=depth_map_path,
             target_resolution=(3, 4),
+            interpolation="rbf",
         ),
         rig=SimpleNamespace(width=2.0, height=1.0, dim=2),
         check=lambda *_args: None,
