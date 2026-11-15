@@ -15,10 +15,15 @@ and set to NaN in their channel. The outermost photosites count as invalid too,
 since the edge-aware demosaic does not interpolate there but copies the neighbouring
 rows and columns.
 
+The demosaiced values in camera units, their invalid values and the white range
+are also given as they are (:func:`read_raw_sensor`), e.g. for a registration that
+compares every value and a sampling that divides by the white range afterwards.
+
 LibRaw is used through the optional package ``rawpy`` (``pip install darsia[raw]``).
 
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -113,23 +118,47 @@ def imread_from_raw(
     )
 
 
-def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
-    """Decode one raw file with the edge-aware demosaic.
+@dataclass(frozen=True)
+class RawSensor:
+    """The demosaiced values of one raw file, in camera units."""
+
+    values: np.ndarray
+    """Black-subtracted camera RGB (rows, cols, 3) of the 16-bit demosaic."""
+    invalid: np.ndarray
+    """Whether each value draws on an invalid photosite (rows, cols, 3)."""
+    white_range: int
+    """The white level minus the black level."""
+
+
+def read_raw_sensor(path: Path, demosaic: str) -> RawSensor:
+    """Read a camera raw file's demosaiced values, before the division by the white
+    range and with their invalid values marked apart (:func:`imread_from_raw`).
 
     Parameters
     ----------
     path : Path
         Path to the raw file.
-    dtype : numpy dtype or str
-        Floating type of the image.
+    demosaic : str
+        Interpolation of the colour filter array; ``"edge_aware"`` is OpenCV's
+        edge-aware Bayer demosaic.
 
     Returns
     -------
-    array
-        Black-subtracted camera RGB divided by the white range, NaN where invalid,
-        shape (rows, cols, 3).
+    RawSensor
+        The values, their invalid values and the white range.
+
+    Raises
+    ------
+    ImportError
+        If ``rawpy`` is not installed.
+    ValueError
+        As :func:`imread_from_raw`.
 
     """
+    if rawpy is None:
+        raise ImportError("Reading camera raw files requires rawpy (darsia[raw]).")
+    if demosaic != "edge_aware":
+        raise ValueError(f"Unknown demosaic {demosaic!r}; 'edge_aware' is supported.")
     with rawpy.imread(str(path)) as raw:
         if np.shape(raw.raw_pattern) != (2, 2):
             raise ValueError(f"{path} has no Bayer colour filter array.")
@@ -156,9 +185,32 @@ def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
     # OpenCV names a Bayer layout by the second row's second and third photosites.
     code = getattr(cv2, f"COLOR_Bayer{'RGB'[phase[1, 1]]}{'RGB'[phase[1, 0]]}2RGB_EA")
     subtracted = mosaic - np.minimum(mosaic, black)
-    image = cv2.demosaicing(subtracted, code).astype(dtype)
-    image /= image.dtype.type(white - black)
-    image[_invalid(subtracted, mosaic >= white, phase)] = np.nan
+    values = cv2.demosaicing(subtracted, code)
+    invalid = _invalid(subtracted, mosaic >= white, phase)
+    return RawSensor(values, invalid, int(white - black))
+
+
+def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
+    """Decode one raw file with the edge-aware demosaic.
+
+    Parameters
+    ----------
+    path : Path
+        Path to the raw file.
+    dtype : numpy dtype or str
+        Floating type of the image.
+
+    Returns
+    -------
+    array
+        Black-subtracted camera RGB divided by the white range, NaN where invalid,
+        shape (rows, cols, 3).
+
+    """
+    sensor = read_raw_sensor(path, "edge_aware")
+    image = sensor.values.astype(dtype)
+    image /= image.dtype.type(sensor.white_range)
+    image[sensor.invalid] = np.nan
     return image
 
 
