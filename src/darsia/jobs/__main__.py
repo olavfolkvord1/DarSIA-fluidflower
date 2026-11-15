@@ -2,6 +2,9 @@
 
 - ``python -m darsia.jobs serve <jobs>`` runs this host's service over a jobs
   folder (:func:`darsia.jobs.service.serve`).
+- ``python -m darsia.jobs request <jobs> <auto|n>`` sets a host's request: as
+  many tasks as its threads and memory admit, at most n, or with 0 none new
+  (:func:`darsia.jobs.service.write_request`).
 - ``python -m darsia.jobs run <job> <task> <token>`` runs one claimed task in its
   own process, which its service started with the job's computing environment. It
   checks that its code is of the job's revision and that this host provides the
@@ -187,15 +190,16 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
     )
 
 
-def _beats(claim: queue.Claim, stop: threading.Event) -> None:
-    """Renew the lease every BEAT until stopped; a lost claim ends the process. A
+def _beats(claim: queue.Claim, stop: threading.Event, host: str) -> None:
+    """Renew the lease every BEAT until stopped, naming this host
+    (:func:`darsia.jobs.service.host_identity`); a lost claim ends the process. A
     beat that has begun ends before the thread does, and :func:`run` waits for
     the thread before it marks the task."""
     pid, born, number = os.getpid(), service.birth(os.getpid()), 1
     while not stop.wait(results.BEAT):
         number += 1
         try:
-            queue.beat(claim, number, pid, born)
+            queue.beat(claim, number, pid, born, host)
         except queue.Revoked as error:
             service.say(f"{error}; this process stops.")
             os._exit(REVOKED)
@@ -248,16 +252,16 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
             service.say(str(error))
             return REVOKED
         return service.REFUSED
-    threads = int(record["environment"]["threads"])
+    threads, host = int(record["environment"]["threads"]), service.host_identity()
     cv2.setNumThreads(threads)
     threadpool_limits(threads)
     try:
-        queue.beat(claim, 1, os.getpid(), service.birth(os.getpid()))
+        queue.beat(claim, 1, os.getpid(), service.birth(os.getpid()), host)
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
     stop = threading.Event()
-    beats = threading.Thread(target=_beats, args=(claim, stop), daemon=True)
+    beats = threading.Thread(target=_beats, args=(claim, stop, host), daemon=True)
     beats.start()
     task = queue.task(job, task_name)
     failure, adopted = None, ()
@@ -298,9 +302,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     running.add_argument("task")
     running.add_argument("token")
     running.add_argument("--machine", default=socket.gethostname())
+    asking = commands.add_parser(
+        "request", help="Set a host's request: auto, or at most n tasks (0 drains)."
+    )
+    asking.add_argument("jobs", type=Path)
+    asking.add_argument("request")
+    asking.add_argument("--machine", default=socket.gethostname())
     args = parser.parse_args(argv)
     if args.command == "run":
         return run(args.job, args.task, args.token, args.machine)
+    if args.command == "request":
+        try:
+            value = args.request if args.request == service.AUTO else int(args.request)
+        except ValueError:
+            service.say(
+                f"A host's request is {service.AUTO!r} or a number of tasks, not "
+                f"{args.request!r}."
+            )
+            return 2
+        service.write_request(args.jobs, args.machine, value)
+        return 0
     until = None
     if args.until_settled:
         until = functools.partial(service.settled, args.jobs)
