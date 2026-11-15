@@ -342,6 +342,8 @@ folder = "photos-r2"
 depth_map = "depth-r2.npz"
 [runs.r2.recipe]
 alkalinity = 1.04
+[runs.r1.depth]
+interpolation = "triangulation"
 [runs.r1.protocols]
 overflow = "overflow-r1.csv"
 [runs.r2.reading.sands.1]
@@ -400,6 +402,16 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     deeper = darsia.ScalarImage(np.full((120, 180), 0.012), dimensions=[0.3, 0.45])
     deeper.save(root / "depth-r2.npz")
     (root / "props.csv").write_text("id,porosity,permeability\n1,0.44,100\n2,0.4,50\n")
+    # The first run's depth comes from these measurements by the rule on its grid;
+    # its edges lie outside their hull.
+    points = [(x, y) for y in (0.05, 0.15, 0.25) for x in (0.05, 0.15, 0.25, 0.4)]
+    (root / "depth.csv").write_text(
+        "x,y,depth\n"
+        + "".join(
+            f"{x},{y},{0.009 + 0.01 * x**2 + 0.004 * y + 0.0003 * (k % 3):.6f}\n"
+            for k, (x, y) in enumerate(points)
+        )
+    )
     corners = [(x, y) for y in (0, 0.15, 0.3) for x in (0, 0.225, 0.45)]
     drawing = {
         "anchors": [list(corner) for corner in corners],
@@ -503,6 +515,16 @@ def _direct(root: Path, selection: Selection) -> dict:
             facies=root / f"facies-{run}.npz",
         ).save(root / run)
         rig = Rig.load(root / run)
+        if run == "r1":  # the depth rule at the grid's pixel centres, in its dtype
+            depths = pd.read_csv(root / "depth.csv")
+            x, y = darsia.pixel_centres(rig.baseline)
+            points = np.stack(np.meshgrid(x, y), axis=-1).reshape(-1, 2)
+            values, outside = darsia.interpolate_linear_in_hull(
+                (depths["x"], depths["y"], depths["depth"]),
+                points.astype(rig.pixel_area.img.dtype),
+            )
+            assert outside.any() and not outside.all()
+            rig.depth.img = values.reshape(rig.depth.img.shape)
         experiment = make_experiment(config)
         rig.load_experiment(experiment)
         images = []
