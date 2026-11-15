@@ -21,8 +21,9 @@ settings.
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -30,11 +31,15 @@ from typing import Literal, Protocol
 import numpy as np
 
 from darsia.experiment.overflow_circulation import CirculationSettings
-from darsia.experiment.overflow_evaporation import EvaporationSettings
+from darsia.experiment.overflow_evaporation import EvaporationRate, EvaporationSettings
 from darsia.experiment.overflow_feed import FeedSettings
 
 FRAME_VOLUMES = "overflow.json"
 """The file of a run's stored free-gas volume per frame (:func:`write_frame_volumes`)."""
+OVERFLOW_RUN = "displaced.json"
+"""The file of a run's stored displaced volume as a donor (:func:`write_overflow_run`)."""
+MEASURED = "measured"
+"""The source of a frame's volume from its run's own readings (:class:`FrameVolume`)."""
 
 
 class OverflowVariant(Protocol):
@@ -124,6 +129,16 @@ class DisplacedVolume:
     """Why the readings are not usable; empty when they are."""
     baseline: np.ndarray
     """Which readings are the baseline: before the injection, in the window."""
+
+    def astype(self, dtype) -> DisplacedVolume:
+        """The displaced volume with its times and volumes in a dtype, e.g. the run
+        grid's, in which :func:`measured_reference` and
+        :func:`estimated_reference` then interpolate it, as our production
+        interpolated its reviewed volumes in the job's precision."""
+        volume = None if self.volume_ml is None else self.volume_ml.astype(dtype)
+        return dataclasses.replace(
+            self, times_h=self.times_h.astype(dtype), volume_ml=volume
+        )
 
 
 @dataclass(frozen=True)
@@ -390,22 +405,220 @@ def estimated_reference(
     return share * mass_g / (density * 1000)
 
 
+def interpolated_atmosphere(
+    times_h: Sequence[float],
+    pressure_bar: Sequence[float],
+    temperature_c: Sequence[float],
+    elapsed_h: float,
+    dtype,
+) -> tuple[float, float]:
+    """A run's atmospheric pressure and temperature at a time, linear in the hours
+    of its pressure-temperature record, with those hours in a dtype, e.g. the run
+    grid's, as our production interpolated a run's atmosphere (``np.interp``);
+    their upward gradients by the same rule.
+
+    Parameters
+    ----------
+    times_h : sequence of float
+        The record's times [h since the injection start], increasing.
+    pressure_bar, temperature_c : sequence of float
+        Its pressure [bar] and temperature [°C] at those times, or their upward
+        gradients [bar/m] and [°C/m].
+    elapsed_h : float
+        The time [h since the injection start].
+    dtype
+        The dtype of the record's times.
+
+    Returns
+    -------
+    tuple of float
+        The pressure [bar] and temperature [°C], or their gradients.
+
+    Raises
+    ------
+    ValueError
+        If the time lies outside the record.
+
+    """
+    times = np.asarray(times_h, dtype)
+    elapsed = float(elapsed_h)
+    if not np.isfinite(elapsed) or not times[0] <= elapsed <= times[-1]:
+        raise ValueError(f"{elapsed} h lies outside the pressure-temperature record.")
+    return (
+        float(np.interp(elapsed, times, pressure_bar)),
+        float(np.interp(elapsed, times, temperature_c)),
+    )
+
+
+@dataclass(frozen=True)
+class FrameVolume:
+    """A frame's free-gas volume, and where it comes from."""
+
+    volume_m3: float | None
+    """The volume [m3]; None for the model's gas."""
+    source: str | None
+    """:data:`MEASURED` for the run's own readings, the donor run's name for an
+    estimate from it, None without a volume."""
+
+
+def frame_volumes(
+    own: DisplacedVolume | None,
+    hours: Sequence[float],
+    donor: tuple[str, DisplacedVolume] | None = None,
+    mass_g: Sequence[float] = (),
+    density: Sequence[float] = (),
+    donor_state: Callable[[float], tuple[float, float]] | None = None,
+) -> list[FrameVolume]:
+    """The free-gas volume of each frame of a run.
+
+    A frame takes its run's own measured reference where the run's readings are
+    usable and reach the frame's time (:func:`measured_reference`); else the
+    donor's estimated reference (:func:`estimated_reference`), from the donor's
+    injected CO2 mass and gas density at the frame's time; else none, the
+    model's gas. A run has one donor for all its frames (e.g. the first of
+    :func:`ranked_donors` that the caller allows), which is never left for
+    another outside its readings.
+
+    Parameters
+    ----------
+    own : DisplacedVolume or None
+        The run's own displaced volume, if it has readings.
+    hours : sequence of float
+        Each frame's time [h since the injection start].
+    donor : tuple of str and DisplacedVolume, optional
+        The donor's name and usable displaced volume.
+    mass_g, density : sequence of float
+        Each frame's injected CO2 mass [g] and gas density [kg/m3], for a donor.
+    donor_state : callable, optional
+        The donor's injected CO2 mass [g] and gas density [kg/m3] at a time [h
+        since its injection start].
+
+    Returns
+    -------
+    list of FrameVolume
+        Each frame's volume and its source.
+
+    """
+    usable = own is not None and own.volume_ml is not None and not own.reasons
+    found = []
+    for k, elapsed_h in enumerate(hours):
+        volume = measured_reference(own, elapsed_h) if usable else None
+        if volume is not None:
+            found.append(FrameVolume(volume, MEASURED))
+            continue
+        if donor is not None:
+            donor_mass, donor_density = donor_state(elapsed_h)
+            volume = estimated_reference(
+                donor[1], elapsed_h, donor_mass, donor_density, mass_g[k], density[k]
+            )
+        found.append(FrameVolume(volume, None if volume is None else donor[0]))
+    return found
+
+
+def _write_json(folder: Path, name: str, value) -> None:
+    """Write a stored result's JSON file; NaN is refused."""
+    text = json.dumps(value, indent=1, allow_nan=False)
+    (Path(folder) / name).write_text(text, encoding="utf-8")
+
+
+def _volume_json(volume: DisplacedVolume | None) -> dict | None:
+    """A displaced volume as plain values."""
+    if volume is None:
+        return None
+    ml = None if volume.volume_ml is None else volume.volume_ml.tolist()
+    return {
+        "times_h": volume.times_h.tolist(),
+        "volume_ml": ml,
+        "reasons": list(volume.reasons),
+        "baseline": volume.baseline.tolist(),
+        "dtype": volume.times_h.dtype.name,
+    }
+
+
+def _volume(value: Mapping | None) -> DisplacedVolume | None:
+    """A displaced volume from its plain values (:func:`_volume_json`)."""
+    if value is None:
+        return None
+    dtype = np.dtype(value["dtype"])
+    ml = value["volume_ml"]
+    return DisplacedVolume(
+        np.asarray(value["times_h"], dtype),
+        None if ml is None else np.asarray(ml, dtype),
+        tuple(value["reasons"]),
+        np.asarray(value["baseline"], bool),
+    )
+
+
+def write_overflow_run(
+    folder: Path,
+    run: OverflowRun,
+    proposal: EvaporationRate | None = None,
+    evaporation_g_h: float | None = None,
+) -> None:
+    """Store a run's displaced volume as a donor reads it, in ``folder``
+    (:data:`OVERFLOW_RUN`): its sand map's identity, recipe, pressure record,
+    injection period and displaced volume, with the proposed evaporation rate and
+    the rate it was corrected by, if any."""
+    proposed = None if proposal is None else dataclasses.asdict(proposal)
+    record = {
+        "sand_map": run.sand_map,
+        "recipe": dict(run.recipe),
+        "pressure_h": np.asarray(run.pressure_h, np.float64).tolist(),
+        "pressure_bar": np.asarray(run.pressure_bar, np.float64).tolist(),
+        "injection_h": list(run.injection_h),
+        "volume": _volume_json(run.volume),
+        "proposed_evaporation": proposed,
+        "evaporation_g_h": evaporation_g_h,
+    }
+    _write_json(folder, OVERFLOW_RUN, record)
+
+
+def read_overflow_run(folder: Path) -> OverflowRun:
+    """A run's stored displaced volume as a donor reads it
+    (:func:`write_overflow_run`)."""
+    record = json.loads((Path(folder) / OVERFLOW_RUN).read_text(encoding="utf-8"))
+    return OverflowRun(
+        sand_map=record["sand_map"],
+        recipe=record["recipe"],
+        pressure_h=np.asarray(record["pressure_h"], np.float64),
+        pressure_bar=np.asarray(record["pressure_bar"], np.float64),
+        injection_h=tuple(record["injection_h"]),
+        volume=_volume(record["volume"]),
+    )
+
+
 def write_frame_volumes(
     folder: Path,
-    volumes: Mapping[str, float | None],
-    reasons: Sequence[str],
-    measured: bool = True,
+    volumes: Mapping[str, FrameVolume],
+    reasons: Sequence[str] = (),
+    held_out: Mapping[str, Mapping[str, FrameVolume]] | None = None,
 ) -> None:
-    """Store a run's free-gas volume [m3] per frame in ``folder``
-    (:data:`FRAME_VOLUMES`): each frame's volume by its name, None for the model's
-    gas; why its readings are not usable; and whether the volumes are its own
-    measurement."""
-    record = {"volumes": dict(volumes), "measured": measured, "reasons": list(reasons)}
-    text = json.dumps(record, indent=1, allow_nan=False)
-    (Path(folder) / FRAME_VOLUMES).write_text(text, encoding="utf-8")
+    """Store a run's free-gas volume per frame in ``folder`` (:data:`FRAME_VOLUMES`):
+    each frame's volume and source by its name, why the run's own readings are not
+    usable, and, for a run held out of a calibration fold whose estimate the frames
+    took, the frames' volumes without it."""
+    record = {
+        "volumes": {k: dataclasses.asdict(v) for k, v in volumes.items()},
+        "reasons": list(reasons),
+        "held_out": {
+            run: {k: dataclasses.asdict(v) for k, v in frames.items()}
+            for run, frames in (held_out or {}).items()
+        },
+    }
+    _write_json(folder, FRAME_VOLUMES, record)
 
 
-def read_frame_volumes(folder: Path) -> dict:
-    """A run's stored free-gas volumes per frame (:func:`write_frame_volumes`):
-    ``volumes``, ``measured`` and ``reasons``."""
-    return json.loads((Path(folder) / FRAME_VOLUMES).read_text(encoding="utf-8"))
+def read_frame_volumes(folder: Path, held_out: str | None = None) -> dict:
+    """A run's stored free-gas volume per frame (:func:`write_frame_volumes`), by
+    frame: without the held-out run's estimate where the frames took it, else
+    the run's volumes."""
+    record = json.loads((Path(folder) / FRAME_VOLUMES).read_text(encoding="utf-8"))
+    frames = record["held_out"].get(held_out, record["volumes"])
+    return {k: FrameVolume(**v) for k, v in frames.items()}
+
+
+def held_out_runs(folder: Path) -> tuple[str, ...]:
+    """The runs held out of a calibration fold without whose estimate a run's
+    frames have volumes of their own (:func:`write_frame_volumes`)."""
+    record = json.loads((Path(folder) / FRAME_VOLUMES).read_text(encoding="utf-8"))
+    return tuple(record["held_out"])

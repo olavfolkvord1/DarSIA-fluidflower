@@ -159,6 +159,37 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
         )
 
 
+def atmospheric_gas_density(pressure_bar: float, temperature_c: float, dtype) -> float:
+    """The gas density [kg/m3] of CO2 at an atmospheric pressure and temperature, at
+    no hydrostatic head, from the official tables in ``dtype``
+    (:class:`PrecisionCO2MassAnalysis` on one pixel at its datum): a frame's gas
+    density as the estimated overflow reference reads it, our production's
+    density at zero height.
+
+    Parameters
+    ----------
+    pressure_bar, temperature_c : float
+        The atmospheric pressure [bar] and temperature [Celsius].
+    dtype : dtype
+        The floating precision of the tables' evaluation.
+
+    Returns
+    -------
+    float
+        The density.
+
+    """
+    pixel = darsia.ScalarImage(np.zeros((1, 1), dtype), dimensions=[1.0, 1.0])
+    _, y = darsia.pixel_centres(pixel)
+    co2 = PrecisionCO2MassAnalysis(
+        pixel,
+        datum_m=float(np.asarray(y).ravel()[0]),
+        atmospheric_pressure=pressure_bar,
+        atmospheric_temperature=temperature_c,
+    )
+    return float(co2.density_gaseous_co2.ravel()[0])
+
+
 def _table(values, supports, table):
     """Linear interpolation of a table in the dtype of the values; a value outside
     the table is refused."""

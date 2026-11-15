@@ -222,3 +222,91 @@ def test_estimated_reference_scales_the_most_similar_run(tmp_path):
     assert share == pytest.approx(0.315 * 2.0 / 1.9 / 1000)
     assert darsia.estimated_reference(volume, 2.5, 0.1, 1.8, 2.0, 1.9) is None
     assert darsia.estimated_reference(volume, 15.0, 1.0, 1.8, 2.0, 1.9) is None
+
+
+# Our production's values (its own_target, reviewed_volume and the atmosphere's
+# interpolation, under each working precision) for the readings and record below.
+OWN_M3 = {"float32": [2.699999868127634e-06, 8.550000529794488e-06]}
+OWN_M3["float64"] = [2.7e-06, 8.550000000000001e-06]
+DONOR_ML = {"float32": 9.300000190734863, "float64": 9.3}
+ATMOSPHERE = {
+    "float32": [
+        (1.0186875000308182, 20.443181820583245),
+        (1.0175260869038802, 20.40434782284194),
+        (1.0086391306585085, 19.856521752921754),
+    ],
+    "float64": [
+        (1.0186875, 20.44318181818182),
+        (1.0175260869565217, 20.40434782608696),
+        (1.0086391304347826, 19.856521739130436),
+    ],
+}
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_frame_volumes_take_the_own_readings_then_the_donor_then_none(dtype):
+    """A run's frames take its own readings while they reach, then its donor's
+    estimate, and none once the donor's readings end too; interpolated in the
+    readings' dtype, they equal our production's in single and double
+    precision."""
+    first = np.array([True, False, False, False, False])
+    own = darsia.DisplacedVolume(
+        np.array([-1.0, 0.0, 1.0, 2.0, 3.0]),
+        np.array([0.0, 1.3, 4.1, 7.9, 9.2]),
+        (),
+        first,
+    ).astype(dtype)
+    donor = darsia.DisplacedVolume(
+        np.array([-1.0, 0.5, 1.5, 2.5, 4.0]),
+        np.array([0.0, 2.0, 5.5, 8.1, 9.9]),
+        (),
+        first,
+    ).astype(dtype)
+    found = darsia.frame_volumes(
+        own,
+        [0.5, 2.5, 3.5, 4.5],
+        ("d", donor),
+        [10.0, 20.0, 30.0, 40.0],
+        [1.8, 1.8, 1.8, 1.8],
+        lambda hours: (25.0, 1.9),
+    )
+    assert [v.source for v in found] == [darsia.MEASURED, darsia.MEASURED, "d", None]
+    assert [v.volume_m3 for v in found[:2]] == OWN_M3[dtype]
+    observed = float(np.dtype(dtype).type(DONOR_ML[dtype]) * 1e-6)
+    share = observed * 1.9 * 1000 / 25.0  # the donor's gas share of its CO2
+    assert found[2].volume_m3 == share * 30.0 / (1.8 * 1000)
+    assert found[3].volume_m3 is None
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_the_atmosphere_is_interpolated_over_its_record_hours(dtype):
+    """The pressure and temperature at a time are linear in the record's hours,
+    those in the dtype, as our production interpolated them; a time outside the
+    record is refused."""
+    record = ([-3.0, 1.4, 3.7, 24.0], [1.013, 1.0207, 1.0061, 1.0153])
+    record += ([20.0, 20.6, 19.7, 20.2],)
+    found = [
+        darsia.interpolated_atmosphere(*record, hours, dtype)
+        for hours in (0.25, 1.9, 3.3)
+    ]
+    assert found == ATMOSPHERE[dtype]
+    with pytest.raises(ValueError, match="outside"):
+        darsia.interpolated_atmosphere(*record, 24.5, dtype)
+
+
+def test_the_atmosphere_is_our_productions_at_its_stored_frames():
+    """At three frames our production's mass analysis stored, the pressure is the
+    one their stored donor difference implies: three rows of the run's stored
+    record, linear in their hours, those in float32, the analysis' precision."""
+    times = (0.13425194444444444, 0.3009186111111111, 0.4675852777777778)
+    pressure = (1.0060873842588398, 1.005886688590725, 1.0056859929226103)
+    frames = (  # the frame's hours, its donor's pressure and their stored difference
+        (0.24720333333333333, 1.0060943022429933, 0.0001429311154843571),
+        (0.30536305555555554, 1.0060873842588398, 0.00020604755557473986),
+        (0.3970297222222222, 1.0060873842588398, 0.0003164301796172442),
+    )
+    for hours, donor, difference in frames:
+        found, _ = darsia.interpolated_atmosphere(
+            times, pressure, (23.0, 23.0, 23.0), hours, "float32"
+        )
+        assert abs(donor - found) == difference
