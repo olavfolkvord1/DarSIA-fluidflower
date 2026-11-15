@@ -10,6 +10,12 @@ The remap and the sand means repeat the CPU backend's arithmetic in the same ord
   precision along each line, its mean taken at each pixel, and the values of the
   dtype between the axes; then the mask's mean divided by the mean of the mask.
 
+The phase probabilities repeat the phase features step by step: the images without
+invalid pixels, their mean colours and changes, and the support, with the CPU's
+bits; the Gaussian filters in OpenCV's order, with its bits; and the 36 features and
+the heads, whose sums run in another order than BLAS's, so the probabilities differ
+from the CPU's in the last bits (:data:`darsia.PHASE_TOLERANCE`).
+
 The kernels are built with contraction of multiply and add off and with correctly
 rounded single-precision division, so every step is the IEEE operation the CPU
 does, on the devices whose arithmetic guarantees these operations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 
+import cv2
 import numpy as np
 
 import darsia
@@ -141,6 +148,196 @@ __kernel void place_mean(__global const real *mean, __global const real *pore,
     values[pixel * channels + channel] =
         volume < (real)1e-12 ? (real)0 : mean[pixel] / volume;
 }
+
+/* NumPy's maximum and minimum: a NaN first operand propagates. */
+static inline real larger(const real a, const real b)
+{
+    return (a >= b || isnan(a)) ? a : b;
+}
+
+static inline real smaller(const real a, const real b)
+{
+    return (a <= b || isnan(a)) ? a : b;
+}
+
+/* The index of OpenCV's default border (gfedcb | abcdefgh | gfedcba). */
+static inline int reflected_101(int index, const int length)
+{
+    if (length == 1) return 0;
+    while (index < 0 || index >= length)
+        index = index < 0 ? -index : 2 * (length - 1) - index;
+    return index;
+}
+
+/* The images without invalid pixels, their validity, their mean colours, the norm
+   of the change against the baseline and its square, and the norm of the change
+   against the previous frame, as PhaseFeatures computes them. */
+__kernel void phase_prepare(__global real *current, __global real *baseline,
+                            __global real *previous, const int dynamic,
+                            const int count, __global uchar *valid,
+                            __global real *gray, __global real *norms)
+{
+    const int pixel = get_global_id(0);
+    if (pixel >= count) return;
+    uchar all_valid = 1;
+    for (int i = 0; i < 2 + dynamic; i++) {
+        __global real *rgb = (i == 0 ? current : i == 1 ? baseline : previous) + 3 * pixel;
+        const uchar finite = isfinite(rgb[0]) && isfinite(rgb[1]) && isfinite(rgb[2]);
+        all_valid &= finite;
+        if (!finite) rgb[0] = rgb[1] = rgb[2] = (real)0;
+        gray[i * count + pixel] = ((rgb[0] + rgb[1]) + rgb[2]) / (real)3;
+    }
+    valid[pixel] = all_valid;
+    __global const real *now = current + 3 * pixel;
+    for (int i = 0; i < 1 + dynamic; i++) {
+        __global const real *other = (i == 0 ? baseline : previous) + 3 * pixel;
+        const real d0 = now[0] - other[0], d1 = now[1] - other[1], d2 = now[2] - other[2];
+        const real norm = sqrt(((d0 * d0) + (d1 * d1)) + (d2 * d2));
+        norms[2 * i * count + pixel] = norm;
+        if (i == 0) norms[count + pixel] = norm * norm;
+    }
+}
+
+/* One pass of cv2.sepFilter2D with a symmetric kernel, in OpenCV's order: along
+   the rows, every tap in turn; along the columns, the centre and then each pair of
+   rows at the same distance. In the first `fused` columns OpenCV's vector code
+   multiplies and adds in one rounding (FMA), in the others in two. */
+__kernel void filter_pass(__global const real *source, const int source_at,
+                          __global real *target, const int target_at,
+                          __global const real *taps, const int width,
+                          const int rows, const int cols, const int along_rows,
+                          const int fused)
+{
+    const int col = get_global_id(0), row = get_global_id(1);
+    if (col >= cols || row >= rows) return;
+    source += source_at;
+    target += target_at;
+    const int reach = width / 2;
+    const bool once = col < fused;
+    real sum;
+    if (along_rows) {
+        __global const real *line = source + row * cols;
+        sum = once ? fma(line[reflected_101(col - reach, cols)], taps[0], (real)0)
+                   : taps[0] * line[reflected_101(col - reach, cols)];
+        for (int k = 1; k < width; k++) {
+            const real value = line[reflected_101(col + k - reach, cols)];
+            sum = once ? fma(value, taps[k], sum) : sum + taps[k] * value;
+        }
+    } else {
+        const real centre = source[row * cols + col];
+        sum = once ? fma(centre, taps[reach], (real)0) : centre * taps[reach] + (real)0;
+        for (int k = 1; k <= reach; k++) {
+            const real pair = source[reflected_101(row + k, rows) * cols + col]
+                              + source[reflected_101(row - k, rows) * cols + col];
+            sum = once ? fma(pair, taps[reach + k], sum) : sum + pair * taps[reach + k];
+        }
+    }
+    target[row * cols + col] = sum;
+}
+
+/* One pass of the erosion by a square; beyond the border nothing erodes. */
+__kernel void erode_pass(__global const uchar *source, __global uchar *target,
+                         const int width, const int rows, const int cols,
+                         const int along_rows)
+{
+    const int col = get_global_id(0), row = get_global_id(1);
+    if (col >= cols || row >= rows) return;
+    const int reach = width / 2;
+    uchar kept = 1;
+    for (int k = -reach; k <= reach && kept; k++) {
+        const int c = along_rows ? col + k : col, r = along_rows ? row : row + k;
+        if (c >= 0 && c < cols && r >= 0 && r < rows) kept = source[r * cols + c];
+    }
+    target[row * cols + col] = kept;
+}
+
+/* The 36 features of PhaseFeatures.matrix and both heads' probabilities. */
+__kernel void phase_heads(__global const real *current, __global const real *baseline,
+                          __global const real *previous, const int dynamic,
+                          __global const real *gray, __global const real *smooth,
+                          __global const real *norms, __global const real *statistics,
+                          __global const uchar *support, __global const real *heads,
+                          const int count, __global real *co2, __global real *gas)
+{
+    const int pixel = get_global_id(0);
+    if (pixel >= count) return;
+    if (!support[pixel]) {
+        co2[pixel] = (real)NAN;
+        gas[pixel] = (real)NAN;
+        return;
+    }
+    const real epsilon = (real)1e-4, floor_ = (real)0.05;
+    __global const real *now = current + 3 * pixel, *then = baseline + 3 * pixel;
+    __global const real *before = previous + 3 * pixel;
+    real intensity[3], contrast[3], texture[3];
+    for (int i = 0; i < 2 + dynamic; i++) {
+        intensity[i] = gray[i * count + pixel];
+        contrast[i] = intensity[i] - smooth[i * count + pixel];
+        texture[i] = fabs(contrast[i]);
+    }
+    const real sum_now = ((now[0] + now[1]) + now[2]) + epsilon;
+    const real sum_then = ((then[0] + then[1]) + then[2]) + epsilon;
+    const real local_mean = statistics[pixel];
+    const real spread = statistics[count + pixel] - local_mean * local_mean;
+    const real local_std = sqrt(larger(spread, (real)0));
+    const real bright_now = larger(contrast[0], (real)0);
+    const real bright_then = larger(contrast[1], (real)0);
+    const real rel_now = smaller(
+        larger(contrast[0] / larger(smooth[pixel], floor_), (real)-1), (real)4);
+    const real rel_then = smaller(
+        larger(contrast[1] / larger(smooth[count + pixel], floor_), (real)-1), (real)4);
+    const real rel_bright_now = larger(rel_now, (real)0);
+    const real rel_bright_then = larger(rel_then, (real)0);
+    const real persistent = smaller(rel_bright_then, rel_bright_now);
+    real f[36];
+    for (int c = 0; c < 3; c++) f[c] = now[c] - then[c];
+    f[3] = intensity[0] - intensity[1];
+    for (int c = 0; c < 3; c++) f[4 + c] = now[c] / sum_now - then[c] / sum_then;
+    for (int k = 0; k < 3; k++) {
+        const int i = k == 1 ? 1 : 0, j = k == 0 ? 1 : 2;
+        const real ratio_now = larger(now[i], epsilon) / larger(now[j], epsilon);
+        const real ratio_then = larger(then[i], epsilon) / larger(then[j], epsilon);
+        f[7 + k] = log(ratio_now) - log(ratio_then);
+    }
+    const real texture_delta = texture[0] - texture[1];
+    f[10] = texture_delta;
+    f[11] = fabs(texture_delta);
+    f[12] = norms[pixel];
+    f[13] = local_mean;
+    f[14] = local_std;
+    f[15] = local_mean / (local_std + epsilon);
+    f[16] = intensity[1];
+    f[17] = contrast[1];
+    f[18] = contrast[0];
+    f[19] = contrast[0] - contrast[1];
+    f[20] = smaller(bright_then, bright_now);
+    f[21] = larger(bright_now - bright_then, (real)0);
+    f[22] = rel_then;
+    f[23] = rel_now;
+    f[24] = rel_now - rel_then;
+    f[25] = persistent;
+    f[26] = larger(rel_bright_now - rel_bright_then, (real)0);
+    f[27] = persistent * persistent / (larger(rel_bright_then, rel_bright_now) + floor_);
+    for (int k = 28; k < 36; k++) f[k] = (real)0;
+    if (dynamic) {
+        f[28] = (real)1;
+        for (int c = 0; c < 3; c++) f[29 + c] = now[c] - before[c];
+        f[32] = intensity[0] - intensity[2];
+        f[33] = texture[0] - texture[2];
+        f[34] = norms[2 * count + pixel];
+        f[35] = statistics[2 * count + pixel];
+    }
+    for (int h = 0; h < 2; h++) {
+        __global const real *head = heads + h * 109;
+        real logit = (real)0;
+        for (int k = 0; k < 36; k++)
+            logit += ((f[k] - head[k]) / head[36 + k]) * head[72 + k];
+        logit = smaller(larger(logit + head[108], (real)-30), (real)30);
+        const real probability = (real)1 / ((real)1 + exp(-logit));
+        if (h == 0) co2[pixel] = probability;
+        else gas[pixel] = probability;
+    }
+}
 """
 """Kernels of the operations, for float32 values or, with ``DOUBLE_VALUES``,
 float64."""
@@ -151,6 +348,20 @@ _FLOATING = (np.dtype(np.float32), np.dtype(np.float64))
 _GROUP = {1: (64,), 2: (32, 8)}
 """Work-group size of the kernels by the dimension of their work; the drivers'
 own choice was up to 50 times slower on grids whose sizes have few divisors."""
+
+_OPENCV_AVX2 = 11
+"""OpenCV's number of the processor feature AVX2 (``cv::CpuFeatures``)."""
+
+_SMALL_FILTER = 5
+"""In single precision OpenCV sums symmetric filters of at most this many taps in
+an order of their own, which these kernels do not repeat."""
+
+
+def _opencv_fuses() -> bool:
+    """Whether OpenCV's filters on this host multiply and add in one rounding: its
+    AVX2 code, which OpenCV builds with FMA3, runs where AVX2 is enabled (not
+    switched off by ``OPENCV_CPU_DISABLE``); its SSE code adds in two roundings."""
+    return cv2.checkHardwareSupport(_OPENCV_AVX2)
 
 
 def opencl_devices() -> list:
@@ -419,3 +630,177 @@ class OpenCLBackend:
                     )
             cl.enqueue_copy(self._queue, result, current)
         return result
+
+    def _filtered(self, made, program, source, target, scratch, taps, shape):
+        """OpenCV's separable filter of a plane with taps: rows, then columns.
+
+        The source and the target are a buffer and the index of a plane in it. In
+        single precision OpenCV's vector code fuses multiply and add, where it runs
+        its AVX2 code, in the columns of whole groups of eight; double precision has
+        no vector code.
+        """
+        rows, cols = shape
+        width = np.int32(len(taps))
+        fused = taps.dtype == np.float32 and _opencv_fuses()
+        fused = np.int32(cols // 8 * 8 if fused else 0)
+        weights = self._upload(made, taps)
+        count = rows * cols
+        for (read, i), (write, j), along_rows in (
+            (source, (scratch, 0), 1),
+            ((scratch, 0), target, 0),
+        ):
+            self._run(
+                program["filter_pass"],
+                (cols, rows),
+                read,
+                np.int32(i * count),
+                write,
+                np.int32(j * count),
+                weights,
+                width,
+                np.int32(rows),
+                np.int32(cols),
+                np.int32(along_rows),
+                fused,
+            )
+
+    def phase_probabilities(
+        self,
+        current: np.ndarray,
+        baseline: np.ndarray,
+        previous: np.ndarray | None,
+        *,
+        texture_sigma_mm: float,
+        pixel_size_mm: float,
+        heads: tuple[darsia.LogisticHead, darsia.LogisticHead],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The probabilities of two logistic heads on a frame's phase features
+        (:meth:`darsia.CpuBackend.phase_probabilities`).
+
+        The images' preparation, the support and the filters give the CPU's bits;
+        the heads sum their terms in another order than BLAS, and the device's
+        logarithms and exponentials round otherwise, so the probabilities differ
+        from the CPU's in the last bits (:data:`darsia.PHASE_TOLERANCE`), on the
+        CPU's support.
+
+        Parameters
+        ----------
+        current, baseline : array
+            Linear RGB images of shape (rows, cols, 3) on one grid.
+        previous : array or None
+            Linear RGB image of the run's previous frame on the same grid.
+        texture_sigma_mm : float
+            Standard deviation (mm) of the Gaussian defining the image texture.
+        pixel_size_mm : float
+            Pixel size of the images' grid.
+        heads : tuple of darsia.LogisticHead
+            The CO2-presence and the gas-within-CO2 head.
+
+        Returns
+        -------
+        tuple of array
+            The two probabilities (rows, cols) in the images' floating dtype.
+
+        Raises
+        ------
+        ValueError
+            If the images differ in shape or are not RGB, or, in single precision,
+            a filter has at most five taps (a texture of less than about 0.56
+            pixels), which OpenCV sums in an order of its own.
+
+        """
+        given = [image for image in (current, baseline, previous) if image is not None]
+        if len({image.shape for image in given}) != 1:
+            raise ValueError("The images of a frame differ in shape.")
+        if current.ndim != 3 or current.shape[2] != 3:
+            raise ValueError("The images of a frame must be RGB.")
+        dtype = np.result_type(*given).type
+        shape = current.shape[:2]
+        count = shape[0] * shape[1]
+        sigma, spatial, width = darsia.phase_feature_sizes(
+            current.shape, texture_sigma_mm, pixel_size_mm, dtype
+        )
+        texture_taps = darsia.gaussian_taps(sigma, dtype)
+        spatial_taps = darsia.gaussian_taps(spatial, dtype)
+        smallest = min(len(texture_taps), len(spatial_taps))
+        if dtype == np.float32 and smallest <= _SMALL_FILTER:
+            raise ValueError(
+                f"A filter of {smallest} taps (texture of {sigma:.3g} pixels) is "
+                "summed by OpenCV in an order of its own; compute on the CPU."
+            )
+        dynamic = previous is not None
+        plane = count * np.dtype(dtype).itemsize
+        co2, gas = (np.empty(shape, dtype) for _ in range(2))
+        with self._operation() as made:
+            program = self._program(dtype)
+            images = [self._upload(made, np.asarray(image, dtype)) for image in given]
+            images += images[:1] * (3 - len(images))  # no previous frame: never read
+
+            def planes(number):
+                """A device buffer of a number of the frame's planes."""
+                return self._allocate(made, number * plane)
+
+            gray, smooth, norms, local, scratch = (planes(n) for n in (3, 3, 3, 3, 1))
+            valid, support, eroded = (self._allocate(made, count) for _ in range(3))
+            n = np.int32(count)
+            self._run(
+                program["phase_prepare"],
+                (count,),
+                *images,
+                np.int32(dynamic),
+                n,
+                valid,
+                gray,
+                norms,
+            )
+            for i in range(2 + dynamic):
+                self._filtered(
+                    made, program, (gray, i), (smooth, i), scratch, texture_taps, shape
+                )
+            for i in range(2 + dynamic):
+                self._filtered(
+                    made, program, (norms, i), (local, i), scratch, spatial_taps, shape
+                )
+            rows, cols = shape
+            for read, write, along_rows in ((valid, eroded, 1), (eroded, support, 0)):
+                self._run(
+                    program["erode_pass"],
+                    (cols, rows),
+                    read,
+                    write,
+                    np.int32(width),
+                    np.int32(rows),
+                    np.int32(cols),
+                    np.int32(along_rows),
+                )
+            parameters = np.concatenate(
+                [
+                    np.concatenate(
+                        (
+                            head.feature_mean,
+                            head.feature_scale,
+                            head.coefficients,
+                            [head.intercept],
+                        )
+                    )
+                    for head in heads
+                ]
+            ).astype(dtype)
+            targets = [self._allocate(made, plane) for _ in range(2)]
+            self._run(
+                program["phase_heads"],
+                (count,),
+                *images,
+                np.int32(dynamic),
+                gray,
+                smooth,
+                norms,
+                local,
+                support,
+                self._upload(made, parameters),
+                n,
+                *targets,
+            )
+            for result, target in zip((co2, gas), targets):
+                cl.enqueue_copy(self._queue, result, target)
+        return co2, gas
