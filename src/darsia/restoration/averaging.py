@@ -67,14 +67,19 @@ class VolumeAveraging:
         )
         """Mean pore volume."""
         tol = 1e-12
-        self.zero_indices = np.where(self.mean_pore_volume < tol)
-        """Zero indices in the mean pore volume."""
+        self.zero_mask = self.mean_pore_volume < tol
+        """Pixels of zero mean pore volume, where the average is zero."""
 
         # User output
         logger.info(
             f"""Number of zero indices in pore volume identification: """
-            f"""{len(self.zero_indices[0])}"""
+            f"""{np.count_nonzero(self.zero_mask)}"""
         )
+
+    @property
+    def zero_indices(self) -> tuple[np.ndarray, ...]:
+        """Zero indices in the mean pore volume: the indices of :attr:`zero_mask`."""
+        return np.where(self.zero_mask)
 
     @overload  # type: ignore [override]
     def __call__(self, img: np.ndarray) -> np.ndarray: ...
@@ -107,7 +112,8 @@ class VolumeAveraging:
     def _average_array(self, arr: np.ndarray) -> np.ndarray:
         """Application of volume averaging to numpy array.
 
-        Apply averaging to each channel of a 3D array.
+        Apply averaging to each channel of a 3D array; the channels are filtered
+        in one pass, each on its own.
 
         Parameters
         ----------
@@ -119,37 +125,21 @@ class VolumeAveraging:
         np.ndarray
             Volume averaged array.
         """
-        if arr.ndim == 2:
-            return self._average_array_single(arr)
-        elif arr.ndim == 3:
-            return np.stack(
-                [self._average_array_single(arr[..., i]) for i in range(arr.shape[-1])],
-                axis=-1,
-            )
-        else:
+        if arr.ndim not in (2, 3):
             raise ValueError("Only 2D and 3D arrays are supported.")
-
-    def _average_array_single(self, arr: np.ndarray) -> np.ndarray:
-        """Application of volume averaging to two-dimensional numpy array.
-
-        Parameters
-        ----------
-        arr : np.ndarray
-            Two-dimensional array.
-
-        Returns
-        -------
-        np.ndarray
-            Two-dimensional volume averaged array.
-        """
-        masked_data = np.multiply(arr, self.mask.img)
+        # The pixel fields, with a trailing axis for the channels of a 3D array.
+        pixels = (Ellipsis,) + (None,) * (arr.ndim - 2)
+        masked_data = np.multiply(arr, self.mask.img[pixels])
         mean_masked_data = self._heterogeneous_uniform_filter(masked_data)
-        result = np.divide(mean_masked_data, self.mean_pore_volume)
-        result[self.zero_indices] = 0
+        result = np.divide(mean_masked_data, self.mean_pore_volume[pixels])
+        np.copyto(result, 0, where=self.zero_mask[pixels])
         return result
 
     def _heterogeneous_uniform_filter(self, data: np.ndarray) -> np.ndarray:
         """Application of a uniform filter to heterogeneous data.
+
+        The filter runs over the axes of the mask; a trailing axis of channels is
+        not filtered over.
 
         Parameters
         ----------
@@ -162,7 +152,9 @@ class VolumeAveraging:
             Filtered data.
         """
         if self.labels is None:
-            return scipy.ndimage.uniform_filter(data, size=self.rev_size)
+            axes = self.mask.img.ndim
+            size = [self.rev_size] * axes + [1] * (data.ndim - axes)
+            return scipy.ndimage.uniform_filter(data, size=size)
         else:
             raise NotImplementedError("Heterogeneous analysis is not yet implemented.")
 
