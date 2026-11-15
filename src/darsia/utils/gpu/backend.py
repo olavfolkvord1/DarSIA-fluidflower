@@ -56,6 +56,20 @@ class ComputeBackend(Protocol):
         (:meth:`darsia.CpuBackend.sand_means`)."""
         ...
 
+    def phase_probabilities(
+        self,
+        current: np.ndarray,
+        baseline: np.ndarray,
+        previous: np.ndarray | None,
+        *,
+        texture_sigma_mm: float,
+        pixel_size_mm: float,
+        heads: tuple[darsia.LogisticHead, darsia.LogisticHead],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The probabilities of two logistic heads on a frame's phase features
+        (:meth:`darsia.CpuBackend.phase_probabilities`)."""
+        ...
+
 
 _current: list[ComputeBackend] = [CpuBackend()]
 """The process's backend."""

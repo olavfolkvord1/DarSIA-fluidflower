@@ -228,6 +228,31 @@ def porosity_based_averaging(
     )
 
 
+def gaussian_taps(sigma: float, dtype: type) -> np.ndarray:
+    """The taps of :func:`gaussian_blur`: a Gaussian of aperture 8 sigma + 1 (odd),
+    summing to one, in a dtype.
+
+    Parameters
+    ----------
+    sigma : float
+        Standard deviation of the Gaussian in pixels.
+    dtype : type
+        Floating dtype of the taps.
+
+    Returns
+    -------
+    array
+        The taps, centred.
+
+    """
+    dtype = np.dtype(dtype).type
+    width = int(np.rint(dtype(sigma) * 8 + 1)) | 1
+    offsets = np.arange(width, dtype=dtype) - width // 2
+    kernel = np.exp((-dtype(0.5) / dtype(sigma) ** 2) * offsets**2)
+    kernel /= kernel.sum(dtype=dtype)
+    return kernel
+
+
 def gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
     """Separable Gaussian filter of aperture 8 sigma + 1, in the image's dtype.
 
@@ -245,9 +270,5 @@ def gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
         (reflected) border.
 
     """
-    dtype = image.dtype.type
-    width = int(np.rint(dtype(sigma) * 8 + 1)) | 1
-    offsets = np.arange(width, dtype=dtype) - width // 2
-    kernel = np.exp((-dtype(0.5) / dtype(sigma) ** 2) * offsets**2)
-    kernel /= kernel.sum(dtype=dtype)
+    kernel = gaussian_taps(sigma, image.dtype)
     return cv2.sepFilter2D(image, -1, kernel, kernel, borderType=cv2.BORDER_DEFAULT)

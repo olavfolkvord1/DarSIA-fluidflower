@@ -14,6 +14,10 @@ import numpy as np
 
 import darsia
 
+_ROWS_PER_CHUNK = 64
+"""Image rows per feature chunk of the phase probabilities; the full feature matrix
+is never held."""
+
 
 class CpuBackend:
     """The operations on the CPU; the reference and the default backend."""
@@ -98,3 +102,61 @@ class CpuBackend:
                 averaging = darsia.VolumeAveraging(rev=rev, mask=weight)
                 result[mask] = averaging(result)[mask]
         return result
+
+    def phase_probabilities(
+        self,
+        current: np.ndarray,
+        baseline: np.ndarray,
+        previous: np.ndarray | None,
+        *,
+        texture_sigma_mm: float,
+        pixel_size_mm: float,
+        heads: tuple[darsia.LogisticHead, darsia.LogisticHead],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The probabilities of two logistic heads on a frame's phase features.
+
+        The features (:class:`darsia.PhaseFeatures`) are read in chunks of rows into
+        one matrix, and each head gives its probability of each pixel
+        (:meth:`darsia.LogisticHead.probability`); outside the features' support
+        both are NaN.
+
+        Parameters
+        ----------
+        current, baseline : array
+            Linear RGB images of shape (rows, cols, 3) on one grid.
+        previous : array or None
+            Linear RGB image of the run's previous frame on the same grid.
+        texture_sigma_mm : float
+            Standard deviation (mm) of the Gaussian defining the image texture.
+        pixel_size_mm : float
+            Pixel size of the images' grid.
+        heads : tuple of darsia.LogisticHead
+            The CO2-presence and the gas-within-CO2 head.
+
+        Returns
+        -------
+        tuple of array
+            The two probabilities (rows, cols) in the images' floating dtype.
+
+        """
+        features = darsia.PhaseFeatures(
+            current,
+            baseline,
+            previous,
+            texture_sigma_mm=texture_sigma_mm,
+            pixel_size_mm=pixel_size_mm,
+        )
+        rows, cols = features.support.shape
+        probabilities = tuple(np.empty((rows, cols), features.dtype) for _ in heads)
+        chunk_pixels = min(rows, _ROWS_PER_CHUNK) * cols
+        columns = len(darsia.PHASE_FEATURE_NAMES)
+        buffer = np.empty((chunk_pixels, columns), features.dtype)
+        for start in range(0, rows, _ROWS_PER_CHUNK):
+            chunk = np.s_[start : start + _ROWS_PER_CHUNK]
+            size = probabilities[0][chunk].size
+            matrix = features.matrix(chunk, out=buffer[:size])
+            for head, probability in zip(heads, probabilities):
+                probability[chunk] = head.probability(matrix).reshape(-1, cols)
+        for probability in probabilities:
+            probability[~features.support] = np.nan
+        return probabilities
