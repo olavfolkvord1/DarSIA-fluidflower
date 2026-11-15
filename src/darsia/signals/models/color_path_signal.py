@@ -28,6 +28,7 @@ import numpy as np
 from scipy import ndimage
 
 import darsia
+from darsia.utils.results import write_json
 
 
 class ColorPathSignal(darsia.Model):
@@ -292,8 +293,7 @@ def write_color_ranges(folder: Path, ranges: Mapping[int, float]) -> None:
     """Store each sand's colour range (:func:`color_ranges`) in ``folder``, as
     JSON with every digit kept."""
     found = {str(int(sand)): float(value) for sand, value in ranges.items()}
-    text = json.dumps(found, indent=1, allow_nan=False)
-    (Path(folder) / COLOR_RANGES).write_text(text + "\n", encoding="utf-8")
+    write_json(Path(folder) / COLOR_RANGES, found)
 
 
 def read_color_ranges(folder: Path) -> dict[int, float]:

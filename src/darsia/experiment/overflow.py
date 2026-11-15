@@ -42,6 +42,7 @@ import numpy as np
 from darsia.experiment.overflow_circulation import CirculationSettings
 from darsia.experiment.overflow_evaporation import EvaporationRate, EvaporationSettings
 from darsia.experiment.overflow_feed import FeedSettings
+from darsia.utils.results import write_json
 
 FRAME_VOLUMES = "overflow.json"
 """The file of a run's stored free-gas volume per frame (:func:`write_frame_volumes`)."""
@@ -649,12 +650,6 @@ def frame_volumes(
     return found
 
 
-def _write_json(folder: Path, name: str, value) -> None:
-    """Write a stored result's JSON file; NaN is refused."""
-    text = json.dumps(value, indent=1, allow_nan=False)
-    (Path(folder) / name).write_text(text, encoding="utf-8")
-
-
 def _volume_json(volume: DisplacedVolume | None) -> dict | None:
     """A displaced volume as plain values."""
     if volume is None:
@@ -704,7 +699,7 @@ def write_overflow_run(
         "proposed_evaporation": proposed,
         "evaporation_g_h": evaporation_g_h,
     }
-    _write_json(folder, OVERFLOW_RUN, record)
+    write_json(Path(folder) / OVERFLOW_RUN, record)
 
 
 def read_overflow_run(folder: Path) -> OverflowRun:
@@ -739,7 +734,7 @@ def write_frame_volumes(
             for run, frames in (held_out or {}).items()
         },
     }
-    _write_json(folder, FRAME_VOLUMES, record)
+    write_json(Path(folder) / FRAME_VOLUMES, record)
 
 
 def read_frame_volumes(folder: Path, held_out: str | None = None) -> dict:

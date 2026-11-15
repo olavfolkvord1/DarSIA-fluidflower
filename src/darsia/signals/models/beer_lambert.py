@@ -59,6 +59,7 @@ from numpy.polynomial import legendre
 from scipy import ndimage
 
 import darsia
+from darsia.utils.results import write_json
 
 _BLOCKS_PER_TERM = 4
 """Fewest block means per term of the background's surface; with fewer the fit is
@@ -872,8 +873,7 @@ def write_path_ratios(folder: Path, ratios: PathRatios) -> None:
         sd_rel={str(sand): value for sand, value in ratios.sd_rel.items()},
         pairs={f"{a}/{b}": asdict(pair) for (a, b), pair in ratios.pairs.items()},
     )
-    text = json.dumps(found, indent=1, allow_nan=False)
-    (Path(folder) / PATH_RATIOS).write_text(text + "\n", encoding="utf-8")
+    write_json(Path(folder) / PATH_RATIOS, found)
 
 
 def read_path_ratios(folder: Path) -> PathRatios:

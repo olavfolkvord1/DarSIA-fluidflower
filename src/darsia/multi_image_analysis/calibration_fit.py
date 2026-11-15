@@ -64,6 +64,7 @@ from darsia.multi_image_analysis.run_statistics import (
     RunStatisticsSettings,
     SandHistogram,
 )
+from darsia.utils.results import write_json
 
 _LOG_GAIN_BOUND = 700.0
 """Bound of the logarithm of the gain in the solver, against an overflow of its
@@ -809,12 +810,6 @@ def mass_calibrations(
     }
 
 
-def _write_json(folder: Path, name: str, value) -> None:
-    """Write a stored result's JSON file; NaN is refused."""
-    text = json.dumps(value, indent=1, allow_nan=False)
-    (Path(folder) / name).write_text(text, encoding="utf-8")
-
-
 def _array(values, dtype) -> list | None:
     """An array as a list of plain numbers, or None."""
     return None if values is None else np.asarray(values, dtype).tolist()
@@ -872,7 +867,7 @@ def write_frames(
             for other, alternative in (held_out or {}).items()
         },
     }
-    _write_json(folder, STATISTICS, record)
+    write_json(Path(folder) / STATISTICS, record)
 
 
 def read_frames(folder: Path, held_out: str | None = None) -> list[CalibrationFrame]:
@@ -923,7 +918,7 @@ def write_calibration(
         "mass": {run: dataclasses.asdict(value) for run, value in masses.items()},
         "predictions": [dataclasses.asdict(p) for p in predictions],
     }
-    _write_json(folder, CALIBRATION, record)
+    write_json(Path(folder) / CALIBRATION, record)
 
 
 def read_calibration(folder: Path) -> dict:
