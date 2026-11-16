@@ -444,6 +444,58 @@ def test_optical_pitch_takes_the_area_factor_of_the_pixel_areas():
     assert np.allclose(pitch, (0.11, 0.22))
 
 
+def test_optical_pitch_takes_the_measured_coordinate_pitch_with_positions():
+    """With measured positions the coordinate pitch is the mean distance, in the
+    positions' precision and averaged in double, between neighbouring pixels both
+    inside the domain."""
+    image = darsia.Image(np.zeros((30, 40)), dimensions=[0.005, 0.0066])
+    model = [
+        [0.00016634789062663913, 4.3004735772456115e-08, -6.023491368978284e-05],
+        [1.642236013843501e-09, -0.00016619959205854684, 0.046765316277742386],
+        [6.102835570231946e-09, 2.6038710743137017e-08, 0.9966205954551697],
+    ]
+    positions = darsia.grid_positions(image, model, np.float32)
+    area = darsia.Image(
+        darsia.grid_pixel_areas(image, model, np.float32, 1.0344),
+        dimensions=[0.005, 0.0066],
+    )
+    domain = np.ones((30, 40), bool)
+    domain[:5, :7] = False
+    x, y = positions.x, positions.y
+    down = np.hypot(np.diff(x, axis=0), np.diff(y, axis=0))[domain[1:] & domain[:-1]]
+    along = np.hypot(np.diff(x, axis=1), np.diff(y, axis=1))[
+        domain[:, 1:] & domain[:, :-1]
+    ]
+    assert down.dtype == np.float32
+    coordinate = [
+        float(np.mean(down, dtype=np.float64)),
+        float(np.mean(along, dtype=np.float64)),
+    ]
+    factor = float(np.median(area.img.astype(np.float64)[domain])) / np.prod(coordinate)
+    expected = tuple(p * float(np.sqrt(factor)) for p in coordinate)
+    assert darsia.optical_pitch_m(area, domain, positions) == expected
+    assert darsia.optical_pitch_m(area, domain) != expected
+    whole = darsia.optical_pitch_m(area, np.ones((30, 40), bool), positions)
+    assert whole != expected
+
+
+def test_the_optical_grid_is_sized_on_the_canvas_of_its_pitch():
+    """A pitch with the counts of its canvas sizes the optical grid on the canvas'
+    pixels: the canvas' dimensions at the pitch in the dtype, over its pixels; the
+    pitch stays the pair it is."""
+    image = darsia.Image(np.zeros((100, 150)), dimensions=[0.02, 0.03])
+    pitch = (1.6714851236783506e-4, 1.6712130886473872e-4)
+    sized = darsia.OpticalPitch(pitch, (101, 202))
+    assert sized == pitch and sized.counts == (101, 202)
+    assert darsia.OpticalPitch(pitch).counts is None
+    found = darsia.optical_grid(image, sized, np.float32).voxel_size
+    expected = [np.float32(n * p) / n for n, p in zip((101, 202), pitch)]
+    assert found == expected and all(v.dtype == np.float32 for v in found)
+    own = darsia.optical_grid(image, pitch, np.float32).voxel_size
+    assert own == [np.float32(n * p) / n for n, p in zip((100, 150), pitch)]
+    assert own[0] != found[0] and own[1] != found[1]
+
+
 def test_optical_grid_sizes_the_pixels_with_the_pitch_in_the_given_dtype():
     """The image's values on the dimensions of its pixels at the pitch."""
     sand_map = darsia.Image(np.arange(8).reshape(2, 4), dimensions=[0.2, 0.8])

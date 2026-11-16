@@ -769,7 +769,13 @@ def _direct(root: Path, selection: Selection) -> dict:
             paths[run][1],
             own_paths[run].sands["1"].scale / ranges[1],
             darsia.reference_background(
-                baseline, facies, pitch, grid.geometry.known, light, response
+                baseline,
+                facies,
+                pitch,
+                grid.geometry.known,
+                light,
+                response,
+                canvas=grid.rig.measurement_canvas,
             ),
             facies,
             pitch,
@@ -1559,7 +1565,11 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
         + '[runs.r2.corrections.material_illumination]\nfit_mask = "mask-r2.npz"\n'
         + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {measured.tolist()}\n"
         + "canvas_origin = [-5, -3]\ncanvas_shape = [126, 190]\n"
+        + 'reporting_domain = "reporting-r1.npz"\n'
     )
+    reported = np.ones((120, 180), bool)
+    reported[:7] = reported[:, -9:] = False  # a frame the run does not report on
+    darsia.Image(reported, dimensions=[0.3, 0.45]).save(project / "reporting-r1.npz")
     job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
     tasks = queue.tasks(job)
     assert [i.key for i in tasks["rig.r1"].inputs] == ["sand-map/r1", "rig/r2"]
@@ -1649,6 +1659,54 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     assert grid.pixel_area_mm2.dtype == np.float64
     assert np.array_equal(grid.pixel_area_mm2, areas.astype(np.float64) * 1e6)
     assert not np.array_equal(grid.pixel_area_mm2, (areas * 1e6).astype(np.float64))
+    # It reports on its reporting domain: the geometry is taken over it, and the
+    # domain whose phase is decided is its pixels of a material with porosity.
+    np.testing.assert_array_equal(first.reporting_domain, reported)
+    np.testing.assert_array_equal(grid.reporting, reported)
+    np.testing.assert_array_equal(grid.geometry.domain, reported)
+    np.testing.assert_array_equal(grid.domain, reported & (first.porosity.img > 0))
+    # Its colour checker is the chart it reports on; the reference run's is its
+    # whole chart.
+    charted = replace(material, chart_label=3)
+    on_chart = first.labels.img == 3
+    assert (on_chart & ~reported).any() and (on_chart & reported).any()
+    found = calibration.run_grid(first, charted).chart
+    np.testing.assert_array_equal(found, on_chart & reported)
+    whole = calibration.run_grid(reference, charted).chart
+    np.testing.assert_array_equal(whole, reference.labels.img == 3)
+    # Its optical pitch takes its measured coordinate pitch over the reporting
+    # domain, its optical grid sized on its canvas' pixels; the reference run's
+    # takes its grid's over every pixel.
+    pitch = darsia.optical_pitch_m(first.pixel_area, reported, grid.positions)
+    assert grid.optical_pitch == pitch and grid.optical_pitch.counts == (126, 190)
+    voxel = [np.float32(n * p) / n for n, p in zip((126, 190), pitch)]
+    found = darsia.optical_grid(first.facies, grid.optical_pitch, f32.type)
+    assert found.voxel_size == voxel
+    naive = darsia.optical_grid(first.facies, pitch, f32.type).voxel_size
+    assert naive != voxel
+    assert pitch != darsia.optical_pitch_m(first.pixel_area, reported)
+    assert pitch != darsia.optical_pitch_m(
+        first.pixel_area, np.ones_like(reported), grid.positions
+    )
+    plain = calibration.run_grid(reference, material)
+    assert plain.domain.all() and plain.reporting.all()
+    assert plain.optical_pitch == darsia.optical_pitch_m(
+        reference.pixel_area, plain.domain
+    )
+    # Where the reporting domain holds material without porosity, its phase is
+    # not decided there, while the geometry and the optical pitch keep the
+    # reporting domain (here under a model in perspective, whose pitch varies).
+    first.porosity.img[90:, :40] = 0
+    tilt = np.array([[0.997, 0, 0.0015], [0, 0.997, 0.0012], [0.004, 0.003, 1.0]])
+    first.grid_to_rig = (tilt @ measured).tolist()
+    zeroed = calibration.run_grid(first, material)
+    analysed = reported & (first.porosity.img > 0)
+    assert analysed.any() and not np.array_equal(analysed, reported)
+    np.testing.assert_array_equal(zeroed.domain, analysed)
+    np.testing.assert_array_equal(zeroed.geometry.domain, reported)
+    over = darsia.optical_pitch_m(first.pixel_area, reported, zeroed.positions)
+    assert zeroed.optical_pitch == over
+    assert over != darsia.optical_pitch_m(first.pixel_area, analysed, zeroed.positions)
 
 
 def test_a_measurement_canvas_goes_with_a_model_and_holds_the_grid():
