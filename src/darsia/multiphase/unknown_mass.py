@@ -105,6 +105,22 @@ class UnknownMassStatistics:
         return ColumnEstimate(self.column, self.ratio, self.capacity_g)
 
 
+def _column_donors(
+    main: np.ndarray, height: np.ndarray, reach_m: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each pixel's column donor, the nearest main pixel above it in its column
+    (its row; 0 where none), and whether the donor lies within the reach: higher
+    and at most ``reach_m`` above it, measured between the two pixels' heights
+    (rows, cols) in their precision, as our production measured it."""
+    rows = np.arange(main.shape[0])[:, None]
+    cols = np.arange(main.shape[1])[None, :]
+    above = np.maximum.accumulate(np.where(main, rows, -1), axis=0)
+    donor = np.vstack((np.full((1, main.shape[1]), -1), above[:-1]))
+    distance = height[np.maximum(donor, 0), cols] - height
+    column = (donor >= 0) & (distance > 0) & (distance <= reach_m)
+    return np.maximum(donor, 0), column
+
+
 def unknown_statistics(
     relative: np.ndarray,
     labels: np.ndarray,
@@ -151,15 +167,12 @@ def unknown_statistics(
     gas_g = float(fixed[with_gas].sum())
 
     own = missing & ~is_gas & measured & valid
-    rows = np.arange(labels.shape[0])[:, None]
     cols = np.arange(labels.shape[1])[None, :]
-    above = np.maximum.accumulate(np.where(main, rows, -1), axis=0)
-    donor = np.vstack((np.full((1, labels.shape[1]), -1), above[:-1]))
-    height = geometry.y_m.astype(capacity.dtype)[:, None]
-    distance = height[np.maximum(donor, 0), 0] - height
-    reach = settings.column_reach_mm / 1000 + _REACH_ROUNDING
-    column = (donor >= 0) & (distance > 0) & (distance <= reach)
-    donor = np.maximum(donor, 0)
+    donor, column = _column_donors(
+        main,
+        geometry.y_m.astype(capacity.dtype),
+        settings.column_reach_mm / 1000 + _REACH_ROUNDING,
+    )
     source = relative[donor, cols]
     ratio = np.divide(
         solubility[donor, cols],
