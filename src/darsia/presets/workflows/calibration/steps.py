@@ -285,6 +285,9 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
     chart = None
     if material.chart_label is not None:
         chart = rig.labels.img == material.chart_label
+    positions = darsia.grid_positions(
+        rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas
+    )
     geometry = darsia.run_geometry(
         rig.facies,
         rig.pixel_area.img,
@@ -293,6 +296,7 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
         swi,
         domain,
         chart,
+        positions,
     )
     scaling = [
         c
@@ -310,9 +314,7 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
         float(rig.baseline.voxel_size[0]) * 1000,
         float(datum),
         darsia.optical_pitch_m(rig.pixel_area, domain),
-        darsia.grid_positions(
-            rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas
-        ),
+        positions,
         np.asarray(rig.pixel_area.img, np.float64) * 1e6,
     )
 
@@ -334,6 +336,7 @@ def co2_state(grid: RunGrid, experiment, date) -> darsia.PrecisionCO2MassAnalysi
         atmospheric_temperature=temperature,
         atmospheric_pressure_gradient=pressure_gradient,
         atmospheric_temperature_gradient=temperature_gradient,
+        y_m=grid.positions.y,
     )
 
 
