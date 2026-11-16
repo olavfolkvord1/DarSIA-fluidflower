@@ -248,28 +248,44 @@ class RunGrid:
     facies: np.ndarray
     permeability: dict[int, float]
     domain: np.ndarray
+    """The pixels whose phase is decided and whose colour change is measured: the
+    reporting domain's pixels of a material with porosity, or every pixel."""
     geometry: darsia.RunGeometry
+    """The geometry over the reporting domain (:func:`darsia.run_geometry`)."""
     chart: np.ndarray | None
     pixel_mm: float
     datum_m: float
     optical_pitch: tuple[float, float]
+    """The pitch [m] on the sand plane (:func:`darsia.optical_pitch_m` over the
+    reporting domain); with a measurement canvas, with its counts, on which the
+    optical grid is sized (:class:`darsia.OpticalPitch`)."""
     positions: darsia.GridPositions
     """Each pixel's position on the rig and the grid's pitch, by the rig's measured
     model of its grid (:func:`darsia.grid_positions`), in the grid's precision."""
     pixel_area_mm2: np.ndarray
     """Each pixel's area [mm2], the rig's pixel areas in double precision times a
     million, as our production's phase rules took them."""
+    reporting: np.ndarray
+    """The pixels the run reports on (``Rig.reporting_domain``), or every pixel."""
 
 
 def run_grid(
     rig: Rig, material: MaterialSettings, pitch_stride: int | None = None
 ) -> RunGrid:
-    """A run's grid: its facies and their permeability, the domain of the facies
-    with one, the geometry with each facies' Swi, the colour checker, the pixel
-    size, the datum of the hydrostatic head, the pitch on the sand plane, and each
-    pixel's position on the rig by the rig's measured model of its grid, with the
-    grid's pitch over the rig's measurement canvas where a pitch stride is given
+    """A run's grid: its facies and their permeability, the domains, the geometry
+    with each facies' Swi, the colour checker, the pixel size, the datum of the
+    hydrostatic head, the pitch on the sand plane, and each pixel's position on the
+    rig by the rig's measured model of its grid, with the grid's pitch over the
+    rig's measurement canvas where a pitch stride is given
     (:func:`darsia.grid_positions`; the phase maps take it).
+
+    With the rig's reporting domain (``Rig.reporting_domain``), the run reports on
+    it, as our production's mass did: the geometry and the optical pitch are taken
+    over it, and the domain whose phase is decided is its pixels of a material with
+    porosity, our production's analysis domain, and the colour checker is its
+    pixels of the chart. Without one both domains are every pixel.
+    With the rig's measurement canvas, the optical pitch is the voxel size of the
+    optical grid sized on the canvas' pixels, as production sized it.
 
     Depth, porosity, Swi and the measured positions take the precision of the
     rig's pixel areas, the run grid's.
@@ -281,13 +297,19 @@ def run_grid(
         int(f): float(rig.permeability.img[facies == f].flat[0])
         for f in np.unique(facies)
     }
-    domain = np.isin(facies, list(permeability))
+    reporting = rig.reporting_domain
+    if reporting is None:
+        reporting = domain = np.isin(facies, list(permeability))
+    else:
+        domain = reporting & (rig.porosity.img > 0)
     swi = np.full(facies.shape, np.nan, dtype)
     for name, value in material.swi.items():
         swi[facies == int(name)] = value
     chart = None
     if material.chart_label is not None:
         chart = rig.labels.img == material.chart_label
+        if rig.reporting_domain is not None:  # the chart the run reports on
+            chart &= reporting
     positions = darsia.grid_positions(
         rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas, pitch_stride
     )
@@ -297,10 +319,14 @@ def run_grid(
         rig.depth.img.astype(dtype),
         rig.porosity.img.astype(dtype),
         swi,
-        domain,
+        reporting,
         chart,
         positions,
     )
+    measured = None if rig.grid_to_rig is None else positions
+    optical = darsia.optical_pitch_m(rig.pixel_area, reporting, measured)
+    if rig.measurement_canvas is not None:
+        optical = darsia.OpticalPitch(optical, rig.measurement_canvas.shape)
     scaling = [
         c
         for c in rig.shape_corrections
@@ -316,9 +342,10 @@ def run_grid(
         chart,
         float(rig.baseline.voxel_size[0]) * 1000,
         float(datum),
-        darsia.optical_pitch_m(rig.pixel_area, domain),
+        optical,
         positions,
         np.asarray(rig.pixel_area.img, np.float64) * 1e6,
+        reporting,
     )
 
 
@@ -402,7 +429,13 @@ def response_reading(
     sands = [int(sand) for sand in reading.sands]
     light = darsia.shadow_light(baseline, facies, pitch, sands, ctx.settings["shadow"])
     background = darsia.reference_background(
-        baseline, facies, pitch, grid.geometry.known, light, settings
+        baseline,
+        facies,
+        pitch,
+        grid.geometry.known,
+        light,
+        settings,
+        canvas=grid.rig.measurement_canvas,
     )
     ranges = ctx.read("color-ranges", darsia.read_color_ranges)
     factor = reading.sands[str(reference)].scale / ranges[reference]

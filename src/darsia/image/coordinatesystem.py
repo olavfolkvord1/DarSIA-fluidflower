@@ -653,7 +653,9 @@ def grid_record(image: darsia.Image) -> dict:
 
 
 def optical_pitch_m(
-    pixel_area: darsia.Image, domain: np.ndarray
+    pixel_area: darsia.Image,
+    domain: np.ndarray,
+    positions: GridPositions | None = None,
 ) -> tuple[float, float]:
     """The pitch [m] on the sand plane of one pixel step down a column and along a
     row.
@@ -662,9 +664,12 @@ def optical_pitch_m(
     margin, a shadow rule, a measurement's tiles) is converted to pixels with it.
     The sand lies behind the plane of the rig's coordinates, and the measured pixel
     areas carry that offset as the optical area factor: their median in the domain
-    over the coordinate cell. The pitch is the coordinate pitch, the grid's
-    dimensions over its pixels, times the factor's square root, so that lengths
-    agree with the areas.
+    over the coordinate cell. The pitch is the coordinate pitch times the factor's
+    square root, so that lengths agree with the areas. The coordinate pitch is the
+    grid's dimensions over its pixels, or with each pixel's measured position (a
+    run's measured model of its grid, :func:`grid_positions`) the mean measured
+    distance between neighbouring pixels inside the domain, as our production
+    took it.
 
     Parameters
     ----------
@@ -673,6 +678,8 @@ def optical_pitch_m(
         the grid's physical dimensions.
     domain : array
         Pixels whose areas give the factor, e.g. the rig's domain.
+    positions : GridPositions, optional
+        Each pixel's measured position on the rig.
 
     Returns
     -------
@@ -684,9 +691,53 @@ def optical_pitch_m(
         float(size) / count
         for size, count in zip(pixel_area.dimensions, pixel_area.img.shape[:2])
     ]
+    if positions is not None:
+        x, y = np.asarray(positions.x), np.asarray(positions.y)
+        pairs = (domain[1:] & domain[:-1], domain[:, 1:] & domain[:, :-1])
+        pitch = [
+            float(
+                np.mean(
+                    np.hypot(np.diff(x, axis=axis), np.diff(y, axis=axis))[pairs[axis]],
+                    dtype=np.float64,
+                )
+            )
+            for axis in (0, 1)
+        ]
     area = np.broadcast_to(np.asarray(pixel_area.img, np.float64), domain.shape)
     factor = float(np.median(area[domain])) / (pitch[0] * pitch[1])
     return tuple(step * float(np.sqrt(factor)) for step in pitch)
+
+
+class OpticalPitch(tuple):
+    """A pitch [m] on the sand plane down a column and along a row (a pair), with
+    the rows and columns of the canvas the optical grid is sized on
+    (:func:`optical_grid`), e.g. a run's measurement canvas, as our production
+    sized its optical grid; without them, the grid's own."""
+
+    counts: tuple[int, int] | None
+    """Rows and columns of the canvas the optical grid is sized on, or None."""
+
+    def __new__(
+        cls, pitch: tuple[float, float], counts: tuple[int, int] | None = None
+    ) -> "OpticalPitch":
+        """A pitch and the counts of its canvas.
+
+        Parameters
+        ----------
+        pitch : tuple of float
+            Pitch [m] down a column and along a row.
+        counts : tuple of int, optional
+            Rows and columns of the canvas.
+
+        Returns
+        -------
+        OpticalPitch
+            The pitch.
+
+        """
+        self = super().__new__(cls, (float(pitch[0]), float(pitch[1])))
+        self.counts = None if counts is None else (int(counts[0]), int(counts[1]))
+        return self
 
 
 def optical_grid(
@@ -705,16 +756,29 @@ def optical_grid(
         An image on the grid, e.g. the sand map.
     optical_pitch : tuple of float
         Pitch [m] on the sand plane down a column and along a row
-        (:func:`optical_pitch_m`).
+        (:func:`optical_pitch_m`), with the counts of the canvas it is sized on
+        where given (:class:`OpticalPitch`).
     dtype : type
         Floating type of the dimensions, that of the images measured.
 
     Returns
     -------
     darsia.Image
-        A scalar image of the image's values with the optical dimensions.
+        A scalar image of the image's values with the optical dimensions; for a
+        pitch with the counts of its canvas (:class:`OpticalPitch`), an image of
+        the canvas' pixels at the pitch, whose voxel size and coordinates are read,
+        as our production sized its optical grid on its canvas.
 
     """
+    counts = getattr(optical_pitch, "counts", None)
+    if counts is not None:
+        # The canvas the grid is sized on: its pixels at the pitch, its values none.
+        values = np.broadcast_to(np.zeros((), image.img.dtype), counts)
+        rows, cols = counts
+        return darsia.ScalarImage(
+            values,
+            dimensions=[dtype(rows * optical_pitch[0]), dtype(cols * optical_pitch[1])],
+        )
     rows, cols = image.img.shape
     return darsia.ScalarImage(
         image.img,

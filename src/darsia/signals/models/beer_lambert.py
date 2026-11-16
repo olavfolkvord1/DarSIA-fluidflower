@@ -191,8 +191,14 @@ def reference_background(
     support: np.ndarray,
     light: np.ndarray,
     settings: BeerLambertSettings,
+    canvas: darsia.MeasurementCanvas | None = None,
 ) -> np.ndarray:
     """The reference sand's smooth background over the whole grid.
+
+    With the canvas the grid's pixels were measured on, the background is fitted
+    on that canvas, the grid placed in it and no reference sand outside the grid:
+    the blocks start at the canvas' first pixel and the surface's coordinates span
+    the canvas, as our production fitted it on its phase canvas.
 
     Reference-sand pixels of ``support`` count when they lie at least
     ``background_margin_mm`` from any other facies and their shadow light is at
@@ -223,6 +229,9 @@ def reference_background(
         Shadow light of each pixel (:func:`shadow_light`; one without shadows).
     settings : BeerLambertSettings
         Settings of the response.
+    canvas : darsia.MeasurementCanvas, optional
+        The canvas the grid's pixels were measured on (``Rig.measurement_canvas``);
+        by default the grid itself.
 
     Returns
     -------
@@ -230,6 +239,33 @@ def reference_background(
         The background (rows, cols, 3).
 
     """
+    if canvas is not None:
+        rows, cols = sand_map.img.shape[:2]
+        top, left = -canvas.origin[1], -canvas.origin[0]
+        box = (slice(top, top + rows), slice(left, left + cols))
+
+        def placed(values, fill):
+            full = np.full((*canvas.shape, *values.shape[2:]), fill, values.dtype)
+            full[box] = values
+            return full
+
+        # Another facies than the reference sand outside the grid.
+        outside = np.array(settings.reference_sand + 1).astype(sand_map.img.dtype)
+        pitch = tuple(float(p) for p in optical_pitch)
+        canvas_map = darsia.Image(
+            placed(sand_map.img, outside),
+            dimensions=[canvas.shape[0] * pitch[0], canvas.shape[1] * pitch[1]],
+        )
+        light = np.asarray(light)
+        field = reference_background(
+            placed(baseline, baseline.dtype.type(np.nan)),
+            canvas_map,
+            darsia.OpticalPitch(pitch, tuple(canvas.shape)),
+            placed(np.asarray(support, bool), False),
+            placed(light, light.dtype.type(1)),
+            settings,
+        )
+        return np.ascontiguousarray(field[box])
     facies = sand_map.img
     own = facies == settings.reference_sand
     optical = darsia.optical_grid(sand_map, optical_pitch, baseline.dtype.type)
