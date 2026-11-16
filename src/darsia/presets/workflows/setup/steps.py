@@ -362,9 +362,11 @@ def _rig(ctx: StepContext) -> None:
     its reference run's grid where the configuration names one, and with the run's
     measured model of its grid (``Rig.grid_to_rig``) and the canvas its pixels were
     measured on (``Rig.measurement_canvas``), by which the depth rule is evaluated
-    on its grid where the run's configuration chooses it. The model is that of the
-    sand map's grid, so a rig on another grid (e.g. scaled to whole metric cells)
-    with a model is refused, as is a canvas that does not hold the grid."""
+    on its grid where the run's configuration chooses it, and each pixel's area is
+    measured (:func:`darsia.grid_pixel_areas`, with the run's optical area factor).
+    The model is that of the sand map's grid, so a rig on another grid (e.g. scaled
+    to whole metric cells) with a model is refused, as is a canvas that does not
+    hold the grid."""
     run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
     sand_map = darsia.imread(labels)
@@ -386,6 +388,13 @@ def _rig(ctx: StepContext) -> None:
         *sand_map.shape[:2]
     ):
         raise ValueError("[labeling.sand_map] the canvas does not hold the grid.")
+    if rig.grid_to_rig is not None and rig.pixel_area is not None:
+        rig.pixel_area.img = darsia.grid_pixel_areas(
+            rig.pixel_area,
+            rig.grid_to_rig,
+            rig.pixel_area.img.dtype,
+            config.corrections.grid.area_factor,
+        )
     if config.depth.interpolation == "triangulation":
         rig.depth = grid_depth(rig, Path(config.depth.measurements))
         rig.setup_geometry()
