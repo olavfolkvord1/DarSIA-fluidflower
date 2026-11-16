@@ -908,10 +908,22 @@ def _direct(root: Path, selection: Selection) -> dict:
         domains,
         wasserstein,
     )
+    # The scales take the official CO2 analysis at the start, as production's
+    # comparison did: the baseline's nominal heights, the protocol's state.
+    begin = experiment.experiment_start
+    begun = experiment.pressure_temperature_protocol.get_state(begin)
+    gradient = experiment.pressure_temperature_protocol.get_gradient(begin)
+    official = darsia.CO2MassAnalysis(
+        grid.rig.baseline,
+        begun.pressure,
+        begun.temperature,
+        gradient.pressure,
+        gradient.temperature,
+    )
     scales = distance_scales(
         3.0,
         experiment.injection_protocol,
-        _co2_state(grid, experiment, experiment.experiment_start),
+        official,
         grid.rig.depth.img,
         grid.rig.facies.dimensions,
         domains,
@@ -1554,8 +1566,10 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     material = settings_from_table(
         calibration.MaterialSettings, table(tables, "material")
     )
-    placed = calibration.run_grid(first, material).positions
+    grid = calibration.run_grid(first, material)
+    placed = grid.positions
     assert np.array_equal(placed.x, x) and np.array_equal(placed.y, y)
+    assert np.array_equal(grid.geometry.y_m, y)
 
 
 def test_a_measurement_canvas_goes_with_a_model_and_holds_the_grid():
@@ -1804,7 +1818,9 @@ def test_a_runs_atmosphere_is_its_record_over_its_hours(tmp_path):
         assert found == gradients[dtype]
         image = darsia.ScalarImage(np.zeros((2, 2), dtype), dimensions=[0.02, 0.02])
         grid = SimpleNamespace(
-            rig=SimpleNamespace(baseline=image, pixel_area=image), datum_m=0.02
+            rig=SimpleNamespace(baseline=image, pixel_area=image),
+            datum_m=0.02,
+            positions=darsia.grid_positions(image),
         )
         for h, value, gradient in zip(hours, values, gradients[dtype]):
             date = start + datetime.timedelta(hours=h)
