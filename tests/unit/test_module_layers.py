@@ -83,6 +83,7 @@ MODULES = [
     "darsia/jobs/__main__.py",
     "darsia/presets/workflows/setup/steps.py",
     "darsia/presets/workflows/setup/target_steps.py",
+    "darsia/presets/workflows/setup/color_path_steps.py",
     "darsia/presets/workflows/calibration/steps.py",
     "darsia/presets/workflows/analysis/steps.py",
     "darsia/presets/workflows/comparison/steps.py",
