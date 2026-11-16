@@ -1,6 +1,8 @@
 """Unit tests for Rig correction workflow setup behavior."""
 
+import errno
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import numpy as np
 import pytest
 
 import darsia
+from darsia.presets.workflows import rig as rig_module
 from darsia.presets.workflows.config.corrections import (
     ColorCorrectionConfig,
     CorrectionsConfig,
@@ -15,6 +18,7 @@ from darsia.presets.workflows.config.corrections import (
     RelativeColorCorrectionConfig,
 )
 from darsia.presets.workflows.rig import Rig
+from darsia.utils import results
 
 
 @dataclass
@@ -579,6 +583,96 @@ def test_a_rig_saved_again_without_a_grid_has_no_pixel_areas(tmp_path):
     loaded = Rig()
     loaded.load_corrections(tmp_path / "rig")
     assert loaded.pixel_area is None
+
+
+def test_a_rig_records_its_shape_corrected_baseline_and_pixel_areas(
+    tmp_path, monkeypatch
+):
+    """A saved rig records whether it has a shape-corrected baseline and pixel
+    areas, and the files of its corrections: a file it records that the share does
+    not find raises a file not found, never a fallback to the baseline, to no areas
+    or to no corrections; a rig saved before the record has them where the files
+    are found, and a listing of a share that is out raises."""
+    i, j = np.mgrid[0:6, 0:9].astype(np.float32)
+    darsia.ImageMappingCorrection(
+        j, i, source_shape=(7, 10), dimensions=[0.6, 0.9]
+    ).save(tmp_path / "mapping.npz")
+    darsia.OpticalImage(np.ones((7, 10, 3)), color_space="RGB").save(
+        tmp_path / "baseline.npz"
+    )
+    (tmp_path / "config.toml").write_text(
+        f'[corrections.mapping]\npath = "{(tmp_path / "mapping.npz").as_posix()}"\n'
+        '[corrections.grid]\nprecision = "float64"\narea_factor = 1.25\n'
+    )
+    rig = Rig()
+    rig.setup_reading(
+        tmp_path / "baseline.npz",
+        experiment=None,
+        corrections_config=CorrectionsConfig().load(tmp_path / "config.toml"),
+    )
+    rig.baseline_path = tmp_path / "baseline.npz"
+    rig.color_corrections = []
+    folder = tmp_path / "rig"
+    with pytest.warns(UserWarning):
+        rig.save(folder)
+    meta = json.loads((folder / "meta_data.json").read_text())
+    assert meta["shape_corrected_baseline"] is True and meta["pixel_area"] is True
+
+    def missing(name):
+        """The file a load of the rig does not find first, with ``name`` hidden."""
+        (folder / name).rename(tmp_path / f"hidden-{name}")
+        try:
+            with pytest.raises(FileNotFoundError) as error:
+                Rig.load(folder)
+        finally:
+            (tmp_path / f"hidden-{name}").rename(folder / name)
+        return Path(error.value.filename).name
+
+    # The rig has no depth map: a load that reads every recorded file stops there.
+    assert missing("shape_corrected_baseline.npz") == "shape_corrected_baseline.npz"
+    assert missing("pixel_area.npz") == "pixel_area.npz"
+    shape = meta["shape_corrections"]
+    assert meta["color_corrections"] == [] and len(shape) == len(rig.shape_corrections)
+    assert sorted(shape) == sorted(p.name for p in folder.glob("shape_correction_*"))
+    assert missing(shape[-1]) == shape[-1]
+    del meta["shape_corrected_baseline"], meta["pixel_area"]
+    del meta["shape_corrections"], meta["color_corrections"]
+    (folder / "meta_data.json").write_text(json.dumps(meta))
+    assert missing("shape_corrected_baseline.npz") == "depth.npz"
+    assert missing("pixel_area.npz") == "depth.npz"
+    assert missing(shape[-1]) == "depth.npz"
+
+    # Before the record its optional files are looked for: a share that is out
+    # raises once its interruption outlasts the grace, never reading none.
+    for name in ("pixel_area.npz", "shape_corrected_baseline.npz"):
+        target = folder / name
+        out = OSError(errno.ENOENT, "The network path was not found", str(target), 53)
+        if getattr(out, "winerror", None) != 53:
+            continue  # the share's own error has a network code on Windows only
+        stat, clock = os.stat, []
+
+        def outage(path, *args, target=target, out=out, **kwargs):
+            if Path(path) == target:
+                raise out
+            return stat(path, *args, **kwargs)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(results, "sleep", clock.append)
+            patched.setattr(results, "monotonic", lambda: sum(clock))
+            patched.setattr(os, "stat", outage)
+            with pytest.raises(results.Unavailable):
+                Rig.load(folder)
+
+    # Before the record the corrections are listed: a share that is out raises.
+    out = OSError(errno.ENETDOWN, "The network is down", str(folder))
+
+    def outage(path):
+        raise out
+
+    monkeypatch.setattr(rig_module.os, "scandir", outage)
+    with pytest.raises(OSError) as raised:
+        Rig.load(folder)
+    assert raised.value is out
 
 
 def test_a_rig_saved_again_drops_obsolete_split_corrections(tmp_path):

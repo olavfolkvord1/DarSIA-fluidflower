@@ -4,6 +4,7 @@
 
 import json
 import logging
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,11 +27,30 @@ from darsia.presets.workflows.config.image_porosity import ImagePorosityConfig
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.facies_props import FaciesProps
 from darsia.presets.workflows.setup.illustrations import save_scalar_map_illustration
+from darsia.utils import results
 
 if TYPE_CHECKING:
     from darsia.presets.workflows.config.roi_registry import RoiRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _correction_file(kind: str, index: int, correction) -> str:
+    """The file name of a rig's ``index``-th ``kind`` correction ("shape" or
+    "color"), as the rig saves and records it."""
+    return f"{kind}_correction_{index}_{type(correction).__name__.lower()}.npz"
+
+
+def _listed(folder: Path, prefix: str) -> list[Path]:
+    """The ``.npz`` files of a folder whose names start with ``prefix``, sorted by
+    name; a listing of a share that is out raises its error, never an empty one."""
+    with os.scandir(folder) as entries:
+        names = [
+            entry.name
+            for entry in entries
+            if entry.name.startswith(prefix) and entry.name.endswith(".npz")
+        ]
+    return [Path(folder) / name for name in sorted(names)]
 
 
 def _resolve_named_roi_voxels(
@@ -348,12 +368,21 @@ class Rig:
         self,
         folder: Path,
         corrections_config: CorrectionsConfig | None = None,
+        pixel_area: bool | None = None,
+        shape_files: list[str] | None = None,
+        color_files: list[str] | None = None,
     ) -> None:
         """Load persisted corrections from disk.
 
-        Supports both split-format files (`shape_correction_*`, `color_correction_*`)
-        and legacy mixed-format files (`correction_*`). The measured pixel areas of
-        the run grid are read with them; a rig saved without them has none.
+        The rig's record names its shape and colour correction files
+        (``shape_files``, ``color_files``), which are read by name: one not found
+        raises. A rig saved before the record has the split-format files
+        (``shape_correction_*``, ``color_correction_*``) or legacy mixed-format
+        files (``correction_*``) its folder lists, and a listing of a share that is
+        out raises. The measured pixel areas of the run grid are read with them:
+        where the rig's record says it has them (``pixel_area``), a file not found
+        raises; a rig saved without them has none; a rig saved before the record has
+        them where the file is found, a share that is out raising.
         """
         if corrections_config is None:
             corrections_config = CorrectionsConfig()
@@ -361,10 +390,16 @@ class Rig:
         self.shape_corrections = []
         self.color_corrections = []
         area = folder / "pixel_area.npz"
-        self.pixel_area = darsia.imread(area) if area.exists() else None
+        if pixel_area is None:
+            pixel_area = results.exists(area)
+        self.pixel_area = darsia.imread(area) if pixel_area else None
 
-        shape_paths = sorted(folder.glob("shape_correction_*.npz"))
-        color_paths = sorted(folder.glob("color_correction_*.npz"))
+        if shape_files is not None and color_files is not None:
+            shape_paths = [folder / name for name in shape_files]
+            color_paths = [folder / name for name in color_files]
+        else:
+            shape_paths = _listed(folder, "shape_correction_")
+            color_paths = _listed(folder, "color_correction_")
         if shape_paths or color_paths:
             for correction_path in shape_paths:
                 correction = darsia.read_correction(correction_path)
@@ -389,7 +424,7 @@ class Rig:
             logger.info("Corrections loaded from split format.")
             return
 
-        for correction_path in sorted(folder.glob("correction_*.npz")):
+        for correction_path in _listed(folder, "correction_"):
             correction = darsia.read_correction(correction_path)
             if self._is_shape_correction(correction):
                 self.shape_corrections.append(correction)
@@ -734,7 +769,6 @@ class Rig:
             Path to the log folder where geometry images will be saved.
         """
         # Load depth map from file and reshape to baseline shape
-        assert path.exists(), f"Path to depth map {path} does not exist."
         pre_depth = darsia.imread(path)
         self.depth: darsia.Image = darsia.resize(pre_depth, ref_image=self.baseline)
         """Depth map for the rig object."""
@@ -779,7 +813,6 @@ class Rig:
         log : Path | None
             Path to the log folder where label images will be saved.
         """
-        assert path.exists(), f"Labels file {path} does not exist."
         if apply_corrections:
             # Assume that the labels are based on non-corrected baseline image.
             # Thus, need to apply the relevant corrections from the read routine.
@@ -856,7 +889,6 @@ class Rig:
         log : Path | None
             Path to the log folder where facies images will be saved.
         """
-        assert path.exists(), f"Facies file {path} does not exist."
         if apply_corrections:
             # Assume that the facies are based on non-corrected baseline image.
             # Thus, need to apply the relevant corrections from the read routine.
@@ -1404,10 +1436,23 @@ class Rig:
                 "origin": [int(v) for v in self.measurement_canvas.origin],
                 "shape": [int(v) for v in self.measurement_canvas.shape],
             }
-        # The setup's reference of each photograph's registration, or none; the
-        # record says which, so that a file not found is not taken for none.
+        # The setup's reference of each photograph's registration, or none, and
+        # which of the rig's optional files it has; the record says which, so that
+        # a file not found is not taken for none.
         registration = getattr(self, "registration", None)
         meta_data["registration"] = registration is not None
+        meta_data["shape_corrected_baseline"] = hasattr(
+            self, "shape_corrected_baseline"
+        )
+        meta_data["pixel_area"] = getattr(self, "pixel_area", None) is not None
+        meta_data["shape_corrections"] = [
+            _correction_file("shape", i, c)
+            for i, c in enumerate(self.shape_corrections)
+        ]
+        meta_data["color_corrections"] = [
+            _correction_file("color", i, c)
+            for i, c in enumerate(self.color_corrections)
+        ]
         with open(folder / "meta_data.json", "w") as f:
             json.dump(meta_data, f)
 
@@ -1438,16 +1483,14 @@ class Rig:
 
         # Save split correction pipelines.
         saved_corrections = set()
-        for i, correction in enumerate(self.shape_corrections):
-            correction_name = type(correction).__name__.lower()
-            path = folder / f"shape_correction_{i}_{correction_name}.npz"
-            correction.save(path)
-            saved_corrections.add(path)
-        for i, correction in enumerate(self.color_corrections):
-            correction_name = type(correction).__name__.lower()
-            path = folder / f"color_correction_{i}_{correction_name}.npz"
-            correction.save(path)
-            saved_corrections.add(path)
+        for kind, corrections in (
+            ("shape", self.shape_corrections),
+            ("color", self.color_corrections),
+        ):
+            for i, correction in enumerate(corrections):
+                path = folder / _correction_file(kind, i, correction)
+                correction.save(path)
+                saved_corrections.add(path)
 
         # An earlier save's split corrections must not outlive the pipeline.
         for prefix in ("shape", "color"):
@@ -1557,10 +1600,15 @@ class Rig:
                 origin=tuple(float(v) for v in reference.origin),
             )
 
-        # Load data for reading images
+        # Load data for reading images: a shape-corrected baseline the record names
+        # is read, and not found it raises; a rig saved before the record has one
+        # where the file is found, else its baseline.
         with darsia.timed("baseline"):
             rig.baseline = darsia.imread(folder / "baseline.npz")
-            if (folder / "shape_corrected_baseline.npz").exists():
+            corrected = meta_data.get("shape_corrected_baseline")
+            if corrected is None:
+                corrected = results.exists(folder / "shape_corrected_baseline.npz")
+            if corrected:
                 rig.shape_corrected_baseline = darsia.imread(
                     folder / "shape_corrected_baseline.npz"
                 )
@@ -1570,7 +1618,13 @@ class Rig:
 
         # Load corrections
         with darsia.timed("corrections"):
-            rig.load_corrections(folder, corrections_config=corrections_config)
+            rig.load_corrections(
+                folder,
+                corrections_config=corrections_config,
+                pixel_area=meta_data.get("pixel_area"),
+                shape_files=meta_data.get("shape_corrections"),
+                color_files=meta_data.get("color_corrections"),
+            )
 
         # Load depth map
         with darsia.timed("depth"):
