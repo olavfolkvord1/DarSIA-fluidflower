@@ -284,3 +284,51 @@ def test_the_reference_grid_places_the_field(dtype):
     corrected = correction.correct_array(baseline)
 
     np.testing.assert_allclose(corrected[:, :270], image[:, :270], rtol=2e-3)
+
+
+def _targets(baseline, corrected, minimum_blocks=8):
+    """The targets measured on 32-pixel blocks of an image of 1 mm pixels, with a
+    1 cm margin."""
+    return darsia.measure_material_targets(
+        baseline,
+        corrected,
+        _bands(baseline.shape[:2]),
+        np.ones(baseline.shape[:2], bool),
+        [1, 2],
+        dimensions=(0.32, 0.48),
+        fit_shape=(80, 120),
+        block_size=8,
+        edge_margin=0.01,
+        dn_scale=1000.0,
+        settings=FIT,
+        minimum_blocks=minimum_blocks,
+    )
+
+
+def test_targets_are_measured_on_the_corrected_blocks():
+    """The target is the median log colour of the clean training blocks of the
+    corrected baseline; the baseline chooses the cells, so a block dark in the
+    baseline is left out, also when the corrected baseline is bright there, and a
+    block of another chromaticity is left out as a colour outlier."""
+    rng = np.random.default_rng(5)
+    baseline = (0.02 * rng.lognormal(0.0, 0.01, (320, 480, 3))).astype(np.float32)
+    corrected = 2 * baseline
+    targets, blocks = _targets(baseline, corrected)
+    for material in (1, 2):
+        np.testing.assert_allclose(targets[material], np.log(40.0), atol=2e-3)
+        assert targets[material].dtype == np.float32
+        assert blocks[material][0] == blocks[material][1]
+    # The training block in rows 32-63 and columns 96-127 is dark in the
+    # baseline only: it is left out.
+    dark = baseline.copy()
+    dark[32:64, 96:128] *= 0.2
+    assert _targets(dark, corrected)[1][1][0] == blocks[1][0] - 1
+    assert _targets(baseline, dark)[1][1] == blocks[1]
+    # A red training block in rows 64-95 and columns 192-223 is an outlier.
+    cast = corrected.copy()
+    cast[64:96, 192:224, 0] *= 1.5
+    found, counted = _targets(baseline, cast)
+    assert counted[1] == (blocks[1][0], blocks[1][0] - 1)
+    np.testing.assert_allclose(found[1], targets[1], atol=2e-3)
+    with pytest.raises(ValueError, match="clean training blocks for material 1"):
+        _targets(baseline, corrected, minimum_blocks=blocks[1][0] + 1)
