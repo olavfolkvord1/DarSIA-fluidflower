@@ -377,6 +377,49 @@ def test_the_pitch_is_taken_over_the_canvas_the_pixels_were_measured_on():
     assert not darsia.MeasurementCanvas((0, 0), (129, 200)).holds(130, 200)
 
 
+def test_grid_pixel_areas_are_the_measured_models_jacobian_in_its_precision():
+    """A pixel's area is the model's Jacobian at its column and row: the model in
+    millimetres, cast to the precision and inverted twice there, the area in
+    double precision stored in single precision as square millimetres, the area
+    factor applied in single precision, and square metres in the precision; a
+    model crossing its horizon on the grid is refused."""
+    image = darsia.Image(np.zeros((300, 400)), dimensions=[0.05, 0.066])
+    model = [
+        [0.00016634789062663913, 4.3004735772456115e-08, -6.023491368978284e-05],
+        [1.642236013843501e-09, -0.00016619959205854684, 0.046765316277742386],
+        [6.102835570231946e-09, 2.6038710743137017e-08, 0.9966205954551697],
+    ]
+    f32 = np.float32
+    x = np.arange(400, dtype=np.float64)[None, :]
+    y = np.arange(300, dtype=np.float64)[:, None]
+
+    def rule(dtype, inversions=2, factor=None, factor_dtype=f32):
+        matrix = np.asarray(np.diag([1000.0, 1000.0, 1.0]) @ np.array(model), dtype)
+        for _ in range(inversions):
+            matrix = np.linalg.inv(np.asarray(matrix, dtype))
+        w = matrix[2, 0] * x + matrix[2, 1] * y + matrix[2, 2]
+        area = (abs(np.linalg.det(matrix)) / np.abs(w) ** 3).astype(f32)
+        if factor is not None:
+            area = (area.astype(factor_dtype) * factor).astype(f32)
+        return np.asarray(area, dtype) / 1e6
+
+    for dtype in (f32, np.float64):
+        for factor in (None, 1.0344):
+            areas = darsia.grid_pixel_areas(image, model, dtype, factor)
+            assert areas.dtype == dtype and areas.shape == (300, 400)
+            np.testing.assert_array_equal(areas, rule(dtype, factor=factor))
+    areas = darsia.grid_pixel_areas(image, model, f32, 1.0344)
+    assert np.unique(areas).size > 100  # each pixel its own
+    # Each choice of the rule tells: the precision of the matrices, the two
+    # inversions and the factor in single precision.
+    assert not np.array_equal(areas, rule(np.float64, factor=1.0344).astype(f32))
+    assert not np.array_equal(areas, rule(f32, inversions=0, factor=1.0344))
+    assert not np.array_equal(areas, rule(f32, factor=1.0344, factor_dtype=np.float64))
+    horizon = [[1e-4, 0, 0], [0, -1e-4, 0.05], [0, -1e-2, 1.0]]  # w = 0 at row 100
+    with pytest.raises(ValueError, match="horizon"):
+        darsia.grid_pixel_areas(image, horizon)
+
+
 def test_grid_record_tells_images_on_one_grid():
     """Images on one grid have one record, whatever their channels; another
     origin is another grid."""
