@@ -162,6 +162,49 @@ def test_the_background_leaves_out_a_shadow():
     assert (followed[inside] / unshaded[inside]).mean() < 0.9
 
 
+def test_the_background_is_fitted_on_the_measurement_canvas():
+    """With the canvas the grid was measured on, the background is the fit on that
+    canvas, the grid placed in it and no reference sand around it, cut back to the
+    grid: its blocks start at the canvas' first pixel, as our production fitted it;
+    a canvas that is the grid gives the grid's own fit."""
+    shape = (200, 300)
+    rows, cols = np.mgrid[0 : shape[0], 0 : shape[1]]
+    facies = np.full(shape, 5, np.uint8)
+    facies[150:, :] = 2
+    sand_map = darsia.ScalarImage(facies, dimensions=[0.1, 0.15])
+    pitch = (0.5e-3, 0.5e-3)
+    light = 0.8 + 0.3 * np.exp(-((cols - 120) ** 2 + (rows - 70) ** 2) / 4e4)
+    baseline = np.array([TONE[label] for label in facies.ravel()]).reshape(shape + (3,))
+    baseline *= light[..., None]
+    support, unshaded = np.ones(shape, bool), np.ones(shape)
+    own = darsia.reference_background(
+        baseline, sand_map, pitch, support, unshaded, SETTINGS
+    )
+    whole = darsia.MeasurementCanvas((0, 0), shape)
+    np.testing.assert_array_equal(
+        darsia.reference_background(
+            baseline, sand_map, pitch, support, unshaded, SETTINGS, canvas=whole
+        ),
+        own,
+    )
+    canvas = darsia.MeasurementCanvas((-7, -3), (213, 311))  # 3 rows, 7 columns
+    placed = darsia.reference_background(
+        baseline, sand_map, pitch, support, unshaded, SETTINGS, canvas=canvas
+    )
+    padding = ((3, 10), (7, 4))
+    padded = np.pad(facies, padding, constant_values=2)
+    fitted = darsia.reference_background(
+        np.pad(baseline, (*padding, (0, 0)), constant_values=np.nan),
+        darsia.ScalarImage(padded, dimensions=[0.1065, 0.1555]),
+        darsia.OpticalPitch(pitch, (213, 311)),
+        np.pad(support, padding),
+        np.pad(unshaded, padding, constant_values=1),
+        SETTINGS,
+    )
+    np.testing.assert_array_equal(placed, fitted[3:203, 7:307])
+    assert not np.array_equal(placed, own)
+
+
 def test_path_ratios_are_measured_where_two_sands_meet():
     shape = (300, 500)  # 0.2 mm pixels
     facies = np.full(shape, 1, np.uint8)

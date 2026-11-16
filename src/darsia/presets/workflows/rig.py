@@ -127,6 +127,10 @@ class Rig:
     """The canvas the run's pixels were measured on, in the grid's pixels, with
     the model (e.g. a padded canvas around the grid); None for the grid itself."""
 
+    reporting_domain: np.ndarray | None = None
+    """The pixels of the grid the run reports on (a boolean mask of the grid), as
+    measured with the run's setup; None for every pixel."""
+
     @property
     def corrections(self) -> list[darsia.BaseCorrection]:
         """Combined correction workflow in execution order."""
@@ -1445,6 +1449,7 @@ class Rig:
             self, "shape_corrected_baseline"
         )
         meta_data["pixel_area"] = getattr(self, "pixel_area", None) is not None
+        meta_data["reporting_domain"] = self.reporting_domain is not None
         meta_data["shape_corrections"] = [
             _correction_file("shape", i, c)
             for i, c in enumerate(self.shape_corrections)
@@ -1503,6 +1508,14 @@ class Rig:
             self.pixel_area.save(folder / "pixel_area.npz")
         else:
             (folder / "pixel_area.npz").unlink(missing_ok=True)
+        # The reporting domain, or none: an earlier save's must not outlive it.
+        if self.reporting_domain is not None:
+            np.savez_compressed(
+                folder / "reporting_domain.npz",
+                reporting_domain=np.asarray(self.reporting_domain, bool),
+            )
+        else:
+            (folder / "reporting_domain.npz").unlink(missing_ok=True)
 
         # Save geometry information
         try:
@@ -1570,6 +1583,12 @@ class Rig:
         rig.baseline_path = Path(meta_data["baseline_path"])
         rig.raw_decoding = meta_data.get("raw_decoding", {})
         rig.grid_to_rig = meta_data.get("grid_to_rig")
+        # A recorded reporting domain is read, and not found it raises; a rig saved
+        # before the record has none.
+        rig.reporting_domain = None
+        if meta_data.get("reporting_domain"):
+            with np.load(folder / "reporting_domain.npz") as stored:
+                rig.reporting_domain = stored["reporting_domain"]
         canvas = meta_data.get("measurement_canvas")
         rig.measurement_canvas = None
         if canvas is not None:

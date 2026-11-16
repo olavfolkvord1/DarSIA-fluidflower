@@ -295,6 +295,21 @@ def grid_model(tables: Mapping[str, Any]) -> list[list[float]] | None:
     return tables.get("labeling", {}).get("sand_map", {}).get("grid_to_rig")
 
 
+def grid_reporting_domain(
+    tables: Mapping[str, Any], grid: darsia.Image
+) -> np.ndarray | None:
+    """The pixels of a run's grid it reports on, a boolean image on the grid
+    (``[labeling.sand_map] reporting_domain``), if it has one.
+
+    Raises
+    ------
+    ValueError
+        If the image is not a boolean mask of the grid.
+
+    """
+    return grid_mask(tables, "reporting_domain", grid.img.shape)
+
+
 def grid_canvas(tables: Mapping[str, Any]) -> darsia.MeasurementCanvas | None:
     """The canvas a run's pixels were measured on, in its grid's pixels
     (``[labeling.sand_map] canvas_origin``, the column and row of its first
@@ -403,10 +418,11 @@ def _rig(ctx: StepContext) -> None:
     measured model of its grid (``Rig.grid_to_rig``) and the canvas its pixels were
     measured on (``Rig.measurement_canvas``), by which the depth rule is evaluated
     on its grid where the run's configuration chooses it, and each pixel's area is
-    measured (:func:`darsia.grid_pixel_areas`, with the run's optical area factor).
-    The model is that of the sand map's grid, so a rig on another grid (e.g. scaled
-    to whole metric cells) with a model is refused, as is a canvas that does not
-    hold the grid."""
+    measured (:func:`darsia.grid_pixel_areas`, with the run's optical area factor),
+    and with the pixels the run reports on (``Rig.reporting_domain``). The model is
+    that of the sand map's grid, so a rig on another grid (e.g. scaled to whole
+    metric cells) with a model is refused, as is a canvas that does not hold the
+    grid."""
     run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
     sand_map = darsia.imread(labels)
@@ -437,6 +453,7 @@ def _rig(ctx: StepContext) -> None:
             rig.pixel_area.img.dtype,
             config.corrections.grid.area_factor,
         )
+    rig.reporting_domain = grid_reporting_domain(run_tables(ctx.tables, run), sand_map)
     if rule:
         rig.depth = grid_depth(rig, Path(config.depth.measurements))
         rig.setup_geometry()
