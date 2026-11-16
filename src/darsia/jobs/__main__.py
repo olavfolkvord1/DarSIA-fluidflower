@@ -51,6 +51,7 @@ from darsia.presets.workflows.calibration import steps as calibration_steps
 from darsia.presets.workflows.comparison import steps as comparison_steps
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.media import steps as media_steps
+from darsia.presets.workflows.setup import color_path_steps
 from darsia.presets.workflows.setup import steps as setup_steps
 from darsia.presets.workflows.setup import target_steps
 from darsia.utils import results
@@ -72,6 +73,7 @@ STEPS: dict[str, Step] = {
         comparison_steps,
         media_steps,
         target_steps,
+        color_path_steps,
     )
     for step in module.STEPS
 }
