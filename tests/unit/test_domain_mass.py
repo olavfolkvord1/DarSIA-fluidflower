@@ -14,7 +14,11 @@ from darsia.presets.workflows.analysis.domain_mass import (
     RunSeries,
     write_domain_mass,
 )
-from darsia.presets.workflows.analysis.domains import AnalysisDomain, injected_mass
+from darsia.presets.workflows.analysis.domains import (
+    AnalysisDomain,
+    injected_mass,
+    layer_parts,
+)
 
 DOMAINS = [
     AnalysisDomain(**row)
@@ -251,6 +255,89 @@ def test_each_mass_has_its_centre_and_spread():
         rel=1e-9,
     )
     assert row["layer:5"]["gas_centre_x_mm"] is None
+
+
+PARTS = [
+    AnalysisDomain(**row)
+    for row in tomllib.loads(
+        """
+        # A layer split into its parts and smaller pieces, as our production's
+        # domains split two layers of its sand map.
+        [[domain]]
+        kind = "layer"
+        domain_id = "layer:3"
+        name = "3 E"
+        label = 3
+        part = 1
+
+        [[domain]]
+        kind = "layer"
+        domain_id = "layer:3:part:2"
+        name = "3 E, part 2 of 2"
+        label = 3
+        part = 2
+
+        [[domain]]
+        kind = "layer"
+        domain_id = "layer:3:pieces"
+        name = "3 E, pieces under 1 cm2"
+        label = 3
+        part = "pieces"
+
+        [[domain]]
+        kind = "layer"
+        domain_id = "layer:5"
+        name = "5 C"
+        label = 5
+        """
+    )["domain"]
+]
+
+
+def test_a_layer_falls_into_its_parts_and_smaller_pieces():
+    """A layer's face-connected pieces, ranked by size, are its parts while they
+    reach the smallest area, the largest always; the smaller pieces are summed
+    apart, and the parts and pieces hold the layer. A layer that runs on behind
+    the colour checker is one piece, and a part that a layer lacks is refused."""
+    geometry, sand, maps, co2 = frame(np.float64)
+    labels = sand.img
+    labels[9:30, 80] = 5  # layer 3 ends in a piece of 21 x 9 pixels (1 cm2 each)
+    labels[40, 70:72] = 3  # and has a piece of two pixels inside layer 5
+    labels[30:49, 40:43] = 17  # the chart, which layer 5 runs on behind
+    area = geometry.pixel_area_m2
+    parts = layer_parts(labels, SAND, area, 2.5e-4, chart_labels=(17,))
+    layer = labels == 3
+    assert (parts[layer] == 1).sum() == 21 * 80 and (parts[layer] == 0).sum() == 2
+    np.testing.assert_array_equal(parts[9:30, 81:], 2)
+    assert (parts[labels == 5] == 1).all()  # one piece behind the chart
+    assert (parts[labels == 17] == -1).all() and (parts[labels == 2] == -1).all()
+    alone = layer_parts(labels, SAND, area, 2.5e-4)
+    assert (alone[:, 43:][labels[:, 43:] == 5] == 1).all()  # the larger side
+    assert (alone[:, :40][labels[:, :40] == 5] == 2).all()
+
+    sums = DomainMass(
+        PARTS, geometry, sand, SAND, chart_labels=(17,), min_part_area_cm2=2.5
+    )
+    row = {r["domain_id"]: r for r in sums(maps, co2)}
+    whole = DomainMass(DOMAINS[4:5], geometry, sand, SAND)(maps, co2)[0]
+    assert row["layer:3:pieces"]["pixels"] == 2
+    assert row["layer:3:part:2"]["pixels"] == 21 * 9
+    for key in ("pixels", "pore_volume_l", "aqueous_quantified_mass_g"):
+        found = sum(
+            row[d][key] for d in ("layer:3", "layer:3:part:2", "layer:3:pieces")
+        )
+        assert found == pytest.approx(whole[key], rel=1e-12)
+    assert row["layer:5"]["pixels"] == (geometry.domain & (labels == 5)).sum()
+    with pytest.raises(ValueError, match="no part 2"):
+        DomainMass(
+            PARTS, geometry, sand, SAND, chart_labels=(17,), min_part_area_cm2=200
+        )
+    with pytest.raises(ValueError, match="needs a sand layer"):
+        DomainMass(PARTS, geometry, sand, (5,))
+    with pytest.raises(ValueError, match="Only a sand layer has a part"):
+        AnalysisDomain(
+            kind="box", domain_id="b", name="b", bounds_mm=(0, 1, 0, 1), part=1
+        )
 
 
 def test_a_run_series_is_read_from_the_table(tmp_path):

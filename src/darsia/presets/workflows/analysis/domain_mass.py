@@ -50,6 +50,7 @@ from darsia.presets.workflows.analysis.domains import (
     COMPONENTS,
     AnalysisDomain,
     domain_pixels,
+    layer_parts,
     write_rows,
 )
 
@@ -99,6 +100,8 @@ class DomainMass:
         geometry: RunGeometry,
         sand_map: darsia.Image,
         sand_labels: Sequence[int] = (),
+        chart_labels: Sequence[int] = (),
+        min_part_area_cm2: float = 1.0,
     ) -> None:
         """Set up the domains of a run.
 
@@ -113,6 +116,17 @@ class DomainMass:
             name and whose coordinates the boxes read.
         sand_labels : sequence of int, optional
             The labels of the sand layers, which a domain of the sand reads.
+        chart_labels : sequence of int, optional
+            The labels of the colour checker, under which the sand layers continue
+            when a domain names a part of a layer (:func:`layer_parts`).
+        min_part_area_cm2 : float, optional
+            The smallest area [cm2] of a layer's part other than its largest, by
+            the pixels' areas of the geometry.
+
+        Raises
+        ------
+        ValueError
+            If a domain names a part of a layer that is not a sand layer.
 
         """
         ids = [domain.domain_id for domain in domains]
@@ -128,10 +142,22 @@ class DomainMass:
         self._area = np.nan_to_num(
             np.asarray(geometry.pixel_area_m2, np.float64)
         ).ravel()
+        parts = None
+        named = {d.label for d in self.domains if d.part is not None}
+        if named - {int(label) for label in sand_labels}:
+            raise ValueError(f"A part of a layer needs a sand layer: {sorted(named)}")
+        if named:
+            parts = layer_parts(
+                sand_map.img,
+                sand_labels,
+                geometry.pixel_area_m2,
+                min_part_area_cm2 * 1e-4,
+                chart_labels,
+            )
         self._pixels = [
             np.flatnonzero(
                 geometry.domain
-                & domain_pixels(domain, sand_map, sand_map.img, sand_labels)
+                & domain_pixels(domain, sand_map, sand_map.img, sand_labels, parts)
             )
             for domain in self.domains
         ]
