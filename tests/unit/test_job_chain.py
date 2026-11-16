@@ -920,6 +920,11 @@ def _direct(root: Path, selection: Selection) -> dict:
             for run in runs
         ]
         extent = darsia.measured_extent(corners, wasserstein.cell_mm, 10)
+    areas = None  # with the reference's model: its measured areas, in double
+    if grid.rig.grid_to_rig is not None:
+        areas = darsia.grid_pixel_areas(
+            grid.rig.labels, grid.rig.grid_to_rig, np.float64
+        )
     reference = wasserstein_reference(
         grid.rig.labels,
         grid.rig.permeability.img,
@@ -930,6 +935,7 @@ def _direct(root: Path, selection: Selection) -> dict:
         wasserstein,
         grid.positions,
         extent,
+        areas,
     )
     # The scales take the official CO2 analysis at the start, as production's
     # comparison did: the baseline's nominal heights, the protocol's state.
@@ -1148,8 +1154,9 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     comparisons' distances, the films' tiles and films and the ensemble's figures;
     each film's encoder opens under the host's waiting lock. Single precision runs
     through the service's task processes, double precision in this process. With
-    a measured model of the first run's grid (in single precision, in this
-    process, on the sand map's grid), every step places that run's pixels by it."""
+    measured models of the runs' grids (in single precision, in this process, on
+    the sand map's grid), every step places each run's pixels by its model and
+    takes their measured areas."""
     project = tmp_path / "project"
     config, selection = _project(
         project, "float32" if precision == "measured" else precision
@@ -1160,10 +1167,14 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
         # Inside the rig's frame, and 1.5 mm off at the port, across the cells' edge.
         shrink = np.array([[0.996, 0, 0.0024], [0, 0.996, 0.0021], [0, 0, 1.0]])
         model = shrink @ np.linalg.inv(rig_grid(grid))
+        # The reference run's in perspective: each of its pixels its own area.
+        tilt = np.array([[0.997, 0, 0.0015], [0, 0.997, 0.0012], [0.004, 0.003, 1.0]])
+        tilted = tilt @ np.linalg.inv(rig_grid(grid))
         config.write_text(
             config.read_text().replace("pixel_size_mm = 5.0\n", "")
             + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {model.tolist()}\n"
             + "canvas_origin = [-7, -5]\ncanvas_shape = [130, 194]\n"
+            + f"[runs.r2.labeling.sand_map]\ngrid_to_rig = {tilted.tolist()}\n"
         )
     direct = _direct(project, selection)
     jobs = tmp_path / "jobs"
