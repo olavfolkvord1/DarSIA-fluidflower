@@ -105,6 +105,7 @@ from darsia.signals.color.label_color_spectrum_map import *
 from darsia.signals.color.label_color_map import *
 from darsia.signals.color.label_color_path_map import *
 from darsia.signals.color.color_path_regression import *
+from darsia.signals.color.color_path_fit import *
 from darsia.signals.models.basemodel import *
 from darsia.signals.models.combinedmodel import *
 from darsia.signals.models.linearmodel import *
