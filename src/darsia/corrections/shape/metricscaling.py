@@ -272,12 +272,15 @@ def cell_sums(cells: MetricCells, values: np.ndarray) -> np.ndarray:
     return _cell_sums(cells, value).reshape(*cells.shape, *values.shape[2:])
 
 
-def cell_means(cells: MetricCells, values: np.ndarray) -> np.ndarray:
+def cell_means(
+    cells: MetricCells, values: np.ndarray, weights: np.ndarray | None = None
+) -> np.ndarray:
     """Mean of an intensive image over the valid pixels of each cell.
 
     Each channel is averaged over the pixels where it is finite, weighted by
-    pixel area. The sums run in the image's floating dtype, at least single
-    precision, in pixel order.
+    pixel area: the cells' pixel area, or each pixel's own (e.g. its measured
+    area). The sums run in the floating dtype of the image and the weights, at
+    least single precision, in pixel order.
 
     Parameters
     ----------
@@ -285,6 +288,9 @@ def cell_means(cells: MetricCells, values: np.ndarray) -> np.ndarray:
         Cells of the image's canvas.
     values : array
         Image (rows, cols, ...) on the canvas.
+    weights : array, optional
+        Each pixel's area (rows, cols) on the canvas; by default the cells'
+        pixel area.
 
     Returns
     -------
@@ -293,9 +299,13 @@ def cell_means(cells: MetricCells, values: np.ndarray) -> np.ndarray:
 
     """
     values = np.asarray(values)
-    dtype = np.result_type(values, np.float32)
+    if weights is None:
+        dtype = np.result_type(values, np.float32)
+        weight = dtype.type(cells.pixel_area)
+    else:
+        dtype = np.result_type(values, weights, np.float32)
+        weight = np.asarray(weights, dtype).reshape(len(cells.index), 1)
     value = values.reshape(len(cells.index), -1).astype(dtype, copy=False)
-    weight = dtype.type(cells.pixel_area)
     valid = np.isfinite(value)
     numerator = _cell_sums(cells, np.where(valid, value * weight, 0))
     denominator = _cell_sums(cells, np.where(valid, weight, 0))

@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 import darsia
-from darsia.presets.workflows.analysis.domains import AnalysisDomain
+from darsia.presets.workflows.analysis.domains import AnalysisDomain, domain_pixels
 from darsia.presets.workflows.comparison import mass_wasserstein as mw
 
 SETTINGS = mw.WassersteinSettings(
@@ -274,6 +274,38 @@ def test_the_reference_goes_onto_its_own_cells_first():
             getattr(cut.weights["whole"], field),
             getattr(reference.weights["whole"], field)[:, :17],
         )
+
+
+def test_the_reference_weights_its_means_by_its_pixels_areas():
+    """Given each reference pixel's area, a cell's weight is the mean of its pixels'
+    weights weighted by their areas, over the region's pixels in its own cells and
+    over all pixels elsewhere; one area each gives the means of before."""
+    labels = np.full((ROWS, COLS), LOWER, np.uint8)
+    labels[:16] = UPPER  # the layers meet inside a row of cells
+    sand = darsia.Image(labels, dimensions=[0.03, 0.045])
+    permeability = np.where(labels == LOWER, 400.0, 100.0)
+    porosity = np.full((ROWS, COLS), 0.4)
+    model = [[0.001, 0, 0.0005], [0, -0.001, 0.0295], [2e-4, 1e-4, 1.0]]
+    areas = darsia.grid_pixel_areas(sand, model, np.float64)
+    box = AnalysisDomain("box", "left", "left", bounds_mm=(0.0, 10.5, 0.0, 30.0))
+    args = (sand, permeability, porosity, SAND, (CHART,), [box], SETTINGS)
+    reference = mw.wasserstein_reference(*args, None, None, areas)
+    cells, pixel_weight = reference.cells, 400.0 / permeability
+    inside = domain_pixels(box, sand, labels, SAND)
+    own = darsia.cell_sums(cells, inside) > 0
+    assert own.any() and not own.all()  # both rules
+    region = darsia.cell_means(cells, np.where(inside, pixel_weight, np.nan), areas)
+    everywhere = darsia.cell_means(cells, pixel_weight, areas)
+    expected = np.where(own, region, everywhere)
+    np.testing.assert_array_equal(reference.weights["left"].weight, expected)
+    plain = mw.wasserstein_reference(*args)
+    for part in (own, ~own):
+        assert not np.array_equal(plain.weights["left"].weight[part], expected[part])
+    uniform = np.full((ROWS, COLS), plain.cells.pixel_area)
+    same = mw.wasserstein_reference(*args, None, None, uniform)
+    np.testing.assert_array_equal(
+        same.weights["left"].weight, plain.weights["left"].weight
+    )
 
 
 def test_the_sand_continues_under_the_colour_checker():
