@@ -397,6 +397,13 @@ def _distances(ctx: StepContext) -> None:
         extent = darsia.measured_extent(
             corners, settings.cell_mm, settings.extent_edge_mm
         )
+    # The reference's measured areas weight its means: by its model alone, in
+    # double precision, as our production's comparison measured them.
+    areas = None
+    if grid.rig.grid_to_rig is not None:
+        areas = darsia.grid_pixel_areas(
+            grid.rig.labels, grid.rig.grid_to_rig, np.float64
+        )
     reference = wasserstein_reference(
         grid.rig.labels,
         grid.rig.permeability.img,
@@ -407,6 +414,7 @@ def _distances(ctx: StepContext) -> None:
         settings,
         grid.positions,
         extent,
+        areas,
     )
     scales = distance_scales(
         time_h,
