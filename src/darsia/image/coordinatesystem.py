@@ -614,6 +614,60 @@ def grid_corners(
     return _measured(grid_to_rig, columns, np.array([top, top, bottom, bottom], dtype))
 
 
+def grid_pixel_areas(
+    image: darsia.Image,
+    grid_to_rig: np.ndarray | list,
+    dtype: np.dtype | type | str | None = None,
+    area_factor: float | None = None,
+) -> np.ndarray:
+    """Each pixel's area [m2] on the rig, by the run's measured model of its grid.
+
+    As our production measured its pixel areas: the model in millimetres, cast to
+    the given precision and inverted twice there, and a pixel's area the model's
+    Jacobian at its column and row (``|det M| / w**3``, in double precision),
+    stored in single precision as square millimetres. An optical area factor
+    multiplies the stored areas in single precision. The areas in square metres
+    are the stored ones in the given precision divided by a million.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        A 2d image on the grid.
+    grid_to_rig : array
+        The run's measured homography (3, 3) from the grid's pixels to rig metres.
+    dtype : numpy dtype, optional
+        Floating precision of the model and of the areas, e.g. the run grid's;
+        double precision by default.
+    area_factor : float, optional
+        The run's optical area factor (sand plane over coordinate plane); none by
+        default.
+
+    Returns
+    -------
+    array
+        The area [m2] of each pixel (rows, cols), in ``dtype``.
+
+    Raises
+    ------
+    ValueError
+        If the model crosses its horizon on the grid.
+
+    """
+    rows, cols = image.img.shape[:2]
+    dtype = np.dtype(dtype or np.float64)
+    to_mm = np.diag([1000.0, 1000.0, 1.0]) @ np.asarray(grid_to_rig, np.float64)
+    model = np.linalg.inv(np.asarray(np.linalg.inv(np.asarray(to_mm, dtype)), dtype))
+    x = np.arange(cols, dtype=np.float64)[None, :]
+    y = np.arange(rows, dtype=np.float64)[:, None]
+    w = model[2, 0] * x + model[2, 1] * y + model[2, 2]
+    if np.min(w) * np.max(w) <= 0:
+        raise ValueError("The measured model of the grid crosses its horizon on it")
+    area = (abs(np.linalg.det(model)) / np.abs(w) ** 3).astype(np.float32)
+    if area_factor is not None:
+        area = (area * float(area_factor)).astype(np.float32)
+    return np.asarray(area, dtype) / 1e6
+
+
 def grid_record(image: darsia.Image) -> dict:
     """The grid of an image as a plain record: its shape, dimensions and origin.
 

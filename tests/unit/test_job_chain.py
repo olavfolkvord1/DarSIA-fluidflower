@@ -537,6 +537,13 @@ def _direct(root: Path, selection: Selection) -> dict:
         sand_map = run_tables(tables, run).get("labeling", {}).get("sand_map", {})
         rig.grid_to_rig = sand_map.get("grid_to_rig")
         rig.measurement_canvas = setup.grid_canvas(run_tables(tables, run))
+        if rig.grid_to_rig is not None:  # each pixel's measured area
+            rig.pixel_area.img = darsia.grid_pixel_areas(
+                rig.pixel_area,
+                rig.grid_to_rig,
+                rig.pixel_area.img.dtype,
+                config.corrections.grid.area_factor,
+            )
         if run == "r1":  # the depth rule at the grid's positions, in its dtype
             depths = pd.read_csv(root / "depth.csv")
             dtype = rig.pixel_area.img.dtype
@@ -1629,6 +1636,19 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     placed = grid.positions
     assert np.array_equal(placed.x, x) and np.array_equal(placed.y, y)
     assert np.array_equal(grid.geometry.y_m, y)
+    # Its pixels' areas are measured by the model, with the run's area factor;
+    # the reference run without one keeps its grid's area.
+    areas = darsia.grid_pixel_areas(first.pixel_area, measured, f32, 1.0337)
+    assert first.pixel_area.img.dtype == f32
+    assert np.array_equal(first.pixel_area.img, areas)
+    nominal_area = np.float32(np.prod(reference.baseline.voxel_size) * 1.0337)
+    assert np.all(reference.pixel_area.img == nominal_area)
+    assert not np.any(first.pixel_area.img == nominal_area)
+    assert np.array_equal(grid.geometry.pixel_area_m2, areas)
+    # The phase rules take them in square millimetres in double precision.
+    assert grid.pixel_area_mm2.dtype == np.float64
+    assert np.array_equal(grid.pixel_area_mm2, areas.astype(np.float64) * 1e6)
+    assert not np.array_equal(grid.pixel_area_mm2, (areas * 1e6).astype(np.float64))
 
 
 def test_a_measurement_canvas_goes_with_a_model_and_holds_the_grid():
