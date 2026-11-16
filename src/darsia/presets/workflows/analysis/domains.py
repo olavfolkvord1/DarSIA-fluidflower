@@ -7,8 +7,16 @@ Wasserstein distances) takes its pixels and its injected mass from here:
 - ``whole``: the whole domain of the run;
 - ``box``: a box in millimetres of the grid's coordinates (x right, y up), as drawn
   in the window;
-- ``layer``: a sand layer by its label in the run's sand map, e.g. the free water;
+- ``layer``: a sand layer by its label in the run's sand map, e.g. the free water,
+  or one of its parts (:func:`layer_parts`);
 - ``sand``: the sand layers, or the sand layers in a box.
+
+A sand layer can fall into pieces that touch only through other material, e.g.
+where another layer cuts it off in a corner. A layer domain then names one of the
+layer's parts on the run's sand map, by our production's rule (:func:`layer_parts`):
+its largest piece is part 1, every other piece of at least a set area its next
+part, and its smaller pieces (``part = "pieces"``) are summed in a domain of their
+own. Without a part, a layer domain holds all of the layer.
 
 A pixel lies in a box by its centre (:func:`darsia.pixel_centres`), each interval
 half-open, so that boxes sharing a side count no pixel twice: the rule of the metric
@@ -30,11 +38,14 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+from scipy import ndimage
 
 import darsia
 
 KINDS = ("whole", "box", "layer", "sand")
 """The kinds of a domain: the whole domain, a box, a sand layer, the sand layers."""
+PIECES = "pieces"
+"""The part of a sand layer that holds its pieces too small to be parts."""
 COMPONENTS = {"total": "mass", "aqueous": "mass_aq", "gas": "mass_g"}
 """The components of the CO2 (all of it, the dissolved CO2 and the free gas), each
 with its field of the mass maps (:class:`darsia.SimpleMassAnalysisResults`)."""
@@ -55,6 +66,10 @@ class AnalysisDomain:
     right and y up."""
     label: int | None = None
     """Sand layer: its label in the sand map (1 to 255)."""
+    part: int | Literal["pieces"] | None = None
+    """Sand layer: one of its parts on the run's sand map (:func:`layer_parts`), 1
+    the largest, or ``"pieces"`` for its pieces that are no part; None for all of
+    the layer."""
 
     def __post_init__(self) -> None:
         """Refuse a domain that would be read as another one or as none."""
@@ -71,6 +86,14 @@ class AnalysisDomain:
             raise ValueError(f"A sand layer needs its label in the map: {self.name}")
         if self.kind != "layer" and self.label is not None:
             raise ValueError(f"Only a sand layer has a label: {self.name}")
+        if self.part is not None and (
+            self.kind != "layer"
+            or not (self.part == PIECES or (type(self.part) is int and self.part >= 1))
+        ):
+            raise ValueError(
+                f"Only a sand layer has a part, a number from 1 or {PIECES!r}: "
+                f"{self.name}"
+            )
 
     @property
     def bounds_m(self) -> tuple[float, float, float, float] | None:
@@ -81,17 +104,128 @@ class AnalysisDomain:
         return x0 / 1000, x1 / 1000, y0 / 1000, y1 / 1000
 
 
+def horizontal_sources(chart: np.ndarray, sand: np.ndarray) -> np.ndarray:
+    """For each colour checker pixel, the column of the sand pixel continuing under it.
+
+    Row by row, a run of chart pixels takes the nearest pixel left or right of the
+    run that is not chart, if it is sand; with sand on both sides the nearer side,
+    the left at equal distance. ``-1`` marks pixels that are not chart, and chart
+    pixels with no sand beside their run.
+
+    Parameters
+    ----------
+    chart, sand : array
+        The pixels of the colour checker and of the sand layers.
+
+    Returns
+    -------
+    array
+        The column of each chart pixel's source (int32), or -1.
+
+    """
+    source = np.full(chart.shape, -1, np.int32)
+    rows = np.flatnonzero(chart.any(axis=1))
+    if rows.size == 0:
+        return source
+    columns = chart.shape[1]
+    row_chart, row_sand = chart[rows], sand[rows]
+    column = np.arange(columns, dtype=np.int32)
+    left = np.maximum.accumulate(np.where(row_chart, -1, column), axis=1)
+    right = np.minimum.accumulate(
+        np.where(row_chart, columns, column)[:, ::-1], axis=1
+    )[:, ::-1]
+    index = np.arange(rows.size)[:, None]
+    left_sand = (left >= 0) & row_sand[index, np.clip(left, 0, columns - 1)]
+    right_sand = (right < columns) & row_sand[index, np.clip(right, 0, columns - 1)]
+    take_left = (
+        row_chart & left_sand & (~right_sand | (column - left <= right - column))
+    )
+    take_right = row_chart & right_sand & ~take_left
+    source[rows] = np.where(take_left, left, np.where(take_right, right, -1))
+    return source
+
+
+def layer_parts(
+    labels: np.ndarray,
+    sand_labels: Sequence[int],
+    area_m2: np.ndarray,
+    min_area_m2: float,
+    chart_labels: Sequence[int] = (),
+) -> np.ndarray:
+    """Each pixel's part of its sand layer, by our production's rule.
+
+    A piece of a sand layer is a face-connected (4-neighbour) region of its label,
+    found after the colour checker's pixels took the layer that continues under
+    them (:func:`horizontal_sources`), so that a layer running on behind the chart
+    is one piece. A layer's pieces are ranked by their pixel count, the largest
+    first, equal counts by their first pixel in raster order. The largest piece
+    is the layer's part 1; every other piece whose area is at least
+    ``min_area_m2`` is its next part; a smaller piece is no part.
+
+    Parameters
+    ----------
+    labels : array
+        The label of each pixel of the run's sand map.
+    sand_labels : sequence of int
+        The labels of the sand layers.
+    area_m2 : array
+        Each pixel's area [m2]; a piece's area is their sum.
+    min_area_m2 : float
+        The smallest area [m2] of a part other than the largest.
+    chart_labels : sequence of int, optional
+        The labels of the colour checker; none by default.
+
+    Returns
+    -------
+    array
+        On each pixel of a sand layer, the number of its piece's part (int32,
+        from 1), 0 on a smaller piece; -1 on every other pixel, also on a chart
+        pixel that a layer continues under.
+
+    """
+    labels = np.asarray(labels)
+    sand = np.isin(labels, sand_labels)
+    placed, continued = labels, np.zeros(labels.shape, bool)
+    if len(chart_labels):
+        source = horizontal_sources(np.isin(labels, chart_labels), sand)
+        continued = source >= 0
+        placed = labels.copy()
+        placed[continued] = labels[np.nonzero(continued)[0], source[continued]]
+    area = np.nan_to_num(np.asarray(area_m2, np.float64)).ravel()
+    parts = np.full(labels.shape, -1, np.int32)
+    faces = ndimage.generate_binary_structure(2, 1)
+    for label in sorted({int(label) for label in sand_labels}):
+        inside = placed == label
+        found, count = ndimage.label(inside, structure=faces)
+        if count == 0:
+            continue
+        pixels = np.bincount(found.ravel(), minlength=count + 1)[1:]
+        sizes = np.bincount(found.ravel(), weights=area, minlength=count + 1)[1:]
+        numbers, part = np.zeros(count + 1, np.int32), 0
+        # Pieces are numbered by their first pixel in raster order, so a stable
+        # sort by size breaks equal counts by that first pixel.
+        for rank, piece in enumerate(np.argsort(-pixels, kind="stable")):
+            if rank == 0 or sizes[piece] >= min_area_m2:
+                part += 1
+                numbers[piece + 1] = part
+        parts[inside] = numbers[found[inside]]
+    parts[continued] = -1
+    return parts
+
+
 def domain_pixels(
     domain: AnalysisDomain,
     grid: darsia.Image,
     labels: np.ndarray,
     sand_labels: Sequence[int] = (),
+    parts: np.ndarray | None = None,
 ) -> np.ndarray:
     """The pixels of a domain on a run's grid.
 
     A pixel lies in a box when its centre does, each interval half-open
     (``x0 <= x < x1``, ``y0 <= y < y1``); a sand layer holds the pixels of its
-    label, and the sand those of the sand layers' labels.
+    label, a part of it those of its part (``parts``), and the sand those of the
+    sand layers' labels.
 
     Parameters
     ----------
@@ -104,6 +238,9 @@ def domain_pixels(
         The label of each pixel, e.g. the sand map's.
     sand_labels : sequence of int
         The labels of the sand layers, which the sand reads.
+    parts : array, optional
+        Each pixel's part of its sand layer (:func:`layer_parts`), which a part of
+        a layer reads.
 
     Returns
     -------
@@ -114,12 +251,22 @@ def domain_pixels(
     Raises
     ------
     ValueError
-        If the sand is asked for without the labels of its layers.
+        If the sand is asked for without the labels of its layers, a part of a
+        layer without the parts, or a part that the layer does not have.
 
     """
     labels = np.asarray(labels)
     if domain.kind == "layer":
         inside = labels == domain.label
+        if domain.part is not None:
+            if parts is None:
+                raise ValueError(f"A part of a layer needs its parts: {domain.name}")
+            inside &= np.asarray(parts) == (0 if domain.part == PIECES else domain.part)
+            if domain.part != PIECES and not inside.any():
+                raise ValueError(
+                    f"The sand layer {domain.label} has no part {domain.part} on "
+                    f"the run's sand map: {domain.name}"
+                )
     elif domain.kind == "sand":
         if len(sand_labels) == 0:
             raise ValueError(f"The sand needs the labels of its layers: {domain.name}")
