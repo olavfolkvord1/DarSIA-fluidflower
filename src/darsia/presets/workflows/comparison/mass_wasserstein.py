@@ -22,7 +22,8 @@ of runs is compared in each region by the official Bregman solver of
   Under the colour checker the sand layer beside it continues horizontally in each
   row, with its label and weight. A cell's weight is the mean over the region's
   reference pixels in it, or over all its reference pixels where the reference has
-  none of the region.
+  none of the region, weighted by the pixels' areas (with the reference run's
+  measured model, its measured areas, :func:`darsia.grid_pixel_areas`).
 - With the runs' measured models of their grids, each run's pixels and the
   reference's go onto the cells by their own measured positions
   (:func:`darsia.grid_positions`), on cells covering the corners of every compared
@@ -282,6 +283,7 @@ def wasserstein_reference(
     settings: WassersteinSettings,
     positions: darsia.GridPositions | None = None,
     extent: tuple[float, float, float, float] | None = None,
+    pixel_area_m2: np.ndarray | None = None,
 ) -> WassersteinReference:
     """The comparison cells and the reference run's weight of each region.
 
@@ -292,8 +294,8 @@ def wasserstein_reference(
     layer continues under it in its row (the nearest side, the left at equal
     distance). Porous material without a known permeability is any other pixel
     without one whose porosity is not zero, and a chart pixel with no sand beside
-    it. A cell's weight is the mean of its pixels' weights in double precision, as
-    our production computed it.
+    it. A cell's weight is the mean of its pixels' weights in double precision,
+    weighted by their areas, as our production computed it.
 
     Parameters
     ----------
@@ -316,6 +318,10 @@ def wasserstein_reference(
         the cells of the grid. The reference's pixels go first onto the cells over
         its own positions, then onto these (:func:`darsia.placed_cells`), as in our
         production.
+    pixel_area_m2 : array, optional
+        Each reference pixel's measured area, e.g. by the reference run's model
+        (:func:`darsia.grid_pixel_areas`), which weights the means; by default
+        one area per pixel.
 
     Returns
     -------
@@ -357,12 +363,12 @@ def wasserstein_reference(
         cells = darsia.metric_cells(shape, dimensions, size, positions, covering)
         cells = darsia.placed_cells(cells, size, covering, extent)
     weight = weight.astype(np.float64)
-    everywhere = darsia.cell_means(cells, weight)
+    everywhere = darsia.cell_means(cells, weight, pixel_area_m2)
     weights = {}
     for domain in domains:
         inside = domain_pixels(domain, sand_map, placed, sand_labels, positions)
         own = darsia.cell_sums(cells, inside) > 0
-        mean = darsia.cell_means(cells, np.where(inside, weight, np.nan))
+        mean = darsia.cell_means(cells, np.where(inside, weight, np.nan), pixel_area_m2)
         weights[domain.domain_id] = RegionWeight(
             own=own,
             weight=np.where(own, mean, everywhere),

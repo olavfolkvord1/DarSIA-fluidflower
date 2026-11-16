@@ -161,6 +161,32 @@ def test_scaling_averages_the_valid_pixels_of_each_cell():
     np.testing.assert_allclose(scaled.origin, [0.1, 0.9])
 
 
+def test_cell_means_weight_each_pixel_by_its_own_area():
+    """With each pixel's area the means weight its valid pixels by it: the sums of
+    value times area over the sums of area, in pixel order, in the dtype of the
+    values and the areas; NaN without a valid pixel."""
+    rng = np.random.default_rng(3)
+    values = rng.random((6, 9))
+    values[:2, :4] = np.nan  # the top left cell without a valid pixel
+    areas = rng.uniform(1.0e-8, 3.0e-8, (6, 9))
+    cells = darsia.metric_cells((6, 9), [0.6, 0.9], 400.0)
+    means = darsia.cell_means(cells, values, areas)
+    valid = np.isfinite(values)
+    numerator = darsia.cell_sums(cells, np.where(valid, values * areas, 0.0))
+    denominator = darsia.cell_sums(cells, np.where(valid, areas, 0.0))
+    expected = np.full(numerator.shape, np.nan)
+    np.divide(numerator, denominator, out=expected, where=denominator > 0)
+    assert means.dtype == np.float64
+    np.testing.assert_array_equal(means, expected)
+    assert np.isnan(means).sum() == np.isnan(expected).sum() > 0
+    plain = darsia.cell_means(cells, values)
+    assert not np.allclose(means[np.isfinite(means)], plain[np.isfinite(plain)])
+    single = darsia.cell_means(
+        cells, values.astype(np.float32), areas.astype(np.float32)
+    )
+    assert single.dtype == np.float32
+
+
 def test_majority_takes_the_largest_area_and_the_lowest_label_on_a_tie():
     """Each cell takes the label of its largest area fraction."""
     labels = np.full((6, 9), 7)
