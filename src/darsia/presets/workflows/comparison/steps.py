@@ -33,11 +33,7 @@ from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext
 from darsia.presets.workflows.analysis.domain_mass import RunSeries, read_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
-from darsia.presets.workflows.calibration.steps import (
-    MaterialSettings,
-    co2_state,
-    run_grid,
-)
+from darsia.presets.workflows.calibration.steps import MaterialSettings, run_grid
 from darsia.presets.workflows.comparison.comparison_events import (
     EventCondition,
     EventQuestion,
@@ -190,6 +186,38 @@ def _times(selection: Selection, tables: Mapping) -> tuple[str, ...]:
     return tuple(named_times(tables["distances"]["times_h"]))
 
 
+def start_co2(baseline: darsia.Image, experiment) -> darsia.CO2MassAnalysis:
+    """The reference run's CO2 at the experiment's start, as our production's
+    comparison took it for the distances' scales: the official
+    :class:`darsia.CO2MassAnalysis` on the reference rig's baseline (its nominal
+    heights), at the pressure and temperature of the experiment's protocol and
+    their gradients at the start.
+
+    Parameters
+    ----------
+    baseline : darsia.Image
+        The reference rig's baseline.
+    experiment : darsia.ProtocolledExperiment
+        The reference run's experiment.
+
+    Returns
+    -------
+    darsia.CO2MassAnalysis
+        The CO2's solubility and gas density on the baseline's grid.
+
+    """
+    protocol = experiment.pressure_temperature_protocol
+    state = protocol.get_state(experiment.experiment_start)
+    gradient = protocol.get_gradient(experiment.experiment_start)
+    return darsia.CO2MassAnalysis(
+        baseline=baseline,
+        atmospheric_pressure=state.pressure,
+        atmospheric_temperature=state.temperature,
+        atmospheric_pressure_gradient=gradient.pressure,
+        atmospheric_temperature_gradient=gradient.temperature,
+    )
+
+
 def _distances(ctx: StepContext) -> None:
     """The distances of every pair of runs in every domain at one time, on the
     configured reference run's sand map, which a job must select
@@ -212,7 +240,7 @@ def _distances(ctx: StepContext) -> None:
     scales = distance_scales(
         time_h,
         experiment.injection_protocol,
-        co2_state(grid, experiment, experiment.experiment_start),
+        start_co2(grid.rig.baseline, experiment),
         grid.rig.depth.img,
         grid.rig.facies.dimensions,
         domains,

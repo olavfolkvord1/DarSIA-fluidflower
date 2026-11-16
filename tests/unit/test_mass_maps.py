@@ -156,6 +156,30 @@ def test_the_datum_is_the_declared_top_on_a_grid_extended_to_whole_cells():
         np.testing.assert_allclose(co2.height_map[:, 0], 0.5 - y, rtol=0, atol=1e-15)
 
 
+def test_the_head_reads_each_pixels_measured_height():
+    """With each pixel's measured height, the head is the datum less it, in double
+    precision; at the pixel centres' heights the tables are the default's."""
+    for dtype in (np.float32, np.float64):
+        baseline = darsia.ScalarImage(np.zeros((50, 4), dtype), dimensions=[0.5, 0.1])
+        default = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01
+        )
+        centres = darsia.grid_positions(baseline)
+        same = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01, y_m=centres.y
+        )
+        tilted = (centres.y + 0.002 * centres.x).astype(dtype)
+        measured = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01, y_m=tilted
+        )
+        np.testing.assert_array_equal(
+            measured.height_map, 0.5 - np.asarray(tilted, np.float64)
+        )
+        for field in ("density_gaseous_co2", "solubility_co2"):
+            np.testing.assert_array_equal(getattr(same, field), getattr(default, field))
+            assert not np.array_equal(getattr(measured, field), getattr(default, field))
+
+
 def test_mass_lies_only_in_the_co2_the_phase_map_measures():
     """Dissolved share from the signal, saturated water under free gas, no mass
     outside CO2, and unknown CO2 left unknown."""

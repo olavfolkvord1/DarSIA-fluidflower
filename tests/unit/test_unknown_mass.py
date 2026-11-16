@@ -32,13 +32,14 @@ CALIBRATION = darsia.MassCalibration(
 SOLUBILITY, DENSITY, SWI = 1.7, 1.8, 0.1
 
 
-def statistics(hole=False):
+def statistics(hole=False, positions=None):
     """A frame on a 10 x 3 grid of 5 mm with an excluded strip below measured CO2.
 
     Column 1: measured dissolved CO2 (rows 1-2) above excluded dissolved CO2 (rows
     3-7); row 3 has its own colour, rows 4-7 do not, row 7 is beyond the reach.
     Column 2: measured free gas (row 1) above excluded dissolved CO2 (row 2).
-    Column 0: excluded free gas (row 5).
+    Column 0: excluded free gas (row 5). The pixels' positions are their centres
+    unless given.
     """
     labels = np.zeros((10, 3), np.uint8)
     labels[1:8, 1] = D
@@ -58,6 +59,7 @@ def statistics(hole=False):
         np.full((10, 3), SWI),
         np.ones((10, 3), bool),
         excluded,
+        positions,
     )
     co2 = SimpleNamespace(
         solubility_co2=np.full((10, 3), SOLUBILITY),
@@ -89,6 +91,27 @@ def test_unknown_pixels_follow_the_stated_rule():
 
     _, undefined = statistics(hole=True)
     assert undefined.rest_g is None
+
+
+def test_the_column_reach_reads_each_pixels_own_height():
+    """The reach of a column estimate is measured between the pixels' own heights
+    on the rig: where a column's pixels lie closer together, the pixel beyond the
+    reach at the pixel centres is within it."""
+    geometry, unknown = statistics()
+    grid = darsia.Image(np.zeros((10, 3)), dimensions=[0.05, 0.015])
+    centres = darsia.grid_positions(grid)
+    y = np.array(centres.y)
+    y[:, 1] = y[2, 1] - 0.004 - (np.arange(10) - 2) * 0.004  # 4 mm apart, lower
+    positions = darsia.GridPositions(centres.x, y, centres.pitch_mm)
+    closer, moved = statistics(positions=positions)
+    np.testing.assert_array_equal(closer.y_m, y)
+    np.testing.assert_array_equal(geometry.y_m, centres.y)
+    low, _, rest = darsia.unknown_bounds(unknown, CALIBRATION, 0.8)
+    near_low, _, near_rest = darsia.unknown_bounds(moved, CALIBRATION, 0.8)
+    capacity = geometry.pore_volume_m3[7, 1] * SOLUBILITY * 1000
+    column = np.clip(0.5 * 1.5, 0, 1) * 0.8
+    assert rest == pytest.approx(capacity, rel=1e-12) and near_rest == 0
+    assert near_low == pytest.approx(low + capacity * column, rel=1e-12)
 
 
 def test_the_calibration_fit_reads_the_column_estimates():
