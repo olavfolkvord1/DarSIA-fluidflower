@@ -125,20 +125,26 @@ def _transient(error: OSError) -> bool:
     )
 
 
-def retry_transient(action: Callable[[], T]) -> T:
+def retry_transient(action: Callable[[], T], *, deadline: float | None = None) -> T:
     """Run an action, retrying it through transient file errors.
 
     A transient error waits for the next of :data:`RETRY_DELAYS` and runs the action
     again. While the share is out (a network error), the last delay repeats as long
     as the wait ends within :data:`GRACE` seconds of the first error. Any other
     transient error, e.g. access denied or a full disk, is retried once per delay,
-    so that a lasting one surfaces after about 7.5 s. Other errors are raised at
-    once.
+    so that a lasting one surfaces after about 7.5 s. A file held by another
+    process (a sharing or lock violation, or a busy file) waits until the caller's
+    deadline, or GRACE without one. No retry starts at or after the deadline;
+    other errors are raised at once.
 
     Parameters
     ----------
     action : Callable[[], T]
         File operation that may run again after an interruption.
+    deadline : float, optional
+        Latest retry time on the monotonic clock, shared by the operations of
+        a caller whose permission expires, e.g. a task's lease. Network errors
+        remain bounded by GRACE as well. Without it, a busy file uses GRACE.
 
     Returns
     -------
@@ -146,20 +152,37 @@ def retry_transient(action: Callable[[], T]) -> T:
         What the action returns.
 
     """
-    first, others = None, 0
+    first, others, last = None, 0, None
     for delay in chain(RETRY_DELAYS, repeat(RETRY_DELAYS[-1])):
+        if deadline is not None and monotonic() >= deadline:
+            if last is not None:
+                raise last
+            raise TimeoutError("The file operation's deadline has expired")
         try:
             return action()
         except OSError as error:
+            last = error
             first = monotonic() if first is None else first
             if not _transient(error):
                 raise
+            busy = getattr(error, "winerror", None) in (32, 33) or error.errno in (
+                errno.EBUSY,
+                errno.EAGAIN,
+            )
             if share_out(error):
                 if monotonic() + delay - first > GRACE:
+                    raise
+                if deadline is not None and monotonic() + delay >= deadline:
+                    raise
+            elif busy:
+                until = first + GRACE if deadline is None else deadline
+                if monotonic() + delay >= until:
                     raise
             else:
                 others += 1
                 if others > len(RETRY_DELAYS):
+                    raise
+                if deadline is not None and monotonic() + delay >= deadline:
                     raise
             logger.warning("File error, trying again in %.1f s: %s", delay, error)
         sleep(delay)
@@ -275,12 +298,23 @@ def _move(source: Path, destination: Path) -> None:
 def write_json(path: Path, value) -> None:
     """Write a stored result's JSON file, indented and with every digit of its
     numbers (Python's ``repr``); NaN is refused."""
-    text = json.dumps(value, indent=1, allow_nan=False)
-    Path(path).write_text(text + "\n", encoding="utf-8")
+    encoder = json.JSONEncoder(indent=1, allow_nan=False)
+    # Validate before opening the target, as dumps did: invalid data must not
+    # truncate an existing file. Neither pass retains the encoded chunks.
+    for _ in encoder.iterencode(value):
+        pass
+    with Path(path).open("w", encoding="utf-8") as stream:
+        for chunk in encoder.iterencode(value):
+            stream.write(chunk)
+        stream.write("\n")
 
 
 def rename(
-    source: Path, destination: Path, ours: Callable[[Path], bool] | None = None
+    source: Path,
+    destination: Path,
+    ours: Callable[[Path], bool] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> None:
     """Move a file or folder in one step, never onto a publication, with one mover.
 
@@ -309,6 +343,8 @@ def rename(
         once the move answered that the source is gone or the destination exists:
         True if it is, False if it is another's; it raises if it cannot tell.
         Without it, that answer is raised.
+    deadline : float, optional
+        Latest retry time on the monotonic clock (:func:`retry_transient`).
 
     Raises
     ------
@@ -335,7 +371,7 @@ def rename(
                 errno.EEXIST, "The destination is another's", str(destination)
             ) from error
 
-    retry_transient(move)
+    retry_transient(move, deadline=deadline)
 
 
 def read_description(folder: Path) -> dict:

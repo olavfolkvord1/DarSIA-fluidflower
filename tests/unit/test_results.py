@@ -236,6 +236,57 @@ def test_a_lasting_error_that_is_not_the_share_surfaces_soon(waits):
     assert waits == list(results.RETRY_DELAYS)
 
 
+@pytest.mark.parametrize("kind", ["sharing", "lock", "busy"])
+def test_a_busy_file_can_be_written_before_its_deadline(monkeypatch, waits, kind):
+    """A lock longer than the ordinary retries can clear within the same lease;
+    repeated operations share its absolute deadline rather than renewing it."""
+    error = OSError(errno.EBUSY, "File busy")
+    monkeypatch.setattr(results, "GRACE", 10.0)
+    if kind != "busy":
+        error.winerror = 32 if kind == "sharing" else 33
+    calls = []
+
+    def write():
+        calls.append(sum(waits))
+        if sum(waits) < 20.0:
+            raise error
+        return "written"
+
+    assert results.retry_transient(write, deadline=30.0) == "written"
+    assert len(calls) > len(results.RETRY_DELAYS) + 1
+    assert max(calls) < 30.0
+
+    def locked():
+        calls.append(sum(waits))
+        raise error
+
+    with pytest.raises(OSError, match="File busy"):
+        results.retry_transient(locked, deadline=30.0)
+    assert max(calls) < 30.0
+    assert sum(waits) < 30.0
+
+
+def test_a_lease_deadline_does_not_extend_network_outage_grace(monkeypatch, waits):
+    """Only a busy file may use the lease's longer remaining time; network
+    outages still stop within the normal grace period."""
+    monkeypatch.setattr(results, "GRACE", 10.0)
+
+    def out():
+        raise _dropped()
+
+    with pytest.raises(OSError):
+        results.retry_transient(out, deadline=30.0)
+    assert 0 < sum(waits) <= 10.0
+
+
+def test_an_expired_deadline_runs_no_file_operation(waits):
+    """Expired permission cannot be extended by starting a new retry helper."""
+    calls = []
+    with pytest.raises(TimeoutError, match="deadline"):
+        results.retry_transient(lambda: calls.append(True), deadline=0.0)
+    assert not calls and not waits
+
+
 @pytest.mark.parametrize("when", ["stored", "lost"])
 @pytest.mark.parametrize("who", [OURS, THEIRS], ids=["ours", "theirs"])
 def test_a_destination_is_done_with_our_token_and_refused_with_another(
