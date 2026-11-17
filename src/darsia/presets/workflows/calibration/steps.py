@@ -780,9 +780,7 @@ def _variants(tables: Mapping, run: str | None, context=None) -> int:
     group has folds, of which its first donor may be held out (:func:`_overflow`)."""
     if run is None or "calibration_runs" not in tables:
         return 0
-    return int(
-        bool(settings_from_table(FitRuns, table(tables, "calibration_runs")).folds)
-    )
+    return int(bool(fit_runs(tables).group(run).folds))
 
 
 def _supported(tables: Mapping, run: str | None, context=None) -> int:
