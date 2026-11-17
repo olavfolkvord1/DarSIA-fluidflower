@@ -11,6 +11,7 @@ import pytest
 import darsia
 from darsia.multiphase.gas_parameters import parameters_at_depth
 from darsia.multiphase import gas_allocation as allocation_module
+from darsia.utils import storage
 
 W, D, G, U = darsia.PhaseLabel
 RULE = darsia.PhaseRule
@@ -245,3 +246,44 @@ def test_a_resumed_run_equals_the_whole_run(tmp_path, start):
     assert (whole[3][0][24:36, 56:68] == G).all()
 
 
+@pytest.mark.parametrize("compress", [False, True])
+def test_a_held_out_variant_stores_only_the_maps_that_differ(
+    tmp_path, monkeypatch, compress
+):
+    """A frame's maps without a held-out run's estimate store only those that differ
+    from its maps, in dtype or a single bit, and read back as a full write of them,
+    plain and compressed; an equal variant stores none, a variant stored whole
+    reads as before, and a variant needs the frame's maps stored first."""
+    monkeypatch.setattr(storage, "_current", [darsia.StorageSettings(compress)])
+    rng = np.random.default_rng(5)
+    labels = rng.integers(0, 4, SHAPE).astype(np.uint8)
+    maps = dict(
+        labels=labels,
+        rules=np.zeros(SHAPE, np.uint8),
+        saturation=rng.random(SHAPE).astype(np.float32),
+        co2=labels > 0,
+        before=labels.copy(),
+    )
+    with pytest.raises(FileNotFoundError):
+        darsia.write_phase_maps(tmp_path, *maps.values(), held_out="r2")
+    darsia.write_phase_maps(tmp_path, *maps.values())
+    variant = dict(maps, rules=maps["rules"].astype(np.int16))  # same values
+    variant["saturation"] = maps["saturation"].copy()
+    variant["saturation"].view(np.uint32)[3, 4] ^= 1  # one bit
+    darsia.write_phase_maps(tmp_path, *variant.values(), held_out="r2")
+    darsia.write_phase_maps(tmp_path, *maps.values(), held_out="r3")
+    np.savez(tmp_path / "maps.without-r4.npz", **variant)  # stored whole
+    for held_out, stored in (("r2", ["rules", "saturation"]), ("r3", [])):
+        with np.load(tmp_path / f"maps.without-{held_out}.npz") as own:
+            assert own.files == stored
+    for held_out, made in (
+        (None, maps),
+        ("r2", variant),
+        ("r3", maps),
+        ("r4", variant),
+    ):
+        found = darsia.read_phase_maps(tmp_path, held_out)
+        assert list(found) == list(made)
+        for name, values in made.items():
+            assert found[name].dtype == values.dtype
+            assert found[name].tobytes() == values.tobytes()

@@ -833,14 +833,41 @@ def write_phase_maps(
     CO2 of its labels before the rules and those labels, by the process's storage
     settings (:func:`darsia.save_arrays`). With ``held_out``, the maps made without
     that run's estimated free-gas volume, which a calibration fold leaving it out
-    reads, are stored beside them."""
-    arrays = dict(labels=labels, rules=rules, saturation=saturation, co2=co2)
-    darsia.save_arrays(Path(folder) / _maps_file(held_out), **arrays, before=before)
+    reads, are stored beside them: only those that differ, in dtype, shape or a
+    single byte, from the frame's maps stored before in the folder.
+
+    Raises
+    ------
+    FileNotFoundError
+        With ``held_out``, if the frame's maps are not stored in the folder.
+
+    """
+    arrays = dict(
+        labels=labels, rules=rules, saturation=saturation, co2=co2, before=before
+    )
+    if held_out is not None:
+        with np.load(Path(folder) / PHASE_MAPS) as main:
+            arrays = {k: v for k, v in arrays.items() if not _same(v, main[k])}
+    darsia.save_arrays(Path(folder) / _maps_file(held_out), **arrays)
+
+
+def _same(values: np.ndarray, stored: np.ndarray) -> bool:
+    """Whether an array is a stored one, bit for bit: dtype, shape and bytes."""
+    values = np.asarray(values)
+    return (
+        values.dtype == stored.dtype
+        and values.shape == stored.shape
+        and values.tobytes() == stored.tobytes()
+    )
 
 
 def read_phase_maps(folder: Path, held_out: str | None = None) -> dict[str, np.ndarray]:
     """A frame's stored maps (:func:`write_phase_maps`): ``labels``, ``rules``,
     ``saturation``, ``co2`` and ``before``; with ``held_out``, those made without
-    that run's estimate."""
-    with np.load(Path(folder) / _maps_file(held_out)) as stored:
-        return {name: stored[name] for name in stored.files}
+    that run's estimate, each from its own file if stored there, else from the
+    frame's maps."""
+    with np.load(Path(folder) / PHASE_MAPS) as main:
+        if held_out is None:
+            return {name: main[name] for name in main.files}
+        with np.load(Path(folder) / _maps_file(held_out)) as own:
+            return {k: (own if k in own.files else main)[k] for k in main.files}
