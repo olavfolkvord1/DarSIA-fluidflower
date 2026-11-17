@@ -61,6 +61,7 @@ MODULES = [
     "darsia/multiphase/label_set.py",
     "darsia/utils/results.py",
     "darsia/utils/locations.py",
+    "darsia/utils/storage.py",
     "darsia/presets/workflows/setup/sand_map_snapping.py",
     "darsia/presets/workflows/setup/sand_map_dye_edge.py",
 ]
