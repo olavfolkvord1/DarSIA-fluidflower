@@ -324,3 +324,14 @@ class TestFindColorPathWeighting:
         )
         assert isinstance(result, darsia.LabelColorPathMap)
         assert 0 in result
+
+
+def test_label_color_spectrum_map_load_skips_matching_directories(tmp_path):
+    """A matching folder is excluded before either label parsing or JSON load."""
+    spectrum = _make_spectrum(resolution=5)
+    darsia.LabelColorSpectrumMap({1: spectrum}).save(tmp_path)
+    (tmp_path / "color_spectrum_2.json").mkdir()
+    (tmp_path / "color_spectrum_not_a_label.json").mkdir()
+    loaded = darsia.LabelColorSpectrumMap.load(tmp_path)
+    assert set(loaded) == {1}
+    np.testing.assert_array_equal(loaded[1].histogram, spectrum.histogram)
