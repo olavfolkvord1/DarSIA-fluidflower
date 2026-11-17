@@ -830,11 +830,12 @@ def write_phase_maps(
 ) -> None:
     """Store a frame's maps as :func:`free_gas` yields them, in ``folder``
     (:data:`PHASE_MAPS`): its phase and rule maps, its free-gas saturation, the
-    CO2 of its labels before the rules and those labels. With ``held_out``, the
-    maps made without that run's estimated free-gas volume, which a calibration
-    fold leaving it out reads, are stored beside them."""
+    CO2 of its labels before the rules and those labels, by the process's storage
+    settings (:func:`darsia.save_arrays`). With ``held_out``, the maps made without
+    that run's estimated free-gas volume, which a calibration fold leaving it out
+    reads, are stored beside them."""
     arrays = dict(labels=labels, rules=rules, saturation=saturation, co2=co2)
-    np.savez(Path(folder) / _maps_file(held_out), **arrays, before=before)
+    darsia.save_arrays(Path(folder) / _maps_file(held_out), **arrays, before=before)
 
 
 def read_phase_maps(folder: Path, held_out: str | None = None) -> dict[str, np.ndarray]:
