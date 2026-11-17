@@ -21,8 +21,10 @@ order:
    zones), and in narrow lobes hanging below wider CO2, is dissolved CO2.
 
 Beside each phase map, a rule map records which rule last changed each pixel's
-label (:class:`PhaseRule`). With it, :func:`model_gas` gives the free gas the
-phase model found before gravity (and a later peel) made it dissolved CO2.
+label (:class:`PhaseRule`). A later allocation can record a gas bridge without
+changing its optical WATER label. With the rule map, :func:`model_gas` gives the
+free gas the phase model found before gravity (and a later peel) made it
+dissolved CO2.
 
 Distances are physical, taken from the grid of the sand map; the area of a
 component is the sum of its pixels' areas, which the caller gives. Every
@@ -55,7 +57,7 @@ class PhaseLabel(IntEnum):
 
 
 class PhaseRule(IntEnum):
-    """Which rule last changed a pixel's label, in a rule map (uint8).
+    """A pixel's last phase rule or allocated-gas provenance, in uint8.
 
     The values are those our production stored, so that its rule maps read the
     same.
@@ -85,6 +87,12 @@ class PhaseRule(IntEnum):
     """A small enclosed hole, made dissolved CO2."""
     GAS_SPECK = 10
     """A small gas speck, made dissolved CO2."""
+    GAS_LIMIT = 11
+    """Model gas outside a completed injection's episode limit, made
+    dissolved CO2."""
+    GAS_BRIDGE = 12
+    """Gas allocated in an injection bridge on an optically WATER pixel. Its
+    label and optical evidence stay WATER; it is not model gas or dissolved CO2."""
 
 
 @dataclass(frozen=True)
