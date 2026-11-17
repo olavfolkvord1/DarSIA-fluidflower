@@ -398,3 +398,13 @@ def test_a_domain_receives_the_injection_of_its_own_points(tmp_path):
     edge = AnalysisDomain("box", "edge", "edge", bounds_mm=(0.0, 600.0, 0.0, 490.0))
     with pytest.raises(ValueError, match="passes through an injection point"):
         injected_mass(edge, protocol, 1.0)
+
+
+def test_the_stored_maps_give_the_rows_of_the_maps_made(tmp_path):
+    """The mass per domain of the stored maps, whose total mass is read as the sum
+    of its parts, is that of the maps made, row for row."""
+    geometry, sand, maps, co2 = frame()
+    darsia.write_mass_maps(tmp_path, maps)
+    stored = darsia.read_mass_maps(tmp_path)
+    sums = DomainMass(DOMAINS, geometry, sand, SAND)
+    assert pd.DataFrame(sums(stored, co2)).equals(pd.DataFrame(sums(maps, co2)))
