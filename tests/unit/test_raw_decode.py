@@ -1,5 +1,6 @@
 """Tests of the decode of camera raw files."""
 
+import tracemalloc
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -159,3 +160,35 @@ def test_rig_decodes_raw_photographs_in_its_precision(tmp_path):
     np.testing.assert_array_equal(
         loaded.read_image(tmp_path / "frame.dng").img, frame.img
     )
+
+
+@pytest.mark.parametrize("name", ["photo.dng", "photo.jpg", "photo.tif", "photo.npz"])
+def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name):
+    """What reading a photo holds at its peak beside its image in single precision,
+    which a raw file is decoded in, is at most its format's decoded bytes per pixel."""
+    rows, cols = 600, 800
+    rng = np.random.default_rng(1)
+    path = tmp_path / name
+    if name.endswith(".dng"):
+        mosaic = rng.integers(600, 15000, (rows, cols), dtype=np.uint16)
+        write_dng(path, mosaic, LAYOUTS["RGGB"][0])
+        read = {"demosaic": "edge_aware", "dtype": "float32"}
+    elif name.endswith(".npz"):
+        darsia.OpticalImage(rng.random((rows, cols, 3))).save(path)
+        read = {}
+    else:
+        bits = np.uint8 if name.endswith(".jpg") else np.uint16
+        maximum = np.iinfo(bits).max
+        cv2.imwrite(str(path), rng.integers(0, maximum, (rows, cols, 3), dtype=bits))
+        read = {}
+    tracemalloc.start()
+    try:
+        start = tracemalloc.get_traced_memory()[0]
+        image = darsia.imread(path, **read)
+        peak = tracemalloc.get_traced_memory()[1] - start
+    finally:
+        tracemalloc.stop()
+    if image.img.dtype == np.float32:  # a raw file is decoded in the precision
+        peak -= image.img.nbytes
+    assert 0 < peak <= darsia.decoded_bytes(path) * rows * cols
+    assert darsia.decoded_bytes("notes.txt") == 0

@@ -106,6 +106,45 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
     return image
 
 
+def decoded_bytes(path: Union[str, Path]) -> int:
+    """Bytes per pixel that reading a photo holds beside its image in the Setup's
+    precision, by the photo's format, as measured on synthetic photos and rounded up
+    to whole words.
+
+    - A camera raw file: 44, its 16-bit mosaic and black-subtracted mosaic, its
+      clipped photosites, its 16-bit demosaic and invalid values and their
+      intermediates (40 measured); the image is decoded in the precision
+      (:func:`darsia.imread_from_raw`).
+    - A JPEG file: 32, its 8-bit decode (6 measured) and the double-precision image
+      the optical reader returns (24).
+    - A PNG or TIFF file: 40, its decode of up to 16 bits (12 measured) and the
+      double-precision image.
+    - A NumPy file: 28, its stored image, in double precision as DarSIA stores an
+      optical image (24), and what reading its archive holds.
+
+    Parameters
+    ----------
+    path : str or Path
+        The photo, or its file name.
+
+    Returns
+    -------
+    int
+        The bytes per pixel; 0 for a format that is not a photo's.
+
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in darsia.RAW_SUFFIXES:
+        return 44
+    if suffix in (".jpg", ".jpeg"):
+        return 32
+    if suffix in (".png", ".tif", ".tiff"):
+        return 40
+    if suffix in (".npy", ".npz"):
+        return 28
+    return 0
+
+
 def imread_from_bytes(
     data: bytes,
     transformations: Optional[list] = None,
