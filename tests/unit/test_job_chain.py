@@ -1018,7 +1018,7 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         stored = darsia.read_mass_maps(
             results / "mass-maps" / run / frame.session / frame.name
         )
-        for name in darsia.MASS_FIELDS:
+        for name in ("mass", *darsia.MASS_FIELDS):  # the total read as its sum
             np.testing.assert_array_equal(
                 getattr(stored, name).img, getattr(maps, name).img
             )
