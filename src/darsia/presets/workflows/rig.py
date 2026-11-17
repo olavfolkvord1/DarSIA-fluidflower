@@ -48,7 +48,9 @@ def _listed(folder: Path, prefix: str) -> list[Path]:
         names = [
             entry.name
             for entry in entries
-            if entry.name.startswith(prefix) and entry.name.endswith(".npz")
+            if entry.name.startswith(prefix)
+            and entry.name.endswith(".npz")
+            and entry.is_file()
         ]
     return [Path(folder) / name for name in sorted(names)]
 

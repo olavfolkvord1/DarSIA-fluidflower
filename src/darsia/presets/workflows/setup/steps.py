@@ -326,13 +326,52 @@ def grid_canvas(tables: Mapping[str, Any]) -> darsia.MeasurementCanvas | None:
 def output_cells(
     tables, runs, context, cell_mm: float, edge_mm=None, reference=None
 ) -> int:
-    """Count nominal metric cells from configured physical rig dimensions."""
+    """Count metric output cells from configured dimensions or measured corners.
+
+    Measured canvases take precedence over the optional grid shape. With neither,
+    a homography cannot locate the last row and column from pixel count alone.
+    A zero-stride image supplies grid metadata to the existing corner calculation
+    without allocating an image. Mixed measured/nominal runs use the nominal
+    rig's full rectangle, conservatively covering its pixel centres.
+    """
     if not math.isfinite(cell_mm) or cell_mm <= 0:
         raise ValueError("Memory estimation needs a finite positive output cell size.")
     own = {r: run_tables(tables, r) if r is not None else tables for r in runs}
+    measured = any(grid_model(t) is not None for t in own.values())
     step = Decimal(str(float(cell_mm))) / Decimal(1000)
-    rig = own[reference if reference is not None else next(iter(own))]["rig"]
-    lengths = (rig["height"], rig["width"])
+    if not measured:
+        rig = own[reference if reference is not None else next(iter(own))]["rig"]
+        lengths = (rig["height"], rig["width"])
+    else:
+        if edge_mm is None:
+            raise ValueError("Measured output-cell memory needs extent_edge_mm.")
+        corners = []
+        for name, one in own.items():
+            rig, model = one["rig"], grid_model(one)
+            if model is None:
+                corners.append(
+                    (np.array([0, rig["width"]]), np.array([0, rig["height"]]))
+                )
+                continue
+            canvas = grid_canvas(one)
+            shape = context.grid_shape
+            if shape is None and canvas is None:
+                raise ValueError(
+                    f"Memory for run {name!r}'s measured output extent needs "
+                    "Sizes.grid_shape=(rows, columns) or configured "
+                    "canvas_origin/canvas_shape."
+                )
+            grid = darsia.Image(
+                np.broadcast_to(np.uint8(0), shape or (1, 1)),
+                dimensions=[rig["height"], rig["width"]],
+            )
+            dtype = np.float32 if context.itemsize == 4 else np.float64
+            corners.append(darsia.grid_corners(grid, model, dtype, canvas))
+        x0, x1, y0, y1 = darsia.measured_extent(corners, cell_mm, edge_mm)
+        lengths = (
+            Decimal(str(y1)) - Decimal(str(y0)),
+            Decimal(str(x1)) - Decimal(str(x0)),
+        )
     if any(not math.isfinite(float(n)) or n <= 0 for n in lengths):
         raise ValueError("Memory estimation needs finite positive output dimensions.")
     return math.prod(

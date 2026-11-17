@@ -715,3 +715,14 @@ def test_a_rig_saved_again_drops_obsolete_split_corrections(tmp_path):
     np.testing.assert_array_equal(
         loaded.shape_corrections[0](rig.baseline).img, mapping(rig.baseline).img
     )
+
+
+def test_rig_listed_skips_same_suffix_directories(tmp_path):
+    """A legacy correction list contains sorted files, never child folders."""
+    for name in ("correction_2.npz", "correction_1.npz", "other.npz"):
+        (tmp_path / name).touch()
+    (tmp_path / "correction_0.npz").mkdir()
+    assert rig_module._listed(tmp_path, "correction_") == [
+        tmp_path / "correction_1.npz",
+        tmp_path / "correction_2.npz",
+    ]
