@@ -82,10 +82,8 @@ def _distance_cell_bytes(tables, run, context) -> int:
     fill-in depends on the region and is learned separately from observed peaks.
     """
     settings = tables["wasserstein"]
-    runs = context.runs or tuple(tables.get("runs", ()))
-    if not runs:
-        raise ValueError("Distance memory needs the selected runs.")
-    reference = runs[0]
+    reference = tables["distances"]["reference_run"]
+    runs = context.runs or (reference,)
     count = output_cells(
         tables,
         runs,

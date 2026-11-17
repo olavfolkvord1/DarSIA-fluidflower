@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 import darsia
-from darsia.jobs.step import Memory, Order, Scope, Step, StepContext
+from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, Term, run_tables
 from darsia.presets.workflows.setup.steps import read_image, read_rig
 
 PATHS = "color_paths.json"
@@ -90,11 +90,31 @@ def _color_path_reading(ctx: StepContext) -> None:
     )
 
 
+def _sample_fraction(tables, run, context=None) -> float:
+    """A shape-independent bound for strided samples per grid pixel.
+
+    Sizes holds pixel counts, not both dimensions. Dividing by the stride
+    once covers even a one-row grid; dividing by its square would not.
+    """
+    stride = int(run_tables(tables, run)["color_path_fit"]["stride_pixels"])
+    if stride <= 0:
+        raise ValueError("The colour-path sampling stride must be positive.")
+    return 1.0 / stride
+
+
 COLOR_PATHS = Step(
     "color-paths",
     {"rig": Scope.OWN, "corrected-image": Scope.OWN},
     Order.RUN,
-    Memory(grid=6.0),
+    Memory(
+        # Rig, current/baseline RGB, support and sampled row/column indices.
+        grid=3 * 4 + 4 + 3 + 2 * 3,
+        camera_bytes=18,
+        grid_bytes=3 * 8 + 3 + 2 * 8,
+        # Retained RGB samples, concatenation, norms and quantile/median work.
+        terms=(Term(_sample_fraction, held=12.0),),
+        frame_bytes=12 * 8,  # Round the strided pixel count up per frame.
+    ),
     _color_paths,
     {"color_path_fit": darsia.ColorPathFitSettings},
 )

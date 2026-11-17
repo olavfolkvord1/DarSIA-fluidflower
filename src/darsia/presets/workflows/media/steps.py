@@ -245,7 +245,7 @@ FILM_TILES = Step(
         "domain-mass": Scope.ALL,
     },
     Order.RUN,
-    Memory(grid=24.0),
+    Memory(grid=23.0, camera_bytes=20.0, grid_bytes=82.0),
     _film_tiles,
     {
         "media": MediaSettings,

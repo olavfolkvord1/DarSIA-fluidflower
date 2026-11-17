@@ -254,3 +254,13 @@ def test_the_stored_maps_give_back_their_total_mass_bit_for_bit(tmp_path):
         assert cells.keys() == made.keys()
         for key, values in made.items():
             assert cells[key].tobytes() == values.tobytes()
+
+
+def test_read_mass_copy_ignores_same_suffix_directories(tmp_path):
+    """Only field files in a frame leaf are read as stored mass maps."""
+    values = np.arange(6, dtype=np.float32).reshape(2, 3)
+    darsia.ScalarImage(values, dimensions=[2, 3]).save(tmp_path / "mass.npz")
+    (tmp_path / "nested.npz").mkdir()
+    stored = darsia.read_mass_copy(tmp_path)
+    assert set(stored) == {"mass"}
+    np.testing.assert_array_equal(stored["mass"].img, values)

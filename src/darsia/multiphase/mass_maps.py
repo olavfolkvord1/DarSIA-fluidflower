@@ -729,4 +729,8 @@ def write_mass_copy(
 def read_mass_copy(folder: Path) -> dict[str, darsia.Image]:
     """A frame's stored copy of its mass maps on metric cells, by field
     (:func:`write_mass_copy`)."""
-    return {f.stem: darsia.imread(f) for f in sorted(Path(folder).glob("*.npz"))}
+    return {
+        f.stem: darsia.imread(f)
+        for f in sorted(Path(folder).glob("*.npz"))
+        if f.is_file()
+    }

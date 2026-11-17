@@ -32,7 +32,8 @@ statistics, and the calibration fit with its folds.
   fit reads them. Every sand is read by Beer–Lambert as the reference sand
   (:func:`response_reading`): on the run's reference-sand background, with the
   measured path ratios and the reference sand's factor, its path's scale over
-  its measured colour range.
+  its measured colour range. Independent frames run in chunks, with one stored
+  result per frame, so an interrupted chunk resumes at its missing frames.
 - ``calibration`` (R6) fits the gain and the dilution across the fit runs, and
   each fold leaves one run out, reading every run's frames without its
   estimate.
@@ -613,6 +614,16 @@ def _window(tables: Mapping, run: str | None, context=None) -> int:
     return window_frames(rules)
 
 
+def _variants(tables: Mapping, run: str | None, context=None) -> int:
+    """The held-out variants of a run's maps at most: one where its calibration
+    group has folds, of which its first donor may be held out (:func:`_overflow`)."""
+    if run is None or "calibration_runs" not in tables:
+        return 0
+    return int(
+        bool(settings_from_table(FitRuns, table(tables, "calibration_runs")).folds)
+    )
+
+
 def _supported(tables: Mapping, run: str | None, context=None) -> int:
     """One where a run names a phase support, whose masked images the phase maps
     hold beside the read ones; else none."""
@@ -625,11 +636,49 @@ def reading_sands(tables: Mapping, run: str | None, context=None) -> int:
     return len(tables.get("reading", {}).get("sands", {}))
 
 
+def _range_rigs(tables: Mapping, run: str | None, context=None) -> int:
+    """Additional rigs retained in the list passed to color_ranges."""
+    return max(0, len(tables.get("response", {}).get("range_runs", ())) - 1)
+
+
 def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
-    """Histogram values retained as Python rows by the initial run writer."""
+    """Stored histogram and column-group values for one frame and its variants.
+
+    A sand histogram has relative/weight arrays of at most intervals + 1
+    entries. Column estimates have relative/ratio/weight arrays of at most
+    (intervals + 1)**2 groups; their own-signal component is zero. Neither the
+    combined disjoint sand histograms nor the column groups can exceed pixels.
+    """
     own = run_tables(tables, run) if run is not None else tables
-    bins = int(own["run_statistics"]["intervals"]) + 1
-    return 2 * min(bins * reading_sands(tables, run), context.grid_pixels)
+    histograms = int(own["run_statistics"]["intervals"]) + 1
+    columns = int(own["unknown_mass"]["intervals"]) + 1
+    pixels = context.grid_pixels
+    # Histograms cover measured dissolved pixels; column groups cover missing
+    # measurements. They partition pixels, so reserve the larger three-value
+    # column groups first and histogram groups only in the remaining pixels.
+    occupied = min(columns**2, pixels)
+    entries = 3 * occupied
+    entries += 2 * min(histograms * reading_sands(tables, run), pixels - occupied)
+    return entries * (1 + _variants(tables, run))
+
+
+def _statistics_bytes(tables: Mapping, run: str | None, context) -> int:
+    """One frame's retained statistics and Python records for the streaming writer.
+
+    Histogram and column arrays follow capacity's dtype: a float64 geometry or
+    CO2 field can promote them even with float32 images. The source arrays stay
+    alive while _rows builds plain lists, and dataclasses.asdict copies a frame.
+    Reserve both arrays at least at float64 width, plus the Python floats and
+    list pointers. _array may also cast one array at a time; that array has at
+    most one entry per pixel, without a sand or variant multiplier. Streaming
+    JSON adds only traversal/chunk/TextIO buffers, covered by the process base.
+    """
+    array_bytes = max(context.itemsize, np.dtype(np.float64).itemsize)
+    value_bytes = 2 * array_bytes + sys.getsizeof(0.0) + np.dtype(np.intp).itemsize
+    return (
+        _statistics_entries(tables, run, context) * value_bytes
+        + context.grid_pixels * array_bytes
+    )
 
 
 def _gas_port_count(tables: Mapping, run: str | None, context) -> int:
@@ -673,7 +722,7 @@ def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
     # plus coupled threshold coefficients/fixed fractions/capacity scales.
     # Active meeting fallback adds a seed copy and component-selection overlap.
     allocations = (20 * count + 51)
-    return shared + max(building, allocations)
+    return shared + max(building, allocations) * (1 + _variants(tables, run))
 
 
 class _Probabilities(Sequence):
@@ -880,12 +929,15 @@ def _run_statistics(ctx: StepContext) -> None:
     }
     reading = response_reading(ctx, run, grid)
     native = native_reading(ctx, run)
-    rows = {held_out: [] for held_out in variants}
-    for index, frame in enumerate(frames):
+    for frame in frames:
+        if ctx.done(frame):
+            continue
+        rows = {held_out: [] for held_out in variants}
         image = ctx.read("corrected-image", read_image, frame=frame).img
         date = experiment.get_datetime(ctx.photo(run, frame))
         co2 = co2_state(grid, experiment, date)
         hours = experiment.time_since_start(date)
+        before = None
         for held_out in variants:
             maps = ctx.read(
                 "phase-maps", lambda f: darsia.read_phase_maps(f, held_out), frame=frame
@@ -893,9 +945,13 @@ def _run_statistics(ctx: StepContext) -> None:
             capacity = darsia.dissolved_capacity(
                 grid.geometry.pore_volume_m3, co2.solubility_co2, maps["saturation"]
             )
-            signal, measured = read_signal(
-                grid, image, maps, reading, statistics_settings, native
-            )
+            # The donor changes the allocation, not the labels before its rules.
+            # Older stored variants may differ; only reuse their same reading.
+            if before is None or not np.array_equal(before, maps["before"]):
+                signal, measured = read_signal(
+                    grid, image, maps, reading, statistics_settings, native
+                )
+                before = maps["before"]
             dissolved = (
                 measured
                 & (maps["labels"] == darsia.PhaseLabel.DISSOLVED)
@@ -933,7 +989,7 @@ def _run_statistics(ctx: StepContext) -> None:
             rows[held_out].append(
                 darsia.CalibrationFrame(
                     run=run,
-                    index=index,
+                    index=0,  # its index in the selected run is set when read
                     elapsed_h=hours,
                     target_h=hours,
                     injected_g=protocol.injected_mass(time=hours) * 1000,
@@ -944,9 +1000,12 @@ def _run_statistics(ctx: StepContext) -> None:
                     measured=volume.source == darsia.MEASURED,
                 )
             )
-    dtype = grid.rig.pixel_area.img.dtype
-    primary = rows.pop(None)
-    ctx.publish(lambda folder: darsia.write_frames(folder, run, primary, dtype, rows))
+        dtype = grid.rig.pixel_area.img.dtype
+        primary = rows.pop(None)
+        ctx.publish(
+            lambda folder: darsia.write_frames(folder, run, primary, dtype, rows),
+            frame=frame,
+        )
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
@@ -961,13 +1020,19 @@ def _calibration(ctx: StepContext) -> None:
     settings = ctx.settings
     runs, material = settings["calibration_runs"], settings["material"]
     held = None if ctx.task.part == "fit" else ctx.task.part.removeprefix("fold-")
-    frames = [
-        frame
-        for run in ctx.selection.frames
-        for frame in ctx.read(
-            "run-statistics", lambda f: darsia.read_frames(f, held), run=run
-        )
-    ]
+    frames = []
+    for run, selected in ctx.selection.frames.items():
+        for index, frame in enumerate(selected):
+            frames.extend(
+                ctx.read(
+                    "run-statistics",
+                    lambda folder, index=index: darsia.read_frames(
+                        folder, held, first_index=index
+                    ),
+                    run=run,
+                    frame=frame,
+                )
+            )
     swi = {int(k): float(v) for k, v in material.swi.items()}
     measured = [int(k) for k in material.measured_swi]
     arguments = (frames, list(runs.fit), settings["calibration_fit"], swi, measured)
@@ -1010,7 +1075,7 @@ OVERFLOW = Step(
     "overflow",
     {"displaced-volume": Scope.ALL, "rig": Scope.OWN},
     Order.RUN,
-    Memory(),
+    Memory(grid=8.0, camera_bytes=20.0, grid_bytes=74.0),
     _overflow,
     {"overflow": darsia.OverflowSettings, "calibration_runs": FitRuns},
     sections=EXPERIMENT,
@@ -1037,6 +1102,7 @@ PHASE_MAPS = Step(
         grid_bytes=112.0,
         terms=(
             Term(_window, grid=3.0 + 2.0),  # RGB image and two probabilities
+            Term(_variants, grid=4.0, grid_bytes=80.0),
             Term(_supported, grid=6.0),
             Term(_injection_map_bytes, grid_bytes=1.0),
         ),
@@ -1059,7 +1125,12 @@ COLOR_RANGES = Step(
     "color-ranges",
     {"rig": Scope.ALL, "corrected-image": Scope.ALL, "phase-maps": Scope.ALL},
     Order.PARTS,
-    Memory(grid=12.0),
+    Memory(
+        grid=31.0,
+        camera_bytes=37.0,
+        grid_bytes=198.0,
+        terms=(Term(_range_rigs, grid=12.0, camera_bytes=18.0, grid_bytes=64.0),),
+    ),
     _color_ranges,
     {
         "color_ranges": darsia.ColorRangeSettings,
@@ -1079,7 +1150,7 @@ PATH_RATIOS = Step(
         "color-ranges": Scope.ONE,
     },
     Order.PARTS,
-    Memory(grid=24.0),
+    Memory(grid=26.0, camera_bytes=18.0, grid_bytes=115.0),
     _path_ratios,
     {
         "path_ratios": darsia.PathRatioSettings,
@@ -1109,7 +1180,7 @@ RUN_STATISTICS = Step(
         "color-ranges": Scope.ONE,
         "path-ratios": Scope.ONE,
     },
-    Order.RUN,
+    Order.FRAMES,
     Memory(
         # Rig/geometry, RGB image, response/native signal, phase maps,
         # capacity, histogram and unknown-mass scratch. read_signal's mask
@@ -1121,11 +1192,8 @@ RUN_STATISTICS = Step(
         grid_bytes=88.0 + 2.0,
         terms=(
             Term(reading_sands, grid_bytes=2.0),
-            # The initial writer retains Python histogram rows for the run.
-            Term(
-                _statistics_entries,
-                frame_bytes=sys.getsizeof(0.0) + np.dtype(np.intp).itemsize,
-            ),
+            # One frame's rows and variants coexist through publication.
+            Term(_statistics_bytes, fixed_bytes=1),
         ),
     ),
     _run_statistics,
@@ -1138,7 +1206,7 @@ RUN_STATISTICS = Step(
     sections=(*READING, *EXPERIMENT),
     files=protocol_files,
 )
-"""Each run's statistics of its frames (R5)."""
+"""Each frame's statistics (R5), independent of other selected frames."""
 CALIBRATION = Step(
     "calibration",
     {"run-statistics": Scope.ALL},

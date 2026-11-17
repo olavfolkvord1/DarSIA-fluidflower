@@ -14,6 +14,8 @@ a Setup job does not need its settings.
 """
 
 import json
+import math
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Any
 import numpy as np
 
 import darsia
-from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, run_tables
+from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, Term, run_tables
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.setup.steps import read_rig
 
@@ -146,11 +148,80 @@ def _material_targets(ctx: StepContext) -> None:
     ctx.publish(write)
 
 
+def _target_work_bytes(tables, run, context) -> int:
+    """Configured light-field design and material-target fitting-grid buffers.
+
+    Count polynomial columns and fitted levels, reduced cells, blocks, dense
+    designs and their solve copies. A default mask contains only the requested
+    materials. An external mask may contain others; minimum_blocks bounds their
+    number before any level/design matrix is allocated. Library solve workspace
+    can vary, so this declaration is combined with the service's measured peaks.
+    """
+    own = run_tables(tables, run) if run is not None else tables
+    correction, settings = _correction(own), own["material_targets"]
+    field = settings["light_field"]
+    cell, block, degree = (
+        int(field[k]) for k in ("cell_pixels", "block_cells", "degree")
+    )
+    minimum = int(field["minimum_blocks"])
+    if min(cell, block, minimum) <= 0 or degree < 1:
+        raise ValueError(
+            "Light-field memory needs positive cell/block/minimum counts and degree."
+        )
+    if context.grid_shape is None:
+        cells = max(1, context.grid_pixels // cell)
+        samples = cells // block**2
+    else:
+        shape = tuple(max(1, n // cell) for n in context.grid_shape)
+        cells = math.prod(shape)
+        samples = math.prod(n // block for n in shape)
+    terms = degree * (degree + 3) // 2
+    levels = len(settings["materials"])
+    if correction.get("fit_mask") is not None:
+        levels = samples // minimum
+    unknowns = terms + levels
+    # Cell labels, green/log-green, block copies and reduction scratch;
+    # sample indices/scalars; polynomial/list stack; levels; design, weighted
+    # design and solve copy; small dense solve factors.
+    light = cells * (6 * 8 + 4 + 3) + samples * 10 * 8
+    light += samples * (2 * terms * 8 + levels * 9 + 3 * unknowns * 8)
+    light += 3 * unknowns**2 * 8
+    fit_shape = tuple(int(n) for n in correction["fit_shape"])
+    if context.grid_shape is not None:
+        fit_shape = tuple(min(n, m) for n, m in zip(fit_shape, context.grid_shape))
+    if len(fit_shape) != 2 or min(fit_shape) <= 0:
+        raise ValueError(
+            "Material-target memory needs two positive fit_shape dimensions."
+        )
+    fitted = math.prod(fit_shape)
+    minimum_cells = int(correction["fit"]["minimum_block_cells"])
+    if minimum_cells <= 0:
+        raise ValueError("Material-target memory needs positive minimum_block_cells.")
+    # Projection/colour/block RGB arrays, int64 indices, coordinates, masks,
+    # and output sample vectors. Each record holds two RGB arrays and scalars.
+    records = fitted // minimum_cells
+    record_bytes = (
+        sys.getsizeof((None,) * 6)
+        + 4 * sys.getsizeof(np.float64(0))
+        + 2 * (sys.getsizeof(np.empty(0, np.float32)) + 3 * 4)
+        + 16
+    )
+    targets = fitted * (4 * 3 * 4 + 4 * 8 + 8) + records * (record_bytes + 12 * 8)
+    return light + targets
+
+
 MATERIAL_TARGETS = Step(
     "material-targets",
     {"rig": Scope.OWN},
     Order.RUN,
-    Memory(grid=8.0),
+    Memory(
+        # Loaded rig, flattened RGB and its copy; tiled float64 field work,
+        # float32 projection input and masks. Fitting grids are counted below.
+        grid=12 + 3 + 3,
+        camera_bytes=18,
+        grid_bytes=64 + 5 * 8 + 3 * 4 + 4,
+        terms=(Term(_target_work_bytes, fixed_bytes=1),),
+    ),
     _material_targets,
     {"material_targets": MaterialTargetSettings},
     sections=(CORRECTION[0],),

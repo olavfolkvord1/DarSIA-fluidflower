@@ -1031,7 +1031,14 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
             np.testing.assert_array_equal(stored[name].img, values)
     for run in selection.frames:  # each frame's histograms of its sands' signal
         made = [frame for frame in direct["statistics"] if frame.run == run]
-        stored = darsia.read_frames(results / "run-statistics" / run)
+        stored = [
+            item
+            for index, frame in enumerate(selection.frames[run])
+            for item in darsia.read_frames(
+                results / "run-statistics" / run / frame.session / frame.name,
+                first_index=index,
+            )
+        ]
         assert len(stored) == len(made)
         for one, other in zip(stored, made):
             assert one.dissolved.keys() == other.dissolved.keys()
@@ -1040,8 +1047,7 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
                 np.testing.assert_array_equal(found.relative, histogram.relative)
                 np.testing.assert_array_equal(found.weight, histogram.weight)
     record = darsia.read_calibration(results / "calibration" / "fit")
-    assert record["calibration"]["gain"] == direct["fit"].gain
-    assert record["calibration"]["beta"] == direct["fit"].beta
+    assert record["calibration"] == json.loads(json.dumps(asdict(direct["fit"])))
     # The fold leaving the second run's donor out read its frames without it.
     record = darsia.read_calibration(results / "calibration" / "fold-r1")
     fold, predictions = direct["fold"]
@@ -1255,7 +1261,9 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     monkeypatch.chdir(project)
     steps = setup.STEPS + calibration.STEPS[:7]
     job = create_job(tmp_path / "jobs", steps, selection, config)
-    statistics = {"run-statistics.r1", "run-statistics.r2"}
+    statistics = {
+        task.id for task in queue.tasks(job).values() if task.step == "run-statistics"
+    }
     _run(job, skip=statistics)
     frame = selection.frames["r1"][-1]
     results = project / "results"
@@ -1269,15 +1277,22 @@ def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
     image = darsia.imread(stored / "image.npz")
     image.img[row, column] = np.nan  # its colour is not measured
     image.save(stored / "image.npz")
-    _run(job, skip={"run-statistics.r2"})
-    found = darsia.read_frames(results / "run-statistics" / "r1")[-1]
+    _run(job, skip={name for name in statistics if ".r2." in name})
+    found = darsia.read_frames(
+        results / "run-statistics" / "r1" / frame.session / frame.name,
+        first_index=len(selection.frames["r1"]) - 1,
+    )[0]
     tables = tomllib.loads(config.read_text())
     material = settings_from_table(calibration.MaterialSettings, tables["material"])
     grid = calibration.run_grid(Rig.load(results / "rig" / "r1"), material)
     statistics = settings_from_table(
         darsia.RunStatisticsSettings, tables["run_statistics"]
     )
-    task = queue.tasks(job)["run-statistics.r1"]
+    task = next(
+        task
+        for task in queue.tasks(job).values()
+        if task.step == "run-statistics" and task.run == "r1" and frame in task.frames
+    )
     ctx = jobs_main.context(job, task, "")  # its reading, as the step makes it
     reading = calibration.response_reading(ctx, "r1", grid)
     native = calibration.native_reading(ctx, "r1")

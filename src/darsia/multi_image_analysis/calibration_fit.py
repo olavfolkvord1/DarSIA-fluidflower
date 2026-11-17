@@ -840,7 +840,11 @@ def write_frames(
     dtype,
     held_out: Mapping[str, Sequence[CalibrationFrame]] | None = None,
 ) -> None:
-    """Store a run's frames as the fit reads them, in ``folder`` (:data:`STATISTICS`).
+    """Store frames of one run in ``folder`` (:data:`STATISTICS`).
+
+    A result can hold one frame or a sequence. Independently stored frames can
+    use index zero; their places in a selected run are assigned by
+    :func:`read_frames` when those results are assembled for the fit.
 
     Parameters
     ----------
@@ -870,15 +874,27 @@ def write_frames(
     write_json(Path(folder) / STATISTICS, record)
 
 
-def read_frames(folder: Path, held_out: str | None = None) -> list[CalibrationFrame]:
+def read_frames(
+    folder: Path,
+    held_out: str | None = None,
+    *,
+    first_index: int | None = None,
+) -> list[CalibrationFrame]:
     """A run's stored frames as the fit reads them (:func:`write_frames`); with
     ``held_out``, those without that run's estimate where they are stored, as a
-    fold leaving it out reads them."""
+    fold leaving it out reads them.
+
+    By default, stored indices are kept, including earlier aggregate results.
+    With ``first_index``, the returned frames are indexed consecutively from it,
+    so independently stored frames take their place in the selected run without
+    depending on the selection that first stored them.
+
+    """
     record = json.loads((Path(folder) / STATISTICS).read_text(encoding="utf-8"))
     dtype = np.dtype(record["dtype"]).type
     rows = record["held_out"].get(held_out, record["frames"])
     frames = []
-    for row in rows:
+    for offset, row in enumerate(rows):
         gas = dict(row["gas"])
         gas["sands"] = {int(k): SandGas(**v) for k, v in gas["sands"].items()}
         column = row["column"]
@@ -890,6 +906,9 @@ def read_frames(folder: Path, held_out: str | None = None) -> list[CalibrationFr
             CalibrationFrame(
                 **{
                     **row,
+                    "index": (
+                        row["index"] if first_index is None else first_index + offset
+                    ),
                     "dissolved": {
                         int(sand): SandHistogram(
                             np.asarray(relative, dtype), np.asarray(weight, dtype)
