@@ -141,7 +141,7 @@ def _box(mask):
     return np.s_[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
 
 
-def _ports(protocol):
+def injection_ports(protocol):
     """Each port's injection periods (touching ones merged), by first start."""
     periods = {}
     for row in protocol.df[protocol.df["rate_kg_s"] > 0].itertuples():
@@ -554,7 +554,7 @@ def free_gas(
     facies = sand_map.img
     x, y = darsia.pixel_centres(sand_map)
     pitch_mm = _pitch_mm(sand_map)
-    ports = _ports(protocol)
+    ports = injection_ports(protocol)
     order = list(ports)
     radius, lower = _port_zones(x, y, ports, rule_settings)
     seal = _seal(facies, domain, permeability, rule_settings)
