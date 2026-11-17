@@ -1878,7 +1878,8 @@ class Image:
     def save(self, path: str | Path, verbose=True) -> None:
         """Save image to file.
 
-        Store array and metadata in single file.
+        Store array and metadata in single file, plain or compressed losslessly by
+        the process's storage settings (:func:`darsia.save_arrays`).
 
         NOTE: Keywords are compatible with imread_from_npz.
 
@@ -1889,7 +1890,7 @@ class Image:
         """
         file_path = Path(path).with_suffix(".npz")
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
+        darsia.save_arrays(
             str(file_path),
             array=self.img,
             metadata=self.metadata(),
