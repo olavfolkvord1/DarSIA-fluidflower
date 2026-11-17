@@ -14,6 +14,7 @@ missing frame with the same maps.
 import datetime
 import json
 import tomllib
+import zipfile
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1087,15 +1088,26 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     """Every frame's mass maps of the job equal the direct calls', and so do the
     comparisons' distances, the films' tiles and films and the ensemble's figures;
     each film's encoder opens under the host's waiting lock. Single precision runs
-    through the service's task processes, double precision in this process."""
+    through the service's task processes, which store the results' arrays
+    compressed by the configuration, double precision in this process."""
     project = tmp_path / "project"
     config, selection = _project(project, precision)
     monkeypatch.chdir(project)
     direct = _direct(project, selection)
+    if precision == "float32":
+        config.write_text(config.read_text() + "[storage]\ncompress = true\n")
     jobs = tmp_path / "jobs"
     job = create_job(jobs, STEPS, selection, config)
     if precision == "float32":
         _serve(jobs, tmp_path, seconds=1200.0)
+        stored = project / "results"  # every image and phase map, compressed
+        paths = [stored / "rig" / "r1" / "baseline.npz"]
+        for kind in ("corrected-image", "phase-maps", "mass-maps", "mass-copy"):
+            paths += (path for path in (stored / kind).rglob("*.npz") if path.is_file())
+        for path in paths:
+            with zipfile.ZipFile(path) as archive:
+                methods = {member.compress_type for member in archive.infolist()}
+            assert methods <= {zipfile.ZIP_DEFLATED}, path
     else:
         taken = []
 
