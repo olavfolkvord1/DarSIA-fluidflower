@@ -8,10 +8,12 @@ on the run's grid, with the calibration's parameters:
   from no dissolved CO2 to saturation, clipped to [0, 1] (:func:`relative_signal`);
 - times the calibrated gain, clipped to one, times the dilution factor
   (:func:`darsia.dilution_factor`): the share of the solubility that is dissolved;
-- CO2 only where the phase map says CO2, a hard limit: dissolved pixels whose colour
+- dissolved CO2 only where the phase map says CO2: dissolved pixels whose colour
   is measured take that share, and the water of the model's gas
   (:func:`darsia.model_gas`, from the phase and rule maps) is saturated;
-- the free-gas saturation of each pixel (e.g., :func:`darsia.free_gas`).
+- the free-gas saturation of each pixel (e.g., :func:`darsia.free_gas`), including
+  gas allocated in a marked injection bridge on optical WATER. That gas creates
+  no dissolved share and does not change the optical labels or model-gas mask.
 
 The mass per pore volume is then the official one
 (:meth:`darsia.CO2MassAnalysis.mass_analysis`): the gas density times the
@@ -40,7 +42,7 @@ import numpy as np
 
 import darsia
 from darsia.multi_image_analysis.calibration_fit import MassCalibration
-from darsia.multiphase.phase_rules import PhaseLabel, model_gas
+from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule, model_gas
 from darsia.pvt import data as pvt_data
 
 _GRAVITY = 9.81
@@ -378,7 +380,9 @@ def mass_maps(
     The dissolved share is the relative signal times the gain, clipped to one,
     times the dilution factor, on the dissolved pixels whose colour is measured
     (:func:`main_pixels`); it is one in the water of the model's gas and zero
-    elsewhere, so CO2 is only where the phase map says CO2. The saturation is the
+    elsewhere. A WATER pixel marked :attr:`darsia.PhaseRule.GAS_BRIDGE` retains
+    its allocated gas saturation, but has no inferred dissolved CO2 and is not
+    model gas. The saturation is the
     given one on those pixels where they count, 1 - Swi on other free gas, and
     zero elsewhere. The masses follow from ``co2.mass_analysis`` and are kept on
     the counted pixels, zero elsewhere, and unknown (NaN) on free gas without a
@@ -416,8 +420,29 @@ def mass_maps(
         Mass, gas and dissolved mass per pore volume (g/L), the free-gas saturation
         and the dissolved share of the solubility.
 
+    Raises
+    ------
+    ValueError
+        If a counted pixel marked GAS_BRIDGE is not WATER, lacks a finite Swi,
+        or has a nonfinite, nonpositive or over-cap gas saturation.
+
     """
     dtype = relative.img.dtype.type
+    bridge = geometry.counted & (rules == PhaseRule.GAS_BRIDGE)
+    if np.any(bridge):
+        bridge_swi, bridge_sg = geometry.swi[bridge], saturation[bridge]
+        if (
+            np.any(labels[bridge] != PhaseLabel.WATER)
+            or not np.isfinite(bridge_swi).all()
+            or not np.isfinite(bridge_sg).all()
+            or np.any(bridge_sg <= 0)
+            or np.any(bridge_sg > dtype(1) - bridge_swi)
+        ):
+            raise ValueError(
+                "Counted GAS_BRIDGE pixels need WATER labels, finite Swi and "
+                "positive finite saturation no greater than 1 - Swi."
+            )
+        del bridge_swi, bridge_sg
     model = model_gas(labels, rules)
     dissolved, gas = main_pixels(labels, measured, geometry, model)
     share = np.clip(relative.img * dtype(calibration.gain), dtype(0), dtype(1))
@@ -427,6 +452,8 @@ def mass_maps(
     held[gas] = dtype(1) - geometry.swi[gas]
     kept = geometry.counted & (dissolved | gas)
     held[kept] = saturation[kept]
+    held[bridge] = saturation[bridge]
+    del bridge
     result = co2.mass_analysis(
         c_aq=darsia.full_like(relative, share), s_g=darsia.full_like(relative, held)
     )
