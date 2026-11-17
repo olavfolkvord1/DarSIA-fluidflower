@@ -165,9 +165,13 @@ def test_rig_decodes_raw_photographs_in_its_precision(tmp_path):
 @pytest.mark.parametrize("name", ["photo.dng", "photo.jpg", "photo.tif", "photo.npz"])
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("scale", [1, 2])
-def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name, dtype, scale):
+@pytest.mark.parametrize("prior_peak", [False, True], ids=["existing", "prior-peak"])
+def test_a_photos_decoded_bytes_cover_its_reading(
+    tmp_path, name, dtype, scale, prior_peak
+):
     """The reader's allocations fit its format budget at two resolutions and
-    both working precisions, beside the final image for the raw reader."""
+    both working precisions, even after an earlier traced allocation."""
+    caller_trace = (tracemalloc.is_tracing(), tracemalloc.get_traced_memory())
     rows, cols = 300 * scale, 400 * scale
     rng = np.random.default_rng(1)
     path = tmp_path / name
@@ -183,8 +187,15 @@ def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name, dtype, scale):
         maximum = np.iinfo(bits).max
         cv2.imwrite(str(path), rng.integers(0, maximum, (rows, cols, 3), dtype=bits))
         read = {}
+    budget = darsia.decoded_bytes(path) * rows * cols
     tracemalloc.start()
     try:
+        if prior_peak:
+            # An earlier operation can leave tracing active with a freed peak.
+            earlier = bytearray(2 * budget)
+            del earlier
+        # start() leaves an existing tracer's earlier high-water mark intact.
+        tracemalloc.reset_peak()
         start = tracemalloc.get_traced_memory()[0]
         image = darsia.imread(path, **read)
         peak = tracemalloc.get_traced_memory()[1] - start
@@ -192,5 +203,5 @@ def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name, dtype, scale):
         tracemalloc.stop()
     if name.endswith(".dng"):  # a raw file is decoded in the precision
         peak -= image.img.nbytes
-    assert 0 < peak <= darsia.decoded_bytes(path) * rows * cols
+    assert 0 < peak <= budget, f"Tracing state on entry: {caller_trace}"
     assert darsia.decoded_bytes("notes.txt") == 0
