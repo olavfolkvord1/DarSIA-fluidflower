@@ -48,8 +48,10 @@ _GRAVITY = 9.81
 _PA_TO_BAR = 1e-5
 _MAPS = {"mass_total": "mass", "mass_aqueous": "mass_aq", "mass_free_gas": "mass_g"}
 """The field of the mass maps behind each mass."""
-MASS_FIELDS = ("mass", "mass_g", "mass_aq", "saturation_g", "concentration_aq")
-"""The fields of stored mass maps, one image each (:func:`write_mass_maps`)."""
+MASS_FIELDS = ("mass_g", "mass_aq", "saturation_g", "concentration_aq")
+"""The fields of stored mass maps, one image each (:func:`write_mass_maps`); the
+total mass is not stored but read as the sum of the gas and dissolved masses
+(:func:`read_mass_maps`)."""
 
 
 @dataclass(frozen=True)
@@ -587,19 +589,25 @@ def cell_ratio(numerator, denominator):
 
 def write_mass_maps(folder: Path, maps: darsia.SimpleMassAnalysisResults) -> None:
     """Store a frame's mass maps in ``folder``: each field of :data:`MASS_FIELDS`
-    as an image (``<field>.npz``)."""
+    as an image (``<field>.npz``). The total mass is not stored: the maps' total is
+    the sum of their gas and dissolved masses, bit for bit, NaN where they are
+    (:func:`mass_maps`, the official mass analysis)."""
     for name in MASS_FIELDS:
         getattr(maps, name).save(Path(folder) / f"{name}.npz")
 
 
 def read_mass_maps(folder: Path) -> darsia.SimpleMassAnalysisResults:
-    """A frame's stored mass maps (:func:`write_mass_maps`)."""
+    """A frame's stored mass maps (:func:`write_mass_maps`), with the total mass
+    the sum of the gas and dissolved masses in their precision, as the mass
+    analysis adds them; a total stored beside them by an earlier writer
+    (``mass.npz``) is that same sum and is not read."""
     images = {name: darsia.imread(Path(folder) / f"{name}.npz") for name in MASS_FIELDS}
-    first = images["mass"]
+    dissolved = images["mass_aq"]
     return darsia.SimpleMassAnalysisResults(
-        name=first.name,
-        date=first.date,
-        time=first.time,
+        name=dissolved.name,
+        date=dissolved.date,
+        time=dissolved.time,
+        mass=darsia.full_like(dissolved, images["mass_g"].img + dissolved.img),
         color_signal=None,
         **images,
     )

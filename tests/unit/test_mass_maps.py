@@ -208,3 +208,30 @@ def test_the_official_route_and_ours_give_mass_maps_of_one_form():
     unknown = np.unravel_index(copy.cells.index.reshape(6, 6)[NO_SWI], (30, 30))
     assert cells["mass_total_known_fraction"][unknown] == 0
     assert copy.static["domain_area_m2"].sum() == pytest.approx(5 * 6 * 25e-6)
+
+
+def test_the_stored_maps_give_back_their_total_mass_bit_for_bit(tmp_path):
+    """The stored maps hold no total mass; read back, it is the total of the maps
+    made, bit for bit with its NaN, also from maps stored with their total by the
+    earlier writer, and the copy on metric cells is that of the maps made."""
+    geometry, _, _, maps = frame()
+    assert np.isnan(maps.mass.img).any()
+    darsia.write_mass_maps(tmp_path / "maps", maps)
+    stored = sorted(path.name for path in (tmp_path / "maps").iterdir())
+    assert stored == sorted(f"{name}.npz" for name in darsia.MASS_FIELDS)
+    assert "mass" not in darsia.MASS_FIELDS
+    for name in ("mass", *darsia.MASS_FIELDS):  # as the earlier writer stored them
+        getattr(maps, name).save(tmp_path / "earlier" / f"{name}.npz")
+    copy = darsia.MassCopy(geometry, SETTINGS)
+    made = copy(maps, LABELS)
+    for folder in ("maps", "earlier"):
+        found = darsia.read_mass_maps(tmp_path / folder)
+        for name in ("mass", *darsia.MASS_FIELDS):
+            values, image = getattr(maps, name).img, getattr(found, name)
+            assert image.img.dtype == values.dtype
+            assert image.img.tobytes() == values.tobytes()
+            assert str(image.metadata()) == str(getattr(maps, name).metadata())
+        cells = copy(found, LABELS)
+        assert cells.keys() == made.keys()
+        for key, values in made.items():
+            assert cells[key].tobytes() == values.tobytes()
