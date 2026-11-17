@@ -6,7 +6,9 @@
   own process, which its service started with the job's computing environment. It
   checks that its code is of the job's revision and that this host provides the
   job's BLAS kernel and compute backend, else it says why in its claim and exits
-  (:data:`darsia.jobs.service.REFUSED`). It sets the threads, renews the lease
+  (:data:`darsia.jobs.service.REFUSED`). It sets the threads and the storage of
+  the results' arrays (the ``[storage]`` table of the job's configuration,
+  :func:`darsia.use_storage`), and renews the lease
   every :data:`darsia.utils.results.BEAT`, runs the step and marks the task done,
   naming its accepted tokens, or failed, with the traceback; the lease is not
   renewed after the step has ended, so that nothing is written into the marker
@@ -42,6 +44,7 @@ from darsia.presets.workflows.comparison import steps as comparison_steps
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.setup import steps as setup_steps
 from darsia.utils import results
+from darsia.utils.storage import StorageSettings, use_storage
 
 STEPS: dict[str, Step] = {
     step.name: step
@@ -207,6 +210,8 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     failure, adopted = None, ()
     try:
         ctx = context(job, task, token, code)
+        storage = ctx.tables.get("storage", {})
+        use_storage(settings_from_table(StorageSettings, storage))
         ctx.step.run(ctx)
         adopted = tuple(ctx.adopted)
     except Exception:
