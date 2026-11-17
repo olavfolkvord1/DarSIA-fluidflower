@@ -42,7 +42,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -591,11 +591,62 @@ def serve(
             sleep(poll)
 
 
-def settled(jobs: Path) -> bool:
+def _all_done(job: Path, known: Collection[str]) -> bool:
+    """Every task has reached done, the only state that cannot be retried.
+
+    Known is the immutable task inventory from the job record, never a folder
+    listing. No queue operation moves a done marker back. Failed jobs are not
+    final: retry_failed may make them runnable again.
+    """
+    if not known or not set(known) <= queue.markers(job, queue.DONE).keys():
+        return False
+    return not any(
+        queue.markers(job, state)
+        for state in (queue.QUEUE, queue.CLAIMED, queue.FAILED)
+    )
+
+
+def settled(jobs: Path, *, complete: set[str] | None = None) -> bool:
     """Whether no task of any job of a folder can still run: each is done,
-    failed, or waits behind a failed task (:func:`darsia.jobs.queue.waiting`)."""
-    for name in sorted(os.listdir(jobs)):
-        if not name.startswith(".") and (Path(jobs) / name / JOB).is_file():
-            if queue.waiting(Path(jobs) / name):
-                return False
+    failed, or waits behind a failed task (:func:`darsia.jobs.queue.waiting`); a
+    folder that cannot be read now through the share is not settled.
+
+    Parameters
+    ----------
+    jobs : Path
+        The jobs folder.
+    complete : set of str, optional
+        This caller's cache of fully done jobs, for this jobs folder alone.
+        Updated in place. Only jobs with an authoritative task inventory in
+        their record whose every task is done enter it. Earlier records without
+        that inventory and failed jobs are checked again.
+
+    Returns
+    -------
+    bool
+        Whether no task can still run.
+
+    """
+    complete = set() if complete is None else complete
+    try:
+        for name in sorted(results.retry_transient(lambda: os.listdir(jobs))):
+            folder = Path(jobs) / name
+            if name.startswith(".") or name in complete:
+                continue
+            if results.exists(folder / JOB):
+                inventory = read_job(folder).get("bytes")
+                if inventory is not None and _all_done(folder, inventory):
+                    complete.add(name)
+                    continue
+                state = queue.states(folder)
+                known = queue.tasks(folder)
+                if inventory is not None and (
+                    not set(inventory) <= state.keys()
+                    or not set(inventory) <= known.keys()
+                ):
+                    return False  # an incomplete view is not a settled job
+                if queue.waiting(folder, known, state):
+                    return False
+    except OSError:
+        return False
     return True

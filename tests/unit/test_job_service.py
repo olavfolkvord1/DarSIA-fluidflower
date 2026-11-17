@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -306,15 +307,15 @@ def test_a_beat_delayed_into_the_mark_lands_before_it(
         if number > 1:
             landed.set()
 
-    def mark(claim, value):
-        write(claim, value)
+    def mark(claim, value, **kwargs):
+        write(claim, value, **kwargs)
         if "accepted" in value:
             marked.set()
 
-    def move(source, destination):
+    def move(source, destination, **kwargs):
         if destination.parent.name == queue.DONE:
             landed.wait(2.0)  # a held beat lands now, if it is still to come
-        return transfer(source, destination)
+        return transfer(source, destination, **kwargs)
 
     monkeypatch.setattr(results, "BEAT", 0.05)
     monkeypatch.setattr(queue, "beat", held)
@@ -470,3 +471,60 @@ def test_the_host_lock_is_the_machines(tmp_path, monkeypatch):
         assert subprocess.run(command, env=other, timeout=60).returncode == 1
     with service.HostMutex(name):
         pass
+
+
+def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch):
+    """A blocked lease write cannot extend the later terminal commit deadline
+    by the time its own retries consumed."""
+    clock, renewed = [10.0], [0.0]
+    waits = iter((False, True))
+    stop = SimpleNamespace(wait=lambda seconds: next(waits))
+    monkeypatch.setattr(jobs_main, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(service, "birth", lambda pid: 1.0)
+
+    def delayed(*args):
+        clock[0] = 20.0
+
+    monkeypatch.setattr(queue, "beat", delayed)
+    jobs_main._beats(None, stop, renewed)
+    assert renewed == [10.0]
+
+
+def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(
+    tmp_path, monkeypatch
+):
+    """Legacy records stay uncached; retrying failed work stays visible."""
+    jobs = tmp_path / "jobs"
+
+    def make(name):
+        config, selection = _project(tmp_path / name)
+        one = Selection({"r2": selection.frames["r2"][:1]}, selection.sessions)
+        return create_job(jobs, (NUMBERS,), one, config)
+
+    first = make("first")
+    queue.finish(queue.claim(first, "numbers.r2.0000", "here"))
+    complete = set()
+    assert service.settled(jobs, complete=complete)
+    assert not complete
+    failed = make("second")
+    queue.finish(queue.claim(failed, "numbers.r2.0000", "here"), traceback="failed")
+    tasks = queue.tasks
+
+    def read(job):
+        return tasks(job)
+
+    monkeypatch.setattr(queue, "tasks", read)
+    assert service.settled(jobs, complete=complete)
+    assert not complete
+    task = "numbers.r2.0000"
+    token = queue.markers(failed, queue.FAILED)[task]
+    assert queue._transfer(
+        failed / queue.FAILED / f"{task}.{token}",
+        failed / queue.QUEUE / f"{task}.{queue.new_token()}",
+    )
+    assert not service.settled(jobs, complete=complete)
+    queue.finish(queue.claim(failed, "numbers.r2.0000", "here"))
+    assert service.settled(jobs, complete=complete)
+    assert not complete
+    make("third")
+    assert not service.settled(jobs, complete=complete)

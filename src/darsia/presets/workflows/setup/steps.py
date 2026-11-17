@@ -18,8 +18,10 @@ them was edited is not reused.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping, Sequence
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -28,7 +30,7 @@ import numpy as np
 import toml
 
 import darsia
-from darsia.jobs.step import RUNS, Memory, Order, Scope, Step, StepContext
+from darsia.jobs.step import RUNS, Memory, Order, Scope, Step, StepContext, run_tables
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.sections import list_required_sections
 from darsia.presets.workflows.rig import Rig
@@ -197,6 +199,24 @@ def _sand_map(ctx: StepContext) -> None:
     ctx.publish(lambda folder: labels.save(Path(folder) / "labels.npz"))
 
 
+def output_cells(
+    tables, runs, context, cell_mm: float, edge_mm=None, reference=None
+) -> int:
+    """Count nominal metric cells from configured physical rig dimensions."""
+    if not math.isfinite(cell_mm) or cell_mm <= 0:
+        raise ValueError("Memory estimation needs a finite positive output cell size.")
+    own = {r: run_tables(tables, r) if r is not None else tables for r in runs}
+    step = Decimal(str(float(cell_mm))) / Decimal(1000)
+    rig = own[reference if reference is not None else next(iter(own))]["rig"]
+    lengths = (rig["height"], rig["width"])
+    if any(not math.isfinite(float(n)) or n <= 0 for n in lengths):
+        raise ValueError("Memory estimation needs finite positive output dimensions.")
+    return math.prod(
+        int((Decimal(str(n)) / step).to_integral_value(rounding=ROUND_CEILING))
+        for n in lengths
+    )
+
+
 def _rig(ctx: StepContext) -> None:
     """The run's rig, with its sand map as the labels and their facies."""
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
@@ -237,7 +257,7 @@ SAND_MAP = Step(
     "sand-map",
     {},
     Order.RUN,
-    Memory(grid=2.0),
+    Memory(camera_bytes=16.0),
     _sand_map,
     sections=tuple(list_required_sections(setup_sand_map)),
     files=_drawing_files,
@@ -247,7 +267,7 @@ RIG = Step(
     "rig",
     {"sand-map": Scope.OWN},
     Order.RUN,
-    Memory(camera=6.0, grid=12.0),
+    Memory(camera=4.0, camera_bytes=164.0, photos=1, photo_bytes=darsia.decoded_bytes),
     _rig,
     sections=tuple(list_required_sections(setup_rig)),
     files=_rig_files,
@@ -257,7 +277,14 @@ CORRECTED_IMAGE = Step(
     "corrected-image",
     {"rig": Scope.OWN},
     Order.FRAMES,
-    Memory(camera=6.0, grid=12.0),
+    Memory(
+        camera=20.0,
+        grid=15.0,
+        camera_bytes=18.0,
+        grid_bytes=68.0,
+        photos=1,
+        photo_bytes=darsia.decoded_bytes,
+    ),
     _corrected_image,
     sections=EXPERIMENT,
     files=protocol_files,

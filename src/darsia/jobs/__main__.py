@@ -31,6 +31,7 @@ import threading
 import traceback
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from time import monotonic
 
 import cv2
 from threadpoolctl import threadpool_info, threadpool_limits
@@ -139,15 +140,17 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
     )
 
 
-def _beats(claim: queue.Claim, stop: threading.Event) -> None:
+def _beats(claim: queue.Claim, stop: threading.Event, renewed: list[float]) -> None:
     """Renew the lease every BEAT until stopped; a lost claim ends the process. A
     beat that has begun ends before the thread does, and :func:`run` waits for
     the thread before it marks the task."""
     pid, born, number = os.getpid(), service.birth(os.getpid()), 1
     while not stop.wait(results.BEAT):
         number += 1
+        started = monotonic()
         try:
             queue.beat(claim, number, pid, born)
+            renewed[0] = started
         except queue.Revoked as error:
             service.say(f"{error}; this process stops.")
             os._exit(REVOKED)
@@ -198,13 +201,14 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     threads = int(record["environment"]["threads"])
     cv2.setNumThreads(threads)
     threadpool_limits(threads)
+    renewed = [monotonic()]
     try:
         queue.beat(claim, 1, os.getpid(), service.birth(os.getpid()))
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
     stop = threading.Event()
-    beats = threading.Thread(target=_beats, args=(claim, stop), daemon=True)
+    beats = threading.Thread(target=_beats, args=(claim, stop, renewed), daemon=True)
     beats.start()
     task = queue.task(job, task_name)
     failure, adopted = None, ()
@@ -220,7 +224,7 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     stop.set()
     beats.join()  # A beat that has begun lands before the mark, never after it.
     try:
-        queue.finish(claim, adopted, failure)
+        queue.finish(claim, adopted, failure, deadline=renewed[0] + results.STALE)
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
@@ -250,7 +254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(args.job, args.task, args.token, args.machine)
     until = None
     if args.until_settled:
-        until = functools.partial(service.settled, args.jobs)
+        until = functools.partial(service.settled, args.jobs, complete=set())
     try:
         service.serve(
             args.jobs,

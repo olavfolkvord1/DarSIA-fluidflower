@@ -142,7 +142,7 @@ def write_json(path: Path, value: Mapping) -> None:
     Path(path).write_text(text, encoding="utf-8", newline="\n")
 
 
-def _write(claim: Claim, value: Mapping) -> None:
+def _write(claim: Claim, value: Mapping, *, deadline: float | None = None) -> None:
     """Rewrite a claimed marker by its token's name, opened and closed at once.
 
     Raises
@@ -158,7 +158,7 @@ def _write(claim: Claim, value: Mapping) -> None:
             stream.truncate()
 
     try:
-        results.retry_transient(write)
+        results.retry_transient(write, deadline=deadline)
     except FileNotFoundError as error:
         raise Revoked(f"Task {claim.task} is no longer claimed by {claim.token}") from (
             error
@@ -248,7 +248,11 @@ def ready(job: Path, known: Mapping[str, Task] | None = None) -> list[Task]:
     return sorted(found, key=lambda task: (-len(task.frames), task.id))
 
 
-def waiting(job: Path, known: Mapping[str, Task] | None = None) -> set[str]:
+def waiting(
+    job: Path,
+    known: Mapping[str, Task] | None = None,
+    state: Mapping[str, str] | None = None,
+) -> set[str]:
     """The tasks that can still run: queued or claimed, and not behind a failed
     task (also through the tasks they wait for).
 
@@ -258,6 +262,9 @@ def waiting(job: Path, known: Mapping[str, Task] | None = None) -> set[str]:
         The job's folder.
     known : Mapping[str, Task], optional
         The job's tasks, if already read (:func:`tasks`).
+    state : Mapping[str, str], optional
+        Task states already observed (:func:`states`), e.g. a caller's complete
+        snapshot checked against the job record's immutable task inventory.
 
     Returns
     -------
@@ -266,7 +273,7 @@ def waiting(job: Path, known: Mapping[str, Task] | None = None) -> set[str]:
 
     """
     known = tasks(job) if known is None else known
-    state = states(job)
+    state = states(job) if state is None else state
     stuck = {name for name, value in state.items() if value == FAILED}
     changed = True
     while changed:
@@ -282,11 +289,13 @@ def waiting(job: Path, known: Mapping[str, Task] | None = None) -> set[str]:
     }
 
 
-def _transfer(source: Path, destination: Path) -> bool:
+def _transfer(
+    source: Path, destination: Path, *, deadline: float | None = None
+) -> bool:
     """Move a marker to a name of the mover's own token; False if the source was
     gone, e.g. moved by another mover."""
     try:
-        results.rename(source, destination)
+        results.rename(source, destination, deadline=deadline)
     except FileExistsError:
         pass  # A replay of the mover's own move: only it names the destination.
     except FileNotFoundError:
@@ -364,7 +373,11 @@ def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
 
 
 def finish(
-    claim: Claim, accepted: Iterable[str] = (), traceback: str | None = None
+    claim: Claim,
+    accepted: Iterable[str] = (),
+    traceback: str | None = None,
+    *,
+    deadline: float | None = None,
 ) -> None:
     """Move a claim to ``done/``, naming its accepted tokens, or to ``failed/``.
 
@@ -377,6 +390,9 @@ def finish(
         always.
     traceback : str, optional
         Why the task failed; without it, the task is done.
+    deadline : float, optional
+        Latest retry time on the monotonic clock, from the task's last renewal.
+        The write and move share it. Without it, they share one GRACE period.
 
     Raises
     ------
@@ -384,13 +400,19 @@ def finish(
         If the claim was taken back, so that nothing is committed.
 
     """
+    if deadline is None:
+        deadline = monotonic() + results.GRACE
     if traceback is None:
         state = DONE
         content = {"token": claim.token, "accepted": sorted({claim.token, *accepted})}
     else:
         state, content = FAILED, {"token": claim.token, "traceback": traceback}
-    _write(claim, {**content, "machine": claim.machine, "time": time()})
-    if not _transfer(claim.path, claim.job / state / claim.path.name):
+    _write(
+        claim, {**content, "machine": claim.machine, "time": time()}, deadline=deadline
+    )
+    if not _transfer(
+        claim.path, claim.job / state / claim.path.name, deadline=deadline
+    ):
         raise Revoked(f"Task {claim.task} is no longer claimed by {claim.token}")
 
 
@@ -439,8 +461,9 @@ def reclaim(job: Path, seen: dict[str, tuple[bytes, float]]) -> list[str]:
     """Take back the claims whose lease stayed unchanged for STALE.
 
     Each claimed marker's content is compared with what this caller saw before,
-    by its own clock; a changed lease restarts its clock. A marker that cannot be
-    read is never stale. A claim taken back goes to the queue under a new name;
+    by its own clock; a changed lease restarts its clock. Terminal content written
+    before its move does not restart an already observed lease's clock. A marker
+    that cannot be read is never stale. A claim taken back goes to the queue under a new name;
     its owner's next beat finds it gone.
 
     Parameters
@@ -470,9 +493,26 @@ def reclaim(job: Path, seen: dict[str, tuple[bytes, float]]) -> list[str]:
         except OSError:
             continue  # Unreadable now, or gone: never stale.
         now = monotonic()
-        if key not in seen or seen[key][0] != content:
+        terminal = False
+        try:
+            value = json.loads(content)
+            terminal = (
+                isinstance(value, dict)
+                and content.endswith(b"\n")
+                and value.get("token") == name.rpartition(".")[2]
+                and "beat" not in value
+                and ("accepted" in value or "traceback" in value)
+            )
+        except (ValueError, UnicodeError):
+            pass
+        if key not in seen:
             seen[key] = (content, now)
             continue
+        if seen[key][0] != content:
+            if not terminal:
+                seen[key] = (content, now)
+                continue
+            seen[key] = (content, seen[key][1])
         if now - seen[key][1] < results.STALE:
             continue
         task, _, _ = name.rpartition(".")

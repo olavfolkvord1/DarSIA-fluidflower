@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import darsia
-from darsia.jobs.step import Memory, Order, Scope, Step, StepContext
+from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, Term, run_tables
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain
 from darsia.presets.workflows.calibration.steps import (
@@ -34,12 +34,14 @@ from darsia.presets.workflows.calibration.steps import (
     read_maps,
     read_mass_calibrations,
     read_signal,
+    reading_sands,
     run_grid,
     sand_reading,
 )
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
+    output_cells,
     protocol_files,
     read_image,
     read_rig,
@@ -84,6 +86,21 @@ def _write_maps(folder: Path, maps: darsia.SimpleMassAnalysisResults) -> None:
     """Store each field of a frame's mass maps as an image."""
     for name in FIELDS:
         getattr(maps, name).save(Path(folder) / f"{name}.npz")
+
+
+def _domain_count(tables: Mapping, run: str | None, context=None) -> int:
+    """An upper bound for the selected domains' retained int64 pixel indices."""
+    tables = run_tables(tables, run) if run is not None else tables
+    return len(tables.get("domains", {}).get("domains", {}))
+
+
+def _copy_cells(tables, run, context) -> int:
+    """The cells whose copy/static fields coexist, even when finer than the input."""
+    own = run_tables(tables, run) if run is not None else tables
+    settings = own["mass_copy"]
+    return output_cells(
+        tables, (run,), context, settings["copy_mm"], settings.get("extent_edge_mm")
+    )
 
 
 def _mass_maps(ctx: StepContext) -> None:
@@ -219,7 +236,15 @@ MASS_MAPS = Step(
         "calibration": Scope.ONE,
     },
     Order.FRAMES,
-    Memory(grid=40.0),
+    Memory(
+        # The signal reader's masks coexist with input maps and the rig.
+        # The five result fields and mass/concentration work use the working
+        # precision; mask, label and index widths remain fixed.
+        grid=50.0,
+        camera_bytes=18.0,
+        grid_bytes=91.0,
+        terms=(Term(reading_sands, grid_bytes=2.0),),
+    ),
     _mass_maps,
     {
         "material": MaterialSettings,
@@ -234,7 +259,14 @@ MASS_COPY = Step(
     "mass-copy",
     {"rig": Scope.OWN, "mass-maps": Scope.OWN, "phase-maps": Scope.OWN},
     Order.FRAMES,
-    Memory(grid=12.0),
+    Memory(
+        grid=20.0,
+        camera_bytes=18.0,
+        grid_bytes=131.0,
+        # Eleven copied fields, three static fields, two cell_ratio inputs,
+        # its result, and an image-sized write buffer, all float64.
+        terms=(Term(_copy_cells, fixed_bytes=(11 + 3 + 2 + 1 + 1) * 8),),
+    ),
     _mass_copy,
     {"mass_copy": darsia.MassCopySettings, "material": MaterialSettings},
 )
@@ -243,7 +275,13 @@ DOMAIN_MASS = Step(
     "domain-mass",
     {"rig": Scope.OWN, "mass-maps": Scope.OWN},
     Order.RUN,
-    Memory(grid=24.0),
+    Memory(
+        grid=20.0,
+        camera_bytes=18.0,
+        grid_bytes=231.0,
+        # DomainMass._pixels retains an int64 index per pixel in each domain.
+        terms=(Term(_domain_count, grid_bytes=8.0),),
+    ),
     _domain_mass,
     {"domains": DomainSettings, "material": MaterialSettings},
     sections=EXPERIMENT,

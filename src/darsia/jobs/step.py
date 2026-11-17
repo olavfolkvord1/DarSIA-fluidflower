@@ -4,9 +4,9 @@ A step makes one kind of stored result, the kind it is named after, from the
 results it reads and the job's configuration. A step module declares each step
 once (:class:`Step`): the kinds it reads and what of them one task consumes
 (:class:`Scope`), how its work is split into tasks (:class:`Order`), what one of
-its results covers (:class:`Each`), the arrays it holds at once (:class:`Memory`)
-and its settings, the configuration tables its methods' settings classes are made
-from.
+its results covers (:class:`Each`), the full-size arrays it holds at its peak
+(:class:`Memory`) and its settings, the configuration tables its methods'
+settings classes are made from.
 
 A task sees the job only through its :class:`StepContext`: it reads accepted
 results of its declared inputs, skips the frames an earlier attempt of the same
@@ -15,8 +15,9 @@ description records what a later request compares to reuse it
 (:data:`darsia.utils.results.REUSED`): the step, every configuration section it
 reads (each run's as the run reads it, its own tables merged), its scope (what of
 the frozen selection it is made from), the job's computing environment, the token
-of every input it is made from and the content of each small file its
-configuration names, e.g. its protocols.
+of every input it is made from, the content of each small file its
+configuration names, e.g. its protocols, and the size and time of each large one,
+e.g. a depth map. Photos are not identified: a photo is never changed, by rule.
 
 """
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -84,21 +86,94 @@ class Each(Enum):
 
 
 @dataclass(frozen=True)
+class MemoryContext:
+    """Generic workload metadata available to a declaration's configured counts.
+
+    Shapes are optional for older callers. A count that needs them must either
+    use its configured geometry or say which metadata is missing.
+    """
+
+    itemsize: int
+    camera_pixels: int
+    grid_pixels: int
+    frames: int
+    project: Path | None = None
+    grid_shape: tuple[int, int] | None = None
+    runs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Term:
+    """Run-grid arrays a task holds per unit of a count that its configuration
+    sets, e.g. per frame of the phase maps' window or per held-out variant of a
+    frame's maps."""
+
+    count: Callable[[Mapping[str, Any], str | None, MemoryContext], float]
+    """The count, from the job's configuration tables, the task's run (None for
+    a task of no run), and the workload's sizes, selected runs and project."""
+    grid: float = 0.0
+    """Values of the Setup's precision per run-grid pixel, per unit."""
+    grid_bytes: float = 0.0
+    """Bytes of arrays of a fixed type per run-grid pixel, per unit."""
+    camera: float = 0.0
+    """Values of the precision per camera pixel, per unit."""
+    camera_bytes: float = 0.0
+    """Bytes of arrays of a fixed type per camera pixel, per unit."""
+    held: float = 0.0
+    """Run-grid values per input frame and per unit."""
+    fixed_bytes: float = 0.0
+    """Bytes per unit, independent of image size."""
+    frame_bytes: float = 0.0
+    """Bytes per input frame and per unit, independent of image size."""
+
+
+@dataclass(frozen=True)
 class Memory:
-    """The arrays a task of a step holds at once, declared, never measured."""
+    """The full-size arrays a task of a step holds at its peak, a property of the
+    step's algorithm, counted per pixel of a camera image and of the run grid:
+    values of the Setup's precision, and bytes of the arrays whose type the
+    precision does not set (masks, labels, sums in double precision); per frame
+    of its input scope; per unit of a count its configuration sets
+    (:class:`Term`); and for each photo it decodes at once, the reader's own
+    bytes per camera pixel of the photo's format (:attr:`photo_bytes`).
+    """
 
     camera: float = 0.0
-    """Arrays of camera pixels held at once."""
+    """Values of the precision per camera pixel."""
     grid: float = 0.0
-    """Arrays of run-grid pixels held at once."""
+    """Values of the precision per run-grid pixel."""
     held: float = 0.0
-    """Run-grid arrays kept per frame of the input scope."""
+    """Values of the precision per run-grid pixel, kept per frame of the input
+    scope."""
+    camera_bytes: float = 0.0
+    """Bytes of arrays of a fixed type per camera pixel."""
+    grid_bytes: float = 0.0
+    """Bytes of arrays of a fixed type per run-grid pixel."""
+    terms: tuple[Term, ...] = ()
+    """The arrays held per unit of each count its configuration sets."""
+    photos: int = 0
+    """Photos decoded at once."""
+    photo_bytes: Callable[[str], int] | None = None
+    """The step's reader budget per camera pixel, by photo name. The engine
+    knows no reader formats; a workflow supplies its reader's own function."""
+    frame_bytes: float = 0.0
+    """Bytes retained per input frame, independent of image size."""
 
     def bytes(
-        self, itemsize: int, camera_pixels: int, grid_pixels: int, frames: int
+        self,
+        itemsize: int,
+        camera_pixels: int,
+        grid_pixels: int,
+        frames: int,
+        tables: Mapping[str, Any] | None = None,
+        run: str | None = None,
+        photo: str | None = None,
+        project: Path | None = None,
+        grid_shape: tuple[int, int] | None = None,
+        runs: tuple[str, ...] = (),
     ) -> int:
-        """Bytes a task holds:
-        ``itemsize * (camera * camera_pixels + (grid + held * frames) * grid_pixels)``.
+        """Bytes a task holds at its peak: its values in the precision, its arrays
+        of a fixed type, and each decoded photo's bytes by its format.
 
         Parameters
         ----------
@@ -108,6 +183,20 @@ class Memory:
             Pixels of a camera image and of the run grid.
         frames : int
             Frames of the task's input scope.
+        tables : Mapping[str, Any], optional
+            The job's configuration tables, from which each term's count is taken;
+            needed for a memory with terms.
+        run : str, optional
+            The task's run, if any.
+        photo : str, optional
+            The file name of a photo the task decodes, whose format gives the
+            reader's bytes; without it, no photo's bytes are counted.
+        project : Path, optional
+            The project folder, needed by terms that read relative metadata files.
+        grid_shape : tuple of int, optional
+            Rows and columns of the run grid, when known.
+        runs : tuple of str, optional
+            The job's selected runs, for terms retained across runs.
 
         Returns
         -------
@@ -115,9 +204,76 @@ class Memory:
             The bytes.
 
         """
-        values = self.camera * camera_pixels
-        values += (self.grid + self.held * frames) * grid_pixels
-        return int(itemsize * values)
+        if self.terms and tables is None:
+            raise ValueError("Configured memory terms need the job's tables.")
+        if grid_shape is not None and (
+            len(grid_shape) != 2
+            or any(type(n) is not int or n <= 0 for n in grid_shape)
+            or math.prod(grid_shape) != grid_pixels
+        ):
+            raise ValueError(
+                "The grid shape needs two positive dimensions whose product is grid pixels."
+            )
+        context = MemoryContext(
+            itemsize, camera_pixels, grid_pixels, frames, project, grid_shape, runs
+        )
+        counts = [term.count(tables, run, context) for term in self.terms]
+        values = [
+            itemsize,
+            camera_pixels,
+            grid_pixels,
+            frames,
+            self.camera,
+            self.grid,
+            self.held,
+            self.camera_bytes,
+            self.grid_bytes,
+            self.photos,
+            self.frame_bytes,
+            *counts,
+        ]
+        for term in self.terms:
+            values.extend(
+                (
+                    term.grid,
+                    term.grid_bytes,
+                    term.camera,
+                    term.camera_bytes,
+                    term.held,
+                    term.fixed_bytes,
+                    term.frame_bytes,
+                )
+            )
+        if itemsize <= 0 or any(not math.isfinite(v) or v < 0 for v in values):
+            raise ValueError(
+                "Memory sizes and array counts must be finite and nonnegative."
+            )
+        camera = self.camera + sum(
+            term.camera * n for term, n in zip(self.terms, counts)
+        )
+        camera_bytes = self.camera_bytes + sum(
+            term.camera_bytes * n for term, n in zip(self.terms, counts)
+        )
+        grid = self.grid + self.held * frames
+        grid += sum(
+            (term.grid + term.held * frames) * n for term, n in zip(self.terms, counts)
+        )
+        grid_bytes = self.grid_bytes
+        grid_bytes += sum(term.grid_bytes * n for term, n in zip(self.terms, counts))
+        values = camera * camera_pixels + grid * grid_pixels
+        fixed = camera_bytes * camera_pixels + grid_bytes * grid_pixels
+        fixed += self.frame_bytes * frames + sum(
+            (term.fixed_bytes + term.frame_bytes * frames) * n
+            for term, n in zip(self.terms, counts)
+        )
+        if photo is not None and self.photos:
+            if self.photo_bytes is None:
+                raise ValueError("A photo memory declaration needs its reader's bytes.")
+            decoded = self.photo_bytes(photo)
+            if not math.isfinite(decoded) or decoded < 0:
+                raise ValueError("The reader's bytes must be finite and nonnegative.")
+            fixed += self.photos * decoded * camera_pixels
+        return math.ceil(itemsize * values + fixed)
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,7 @@
 """Tests of the job engine: jobs, their queue and the step context, in this process."""
 
+import builtins
+import errno
 import json
 import os
 import time
@@ -321,8 +323,8 @@ def test_a_superseded_owner_commits_nothing(tmp_path, monkeypatch):
     owner = queue.claim(job, other.id, "here")
     write = queue._write
 
-    def written_then_taken_back(claim, value):
-        write(claim, value)
+    def written_then_taken_back(claim, value, **kwargs):
+        write(claim, value, **kwargs)
         queue._transfer(claim.path, job / queue.QUEUE / f"{claim.task}.back")
 
     monkeypatch.setattr(queue, "_write", written_then_taken_back)
@@ -513,3 +515,74 @@ def test_a_job_of_a_revision_not_known_is_refused(tmp_path, monkeypatch):
     assert revision() is None
     with pytest.raises(ValueError, match="revision is not known"):
         create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+
+
+@pytest.mark.parametrize("failure", [None, "the task failed"])
+@pytest.mark.parametrize("unlock_move", [25.0, 40.0])
+def test_a_terminal_mark_uses_one_deadline_for_its_write_and_move(
+    tmp_path, monkeypatch, failure, unlock_move
+):
+    """Long sharing violations may clear while the lease is valid. A move
+    cannot renew the write's deadline, and expiry leaves the claim uncommitted."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
+    claim = queue.claim(job, task, "here")
+    waits, writes, moves = [], [], []
+    monkeypatch.setattr(results, "monotonic", lambda: sum(waits))
+    monkeypatch.setattr(queue, "monotonic", lambda: sum(waits))
+    monkeypatch.setattr(results, "sleep", waits.append)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.5, 2.0, 5.0))
+    error = OSError(errno.EACCES, "Sharing violation")
+    error.winerror = 32
+
+    def opened(path, *args, **kwargs):
+        if Path(path) == claim.path:
+            writes.append(sum(waits))
+            if sum(waits) < 20.0:
+                raise error
+        return builtins.open(path, *args, **kwargs)
+
+    move = results._move
+
+    def moved(source, destination):
+        moves.append(sum(waits))
+        if sum(waits) < unlock_move:
+            raise error
+        return move(source, destination)
+
+    monkeypatch.setattr(queue, "open", opened, raising=False)
+    monkeypatch.setattr(results, "_move", moved)
+    if unlock_move < 30.0:
+        queue.finish(claim, traceback=failure, deadline=30.0)
+        state = queue.DONE if failure is None else queue.FAILED
+        assert queue.markers(job, state)[task] == claim.token
+        assert not claim.path.exists()
+    else:
+        with pytest.raises(OSError, match="Sharing violation"):
+            queue.finish(claim, traceback=failure, deadline=30.0)
+        assert claim.path.exists()
+        assert task not in queue.markers(job, queue.DONE)
+        assert task not in queue.markers(job, queue.FAILED)
+    assert max(writes + moves) < 30.0
+    assert len(writes) > len(results.RETRY_DELAYS) + 1
+
+
+def test_a_late_terminal_write_does_not_renew_the_observed_lease(tmp_path, monkeypatch):
+    """A terminal write whose move is blocked keeps the last observed renewal's
+    clock, so another service can recover it when that lease becomes stale."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
+    claim = queue.claim(job, task, "here")
+    queue.beat(claim, 1, 1234, 1.0)
+    now, seen = [0.0], {}
+    monkeypatch.setattr(queue, "monotonic", lambda: now[0])
+    assert not queue.reclaim(job, seen)
+    now[0] = results.STALE - 50.0
+    queue._write(claim, {"token": claim.token, "traceback": "failed"})
+    assert not queue.reclaim(job, seen)
+    assert seen[f"{job}/{claim.path.name}"][1] == 0.0
+    now[0] = results.STALE + 1.0
+    assert queue.reclaim(job, seen) == [task]
+    assert task in queue.markers(job, queue.QUEUE)

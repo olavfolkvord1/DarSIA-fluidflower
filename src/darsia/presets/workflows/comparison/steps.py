@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext
+from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext, Term
 from darsia.presets.workflows.analysis.domain_mass import RunSeries
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import (
@@ -62,10 +62,40 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
+    output_cells,
     protocol_files,
     read_rig,
     run_settings,
 )
+
+
+def _distance_cell_bytes(tables, run, context) -> int:
+    """Retained per-run/domain cell maps and the comparison solver's array work.
+
+    Each region retains a working-precision mass and float64 pixel counts per
+    run, and the reference's float64 weight and two masks. The solver budget
+    counts scalar/vector work and sparse stencil storage; library factorization
+    fill-in depends on the region and is learned separately from observed peaks.
+    """
+    settings = tables["wasserstein"]
+    runs = context.runs or tuple(tables.get("runs", ()))
+    if not runs:
+        raise ValueError("Distance memory needs the selected runs.")
+    reference = runs[0]
+    count = output_cells(
+        tables,
+        runs,
+        context,
+        settings["cell_mm"],
+        settings.get("extent_edge_mm"),
+        reference,
+    )
+    domains = len(tables["domains"]["domains"])
+    retained = domains * ((context.itemsize + 8) * len(runs) + 8 + 2)
+    # Two faces per cell: Bregman flux/force/auxiliary arrays, cell scalars,
+    # and eight sparse mixed/stencil operators with value/index storage.
+    work = (2 * 12 + 12) * 8 + 8 * 5 * (8 + 4) + 8 * 4
+    return count * (retained + work)
 
 
 @dataclass(frozen=True)
@@ -244,7 +274,7 @@ ENSEMBLE = Step(
     "ensemble",
     {"domain-mass": Scope.ALL},
     Order.PARTS,
-    Memory(),
+    Memory(camera_bytes=14.0),
     _ensemble,
     {"ensemble": EnsembleSettings, "domains": DomainSettings},
     sections=EXPERIMENT,
@@ -256,7 +286,13 @@ DISTANCES = Step(
     "distances",
     {"rig": Scope.ALL, "mass-maps": Scope.ALL, "phase-maps": Scope.ALL},
     Order.PARTS,
-    Memory(grid=24.0),
+    Memory(
+        camera=1.0,
+        grid=28.0,
+        camera_bytes=24.0,
+        grid_bytes=174.0,
+        terms=(Term(_distance_cell_bytes, fixed_bytes=1),),
+    ),
     _distances,
     {
         "wasserstein": WassersteinSettings,

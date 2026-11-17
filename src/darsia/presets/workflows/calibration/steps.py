@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -39,8 +40,13 @@ from darsia.jobs.step import (
     Selection,
     Step,
     StepContext,
+    Term,
     run_tables,
+    table,
 )
+from darsia.multiphase.gas_allocation import injection_ports
+from darsia.presets.workflows.config.protocols import InjectionProtocolConfig
+from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
@@ -378,12 +384,78 @@ def _within(image: np.ndarray | None, support: np.ndarray | None) -> np.ndarray 
     return within
 
 
+def _phase_support(tables: Mapping) -> str | None:
+    """The phase support a run's tables name (``[labeling.sand_map]
+    phase_support``), or None."""
+    return tables.get("labeling", {}).get("sand_map", {}).get("phase_support")
+
+
 def _phase_map_files(tables: Mapping, project, folders) -> list[str]:
-    """The run's protocols and its phase support, if it names one
-    (``[labeling.sand_map] phase_support``)."""
-    support = tables.get("labeling", {}).get("sand_map", {}).get("phase_support")
+    """The run's protocols and its phase support, if it names one."""
+    support = _phase_support(tables)
     found = protocol_files(tables, project, folders)
     return found + ([str(support)] if support is not None else [])
+
+
+def window_frames(rules: darsia.PhaseRuleSettings) -> int:
+    """The frames the phase maps keep at once: the rules' neighbours on each side
+    of a frame, the frame itself and the one after it."""
+    return 2 * rules.neighbours_per_side + 2
+
+
+def _window(tables: Mapping, run: str | None, context=None) -> int:
+    """The phase maps' window by the job's rules (:func:`window_frames`)."""
+    tables = run_tables(tables, run) if run is not None else tables
+    rules = settings_from_table(darsia.PhaseRuleSettings, table(tables, "phase_rules"))
+    return window_frames(rules)
+
+
+def _supported(tables: Mapping, run: str | None, context=None) -> int:
+    """One where a run names a phase support, whose masked images the phase maps
+    hold beside the read ones; else none."""
+    return int(run is not None and _phase_support(run_tables(tables, run)) is not None)
+
+
+def reading_sands(tables: Mapping, run: str | None, context=None) -> int:
+    """The sand masks read_signal and sand_mean keep simultaneously."""
+    tables = run_tables(tables, run) if run is not None else tables
+    return len(tables.get("reading", {}).get("sands", {}))
+
+
+def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
+    """Histogram values retained as Python rows by the initial run writer."""
+    own = run_tables(tables, run) if run is not None else tables
+    bins = int(own["run_statistics"]["intervals"]) + 1
+    return 2 * min(bins * reading_sands(tables, run), context.grid_pixels)
+
+
+def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
+    """Fixed-width bytes per pixel retained for injection ports and end anchors.
+
+    The phase rules keep radius/lower masks per port, and allocation keeps two
+    such pairs (the second aliases the first in single precision). A reduction
+    may stack one more mask per port. Each injection end can retain a float64
+    distance and weight map. Counting distinct merged ends bounds the distinct
+    anchor frames even when several ends select the same frame, or none does.
+    """
+    own = run_tables(tables, run) if run is not None else tables
+    config = InjectionProtocolConfig()
+    config.load_injection(own["protocols"])
+    source = config.injection
+    if source is None:
+        raise ValueError("The phase maps need an injection protocol for their memory.")
+    path = source[0] if isinstance(source, tuple) else source
+    if not path.is_absolute():
+        if context.project is None:
+            raise ValueError("Relative injection protocols need the job's project.")
+        path = Path(context.project) / path
+    source = (path, source[1]) if isinstance(source, tuple) else path
+    protocol = darsia.InjectionProtocol(
+        source, reference_density=config.injection_reference_density
+    )
+    ports = injection_ports(protocol)
+    ends = {end for periods in ports.values() for _, end in periods}
+    return 7 * len(ports) + 2 * 8 * len(ends)
 
 
 class _Probabilities(Sequence):
@@ -660,7 +732,22 @@ PHASE_MAPS = Step(
         "overflow": Scope.OWN,
     },
     Order.RUN,
-    Memory(grid=40.0, held=0.0),
+    Memory(
+        # Two loaded rigs and a corrected previous acquisition; feature
+        # construction overlaps the rule/allocation generators. Fixed-width
+        # terms cover labels, indices, masks and float64 distance/volume work.
+        camera=13.0,
+        grid=64.0,
+        camera_bytes=46.0,
+        grid_bytes=112.0,
+        terms=(
+            Term(_window, grid=3.0 + 2.0),  # RGB image and two probabilities
+            Term(_supported, grid=6.0),
+            Term(_injection_map_bytes, grid_bytes=1.0),
+        ),
+        photos=1,
+        photo_bytes=darsia.decoded_bytes,
+    ),
     _phase_maps,
     {
         "phase_model": PhaseModelSource,
@@ -682,7 +769,24 @@ RUN_STATISTICS = Step(
         "overflow": Scope.OWN,
     },
     Order.RUN,
-    Memory(grid=24.0),
+    Memory(
+        # Rig/geometry, RGB image, response/native signal, phase maps,
+        # capacity, histogram and unknown-mass scratch. read_signal's mask
+        # dictionary and sand_mean's list each hold one mask per sand.
+        # Include the signal, measured mask and previous before labels cached
+        # by per-frame statistics while another held-out variant is read.
+        grid=46.0 + 1.0,
+        camera_bytes=18.0,
+        grid_bytes=88.0 + 2.0,
+        terms=(
+            Term(reading_sands, grid_bytes=2.0),
+            # The initial writer retains Python histogram rows for the run.
+            Term(
+                _statistics_entries,
+                frame_bytes=sys.getsizeof(0.0) + np.dtype(np.intp).itemsize,
+            ),
+        ),
+    ),
     _run_statistics,
     {
         "run_statistics": darsia.RunStatisticsSettings,
