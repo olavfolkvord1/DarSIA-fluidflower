@@ -20,14 +20,20 @@ says why. Every :data:`POLL` seconds the service
 - starts ready tasks, the oldest job's first, each as a new process
   (``python -m darsia.jobs run``) with its job's computing environment, while the
   host admits them (:func:`admit`): the live tasks' threads and the task's are at
-  most the host's, and the task's declared bytes are at most the memory free now,
-  less the reserve, less what the live tasks may still take.
+  most the host's, and the bytes the task reserves are at most the memory free
+  now, less the reserve, less what the live tasks may still take. A task reserves
+  its estimate (its step's memory in the Setup's sizes and its process's own), or
+  its step's largest measured peak scaled to it, whichever is larger
+  (:func:`need`): the service looks at what each live task's processes hold once
+  per round, and keeps the largest observed peak of each workload for its step.
 
 Each round it also reads its host's request (``machines/<machine>.request.json``,
 :func:`write_request`): :data:`AUTO`, or at most a number of tasks, 0 taking no new
 ones; a request that cannot be read now keeps the last. It writes its host's
 record (``machines/<machine>.json``): the live tasks with the threads and bytes
-they reserve, the free memory, the reserve and why it took no more tasks. The
+they reserve, the free memory, the reserve, why it took no more tasks, and each
+step's measured peak with the Setup's sizes and the photos' format it was
+measured at, which the next service of this host and revision takes up. The
 record is created once, never onto another's, and rewritten in place by the one
 service whose token it names; a service that finds another's token in it counts no
 claims of the host and takes no tasks until that record stays unchanged for
@@ -75,7 +81,15 @@ from time import monotonic, sleep, time
 import psutil
 
 from darsia.jobs import queue
-from darsia.jobs.job import JOB, Environment, project_of, read_job, revision
+from darsia.jobs.job import (
+    JOB,
+    Environment,
+    project_of,
+    read_job,
+    revision,
+    task_photo,
+)
+from darsia.jobs.step import Task
 from darsia.utils import results
 
 try:
@@ -529,36 +543,82 @@ class Live:
     born: float | None = None
     """A survivor's birth time."""
     bytes: int = 0
-    """The bytes it reserves: those it declares (:func:`darsia.jobs.job.task_bytes`)
-    and its process's own (:data:`PROCESS`)."""
+    """The bytes it reserves (:func:`need`)."""
     held: int = 0
     """The bytes its processes held when the service last looked
     (:meth:`resident`), once per round."""
+    task: Task | None = None
+    """Its task, whose step its measured peak is kept for."""
+    estimate: int = 0
+    """Its estimate (:func:`estimate`), of which its peak is a share."""
+    peak: int = 0
+    """The most its processes held at the service's looks (:meth:`resident`)."""
 
     def resident(self) -> int:
         """The bytes its process and the processes it started hold now (their
         resident sets), e.g. the interpreter a launcher starts or a film's
         encoder; none of a process that is gone or may not be looked at, so that
-        its declaration stays reserved."""
+        its declaration stays reserved. The most they have held is noted in
+        :attr:`peak`: on Windows each one's peak working set or peak commit, which
+        the system keeps since the process started, elsewhere what they hold
+        now."""
         pid = self.process.pid if self.process is not None else self.pid
         try:
             process = psutil.Process(int(pid))
+            if self.born is not None and process.create_time() != self.born:
+                return 0  # A survivor's PID was reused by another process.
             tree = [process, *process.children(recursive=True)]
         except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError, ValueError):
             return 0
-        held = 0
+        held = most = 0
         for one in tree:
             try:
-                held += one.memory_info().rss
+                info = one.memory_info()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                continue
+            held += info.rss
+            peaks = (getattr(info, "peak_wset", 0), getattr(info, "peak_pagefile", 0))
+            most += max(info.rss, *peaks)
+        self.peak = max(self.peak, int(most))
         return int(held)
 
 
-def _reserved(record: dict, task: str) -> int:
-    """The bytes a task of a job reserves: those it declares and its process's
-    own (:data:`PROCESS`)."""
+def estimate(record: dict, task: str) -> int:
+    """The bytes a task of a job holds by its step's memory
+    (:func:`darsia.jobs.job.task_bytes`), and its process's own (:data:`PROCESS`)."""
     return record.get("bytes", {}).get(task, 0) + PROCESS
+
+
+def need(estimate: int, peak: dict | None) -> int:
+    """The bytes a task reserves: its estimate, or its step's measured peak scaled
+    to it, whichever is larger. Only the array part scales: the process base is
+    kept fixed. A smaller task still reserves the observed peak because one
+    observation cannot distinguish unmodelled fixed costs from array costs.
+
+    Parameters
+    ----------
+    estimate : int
+        The task's estimate (:func:`estimate`).
+    peak : dict or None
+        Its step's measured peak (:attr:`Service.peaks`): its ``bytes`` and the
+        ``estimate`` of its task; None when none is measured.
+
+    Returns
+    -------
+    int
+        The bytes.
+
+    """
+    if not peak or peak["estimate"] <= 0:
+        return estimate
+    base = peak.get("base", PROCESS)
+    previous = peak["estimate"] - base
+    if previous <= 0:
+        return max(estimate, peak["bytes"])
+    arrays = max(0, estimate - PROCESS)
+    observed = max(0, peak["bytes"] - base)
+    scaled = PROCESS + (arrays * observed + previous - 1) // previous
+    return max(estimate, peak["bytes"], scaled)
 
 
 def admit(
@@ -671,6 +731,12 @@ class Service:
         self.stopped: dict[tuple[str, str], tuple[int, str]] = {}
         """Exits stopped by the share's outage in a row, by job and task, with the
         last one's reason; another end of the task's process clears them."""
+        self.peaks: dict[tuple, dict] = {}
+        """The largest measured peak of each distinct workload: its ``bytes``,
+        the ``estimate``, fixed process ``base``, the job and task, the
+        Setup's sizes (``itemsize``, ``camera`` and ``grid`` pixels) and its
+        photos' ``format``. They are kept in the host's record, and a later service
+        of this host and revision takes them up."""
         self.token = queue.new_token()
         """This service's token in its host's record."""
         self.held = False
@@ -680,6 +746,7 @@ class Service:
         self._seen: dict[str, tuple[bytes, float]] = {}
         self._records: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
+        self._complete: set[str] = set()
         self._idle: str | None = None
         self._passed: set[tuple[str, str]] = set()
         self._unknown: set[str] = set()
@@ -747,6 +814,9 @@ class Service:
             return self._take(raw)
         own = found.get("host") == self._identity["host"]
         if own and not alive(found.get("pid"), found.get("birth")):
+            if found.get("revision") == self.revision:
+                for peak in found.get("peaks") or ():
+                    self._keep(peak)
             return self._take(raw)
         now = monotonic()
         if self._other is None or self._other[0] != raw:
@@ -800,6 +870,7 @@ class Service:
             "reserve": reserve(),
             "live": live,
             "reason": self.reason,
+            "peaks": [self.peaks[key] for key in sorted(self.peaks)],
             "outages": [
                 {"job": job, "task": task, "times": times, "reason": why}
                 for (job, task), (times, why) in self.stopped.items()
@@ -844,18 +915,25 @@ class Service:
         """The jobs of the folder with their records, oldest first. A job whose
         record cannot be read now, or whose record's state cannot be known
         through the share, is not known in this round (:attr:`_unknown`), never
-        taken for no job, and is read again in the next."""
+        taken for no job, and is read again in the next. Jobs whose immutable
+        task set has all reached done are remembered and skipped; a failed job
+        stays discoverable because its failed tasks may be retried."""
         found, self._unknown = [], set()
         names = sorted(results.retry_transient(lambda: os.listdir(self.jobs)))
         for name in names:
             folder = self.jobs / name
-            if name.startswith("."):
+            if name.startswith(".") or name in self._complete:
                 continue
             try:
                 if name not in self._records:
                     if not results.exists(folder / JOB):
                         continue
                     self._records[name] = read_job(folder)
+                record = self._records[name]
+                known = record.get("bytes")
+                if known is not None and _all_done(folder, known):
+                    self._complete.add(name)
+                    continue
             except (OSError, ValueError) as error:
                 self._unknown.add(name)
                 say(f"The job {name} cannot be read now; trying again: {error}")
@@ -918,8 +996,13 @@ class Service:
             )
 
     def _reap(self) -> None:
-        """Note the task processes that exited, and what they left behind."""
+        """Look at what each live task's processes hold (:attr:`Live.held`), once
+        per round, and note the task processes that exited, what they left behind
+        and the most they held (:meth:`_note`)."""
         for path, live in list(self.live.items()):
+            live.held = live.resident()
+            live.bytes = max(live.bytes, live.peak)
+            self._note(live)
             if live.process is not None:
                 code = live.process.poll()
                 if code is None:
@@ -971,6 +1054,99 @@ class Service:
                 say(f"Task {claim.task} failed: its process ended twice unmarked", log)
             except (queue.Revoked, OSError) as error:
                 say(f"Task {claim.task} could not be marked failed: {error}", log)
+        # A peak learned from one task also raises the bytes its live peers may
+        # still take before any new task is admitted in this round.
+        for live in self.live.values():
+            record = self._records.get(live.claim.job.name)
+            if live.task is not None and record is not None:
+                live.bytes = max(live.bytes, self._reserve(record, live.task)[0])
+
+    def _note(self, live: Live) -> None:
+        """Keep a task's measured peak for its step (:meth:`_keep`), with
+        its job's sizes and its photos' format."""
+        if live.task is None or live.peak <= 0 or live.estimate <= 0:
+            return
+        record = self._records.get(live.claim.job.name, {})
+        sizes = record.get("memory", {}).get(live.task.id) or record.get("sizes") or {}
+        photo = task_photo(live.task)
+        self._keep(
+            {
+                "step": live.task.step,
+                "bytes": live.peak,
+                "estimate": live.estimate,
+                "base": PROCESS,
+                "job": live.claim.job.name,
+                "task": live.task.id,
+                "itemsize": sizes.get("itemsize"),
+                "camera": sizes.get("camera"),
+                "grid": sizes.get("grid"),
+                **(
+                    {"grid_shape": sizes["grid_shape"]} if "grid_shape" in sizes else {}
+                ),
+                "format": sizes.get(
+                    "format", None if photo is None else Path(photo).suffix.lower()
+                ),
+            }
+        )
+
+    def _keep(self, peak) -> None:
+        """Keep the largest peak for one workload; ignore incomplete records.
+
+        Different resolutions, precisions, formats and configured array counts
+        stay separate: a large fixed peak and a large scaling factor need not
+        have been observed in the same task.
+        """
+        if not isinstance(peak, dict) or not isinstance(peak.get("step"), str):
+            return
+        if not all(type(peak.get(k)) is int for k in ("bytes", "estimate")):
+            return
+        if peak["estimate"] <= 0 or peak["bytes"] <= 0:
+            return
+        if type(peak.get("base", PROCESS)) is not int or peak.get("base", PROCESS) < 0:
+            return
+        if not all(
+            peak.get(k) is None or (type(peak[k]) is int and peak[k] >= 0)
+            for k in ("itemsize", "camera", "grid")
+        ):
+            return
+        if peak.get("format") is not None and not isinstance(peak["format"], str):
+            return
+        shape = peak.get("grid_shape")
+        if shape is not None and (
+            not isinstance(shape, (tuple, list))
+            or len(shape) != 2
+            or any(type(n) is not int or n <= 0 for n in shape)
+            or shape[0] * shape[1] != peak.get("grid")
+        ):
+            return
+        key = (
+            peak["step"],
+            peak.get("format") or "",
+            *(peak.get(k) or 0 for k in ("itemsize", "camera", "grid")),
+            peak["estimate"],
+            peak.get("base", PROCESS),
+        )
+        best = self.peaks.get(key)
+        if best is None or peak["bytes"] > best["bytes"]:
+            self.peaks[key] = dict(peak)
+
+    def _reserve(self, record: dict, task: Task) -> tuple[int, int]:
+        """The bytes a task of a job reserves (:func:`need`, with its step's
+        measured peak), and its estimate (:func:`estimate`)."""
+        made = estimate(record, task.id)
+        photo = task_photo(task)
+        photo_format = (
+            record.get("memory", {})
+            .get(task.id, {})
+            .get("format", None if photo is None else Path(photo).suffix.lower())
+        )
+        peaks = [
+            p
+            for p in self.peaks.values()
+            if p["step"] == task.step
+            and (photo_format is None or p.get("format") in (None, photo_format))
+        ]
+        return max((need(made, peak) for peak in peaks), default=made), made
 
     def _stopped(self, claim: queue.Claim, key: tuple[str, str]) -> None:
         """Count a task's exit stopped by the share's outage, with the reason its
@@ -1035,6 +1211,13 @@ class Service:
                 if lease.get("host") != self._identity["host"]:
                     continue  # Another machine's under this name: left to reclaim.
                 if alive(lease.get("pid"), lease.get("birth")):
+                    try:
+                        one = self._tasks.get(record["id"], {}).get(task)
+                        one = one or queue.task(job, task)
+                    except (OSError, ValueError):
+                        complete = False  # Its task unreadable now: not counted.
+                        continue
+                    reserved, made = self._reserve(record, one)
                     threads = record["environment"]["threads"]
                     self.live[claim.path] = Live(
                         claim,
@@ -1042,7 +1225,9 @@ class Service:
                         None,
                         lease["pid"],
                         lease["birth"],
-                        _reserved(record, task),
+                        reserved,
+                        task=one,
+                        estimate=made,
                     )
                     say(f"Task {task} still runs in process {lease['pid']}", job / LOG)
                 else:
@@ -1053,8 +1238,9 @@ class Service:
         """The local file of a task's output."""
         return self.logs / claim.job.name / f"{claim.task}.{claim.token}.log"
 
-    def _start(self, job: Path, record: dict, claim: queue.Claim) -> None:
-        """Start a claimed task's process with its job's environment.
+    def _start(self, job: Path, record: dict, claim: queue.Claim, task: Task) -> None:
+        """Start a claimed task's process with its job's environment, reserving
+        its bytes (:meth:`_reserve`).
 
         The process is then the only writer of its claimed marker: its lease, and
         its mark done, failed or refused.
@@ -1083,8 +1269,15 @@ class Service:
         finally:
             if output is not subprocess.DEVNULL:
                 output.close()
-        need = _reserved(record, claim.task)
-        self.live[claim.path] = Live(claim, environment.threads, process, bytes=need)
+        reserved, made = self._reserve(record, task)
+        self.live[claim.path] = Live(
+            claim,
+            environment.threads,
+            process,
+            bytes=reserved,
+            task=task,
+            estimate=made,
+        )
         say(f"{self.machine} started task {claim.task}", job / LOG)
 
     def _admit(self, jobs: list[tuple[Path, dict]]) -> None:
@@ -1097,7 +1290,7 @@ class Service:
         task, and so is every later task of its job and step that declares at
         least as much. A step passed over is said once, and again only after a
         round that did not pass it over. What the live tasks' processes hold is
-        looked at once per round (:attr:`Live.held`). A task whose process cannot
+        looked at once per round (:meth:`_reap`). A task whose process cannot
         start is returned, and the host takes no more of its job's tasks. Why the
         host took no more tasks, a task waiting, a step passed over or a job
         refused, is kept in :attr:`reason`.
@@ -1108,8 +1301,6 @@ class Service:
         if not self._taking():
             self.reason = f"It takes no new tasks: {self._idle}."
             return
-        for live in self.live.values():
-            live.held = live.resident()
         passed = refused = None
         for job, record in jobs:
             why = self._refusal(record)
@@ -1122,21 +1313,21 @@ class Service:
                 self._tasks[record["id"]] = queue.tasks(job)
             smallest: dict[str, int] = {}
             for task in queue.ready(job, self._tasks[record["id"]]):
-                need = _reserved(record, task.id)
-                if need >= smallest.get(task.step, need + 1):
-                    continue  # its step passed over a task that declares less
+                reserved = self._reserve(record, task)[0]
+                if reserved >= smallest.get(task.step, reserved + 1):
+                    continue  # its step passed over a task that reserves less
                 live = list(self.live.values())
                 free, kept = headroom(), reserve()
                 started, why = admit(
-                    need, threads, live, self.request, self.threads, free, kept
+                    reserved, threads, live, self.request, self.threads, free, kept
                 )
                 if not started:
                     alone = free + sum(other.held for other in live)
                     named = f"Task {task.id} of job {record['id']}"
-                    if admit(need, threads, (), AUTO, self.threads, alone, kept)[0]:
+                    if admit(reserved, threads, (), AUTO, self.threads, alone, kept)[0]:
                         self.reason = f"{named} waits: {why}."
                         return
-                    smallest[task.step] = need
+                    smallest[task.step] = reserved
                     unfit = f"{named} does not fit this host now: {why}."
                     passed = passed or unfit
                     step = (record["id"], task.step)
@@ -1149,7 +1340,7 @@ class Service:
                 if claim is None:
                     continue
                 try:
-                    self._start(job, record, claim)
+                    self._start(job, record, claim, task)
                 except Exception as error:
                     why = f"its process could not be started: {error!r}"
                     self._release(claim, job / LOG, why)

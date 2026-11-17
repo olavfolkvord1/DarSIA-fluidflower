@@ -3,8 +3,9 @@
 :func:`create_job` writes a job's folder in the jobs folder: ``job.json`` with its
 steps, selection, computing environment, results folder, the code's revision, the
 token of each input made outside the job (``bound``), the earlier jobs it
-completes (``basis``) and the bytes each task declares (``bytes``, in the Setup's
-``sizes``); copies of its configuration files; one file per task in
+completes (``basis``), the bytes each task declares (``bytes``), and its workload
+description (``memory``, including the Setup's ``sizes`` and photo format);
+copies of its configuration files; one file per task in
 ``tasks/``; and one marker per task in ``queue/`` (:mod:`darsia.jobs.queue`).
 
 Each task's inputs are enumerated from the frozen selection by the scope of each
@@ -28,7 +29,7 @@ import importlib.metadata
 import os
 import subprocess
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -148,18 +149,35 @@ class Sizes:
         return found
 
 
+def task_photo(
+    task: Task, photo_bytes: Callable[[str], int] | None = None
+) -> str | None:
+    """A task's most expensive photo by its reader's bytes, or None.
+
+    Mixed-format runs reserve the largest decode, rather than assuming that
+    the first frame represents every frame of the task. Without a decoder
+    budget, the name alone breaks ties deterministically.
+    """
+    return max(
+        (frame.name for frame in task.frames),
+        key=lambda name: (0 if photo_bytes is None else photo_bytes(name), name),
+        default=None,
+    )
+
+
 def task_bytes(
     step: Step,
     task: Task,
     selection: Selection,
     sizes: Sizes,
-    tables: Mapping | None = None,
+    tables: Mapping[str, Any] | None = None,
     project: Path | None = None,
 ) -> int:
-    """The bytes a task of a step holds at once by its declaration
-    (:meth:`darsia.jobs.step.Memory.bytes`), with the frames of its input scope:
-    its own frames and those its inputs cover, a run's result covering the run's
-    selected frames.
+    """The bytes a task of a step holds at its peak by its step's memory
+    (:meth:`darsia.jobs.step.Memory.bytes`), with the frames of its input scope
+    (its own frames and those its inputs cover, a run's result covering the run's
+    selected frames), the counts its configuration sets and the format of its
+    run's photos (:func:`task_photo`).
 
     Parameters
     ----------
@@ -171,6 +189,10 @@ def task_bytes(
         The job's selection.
     sizes : Sizes
         The Setup's sizes.
+    tables : Mapping[str, Any], optional
+        The job's configuration tables; needed for a step whose memory has terms.
+    project : Path, optional
+        The project folder, for terms that read configured metadata files.
 
     Returns
     -------
@@ -178,18 +200,36 @@ def task_bytes(
         The bytes.
 
     """
+    return task_memory(step, task, selection, sizes, tables, project)["bytes"]
+
+
+def task_memory(
+    step: Step,
+    task: Task,
+    selection: Selection,
+    sizes: Sizes,
+    tables: Mapping[str, Any] | None = None,
+    project: Path | None = None,
+) -> dict:
+    """A task's array estimate and the workload used to derive it.
+
+    The description is frozen with the job, so peak measurements can be related
+    to its precision, camera and grid pixels, input frames and decoder format.
+    A task over several runs uses their most expensive photo format.
+    """
     frames = {(task.run, frame) for frame in task.frames}
     for i in task.inputs:
         if i.frame is not None:
             frames.add((i.run, i.frame))
         elif i.run is not None:
             frames.update((i.run, frame) for frame in selection.frames.get(i.run, ()))
-    photos = [frame.name for _, frame in frames]
-    cost = step.memory.photo_bytes
+    photo_bytes = step.memory.photo_bytes
     photo = max(
-        photos, key=lambda name: (cost(name) if cost else 0, name), default=None
+        (frame.name for _, frame in frames),
+        key=lambda name: (0 if photo_bytes is None else photo_bytes(name), name),
+        default=None,
     )
-    return step.memory.bytes(
+    amount = step.memory.bytes(
         sizes.itemsize,
         sizes.camera,
         sizes.grid,
@@ -201,6 +241,12 @@ def task_bytes(
         sizes.grid_shape,
         tuple(selection.frames),
     )
+    return {
+        **sizes.to_json(),
+        "frames": len(frames),
+        "format": None if photo is None else Path(photo).suffix.lower(),
+        "bytes": amount,
+    }
 
 
 def revision(folder: Path | None = None) -> str | None:
@@ -569,6 +615,16 @@ def create_job(
     if refused:
         raise ValueError("The job is refused:\n" + "\n".join(dict.fromkeys(refused)))
 
+    memory = (
+        {
+            task.id: task_memory(
+                kinds[task.step], task, selection, sizes, tables, project
+            )
+            for task in made_tasks
+        }
+        if sizes is not None
+        else {}
+    )
     created = datetime.now(timezone.utc)
     name = f"{created:%Y%m%dT%H%M%S%fZ}-{queue.new_token()[:6]}"
     partial = jobs / f".{name}.partial"
@@ -594,15 +650,9 @@ def create_job(
         "bound": {key: token for key, token in bound.items() if token},
         "basis": list(basis),
         "sizes": None if sizes is None else sizes.to_json(),
+        "memory": memory,
         "bytes": {
-            task.id: (
-                0
-                if sizes is None
-                else task_bytes(
-                    kinds[task.step], task, selection, sizes, tables, project
-                )
-            )
-            for task in made_tasks
+            task.id: memory.get(task.id, {}).get("bytes", 0) for task in made_tasks
         },
     }
     queue.write_json(partial / JOB, record)

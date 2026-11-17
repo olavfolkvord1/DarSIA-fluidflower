@@ -371,6 +371,23 @@ def test_a_beat_delayed_into_the_mark_lands_before_it(
     assert queue.accepted(job, claim.task) == {claim.token}
 
 
+def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch):
+    """A blocked lease write cannot extend the later terminal commit deadline
+    by the time its own retries consumed."""
+    clock, renewed = [10.0], [0.0]
+    waits = iter((False, True))
+    stop = SimpleNamespace(wait=lambda seconds: next(waits))
+    monkeypatch.setattr(jobs_main, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(service, "birth", lambda pid: 1.0)
+
+    def delayed(*args):
+        clock[0] = 20.0
+
+    monkeypatch.setattr(queue, "beat", delayed)
+    jobs_main._beats(None, stop, "here", renewed)
+    assert renewed == [10.0]
+
+
 def test_a_task_runs_on_its_job_backend(tmp_path, monkeypatch, kept_threads):
     """A task process takes its job's compute backend by its label, checked with
     the job's phase-model heads, runs the step on it and records its device with
@@ -640,23 +657,6 @@ def test_a_waiting_lock_held_by_another_process_is_taken_once_it_lets_go(
     finally:
         holder.wait(60)
         holder.stdout.close()
-
-
-def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch):
-    """A blocked lease write cannot extend the later terminal commit deadline
-    by the time its own retries consumed."""
-    clock, renewed = [10.0], [0.0]
-    waits = iter((False, True))
-    stop = SimpleNamespace(wait=lambda seconds: next(waits))
-    monkeypatch.setattr(jobs_main, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(service, "birth", lambda pid: 1.0)
-
-    def delayed(*args):
-        clock[0] = 20.0
-
-    monkeypatch.setattr(queue, "beat", delayed)
-    jobs_main._beats(None, stop, "here", renewed)
-    assert renewed == [10.0]
 
 
 def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(

@@ -17,10 +17,11 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+import darsia
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import queue, service
 from darsia.jobs.job import Sizes, create_job, read_job, task_bytes
-from darsia.jobs.step import Memory, Order, Scope, Selection, Step
+from darsia.jobs.step import Memory, Order, Scope, Selection, Step, Term
 from darsia.utils import results
 from tests.unit.test_job_service import importable  # noqa: F401
 from tests.unit.test_jobs import no_share_wait  # noqa: F401
@@ -158,6 +159,33 @@ def test_a_task_declares_the_bytes_of_its_input_scope(tmp_path):
     assert task_bytes(held, task, selection, sizes) == found["held"]
     again = create_job(tmp_path / "again", (LIGHT,), selection, config)
     assert set(read_job(again)["bytes"].values()) == {0}
+
+
+def test_a_tasks_bytes_count_its_terms_fixed_arrays_and_photos(tmp_path):
+    """A task's bytes count its values in the precision and its arrays of a fixed
+    type per pixel, those per unit of each count its configuration sets for its
+    run, and the reader's bytes of its run's photos by their format."""
+    config, selection = _project(tmp_path)
+    term = Term(
+        lambda tables, run, project: 3 if run == "r1" else 1, grid=1.0, grid_bytes=2.0
+    )
+    memory = Memory(
+        camera=1.0,
+        grid=2.0,
+        camera_bytes=5.0,
+        grid_bytes=7.0,
+        terms=(term,),
+        photos=1,
+        photo_bytes=darsia.decoded_bytes,
+    )
+    counted = Step("counted", {}, Order.RUN, memory, _numbers)
+    job = create_job(
+        tmp_path / "jobs", (counted,), selection, config, sizes=Sizes(4, 10, 100)
+    )
+    found = read_job(job)["bytes"]
+    photo = darsia.decoded_bytes("r1-00.npz") * 10
+    assert found["counted.r1"] == 4 * (10 + 5 * 100) + 50 + 13 * 100 + photo
+    assert found["counted.r2"] == 4 * (10 + 3 * 100) + 50 + 9 * 100 + photo
 
 
 def test_admission_by_threads_and_bytes_with_a_request_as_a_ceiling():
@@ -1044,6 +1072,74 @@ def test_a_folder_out_of_reach_is_not_settled(tmp_path, monkeypatch):
         assert not service.settled(jobs)
 
 
+def test_service_discovery_skips_done_jobs_without_hiding_retries(
+    tmp_path, monkeypatch, started
+):
+    """The running service remembers terminal success, while failed tasks can
+    return and use its capacity after a retry."""
+    job = _job(tmp_path, (LIGHT,), runs=("r2",))
+    one, _ = _service(tmp_path, monkeypatch)
+    one.poll()
+    assert len(started) == 1
+    started[0].end()
+    one.poll()
+    assert one._complete == {job.name}
+    assert not one._jobs()
+    failed = _job(tmp_path, (LIGHT,), runs=("r2",), name="failed")
+    queue.finish(queue.claim(failed, "light.r2.0000", "here"), traceback="failed")
+    one.poll()
+    assert failed.name not in one._complete
+    assert queue.retry_failed(failed, "light.r2.0000")
+    one.poll()
+    assert len(started) == 2
+    assert Path(started[-1].job) == failed
+
+
+def test_a_partial_task_listing_cannot_make_a_job_permanently_complete(tmp_path):
+    """A remaining marker prevents caching even if a caller knows only an
+    already completed subset of the job's tasks."""
+    job = _job(tmp_path, (LIGHT,))
+    known = queue.tasks(job)
+    first = next(iter(known))
+    queue.finish(queue.claim(job, first, "here"))
+    assert not service._all_done(job, {first: known[first]})
+    assert not service._all_done(job, {})
+
+
+def test_simultaneous_partial_task_and_state_listings_are_not_cached(
+    tmp_path, monkeypatch
+):
+    """The immutable record still names a runnable task hidden by both directory
+    listings; neither the settled check nor discovery may forget that task."""
+    job = _job(tmp_path, (LIGHT,))
+    known = queue.tasks(job)
+    first = next(iter(known))
+    queue.finish(queue.claim(job, first, "here"))
+    complete = set()
+    tasks, markers = queue.tasks, queue.markers
+    with monkeypatch.context() as partial:
+        partial.setattr(queue, "tasks", lambda folder: {first: known[first]})
+        partial.setattr(
+            queue,
+            "markers",
+            lambda folder, state: markers(folder, state) if state == queue.DONE else {},
+        )
+        assert not service.settled(job.parent, complete=complete)
+        one = service.Service(job.parent, "here", 1, tmp_path / "logs")
+        assert [folder for folder, _ in one._jobs()] == [job]
+        assert not one._complete
+    assert not complete
+    assert not service.settled(job.parent, complete=complete)
+    # Older records without the immutable manifest retain no permanent cache.
+    record = read_job(job)
+    record.pop("bytes")
+    queue.write_json(job / "job.json", record)
+    for task in queue.ready(job, tasks(job)):
+        queue.finish(queue.claim(job, task.id, "here"))
+    assert service.settled(job.parent, complete=complete)
+    assert not complete
+
+
 def _end(process):
     """End a process this test started, with the processes it started, if it
     still runs."""
@@ -1122,3 +1218,111 @@ def test_an_idle_host_takes_another_jobs_ready_tasks(
         (tmp_path / "older" / "project" / "linger").unlink(missing_ok=True)
         for process in services:
             _end(process)
+
+
+def test_a_steps_measured_peak_raises_what_its_later_tasks_reserve(
+    tmp_path, monkeypatch, started
+):
+    """The most an ended task's processes held is kept for its step in the host's
+    record, with its estimate, its job's sizes and its photos' format; a later task
+    of the step reserves that peak scaled to its own estimate, being larger, and a
+    later service of the host takes it up at the same revision only."""
+    jobs = tmp_path / "jobs"
+    job = _job(tmp_path, (LIGHT,), runs=("r1", "r2"))
+
+    def looked(live):  # its processes hold 1 GiB now and held 3 GiB at the most
+        live.peak = max(live.peak, 3 * GIB)
+        return GIB
+
+    monkeypatch.setattr(service.Live, "resident", looked)
+    running, _ = _service(tmp_path, monkeypatch, threads=1)
+    running._identity["pid"] = 999_999  # it ends, as its record will say
+    running.poll()
+    assert [live.bytes for live in running.live.values()] == [GIB]  # its estimate
+    running.poll()
+    started[0].end()
+    running.poll()
+    peak = {
+        "step": "light",
+        "bytes": 3 * GIB,
+        "estimate": GIB,
+        "base": 0,
+        "job": job.name,
+        "task": started[0].task,
+        "itemsize": 1,
+        "camera": 0,
+        "grid": GIB,
+        "format": ".npz",
+    }
+    assert _record(jobs, "here")["peaks"] == [peak]
+    assert [live.bytes for live in running.live.values()] == [3 * GIB]
+    assert service.need(2 * GIB, peak) == 6 * GIB and service.need(GIB, None) == GIB
+    again = service.Service(jobs, "here", 0, tmp_path / "logs")
+    again.poll()
+    assert again.held and list(again.peaks.values()) == [peak]
+    other = service.Service(jobs, "here", 0, tmp_path / "logs")
+    other.revision = "another"
+    other._identity["pid"] = 999_999
+    again._identity["pid"] = 999_999
+    again.poll()  # its record now names a process that is gone
+    other.poll()
+    assert other.held and other.peaks == {}
+
+
+def test_learned_admission_keeps_the_process_base_and_smaller_peak(monkeypatch):
+    """Array growth scales the observed array peak; the interpreter stays fixed,
+    and a smaller workload retains its observed floor until measured itself."""
+    monkeypatch.setattr(service, "PROCESS", 100)
+    peak = {"estimate": 200, "bytes": 400, "base": 100}
+    assert service.need(300, peak) == 700
+    assert service.need(150, peak) == 400
+    assert service.need(500, {"estimate": 100, "bytes": 450, "base": 100}) == 500
+
+
+def test_peak_records_keep_distinct_workloads_and_ignore_bad_measurements(tmp_path):
+    """A lower relative peak at a larger resolution must not erase a smaller
+    workload's larger scaling factor; malformed records cannot break admission."""
+    running = service.Service(tmp_path / "jobs", "here", 0, tmp_path / "logs")
+    small = dict(
+        step="maps",
+        bytes=800,
+        estimate=200,
+        base=0,
+        camera=100,
+        grid=50,
+        itemsize=4,
+        format=".dng",
+    )
+    large = dict(small, bytes=1000, estimate=400, camera=200, grid=100)
+    running._keep(small)
+    running._keep(large)
+    running._keep(dict(small, bytes=400))
+    assert sorted(p["bytes"] for p in running.peaks.values()) == [800, 1000]
+    for bad in (
+        None,
+        {},
+        dict(small, bytes=-1),
+        dict(small, estimate=float("inf")),
+        dict(small, camera="unknown"),
+        dict(small, base=-1),
+    ):
+        running._keep(bad)
+    assert len(running.peaks) == 2
+
+
+def test_a_learned_peak_raises_live_peer_reservations(tmp_path, monkeypatch, started):
+    """A live peer that has not reached its peak still reserves the learned cost,
+    leaving that future growth out of the space offered to a new task."""
+    _job(tmp_path, (LIGHT,), runs=("r1", "r2"))
+    running, _ = _service(tmp_path, monkeypatch, threads=3, free=10 * GIB)
+    running.poll()
+    assert len(running.live) == 3
+    observed = list(running.live.values())[-1]
+
+    def looked(live):
+        live.peak = 3 * GIB if live is observed else GIB
+        return GIB
+
+    monkeypatch.setattr(service.Live, "resident", looked)
+    running._reap()
+    assert [live.bytes for live in running.live.values()] == [3 * GIB] * 3
