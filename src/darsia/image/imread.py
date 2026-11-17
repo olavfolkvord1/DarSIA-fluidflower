@@ -108,19 +108,18 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
 
 def decoded_bytes(path: Union[str, Path]) -> int:
     """Bytes per pixel that reading a photo holds beside its image in the Setup's
-    precision, by the photo's format, as measured on synthetic photos and rounded up
-    to whole words.
+    precision, by the arrays in the reader. This is a budget for a three-channel
+    photo, with stored NumPy images no wider than float64. Decoder libraries and
+    archive buffers also have a fixed cost covered by the task process's base.
 
-    - A camera raw file: 44, its 16-bit mosaic and black-subtracted mosaic, its
-      clipped photosites, its 16-bit demosaic and invalid values and their
-      intermediates (40 measured); the image is decoded in the precision
-      (:func:`darsia.imread_from_raw`).
-    - A JPEG file: 32, its 8-bit decode (6 measured) and the double-precision image
-      the optical reader returns (24).
-    - A PNG or TIFF file: 40, its decode of up to 16 bits (12 measured) and the
-      double-precision image.
-    - A NumPy file: 28, its stored image, in double precision as DarSIA stores an
-      optical image (24), and what reading its archive holds.
+    - A camera raw file: 44, three 16-bit mosaic buffers, a 16-bit RGB demosaic,
+      two int64 colour-index maps, the RGB invalid map and thirteen byte masks
+      and scratch arrays of the invalid-pixel interpolation; the image is decoded
+      in the precision (:func:`darsia.imread_from_raw`).
+    - A JPEG file: two 8-bit colour buffers budgeted at four channels, plus
+      the RGB float64 image returned by the optical reader.
+    - A PNG or TIFF file: the same buffers at up to 16 bits, plus float64 RGB.
+    - A NumPy file: float64 RGB and a second image-sized read/archive buffer.
 
     Parameters
     ----------
@@ -135,13 +134,13 @@ def decoded_bytes(path: Union[str, Path]) -> int:
     """
     suffix = Path(path).suffix.lower()
     if suffix in darsia.RAW_SUFFIXES:
-        return 44
+        return 3 * 2 + 3 * 2 + 2 * 8 + 3 + 13
     if suffix in (".jpg", ".jpeg"):
-        return 32
+        return 2 * 4 + 3 * 8
     if suffix in (".png", ".tif", ".tiff"):
-        return 40
+        return 2 * 4 * 2 + 3 * 8
     if suffix in (".npy", ".npz"):
-        return 28
+        return 2 * 3 * 8
     return 0
 
 

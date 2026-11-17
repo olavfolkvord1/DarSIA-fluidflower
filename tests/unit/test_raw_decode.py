@@ -163,16 +163,18 @@ def test_rig_decodes_raw_photographs_in_its_precision(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["photo.dng", "photo.jpg", "photo.tif", "photo.npz"])
-def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name):
-    """What reading a photo holds at its peak beside its image in single precision,
-    which a raw file is decoded in, is at most its format's decoded bytes per pixel."""
-    rows, cols = 600, 800
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("scale", [1, 2])
+def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name, dtype, scale):
+    """The reader's allocations fit its format budget at two resolutions and
+    both working precisions, beside the final image for the raw reader."""
+    rows, cols = 300 * scale, 400 * scale
     rng = np.random.default_rng(1)
     path = tmp_path / name
     if name.endswith(".dng"):
         mosaic = rng.integers(600, 15000, (rows, cols), dtype=np.uint16)
         write_dng(path, mosaic, LAYOUTS["RGGB"][0])
-        read = {"demosaic": "edge_aware", "dtype": "float32"}
+        read = {"demosaic": "edge_aware", "dtype": dtype}
     elif name.endswith(".npz"):
         darsia.OpticalImage(rng.random((rows, cols, 3))).save(path)
         read = {}
@@ -188,7 +190,7 @@ def test_a_photos_decoded_bytes_cover_its_reading(tmp_path, name):
         peak = tracemalloc.get_traced_memory()[1] - start
     finally:
         tracemalloc.stop()
-    if image.img.dtype == np.float32:  # a raw file is decoded in the precision
+    if name.endswith(".dng"):  # a raw file is decoded in the precision
         peak -= image.img.nbytes
     assert 0 < peak <= darsia.decoded_bytes(path) * rows * cols
     assert darsia.decoded_bytes("notes.txt") == 0
