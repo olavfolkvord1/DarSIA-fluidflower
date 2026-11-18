@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -149,8 +150,8 @@ class SimulatorExportSettings:
     excluded_facies: Sequence[int]
     """Facies outside the porous domain wherever they lie, e.g. silicone along the
     walls."""
-    cell_sizes_mm: Sequence[float]
-    """Sizes [mm] of the metric cells of the package, one geometry each."""
+    cell_sizes_mm: Sequence[float | None]
+    """Sizes [mm], or None for the canvas's native rectangular cells."""
     precision: Literal["float32", "float64"]
     """Precision of the package's arrays; areas and volumes are summed in double
     precision."""
@@ -178,6 +179,28 @@ class MassFrames:
     """The run's geometry (:func:`darsia.run_geometry`)."""
     frames: Iterable[tuple[str, darsia.SimpleMassAnalysisResults, np.ndarray]]
     """Each frame's name, its mass maps and its phase map."""
+    sources: Mapping[str, "MassFrameSource"] | None = None
+    """Original source identities and times by exported frame name, never inferred."""
+
+
+@dataclass(frozen=True)
+class MassFrameSource:
+    """A mass frame's source and physical clock, independent of its output name."""
+
+    session: str
+    image: str
+    capture_datetime: datetime
+    injection_start: datetime
+
+    def row(self) -> dict:
+        """Source and elapsed time in seconds from injection, without rounding."""
+        return dict(
+            source_session=self.session,
+            source_image=self.image,
+            capture_datetime=self.capture_datetime.isoformat(),
+            injection_start=self.injection_start.isoformat(),
+            elapsed_s=(self.capture_datetime - self.injection_start).total_seconds(),
+        )
 
 
 @dataclass(frozen=True)
@@ -431,12 +454,31 @@ def complete_geometry(
     )
 
 
+def _export_cells(shape, dimensions, size):
+    """One export grid for both geometry and masses, including native pitches."""
+    if size is not None:
+        if not np.isfinite(size) or size <= 0:
+            raise ValueError("Export cell size must be positive and finite.")
+        return darsia.metric_cells(shape, list(dimensions), size)
+    return darsia.MetricCells(
+        shape=tuple(shape),
+        dimensions=list(dimensions),
+        index=np.arange(np.prod(shape), dtype=np.int64),
+        pixel_area=float(np.prod(np.asarray(dimensions) / shape)),
+    )
+
+
+def _size_name(size):
+    """The public resolution name, without assuming square native pixels."""
+    return "full" if size is None else f"{size:g}mm"
+
+
 def geometry_cells(
     completed: CompletedGeometry,
     depth_m: np.ndarray,
     porosity: Mapping[int, float],
     dimensions: Sequence[float],
-    cell_size_mm: float,
+    cell_size_mm: float | None,
     precision: str,
 ) -> dict[str, np.ndarray]:
     """The completed geometry on metric cells (:func:`darsia.metric_cells`).
@@ -474,7 +516,7 @@ def geometry_cells(
 
     """
     domain = completed.domain
-    cells = darsia.metric_cells(domain.shape, list(dimensions), cell_size_mm)
+    cells = _export_cells(domain.shape, dimensions, cell_size_mm)
     area = np.float64(cells.pixel_area)
     facies = np.where(domain, completed.facies, 0)
     present = [int(value) for value in np.unique(facies[domain])]
@@ -503,7 +545,11 @@ def geometry_cells(
         larger = weights > largest
         majority[larger] = facies_id
         largest[larger] = weights[larger]
-    cell_area = (cell_size_mm / 1000.0) * (cell_size_mm / 1000.0)
+    cell_area = (
+        cells.pixel_area
+        if cell_size_mm is None
+        else (cell_size_mm / 1000.0) * (cell_size_mm / 1000.0)
+    )
     drawn = completed.drawn_behind
     drawn_ids = [int(value) for value in np.unique(completed.facies[drawn])]
     arrays = {
@@ -732,13 +778,18 @@ def _write_geometry(
             size,
             settings.precision,
         )
-        stem = folder / f"simulator_geometry_{size:g}mm"
+        name = _size_name(size)
+        stem = folder / f"simulator_geometry_{name}"
         np.savez_compressed(stem.with_suffix(".npz"), **arrays)
         shape = list(arrays["domain_area_m2"].shape)
         document = dict(
-            cell_size_mm=float(size),
+            cell_size_mm=None if size is None else float(size),
             shape=shape,
-            extent_m=[0.0, shape[1] * size / 1000, 0.0, shape[0] * size / 1000],
+            extent_m=(
+                [0.0, float(canvas.dimensions[1]), 0.0, float(canvas.dimensions[0])]
+                if size is None
+                else [0.0, shape[1] * size / 1000, 0.0, shape[0] * size / 1000]
+            ),
             axes="rows: y from the floor up; columns: x from the left",
             canvas=dict(shape=list(layers.shape), dimensions_m=list(canvas.dimensions)),
             filled_pixels_by_layer=filled_by_layer,
@@ -748,47 +799,179 @@ def _write_geometry(
                 for name, a in arrays.items()
             },
         )
+        if size is None:
+            document["cell_pitch_m"] = dict(
+                dy=float(canvas.dimensions[0] / shape[0]),
+                dx=float(canvas.dimensions[1] / shape[1]),
+            )
+            document["resolution"] = "native rectangular cells"
         stem.with_suffix(".json").write_text(
             json.dumps(document, indent=1, allow_nan=False) + "\n", encoding="utf-8"
         )
-        files[f"{size:g}mm"] = stem.with_suffix(".npz").relative_to(package).as_posix()
+        files[name] = stem.with_suffix(".npz").relative_to(package).as_posix()
     return files, filled_by_layer
 
 
-def _write_mass(folder: Path, mass: MassFrames, canvas: darsia.Image, sizes) -> int:
-    """Write a run's mass maps on the cells of each size; the number of frames."""
-    copies = {
-        size: darsia.MassCopy(mass.geometry, darsia.MassCopySettings(copy_mm=size))
-        for size in sizes
-    }
-    for size, copy in copies.items():
-        target = folder / f"{size:g}mm"
+def write_simulator_mass(
+    folder: Path,
+    mass: MassFrames,
+    canvas: darsia.Image,
+    sizes: Sequence[float | None],
+) -> int:
+    """Stream a run's observed maps onto the simulator geometry's exact grids.
+
+    The shared native MassCopy reducers preserve extensive masses and known
+    fractions; completed sand geometry never supplies missing observed mass.
+    The uniform source grid must span the canvas and share its lower-left
+    origin. Native export requires its own grid; metric export uses the common
+    metric-cell reducer. Unknown mass contributes no known
+    sum, and its pore-volume fraction remains explicit. Every resolution's sum
+    is checked against the source finite mass before publication by the caller.
+
+    The destination must be empty. An index gives supplied source identities,
+    capture times and injection-relative seconds, as well as conservation totals.
+    The output names are distinct safe stems; sessions never overwrite each other.
+    """
+    folder = Path(folder)
+    if folder.exists() and any(folder.iterdir()):
+        raise FileExistsError("The simulator mass destination must be empty.")
+    sizes = tuple(sizes)
+    if not sizes or len(set(sizes)) != len(sizes):
+        raise ValueError("Choose distinct simulator export resolutions.")
+    lower_left = (
+        float(canvas.origin[0]),
+        float(canvas.origin[1] - canvas.dimensions[0]),
+    )
+    rows, cols = mass.geometry.domain.shape
+    if not np.allclose(mass.geometry.dimensions, canvas.dimensions):
+        raise ValueError("Uniform source geometry must span the export canvas.")
+    copies, grids = {}, {}
+    for size in sizes:
+        target_cells = _export_cells(canvas.img.shape[:2], canvas.dimensions, size)
+        height, width = target_cells.dimensions
+        extent = (
+            lower_left[0],
+            lower_left[0] + width,
+            lower_left[1],
+            lower_left[1] + height,
+        )
+        if size is None and (rows, cols) != tuple(canvas.img.shape[:2]):
+            raise ValueError("Uniform native export requires the canvas's own grid.")
+        cells = _export_cells((rows, cols), mass.geometry.dimensions, size)
+        if cells.shape != target_cells.shape:
+            raise ValueError("Uniform source cells must match the export grid.")
+        copy = darsia.MassCopy.from_cells(mass.geometry, cells, extent)
+        name = _size_name(size)
+        copies[name] = copy
+        grids[name] = dict(
+            shape=list(cells.shape),
+            extent_m=extent,
+            cell_pitch_m=dict(dy=height / cells.shape[0], dx=width / cells.shape[1]),
+        )
+    for name, copy in copies.items():
+        target = folder / name
         target.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             target / "static.npz", **{k: v[::-1] for k, v in copy.static.items()}
         )
-    count = 0
+    index, seen = [], set()
+    fields = {
+        "mass_total_g": "mass",
+        "mass_aqueous_g": "mass_aq",
+        "mass_free_gas_g": "mass_g",
+    }
     for name, maps, labels in mass.frames:
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+            or name.lower() == "static"
+        ):
+            raise ValueError(
+                "Export frame names must be safe, non-reserved file stems."
+            )
+        if name.casefold() in seen:
+            raise ValueError(f"Duplicate simulator frame name: {name}")
+        seen.add(name.casefold())
         corner = (maps.mass.origin[0], maps.mass.origin[1] - maps.mass.dimensions[0])
-        lower_left = (canvas.origin[0], canvas.origin[1] - canvas.dimensions[0])
         if not np.allclose(corner, lower_left):
             raise ValueError(
                 f"The mass maps of {name} do not start at the canvas's lower left "
                 "corner, so their cells would not be the geometry's."
             )
+        if labels.shape != (rows, cols) or any(
+            np.shape(getattr(maps, field).img) != (rows, cols)
+            for field in (*fields.values(), "concentration_aq", "saturation_g")
+        ):
+            raise ValueError("Every mass and phase field must match the run geometry.")
+        row = dict(frame=name)
+        if mass.sources is not None:
+            if name not in mass.sources:
+                raise ValueError(f"Missing source/time metadata for {name}")
+            row.update(mass.sources[name].row())
+        totals = {}
+        for field, attribute in fields.items():
+            values = np.asarray(getattr(maps, attribute).img, dtype=float)
+            totals[field] = float(
+                np.sum(
+                    np.where(np.isfinite(values), values, 0)
+                    * mass.geometry.pore_volume_m3
+                    * 1000,
+                    dtype=float,
+                )
+            )
+            row["source_" + field] = totals[field]
         for size, copy in copies.items():
             cells = copy(maps, labels)
+            for field, expected in totals.items():
+                found = float(np.sum(cells[field], dtype=float))
+                if not np.isclose(found, expected, rtol=1e-9, atol=1e-12):
+                    raise ValueError(
+                        f"The {size} export does not conserve {field} for {name}."
+                    )
+                row[size + "_" + field] = found
             np.savez_compressed(
-                folder / f"{size:g}mm" / f"{name}.npz",
+                folder / size / f"{name}.npz",
                 **{k: v[::-1] for k, v in cells.items()},
             )
-        count += 1
-    return count
+        index.append(row)
+    if mass.sources is not None and set(mass.sources) != {
+        row["frame"] for row in index
+    }:
+        raise ValueError("Source metadata must correspond exactly to exported frames.")
+    columns = list(index[0]) if index else ["frame"]
+    write_rows(folder / "index.csv", index, columns)
+    manifest = dict(
+        frames=len(index),
+        index="index.csv",
+        grids=grids,
+        axes="rows: y from the floor up; columns: x from the left",
+        source_positions="uniform lower-left aligned",
+        source_times=(
+            "recorded capture and injection origin"
+            if mass.sources is not None
+            else "not supplied"
+        ),
+        static_geometry="observed source pore volume and area; not completed simulator sand",
+        unknown_mass="Known finite sum only; read each mass_known_fraction. NaN coverage is not known zero.",
+        units=dict(
+            mass="g per cell",
+            concentration_aq="1 (share of local CO2 solubility)",
+            saturation_g="1",
+            pore_volume_l="L",
+            domain_area_m2="m2",
+            fractions="1",
+            elapsed_s="s from injection start",
+        ),
+    )
+    (folder / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    return len(index)
 
 
 README = """# Simulator package
 
-{runs} runs; metric cells of {sizes} mm. Start with manifest.json.
+{runs} runs; resolutions: {sizes}. Start with manifest.json.
 
 ## Frame
 
@@ -799,11 +982,13 @@ coordinates lie in it, on the grid on which the drawing is filled.
 {notes}
 ## Geometry
 
-geometry/simulator_geometry_<size>mm.npz holds the rig's porous domain on metric
+geometry/simulator_geometry_<resolution>.npz holds the rig's porous domain on
 cells (read with numpy.load, allow_pickle=False); its JSON companion lists each
 array with its unit. Rows run from the floor up (y increasing) and columns from
-the left (x increasing); cell centres lie at (index + 0.5) x size from the rig's
-lower left inner corner. A cell with a positive domain_area_m2 holds porous medium;
+the left (x increasing). Resolution is <size>mm for square metric cells, or full
+for native rectangular cells. Cell centres lie at (index + 0.5) times each axis's
+pitch from the rig's lower left inner corner; the JSON records both pitches for
+full resolution. A cell with a positive domain_area_m2 holds porous medium;
 outside it the intensive values are NaN. Volumes are m3 per cell, depth m, porosity
 pore over bulk volume. Pixels are assigned to cells by their centres, so a cell's
 domain_area_fraction may exceed 1. The facies fractions are shares of the cell's
@@ -850,10 +1035,18 @@ lack their own."""
 MASS_README = """
 ## Mass maps
 
-runs/<run>/mass/<size>mm/<frame>.npz holds the frame's masses per cell in g, each
+runs/<run>/mass/<resolution>/<frame>.npz holds the frame's masses per cell in g, each
 with the share of the cell's pore volume whose mass is known, the pore-volume
 weighted concentration and saturation, and the phase area fractions; static.npz
-holds the cells' pore volume and domain area.
+holds observed source pore volume and domain area, distinct from completed sand
+behind fixtures. Resolution is full (the geometry's native rectangular cells), or
+<size>mm. manifest.json gives the exact extent, shape, pitches, orientation and
+units. index.csv identifies each supplied source session/image and capture time,
+seconds from injection start, and source/export mass totals at every resolution.
+Unknown coverage is never interpreted as zero mass. Rows run from the floor up.
+concentration_aq is the stored dimensionless share of local CO2 solubility.
+When the native CO2 state is supplied, concentration_aq_g_l gives g/L: each
+source pixel is converted at its local pressure and temperature before averaging.
 """
 """The README's section on mass maps, for a package that holds them."""
 
@@ -979,7 +1172,7 @@ def write_simulator_package(
         sand_map = "" if run.adjustment is None else name
         donor_runs[name] = _donor_run(run, sand_map, injection, volume)
         if run.mass is not None:
-            entry["mass_frames"] = _write_mass(
+            entry["mass_frames"] = write_simulator_mass(
                 target / "mass", run.mass, series.canvas, settings.cell_sizes_mm
             )
         entries[name] = entry
@@ -1031,7 +1224,9 @@ def write_simulator_package(
             width=width,
             height=height,
         ),
-        cell_sizes_mm=[float(size) for size in settings.cell_sizes_mm],
+        cell_sizes_mm=[
+            None if size is None else float(size) for size in settings.cell_sizes_mm
+        ],
         geometry=common,
         filled_pixels_by_layer=filled,
         runs_with_own_geometry=own,
@@ -1051,7 +1246,10 @@ def write_simulator_package(
     (folder / "README.md").write_text(
         README.format(
             runs=len(entries),
-            sizes=", ".join(f"{size:g}" for size in settings.cell_sizes_mm),
+            sizes=", ".join(
+                "native/full" if size is None else f"{size:g} mm"
+                for size in settings.cell_sizes_mm
+            ),
             width=width,
             height=height,
             notes="".join(f"\n{note}\n" for note in settings.notes),
