@@ -54,12 +54,12 @@ def test_invalid_memory_counts_fail_before_admission():
 
 @pytest.mark.parametrize("itemsize", [4, 8])
 @pytest.mark.parametrize("pixels", [120, 480])
-def test_injection_memory_uses_merged_ports_ends_and_run_protocol(
+def test_injection_memory_counts_shared_cache_and_run_protocol(
     tmp_path, itemsize, pixels
 ):
-    """Port masks and end-anchor distance maps grow with the protocol, not with
-    working precision. Touching periods merge, repeated ends share the bound,
-    inactive ports do not count, and run overrides use the configured density."""
+    """Shared model frames and per-port signal use working precision; bool/uint8
+    maps and float32 link blends keep their own widths. Repeated episodes do not
+    duplicate a port's state, and run overrides use the configured density."""
     (tmp_path / "injection.csv").write_text(
         "id,location_x,location_y,start,end,rate_g/s\n"
         "1,0,0,2024-01-01 00:00,2024-01-01 01:00,1\n"
@@ -86,11 +86,11 @@ def test_injection_memory_uses_merged_ports_ends_and_run_protocol(
     memory = Memory(terms=(Term(_injection_map_bytes, grid_bytes=1),))
     assert (
         memory.bytes(itemsize, 0, pixels, 0, tables, "r1", project=tmp_path)
-        == 46 * pixels
+        == {4: 173, 8: 189}[itemsize] * pixels
     )
     assert (
         memory.bytes(itemsize, 0, pixels, 0, tables, "r2", project=tmp_path)
-        == 23 * pixels
+        == {4: 127, 8: 143}[itemsize] * pixels
     )
     with pytest.raises(ValueError, match="project"):
         memory.bytes(itemsize, 0, pixels, 0, tables, "r1")

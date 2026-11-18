@@ -36,12 +36,13 @@ from darsia.presets.workflows.calibration import steps as calibration
 from darsia.presets.workflows.comparison import steps as comparison
 from darsia.presets.workflows.comparison.ensemble import (
     EnsembleRun,
-    EnsembleSettings,
     ensemble_tables,
 )
 from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 from darsia.presets.workflows.comparison.mass_wasserstein import (
+    ComparedFrame,
     WassersteinSettings,
+    distance_rows,
     distance_scales,
     frame_cells,
     wasserstein_distances,
@@ -73,6 +74,13 @@ from darsia.utils.locations import Frame, normal_path
 from tests.unit.test_gas_allocation import TABLES as RULE_TABLES
 from tests.unit.test_job_service import _serve, importable, numpys_blas  # noqa: F401
 from tests.unit.test_minimal_chain import COLOURS, _head
+
+@pytest.fixture(autouse=True)
+def local_model_cache(tmp_path, monkeypatch):
+    """Keep retained model evidence, including child workers', inside this test."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "app-cache"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "app-cache"))
+
 
 START = datetime.datetime(2026, 1, 1, 12)
 HOUR = datetime.timedelta(hours=1)
@@ -448,6 +456,12 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     rules = toml.dumps({k: RULE_TABLES[k] for k in ("phase_rules", "gas_allocation")})
     targets = "".join(f'"{m}" = {np.log(COLOURS[m] * 1e3).tolist()}\n' for m in (1, 2))
     text = SETTINGS.format(kernel=KERNEL, precision=precision, targets=targets)
+    for run, selected in frames.items():
+        text += f"\n[ensemble.target_h.{run}]\n"
+        text += "".join(
+            f'"{frame.session}/{frame.name}" = {float(index + 1)}\n'
+            for index, frame in enumerate(selected)
+        )
     (root / "config.toml").write_text(text + rules)
     sessions = {run: {f"photos-{run}": f"photos-{run}"} for run in frames}
     selection = Selection(frames, sessions, domains=("whole", "upper"))
@@ -615,6 +629,7 @@ def _direct(root: Path, selection: Selection) -> dict:
     rules = settings(darsia.PhaseRuleSettings, "phase_rules")
     allocation = settings(darsia.GasAllocationSettings, "gas_allocation")
     variants, frames = {}, {None: [], "r1": []}
+    allocations = {}
     for run, (grid, experiment, images, dates) in runs.items():
         rig, start = grid.rig, experiment.experiment_start
         model = darsia.read_phase_model(
@@ -638,7 +653,9 @@ def _direct(root: Path, selection: Selection) -> dict:
             for image, before in zip(images, previous)
         ]
         variants[run] = {}
+        allocations[run] = {}
         for held_out, found in volumes[run].items():
+            records = []
             maps = darsia.free_gas(
                 probabilities,
                 dates,
@@ -654,9 +671,12 @@ def _direct(root: Path, selection: Selection) -> dict:
                 allocation,
                 grid.chart,
                 gas_threshold=model.gas_threshold,
+                depth_m=rig.depth.img,
+                record=lambda index, value: records.append(asdict(value)),
             )
             names = ("labels", "rules", "saturation", "co2", "before")
             variants[run][held_out] = [dict(zip(names, m)) for m in maps]
+            allocations[run][held_out] = records
     # Each run's colour paths; the second run's reference sand has its own.
     paths, own_paths = {}, {}
     for run in runs:
@@ -893,12 +913,15 @@ def _direct(root: Path, selection: Selection) -> dict:
         grid.rig.facies.dimensions,
         domains,
     )
-    found = {}
+    found, compared_frames = {}, {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
         start = experiment.experiment_start
         hours = [(date - start).total_seconds() / 3600 for date in dates]
         nearest = int(np.argmin([abs(h - 3.0) for h in hours]))
         frame = selection.frames[run][nearest]
+        compared_frames[run] = ComparedFrame(
+            calibration.frame_key(frame), dates[nearest].isoformat(), hours[nearest]
+        )
         found[run] = frame_cells(
             made[(run, frame)],
             maps[nearest]["labels"],
@@ -921,7 +944,7 @@ def _direct(root: Path, selection: Selection) -> dict:
             row["case_id"]: protocol.injected_mass(time=row["elapsed_h"]) * 1000
             for row in rows
         }
-        times = {row["case_id"]: row["elapsed_h"] for row in rows}
+        times = tables["ensemble"]["target_h"][run]
         ensemble.append(EnsembleRun(rows, injected, times, protocol))
         graphs[run] = [
             {**row, "injected_mass_g": injected[row["case_id"]]}
@@ -992,17 +1015,18 @@ def _direct(root: Path, selection: Selection) -> dict:
             unit="g/L",
             style=style,
         )
-    ensemble_settings = settings(EnsembleSettings, "ensemble")
+    ensemble_settings = settings(comparison.EnsembleInputSettings, "ensemble")
     tables = ensemble_tables(ensemble, domains, ensemble_settings)
     (root / "figures").mkdir()
     ensemble_figures(root / "figures", tables, ensemble, ensemble_settings, style)
     return {
         "maps": made,
+        "allocations": allocations,
         "copies": copies,
         "fit": fit,
         "fold": (fold, predictions),
         "domain_mass": domain_mass,
-        "distances": [asdict(distance) for distance in distances],
+        "distances": distance_rows(distances, compared_frames),
         "statistics": frames[None],
         "drawings": len(drawings),
         "films": records,
@@ -1014,6 +1038,19 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
     its sands' signal and the fit equal the direct calls', and so do the films'
     tiles, the films and the ensemble's figures."""
     results = project / "results"
+    for run, frames in selection.frames.items():
+        records = direct["allocations"][run]
+        for index, frame in enumerate(frames):
+            folder = results / "phase-maps" / run / frame.session / frame.name
+            stored = json.loads((folder / "result.json").read_text())
+            assert stored["measurements"]["gas_allocation"] == {
+                "primary": records[None][index],
+                "without": {
+                    held: values[index]
+                    for held, values in records.items()
+                    if held is not None
+                },
+            }
     for (run, frame), maps in direct["maps"].items():
         stored = darsia.read_mass_maps(
             results / "mass-maps" / run / frame.session / frame.name
@@ -1137,7 +1174,7 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     ]
     assert queue.waiting(job) == set()
     _compare(project, selection, direct)
-    for name in ("events/events.csv", "ensemble/mass_long.csv"):
+    for name in ("events/events.csv", "ensemble/mass_long.csv", "ensemble/events_summary.csv"):
         assert (project / "results" / name).is_file()
     if precision == "float64":
         _reused_only_while_unchanged(jobs, project, config, selection)
@@ -1215,6 +1252,12 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     whole = {
         f: darsia.read_phase_maps(folder / f.session / f.name) for f in one.frames["r1"]
     }
+    measurements = {
+        f: json.loads((folder / f.session / f.name / "result.json").read_text())[
+            "measurements"
+        ]
+        for f in one.frames["r1"]
+    }
     again = project / "config-again.toml"
     again.write_text(
         config.read_text().replace('results = "results"', 'results = "again"')
@@ -1248,6 +1291,10 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
         resumed = darsia.read_phase_maps(folder / frame.session / frame.name)
         for name, array in maps.items():
             np.testing.assert_array_equal(resumed[name], array)
+        record = json.loads(
+            (folder / frame.session / frame.name / "result.json").read_text()
+        )
+        assert record["measurements"] == measurements[frame]
 
 
 def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
@@ -1712,3 +1759,84 @@ def test_a_job_without_a_fit_run_or_the_reference_run_is_refused(tmp_path):
     alone = Selection({"r1": frames["r1"]}, selection.sessions)
     with pytest.raises(ValueError, match=r"distances needs run\(s\) \['r2'\]"):
         create_job(jobs, (comparison.DISTANCES,), alone, config)
+
+
+
+EXPERT_TABLES = """
+[[roi]]
+name = "upper_right"
+shape = "label"
+label_index = 3
+
+[expert_knowledge]
+no_concentration_aq = ["upper_right"]
+no_saturation_g = ["upper_right"]
+"""
+"""No CO2 in the upper right sand layer (raw label 3)."""
+
+
+def test_expert_knowledge_keeps_co2_out_of_a_region_of_the_phase_maps(
+    tmp_path, monkeypatch
+):
+    """A run's expert knowledge that names a label region in no_concentration_aq and
+    no_saturation_g leaves no CO2 there in its phase maps, decided before the phase
+    rules and the free-gas allocation: the region is water with no free gas. Each
+    phase map records the CO2 area the model saw there, and CO2 elsewhere stays."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float32")
+    config.write_text(  # the first run alone, the one fit run
+        config.read_text().replace('fit = ["r1", "r2"]', 'fit = ["r1"]')
+    )
+    monkeypatch.chdir(project)
+    one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    early = setup.STEPS + (
+        calibration.PHASE_MODEL,
+        calibration.DISPLACED_VOLUME,
+        calibration.OVERFLOW,
+        calibration.PHASE_MAPS,
+    )
+    _run(create_job(tmp_path / "jobs", early, one, config))
+    limited = project / "config-limited.toml"
+    limited.write_text(
+        config.read_text().replace('results = "results"', 'results = "limited"')
+        + EXPERT_TABLES
+    )
+    _run(create_job(tmp_path / "limited-jobs", early, one, limited))
+    labels = darsia.imread(project / "limited" / "rig" / "r1" / "labels.npz").img
+    region = labels == 3
+    co2_phases = (darsia.PhaseLabel.DISSOLVED, darsia.PhaseLabel.GAS)
+    seen_in_plain = seen_in_record = 0.0
+    for frame in one.frames["r1"]:
+        plain = darsia.read_phase_maps(
+            project / "results" / "phase-maps" / "r1" / frame.session / frame.name
+        )
+        folder = project / "limited" / "phase-maps" / "r1" / frame.session / frame.name
+        maps = darsia.read_phase_maps(folder)
+        assert not np.isin(maps["labels"][region], co2_phases).any()
+        assert not maps["co2"][region].any()
+        assert np.all(np.nan_to_num(maps["saturation"][region]) == 0)
+        record = json.loads((folder / "result.json").read_text())["measurements"]
+        removed = record["expert_knowledge"]
+        assert set(removed) == {"co2_area_mm2", "gas_area_mm2"}
+        if np.isin(plain["labels"][region], co2_phases).any():
+            assert removed["co2_area_mm2"] > 0
+        seen_in_plain += np.isin(plain["labels"][region], co2_phases).sum()
+        seen_in_record += removed["co2_area_mm2"]
+        plain_record = json.loads(
+            (
+                project
+                / "results"
+                / "phase-maps"
+                / "r1"
+                / frame.session
+                / frame.name
+                / "result.json"
+            ).read_text()
+        )["measurements"]
+        assert "expert_knowledge" not in plain_record
+    assert seen_in_plain > 0 and seen_in_record > 0  # the region held CO2 before
+    last = one.frames["r1"][-1]
+    maps = darsia.read_phase_maps(
+        project / "limited" / "phase-maps" / "r1" / last.session / last.name
+    )
+    assert np.isin(maps["labels"][~region], co2_phases).any()  # CO2 elsewhere stays
