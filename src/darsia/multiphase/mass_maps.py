@@ -533,6 +533,35 @@ class MassCopy:
         shape = geometry.domain.shape
         self.cells = darsia.metric_cells(shape, geometry.dimensions, settings.copy_mm)
         """The cells (:func:`darsia.metric_cells`)."""
+        self._geometry(geometry, (settings.copy_mm / 1000) ** 2)
+
+    @classmethod
+    def from_cells(
+        cls,
+        geometry: RunGeometry,
+        cells: darsia.MetricCells,
+        extent: tuple[float, float, float, float],
+    ) -> "MassCopy":
+        """Copy onto an explicit shared grid with the same scientific reducers.
+
+        This also supports rectangular native cells. A known, counted pore
+        volume outside that grid is refused rather than silently losing mass.
+        The ordinary square-cell constructor retains its original arithmetic.
+        """
+        if cells.index.size != geometry.domain.size:
+            raise ValueError("The copy's cells must identify every source pixel.")
+        outside = cells.index.reshape(geometry.domain.shape) < 0
+        if np.any(outside & geometry.counted & (geometry.pore_volume_m3 > 0)):
+            raise ValueError("Counted pore volume lies outside the export cells.")
+        result = cls.__new__(cls)
+        result.cells = cells
+        result.extent = tuple(float(v) for v in extent)
+        area = float(np.prod(np.asarray(cells.dimensions, float) / cells.shape))
+        result._geometry(geometry, area)
+        return result
+
+    def _geometry(self, geometry: RunGeometry, cell_area: float) -> None:
+        """Set up the common pore-volume and area reducers without copying maps."""
         self.volume_l = np.asarray(geometry.pore_volume_m3, np.float64) * 1000
         """Pore volume [L] of each pixel."""
         self.area_m2 = np.where(geometry.domain, geometry.pixel_area_m2, 0.0)
@@ -541,7 +570,7 @@ class MassCopy:
         self.static = {
             "pore_volume_l": darsia.cell_sums(self.cells, self.volume_l),
             "domain_area_m2": domain_area,
-            "domain_area_fraction": domain_area / (settings.copy_mm / 1000) ** 2,
+            "domain_area_fraction": domain_area / cell_area,
         }
         """Pore volume [L], domain area [m2] and its share of the cell's area, per
         cell."""
