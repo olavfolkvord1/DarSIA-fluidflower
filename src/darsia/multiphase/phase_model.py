@@ -339,3 +339,53 @@ def phase_probabilities(
     co2[support == 0] = np.nan
     gas[support == 0] = np.nan
     return co2, gas
+
+
+def limit_probabilities(
+    co2: np.ndarray,
+    gas: np.ndarray,
+    keep_co2: np.ndarray | None = None,
+    keep_gas: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A frame's phase probabilities limited by expert knowledge.
+
+    Where no CO2 may be (outside ``keep_co2``) both probabilities are zero, so the
+    phase rules see water there; where no free gas may be (outside ``keep_gas``)
+    the gas-within-CO2 probability is zero, so CO2 there is dissolved. Outside the
+    features' support the probabilities stay unknown (NaN). Without a limit the
+    probabilities are returned as given.
+
+    Parameters
+    ----------
+    co2, gas : array
+        CO2-presence and gas-within-CO2 probabilities of shape (rows, cols)
+        (:func:`phase_probabilities`).
+    keep_co2, keep_gas : array, optional
+        Where CO2, dissolved or as gas, and where free gas may be, of shape
+        (rows, cols), e.g. an expert-knowledge adapter's masks of
+        ``concentration_aq`` and ``saturation_g``; None limits nothing.
+
+    Returns
+    -------
+    co2, gas : array
+        The limited probabilities in their dtype, new arrays where limited.
+
+    Raises
+    ------
+    ValueError
+        If a limit is not of the probabilities' shape.
+
+    """
+    if keep_co2 is None and keep_gas is None:
+        return co2, gas
+    for keep in (keep_co2, keep_gas):
+        if keep is not None and keep.shape != co2.shape:
+            raise ValueError(
+                f"A limit of shape {keep.shape} does not fit probabilities of "
+                f"shape {co2.shape}."
+            )
+    no_co2 = np.zeros(co2.shape, bool) if keep_co2 is None else ~keep_co2
+    no_gas = no_co2 if keep_gas is None else no_co2 | ~keep_gas
+    co2 = np.where(no_co2 & ~np.isnan(co2), co2.dtype.type(0), co2)
+    gas = np.where(no_gas & ~np.isnan(gas), gas.dtype.type(0), gas)
+    return co2, gas
