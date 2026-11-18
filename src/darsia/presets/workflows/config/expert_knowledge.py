@@ -82,7 +82,41 @@ class ExpertKnowledgeConfig:
         self, path: Path | list[Path], roi_registry: "RoiRegistry | None" = None
     ) -> "ExpertKnowledgeConfig":
         sec = _get_section_from_toml(path, "expert_knowledge")
+        return self._read(sec, roi_registry)
 
+    @classmethod
+    def from_table(
+        cls, sec: dict, roi_registry: "RoiRegistry | None" = None
+    ) -> "ExpertKnowledgeConfig":
+        """The configuration of an ``[expert_knowledge]`` table already read, e.g.
+        from a job's merged configuration tables, by the same rules as
+        :meth:`load`.
+
+        Parameters
+        ----------
+        sec : dict
+            The ``[expert_knowledge]`` table.
+        roi_registry : RoiRegistry, optional
+            The registry its ROI keys are resolved in; needed when it names any.
+
+        Returns
+        -------
+            The configuration.
+
+        Raises
+        ------
+        ValueError
+            If a key list is not a list of strings, or keys are named without a
+            registry.
+        KeyError
+            If a named ROI is not in the registry.
+        """
+        return cls()._read(sec, roi_registry)
+
+    def _read(
+        self, sec: dict, roi_registry: "RoiRegistry | None"
+    ) -> "ExpertKnowledgeConfig":
+        """Set and check the fields from the section's table."""
         self.saturation_g = _get_key(sec, "saturation_g", required=False, default=[])
         self.concentration_aq = _get_key(
             sec, "concentration_aq", required=False, default=[]
