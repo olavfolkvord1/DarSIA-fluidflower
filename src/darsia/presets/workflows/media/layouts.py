@@ -26,10 +26,10 @@ import cv2
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
 from matplotlib.font_manager import FontProperties
 from matplotlib.lines import Line2D
 
+from darsia.presets.workflows.media.panels import colour_norm
 from darsia.presets.workflows.media.style import (
     PIXEL_DPI,
     FigureStyle,
@@ -159,21 +159,35 @@ def graph_key(font_px: float, style: FigureStyle, columns: int = 1) -> np.ndarra
 
 @lru_cache(maxsize=32)
 def colour_key(
-    limit: float, label: str, height: int, font_px: float, colour_map: str
+    limit: float,
+    label: str,
+    height: int,
+    font_px: float,
+    colour_map: str,
+    normalization: str = "linear",
+    over_range: str | None = None,
 ) -> np.ndarray:
     """A map's key: a thin vertical bar of ``colour_map`` from 0 to ``limit`` with
     three ticks and ``label`` above, on a dark backing; RGBA pixels."""
     width = int(round(font_px * 4.6))
-    ticks = [0.0, limit / 2, limit]
+    ticks = [0.0, limit / (4 if normalization == "sqrt" else 2), limit]
     figure = canvas((width, int(height)), constrained=False)
     figure.patch.set_facecolor((0, 0, 0, 0.55))
     left, bar_w = 0.5 * font_px / width, max(6, round(font_px * 0.8)) / width
     top, bottom = 1.9 * font_px / height, 0.8 * font_px / height
     axis = figure.add_axes([left, bottom, bar_w, 1 - top - bottom])
+    colours = colormaps[colour_map]
+    if over_range is not None:
+        colours = colours.with_extremes(over=over_range)
     mappable = ScalarMappable(
-        norm=Normalize(0.0, float(limit)), cmap=colormaps[colour_map]
+        norm=colour_norm(float(limit), normalization), cmap=colours
     )
-    bar = figure.colorbar(mappable, cax=axis, ticks=ticks)
+    bar = figure.colorbar(
+        mappable,
+        cax=axis,
+        ticks=ticks,
+        extend="max" if over_range is not None else "neither",
+    )
     bar.ax.tick_params(labelsize=_points(font_px), colors="white", length=2)
     bar.ax.set_yticklabels([f"{value:g}" for value in ticks])
     bar.outline.set_edgecolor("white")
@@ -229,6 +243,177 @@ def _place(frame: np.ndarray, cell, tile, is_held: bool, empty) -> None:
 
 
 @dataclass(frozen=True)
+class SideBySideLayout:
+    """Two equal panels, with a separate colour key and room for captions."""
+
+    size: tuple
+    cells: tuple
+    key: tuple
+
+
+def paired_grid_layout(size, panel_size, key_width: int) -> SideBySideLayout:
+    """Two unscaled grid panels and a key, padded only at the outer even edge."""
+    panel_w, panel_h = map(int, panel_size)
+    logical = 2 * panel_w + key_width, panel_h
+    encoded = tuple(value + value % 2 for value in logical)
+    if min(panel_w, panel_h, key_width) < 1 or tuple(size) != encoded:
+        raise ValueError(
+            "Paired-grid size must fit two logical panels and the key with even padding"
+        )
+    return SideBySideLayout(
+        encoded,
+        ((0, 0, panel_w, panel_h), (panel_w, 0, panel_w, panel_h)),
+        (2 * panel_w, 0, key_width, panel_h),
+    )
+
+
+def compose_paired_grid(
+    tiles,
+    names,
+    layout,
+    *,
+    lines,
+    style,
+    graph,
+    scale,
+    normalization="sqrt",
+    over_range=None,
+):
+    """Grid-sized photo and map with a separate physical colour bar; BGR pixels."""
+    if graph is not None or scale is None or normalization != "sqrt":
+        raise ValueError(
+            "The paired-grid layout needs a photograph and a sqrt mass map"
+        )
+    width, height = layout.size
+    frame = np.full((height, width, 3), 40, dtype=np.uint8)
+    for cell, (tile, is_held, _note) in zip(layout.cells, tiles):
+        _place(frame, cell, tile, is_held, bgr(style.empty))
+    x, _y, bar_width, logical_h = layout.key
+    bar = frame[:logical_h, x : x + bar_width]
+    bar[...] = 255
+    top, bottom = min(60, logical_h // 5), logical_h - min(30, logical_h // 10)
+    lut = (colormaps[style.colour_map](np.linspace(0, 1, 256))[:, :3] * 255).astype(
+        np.uint8
+    )[:, ::-1]
+    for y in range(top, bottom):
+        bar[y, 14 : min(44, bar_width)] = lut[int(255 * (bottom - y) / (bottom - top))]
+    for fraction in (0, 0.25, 0.5, 0.75, 1):
+        y = int(bottom - fraction * (bottom - top))
+        cv2.putText(
+            bar,
+            f"{fraction ** 2 * scale[0]:.1f}",
+            (48, y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.putText(
+        bar,
+        "g/m2",
+        (20, max(12, top - 16)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    # Captions are overlaid without resizing or cropping either logical panel.
+    font = max(10, min(18, logical_h * 0.024))
+    heading = text_image(
+        " · ".join(lines[:3]), font, backing=0.5, max_px=2 * layout.cells[0][2] - 16
+    )
+    blend(frame, heading, 8, 4)
+    for name, cell in zip(names, layout.cells):
+        label = text_image(name, font * 0.85, max_px=cell[2] - 16)
+        blend(frame, label, cell[0] + 8, logical_h - label.shape[0] - 8)
+    if len(lines) > 3:
+        note = text_image(lines[3], font * 0.65, max_px=2 * layout.cells[0][2] - 16)
+        blend(frame, note, 8, heading.shape[0] + 8)
+    return frame
+
+
+def side_by_side_layout(size, aspect: float) -> SideBySideLayout:
+    """Fit two panels of the same aspect horizontally without cropping them."""
+    width, height = (int(value) for value in size)
+    key_width = max(60, int(width * 0.08))
+    panel_w = min((width - key_width - SEPARATOR) // 2, int(height * 0.64 * aspect))
+    panel_h = int(panel_w / aspect)
+    if panel_w < 8 or panel_h < 8:
+        raise ValueError("The side-by-side panels do not fit this frame")
+    top = (height - panel_h) // 2
+    left = (width - key_width - 2 * panel_w - SEPARATOR) // 2
+    return SideBySideLayout(
+        (width, height),
+        (
+            (left, top, panel_w, panel_h),
+            (left + panel_w + SEPARATOR, top, panel_w, panel_h),
+        ),
+        (width - key_width, top, key_width, panel_h),
+    )
+
+
+def compose_side_by_side(
+    tiles,
+    names,
+    layout: SideBySideLayout,
+    *,
+    lines,
+    style: FigureStyle,
+    graph,
+    scale,
+    normalization="linear",
+    over_range=None,
+) -> np.ndarray:
+    """Two panels with visible source, contour and clipping captions; BGR pixels."""
+    width, height = layout.size
+    frame = np.empty((height, width, 3), np.uint8)
+    frame[...] = bgr(style.frame)
+    font = max(10.0, height * FONT_SHARE)
+    for number, (cell, (tile, is_held, note)) in enumerate(zip(layout.cells, tiles)):
+        x, y, cell_w, cell_h = cell
+        _place(frame, cell, tile, is_held, bgr(style.empty))
+        heading = text_image(names[number], font, bold=True, max_px=cell_w - 8)
+        blend(frame, heading, x + 4, y - heading.shape[0] - 4)
+        if note:
+            message = text_image(note, font * 0.8, max_px=cell_w - 8)
+            blend(frame, message, x + 4, y + cell_h - message.shape[0] - 4)
+        if number == graph:
+            key = graph_key(round(font, 1), style)
+            blend(frame, key, x + cell_w - key.shape[1] - 4, y + 4)
+    # Run and time above the panels; provenance and quantitative clipping below.
+    y = 4
+    for number, line in enumerate(lines):
+        if number == 3:
+            y = layout.cells[0][1] + layout.cells[0][3] + 8
+        message = text_image(
+            line,
+            font if number == 0 else font * 0.8,
+            bold=number == 0,
+            backing=0,
+            max_px=width - 16,
+        )
+        if y + message.shape[0] > height:
+            raise ValueError("The film captions do not fit; increase size_px")
+        blend(frame, message, 8, y)
+        y += message.shape[0] + 3
+    if scale is not None:
+        x, y, _width, key_h = layout.key
+        key = colour_key(
+            scale[0],
+            scale[1],
+            key_h,
+            font * 0.8,
+            style.colour_map,
+            normalization,
+            over_range,
+        )
+        blend(frame, key, x, y)
+    return frame
+
+
+@dataclass(frozen=True)
 class PyramidLayout:
     """Where a pyramid's cells (x, y, width, height) and free areas lie."""
 
@@ -276,6 +461,8 @@ def compose_pyramid(
     style: FigureStyle,
     graph: int | None,
     scale: tuple[float, str] | None,
+    normalization: str = "linear",
+    over_range: str | None = None,
 ) -> np.ndarray:
     """One pyramid frame; BGR pixels.
 
@@ -346,7 +533,15 @@ def compose_pyramid(
     room = right_y + right_h - below - 2 * margin
     bar_h = int(min(0.55 * layout.right_cell[3], room))
     if scale is not None and bar_h >= 4 * font:
-        bar = colour_key(float(scale[0]), scale[1], bar_h, font, style.colour_map)
+        bar = colour_key(
+            float(scale[0]),
+            scale[1],
+            bar_h,
+            font,
+            style.colour_map,
+            normalization,
+            over_range,
+        )
         blend(
             frame,
             bar,
@@ -432,6 +627,8 @@ def compose_grid(
     style: FigureStyle,
     graph: bool,
     scale: tuple[float, str] | None,
+    normalization: str = "linear",
+    over_range: str | None = None,
 ) -> np.ndarray:
     """One grid frame: every run's tile in its cell, named in its corner, and the
     title column; BGR pixels.
@@ -468,7 +665,15 @@ def compose_grid(
     key = None
     if scale is not None:
         bar_h = int(min(side_h * 0.35, height * 0.35))
-        key = colour_key(float(scale[0]), scale[1], bar_h, key_px, style.colour_map)
+        key = colour_key(
+            float(scale[0]),
+            scale[1],
+            bar_h,
+            key_px,
+            style.colour_map,
+            normalization,
+            over_range,
+        )
     elif graph:
         key = graph_key(key_px, style)
     if key is not None:

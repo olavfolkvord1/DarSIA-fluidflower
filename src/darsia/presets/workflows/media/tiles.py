@@ -13,6 +13,7 @@ that, and :func:`write_tile_index` lists a folder's tiles for the films
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ from darsia.presets.workflows.media.display_mean import (
     block_mean,
     depth_scaled,
     display_step,
+    mass_per_area,
     pooled_mean,
     shown_values,
 )
@@ -33,11 +35,18 @@ from darsia.presets.workflows.media.panels import (
     graph_tile,
     image_tile,
     map_tile,
+    outline_masks,
+    overlay_outlines,
     photograph,
     shared_axes,
     tile_size,
 )
 from darsia.presets.workflows.media.style import FigureStyle
+from darsia.presets.workflows.media.transfer import (
+    area_map,
+    divided_size,
+    stretched_photo,
+)
 
 IMAGE, GRAPH = "image", "graph"
 """Panel contents besides mass maps: the corrected image and the mass graph."""
@@ -82,9 +91,30 @@ class TileSettings:
     """The display grid's longest side, in cells (:func:`display_step`)."""
     colour_scale: float
     """The top of every map's fixed colour scale, in the maps' unit."""
-    graph_axes: tuple[tuple[float, float], tuple[float, float]] | None
-    """The graphs' time [h] and mass [g] limits, or None for limits shared over
-    the runs (:func:`shared_axes`)."""
+    graph_axes: tuple[tuple[float, float], tuple[float, float]] | None = None
+    """The graphs' time [h] and mass [g] limits, or None (by default, and in a
+    table without them) for limits shared over the runs (:func:`shared_axes`)."""
+    mass_quantity: Literal["pore-volume", "area"] = "pore-volume"
+    """Mass density per pore volume [g/L], or mass per measured area [g/m²]."""
+    normalization: Literal["linear", "sqrt"] = "linear"
+    """Fixed colour normalization; the scale and ticks keep the physical units."""
+    grid_divisor: int | None = None
+    """Optional integer grid reduction with area interpolation and exact panel size."""
+
+    def __post_init__(self):
+        """Refuse invalid fixed scales, quantities and normalizations."""
+        if not math.isfinite(self.colour_scale) or self.colour_scale <= 0:
+            raise ValueError("colour_scale must be finite and positive")
+        if self.mass_quantity not in ("pore-volume", "area"):
+            raise ValueError("mass_quantity must be pore-volume or area")
+        if self.normalization not in ("linear", "sqrt"):
+            raise ValueError("normalization must be linear or sqrt")
+        if self.grid_divisor is not None:
+            divided_size((self.grid_divisor, self.grid_divisor), self.grid_divisor)
+            if self.mass_quantity != "area" or self.normalization != "sqrt":
+                raise ValueError(
+                    "Grid-divided maps require area quantity and sqrt normalization"
+                )
 
 
 @dataclass(frozen=True)
@@ -101,6 +131,8 @@ class SandGeometry:
     """The rig's depth at each pixel."""
     pixel_area_m2: np.ndarray
     """Each pixel's area."""
+    swi: np.ndarray | None = None
+    """Irreducible water saturation per pixel, required for a gas contour."""
 
 
 @dataclass(frozen=True)
@@ -129,6 +161,8 @@ class Frame:
     """The free-gas saturation, for the depth-scaled mean."""
     sand: SandGeometry | None = None
     """The sand layers and pore space, for the depth-scaled mean."""
+    rules: np.ndarray | None = None
+    """Stored phase provenance, including explicitly allocated hidden gas bridges."""
 
 
 def graph_axes(
@@ -149,6 +183,7 @@ def draw_tile(
     rows: Sequence[Mapping] = (),
     axes=None,
     label_room: bool = False,
+    photograph_limits: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """One panel of one frame as a tile, and how it was drawn.
 
@@ -179,17 +214,140 @@ def draw_tile(
         depth), or a graph's ``label_room``.
 
     """
-    size = tile_size(frame.box, settings.width_px)
+    size = (
+        tile_size(frame.box, settings.width_px)
+        if settings.grid_divisor is None
+        else divided_size((frame.box[3], frame.box[2]), settings.grid_divisor)
+    )
     step = display_step(frame.shape, settings.display_cells)
     if panel.content == IMAGE:
-        photo = photograph(frame.image[::step, ::step], photograph_settings)
-        return image_tile(photo, frame.box, step, size), {}
+        direct = photograph_settings.transfer == "first-frame"
+        if direct:
+            if photograph_limits is None:
+                raise ValueError(
+                    "First-frame transfer requires the run's fixed photograph limits"
+                )
+            photo = stretched_photo(
+                frame.image,
+                size,
+                photograph_limits,
+                photograph_settings.gamma,
+                photograph_settings.invalid_grey,
+            )
+        else:
+            photo = photograph(frame.image[::step, ::step], photograph_settings)
+        outlines, drawn = [], {}
+        if photograph_settings.co2_outline or photograph_settings.gas_contour:
+            mass_area = None
+            if (
+                photograph_settings.co2_source == "mass"
+                and photograph_settings.co2_outline
+            ):
+                if frame.maps is None or frame.sand is None or frame.unit != "g/L":
+                    raise ValueError(
+                        "Mass outlines require stored g/L mass and measured geometry"
+                    )
+                mass_area = mass_per_area(
+                    frame.maps["mass"], frame.sand.pore_volume, frame.sand.pixel_area_m2
+                )
+            co2, gas = outline_masks(
+                frame.phase,
+                frame.saturation,
+                None if frame.sand is None else frame.sand.swi,
+                photograph_settings,
+                rules=frame.rules,
+                mass_area=mass_area,
+            )
+            outlines = [
+                (mask, colour)
+                for mask, colour in (
+                    (co2, photograph_settings.co2_colour),
+                    (gas, photograph_settings.gas_colour),
+                )
+                if mask is not None
+            ]
+            drawn = dict(
+                co2_outline=photograph_settings.co2_outline,
+                gas_contour=photograph_settings.gas_contour,
+                gas_contour_fraction=photograph_settings.gas_contour_fraction,
+                co2_colour=photograph_settings.co2_colour,
+                gas_colour=photograph_settings.gas_colour,
+            )
+            if photograph_settings.co2_source != "phase":
+                drawn["co2_source"] = photograph_settings.co2_source
+        if direct:
+            drawn.update(
+                photograph_transfer="first-frame",
+                photograph_limits=list(photograph_limits),
+                photograph_percentiles=list(photograph_settings.percentiles),
+                photograph_gamma=photograph_settings.gamma,
+            )
+            return (
+                overlay_outlines(
+                    photo,
+                    frame.box,
+                    outlines,
+                    photograph_settings.outline_width_pt,
+                    reduced_occupancy=True,
+                ),
+                drawn,
+            )
+        return (
+            image_tile(
+                photo,
+                frame.box,
+                step,
+                size,
+                outlines=outlines,
+                outline_width_pt=photograph_settings.outline_width_pt,
+            ),
+            drawn,
+        )
     if panel.content == GRAPH:
         room = LABEL_ROOM if label_room else 0.0
         tile = graph_tile(rows, frame.case, size, axes=axes, style=style, top_room=room)
         return tile, dict(label_room=label_room)
     values = shown_values(frame.maps[panel.content], frame.phase)
     drawn = dict(display_mean=panel.display_mean)
+    if settings.grid_divisor is not None and panel.display_mean != "none":
+        raise ValueError(
+            "Grid-divided maps use direct area interpolation without a depth mean"
+        )
+    if settings.grid_divisor is not None:
+        if frame.sand is None or frame.unit != "g/L":
+            raise ValueError(
+                "Grid-divided maps require stored g/L mass and measured geometry"
+            )
+        full = shown_values(
+            mass_per_area(values, frame.sand.pore_volume, frame.sand.pixel_area_m2),
+            frame.phase,
+        )
+        x, y, width, height = frame.box
+        shown_box = np.s_[y : y + height, x : x + width]
+        tile, shown, known = area_map(
+            full[shown_box],
+            frame.sand.pore_volume[shown_box],
+            size,
+            settings.colour_scale,
+            colour_map=style.colour_map,
+            no_value=style.no_value,
+            over_range=style.over_range,
+        )
+        count = int(known.sum())
+        clipped = int(np.count_nonzero(known & (shown > settings.colour_scale)))
+        drawn.update(
+            mass_quantity="area",
+            normalization="sqrt",
+            colour_scale=settings.colour_scale,
+            unit="g/m²",
+            over_range=style.over_range,
+            known_display_cells=count,
+            clipped_display_cells=clipped,
+            clipped_share=None if count == 0 else clipped / count,
+            grid_divisor=settings.grid_divisor,
+            logical_panel_size=list(size),
+        )
+        return tile, drawn
     if panel.display_mean == "depth":
         sand = frame.sand
         full, window_px, window_mm = depth_scaled(
@@ -202,10 +360,46 @@ def draw_tile(
             sand.depth_m,
             sand.pixel_area_m2,
         )
-        shown = pooled_mean(full, sand.pore_volume, step)
         drawn.update(window_px=window_px, window_mm=window_mm)
+        if settings.mass_quantity == "pore-volume":
+            shown = pooled_mean(full, sand.pore_volume, step)
     else:
         shown = block_mean(values, step)
+        full = values
+    unit = frame.unit
+    if settings.mass_quantity == "area":
+        if frame.sand is None:
+            raise ValueError(
+                "Mass per area requires the measured pore and pixel geometry"
+            )
+        if frame.unit != "g/L":
+            raise ValueError("Mass per area requires stored mass density in g/L")
+        full = shown_values(
+            mass_per_area(full, frame.sand.pore_volume, frame.sand.pixel_area_m2),
+            frame.phase,
+        )
+        shown = pooled_mean(full, frame.sand.pixel_area_m2, step)
+        unit = "g/m²"
+    enhanced = settings.mass_quantity == "area" or settings.normalization != "linear"
+    if enhanced:
+        x, y, width, height = frame.box
+        visible = shown[
+            y // step : math.ceil((y + height) / step),
+            x // step : math.ceil((x + width) / step),
+        ]
+        known = np.isfinite(visible)
+        count = int(known.sum())
+        clipped = int(np.count_nonzero(known & (visible > settings.colour_scale)))
+        drawn.update(
+            mass_quantity=settings.mass_quantity,
+            normalization=settings.normalization,
+            colour_scale=settings.colour_scale,
+            unit=unit,
+            over_range=style.over_range,
+            known_display_cells=count,
+            clipped_display_cells=clipped,
+            clipped_share=None if count == 0 else clipped / count,
+        )
     tile = map_tile(
         shown,
         frame.box,
@@ -213,8 +407,10 @@ def draw_tile(
         size,
         scale=settings.colour_scale,
         label=panel.label,
-        unit=frame.unit,
+        unit=unit,
         style=style,
+        normalization=settings.normalization,
+        show_over_range=enhanced,
     )
     return tile, drawn
 

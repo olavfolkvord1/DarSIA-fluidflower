@@ -22,8 +22,10 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 from matplotlib import colormaps, rc_context
+from matplotlib.colors import Normalize, PowerNorm, to_rgb, to_rgba
 
-from darsia.presets.workflows.media.style import FigureStyle, canvas, pixels
+from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule
+from darsia.presets.workflows.media.style import PIXEL_DPI, FigureStyle, canvas, pixels
 
 TEXT_PT = 10.0
 """Text size [points] around image and map tiles; colour-bar labels are a step
@@ -44,6 +46,95 @@ class PhotographSettings:
     """Camera RGB to linear sRGB: a pixel's row vector times this 3 x 3 matrix."""
     invalid_grey: int
     """Grey level (0 to 255) of pixels without a value."""
+    co2_outline: bool = False
+    """Draw the boundary of known dissolved CO2 and free gas."""
+    gas_contour: bool = False
+    """Draw gas whose saturation reaches ``gas_contour_fraction * (1 - Swi)``."""
+    gas_contour_fraction: float = 0.9
+    """Fraction of the available gas saturation, between zero and one."""
+    co2_colour: str = "white"
+    """The CO2 outline colour."""
+    gas_colour: str = "red"
+    """The gas contour colour, drawn over the CO2 outline."""
+    outline_width_pt: float = 1.0
+    """Both contours' width in points on the tile canvas."""
+    transfer: str = "srgb"
+    """Legacy camera-to-sRGB, or fixed-first-frame percentile/gamma display."""
+    percentiles: tuple[float, float] = (0.5, 99.5)
+    """Low and high percentiles measured once on the reduced first photograph."""
+    gamma: float = 2.2
+    """The divisor of the exponent for the percentile display transfer."""
+    co2_source: str = "phase"
+    """White contour: optical phase labels, or positive total mass per area."""
+
+    def __post_init__(self):
+        """Validate contour settings without changing the photograph transfer."""
+        if not math.isfinite(self.gas_contour_fraction) or not (
+            0 < self.gas_contour_fraction <= 1
+        ):
+            raise ValueError("gas_contour_fraction must be in (0, 1]")
+        if not math.isfinite(self.outline_width_pt) or self.outline_width_pt <= 0:
+            raise ValueError("outline_width_pt must be finite and positive")
+        for colour in (self.co2_colour, self.gas_colour):
+            to_rgba(colour)
+        if self.transfer not in ("srgb", "first-frame"):
+            raise ValueError("Photograph transfer must be srgb or first-frame")
+        if self.co2_source not in ("phase", "mass"):
+            raise ValueError("CO2 contour source must be phase or mass")
+        if not (0 <= self.percentiles[0] < self.percentiles[1] <= 100):
+            raise ValueError("Photograph percentiles must be ordered in [0, 100]")
+        if not math.isfinite(self.gamma) or self.gamma <= 0:
+            raise ValueError("Photograph gamma must be finite and positive")
+
+
+def outline_masks(
+    phase, saturation, swi, settings: PhotographSettings, *, rules=None, mass_area=None
+) -> tuple:
+    """Full-grid CO2 and gas masks; unknown labels or Swi never become gas.
+
+    A finite saturation reaches the gas threshold in a known CO2 pixel or an
+    explicitly marked gas bridge on known water, with finite ``0 <= Swi < 1``.
+    The white CO2 mask follows the configured optical or mass evidence. These display masks
+    never change stored labels, rules, saturation or masses.
+    """
+    if phase is None:
+        raise ValueError("Photo outlines require the stored phase labels")
+    co2 = (phase == PhaseLabel.DISSOLVED) | (phase == PhaseLabel.GAS)
+    optical = co2
+    if settings.co2_source == "mass" and settings.co2_outline:
+        if mass_area is None or np.shape(mass_area) != np.shape(phase):
+            raise ValueError("The mass CO2 outline requires matching mass per area")
+        co2 = (phase != PhaseLabel.UNKNOWN) & np.isfinite(mass_area) & (mass_area > 0)
+    gas = None
+    if settings.gas_contour:
+        if saturation is None or swi is None:
+            raise ValueError("The gas contour requires saturation and Swi")
+        swi = np.asarray(swi)
+        # Allocated gas can retain a dissolved phase label. Saturation, not the
+        # categorical gas label, decides this physical display threshold.
+        eligible = optical
+        if rules is not None:
+            rules = np.asarray(rules)
+            if rules.shape != np.shape(phase):
+                raise ValueError("Gas contour rules must match the phase grid")
+            eligible = optical | (
+                (phase == PhaseLabel.WATER) & (rules == PhaseRule.GAS_BRIDGE)
+            )
+        gas = eligible & np.isfinite(saturation)
+        gas &= np.isfinite(swi) & (swi >= 0) & (swi < 1)
+        gas &= saturation >= settings.gas_contour_fraction * (1 - swi)
+    return co2 if settings.co2_outline else None, gas
+
+
+def colour_norm(scale: float, normalization: str):
+    """The fixed colour normalization; ticks retain the physical map units."""
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("The colour scale must be finite and positive")
+    if normalization == "linear":
+        return Normalize(0, scale)
+    if normalization == "sqrt":
+        return PowerNorm(0.5, vmin=0, vmax=scale, clip=False)
+    raise ValueError("The colour normalization is linear or sqrt")
 
 
 def tile_size(box, width: int) -> tuple[int, int]:
@@ -96,7 +187,9 @@ def _view(axis, box, step: int) -> None:
     axis.set_ylim(bottom, top)
 
 
-def image_tile(photo: np.ndarray, box, step: int, size) -> np.ndarray:
+def image_tile(
+    photo: np.ndarray, box, step: int, size, *, outlines=(), outline_width_pt=1.0
+) -> np.ndarray:
     """A corrected image's tile: the photograph of the box's every ``step``-th
     pixel (:func:`photograph`) filling a ``size`` tile; RGB pixels."""
     figure = canvas(size)
@@ -111,7 +204,44 @@ def image_tile(photo: np.ndarray, box, step: int, size) -> np.ndarray:
         interpolation="antialiased",
     )
     axis.set_axis_off()
-    return pixels(figure)[..., :3]
+    tile = pixels(figure)[..., :3]
+    return overlay_outlines(tile, box, outlines, outline_width_pt)
+
+
+def overlay_outlines(tile, box, outlines, outline_width_pt, *, reduced_occupancy=False):
+    """Draw full-grid contour boundaries onto already transferred RGB pixels."""
+    # Mark the boundary before display reduction. Raster masks bound memory by
+    # grid size even for a fragmented mask, without a Python object per contour.
+    x, y, width, height = box
+    size = tile.shape[1], tile.shape[0]
+    stroke = max(1, round(outline_width_pt * PIXEL_DPI / 72))
+    kernel = np.ones((3, 3), np.uint8)
+    for mask, colour in outlines:
+        inside = np.asarray(mask, dtype=np.uint8)
+        if reduced_occupancy:
+            reduced = cv2.resize(
+                inside[y : y + height, x : x + width].astype(np.float32),
+                size,
+                interpolation=cv2.INTER_AREA,
+            )
+            contours, _ = cv2.findContours(
+                (reduced > 0).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
+            )
+            rgb = tuple(int(round(255 * value)) for value in to_rgb(colour))
+            cv2.drawContours(tile, contours, -1, rgb, stroke)
+            continue
+        eroded = cv2.erode(
+            inside, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        boundary = (inside - eroded)[y : y + height, x : x + width]
+        shown = cv2.resize(
+            boundary.astype(np.float32), size, interpolation=cv2.INTER_AREA
+        )
+        shown = cv2.dilate(
+            (shown > 0).astype(np.uint8), np.ones((stroke, stroke), np.uint8)
+        )
+        tile[shown != 0] = np.rint(255 * np.asarray(to_rgb(colour))).astype(np.uint8)
+    return tile
 
 
 def map_tile(
@@ -124,6 +254,8 @@ def map_tile(
     label: str,
     unit: str,
     style: FigureStyle,
+    normalization: str = "linear",
+    show_over_range: bool = False,
 ) -> np.ndarray:
     """A mass map's tile: its display values from 0 to ``scale`` in the style's
     colour map, cells without a value in its no-value colour; RGB pixels.
@@ -143,13 +275,14 @@ def map_tile(
             lambda _event: placed.append(axis.get_position(original=False).bounds),
         )
         colours = colormaps[style.colour_map].with_extremes(bad=style.no_value)
+        if show_over_range:
+            colours = colours.with_extremes(over=style.over_range)
         # Displayed in double precision, as our production displayed every map.
         shown = np.ma.masked_invalid(np.asarray(values, dtype=np.float64))
         mapped = axis.imshow(
             shown,
             cmap=colours,
-            vmin=0.0,
-            vmax=float(scale),
+            norm=colour_norm(float(scale), normalization),
             origin="upper",
             interpolation="nearest",
         )

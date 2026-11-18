@@ -71,6 +71,8 @@ class FigureStyle:
     """The line marking a graph's frame time."""
     curves: tuple[Curve, ...]
     """The curves of a mass graph, in drawing order."""
+    over_range: str = "#ff00ff"
+    """Distinct colour of values above an area or nonlinear map's fixed scale."""
 
 
 def bgr(colour: str) -> tuple[int, int, int]:

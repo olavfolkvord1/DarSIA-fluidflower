@@ -40,6 +40,22 @@ def display_step(shape, cells: int) -> int:
     return max(1, math.ceil(max(int(size) for size in shape) / int(cells)))
 
 
+def mass_per_area(values, pore_volume, pixel_area_m2) -> np.ndarray:
+    """Convert g/L of pore volume to g/m² using the measured cell geometry.
+
+    Zero pore volume means zero mass even without a density. Unknown density in
+    positive pore volume, unknown volume, and nonpositive or unknown area remain
+    unknown. This changes display values only, never the stored mass maps.
+    """
+    values, volume, area = np.broadcast_arrays(values, pore_volume, pixel_area_m2)
+    shown = np.full(values.shape, np.nan, dtype=np.float64)
+    geometry = np.isfinite(area) & (area > 0) & np.isfinite(volume) & (volume >= 0)
+    shown[geometry & (volume == 0)] = 0
+    known = geometry & (volume > 0) & np.isfinite(values)
+    shown[known] = values[known] * (1000 * volume[known] / area[known])
+    return shown
+
+
 def block_mean(values: np.ndarray, step: int) -> np.ndarray:
     """The mean of the finite values of each ``step`` x ``step`` block; NaN for a
     block without one.
