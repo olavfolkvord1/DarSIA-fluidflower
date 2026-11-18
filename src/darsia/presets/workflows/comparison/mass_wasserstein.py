@@ -47,7 +47,7 @@ table (the masses per domain are in g).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import numpy as np
@@ -181,6 +181,47 @@ class WassersteinDistance:
     expected_mass_kg: float = np.nan
     """Mass [kg] injected into the region by the time; NaN for a region without an
     injection of its own (a sand layer, the sand), and when missing."""
+
+
+@dataclass(frozen=True)
+class ComparedFrame:
+    """The selected image behind a run's comparison, without changing its time."""
+
+    case_id: str
+    """Session and image filename, separated by a slash."""
+    acquired_at: str
+    """Acquisition datetime in ISO format, preserving the protocol's time zone
+    when one is supplied; a naive datetime is not relabelled as UTC."""
+    elapsed_h: float
+    """Actual hours since this run's injection start."""
+
+
+def distance_rows(
+    distances: Sequence[WassersteinDistance],
+    frames: Mapping[str, ComparedFrame | None],
+) -> list[dict]:
+    """Distance table rows with both selected images and their actual times.
+
+    ``None`` explicitly denotes a run with no frame inside the comparison's
+    tolerance. Its image fields stay empty, including on a missing pair's row.
+    The signed offsets are actual acquisition time minus the comparison target,
+    in seconds. Numerical distances and their convergence status are unchanged.
+    """
+    rows = []
+    for distance in distances:
+        row = asdict(distance)
+        for side, run in enumerate((distance.run_1, distance.run_2), 1):
+            frame = frames[run]
+            if frame is None and distance.status != "missing":
+                raise ValueError(f"Distance of {run} has no selected image")
+            row[f"case_id_{side}"] = None if frame is None else frame.case_id
+            row[f"acquired_at_{side}"] = None if frame is None else frame.acquired_at
+            row[f"elapsed_{side}_h"] = None if frame is None else frame.elapsed_h
+            row[f"offset_{side}_s"] = (
+                None if frame is None else (frame.elapsed_h - distance.time_h) * 3600
+            )
+        rows.append(row)
+    return rows
 
 
 @dataclass(frozen=True)
