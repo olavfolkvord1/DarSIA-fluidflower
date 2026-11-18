@@ -188,3 +188,18 @@ def test_cell_sums_add_single_precision_values_in_double_precision():
     ]
     np.testing.assert_allclose(sums, expected, rtol=1e-15)
     assert sums.sum() == pytest.approx(values.astype(np.float64).sum(), rel=1e-15)
+
+
+def test_rectangular_cells_keep_measured_positions_and_mark_outside():
+    positions = darsia.GridPositions(
+        np.array([[0.5, 3.5], [1.0, 4.0]]),
+        np.array([[2.5, 0.5], [0.0, 1.0]]),
+        None,
+    )
+    cells = darsia.rectangular_cells(
+        (2, 2), [3.0, 4.0], (3, 2), (0.0, 4.0, 0.0, 3.0), positions
+    )
+    # Cells are 2m wide and 1m high, lower edges included, upper edges excluded.
+    np.testing.assert_array_equal(cells.index, [0, 5, 4, -1])
+    summed = darsia.cell_sums(cells, np.array([[1.0, 2.0], [3.0, 99.0]]))
+    np.testing.assert_array_equal(summed, [[1.0, 0.0], [0.0, 0.0], [3.0, 2.0]])

@@ -234,6 +234,76 @@ def placed_cells(
     )
 
 
+def rectangular_cells(
+    native_shape: tuple[int, int],
+    dimensions: Sequence[float],
+    shape: tuple[int, int],
+    extent: tuple[float, float, float, float],
+    positions: "darsia.GridPositions",
+    *,
+    boundary_tolerance_m: float = 0.0,
+) -> MetricCells:
+    """Assign measured pixel centres to a fixed rectangular cell grid.
+
+    The target is ``shape`` rows and columns over ``extent`` x0, x1, y0, y1
+    in metres. Its x and y pitches may differ, as for a native simulator canvas.
+    Cells are half-open from the lower left; rows in the returned grid start
+    at the top, just as :func:`metric_cells`. Outside or nonfinite positions get
+    index -1, so a caller must account for those pixels before reducing data.
+    Neither coordinates nor extensive values are interpolated or stretched.
+    A caller may supply a documented numerical boundary tolerance in metres:
+    positions within it of the outer frame join the nearest boundary cell.
+    This changes only the cell index, never a source coordinate or value. The
+    default is strict, with no tolerance; larger excursions remain outside.
+    """
+    rows, cols = (int(n) for n in native_shape)
+    target = tuple(int(n) for n in shape)
+    lengths = np.asarray(dimensions, dtype=float)
+    bounds = np.asarray(extent, dtype=float)
+    if rows <= 0 or cols <= 0 or len(target) != 2 or min(target) <= 0:
+        raise ValueError("Source and target cell grids need positive shapes.")
+    if lengths.shape != (2,) or not np.isfinite(lengths).all() or np.any(lengths <= 0):
+        raise ValueError("The source grid needs two positive finite dimensions.")
+    if bounds.shape != (4,) or not np.isfinite(bounds).all():
+        raise ValueError("The target extent needs four finite coordinates.")
+    x0, x1, y0, y1 = bounds
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("The target extent must have positive width and height.")
+    if not np.isfinite(boundary_tolerance_m) or boundary_tolerance_m < 0:
+        raise ValueError("The boundary tolerance must be finite and nonnegative.")
+    x, y = np.broadcast_arrays(positions.x, positions.y)
+    if x.shape != (rows, cols):
+        raise ValueError("Measured positions must match the source grid.")
+    inside = np.isfinite(x) & np.isfinite(y)
+    if boundary_tolerance_m:
+        inside &= (
+            (x >= x0 - boundary_tolerance_m)
+            & (x <= x1 + boundary_tolerance_m)
+            & (y >= y0 - boundary_tolerance_m)
+            & (y <= y1 + boundary_tolerance_m)
+        )
+    else:
+        inside &= (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+    # Convert in double precision without changing the recorded coordinates.
+    column = np.floor(
+        (np.where(inside, x, x0).astype(float) - x0) / ((x1 - x0) / target[1])
+    ).astype(np.int64)
+    row = np.floor(
+        (np.where(inside, y, y0).astype(float) - y0) / ((y1 - y0) / target[0])
+    ).astype(np.int64)
+    if boundary_tolerance_m:
+        column = np.clip(column, 0, target[1] - 1)
+        row = np.clip(row, 0, target[0] - 1)
+    else:
+        inside &= (column < target[1]) & (row < target[0])
+    return MetricCells(
+        shape=target,
+        dimensions=[float(y1 - y0), float(x1 - x0)],
+        index=np.where(inside, (target[0] - 1 - row) * target[1] + column, -1).ravel(),
+        pixel_area=float(np.prod(lengths / (rows, cols))),
+    )
+
+
 def _cell_sums(cells: MetricCells, values: np.ndarray) -> np.ndarray:
     """Sums per cell of values (pixels, channels), in their dtype and pixel order;
     a pixel without a cell (index -1) counts in none."""
