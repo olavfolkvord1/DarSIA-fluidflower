@@ -469,10 +469,16 @@ def read_events(path: Path) -> list[dict]:
         elapsed_h=float,
         after_injection_h=float,
         resolution_h=float,
+        domain_id=str,
+        component=str,
+        mass_g=float,
     )
     for row in rows:
         row.update(
-            {key: kind(row[key]) if row[key] else None for key, kind in kinds.items()}
+            {
+                key: kind(row[key]) if row.get(key) else None
+                for key, kind in kinds.items()
+            }
         )
     return rows
 
