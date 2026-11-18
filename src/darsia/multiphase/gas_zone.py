@@ -333,13 +333,16 @@ def _half_disc_dilation(source, radius_mm, pitch_mm):
     return result
 
 
-def _depth_margin(contour, depth_m, path, pitch_mm):
+def _depth_margin(contour, depth_m, path, pitch_mm, *, previous=None):
     """Union upward half-discs, quantised at the finer measured grid pitch.
 
     Rounding ties go up; the error is at most half that pixel pitch.
     The numerical resolution follows the grid; no rig depth is assumed.
     Unknown or nonpositive depth at either pixel grants no additional support.
     Only the unexpanded contour is used, preventing repeated margin growth.
+    For a growing contour on the same depth/path/pitch, ``previous`` holds
+    its prior bare and expanded masks. Only new bare sources need dilation;
+    diagnostics still describe the complete current bare contour.
     """
     depth = np.asarray(depth_m)
     quantum = float(min(pitch_mm))
@@ -362,8 +365,15 @@ def _depth_margin(contour, depth_m, path, pitch_mm):
         ),
         "added_pixels": 0,
     }
+    margin = contour.copy()
+    if previous is not None:
+        before, expanded = previous
+        margin |= expanded
+        sources &= ~before
+        values = 1000 * depth[sources]
     if not sources.any():
-        return contour.copy(), diagnostics
+        diagnostics["added_pixels"] = int((margin & ~contour).sum())
+        return margin, diagnostics
     levels = np.zeros(contour.shape, np.int64)
     # Larger radii than the grid diagonal are geometrically indistinguishable;
     # capping before conversion also avoids integer overflow on extreme depths.
@@ -372,7 +382,6 @@ def _depth_margin(contour, depth_m, path, pitch_mm):
     levels[sources] = np.floor(np.minimum(values / quantum, last_level) + 0.5).astype(
         np.int64
     )
-    margin = contour.copy()
     for level in np.unique(levels[sources]):
         if level > 0:
             margin |= _half_disc_dilation(
@@ -458,6 +467,7 @@ def gas_model_zones(
     seal_gas = np.zeros_like(gas)
     previous = np.zeros_like(gas)
     previous_bare = np.zeros_like(gas)
+    previous_expanded = None
     base = np.zeros_like(gas)
     observed, maximum, periods = {}, {}, {}
     for index, (date, frame) in enumerate(zip(dates, frames, strict=True)):
@@ -521,7 +531,18 @@ def gas_model_zones(
             _envelope(bodies, path, pitch_mm, settings) if lines else base
         )
         bare = previous_bare | rounded
-        expanded, margin_record = _depth_margin(bare, depth_m, path, pitch_mm)
+        expanded, margin_record = _depth_margin(
+            bare,
+            depth_m,
+            path,
+            pitch_mm,
+            previous=(
+                (previous_bare, previous_expanded)
+                if previous_expanded is not None
+                else None
+            ),
+        )
+        previous_expanded = expanded
         # Seal gas is preserved only after every shape operation. It cannot
         # seed smoothing, an injector route or a measured-depth margin.
         contour = previous | expanded | seal_gas
