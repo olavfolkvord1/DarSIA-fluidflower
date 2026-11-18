@@ -45,7 +45,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -66,6 +66,11 @@ from darsia.jobs.step import (
 )
 from darsia.multiphase.gas_allocation import injection_ports
 from darsia.multiphase.gas_model_cache import GasModelCache
+from darsia.multiphase.gas_zone_cache import GasZoneCache
+from darsia.presets.workflows.analysis.expert_knowledge import ExpertKnowledgeAdapter
+from darsia.presets.workflows.calibration.model_cache import model_cache_identity
+from darsia.presets.workflows.config.expert_knowledge import ExpertKnowledgeConfig
+from darsia.presets.workflows.config.roi_registry import RoiRegistry
 from darsia.presets.workflows.config.protocols import InjectionProtocolConfig
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.rig import Rig
@@ -78,6 +83,9 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+
+EXPERT = ("expert_knowledge", "roi")
+"""Named expert limits read by phase-map jobs."""
 
 READING = ("reading",)
 """The section of the sands' colour paths, which a step reads per run
@@ -594,6 +602,72 @@ def _phase_support(tables: Mapping) -> str | None:
     return tables.get("labeling", {}).get("sand_map", {}).get("phase_support")
 
 
+def expert_limits(
+    tables: Mapping, rig: Rig
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Where a run's expert knowledge lets CO2, dissolved or as gas, and free gas
+    be on its grid.
+
+    The run's ``[expert_knowledge]`` table and its ``[[roi]]`` regions, read as the
+    analysis reads them (:class:`ExpertKnowledgeConfig`, :class:`RoiRegistry`),
+    become the masks of ``concentration_aq`` and ``saturation_g`` of an
+    :class:`ExpertKnowledgeAdapter` on the rig's labels and facies; a region named
+    in a ``no_`` list is excluded, a positive list keeps only its regions.
+
+    Parameters
+    ----------
+    tables : Mapping
+        The run's configuration tables (:func:`run_tables`).
+    rig : Rig
+        The run's rig, whose facies give the grid.
+
+    Returns
+    -------
+    keep_co2, keep_gas : array or None
+        Where CO2 and where free gas may be; None where nothing limits it, e.g.
+        without the table.
+
+    Raises
+    ------
+    ValueError
+        If the table names phase maps as dynamic expert knowledge, which the phase
+        maps cannot read, since they are what it limits.
+
+    """
+    section = tables.get("expert_knowledge")
+    if not section:
+        return None, None
+    registry = RoiRegistry.from_entries(tables.get("roi", []))
+    config = ExpertKnowledgeConfig.from_table(section, registry)
+    if config.phase_maps is not None:
+        raise ValueError(
+            "The phase maps cannot be limited by phase maps: [expert_knowledge] "
+            "phase_maps is the analysis' dynamic expert knowledge."
+        )
+    adapter = ExpertKnowledgeAdapter.from_config(
+        config, registry, labels_image=rig.labels, facies_image=rig.facies
+    )
+    return (
+        adapter.mask_for(rig.facies, "concentration_aq"),
+        adapter.mask_for(rig.facies, "saturation_g"),
+    )
+
+
+def _expert_limited(tables: Mapping, run: str | None, context=None) -> int:
+    """One where a run's expert knowledge names any region, whose two masks the
+    phase maps hold; else none."""
+    if run is None:
+        return 0
+    section = run_tables(tables, run).get("expert_knowledge") or {}
+    keys = (
+        "saturation_g",
+        "concentration_aq",
+        "no_saturation_g",
+        "no_concentration_aq",
+    )
+    return int(any(section.get(key) for key in keys))
+
+
 def _phase_map_files(tables: Mapping, project, folders) -> list[str]:
     """The run's protocols and its phase support, if it names one."""
     support = _phase_support(tables)
@@ -721,8 +795,8 @@ def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
     # Hidden bridge profiles/transition (float32), mask, centreline coordinates
     # plus coupled threshold coefficients/fixed fractions/capacity scales.
     # Active meeting fallback adds a seed copy and component-selection overlap.
-    allocations = (20 * count + 51)
-    return shared + max(building, allocations) * (1 + _variants(tables, run))
+    allocations = (20 * count + 51) * (1 + _variants(tables, run))
+    return shared + max(building, allocations)
 
 
 class _Probabilities(Sequence):
@@ -731,16 +805,37 @@ class _Probabilities(Sequence):
     it (:func:`previous_acquisition`), read through the rig's corrections as the
     corrected-image step reads a photo. With the run's phase support, the current
     image, the previous image and the baseline are read inside it, the rest
-    unknown (NaN), as our production's phase step read them."""
+    unknown (NaN), as our production's phase step read them.
+
+    With the run's expert knowledge (:func:`expert_limits`) the probabilities are
+    limited to where CO2 and free gas may be (:func:`darsia.limit_probabilities`),
+    and each frame's area that the model saw as CO2 and as free gas outside them
+    is noted by index (``removed``)."""
 
     def __init__(
-        self, ctx, model, grid, frames, kept: int, rig: Rig, support=None
+        self,
+        ctx,
+        model,
+        grid,
+        frames,
+        kept: int,
+        rig: Rig,
+        support=None,
+        limits: tuple[np.ndarray | None, np.ndarray | None] = (None, None),
+        co2_threshold: float | None = None,
     ) -> None:
         self.ctx, self.model, self.grid, self.frames = ctx, model, grid, frames
         self.rig, self.support = rig, support
+        self.limits, self.co2_threshold = limits, co2_threshold
+        self.removed: dict[int, dict[str, float]] = {}
         self.baseline = _within(grid.rig.baseline.img, support)
         self.image = lru_cache(maxsize=kept + 1)(self._image)
         self.probabilities = lru_cache(maxsize=kept)(self._probabilities)
+
+    @property
+    def limited(self) -> bool:
+        """Whether expert knowledge limits the probabilities."""
+        return any(limit is not None for limit in self.limits)
 
     def _image(self, index: int) -> np.ndarray:
         image = self.ctx.read("corrected-image", read_image, frame=self.frames[index])
@@ -756,16 +851,36 @@ class _Probabilities(Sequence):
         )
         if previous is None:
             return None
-        return self.rig.read_image(previous).img
+        return corrected_photo(self.rig, previous)[0].img
 
     def _probabilities(self, index: int):
-        return darsia.phase_probabilities(
+        found = darsia.phase_probabilities(
             self.model,
             self.image(index),
             self.baseline,
             _within(self._previous(index), self.support),
             pixel_size_mm=self.grid.pixel_mm,
         )
+        if not self.limited:
+            return found
+        (co2, gas), (keep_co2, keep_gas) = found, self.limits
+        seen = self.grid.domain & (co2 >= self.co2_threshold)
+        seen_gas = seen & (gas >= self.model.gas_threshold)
+        no_co2 = np.zeros(co2.shape, bool) if keep_co2 is None else ~keep_co2
+        no_gas = no_co2 if keep_gas is None else no_co2 | ~keep_gas
+        area = self.grid.pixel_area_mm2
+        self.removed[index] = {
+            "co2_area_mm2": float(np.sum(area, where=seen & no_co2)),
+            "gas_area_mm2": float(np.sum(area, where=seen_gas & no_gas)),
+        }
+        return darsia.limit_probabilities(co2, gas, keep_co2, keep_gas)
+
+    def removed_at(self, index: int) -> dict[str, float]:
+        """The CO2 and free-gas area [mm2] that the model saw in a frame where its
+        run's expert knowledge lets none be, before the phase rules."""
+        if index not in self.removed:
+            self.probabilities(index)
+        return self.removed[index]
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -773,9 +888,20 @@ class _Probabilities(Sequence):
     def __getitem__(self, index):
         return self.probabilities(int(index))
 
+    def clear(self) -> None:
+        """Release the model's temporal arrays after the complete prepass."""
+        self.probabilities.cache_clear()
+        self.image.cache_clear()
+
 
 def _phase_maps(ctx: StepContext) -> None:
-    """The run's phase maps in time order, resumed at its first missing frame.
+    """One model pass and prefix-zone pass, then cached allocation in time order.
+
+    Resume replays every selected frame to prepare the same prefix zones, then
+    allocates from the first missing frame. Both private local caches are shared
+    by primary and held-out volumes. Model frames are retained with exact local
+    provenance for explicit later reuse; allocation-dependent zones are removed
+    when this invocation ends.
 
     Raises
     ------
@@ -811,36 +937,129 @@ def _phase_maps(ctx: StepContext) -> None:
     support = grid_mask(
         run_tables(ctx.tables, run), "phase_support", grid.rig.baseline.img.shape
     )
-    probabilities = _Probabilities(ctx, model, grid, frames, kept, rig, support)
+    limits = expert_limits(run_tables(ctx.tables, run), grid.rig)
+    limited = any(limit is not None for limit in limits)
+    probabilities = _Probabilities(
+        ctx,
+        model,
+        grid,
+        frames,
+        kept,
+        rig,
+        support,
+        limits,
+        rules.co2_threshold if limited else None,
+    )
+    models = darsia.gas_model_frames(
+        probabilities,
+        dates,
+        grid.rig.facies,
+        grid.domain,
+        grid.pixel_area_mm2,
+        grid.permeability,
+        experiment.injection_protocol,
+        rules,
+        grid.chart,
+        gas_threshold=model.gas_threshold,
 
-    def maps(held_out):
-        volumes = ctx.read("overflow", lambda f: darsia.read_frame_volumes(f, held_out))
-        return darsia.free_gas(
-            probabilities,
+    )
+    previous_photos = [
+        previous_acquisition(
+            ctx.photo(run, frame),
+            list(ctx.locations.sessions[run].values()),
+            experiment.is_blacklisted,
+        )
+        for frame in frames
+    ]
+    identity = model_cache_identity(ctx, frames, dates, previous_photos)
+
+    def checked_models():
+        yield from models
+        after = [
+            previous_acquisition(
+                ctx.photo(run, frame),
+                list(ctx.locations.sessions[run].values()),
+                experiment.is_blacklisted,
+            )
+            for frame in frames
+        ]
+        if model_cache_identity(ctx, frames, dates, after) != identity:
+            raise ValueError("Model cache provenance changed during the model pass.")
+
+    with (
+        GasModelCache(
+            len(frames), retain=True, identity=identity, revision=ctx.revision
+        ) as cached,
+        GasZoneCache(len(frames)) as zones,
+    ):
+        print(f"Retained model cache: {cached.retained_path}", flush=True)
+        prepared_zones = darsia.gas_model_zones(
+            cached.store(checked_models()),
             dates,
             grid.rig.facies,
             grid.domain,
-            grid.pixel_area_mm2,
             grid.permeability,
             experiment.injection_protocol,
             rules,
-            grid.geometry.pore_volume_m3,
-            grid.geometry.swi,
-            [volumes[frame_key(frame)].volume_m3 for frame in frames],
             settings["gas_allocation"],
-            grid.chart,
-            gas_threshold=model.gas_threshold,
-            start=start,
+
+            chart=grid.chart,
             depth_m=grid.rig.depth.img,
         )
+        for _ in zones.store(prepared_zones):
+            del _
+        probabilities.clear()
+        allocations = {}
 
-    for frame, *found in zip(frames[start:], *(maps(v) for v in variants)):
+        def maps(held_out):
+            volumes = ctx.read(
+                "overflow", lambda f: darsia.read_frame_volumes(f, held_out)
+            )
+            return darsia.free_gas(
+                probabilities,
+                dates,
+                grid.rig.facies,
+                grid.domain,
+                grid.pixel_area_mm2,
+                grid.permeability,
+                experiment.injection_protocol,
+                rules,
+                grid.geometry.pore_volume_m3,
+                grid.geometry.swi,
+                [volumes[frame_key(frame)].volume_m3 for frame in frames],
+                settings["gas_allocation"],
+                grid.chart,
+                gas_threshold=model.gas_threshold,
+                start=start,
+                model_frames=cached,
+                zones=zones,
+                depth_m=grid.rig.depth.img,
 
-        def write(folder, found=found):
-            for held_out, arrays in zip(variants, found):
-                darsia.write_phase_maps(folder, *arrays[:4], held_out=held_out)
+                record=lambda index, value: allocations.__setitem__(
+                    held_out, asdict(value)
+                ),
+            )
 
-        ctx.publish(write, frame=frame)
+        found_maps = zip(frames[start:], *(maps(v) for v in variants))
+        for index, (frame, *found) in enumerate(found_maps, start):
+
+            def write(folder, found=found):
+                for held_out, arrays in zip(variants, found):
+                    darsia.write_phase_maps(folder, *arrays, held_out=held_out)
+
+            measurements = {
+                "gas_allocation": {
+                    "primary": allocations[None],
+                    "without": {
+                        run: value
+                        for run, value in allocations.items()
+                        if run is not None
+                    },
+                }
+            }
+            if limited:
+                measurements["expert_knowledge"] = probabilities.removed_at(index)
+            ctx.publish(write, frame=frame, measurements=measurements)
 
 
 class _RunFrames(Sequence):
@@ -1105,6 +1324,7 @@ PHASE_MAPS = Step(
             Term(_variants, grid=4.0, grid_bytes=80.0),
             Term(_supported, grid=6.0),
             Term(_injection_map_bytes, grid_bytes=1.0),
+            Term(_expert_limited, grid_bytes=2.0),
         ),
         photos=1,
         photo_bytes=darsia.decoded_bytes,
@@ -1117,7 +1337,7 @@ PHASE_MAPS = Step(
         "material": MaterialSettings,
     },
     each=Each.FRAME,
-    sections=EXPERIMENT,
+    sections=EXPERIMENT + EXPERT,
     files=_phase_map_files,
 )
 """Each frame's phase maps and free-gas saturation (R4)."""
