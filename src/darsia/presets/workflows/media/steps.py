@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import darsia
-from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext
+from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext, Term
 from darsia.presets.workflows.analysis.domain_mass import read_domain_mass
 from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
 from darsia.presets.workflows.calibration.steps import (
@@ -32,8 +32,9 @@ from darsia.presets.workflows.calibration.steps import (
 )
 from darsia.presets.workflows.media import tiles as media
 from darsia.presets.workflows.media.films import FilmSettings, write_films
-from darsia.presets.workflows.media.panels import PhotographSettings
+from darsia.presets.workflows.media.panels import PhotographSettings, tile_size
 from darsia.presets.workflows.media.style import FigureStyle
+from darsia.presets.workflows.media.transfer import divided_size, first_frame_limits
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
@@ -84,7 +85,7 @@ def drawings(settings: MediaSettings) -> list[dict]:
         for panel in film.panels:
             if panel.content not in (media.IMAGE, media.GRAPH, *MAPS):
                 raise ValueError(f"A film shows no {panel.content}; maps: {MAPS}.")
-            room = panel.content == media.GRAPH and film.layout == "grid"
+            room = panel.content == media.GRAPH and film.layout in ("grid", "single")
             drawing = dict(panel=asdict(panel), label_room=room)
             if drawing not in found:
                 found.append(drawing)
@@ -146,6 +147,7 @@ def _film_tiles(ctx: StepContext) -> None:
         grid.geometry.pore_volume_m3,
         rig.depth.img,
         rig.pixel_area.img,
+        grid.geometry.swi,
     )
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     shape = rig.facies.img.shape
@@ -153,7 +155,13 @@ def _film_tiles(ctx: StepContext) -> None:
     def write(folder):
         parts = [Path(folder) / f"{k:02d}" for k in range(len(found))]
         rows = [[] for _ in found]
-        for frame in ctx.task.frames:
+        photograph_limits = None
+        frames = ctx.task.frames
+        if settings["photograph"].transfer == "first-frame":
+            frames = sorted(
+                frames, key=lambda frame: experiment.get_datetime(ctx.photo(run, frame))
+            )
+        for frame in frames:
             maps = ctx.read("mass-maps", darsia.read_mass_maps, frame=frame)
             phase = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
             date = experiment.get_datetime(ctx.photo(run, frame))
@@ -170,7 +178,20 @@ def _film_tiles(ctx: StepContext) -> None:
                 phase=phase["labels"],
                 saturation=phase["saturation"],
                 sand=sand,
+                rules=phase["rules"],
             )
+            if (
+                settings["photograph"].transfer == "first-frame"
+                and photograph_limits is None
+            ):
+                size = (
+                    tile_size(shown.box, tile_settings.width_px)
+                    if tile_settings.grid_divisor is None
+                    else divided_size(shape, tile_settings.grid_divisor)
+                )
+                photograph_limits = first_frame_limits(
+                    shown.image, size, settings["photograph"].percentiles
+                )
             for k, (panel, drawing) in enumerate(zip(panels, found)):
                 tile, drawn = media.draw_tile(
                     panel,
@@ -181,6 +202,7 @@ def _film_tiles(ctx: StepContext) -> None:
                     rows=graphs[run],
                     axes=axes,
                     label_room=drawing["label_room"],
+                    photograph_limits=photograph_limits,
                 )
                 rows[k].append(media.save_tile(parts[k], shown, tile, drawn))
         for part, made in zip(parts, rows):
@@ -207,6 +229,39 @@ def _film_names(selection: Selection, tables: Mapping) -> tuple[str, ...]:
     return tuple(film["name"] for film in tables["media"]["films"])
 
 
+def _display_bytes(tables, _run, context):
+    """Additional area conversion and raster-overlay arrays, in bytes.
+
+    Area mode reserves eight float64 grid arrays for conversion, validity and
+    weighted block pooling. Overlay masks/boundary reduction need twelve bytes
+    per grid cell plus twelve per tile pixel; no contour objects are retained.
+    The two branches run sequentially, so their maximum is reserved.
+    """
+    tile = tables["tiles"]
+    photo = tables["photograph"]
+    area = 64 * context.grid_pixels if tile.get("mass_quantity") == "area" else 0
+    overlay = 0
+    if photo.get("co2_outline", False) or photo.get("gas_contour", False):
+        shape = context.grid_shape
+        if shape is None:
+            # Before measured shape metadata is available, the thinnest grid
+            # gives the conservative height bound.
+            shape = (context.grid_pixels, 1)
+        size = media.tile_size((0, 0, shape[1], shape[0]), int(tile["width_px"]))
+        if tile.get("grid_divisor") is not None and context.grid_shape is not None:
+            size = divided_size(shape, tile["grid_divisor"])
+        per_display_pixel = 256 if photo.get("transfer") == "first-frame" else 12
+        overlay = 12 * context.grid_pixels + per_display_pixel * size[0] * size[1]
+        if photo.get("co2_source") == "mass":
+            overlay += 40 * context.grid_pixels
+    transfer = 0
+    if photo.get("transfer") == "first-frame":
+        # Finite RGB handling, conversion and percentile selection coexist only
+        # during first-frame measurement; all reduced RGB buffers fit this bound.
+        transfer = 88 * context.grid_pixels
+    return max(area, overlay, transfer)
+
+
 def _films(ctx: StepContext) -> None:
     """One film setting's films of the selected runs' tiles."""
     settings = ctx.settings
@@ -216,7 +271,7 @@ def _films(ctx: StepContext) -> None:
         stored = ctx.read("film-tiles", read_film_tiles, run=run)
         tiles[run] = []
         for panel in film.panels:
-            room = panel.content == media.GRAPH and film.layout == "grid"
+            room = panel.content == media.GRAPH and film.layout in ("grid", "single")
             wanted = dict(panel=asdict(panel), label_room=room)
             tiles[run].append(next(rows for d, rows in stored if d == wanted))
 
@@ -245,7 +300,12 @@ FILM_TILES = Step(
         "domain-mass": Scope.ALL,
     },
     Order.RUN,
-    Memory(grid=23.0, camera_bytes=20.0, grid_bytes=82.0),
+    Memory(
+        grid=23.0,
+        camera_bytes=20.0,
+        grid_bytes=82.0,
+        terms=(Term(_display_bytes, fixed_bytes=1),),
+    ),
     _film_tiles,
     {
         "media": MediaSettings,

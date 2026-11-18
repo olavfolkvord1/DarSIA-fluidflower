@@ -11,8 +11,9 @@
   configured. The configured reference run's sand map and geometry are the
   reference.
 
-Each frame's production target is its own time since the injection start, as in
-the run statistics. The comparisons' domains are the selection's, defined in the
+The ensemble's shared production targets are frozen by job authoring from the
+selection's provenance, separately from each frame's actual time since injection.
+The comparisons' domains are the selection's, defined in the
 ``[domains]`` table. A comparison is stored once per results folder, by its kind
 and part, with the selection's runs, frames and domains in its scope; a
 comparison over another selection is therefore refused there until the stored
@@ -22,8 +23,10 @@ one is removed, or it is made in another results folder.
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -37,23 +40,28 @@ from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSet
 from darsia.presets.workflows.calibration.steps import (
     MaterialSettings,
     co2_state,
+    frame_key,
     run_grid,
 )
 from darsia.presets.workflows.comparison.comparison_events import (
     EventCondition,
     EventQuestion,
     event_table,
+    read_events,
     write_events,
 )
 from darsia.presets.workflows.comparison.ensemble import (
     EnsembleRun,
     EnsembleSettings,
     ensemble_tables,
+    event_summary,
     write_tables,
 )
 from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 from darsia.presets.workflows.comparison.mass_wasserstein import (
+    ComparedFrame,
     WassersteinSettings,
+    distance_rows,
     distance_scales,
     frame_cells,
     wasserstein_distances,
@@ -68,6 +76,7 @@ from darsia.presets.workflows.setup.steps import (
     read_rig,
     run_settings,
 )
+from darsia.utils.locations import Locations, normal_path
 
 FIGURES = "figures"
 """The folder of the ensemble's figures, beside its tables."""
@@ -109,6 +118,88 @@ class EventSettings:
     by name."""
     masses: str = "complete"
     """A domain's total, ``"complete"``, or its known part, ``"quantified"``."""
+
+
+@dataclass(frozen=True)
+class EnsembleInputSettings(EnsembleSettings):
+    """The ensemble's method settings and its frozen selection targets.
+
+    Job authoring supplies the targets from the selection's provenance, through
+    :func:`ensemble_targets`; they are not inferred from acquisition times.
+
+    """
+
+    target_h: Mapping[str, Mapping[str, float]]
+    """The exact shared target [h] of each selected case id, by run. Required for
+    the workflow adapter; a legacy job without these assignments must be remade."""
+
+
+def ensemble_targets(
+    selection: Selection,
+    locations: Locations,
+    matches: Mapping[str, Sequence[tuple[Path, float]]],
+) -> dict[str, dict[str, float]]:
+    """Extract exact selected-photo targets for a job's ensemble configuration.
+
+    Parameters
+    ----------
+    selection : Selection
+        The job's frozen frames.
+    locations : Locations
+        Their source-photo locations.
+    matches : mapping
+        Per run, source-photo paths and their target hours, as recorded in the
+        selection's pinned provenance. Job authoring verifies that provenance's
+        content identity before passing its records. Paths may be relative to
+        the project; comparison uses the normal source path, never a basename,
+        acquisition time or nearest-time match.
+
+    Returns
+    -------
+    dict
+        Run to case id to target hour, for ``[ensemble].target_h``. The normal job
+        configuration freeze makes these assignments part of result identity.
+
+    Raises
+    ------
+    ValueError
+        If a selected source has no target, a source is ambiguous, a record names
+        an unselected source, or a target is not a finite number.
+
+    """
+    found = {}
+    for run, frames in selection.frames.items():
+        sources = {}
+        for frame in frames:
+            source = os.path.normcase(normal_path(locations.photo(run, frame)))
+            if source in sources:
+                raise ValueError(f"Ambiguous selected source in {run}: {source}.")
+            sources[source] = frame_key(frame)
+        targets = {}
+        for path, target in matches.get(run, ()):
+            source = os.path.normcase(normal_path(path, locations.project))
+            if source not in sources:
+                raise ValueError(f"Unselected target source in {run}: {source}.")
+            case = sources[source]
+            if case in targets:
+                raise ValueError(f"Ambiguous target for {run}/{case}.")
+            targets[case] = _target_hour(target, run, case)
+        missing = set(sources.values()) - targets.keys()
+        if missing:
+            raise ValueError(f"Missing frozen targets in {run}: {sorted(missing)}.")
+        found[run] = targets
+    return found
+
+
+def _target_hour(value, run, case) -> float:
+    """One explicitly assigned, finite target hour."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"Invalid frozen target for {run}/{case}: {value!r}.")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -177,17 +268,21 @@ def _events(ctx: StepContext) -> None:
 def _ensemble(ctx: StepContext) -> None:
     """The ensemble's tables of the selected runs' domains, and their figures in
     :data:`FIGURES`."""
-    runs = [
-        EnsembleRun(
-            rows,
-            injected,
-            {row["case_id"]: float(row["elapsed_h"]) for row in rows},
-            protocol,
-        )
-        for rows, injected, protocol in _series(ctx).values()
-    ]
     settings = ctx.settings["ensemble"]
+    runs = []
+    for run, (rows, injected, protocol) in _series(ctx).items():
+        assigned = settings.target_h.get(run, {})
+        cases = {frame_key(frame) for frame in ctx.selection.frames[run]}
+        cases.update(row["case_id"] for row in rows)
+        missing = cases - assigned.keys()
+        if missing:
+            raise ValueError(f"Missing frozen targets in {run}: {sorted(missing)}.")
+        targets = {case: _target_hour(assigned[case], run, case) for case in cases}
+        runs.append(EnsembleRun(rows, injected, targets, protocol))
     tables = ensemble_tables(runs, _domains(ctx), settings)
+    tables["events_summary"] = event_summary(
+        ctx.read("events", lambda folder: read_events(Path(folder) / "events.csv"))
+    )
 
     def write(folder):
         write_tables(Path(folder), tables)
@@ -272,19 +367,24 @@ def _distances(ctx: StepContext) -> None:
         grid.rig.facies.dimensions,
         domains,
     )
-    frames, observation_pixels = {}, {}
+    frames, selected_frames, observation_pixels = {}, {}, {}
     for run, run_frames in ctx.selection.frames.items():
         grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-        hours = [
-            experiment.time_since_start(experiment.get_datetime(ctx.photo(run, f)))
-            for f in run_frames
-        ]
+        dates = [experiment.get_datetime(ctx.photo(run, f)) for f in run_frames]
+        hours = [experiment.time_since_start(date) for date in dates]
+        if not hours:
+            frames[run] = selected_frames[run] = None
+            continue
         nearest = int(np.argmin([abs(h - time_h) for h in hours]))
         if abs(hours[nearest] - time_h) > distances.tolerance_h:
             frames[run] = None
+            selected_frames[run] = None
             continue
         frame = run_frames[nearest]
+        selected_frames[run] = ComparedFrame(
+            frame_key(frame), dates[nearest].isoformat(), hours[nearest]
+        )
         maps = ctx.read("mass-maps", darsia.read_mass_maps, run=run, frame=frame)
         phase = ctx.read("phase-maps", darsia.read_phase_maps, run=run, frame=frame)
         labels = phase["labels"]
@@ -301,7 +401,7 @@ def _distances(ctx: StepContext) -> None:
             settings,
         )
     found = wasserstein_distances(time_h, frames, reference, scales, settings)
-    rows = [asdict(distance) for distance in found]
+    rows = distance_rows(found, selected_frames)
     columns = list(rows[0]) if rows else []
     ctx.publish(
         lambda folder: write_rows(Path(folder) / "distances.csv", rows, columns),
@@ -323,11 +423,15 @@ EVENTS = Step(
 """The events of the selected runs."""
 ENSEMBLE = Step(
     "ensemble",
-    {"domain-mass": Scope.ALL},
+    {"domain-mass": Scope.ALL, "events": Scope.ONE},
     Order.PARTS,
     Memory(camera_bytes=14.0),
     _ensemble,
-    {"ensemble": EnsembleSettings, "domains": DomainSettings, "style": FigureStyle},
+    {
+        "ensemble": EnsembleInputSettings,
+        "domains": DomainSettings,
+        "style": FigureStyle,
+    },
     sections=EXPERIMENT,
     files=protocol_files,
     domains=True,

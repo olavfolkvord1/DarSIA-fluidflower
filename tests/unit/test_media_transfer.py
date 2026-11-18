@@ -327,6 +327,89 @@ def test_actual_paired_render_keeps_pixels_padding_and_transfer_receipts():
     assert choices[1][3]["logical_panel_size"] == [150, 75]
 
 
+def test_workflow_fixes_earliest_photo_transfer_and_records_actual_times(
+    tmp_path, monkeypatch
+):
+    """Reversed authoring order cannot remeasure limits on a later acquisition."""
+    from darsia.presets.workflows.media import steps
+    from darsia.presets.workflows.media.tiles import read_tile_index
+
+    shape = (40, 80)
+    first = np.linspace(0.01, 0.9, 40 * 80 * 3, dtype=np.float32).reshape(*shape, 3)
+    images = {"first": first, "later": first * 0.2}
+    dates = {"first": 1.98, "later": 2.03}
+    frames = [SimpleNamespace(session="s", name=name) for name in ("later", "first")]
+    image = lambda data: SimpleNamespace(img=data)
+    rig = SimpleNamespace(
+        labels=image(np.ones(shape)),
+        facies=image(np.ones(shape)),
+        depth=image(np.full(shape, 0.01)),
+        pixel_area=image(np.full(shape, 1e-4)),
+    )
+    geometry = SimpleNamespace(pore_volume_m3=np.full(shape, 1e-6), swi=np.zeros(shape))
+    monkeypatch.setattr(
+        steps,
+        "run_grid",
+        lambda value, material: SimpleNamespace(rig=rig, geometry=geometry),
+    )
+    monkeypatch.setattr(steps, "run_settings", lambda *args: {})
+    monkeypatch.setattr(
+        steps,
+        "make_experiment",
+        lambda *args: SimpleNamespace(
+            get_datetime=lambda name: dates[name], time_since_start=lambda date: date
+        ),
+    )
+    photo = PhotographSettings(
+        tuple(map(tuple, np.eye(3))), 40, transfer="first-frame", co2_source="mass"
+    )
+    panels = (Panel("image", "Photo", "none"), Panel("mass", "Mass", "none"))
+    film = FilmSettings(
+        "mass", "paired-grid", panels, (160, 10), 6, "mp4v", "stored maps"
+    )
+    settings = {
+        "style": STYLE,
+        "tiles": TileSettings(
+            20, 20, 2, mass_quantity="area", normalization="sqrt", grid_divisor=4
+        ),
+        "photograph": photo,
+        "media": steps.MediaSettings((film,)),
+        "material": None,
+        "domains": SimpleNamespace(sand_labels=[1]),
+    }
+
+    def read(step, reader, frame=None):
+        if step == "rig":
+            return rig
+        if step == "corrected-image":
+            return image(images[frame.name])
+        if step == "mass-maps":
+            return SimpleNamespace(
+                **{name: image(np.full(shape, 0.1)) for name in steps.MAPS}
+            )
+        if step == "phase-maps":
+            return {
+                "labels": np.full(shape, PhaseLabel.DISSOLVED),
+                "saturation": np.zeros(shape),
+                "rules": np.zeros(shape),
+            }
+        raise AssertionError(step)
+
+    ctx = SimpleNamespace(
+        task=SimpleNamespace(run="run", frames=frames),
+        settings=settings,
+        read=read,
+        photo=lambda run, frame: frame.name,
+        publish=lambda writer: writer(tmp_path),
+    )
+    steps._film_tiles(ctx)
+    rows = read_tile_index(tmp_path / "00")
+    assert [row["elapsed_h"] for row in rows] == [1.98, 2.03]
+    expected = list(first_frame_limits(first, (20, 10)))
+    assert all(row["photograph_limits"] == expected for row in rows)
+    assert [row["case_id"] for row in rows] == ["s/first", "s/later"]
+    pixels = [cv2.imread(row["path"]) for row in rows]
+    assert pixels[1].mean() < pixels[0].mean()
 
 
 def test_single_graph_is_authored_per_run_without_cross_run_time_alignment(
@@ -360,6 +443,44 @@ def test_single_graph_is_authored_per_run_without_cross_run_time_alignment(
     assert calls[1][0] == {"second": [{"elapsed_h": 2.03}]}
 
 
+def test_single_graph_label_margin_survives_drawing_storage_and_film_adapter(
+    tmp_path, monkeypatch
+):
+    """A separately authored graph must reserve space for its overlaid run name."""
+    from contextlib import nullcontext
+
+    from darsia.presets.workflows.media import films, steps
+
+    panel = Panel("graph", "Whole-domain mass", "none")
+    film = FilmSettings(
+        "graph", "single", (panel,), (640, 480), 6, "mp4v", "stored maps"
+    )
+    media = steps.MediaSettings((film,))
+    (drawing,) = steps.drawings(media)
+    assert drawing["label_room"] is True
+    rows = [{"label_room": True, "elapsed_h": 1.98}]
+    films._drawn_as_chosen(panel, [rows], film)
+    with pytest.raises(ValueError, match="label_room"):
+        films._drawn_as_chosen(panel, [[{"label_room": False}]], film)
+    called = []
+
+    def write(tiles, output, **options):
+        called.append(tiles)
+        films._drawn_as_chosen(panel, [tiles["run"][0]], options["film"])
+        return [{"name": "graph_run"}]
+
+    monkeypatch.setattr(steps, "write_films", write)
+    ctx = SimpleNamespace(
+        task=SimpleNamespace(part="graph"),
+        settings={"media": media, "tiles": TileSettings(160, 160, 1), "style": STYLE},
+        selection=SimpleNamespace(frames={"run": []}),
+        read=lambda *args, **kwargs: [(drawing, rows)],
+        host_lock=lambda *args: nullcontext(),
+        publish=lambda writer: writer(tmp_path),
+    )
+    steps._films(ctx)
+    assert called == [{"run": [rows]}]
+    assert (tmp_path / steps.RECORDS).is_file()
 
 
 def test_real_paired_mp4_roundtrip_preserves_odd_logical_panel_and_even_padding(
