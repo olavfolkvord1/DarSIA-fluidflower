@@ -19,7 +19,7 @@ def test_uniform_native_and_metric_export_preserves_clocks_mass_and_local_concen
     labels = np.array([[255, 1], [1, 1]], np.uint8)
     start = datetime(2000, 1, 1)
     sources = {"one": MassFrameSource("a", "same.raw", start + timedelta(seconds=17), start), "two": MassFrameSource("b", "same.raw", start + timedelta(seconds=31), start)}
-    mass = MassFrames(geometry, [(name, maps, labels) for name in sources], sources=sources)
+    mass = MassFrames(geometry, [(name, maps, labels) for name in sources], sources=sources, co2=lambda _: SimpleNamespace(solubility_co2=np.array([[1., 2.], [3., 4.]])))
     assert write_simulator_mass(tmp_path, mass, canvas, [None, 10.]) == 2
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["grids"]["full"]["cell_pitch_m"] == pytest.approx(dict(dy=0.003, dx=0.002))
@@ -29,6 +29,7 @@ def test_uniform_native_and_metric_export_preserves_clocks_mass_and_local_concen
         assert data["mass_total_g"][0, 0] == pytest.approx(3 * 6e-6 * .01 * .4 * 1000)
     with np.load(tmp_path / "10mm/one.npz") as data:
         assert data["concentration_aq"][0, 0] == pytest.approx(.3)
+        assert data["concentration_aq_g_l"][0, 0] == pytest.approx((.4 + .9 + 1.6) / 3)
     with (tmp_path / "index.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert [row["source_session"] for row in rows] == ["a", "b"]

@@ -144,4 +144,21 @@ def test_explicit_boundary_roundoff_preserves_mass_but_refuses_real_excursions(
         write_simulator_mass(tmp_path / "too_far", mass, canvas, [None])
 
 
-
+def test_physical_concentration_uses_local_solubility_before_cell_averaging(tmp_path):
+    canvas, geometry, positions, maps, labels = example()
+    maps.concentration_aq.img = np.array([[np.nan, 0.2], [0.3, 0.4]])
+    state = SimpleNamespace(solubility_co2=np.array([[1.0, 2.0], [3.0, 4.0]]))
+    mass = MassFrames(
+        geometry, [("frame", maps, labels)], positions, co2=lambda name: state
+    )
+    write_simulator_mass(tmp_path, mass, canvas, [None, 10.0])
+    with np.load(tmp_path / "10mm" / "frame.npz", allow_pickle=False) as data:
+        assert data["concentration_aq"][0, 0] == pytest.approx(0.3)
+        assert data["concentration_aq_g_l"][0, 0] == pytest.approx(
+            (0.4 + 0.9 + 1.6) / 3
+        )
+        assert data["concentration_aq_g_l"][0, 0] != pytest.approx(0.3 * 3.0)
+    with np.load(tmp_path / "full" / "frame.npz", allow_pickle=False) as data:
+        assert np.isnan(data["concentration_aq_g_l"][2, 0])
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["units"]["concentration_aq"].startswith("1 ")
