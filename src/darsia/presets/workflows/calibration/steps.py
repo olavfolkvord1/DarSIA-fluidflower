@@ -45,6 +45,7 @@ from darsia.jobs.step import (
     table,
 )
 from darsia.multiphase.gas_allocation import injection_ports
+from darsia.multiphase.gas_model_cache import GasModelCache
 from darsia.presets.workflows.config.protocols import InjectionProtocolConfig
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.rig import Rig
@@ -429,15 +430,8 @@ def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
     return 2 * min(bins * reading_sands(tables, run), context.grid_pixels)
 
 
-def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
-    """Fixed-width bytes per pixel retained for injection ports and end anchors.
-
-    The phase rules keep radius/lower masks per port, and allocation keeps two
-    such pairs (the second aliases the first in single precision). A reduction
-    may stack one more mask per port. Each injection end can retain a float64
-    distance and weight map. Counting distinct merged ends bounds the distinct
-    anchor frames even when several ends select the same frame, or none does.
-    """
+def _gas_port_count(tables: Mapping, run: str | None, context) -> int:
+    """Distinct measured injecting ports, including per-run protocol overrides."""
     own = run_tables(tables, run) if run is not None else tables
     config = InjectionProtocolConfig()
     config.load_injection(own["protocols"])
@@ -453,9 +447,31 @@ def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
     protocol = darsia.InjectionProtocol(
         source, reference_density=config.injection_reference_density
     )
-    ports = injection_ports(protocol)
-    ends = {end for periods in ports.values() for _, end in periods}
-    return 7 * len(ports) + 2 * 8 * len(ends)
+    return len(injection_ports(protocol))
+
+
+def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
+    """Protocol and cache arrays retained across the prefix and allocation passes.
+
+    Three model frames belong to the LRU; one prior frame can remain with an
+    allocation while a skipped-neighbour miss evicts it. Two zone payloads can
+    coexist across a read miss or while the next prefix is built. Each zone has
+    a bool contour and at most one bool path/float32 blend per port.
+
+    The builder holds each active port's CO2 mask and working maximum, the phase
+    rules' port masks/reduction, twelve grid masks and the last float64 distance
+    and normalized distance. Allocations keep their own port masks/reduction,
+    current limit and float64 inward fade; they have no running signal maximum.
+    Builder and allocation lifetimes are sequential, so reserve the larger.
+    """
+    count, working = _gas_port_count(tables, run, context), context.itemsize
+    shared = (GasModelCache.DEFAULT_KEPT + 1) * (working + 3) + 2 * (1 + 13 * count)
+    building = 11 * count + count * (working + 1) + 28
+    # Hidden bridge profiles/transition (float32), mask, centreline coordinates
+    # plus coupled threshold coefficients/fixed fractions/capacity scales.
+    # Active meeting fallback adds a seed copy and component-selection overlap.
+    allocations = (20 * count + 51)
+    return shared + max(building, allocations)
 
 
 class _Probabilities(Sequence):
@@ -560,9 +576,9 @@ def _phase_maps(ctx: StepContext) -> None:
         grid.chart,
         gas_threshold=model.gas_threshold,
         start=start,
-        anchor_saturation=lambda k: ctx.own(read_maps, frame=frames[k])["saturation"],
+        depth_m=grid.rig.depth.img,
     )
-    for frame, (labels, rule_map, saturation, co2) in zip(frames[start:], maps):
+    for frame, (labels, rule_map, saturation, co2, _before) in zip(frames[start:], maps):
         arrays = dict(labels=labels, rules=rule_map, saturation=saturation, co2=co2)
         ctx.publish(lambda f: np.savez(Path(f) / "maps.npz", **arrays), frame=frame)
 
