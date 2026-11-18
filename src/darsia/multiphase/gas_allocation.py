@@ -1,56 +1,39 @@
-"""Gas allocation: the free gas of a run's frames from a free-gas volume per frame.
+"""Allocate each frame's free-gas volume inside causal growing contours.
 
-The phase maps (:func:`darsia.phase_maps`) say where CO2 is and where the phase
-model saw free gas. A free-gas volume per frame, such as the overflow reference
-(:mod:`darsia.experiment.overflow`), decides how much free gas each frame holds,
-as a saturation of at most 1 - Swi per pixel:
+The contour is built from each prefix's GAS after the unchanged phase
+rules, before adding or peeling gas. Observed CO2 and gas probability during
+injection determine a smooth path to each injector where needed. The checker,
+free water and impermeable seals are excluded. The same per-frame contours and
+model maps are shared by all overflow variants; each allocation uses its own
+volume and intersects its contour with that frame's CO2.
 
-- more than the model's gas: the model's gas stays, and the rest is added on
-  dissolved CO2 joined to seed gas, by a score: the gas probability averaged over
-  a window, falling off with the distance from the injecting ports' cones during
-  injection and from the end-gas region after it, and fading towards the region
-  below the lowest started port. Each pixel takes a share of its capacity in
-  proportion to its score, up to all of it, and the score threshold that gives
-  the volume is solved exactly. No gas is added on seals, on gas the phase model
-  dismissed as too small, or where gravity forbids free gas;
-- less than the model's gas: whole pixels are peeled from each gas piece, by an
-  anisotropic cost from its core outwards (the outer and lower parts first), and
-  one partial pixel makes the volume exact; a peeled pixel becomes dissolved CO2,
-  recorded in the rule map;
-- no volume: the model's gas stays.
-
-After an injection end, the free gas of the last frame before the end, widened
-upwards through the porous facies to the seals and along the seal undersides it
-reaches, is the end-gas region. The distance from it weights the gas
-probability of the later frames, in the time average of the phase rules and in
-the score.
-
-The model's gas (:func:`darsia.model_gas`) is the phase map's free gas with the
-gas that the gravity limit of the phase rules or the peel made dissolved CO2; our
-production kept the water of those pixels saturated. Beside each frame's maps,
-the allocation gives the CO2 of its labels before the rules, which the dilution
-law of the mass reads.
-
-Every setting is a field of :class:`GasAllocationSettings`; the phase rules'
-settings give the CO2 threshold, the seals, the port zones and the gravity
-limit, and the phase model gives the gas threshold.
-
+Extra gas follows a normalized Gaussian probability score, an inward fade and
+the unchanged seed, gravity and capacity rules. Lower volumes peel the model
+gas by the anisotropic cost, recording PEELED pixels as dissolved CO2. No volume
+keeps the model gas. The pre-rule labels and CO2 remain the optical mass input.
+Geometric lengths scale with the median depth of the run's measured rig map.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
-from math import ceil, hypot, radians, tan
+from math import hypot
 
 import cv2
 import numpy as np
 from scipy import ndimage
+from scipy.signal import fftconvolve
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 import darsia
+from darsia.multiphase.gas_parameters import GasAllocationSettings, gas_parameters
+from darsia.multiphase.gas_model_cache import GasModelCache, GasModelFrame
+from darsia.multiphase.gas_bridge import bridge_scores, hidden_bridges
+from darsia.multiphase.gas_zone import GasZone, gas_model_zones
+from darsia.multiphase.gas_zone_cache import GasZoneCache
 from darsia.multiphase.phase_rules import (
     PhaseLabel,
     PhaseRule,
@@ -58,9 +41,9 @@ from darsia.multiphase.phase_rules import (
     _change,
     _co2,
     _gravity_limit,
-    _pitch_mm,
     _port_zones,
     _seal,
+    _pitch_mm,
     _summed_areas,
     phase_labels,
     phase_maps,
@@ -68,57 +51,58 @@ from darsia.multiphase.phase_rules import (
 
 _RELATIVE = 1e-9
 """A peeled pixel goes whole when its room exceeds what is left by at most this."""
-_FADE_REACH = 8
-"""Beyond this many fade lengths the fade weight is one."""
-_STEP_ROUNDING = 1e-12
-"""Rounding guard of the sideways steps of the upward widening."""
+PHASE_MAPS = "maps.npz"
+"""The file of a frame's stored phase maps (:func:`write_phase_maps`)."""
 NEIGHBOURS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 """The eight neighbours of a pixel as (row, column) steps, in one fixed order, so
 that a sum over them is reproducible."""
 
 
 @dataclass(frozen=True)
-class GasAllocationSettings:
-    """Settings of the gas allocation; one configuration table."""
+class GasAllocationRecord:
+    """Requested and placed gas volumes for one allocation frame, in m3."""
 
-    seed_mm2: float
-    """Gas bodies of at least this area seed added gas."""
-    persistent_seed_mm2: float
-    """Smaller bodies of this area seed too where they overlap a gas body of this
-    area in the nearest earlier or later frame."""
-    seed_window_h: float
-    """Time [h] within which the nearest frames count for persistent seeds."""
-    fallback_seed_mm2: float
-    """Without any seed, gas bodies of this area seed; without those, the CO2 at
-    an injecting port does."""
-    score_window_mm: float
-    """Width of the window that averages the gas probability into the score."""
-    cone_base_mm: Sequence[float]
-    """Half width of each injecting port's cone at the port's height, in the order
-    the ports start; the last value repeats."""
-    cone_width_mm: Sequence[float]
-    """Half width the cone approaches far above each port."""
-    cone_rise_mm: float
-    """Height over which the cone widens towards that half width."""
-    seal_band_mm: float
-    """Depth of the band under the first seal above a port that the cone follows."""
-    cone_decay_mm: float
-    """Distance outside the cones over which the score falls by a factor e."""
-    end_gas_decay_mm: float
-    """Distance outside the end-gas region over which the score and the gas
-    probability fall by a factor e."""
-    end_gas_angle_deg: float
-    """Half angle at which the end-gas region widens upwards."""
-    port_fade_mm: float
-    """Length over which added gas fades towards the region below the ports."""
-    lattice_mm: float
-    """Cell size of the lattice the peeling cost runs on."""
-    cost_up_per_mm: float
-    """Peeling cost of an upward step per mm."""
-    cost_side_per_mm: float
-    """Peeling cost of a sideways step per mm."""
-    cost_down_per_mm: float
-    """Peeling cost of a downward step per mm."""
+    target_m3: float | None
+    """Requested volume, or None when the model gas alone decides it."""
+    model_m3: float
+    """Model gas after the phase rules, before adding or peeling."""
+    placed_m3: float
+    """Volume represented by the returned saturation."""
+    unplaced_m3: float
+    """Requested volume that could not be placed, at least zero."""
+    limit_area_mm2: float
+    """Area of the current CO2 and active bridge limit, before gravity checks."""
+    disconnected_added_area_mm2: float
+    """Added gas not connected to this allocation's seed body; must be zero."""
+    bridge_length_mm: float = 0.0
+    """Total length of active hidden stretches carrying added gas."""
+    bridge_area_mm2: float = 0.0
+    """Union area of hidden pixels with positive added saturation."""
+    geometry: dict = field(default_factory=dict)
+    """Measured depth and all derived geometric lengths for this run."""
+    bridge_volume_m3: float = 0.0
+    """Inferred bridge gas, already included in placed_m3, never an extra volume."""
+    active_link_diagnostics: list[dict] = field(default_factory=list)
+    """Raw geometry outcomes for active ports, including local-depth refusals."""
+
+
+def _active_link_diagnostics(zone, ports):
+    """Keep compact JSON-native link provenance after the zone cache is released."""
+    rows = []
+    for port in ports:
+        note = zone.diagnostics.get("ports", {}).get(port, {})
+        row = {
+            "port_m": [float(value) for value in port],
+            "status": str(note.get("status", "unrecorded_geometry")),
+        }
+        for name in ("port_pixel", "meeting_pixel", "target_pixel"):
+            if name in note:
+                row[name] = [int(value) for value in note[name]]
+        for name in ("local_depth_mm", "downward_drop_mm"):
+            if name in note:
+                row[name] = None if note[name] is None else float(note[name])
+        rows.append(row)
+    return rows
 
 
 def _components(mask):
@@ -160,121 +144,47 @@ def injection_ports(protocol):
     return ports
 
 
-def _under_seal(co2, seal, y, depth_m):
-    """CO2 within a depth below the top of its vertical run, where a seal caps it."""
-    through = co2 & ~seal
-    above_open = np.zeros_like(through)
-    above_open[1:] = through[:-1]
-    above_seal = np.zeros_like(through)
-    above_seal[1:] = seal[:-1]
-    rows = np.arange(len(y))[:, None]
-    top = np.maximum.accumulate(np.where(through & ~above_open, rows, -1), axis=0)
-    first = np.maximum(top, 0)
-    depth = y[first] - y[:, None]
-    contact = np.take_along_axis(above_seal, first, axis=0)
-    return through & (top >= 0) & contact & (depth >= 0) & (depth <= depth_m)
+def _inward_weight(limit, pitch_mm, decay_mm):
+    """One minus exp(-d/lambda), with zero at boundary pixels and outside.
 
-
-def _cones(co2, injecting, order, radius, lower, seal, x, y, settings):
-    """The injecting ports' cones: where added gas is preferred during injection.
-
-    A port's CO2 body (the CO2 reaching its radius) below the first seal above
-    the port is kept within a half width that widens with the height from the
-    port's base to its full width, and within the port's lower zone below it;
-    the band of the body under that seal joins where the cone reaches it.
+    Boundary pixel centres define zero distance. Padding makes a limit touching
+    the image edge fade there too. Distances use the grid's metric pitch.
     """
-    components = _components(co2)
-    cones = np.zeros(co2.shape, bool)
-    for port in injecting:
-        base, width = (
-            values[min(order.index(port), len(values) - 1)]
-            for values in (settings.cone_base_mm, settings.cone_width_mm)
-        )
-        body = _touching(co2, radius[port], components)
-        column = int(np.abs(x - port[0]).argmin())
-        sealing = seal[:, column] & (y > port[1])
-        top = y[sealing].min() if sealing.any() else None
-        rise = y[:, None] - port[1]
-        scope = body if top is None else body & (y < top)[:, None]
-        height = np.maximum(rise, 0) * 1000 / settings.cone_rise_mm
-        half_width = base / 1000 - (width - base) / 1000 * np.expm1(-np.square(height))
-        cone = np.abs(x[None, :] - port[0]) <= half_width
-        kept = body & (~scope | np.where(rise >= 0, cone, lower[port]))
-        if top is not None and scope.any():
-            hit = np.flatnonzero(sealing & (y == top))[0]
-            seals = _components(seal)[1]
-            first = seals == seals[hit, column]
-            band = _under_seal(
-                body & ~seal & (rise >= 0), first, y, settings.seal_band_mm / 1000
-            )
-            contact = band & cone
-            if contact.any():
-                kept |= _touching(band, contact)
-        cones |= scope & kept
-    return cones
+    inside = ndimage.binary_erosion(limit, structure=np.ones((3, 3), bool))
+    if not inside.any():
+        return np.zeros(limit.shape, dtype=np.float64)
+    boundary = limit & ~inside
+    distance = ndimage.distance_transform_edt(~boundary, sampling=pitch_mm)
+    return np.where(inside, -np.expm1(-distance / decay_mm), 0.0)
 
 
-def _distance(region, active, pitch_mm, decay_mm):
-    """Distance of the active pixels from a region, in decay lengths."""
-    box = _box(region | active)
-    distance = ndimage.distance_transform_edt(~region[box], sampling=pitch_mm)
-    distance /= decay_mm
-    return distance[active[box]]
+def _round_score(scored, values, pitch_mm, window_mm):
+    """Normalized Gaussian probability mean, matching the box's second moment.
 
-
-def _upward(path, seeds, lateral_per_row):
-    """Paths upwards from the seeds through ``path``, widening sideways.
-
-    Each row up, the reach may step sideways by as many pixels as the rise
-    allows at ``lateral_per_row``; a diagonal step needs an open face pixel.
+    Its physical sigma is window/sqrt(12), truncated at three sigma. Dividing
+    by the filtered support excludes unscored pixels without a square kernel.
     """
-    path, seeds = path[::-1], seeds[::-1] & path[::-1]
-    reached = np.zeros(path.shape, bool)
-    seed_rows = np.flatnonzero(seeds.any(axis=1))
-    if not seed_rows.size:
-        return reached
-    first = int(seed_rows[0])
-    reached[first] = seeds[first]
-    for row in range(first + 1, path.shape[0]):
-        previous, open_cells = reached[row - 1], path[row]
-        advance = previous & open_cells
-        rise = row - first
-        moves = int(rise * lateral_per_row + _STEP_ROUNDING) - int(
-            (rise - 1) * lateral_per_row + _STEP_ROUNDING
-        )
-        if moves:
-            above = path[row - 1]
-            advance[1:] |= (
-                previous[:-1] & open_cells[1:] & (open_cells[:-1] | above[1:])
-            )
-            advance[:-1] |= (
-                previous[1:] & open_cells[:-1] & (open_cells[1:] | above[:-1])
-            )
-            for _ in range(1, min(moves, advance.size)):
-                spread = advance.copy()
-                spread[1:] |= advance[:-1] & open_cells[1:]
-                spread[:-1] |= advance[1:] & open_cells[:-1]
-                if np.array_equal(spread, advance):
-                    break
-                advance = spread
-        reached[row] = advance | seeds[row]
-    return reached[::-1]
-
-
-def _end_gas(gas, porous, seal, pitch_mm, settings):
-    """The end-gas region of a frame's free gas; None without free gas."""
-    if not gas.any():
-        return None
-    space = porous | gas
-    dy, dx = pitch_mm
-    slope = dy / dx * tan(radians(settings.end_gas_angle_deg))
-    reached = _upward(space & ~seal, gas, slope)
-    underside = np.zeros_like(space)
-    underside[1:] = space[1:] & ~seal[1:] & seal[:-1]
-    contact = underside & reached
-    if contact.any():
-        reached |= _touching(underside, contact)
-    return reached | gas
+    sigma = window_mm / np.sqrt(12)
+    reach = [int(np.ceil(3 * sigma / step)) for step in pitch_mm]
+    rows = np.arange(-reach[0], reach[0] + 1) * pitch_mm[0]
+    cols = np.arange(-reach[1], reach[1] + 1) * pitch_mm[1]
+    squared = rows[:, None] ** 2 + cols[None, :] ** 2
+    disc = squared <= (3 * sigma) ** 2
+    kernel = np.where(disc, np.exp(-squared / (2 * sigma**2)), 0)
+    kernel /= kernel.sum()
+    kernel = kernel.astype(values.dtype)
+    score = fftconvolve(np.where(scored, values, 0), kernel, mode="same")
+    support = fftconvolve(scored.astype(values.dtype), kernel, mode="same")
+    np.divide(score, support, out=score, where=support > 0)
+    np.clip(score, 0, 1, out=score)
+    # FFT-backed filters can leave tiny positive roundoff outside exact support.
+    positive = scored & (values > 0)
+    if positive.any():
+        distance = ndimage.distance_transform_edt(~positive, sampling=pitch_mm)
+        score[distance > 3 * sigma] = 0
+    else:
+        score.fill(0)
+    return score
 
 
 def _seeds(model, candidate, allowance, neighbours, pixel_area, settings):
@@ -299,23 +209,27 @@ def _seeds(model, candidate, allowance, neighbours, pixel_area, settings):
     return seeds if seeds.any() else allowance & candidate
 
 
-def _fade(below, active, pitch_mm, fade_mm):
-    """Weight of the active pixels falling to zero at ``below``; None far off."""
-    rows, cols = np.flatnonzero(active.any(1)), np.flatnonzero(active.any(0))
-    if not rows.size:
-        return None
-    height, width = active.shape
-    reach_rows = ceil(min(height, _FADE_REACH * (fade_mm / pitch_mm[0])))
-    reach_cols = ceil(min(width, _FADE_REACH * (fade_mm / pitch_mm[1])))
-    box = np.s_[
-        max(0, rows[0] - reach_rows) : min(height, rows[-1] + reach_rows + 1),
-        max(0, cols[0] - reach_cols) : min(width, cols[-1] + reach_cols + 1),
-    ]
-    if not below[box].any():
-        return None
-    distance = ndimage.distance_transform_edt(~below[box], sampling=pitch_mm)
-    weight = -np.expm1(-np.square(distance[active[box]] / fade_mm))
-    return np.maximum(weight, np.finfo(np.float32).tiny)
+def _connected_candidates(gas, candidate, seeds, meetings):
+    """Seed an otherwise unseeded admissible component at its active meeting.
+
+    ``candidate`` already includes the positive coefficient/fixed-fraction test.
+    A meeting outside this graph grants nothing. Existing seed pixels are kept;
+    no input mask is changed and no geometric or numerical floor is introduced.
+    """
+    graph = gas | candidate
+    components = count, labels = _components(graph)
+    seeded = np.zeros(count, bool)
+    seeded[np.unique(labels[seeds])] = True
+    seeded[0] = False
+    selected = seeds
+    for point in meetings:
+        component = labels[point]
+        if component and not seeded[component]:
+            if selected is seeds:
+                selected = seeds.copy()
+            selected[point] = True
+            seeded[component] = True
+    return candidate & _touching(graph, selected, components), selected
 
 
 def _threshold(score, capacity, volume):
@@ -343,40 +257,43 @@ def _add(
     cap,
     scores,
     seeds,
-    near,
-    below,
+    weight,
     pitch_mm,
     settings,
+    bridges=(),
+    meetings=(),
 ):
     """Add a volume [m3] on the candidates joined to the seeds, by their score.
 
     ``scores`` are the scored pixels and their gas probability, ``gas`` the gas
-    through which added gas joins its seeds, and ``near`` gives the distance of
-    the active pixels from the preferred region in decay lengths (or None).
+    through which added gas joins its seeds, and ``weight`` is the inward fade,
+    zero at the limit's edge and outside it. Active link meetings can seed
+    an otherwise unseeded admissible component. The effective seeds are
+    returned for connectivity diagnostics.
     """
-    dy, dx = pitch_mm
-    window = (
-        2 * int(settings.score_window_mm / (2 * dx)) + 1,
-        2 * int(settings.score_window_mm / (2 * dy)) + 1,
-    )
     scored, values = scores
-    box = dict(normalize=False, borderType=cv2.BORDER_CONSTANT)
-    score = cv2.boxFilter(np.where(scored, values, 0), -1, window, **box)
-    support = cv2.boxFilter(scored.astype(np.float32), -1, window, **box)
-    np.divide(score, support, out=score, where=support > 0)
-    np.clip(score, 0, 1, out=score)
-    candidate = candidate & (score > 0)
-    active = candidate & _touching(gas | candidate, seeds)
-    probability = score[active].astype(np.float64)
-    distance = near(active)
-    if distance is not None:
-        probability = np.exp(np.log(probability) - distance)
+    score = _round_score(scored, values, pitch_mm, settings.score_window_mm)
+    coefficient = score.astype(np.float64) * weight
+    fixed = np.zeros_like(coefficient)
+    scale = None
+    if bridges:
+        coefficient, fixed, scale = bridge_scores(coefficient, candidate, gas, bridges)
+    positive = (coefficient > 0) | (fixed > 0)
+    candidate = candidate & positive
+    active, seeds = _connected_candidates(gas, candidate, seeds, meetings)
+    fixed_volume = float(np.sum(room[active] * fixed[active]))
+    if fixed_volume > volume + 1e-12:
+        raise ValueError("The measured added volume cannot fill the fixed gas bridge")
+    fixed_cells = active & (fixed > 0)
+    saturation[fixed_cells] = cap[fixed_cells] * fixed[fixed_cells]
+    active &= ~fixed_cells
+    probability = coefficient[active]
     capacity, peak = room[active], cap[active]
-    fade = _fade(below, active, pitch_mm, settings.port_fade_mm)
-    if fade is not None:
-        capacity, peak = capacity * fade, peak * fade
+    if scale is not None:
+        capacity = capacity * scale[active]
+        peak = peak * scale[active]
     available = float(capacity.sum())
-    placed = min(volume, available)
+    placed = min(max(0, volume - fixed_volume), available)
     if placed > 0:
         threshold = (
             float(probability.min())
@@ -384,6 +301,7 @@ def _add(
             else _threshold(probability, capacity, placed)
         )
         saturation[active] = peak * np.minimum(1.0, probability / threshold)
+    return seeds
 
 
 def _lattice_cost(cells, sources, step_mm, settings):
@@ -484,6 +402,79 @@ def _peel(saturation, volume, model, room, pore_volume, cap, y, pitch_mm, settin
     return saturation, gone & (saturation == 0)
 
 
+def gas_model_frames(
+    probabilities,
+    dates,
+    sand_map,
+    domain,
+    pixel_area_mm2,
+    permeability,
+    protocol,
+    rule_settings,
+    chart=None,
+    *,
+    gas_threshold,
+):
+    """Yield the model's preallocation state once for every selected frame.
+
+    No volume or held-out overflow variant enters these maps. The probability
+    sequence keeps its existing temporal window; consumers can spool each frame
+    while accumulating the prefix contours.
+
+    Parameters
+    ----------
+    probabilities : sequence of (array, array)
+        CO2 and conditional gas probabilities in selected acquisition order.
+    dates : sequence of datetime
+        Acquisition times of the selected frames.
+    sand_map : darsia.Image
+        Facies labels and the physical grid.
+    domain : array
+        Pixels whose phase is decided.
+    pixel_area_mm2 : float or array
+        Physical pixel areas in square millimetres.
+    permeability : mapping
+        Permeability by porous facies label.
+    protocol : darsia.InjectionProtocol
+        Injection timetable and measured injector positions.
+    rule_settings : PhaseRuleSettings
+        Existing phase rule settings, unchanged by volume allocation.
+    chart : array, optional
+        Colour checker mask.
+    gas_threshold : float
+        Conditional gas probability threshold of the phase model.
+
+    Yields
+    ------
+    GasModelFrame
+        Gas probability and the pre-rule, post-rule and rule labels.
+    """
+    made = phase_maps(
+        probabilities,
+        dates,
+        sand_map,
+        domain,
+        pixel_area_mm2,
+        permeability,
+        protocol,
+        rule_settings,
+        chart,
+        None,
+        gas_threshold=gas_threshold,
+
+    )
+    for index, (labels, rules) in enumerate(made):
+        probability = probabilities[index]
+        before = phase_labels(
+            *probability,
+            domain,
+            pixel_area_mm2,
+            rule_settings,
+            gas_threshold=gas_threshold,
+        )
+        yield GasModelFrame(probability[1], before, labels, rules)
+
+
 def free_gas(
     probabilities: Sequence[tuple[np.ndarray, np.ndarray]],
     dates: Sequence[datetime],
@@ -500,15 +491,25 @@ def free_gas(
     chart: np.ndarray | None = None,
     *,
     gas_threshold: float,
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    depth_m: np.ndarray | None = None,
+    start: int = 0,
+    record: Callable[[int, GasAllocationRecord], None] | None = None,
+    model_frames: Sequence[GasModelFrame] | None = None,
+    zones: Sequence[GasZone] | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
-    The phase maps are those of :func:`darsia.phase_maps`, with the end-gas
-    weight described in the module; each frame's free gas then holds the
+    The phase maps are those of :func:`darsia.phase_maps`; each frame holds the
     frame's volume as described there, and the gas it peels is dissolved CO2;
-    the rule map records it (:attr:`darsia.PhaseRule.PEELED`). Beside them comes
-    the CO2 of the frame's labels before the rules (:func:`darsia.phase_labels`),
-    which neither the rules nor the allocation change.
+    the rule map records it (:attr:`darsia.PhaseRule.PEELED`). Beside them come
+    the frame's labels before the rules (:func:`darsia.phase_labels`) and their
+    CO2, which neither the rules nor the allocation change: the colour of the
+    frame's dissolved CO2 is read on these labels, as our production read it.
+
+    A run resumes at its first missing frame (``start``). The complete selected
+    run is prepared before allocation, including earlier completed frames. The
+    prefix contour never depends on allocated or peeled output. Prepared maps and
+    their contour may be shared across independent allocation variants.
 
     Parameters
     ----------
@@ -542,75 +543,118 @@ def free_gas(
         The colour checker's pixels.
     gas_threshold : float
         Gas threshold of the phase model, as for :func:`darsia.phase_maps`.
+    depth_m : array, optional
+        Measured local rig depth in metres. Required to derive the geometric
+        lengths, including when using prepared model states and contours.
+    start : int, optional
+        Index of the first frame to allocate. The complete run remains the
+        source of the contour, neighbours and any active-injection signal.
+    record : callable, optional
+        Receives a frame index and its numeric :class:`GasAllocationRecord`
+        before that frame is yielded. The iterator still yields five arrays.
+    model_frames : sequence of GasModelFrame, optional
+        Complete preallocation model states. If omitted, build them once in a
+        bounded private temporary cache.
+    zones : sequence of GasZone, optional
+        Causal nonshrinking contours prepared from exactly those model states,
+        one per frame. Required together with ``model_frames``.
 
     Yields
     ------
     tuple of arrays
         The phase map (uint8), its rule map (uint8, :class:`darsia.PhaseRule`),
-        the free-gas saturation and the CO2 of the labels before the rules (bool)
-        of each frame.
+        the free-gas saturation, the CO2 of the labels before the rules (bool) and
+        those labels (uint8, :func:`darsia.phase_labels`), on which the colour of
+        the frame's dissolved CO2 is read, of each frame from ``start`` on.
+
+    Raises
+    ------
+    ValueError
+        If prepared maps and contour disagree, or the start is out of range.
 
     """
+    settings = gas_parameters(settings, depth_m)
+    if model_frames is None:
+        if zones is not None:
+            raise ValueError("Supplied contours need their prepared model frames")
+        if depth_m is None:
+            raise ValueError("Contour preparation requires the measured rig depth map")
+        with (
+            GasModelCache(len(dates), kept=3) as prepared,
+            GasZoneCache(len(dates)) as contours,
+        ):
+            originals = gas_model_frames(
+                probabilities,
+                dates,
+                sand_map,
+                domain,
+                pixel_area_mm2,
+                permeability,
+                protocol,
+                rule_settings,
+                chart,
+                gas_threshold=gas_threshold,
+
+            )
+            made = gas_model_zones(
+                prepared.store(originals),
+                dates,
+                sand_map,
+                domain,
+                permeability,
+                protocol,
+                rule_settings,
+                settings,
+
+                chart=chart,
+                depth_m=depth_m,
+            )
+            for _ in contours.store(made):
+                pass
+            yield from free_gas(
+                probabilities,
+                dates,
+                sand_map,
+                domain,
+                pixel_area_mm2,
+                permeability,
+                protocol,
+                rule_settings,
+                pore_volume_m3,
+                swi,
+                volumes_m3,
+                settings,
+                chart,
+                gas_threshold=gas_threshold,
+                start=start,
+
+                record=record,
+                model_frames=prepared,
+                zones=contours,
+                depth_m=depth_m,
+            )
+        return
+    if zones is None or len(model_frames) != len(dates) or len(zones) != len(dates):
+        raise ValueError("Prepared maps and contours must cover the selected run")
+    if not 0 <= start <= len(dates):
+        raise ValueError("Allocation start lies outside the selected run")
     facies = sand_map.img
     x, y = darsia.pixel_centres(sand_map)
     pitch_mm = _pitch_mm(sand_map)
     ports = injection_ports(protocol)
-    order = list(ports)
     radius, lower = _port_zones(x, y, ports, rule_settings)
     seal = _seal(facies, domain, permeability, rule_settings)
-    porous = [k for k in permeability if k not in rule_settings.free_water_facies]
-    porous = domain & np.isin(facies, porous)
     eligible = pore_volume_m3 > 0
-    episodes = sorted({period for periods in ports.values() for period in periods})
-    anchors = {}
-    for _, end in episodes:
-        before = [index for index, date in enumerate(dates) if date <= end]
-        if before:
-            anchors[end] = before[-1]
-    regions, stored = {}, {}
-
-    def end_gas(index):
-        """Distance from the end-gas region that applies to a frame, and weight."""
-        date = dates[index]
-        if any(start <= date <= end for start, end in episodes):
-            return None
-        stop = max((end for _, end in episodes if end < date), default=None)
-        return regions.get(anchors.get(stop))
-
-    def weight(index):
-        """The end-gas weight of a frame's gas probability, or None."""
-        region = end_gas(index)
-        return None if region is None else region[1]
 
     def stored_labels(index):
-        """A frame's labels before the rules (:func:`darsia.phase_labels`)."""
-        if index not in stored:
-            stored[index] = phase_labels(
-                *probabilities[index],
-                domain,
-                pixel_area_mm2,
-                rule_settings,
-                gas_threshold=gas_threshold,
-            )
-        return stored[index]
+        return model_frames[index].before
 
-    maps = phase_maps(
-        probabilities,
-        dates,
-        sand_map,
-        domain,
-        pixel_area_mm2,
-        permeability,
-        protocol,
-        rule_settings,
-        chart,
-        weight,
-        gas_threshold=gas_threshold,
-    )
-    for index, (labels, rules) in enumerate(maps):
+    for index in range(start, len(dates)):
+        frame = model_frames[index]
+        zone = zones[index]
         date = dates[index]
-        gas_probability = probabilities[index][1]
-        own = stored_labels(index)
+        labels, rules = frame.labels.copy(), frame.rules.copy()
+        gas_probability, own = frame.gas_probability, frame.before
         nearest = [
             next((j for j in side if dates[j] != date), None)
             for side in (range(index - 1, -1, -1), range(index + 1, len(dates)))
@@ -621,19 +665,32 @@ def free_gas(
             if j is not None
             and abs((dates[j] - date).total_seconds()) / 3600 <= settings.seed_window_h
         ]
-        for j in [j for j in stored if j < index]:
-            del stored[j]
 
         started = [p for p, periods in ports.items() if periods[0][0] <= date]
         injecting = [
             p for p, periods in ports.items() if any(s <= date < e for s, e in periods)
         ]
         co2 = _co2(labels)
+        bridges = hidden_bridges(
+            zone,
+            co2,
+            labels == PhaseLabel.WATER,
+            eligible & ~seal,
+            pitch_mm,
+            settings,
+        )
+        hidden = np.zeros(co2.shape, bool)
+        for bridge in bridges:
+            hidden |= bridge.hidden
+        limit = (zone.contour & co2) | hidden
+        decay = settings.fade_length_mm
+        if np.any((labels == PhaseLabel.GAS) & eligible & ~limit):
+            raise ValueError("The contour excludes eligible preallocation model gas")
         below, lobes = _gravity_limit(
             co2, started, radius, lower, y, pitch_mm, rule_settings
         )
         dissolved = labels == PhaseLabel.DISSOLVED
-        keep = co2 & eligible
+        keep = (co2 | hidden) & eligible
         cap = np.zeros_like(swi)
         cap[keep] = swi.dtype.type(1) - swi[keep]
         dismissed = (own == PhaseLabel.DISSOLVED) & (gas_probability >= gas_threshold)
@@ -644,25 +701,14 @@ def free_gas(
         model = allowed & (labels == PhaseLabel.GAS)
         saturation = np.where(model, cap, cap.dtype.type(0))
         target = volumes_m3[index]
+        model_volume = float(np.sum(room[model]))
+        seeds = None
         if target is not None:
-            model_volume = float(np.sum(room[model]))
             if target >= model_volume:
-                region = end_gas(index)
-                cones = None
-                if region is None and injecting:
-                    cones = _cones(
-                        co2, injecting, order, radius, lower, seal, x, y, settings
-                    )
-
-                def near(active):
-                    """Distance of the active pixels from the preferred region."""
-                    if region is not None:
-                        return region[0][active]
-                    if cones is None or not cones.any() or not active.any():
-                        return None
-                    return _distance(cones, active, pitch_mm, settings.cone_decay_mm)
-
-                candidate = allowed & dissolved & ~seal & ~below & ~lobes
+                inward = _inward_weight(limit, pitch_mm, decay)
+                candidate = (
+                    allowed & (dissolved | hidden) & ~seal & ~below & ~lobes & limit
+                )
                 allowance = np.zeros(co2.shape, bool)
                 for port in injecting:
                     allowance |= radius[port]
@@ -678,7 +724,20 @@ def free_gas(
                     np.isfinite(gas_probability) & co2,
                     np.where(_co2(own), gas_probability, 0),
                 )
-                _add(
+                meetings = []
+                for port in injecting:
+                    if port not in zone.links:
+                        note = zone.diagnostics.get("ports", {}).get(port, {})
+                        if note.get("status") == "already_inside":
+                            point = tuple(note["port_pixel"])
+                            if co2[point]:
+                                meetings.append(point)
+                        continue
+                    points = zone.links[port].path_coordinates
+                    seen = np.flatnonzero(co2[points[:, 0], points[:, 1]])
+                    if seen.size:
+                        meetings.append(tuple(points[int(seen[0])]))
+                seeds = _add(
                     saturation,
                     target - model_volume,
                     model & ~seal,
@@ -687,10 +746,11 @@ def free_gas(
                     cap,
                     scores,
                     seeds,
-                    near,
-                    below,
+                    inward,
                     pitch_mm,
                     settings,
+                    bridges=bridges,
+                    meetings=meetings,
                 )
             else:
                 saturation, freed = _peel(
@@ -706,10 +766,42 @@ def free_gas(
                 )
                 _change(labels, rules, freed, PhaseLabel.DISSOLVED, PhaseRule.PEELED)
             saturation = np.minimum(saturation, cap)
-        if index in anchors.values():
-            gas = _end_gas(saturation > 0, porous, seal, pitch_mm, settings)
-            if gas is not None:
-                distance = ndimage.distance_transform_edt(~gas, sampling=pitch_mm)
-                distance /= settings.end_gas_decay_mm
-                regions[index] = (distance, np.exp(-distance))
-        yield labels, rules, saturation, _co2(own)
+        inferred = hidden & (saturation > 0)
+        # Keep optical WATER and before labels intact: this is inferred free
+        # gas, not model evidence and not an inferred dissolved concentration.
+        rules[inferred] = PhaseRule.GAS_BRIDGE
+        if record is not None:
+            placed = float(np.sum(pore_volume * saturation.astype(np.float64)))
+            disconnected = np.zeros_like(model)
+            if seeds is not None:
+                added = (saturation > 0) & ~model
+                disconnected = added & ~_touching(model | added, seeds)
+            disconnected_area = (
+                float(pixel_area_mm2) * int(disconnected.sum())
+                if np.ndim(pixel_area_mm2) == 0
+                else float(
+                    np.sum(np.asarray(pixel_area_mm2)[disconnected], dtype=np.float64)
+                )
+            )
+            area = (
+                float(pixel_area_mm2) * int(limit.sum())
+                if np.ndim(pixel_area_mm2) == 0
+                else float(np.sum(np.asarray(pixel_area_mm2)[limit], dtype=np.float64))
+            )
+            record(
+                index,
+                GasAllocationRecord(
+                    None if target is None else float(target),
+                    model_volume,
+                    placed,
+                    0.0 if target is None else max(0.0, float(target) - placed),
+                    area,
+                    disconnected_area,
+                    sum(b.length_mm for b in bridges if np.any(inferred & b.hidden)),
+                    float(np.sum(pixel_area_mm2 * inferred)),
+                    settings.geometry_record(),
+                    float(np.sum(pore_volume[inferred] * saturation[inferred])),
+                    _active_link_diagnostics(zone, injecting),
+                ),
+            )
+        yield labels, rules, saturation, _co2(own), own

@@ -2,11 +2,15 @@
 
 import datetime
 import tomllib
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import darsia
+from darsia.multiphase.gas_parameters import parameters_at_depth
+from darsia.multiphase import gas_allocation as allocation_module
 
 W, D, G, U = darsia.PhaseLabel
 RULE = darsia.PhaseRule
@@ -38,15 +42,6 @@ TABLES = tomllib.loads(
     persistent_seed_mm2 = 25.0
     seed_window_h = 1.01
     fallback_seed_mm2 = 25.0
-    score_window_mm = 5.0
-    cone_base_mm = [14.74, 14.74]
-    cone_width_mm = [38.1, 41.45]
-    cone_rise_mm = 12.81
-    seal_band_mm = 30.0
-    cone_decay_mm = 10.0
-    end_gas_decay_mm = 10.0
-    end_gas_angle_deg = 30.0
-    port_fade_mm = 10.0
     lattice_mm = 1.0
     cost_up_per_mm = 0.5
     cost_side_per_mm = 1.0
@@ -54,7 +49,9 @@ TABLES = tomllib.loads(
     """
 )
 RULES = darsia.PhaseRuleSettings(**TABLES["phase_rules"])
-SETTINGS = darsia.GasAllocationSettings(**TABLES["gas_allocation"])
+
+BASE_SETTINGS = darsia.GasAllocationSettings(**TABLES["gas_allocation"])
+SETTINGS = parameters_at_depth(BASE_SETTINGS, 5.0)
 GAS_THRESHOLD = 0.66
 """Gas threshold of our production phase model, from its folder."""
 
@@ -75,7 +72,17 @@ def _frame(co2=(), gas=(), level=0.9):
     return tuple(probabilities)
 
 
-def _run(tmp_path, frames, hours, volumes, *, end_h=9.0, facies=None):
+def _run(
+    tmp_path,
+    frames,
+    hours,
+    volumes,
+    *,
+    end_h=9.0,
+    facies=None,
+
+    record=None,
+):
     """Phase and rule maps and saturations of a run, one port at height 4.5 mm."""
     csv = tmp_path / "protocol.csv"
     pd.DataFrame(
@@ -106,29 +113,47 @@ def _run(tmp_path, frames, hours, volumes, *, end_h=9.0, facies=None):
             np.full(SHAPE, PORE),
             np.full(SHAPE, SWI),
             volumes,
-            SETTINGS,
+            BASE_SETTINGS,
             gas_threshold=GAS_THRESHOLD,
+            depth_m=np.full(SHAPE, 0.02),
+
+            record=record,
         )
     )
 
 
+
+
+
+
 def test_added_gas_joins_the_model_gas_by_its_score(tmp_path):
-    """The model's gas stays; the rest fills its CO2 body above the seal, exactly."""
+    """Model gas stays; a request larger than the footprint's room is capped."""
     facies = np.ones(SHAPE, int)
     facies[40:42] = 2  # a seal across the CO2
-    probabilities = _frame(co2=[np.s_[20:52, 10:70]], gas=[np.s_[22:34, 34:46]])
+    # The fixed smoothed contour joins the bodies. The seed-connected gas cannot
+    # cross the seal to isolated CO2 below it.
+    bodies = [np.s_[22:34, 34:39], np.s_[22:34, 41:46]]
+    probabilities = _frame(co2=[np.s_[20:52, 10:70]], gas=bodies)
     probabilities[1][20:40, 10:70] += np.linspace(0, 0.3, 60, dtype=np.float32)
-    model = 144 * PORE * (1 - SWI)
-    labels, _, saturation, _ = _run(
-        tmp_path, [probabilities], [0.0], [model + 6e-7], facies=facies
+    records = []
+    labels, _, saturation, _, _ = _run(
+        tmp_path,
+        [probabilities],
+        [0.0],
+        [1.0],
+        facies=facies,
+        record=lambda index, value: records.append(value),
     )[0]
-    assert np.isclose(np.sum(PORE * saturation.astype(float)), model + 6e-7, rtol=1e-6)
-    assert (saturation[22:34, 34:46] == 1 - SWI).all() and (
-        labels[22:34, 34:46] == G
-    ).all()
+    placed = np.sum(PORE * saturation.astype(float))
+    assert placed < 1.0
+    assert records[0].unplaced_m3 > 0
+    assert np.isclose(placed + records[0].unplaced_m3, 1.0)
+    for body in bodies:
+        assert (saturation[body] == 1 - SWI).all() and (labels[body] == G).all()
     added = (saturation > 0) & (labels == D)
-    assert added.sum() > 100 and not added[40:].any()
-    assert saturation[30, 66] >= saturation[30, 14]
+    assert added[25:31, 39:41].any() and not added[40:].any()
+    assert not added[:20].any()
+    assert records[0].disconnected_added_area_mm2 == 0
 
 
 def test_removed_gas_peels_the_lower_edges_first(tmp_path):
@@ -136,8 +161,8 @@ def test_removed_gas_peels_the_lower_edges_first(tmp_path):
     probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
     model = 400 * PORE * (1 - SWI)
     kept, gone = _run(tmp_path, [probabilities] * 2, [0.0, 3.0], [0.4 * model, 0.0])
-    kept, kept_rules, kept_saturation, kept_co2 = kept
-    gone, gone_rules, gone_saturation, gone_co2 = gone
+    kept, kept_rules, kept_saturation, kept_co2, kept_before = kept
+    gone, gone_rules, gone_saturation, gone_co2, gone_before = gone
     assert np.isclose(np.sum(PORE * kept_saturation.astype(float)), 0.4 * model)
     partial = (kept_saturation > 0) & (kept_saturation < 1 - SWI)
     assert partial.sum() <= 1
@@ -150,19 +175,73 @@ def test_removed_gas_peels_the_lower_edges_first(tmp_path):
     assert ((kept_rules == RULE.PEELED) == (gas & (kept == D))).all()
     assert (darsia.model_gas(kept, kept_rules) == gas).all()
     assert (darsia.model_gas(gone, gone_rules) == gas).all()
-    # The CO2 before the rules, which the dilution law reads, stays the model's.
+    # The CO2 before the rules, which the dilution law reads, stays the model's,
+    # and so do the labels before the rules, on which the colour is read.
     co2 = np.zeros(SHAPE, bool)
     co2[10:50, 20:60] = True
     assert (kept_co2 == co2).all() and (gone_co2 == co2).all()
+    model = np.where(gas, G, np.where(co2, D, W))
+    np.testing.assert_array_equal(kept_before, model)
+    np.testing.assert_array_equal(gone_before, model)
 
 
-def test_end_gas_weights_the_gas_after_the_injection(tmp_path):
-    """After the injection, gas far from the free gas at its end is dissolved."""
+@pytest.mark.parametrize("end_h", [1.0, 3.0, 4.0])
+def test_fixed_contour_keeps_later_model_gas_after_injection(tmp_path, end_h):
+    """All selected post-rule gas contributes, irrespective of injection end."""
     left, right = np.s_[20:40, 10:30], np.s_[20:40, 52:72]
     before = _frame(co2=[left], gas=[left])
-    after = _frame(co2=[left, right], gas=[left, right], level=0.7)
-    (_, _, saturation, _), (labels, _, _, _) = _run(
-        tmp_path, [before, after], [0.5, 3.0], [None, None], end_h=1.0
+    after = _frame(co2=[left, right], gas=[left, right], level=0.99)
+    (_, _, saturation, _, _), (labels, rules, _, _, _) = _run(
+        tmp_path, [before, after], [0.5, 3.0], [None, None], end_h=end_h
     )
     assert (saturation[left] == 1 - SWI).all()
-    assert (labels[left] == G).all() and (labels[right] == D).all()
+    assert (labels[left] == G).all() and (labels[right] == G).all()
+    assert not (rules == darsia.PhaseRule.GAS_LIMIT).any()
+
+
+@pytest.mark.parametrize("start", [1, 3])
+def test_a_resumed_run_equals_the_whole_run(tmp_path, start):
+    """The full prepass reconstructs the fixed contour before resuming.
+
+    Every later map and saturation equals the whole run's, including peeled gas.
+    """
+    left, right = np.s_[20:40, 10:30], np.s_[20:40, 52:72]
+    frames = [
+        _frame(co2=[left], gas=[left]),
+        _frame(co2=[left], gas=[np.s_[22:38, 12:28]]),
+        _frame(co2=[left, right], gas=[left, right], level=0.7),
+        _frame(co2=[left, right], gas=[left, np.s_[24:36, 56:68]], level=0.7),
+        _frame(co2=[left, right], gas=[left, right], level=0.75),
+    ]
+    hours, volumes = [0.0, 0.5, 1.5, 2.0, 3.0], [None, 3e-7, 2e-7, None, 4e-7]
+    whole = _run(tmp_path, frames, hours, volumes, end_h=1.0)
+    csv = tmp_path / "protocol.csv"
+    args = (
+        frames,
+        [START + datetime.timedelta(hours=h) for h in hours],
+        darsia.Image(np.ones(SHAPE, int), dimensions=[0.06, 0.08]),
+        np.ones(SHAPE, bool),
+        1.0,
+        {1: 1.0, 2: 0.01},
+        darsia.InjectionProtocol(csv),
+        RULES,
+        np.full(SHAPE, PORE),
+        np.full(SHAPE, SWI),
+        volumes,
+        BASE_SETTINGS,
+    )
+    resumed = list(
+        darsia.free_gas(
+            *args,
+            gas_threshold=GAS_THRESHOLD,
+            start=start,
+            depth_m=np.full(SHAPE, 0.02),
+        )
+    )
+    assert len(resumed) == len(frames) - start
+    for made, again in zip(whole[start:], resumed):
+        for array, other in zip(made, again):
+            np.testing.assert_array_equal(array, other)
+    assert (whole[3][0][24:36, 56:68] == G).all()
+
+
