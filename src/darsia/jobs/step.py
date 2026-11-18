@@ -938,6 +938,7 @@ class StepContext:
         run: str | None = None,
         frame: Frame | None = None,
         part: str | None = None,
+        measurements: Mapping[str, Any] | None = None,
     ) -> None:
         """Publish one of this task's results under its claim token.
 
@@ -956,6 +957,10 @@ class StepContext:
             The frame, for a frame's result.
         part : str, optional
             The part; by default the task's.
+        measurements : Mapping[str, Any], optional
+            Numeric diagnostics stored under ``measurements`` in result.json,
+            readable without the result's arrays. They do not change its reuse
+            identity. Values must be strict JSON, with None for unknown values.
 
         Raises
         ------
@@ -971,6 +976,8 @@ class StepContext:
             "task": self.task.id,
             "revision": self.revision,
         }
+        if measurements is not None:
+            description["measurements"] = dict(measurements)
         try:
             results.publish(
                 location, write, description, self.token, root=self.locations.results
