@@ -15,7 +15,13 @@
   device. It sets the threads and the storage of the results' arrays (the
   ``[storage]`` table of the job's configuration, :func:`darsia.use_storage`),
   renews the lease every :data:`darsia.utils.results.BEAT`, runs the step and
-  marks the task done, naming its accepted tokens, or failed, with the traceback;
+  marks the task done, naming its accepted tokens, or failed, with the traceback.
+  As it starts, before it starts any process, the task's process enters a job
+  object of its own (:class:`darsia.jobs.service.Family`); a done mark then holds
+  the commit charge peaks of all its processes, bound to its claim's token, when
+  the system kept them and no other process of the family runs any more, as
+  the measurement of each step's memory. A job object sets no limit, changes no
+  result and decides no admission;
   the lease is not renewed after the step has ended, so that nothing is written
   into the marker between its mark and its move. A lease or mark is retried while
   the share is out, up to :data:`darsia.utils.results.GRACE`; after a longer
@@ -245,7 +251,13 @@ def _beats(
             os._exit(_lost(error, "renewing the lease"))
 
 
-def run(job: Path, task_name: str, token: str, machine: str) -> int:
+def run(
+    job: Path,
+    task_name: str,
+    token: str,
+    machine: str,
+    family: service.Family | None = None,
+) -> int:
     """Run one claimed task in this process (``python -m darsia.jobs run``).
 
     Parameters
@@ -258,6 +270,11 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
         Its claim token.
     machine : str
         The machine that claimed it.
+    family : darsia.jobs.service.Family, optional
+        The job object this process entered as it started, whose commit charge
+        peaks (:meth:`darsia.jobs.service.Family.peaks`) a done mark keeps; none
+        when this process entered none, e.g. a test's, and then a done mark keeps
+        no peaks.
 
     Returns
     -------
@@ -331,8 +348,12 @@ def run(job: Path, task_name: str, token: str, machine: str) -> int:
     beats.join()  # A beat that has begun lands before the mark, never after it.
     if out is not None:  # not known now: no mark; its service runs it again
         return _lost(out, "running the step")
+    memory = None
+    if failure is None and family is not None:
+        memory = family.peaks(token)  # once no other process of it runs
     try:
-        queue.finish(claim, adopted, failure, deadline=renewed[0] + results.STALE)
+        deadline = renewed[0] + results.STALE
+        queue.finish(claim, adopted, failure, deadline=deadline, memory=memory)
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
@@ -369,8 +390,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     asking.add_argument("request")
     asking.add_argument("--machine", default=socket.gethostname())
     args = parser.parse_args(argv)
-    if args.command == "run":
-        return run(args.job, args.task, args.token, args.machine)
+    if args.command == "run":  # its job object first, before any other process
+        family = service.Family.start()
+        return run(args.job, args.task, args.token, args.machine, family)
     if args.command == "request":
         try:
             value = args.request if args.request == service.AUTO else int(args.request)

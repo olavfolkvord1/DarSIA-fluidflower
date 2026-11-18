@@ -10,7 +10,9 @@ says why. Every :data:`POLL` seconds the service
   returned, uncounted; and one that refused its
   job (its BLAS kernel, compute backend or code revision is not this host's) and
   said so in its claim is returned, and the host takes no more of that job's
-  tasks;
+  tasks; when it refused the job's BLAS kernel or compute backend, the host also
+  refuses every job of that kernel and backend before any claim, look at its
+  memory or start (:meth:`Service._refusal`);
 - takes back stale claims of any host (:func:`darsia.jobs.queue.reclaim`);
 - counts the claims of its host whose process outlived an earlier service, each
   known by its claim's token, its process and that process's birth time, and
@@ -72,7 +74,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -528,6 +530,173 @@ def _size(value: int) -> str:
     return f"{value / 2**30:.2f} GiB"
 
 
+class _JobAccounting(ctypes.Structure):
+    """Windows' ``JOBOBJECT_BASIC_ACCOUNTING_INFORMATION``."""
+
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_int64),
+        ("TotalKernelTime", ctypes.c_int64),
+        ("ThisPeriodTotalUserTime", ctypes.c_int64),
+        ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+        ("TotalPageFaultCount", ctypes.c_uint32),
+        ("TotalProcesses", ctypes.c_uint32),
+        ("ActiveProcesses", ctypes.c_uint32),
+        ("TotalTerminatedProcesses", ctypes.c_uint32),
+    ]
+
+
+class _BasicLimits(ctypes.Structure):
+    """Windows' ``JOBOBJECT_BASIC_LIMIT_INFORMATION``."""
+
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JobLimits(ctypes.Structure):
+    """Windows' ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION``, whose peaks the system
+    keeps for every job object, also one that limits nothing."""
+
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimits),
+        ("IoInfo", ctypes.c_uint64 * 6),  # IO_COUNTERS
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_ACCOUNTING, _LIMITS = 1, 9
+"""The classes of :class:`_JobAccounting` and :class:`_JobLimits` in
+``QueryInformationJobObject``: ``JobObjectBasicAccountingInformation`` and
+``JobObjectExtendedLimitInformation``."""
+
+
+def _job_kernel32():
+    """Windows' kernel32 with the types of its job objects' calls set."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = ()
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPDWORD,
+    )
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel32
+
+
+class Family:
+    """The processes of one task: on Windows a job object of its own, which the
+    task's process enters as it starts, before it starts any process, so that
+    every process it starts, and theirs, belongs to it, nested in any job object
+    the process was in, as Windows allows since 8. The job object limits nothing
+    and ends no process; the system keeps the commit charge of all its processes
+    together over their whole life, which no look from outside can miss
+    (:meth:`peaks`). A launcher the task's process was started through, e.g. a
+    virtual environment's interpreter, which waits for it, stays outside, and its
+    few megabytes are not counted. Elsewhere, and where the system refuses a step
+    of it, the family knows no peaks. The peaks are a measurement only: they
+    decide no admission or reservation.
+
+    Parameters
+    ----------
+    handle : int, optional
+        The job object's handle; None for a family that knows no peaks.
+
+    """
+
+    def __init__(self, handle: int | None = None) -> None:
+        self._handle = handle
+
+    @classmethod
+    def start(cls) -> Family:
+        """Put this process into a new job object of its own, as it starts and
+        before it starts any process (``python -m darsia.jobs run``); a family
+        that knows no peaks where that fails, never an error."""
+        if os.name != "nt":
+            return cls()
+        try:
+            kernel32 = _job_kernel32()
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                return cls()
+            if not kernel32.AssignProcessToJobObject(
+                handle, kernel32.GetCurrentProcess()
+            ):
+                kernel32.CloseHandle(handle)
+                return cls()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return cls()
+        return cls(handle)
+
+    def _query(self, kind: int, found: ctypes.Structure) -> bool:
+        """Fill one class of the job object's information
+        (``QueryInformationJobObject``); whether the system did."""
+        kernel32 = _job_kernel32()
+        size = ctypes.sizeof(found)
+        return bool(
+            kernel32.QueryInformationJobObject(
+                self._handle, kind, ctypes.byref(found), size, None
+            )
+        )
+
+    def peaks(self, attempt: str) -> dict | None:
+        """The peak commit charge of the family's processes, bound to an attempt
+        of its task: of all of them together over their whole life
+        (``job_commit_peak``, the job object's ``PeakJobMemoryUsed``) and of the
+        largest one (``process_commit_peak``, ``PeakProcessMemoryUsed``), in bytes,
+        with the processes it ever held. These are commit charge alone, neither a
+        working set nor physical memory. They are known only once no other
+        process of the family runs, so that the family is closed but for this
+        process, which then only marks its task; None else, and where the system
+        does not say.
+
+        Parameters
+        ----------
+        attempt : str
+            The token of the task's claim, which the peaks are bound to.
+
+        """
+        if self._handle is None:
+            return None
+        accounting, limits = _JobAccounting(), _JobLimits()
+        try:
+            known = self._query(_ACCOUNTING, accounting)
+            known = known and self._query(_LIMITS, limits)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        if not known:
+            return None
+        if accounting.ActiveProcesses != 1:  # another of its processes still runs
+            return None
+        job, one = int(limits.PeakJobMemoryUsed), int(limits.PeakProcessMemoryUsed)
+        if not 0 < one <= job:
+            return None
+        return {
+            "attempt": attempt,
+            "job_commit_peak": job,
+            "process_commit_peak": one,
+            "processes": int(accounting.TotalProcesses),
+        }
+
+
 @dataclass
 class Live:
     """A task running on this host: started by this service, or a survivor."""
@@ -681,6 +850,38 @@ def admit(
     return True, ""
 
 
+def _environment(record: Mapping) -> tuple[str, str]:
+    """A job's computing environment as a host runs it or not: its BLAS kernel and
+    its compute backend."""
+    found = record["environment"]
+    return str(found["blas_kernel"]), str(found.get("backend", "cpu"))
+
+
+def _environment_refusal(record: Mapping, why: str) -> bool:
+    """Whether a task process's refusal of a job (:func:`darsia.jobs.__main__.run`)
+    concerns the job's computing environment alone, so that this host runs no job
+    of the same BLAS kernel and compute backend: this host's OpenBLAS runs another
+    kernel than the job's, or the job's backend names no backend or no device of
+    this host (:func:`darsia.backend_named`).
+
+    A refusal of the job's code revision is none; neither is one of a device of
+    this host that gave other numbers than the CPU with the job's phase model, nor
+    one of a phase model that could not be read, since these concern the job. The
+    texts are the task process's own; any other text is no such refusal.
+
+    """
+    kernel, backend = _environment(record)
+    if why.startswith("This host runs the BLAS kernel ") and why.endswith(
+        f", not the job's {kernel}."
+    ):
+        return True
+    prefix = f"This host cannot run the job's backend {backend}: "
+    return why in (
+        f"{prefix}{backend}: no such device here.",
+        f"{prefix}No compute backend is labelled {backend!r}.",
+    )
+
+
 class Service:
     """One host's service over a jobs folder (:func:`serve`).
 
@@ -723,6 +924,10 @@ class Service:
         """The tasks running on this host, by claimed marker."""
         self.refused: dict[str, str] = {}
         """Jobs this service takes no tasks of, and why."""
+        self.unfit: dict[tuple[str, str], tuple[str, str]] = {}
+        """The computing environments this host runs no job of, by their BLAS
+        kernel and compute backend, each with the job whose task process refused
+        it and why (:meth:`_unfit`), for the service's life."""
         self.exits: dict[tuple[str, str], int] = {}
         """Exits without a mark, by job and task."""
         self.outages = outages
@@ -841,8 +1046,9 @@ class Service:
 
     def _record(self) -> None:
         """Write the host's record: the live tasks with the threads and bytes they
-        reserve, the free memory, the reserve, the request, the reason and the
-        tasks stopped by the share's outage :attr:`outages` times in a row. It is
+        reserve, the free memory, the reserve, the request, the reason, the
+        computing environments it refuses (:attr:`unfit`) and the tasks stopped by
+        the share's outage :attr:`outages` times in a row. It is
         created whole, by a partial file renamed without replacing another's, and
         then rewritten in place by its holder alone: through the one handle it
         reads the record, and writes only if it is still what :meth:`_hold` read
@@ -870,6 +1076,10 @@ class Service:
             "reserve": reserve(),
             "live": live,
             "reason": self.reason,
+            "unfit": [
+                {"blas_kernel": kernel, "backend": backend, "job": job, "reason": why}
+                for (kernel, backend), (job, why) in sorted(self.unfit.items())
+            ],
             "peaks": [self.peaks[key] for key in sorted(self.peaks)],
             "outages": [
                 {"job": job, "task": task, "times": times, "reason": why}
@@ -946,7 +1156,19 @@ class Service:
 
         A job's code revision is fixed at its creation; a service of another
         revision takes none of its tasks. A job whose tasks need more threads than
-        the host has cannot start here.
+        the host has cannot start here. A job of a computing environment that a
+        task process of an earlier job refused on this host for its BLAS kernel or
+        compute backend (:attr:`unfit`) is refused too, before any claim, look at
+        memory or start, so that it holds up no task.
+
+        The first job of an environment this host has not refused yet costs one
+        discovery: its task is admitted by memory, claimed and started like any
+        other, and until then it may wait for memory at the head of the queue.
+        The service cannot check an environment in its own process: OpenBLAS
+        chooses its kernel when it loads, so only a process started with the
+        job's kernel can say whether this host runs it, and a compute backend is
+        checked by loading the OpenCL drivers and computing on the device with
+        the job's phase model, which the service keeps out of its process.
 
         """
         if record["id"] in self.refused:
@@ -960,6 +1182,13 @@ class Service:
             return (
                 f"Its tasks need {record['environment']['threads']} threads; this "
                 f"host has {self.threads}."
+            )
+        kernel, backend = _environment(record)
+        unfit = self.unfit.get((kernel, backend))
+        if unfit is not None:
+            return (
+                f"Its BLAS kernel {kernel} and compute backend {backend} are not "
+                f"this host's, as a task of job {unfit[0]} found: {unfit[1]}"
             )
         return None
 
@@ -993,6 +1222,21 @@ class Service:
             self.refused[record["id"]] = why
             say(
                 f"{self.machine} takes no tasks of job {record['id']}: {why}", job / LOG
+            )
+
+    def _unfit(self, record: dict, why: str) -> None:
+        """Take no task of any job of a job's computing environment when a task
+        process of the job refused the job for its BLAS kernel or compute backend
+        (:func:`_environment_refusal`), saying so once; any other refusal stays the
+        job's alone."""
+        if not _environment_refusal(record, why):
+            return
+        key = _environment(record)
+        if key not in self.unfit:
+            self.unfit[key] = (record["id"], why)
+            say(
+                f"{self.machine} takes no task of any job of the BLAS kernel "
+                f"{key[0]} and the compute backend {key[1]}: {why}"
             )
 
     def _reap(self) -> None:
@@ -1039,6 +1283,7 @@ class Service:
             if code == REFUSED and lease.get("refused"):
                 self._release(claim, log, "its process refused the job")
                 self._refuse(claim.job, record, lease["refused"])
+                self._unfit(record, lease["refused"])
                 continue
             key = (record["id"], claim.task)
             self.exits[key] = self.exits.get(key, 0) + 1

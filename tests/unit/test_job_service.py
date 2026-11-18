@@ -1,5 +1,6 @@
 """Tests of the job engine's service: task processes, environments and hosts."""
 
+import ctypes
 import json
 import os
 import secrets
@@ -18,11 +19,21 @@ from threadpoolctl import threadpool_info, threadpool_limits
 
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import queue, service
-from darsia.jobs.job import create_job, read_job
-from darsia.jobs.step import Selection
+from darsia.jobs.job import Sizes, create_job, read_job
+from darsia.jobs.step import Memory, Order, Selection, Step
 from darsia.utils import results
+from darsia.utils.gpu import backend as gpu_backend
+from darsia.utils.gpu import opencl
 from tests.unit.test_jobs import no_share_wait  # noqa: F401
-from tests.unit.test_jobs import NUMBERS, SUMS, _project, _stored
+from tests.unit.test_jobs import (
+    NUMBERS,
+    SUMS,
+    ToySettings,
+    _files,
+    _numbers,
+    _project,
+    _stored,
+)
 from tests.unit.test_minimal_chain import _head
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -699,3 +710,376 @@ def test_completed_jobs_are_not_read_again_but_failed_jobs_can_be_retried(
     assert complete == {first.name, failed.name}
     make("third")
     assert not service.settled(jobs, complete=complete)
+
+
+GIB = 2**30
+"""A gibibyte."""
+
+
+# Eligibility before memory: a host refuses a refused computing environment.
+
+SIZES = Sizes(1, 0, GIB)
+"""Sizes in which a step's grid arrays are GiB."""
+ARRAYS = Step(
+    "arrays",
+    {},
+    Order.FRAMES,
+    Memory(grid=2.0),
+    _numbers,
+    {"toy": ToySettings},
+    sections=("protocols",),
+    files=_files,
+)
+"""A step over frames whose task declares 2 GiB."""
+
+
+def _arrays(tmp_path, name, **project):
+    """A job of the arrays step over both runs of a project of its own: three
+    tasks of one workload."""
+    config, selection = _project(tmp_path / name, **project)
+    return create_job(tmp_path / "jobs", (ARRAYS,), selection, config, sizes=SIZES)
+
+
+class _Process:
+    """A task process of a test, which holds no memory: it runs until the test ends
+    it; one of a job the test refuses says why in its claim and exits at once, as
+    a task process does (:func:`darsia.jobs.__main__.run`)."""
+
+    def __init__(self, found, command):
+        job, task, token = Path(command[4]), command[5], command[6]
+        self.claim = queue.Claim(job, task, token, "here")
+        self.pid, self.code = 999_999, None
+        found.started.append(self)
+        if job.name in found.refusals:
+            queue.refuse(self.claim, found.refusals[job.name])
+            self.code = service.REFUSED
+
+    def poll(self):
+        """Its exit code, once it has ended."""
+        return self.code
+
+    def end(self):
+        """Mark its task done and exit with code 0."""
+        queue.finish(self.claim)
+        self.code = 0
+
+
+@pytest.fixture
+def processes(monkeypatch):
+    """The task processes a test's services start (:class:`_Process`), and the
+    refusals of the jobs whose processes refuse them, by job name."""
+    found = SimpleNamespace(started=[], refusals={})
+    starting = SimpleNamespace(
+        Popen=lambda command, **_: _Process(found, command),
+        DEVNULL=subprocess.DEVNULL,
+        STDOUT=subprocess.STDOUT,
+    )
+    monkeypatch.setattr(service, "subprocess", starting)
+    return found
+
+
+def _serving(tmp_path, monkeypatch, threads, peak=None):
+    """A service of this host over the test's jobs folder, with ample memory, no
+    reserve and no bytes of a task process's own, whose look at a live task finds
+    its processes holding nothing now and ``peak["bytes"]`` at the most; nothing
+    once its process has ended."""
+    running = service.Service(tmp_path / "jobs", "here", threads, tmp_path / "logs")
+    monkeypatch.setattr(service, "revision", lambda: running.revision)
+    monkeypatch.setattr(service, "headroom", lambda: 100 * GIB)
+    monkeypatch.setattr(service, "reserve", lambda: 0)
+    monkeypatch.setattr(service, "PROCESS", 0)
+
+    def looked(live):
+        if peak is not None and (live.process is None or live.process.poll() is None):
+            live.peak = max(live.peak, peak["bytes"])
+        return 0
+
+    monkeypatch.setattr(service.Live, "resident", looked)
+    return running
+
+
+def test_a_refused_environment_refuses_its_later_jobs_before_any_claim(
+    tmp_path, monkeypatch, processes
+):
+    """After a task process refused its job for want of its compute backend's
+    device on this host, a later job of the same BLAS kernel and backend is
+    refused before any claim, look at its memory or start, and never becomes the
+    reason the host waits, while a later job of the CPU starts in the same round;
+    the host's record shows the environment refused."""
+    monkeypatch.setattr(opencl, "opencl_devices", lambda: [])  # no such device here
+    first = _arrays(tmp_path, "first", backend="opencl:Absent")
+    with pytest.raises(ValueError) as refused:
+        jobs_main.backend_of(first, read_job(first))
+    why = str(refused.value)
+    assert why == (
+        "This host cannot run the job's backend opencl:Absent: opencl:Absent: no "
+        "such device here."
+    )
+    processes.refusals[first.name] = why
+    running = _serving(tmp_path, monkeypatch, threads=1)
+    running.poll()  # its first task is claimed and started; its process refuses
+    running.poll()  # it is returned, and its job and environment refused
+    environment = service._environment(read_job(first))
+    assert running.unfit == {environment: (first.name, why)}
+    assert len(queue.markers(first, queue.QUEUE)) == 3
+    same = _arrays(tmp_path, "same", backend="opencl:Absent")
+    cpu = _arrays(tmp_path, "cpu")
+    reserved, claimed = [], []
+    reserve, claim = running._reserve, queue.claim
+
+    def reserving(record, task):
+        reserved.append(record["id"])
+        return reserve(record, task)
+
+    def claiming(job, *rest):
+        claimed.append(Path(job).name)
+        return claim(job, *rest)
+
+    monkeypatch.setattr(running, "_reserve", reserving)
+    monkeypatch.setattr(queue, "claim", claiming)
+    running.poll()
+    assert same.name not in reserved and same.name not in claimed
+    assert not queue.markers(same, queue.CLAIMED)
+    assert len(queue.markers(same, queue.QUEUE)) == 3
+    assert running.refused[same.name] == (
+        f"Its BLAS kernel {environment[0]} and compute backend opencl:Absent are "
+        f"not this host's, as a task of job {first.name} found: {why}"
+    )
+    assert [process.claim.job for process in processes.started] == [first, cpu]
+    assert running.reason.startswith(f"Task arrays.r2.0000 of job {cpu.name} waits")
+    path = service.machine_files(tmp_path / "jobs", "here")[0]
+    assert json.loads(path.read_text())["unfit"] == [
+        {
+            "blas_kernel": environment[0],
+            "backend": "opencl:Absent",
+            "job": first.name,
+            "reason": why,
+        }
+    ]
+
+
+def test_only_a_refusal_of_the_environment_refuses_its_other_jobs(
+    tmp_path, monkeypatch, processes
+):
+    """A refusal counts for its job's environment only when the task process
+    found this host without the job's BLAS kernel, or its compute backend's label
+    or device: one of the code revision, of a device of this host that gave other
+    numbers with the job's phase model, or of a phase model that could not be
+    read stays its job's alone; and a job of more threads than the host's is
+    refused as before."""
+    job = _arrays(tmp_path, "gpu", backend="opencl:Device")
+    record = read_job(job)
+    environment = record["environment"]
+    kernel = dict(record, environment=dict(environment, blas_kernel="NoSuchKernel"))
+    label = dict(record, environment=dict(environment, backend="opencl-gpu"))
+
+    def backend_refusal(record):
+        with pytest.raises(ValueError) as refused:
+            jobs_main.backend_of(job, record)
+        return str(refused.value)
+
+    monkeypatch.setattr(opencl, "opencl_devices", lambda: [])
+    absent, unknown = backend_refusal(record), backend_refusal(label)
+    device = SimpleNamespace(name="Device")
+    monkeypatch.setattr(opencl, "opencl_devices", lambda: [device])
+    monkeypatch.setattr(opencl, "OpenCLBackend", lambda device: device)
+    monkeypatch.setattr(gpu_backend, "_agrees", lambda backend, heads: False)
+    other = backend_refusal(record)
+    assert other.endswith("opencl:Device: none gives the CPU's numbers.")
+
+    def unreadable(job, record):
+        raise ValueError("the phase model is not whole")
+
+    monkeypatch.setattr(jobs_main, "heads", unreadable)
+    model = backend_refusal(record)
+    found = jobs_main.refusal(kernel["environment"])
+    assert service._environment_refusal(kernel, found)
+    assert service._environment_refusal(record, absent)
+    assert service._environment_refusal(label, unknown)
+    revision = jobs_main.other_revision(record, "another")
+    for why in (other, model, revision):
+        assert not service._environment_refusal(record, why)
+    processes.refusals[job.name] = revision
+    running = _serving(tmp_path, monkeypatch, threads=1)
+    running.poll()  # its task process refuses the job's revision
+    running.poll()
+    assert running.refused[job.name] == revision and running.unfit == {}
+    later = _arrays(tmp_path, "later", backend="opencl:Device")
+    assert running._refusal(read_job(later)) is None
+    wide = _arrays(tmp_path, "wide", threads=3)
+    assert running._refusal(read_job(wide)) == (
+        "Its tasks need 3 threads; this host has 1."
+    )
+    assert running.unfit == {}
+
+
+@pytest.mark.parametrize(
+    "kernel, backend", [("NoSuchKernel", "cpu"), ("Haswell", "opencl-gpu")]
+)
+def test_a_task_process_that_refuses_its_environment_refuses_its_later_jobs(
+    tmp_path, importable, monkeypatch, kernel, backend
+):
+    """A task process that refuses its job's BLAS kernel or compute backend makes
+    its service refuse a later job of the same kernel and backend before any claim
+    or start, saying why."""
+    monkeypatch.setattr(service, "headroom", lambda: 2**40)
+    monkeypatch.setattr(service, "reserve", lambda: 0)
+
+    def make(name):
+        config, selection = _project(tmp_path / name, kernel=kernel, backend=backend)
+        one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+        return create_job(tmp_path / "jobs", (NUMBERS,), one, config)
+
+    first = make("first")
+    running = service.Service(tmp_path / "jobs", "here", 2, tmp_path / "logs")
+    running.poll()
+    ((_, live),) = running.live.items()
+    live.process.wait(120)
+    running.poll()
+    why = running.refused[first.name]
+    assert running.unfit == {(kernel, backend): (first.name, why)}
+    later = make("later")
+    running.poll()
+    assert not running.live and not queue.markers(later, queue.CLAIMED)
+    assert set(queue.markers(later, queue.QUEUE)) == {"numbers.r2.0000"}
+    assert running.refused[later.name] == (
+        f"Its BLAS kernel {kernel} and compute backend {backend} are not this "
+        f"host's, as a task of job {first.name} found: {why}"
+    )
+
+
+class _Family:
+    """A task's family whose job object kept the given commit peaks, or none."""
+
+    def __init__(self, job=None, one=None):
+        self.job, self.one, self.asked = job, one, []
+
+    def peaks(self, attempt):
+        """Its peaks bound to an attempt (:meth:`darsia.jobs.service.Family.peaks`)."""
+        self.asked.append(attempt)
+        if self.job is None:
+            return None
+        return {
+            "attempt": attempt,
+            "job_commit_peak": self.job,
+            "process_commit_peak": self.one,
+            "processes": 2,
+        }
+
+
+def test_a_done_mark_keeps_its_familys_commit_peaks_bound_to_its_attempt(
+    tmp_path, monkeypatch, kept_threads
+):
+    """A task process that ended its step marks its task done with the commit
+    peaks its family's job object kept, bound to its claim's token; one whose
+    family knows none, or that entered none, keeps none, and a failed task's mark
+    never does."""
+    marks = {}
+    for name, family in (
+        ("kept", _Family(3 * GIB, GIB)),
+        ("unknown", _Family()),
+        ("none", None),
+    ):
+        job = _one(tmp_path / name, kernel=HERE)
+        claim = queue.claim(job, "numbers.r2.0000", "here")
+        assert jobs_main.run(job, claim.task, claim.token, "here", family) == 0
+        marker = queue.read_marker(job / queue.DONE / claim.path.name)
+        marks[name] = (claim.token, marker.get("memory"))
+        assert family is None or family.asked == [claim.token]
+    token, memory = marks["kept"]
+    assert memory == {
+        "attempt": token,
+        "job_commit_peak": 3 * GIB,
+        "process_commit_peak": GIB,
+        "processes": 2,
+    }
+    assert marks["unknown"][1] is None and marks["none"][1] is None
+    job = _one(tmp_path / "failed", kernel=HERE)
+    claim = queue.claim(job, "numbers.r2.0000", "here")
+
+    def broken(job, name):
+        raise ValueError("its task cannot be read")
+
+    monkeypatch.setattr(queue, "task", broken)
+    family = _Family(3 * GIB, GIB)
+    assert jobs_main.run(job, claim.task, claim.token, "here", family) == 0
+    marker = queue.read_marker(job / queue.FAILED / claim.path.name)
+    assert "memory" not in marker and family.asked == []
+
+
+def test_a_family_knows_its_peaks_only_whole_and_once_it_is_closed(monkeypatch):
+    """A family's peaks are its job object's commit peaks, bound to an attempt,
+    once no other process of it runs: none while one does, when the system does
+    not say, when they are out of order, without a job object, and on a system
+    without job objects."""
+
+    def answering(active, job, one, known=True):
+        def query(self, kind, found):
+            if kind == service._ACCOUNTING:
+                found.ActiveProcesses, found.TotalProcesses = active, 3
+            else:
+                found.PeakJobMemoryUsed, found.PeakProcessMemoryUsed = job, one
+            return known
+
+        return query
+
+    family = service.Family(handle=1)
+    monkeypatch.setattr(service.Family, "_query", answering(1, 3 * GIB, GIB))
+    assert family.peaks("token") == {
+        "attempt": "token",
+        "job_commit_peak": 3 * GIB,
+        "process_commit_peak": GIB,
+        "processes": 3,
+    }
+    for query in (
+        answering(2, 3 * GIB, GIB),  # another of its processes still runs
+        answering(1, 3 * GIB, GIB, known=False),
+        answering(1, GIB, 3 * GIB),
+        answering(1, 0, 0),
+    ):
+        monkeypatch.setattr(service.Family, "_query", query)
+        assert family.peaks("token") is None
+    assert service.Family().peaks("token") is None
+    monkeypatch.setattr(service, "os", SimpleNamespace(name="posix"))
+    assert service.Family.start().peaks("token") is None
+    if ctypes.sizeof(ctypes.c_void_p) == 8:  # the layouts of Windows' headers
+        assert ctypes.sizeof(service._JobAccounting) == 48
+        assert ctypes.sizeof(service._JobLimits) == 144
+
+
+_FAMILY = """
+import json, subprocess, sys
+import psutil
+from darsia.jobs import service
+held = bytearray(int(sys.argv[1]))  # committed before it enters its job object
+family = service.Family.start()
+code = "import sys, time; b = bytearray(int(sys.argv[1])); time.sleep(2.0)"
+child = subprocess.Popen([sys.executable, "-c", code, sys.argv[2]])
+running = family.peaks("token")
+child.wait()
+after = family.peaks("token")
+own = psutil.Process().memory_info().private
+print(json.dumps({"running": running, "after": after, "own": own}))
+"""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows'")
+def test_a_familys_job_object_keeps_the_commit_peak_of_all_its_processes(
+    importable,
+):
+    """A process that entered a job object of its own knows, once its child has
+    ended, the peak commit charge of both together, its own commit from before it
+    entered the job included, and nothing while the child runs. A virtual
+    environment's interpreter starts the child through its launcher, a process of
+    the family too."""
+    held, child = 64 * 2**20, 256 * 2**20
+    command = [sys.executable, "-c", _FAMILY, str(held), str(child)]
+    found = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    assert found.returncode == 0, found.stderr
+    seen = json.loads(found.stdout.strip().splitlines()[-1])
+    assert seen["running"] is None, seen
+    after = seen["after"]
+    assert after["attempt"] == "token" and after["processes"] >= 2, seen
+    assert after["job_commit_peak"] >= held + child, seen
+    assert after["job_commit_peak"] >= after["process_commit_peak"], seen
+    assert after["process_commit_peak"] >= max(child, seen["own"]), seen
