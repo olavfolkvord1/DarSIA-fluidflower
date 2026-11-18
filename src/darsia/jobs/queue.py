@@ -378,6 +378,7 @@ def finish(
     traceback: str | None = None,
     *,
     deadline: float | None = None,
+    memory: Mapping | None = None,
 ) -> None:
     """Move a claim to ``done/``, naming its accepted tokens, or to ``failed/``.
 
@@ -393,6 +394,11 @@ def finish(
     deadline : float, optional
         Latest retry time on the monotonic clock, from the task's last renewal.
         The write and move share it. Without it, they share one GRACE period.
+    memory : Mapping, optional
+        The commit charge peaks of the task's processes, bound to its claim's
+        token (:meth:`darsia.jobs.service.Family.peaks`), which its done marker
+        keeps as the measurement of its step's memory; a failed marker keeps
+        none.
 
     Raises
     ------
@@ -405,6 +411,8 @@ def finish(
     if traceback is None:
         state = DONE
         content = {"token": claim.token, "accepted": sorted({claim.token, *accepted})}
+        if memory:
+            content["memory"] = dict(memory)
     else:
         state, content = FAILED, {"token": claim.token, "traceback": traceback}
     _write(
