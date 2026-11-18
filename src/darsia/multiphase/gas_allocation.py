@@ -19,8 +19,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import hypot
 from pathlib import Path
+from darsia.utils import results
+
+from math import hypot
 
 import cv2
 import numpy as np
@@ -811,7 +813,6 @@ def free_gas(
                 ),
             )
         yield labels, rules, saturation, _co2(own), own
-
 
 def _maps_file(held_out: str | None) -> str:
     """The file of a frame's stored maps, or of its maps without a held-out run's
