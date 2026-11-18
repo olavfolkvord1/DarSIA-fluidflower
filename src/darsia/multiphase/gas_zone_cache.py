@@ -6,6 +6,7 @@ import operator
 import numpy as np
 
 from darsia.multiphase.gas_model_cache import GasModelCache, GasModelReader
+from darsia.multiphase.gas_zone import GasLink, GasZone
 
 
 def _encode(value):
@@ -77,8 +78,6 @@ class GasZoneReader(GasModelReader):
         return super().__getitem__(index)
 
     def _validate(self, zone):
-        from darsia.multiphase.gas_zone import GasLink, GasZone
-
         if not isinstance(zone, GasZone):
             raise TypeError("A gas-zone cache stores GasZone values.")
         if (
@@ -138,8 +137,6 @@ class GasZoneReader(GasModelReader):
                 )
 
     def _load(self, index):
-        from darsia.multiphase.gas_zone import GasLink, GasZone
-
         with np.load(self._directory / f"{index:08d}.npz", allow_pickle=False) as saved:
             metadata = saved["metadata"]
             if metadata.ndim != 1 or metadata.dtype != np.uint8:

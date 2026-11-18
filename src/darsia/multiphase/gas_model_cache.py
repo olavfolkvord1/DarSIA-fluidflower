@@ -9,6 +9,7 @@ their files and strict provenance in the local application cache, even on error.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import operator
@@ -34,8 +35,6 @@ def _local_cache() -> Path:
     if not base.is_absolute():
         raise ValueError("The local application cache must be an absolute path.")
     if os.name == "nt":
-        import ctypes
-
         if (
             str(base).startswith("\\\\")
             or ctypes.windll.kernel32.GetDriveTypeW(str(base.anchor)) == 4

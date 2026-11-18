@@ -35,6 +35,11 @@ MODULES = [
     "darsia/experiment/overflow_circulation.py",
     "darsia/experiment/overflow_evaporation.py",
     "darsia/multiphase/gas_allocation.py",
+    "darsia/multiphase/gas_bridge.py",
+    "darsia/multiphase/gas_model_cache.py",
+    "darsia/multiphase/gas_parameters.py",
+    "darsia/multiphase/gas_zone.py",
+    "darsia/multiphase/gas_zone_cache.py",
 ]
 """Modules under the rules, relative to the source folder."""
 

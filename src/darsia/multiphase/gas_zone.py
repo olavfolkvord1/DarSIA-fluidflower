@@ -392,6 +392,25 @@ def _depth_margin(contour, depth_m, path, pitch_mm, *, previous=None):
     return contour | margin, diagnostics
 
 
+def injection_ports(protocol):
+    """Each port's injection periods (touching ones merged), by first start."""
+    periods = {}
+    for row in protocol.df[protocol.df["rate_kg_s"] > 0].itertuples():
+        periods.setdefault((row.location_x, row.location_y), []).append(
+            (row.start, row.end)
+        )
+    ports = {}
+    for port, rows in sorted(periods.items(), key=lambda item: min(item[1])[0]):
+        merged = []
+        for start, end in sorted(rows):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        ports[port] = merged
+    return ports
+
+
 def gas_model_zones(
     frames,
     dates,
@@ -447,8 +466,6 @@ def gas_model_zones(
     GasZone
         Immutable cumulative contour and the current injection's signal paths.
     """
-    from darsia.multiphase.gas_allocation import injection_ports
-
     settings = gas_parameters(settings, depth_m)
 
     columns, rows = darsia.pixel_centres(sand_map)

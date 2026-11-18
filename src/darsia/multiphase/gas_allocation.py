@@ -32,7 +32,7 @@ import darsia
 from darsia.multiphase.gas_parameters import GasAllocationSettings, gas_parameters
 from darsia.multiphase.gas_model_cache import GasModelCache, GasModelFrame
 from darsia.multiphase.gas_bridge import bridge_scores, hidden_bridges
-from darsia.multiphase.gas_zone import GasZone, gas_model_zones
+from darsia.multiphase.gas_zone import GasZone, gas_model_zones, injection_ports
 from darsia.multiphase.gas_zone_cache import GasZoneCache
 from darsia.multiphase.phase_rules import (
     PhaseLabel,
@@ -125,23 +125,6 @@ def _box(mask):
     return np.s_[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
 
 
-def injection_ports(protocol):
-    """Each port's injection periods (touching ones merged), by first start."""
-    periods = {}
-    for row in protocol.df[protocol.df["rate_kg_s"] > 0].itertuples():
-        periods.setdefault((row.location_x, row.location_y), []).append(
-            (row.start, row.end)
-        )
-    ports = {}
-    for port, rows in sorted(periods.items(), key=lambda item: min(item[1])[0]):
-        merged = []
-        for start, end in sorted(rows):
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-            else:
-                merged.append((start, end))
-        ports[port] = merged
-    return ports
 
 
 def _inward_weight(limit, pitch_mm, decay_mm):
