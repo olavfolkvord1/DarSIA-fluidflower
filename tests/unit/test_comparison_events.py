@@ -17,6 +17,7 @@ from darsia.presets.workflows.comparison.comparison_events import (
     injection_answers,
     integrated_events,
     question_states,
+    read_events,
     run_answer,
     write_events,
 )
@@ -307,3 +308,135 @@ def test_the_official_volume_events_are_unchanged():
     assert found["w"] is None
     with pytest.raises(AssertionError, match="exact_volume_total_m3"):
         integrated_events(table.drop(columns="exact_volume_total_m3"), events)
+
+
+def test_event_table_keeps_peak_mass_and_unknown_answers(tmp_path):
+    """The maximum's mass accompanies its time; missing answers are not zero."""
+    known = series(np.float32)
+    unknown = replace(series(gas=[np.nan] * len(HOURS)), run="unknown")
+    rows = event_table(
+        [QUESTIONS["peak"]],
+        [known, unknown],
+        {"run": INJECTIONS, "unknown": INJECTIONS},
+    )
+    path = tmp_path / "events.csv"
+    write_events(path, rows)
+    restored = read_events(path)
+    peak, missing = restored[:2]
+    assert (peak["case_id"], peak["elapsed_h"]) == ("run-4", 2.0)
+    assert (peak["domain_id"], peak["component"]) == ("box2", "gas")
+    assert peak["mass_g"] == float(np.float32(0.08))
+    assert missing["case_id"] is None and missing["mass_g"] is None
+    assert "unknown" in missing["note"]
+
+
+def test_compound_event_does_not_invent_a_single_mass():
+    """A question involving multiple components has no one scalar mass."""
+    question = EventQuestion(
+        "both", [QUESTIONS["arrival"].conditions[0], QUESTIONS["peak"].conditions[0]]
+    )
+    answer = run_answer(question, series())
+    assert answer.case_id == "run-4"
+    assert (answer.domain_id, answer.component, answer.mass_g) == (None, None, None)
+
+
+def test_older_event_tables_remain_readable(tmp_path):
+    path = tmp_path / "old-events.csv"
+    path.write_text(
+        "question,mode,run,injection,case_id,elapsed_h,after_injection_h,resolution_h,note\n"
+        "peak,run,r,1,s/image.ARW,2,2,0.5,\n",
+        encoding="utf-8",
+    )
+    row = read_events(path)[0]
+    assert row["elapsed_h"] == 2.0 and row["case_id"] == "s/image.ARW"
+    assert (row["domain_id"], row["component"], row["mass_g"]) == (None, None, None)
+
+
+@pytest.mark.parametrize("missing_frames", [(7,), (0,), (0, 7)])
+def test_maximum_discloses_missing_mass_anywhere_in_run(missing_frames, tmp_path):
+    """A known peak survives, but missing samples can hide a larger run maximum."""
+    values = np.array(GAS)
+    values[list(missing_frames)] = np.nan
+    run = series(gas=values)
+    answer = run_answer(QUESTIONS["peak"], run)
+    assert (answer.case_id, answer.elapsed_h, answer.mass_g) == ("run-4", 2.0, 0.08)
+    assert (
+        f"Largest known mass only; complete-run maximum unknown: "
+        f"{len(missing_frames)} of 8 frame(s) unknown"
+    ) in answer.note
+    if 0 in missing_frames:
+        assert answer.note.startswith("1 earlier frame(s) unknown;")
+    rows = event_table([QUESTIONS["peak"]], [run], {"run": INJECTIONS})
+    path = tmp_path / "peak.csv"
+    write_events(path, rows)
+    assert read_events(path)[0]["note"] == answer.note
+
+
+def test_maximum_discloses_unknowns_outside_answered_injection():
+    """The maximum condition covers the run even for a per-injection answer."""
+    run = series(gas=[0, 0, 0.01, 0.05, 0.08, 0.06, 0, np.nan])
+    injections = pd.DataFrame({"number": [1, 2], "start_h": [0.0, 3.0]})
+    peak, later = injection_answers(QUESTIONS["peak"], run, injections)
+    assert (peak.injection, peak.case_id, peak.mass_g) == (1, "run-4", 0.08)
+    assert "complete-run maximum unknown: 1 of 8" in peak.note
+    assert later.case_id is None and later.mass_g is None
+
+
+def test_maximum_ties_and_complete_coverage_keep_original_answer():
+    """Complete data keep the first tied maximum, with no incomplete-run note."""
+    run = series(gas=[0, 0, 0.01, 0.05, 0.08, 0.08, 0, 0])
+    answer = run_answer(QUESTIONS["peak"], run)
+    assert (answer.case_id, answer.mass_g, answer.note) == ("run-4", 0.08, "")
+
+
+def test_all_unknown_maximum_has_no_invented_known_value():
+    """Without any known mass there is no observed peak or time to preserve."""
+    answer = run_answer(QUESTIONS["peak"], series(gas=[np.nan] * 8))
+    assert (answer.case_id, answer.elapsed_h, answer.mass_g) == (None, None, None)
+    assert answer.note == "Not found; some frames are unknown"
+
+
+def test_compound_maxima_disclose_each_missing_component():
+    """Kleene combination must not hide incomplete maximum input coverage."""
+    question = EventQuestion(
+        "both peaks",
+        [
+            dict(component="gas", event="maximum", domain_id="box2"),
+            dict(component="aqueous", event="maximum", domain_id="box2"),
+        ],
+    )
+    run = series(
+        gas=[0, 0, 0.01, 0.05, 0.08, 0.06, 0, np.nan],
+        aqueous=np.asarray([np.nan, 0, 0.01, 0.05, 0.09, 0.06, 0, 0]),
+    )
+    answer = run_answer(question, run)
+    assert answer.case_id == "run-4" and answer.mass_g is None
+    assert "Largest known mass only (box2, gas)" in answer.note
+    assert "Largest known mass only (box2, aqueous)" in answer.note
+    assert answer.note.count("complete-run maximum unknown: 1 of 8") == 2
+
+
+def test_later_unknown_does_not_change_first_arrival_disclosure():
+    """A future missing sample cannot invalidate an already observed arrival."""
+    answer = run_answer(
+        QUESTIONS["arrival"], series(gas=[0, 0, 0.01, 0.05, 0.08, 0.06, 0, np.nan])
+    )
+    assert answer.case_id == "run-2" and answer.note == ""
+
+
+def test_other_true_condition_does_not_invent_an_all_unknown_maximum():
+    """An OR answer can exist while its maximum condition has no known mass."""
+    question = EventQuestion(
+        "either",
+        [
+            dict(component="gas", event="maximum", domain_id="box2"),
+            dict(component="aqueous", event="detected", domain_id="box2"),
+        ],
+        combine="any",
+    )
+    answer = run_answer(question, series(gas=[np.nan] * 8, aqueous=np.asarray(GAS)))
+    assert answer.case_id == "run-2" and answer.mass_g is None
+    assert (
+        "No known mass (box2, gas); complete-run maximum unknown: 8 of 8" in answer.note
+    )
+    assert "Largest known mass" not in answer.note

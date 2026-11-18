@@ -7,7 +7,8 @@ A question (:class:`EventQuestion`) holds one or more conditions
 - ``detected``: its mass is above the noise limit;
 - ``reaches``: its mass is at least a threshold;
 - ``falls_below``: its mass is below a threshold it reached at an earlier frame;
-- ``maximum``: the frame of its largest mass;
+- ``maximum``: the frame of its largest known mass, with missing coverage
+  disclosed in the answer;
 - ``gone``: it had been detected, and is detected neither at this frame nor later.
 
 A threshold, and the noise limit, is in grams or in percent of the CO2 injected
@@ -75,6 +76,9 @@ COLUMNS = (
     "after_injection_h",
     "resolution_h",
     "note",
+    "domain_id",
+    "component",
+    "mass_g",
 )
 """Columns of the event table: a row per question, run and, per injection, injection."""
 _TRUE, _UNKNOWN, _FALSE = 1.0, 0.5, 0.0
@@ -171,7 +175,17 @@ class EventAnswer:
     """Hours since the frame before, at which the question did not hold; None at
     the run's first frame and where the question held or was unknown there."""
     note: str = ""
-    """Unknown frames before the answer, or why there is none."""
+    """Unknown coverage, including the whole run for a maximum, or why there
+    is no answer."""
+    domain_id: str | None = None
+    """Domain of a single-condition question; None for a compound question."""
+    component: str | None = None
+    """Mass component of a single-condition question."""
+    mass_g: float | None = None
+    """Mass [g] at the answer's frame for a single-condition question, including
+    its largest known mass for a maximum event. Missing run coverage is
+    disclosed in ``note``. None without an answer or for a
+    compound question, which has no single mass."""
 
 
 def _limit(value: float, unit: str, injected: np.ndarray) -> np.ndarray:
@@ -271,14 +285,44 @@ def question_states(question: EventQuestion, series: RunSeries) -> np.ndarray:
 def _first(question, series, states, frames, injection, never) -> EventAnswer:
     """The first of ``frames`` where ``states`` hold, counted from ``injection``."""
     number, start_h = (None, None) if injection is None else injection
+    condition = question.conditions[0] if len(question.conditions) == 1 else None
+    identity = (
+        dict(domain_id=condition.domain_id, component=condition.component)
+        if condition is not None
+        else {}
+    )
     found = np.flatnonzero(states[frames] == _TRUE)
     if found.size == 0:
         unknown = np.any(states[frames] == _UNKNOWN)
         note = "Not found; some frames are unknown" if unknown else never
-        return EventAnswer(question.name, series.run, number, note=note)
+        return EventAnswer(question.name, series.run, number, note=note, **identity)
     frame = frames[found[0]]
     unknown = int(np.count_nonzero(states[frames[: found[0]]] == _UNKNOWN))
     hours = float(series.elapsed_h[frame])
+    mass = (
+        float(series.masses[condition.domain_id][condition.component][frame])
+        if condition is not None
+        else None
+    )
+    notes = [f"{unknown} earlier frame(s) unknown"] if unknown else []
+    for maximum in question.conditions:
+        if maximum.event != "maximum":
+            continue
+        amounts = series.masses[maximum.domain_id][maximum.component]
+        missing = int(np.count_nonzero(np.isnan(amounts)))
+        if missing:
+            label = (
+                f" ({maximum.domain_id}, {maximum.component})"
+                if len(question.conditions) > 1
+                else ""
+            )
+            coverage = (
+                "Largest known mass only" if missing < len(amounts) else "No known mass"
+            )
+            notes.append(
+                f"{coverage}{label}; complete-run maximum unknown: "
+                f"{missing} of {len(amounts)} frame(s) unknown"
+            )
     return EventAnswer(
         question=question.name,
         run=series.run,
@@ -291,7 +335,9 @@ def _first(question, series, states, frames, injection, never) -> EventAnswer:
             if frame and states[frame - 1] == _FALSE
             else None
         ),
-        note=f"{unknown} earlier frame(s) unknown" if unknown else "",
+        note="; ".join(notes),
+        mass_g=mass if mass is not None and np.isfinite(mass) else None,
+        **identity,
     )
 
 
@@ -402,6 +448,8 @@ def write_events(path: Path, rows: Iterable[dict]) -> None:
 
     """
     write_rows(path, rows, COLUMNS)
+
+
 
 
 def integrated_events(
