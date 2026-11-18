@@ -481,11 +481,10 @@ def grid_positions(
     rows, cols = image.img.shape[:2]
     if grid_to_rig is None:
         x, y = pixel_centres(image)
-        dy, dx = image.voxel_size
         return GridPositions(
             np.broadcast_to(x[None, :], (rows, cols)),
             np.broadcast_to(y[:, None], (rows, cols)),
-            (dy * 1000, dx * 1000),
+            grid_pitch(image),
         )
     dtype = np.dtype(dtype or np.float64)
     x, y = _measured(
@@ -493,10 +492,53 @@ def grid_positions(
         np.arange(cols, dtype=dtype)[None, :],
         np.arange(rows, dtype=dtype)[:, None],
     )
-    pitch = None
-    if pitch_stride is not None:
-        pitch = _canvas_pitch(grid_to_rig, dtype, canvas, rows, cols, pitch_stride)
+    pitch = grid_pitch(image, grid_to_rig, dtype, canvas, pitch_stride)
     return GridPositions(x, y, pitch)
+
+
+def grid_pitch(
+    image: darsia.Image,
+    grid_to_rig: np.ndarray | list | None = None,
+    dtype: np.dtype | type | str | None = None,
+    canvas: MeasurementCanvas | None = None,
+    pitch_stride: int | None = None,
+) -> tuple[float, float] | None:
+    """The pitch of :func:`grid_positions`, without placing every grid pixel.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        A 2d image supplying only the grid shape and physical dimensions.
+    grid_to_rig : array, optional
+        The measured homography from grid pixels to rig metres.
+    dtype : numpy dtype, optional
+        Precision of measured positions; double precision by default.
+    canvas : MeasurementCanvas, optional
+        The measurement canvas; by default the image's grid.
+    pitch_stride : int, optional
+        Every how many canvas rows and columns to sample, as in grid_positions.
+
+    Returns
+    -------
+    tuple of float or None
+        Row and column pitch in millimetres; None for a measured grid without
+        a sampling stride. Nominal grids use their voxel size.
+
+    Raises
+    ------
+    ValueError
+        If the measurement canvas does not hold the grid.
+
+    """
+    if grid_to_rig is None:
+        dy, dx = image.voxel_size
+        return dy * 1000, dx * 1000
+    if pitch_stride is None:
+        return None
+    rows, cols = image.img.shape[:2]
+    return _canvas_pitch(
+        grid_to_rig, np.dtype(dtype or np.float64), canvas, rows, cols, pitch_stride
+    )
 
 
 def _canvas_pitch(
