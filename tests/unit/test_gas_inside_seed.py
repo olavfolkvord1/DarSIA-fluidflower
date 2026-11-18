@@ -33,7 +33,7 @@ def _inside_scene():
             scene["protocol"],
             RULES,
             SETTINGS,
-            
+            positions=scene["positions"],
             depth_m=np.full(scene["domain"].shape, 0.005),
         )
     )

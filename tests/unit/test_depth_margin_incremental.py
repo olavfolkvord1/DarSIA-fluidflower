@@ -164,7 +164,7 @@ def test_complete_zone_sequence_keeps_contours_links_and_diagnostics(
     )
     incremental = list(
         gas_zone.gas_model_zones(
-            frames, *args,  chart=chart, depth_m=depth
+            frames, *args, positions=positions, chart=chart, depth_m=depth
         )
     )
     assert any(zone.links for zone in incremental[:2])
@@ -177,7 +177,7 @@ def test_complete_zone_sequence_keeps_contours_links_and_diagnostics(
     monkeypatch.setattr(gas_zone, "_depth_margin", complete)
     reference = list(
         gas_zone.gas_model_zones(
-            frames, *args,  chart=chart, depth_m=depth
+            frames, *args, positions=positions, chart=chart, depth_m=depth
         )
     )
     for made, full in zip(incremental, reference, strict=True):

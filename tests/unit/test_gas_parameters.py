@@ -80,7 +80,7 @@ def test_public_contours_scale_with_the_physical_rig_and_record_actual_depth():
                 _protocol(positions),
                 RULES,
                 BASE_SETTINGS,
-                
+                positions=positions,
                 depth_m=np.full(domain.shape, 0.003 * scale),
             )
         )

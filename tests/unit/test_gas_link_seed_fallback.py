@@ -105,7 +105,7 @@ def _allocate(scene):
             model_frames=[scene["frame"]],
             zones=[scene["zone"]],
             depth_m=np.full(scene["domain"].shape, 0.005),
-            
+            positions=scene["positions"],
             record=lambda index, value: records.append(value),
         )
     )[0]

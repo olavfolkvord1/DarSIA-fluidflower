@@ -19,10 +19,7 @@ def scene(shape=(40, 50), pitch=(1.0, 1.0)):
     image = darsia.Image(
         np.ones(shape, int), dimensions=np.asarray(shape) * pitch / 1000
     )
-    columns, rows = darsia.pixel_centres(image)
-    x, y = np.broadcast_arrays(columns[None, :], rows[:, None])
-    positions = SimpleNamespace(x=x, y=y, pitch_mm=tuple(pitch))
-    return image, positions, np.ones(shape, bool)
+    return image, darsia.grid_positions(image), np.ones(shape, bool)
 
 
 def settings():
@@ -97,7 +94,7 @@ def test_hidden_segment_is_straight_and_seen_cost_uses_probability_median(
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -134,7 +131,7 @@ def test_hidden_segment_refuses_seal_even_when_detour_and_farther_target_exist()
         contour,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=contour,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -158,7 +155,7 @@ def test_seen_segment_can_follow_observed_co2_around_seal():
         path,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -197,7 +194,7 @@ def test_nearest_current_meeting_uses_physical_not_pixel_distance(measured):
         current,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(current), 0.1),
@@ -218,7 +215,7 @@ def test_nearest_current_meeting_does_not_jump_disconnected_seen_co2():
         current,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -240,7 +237,7 @@ def test_zero_probability_reference_does_not_invent_finite_cost(dtype):
         current,
         np.zeros(path.shape, dtype),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         configured,
         current_co2=current,
         depth_m=np.full(np.shape(current), 0.1),
@@ -270,7 +267,7 @@ def test_zero_reference_keeps_positive_probability_cells_usable(monkeypatch):
         current,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         configured,
         current_co2=current,
         depth_m=np.full(np.shape(current), 0.1),
@@ -291,7 +288,7 @@ def test_water_anchor_inside_contour_still_routes_to_current_co2():
         path,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(path), 0.1),
@@ -305,7 +302,7 @@ def test_water_anchor_inside_contour_still_routes_to_current_co2():
         path,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=current,
         depth_m=np.full(np.shape(path), 0.1),
@@ -323,7 +320,7 @@ def test_historical_co2_without_current_target_never_invents_a_meeting():
         path,
         np.ones(path.shape),
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         settings(),
         current_co2=np.zeros_like(path),
         depth_m=np.full(np.shape(contour), 0.1),
@@ -365,7 +362,7 @@ def zones(labels, dates, start):
             protocol,
             SimpleNamespace(free_water_facies=(5,), seal_permeability_fraction=0.05),
             settings(),
-            
+            positions=positions,
             depth_m=np.full(domain.shape, 0.0001),
         )
     )

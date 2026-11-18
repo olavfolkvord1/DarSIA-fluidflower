@@ -25,7 +25,7 @@ def _case(start=(3, 3), meeting=(7, 3)):
         observed=current.copy(),
         probability=np.ones(rows.shape),
         path=path,
-        x=positions.x, y=positions.y, pitch_mm=positions.pitch_mm,
+        positions=positions,
         settings=SimpleNamespace(link_smoothing_mm=(0, 0)),
         current_co2=current,
         depth_m=np.full(rows.shape, 1 / 64),

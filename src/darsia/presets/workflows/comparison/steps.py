@@ -39,7 +39,6 @@ from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
 from darsia.presets.workflows.calibration.steps import (
     MaterialSettings,
-    co2_state,
     frame_key,
     run_grid,
 )
