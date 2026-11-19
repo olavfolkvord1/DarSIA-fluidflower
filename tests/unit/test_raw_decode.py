@@ -41,6 +41,7 @@ def write_dng(path, mosaic, pattern):
             (50714, "H", 1, (BLACK,), True),  # BlackLevel
             (50717, "H", 1, (WHITE,), True),  # WhiteLevel
             (50721, "f", 9, (1, 0, 0, 0, 1, 0, 0, 0, 1), True),  # ColorMatrix1
+            (50728, "f", 3, (0.5, 1, 0.25), True),  # AsShotNeutral
         ],
     )
 
