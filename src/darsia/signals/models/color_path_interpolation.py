@@ -205,7 +205,8 @@ class ColorPathInterpolation(ColorPathFunction):
     def __call__(self, image: np.ndarray | darsia.Image) -> np.ndarray | darsia.Image:
         """Inverse of the color path to an image defined by the closest color
         representation on the path, and linearly interpolated with piecewise
-        defined functions (through values).
+        defined functions (through values). Floating colors are interpreted in
+        their own dtype.
 
         Parameters
         ----------
@@ -308,30 +309,27 @@ class ColorPathInterpolation(ColorPathFunction):
                 mode="equidistant",
             )
 
-        # Linear interpolation based on values
+        # Linear interpolation based on values, in the dtype of the parametrization
+        distances = np.asarray(
+            self.color_path.equidistant_distances, dtype=parametrization.dtype
+        )
+        values = np.asarray(self.values, dtype=parametrization.dtype)
         result = np.zeros_like(parametrization)
         for i in range(self.color_path.num_segments):
             if i == 0:
-                mask = parametrization <= self.color_path.equidistant_distances[i + 1]
+                mask = parametrization <= distances[i + 1]
             elif i == self.color_path.num_segments - 1:
-                mask = parametrization >= self.color_path.equidistant_distances[i]
+                mask = parametrization >= distances[i]
             else:
                 mask = np.logical_and(
-                    parametrization >= self.color_path.equidistant_distances[i],
-                    parametrization <= self.color_path.equidistant_distances[i + 1],
+                    parametrization >= distances[i],
+                    parametrization <= distances[i + 1],
                 )
-            segment_distance = (
-                parametrization[mask] - self.color_path.equidistant_distances[i]
-            )
+            segment_distance = parametrization[mask] - distances[i]
 
-            segment_length = (
-                self.color_path.equidistant_distances[i + 1]
-                - self.color_path.equidistant_distances[i]
-            )
+            segment_length = distances[i + 1] - distances[i]
             weight = segment_distance / segment_length
 
-            result[mask] = self.values[i] + weight * (
-                self.values[i + 1] - self.values[i]
-            )
+            result[mask] = values[i] + weight * (values[i + 1] - values[i])
 
         return result
