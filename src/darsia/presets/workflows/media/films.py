@@ -68,12 +68,14 @@ class FilmSettings:
     """The frame's width and height (even numbers)."""
     fps: float
     """Frames per second."""
-    codec: str
-    """The video codec, a four-character code such as "avc1" (H.264)."""
-    note: str
+    codec: str = "libx264"
+    """The H.264 encoder "libx264", or an OpenCV four-character codec."""
+    note: str = ""
     """The maps' source, written in every frame."""
     key_width_px: int = 120
     """Separate colour-bar width for an unscaled paired-grid film."""
+    crf: int = 17
+    """Constant rate factor of the H.264 encoder, from 0 to 51."""
 
     def __post_init__(self):
         """Refuse a layout that is not one of :data:`LAYOUTS`, or another number of
@@ -88,7 +90,7 @@ def film_targets(sets: Sequence[Sequence[Mapping]]) -> list[float]:
     """The target times [h] of the tiles of all ``sets``, sorted, each once."""
     return sorted(
         {
-            round(float(row["target_h"]), 6)
+            float(row["target_h"])
             for rows in sets
             for row in rows
             if row["target_h"] is not None
@@ -100,7 +102,7 @@ def tile_at(rows: Sequence[Mapping], target: float) -> tuple[Mapping | None, boo
     """The tile a film shows at ``target`` and whether it is held: the tile of that
     target, else the last earlier one (held), else none (held)."""
     timed = [row for row in rows if row["target_h"] is not None]
-    exact = [row for row in timed if abs(float(row["target_h"]) - target) < 1e-6]
+    exact = [row for row in timed if float(row["target_h"]) == target]
     if exact:
         return exact[0], False
     earlier = [row for row in timed if float(row["target_h"]) < target]
@@ -414,7 +416,12 @@ def write_pyramid_film(
     _free(output, stem)
     read = _reader(24)
     writer = MovieWriter(
-        output / f"{stem}.mp4", film.size_px, film.fps, film.codec, lock=lock
+        output / f"{stem}.mp4",
+        film.size_px,
+        film.fps,
+        film.codec,
+        lock=lock,
+        crf=film.crf,
     )
     frames = []
     for number, target in enumerate(targets, 1):
@@ -439,6 +446,7 @@ def write_pyramid_film(
         run=run,
         movie=f"{stem}.mp4",
         figure=figure,
+        codec=film.codec,
         frames=frames,
         **(
             {
@@ -559,7 +567,12 @@ def write_grid_film(
     _free(output, film.name)
     read = _reader(4 * len(tiles))
     writer = MovieWriter(
-        output / f"{film.name}.mp4", film.size_px, film.fps, film.codec, lock=lock
+        output / f"{film.name}.mp4",
+        film.size_px,
+        film.fps,
+        film.codec,
+        lock=lock,
+        crf=film.crf,
     )
     frames = []
     for number, target in enumerate(targets, 1):
@@ -583,6 +596,7 @@ def write_grid_film(
         name=film.name,
         movie=f"{film.name}.mp4",
         figure=figure,
+        codec=film.codec,
         frames=frames,
         **decoded,
     )

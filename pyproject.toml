@@ -77,6 +77,9 @@ darsia-install-desktop = "darsia.gui.desktop_integration:main"
 
 # ── Optional dependencies (replaces extras_require in setup.py) ───────────────
 [project.optional-dependencies]
+media = [
+  "imageio-ffmpeg",
+]
 dev = [
   "pytest>=7.1",
   "pytest-qt",

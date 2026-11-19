@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import cv2
 import numpy as np
 from matplotlib import colormaps, rc_context
 from matplotlib.colors import Normalize, PowerNorm, to_rgb, to_rgba
 
+from darsia.image.raw import RAW_SUFFIXES, raw_display_matrix
 from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule
 from darsia.presets.workflows.media.style import PIXEL_DPI, FigureStyle, canvas, pixels
 
@@ -42,9 +44,9 @@ SRGB = dict(threshold=0.0031308, gain=12.92, power=2.4, scale=1.055, offset=0.05
 class PhotographSettings:
     """How a corrected image is shown as a photograph; one table."""
 
-    matrix: tuple[tuple[float, float, float], ...]
-    """Camera RGB to linear sRGB: a pixel's row vector times this 3 x 3 matrix."""
-    invalid_grey: int
+    matrix: tuple[tuple[float, float, float], ...] | None = None
+    """Camera RGB to linear sRGB, or None to use the source's as-shot metadata."""
+    invalid_grey: int = 128
     """Grey level (0 to 255) of pixels without a value."""
     co2_outline: bool = False
     """Draw the boundary of known dissolved CO2 and free gas."""
@@ -66,6 +68,8 @@ class PhotographSettings:
     """The divisor of the exponent for the percentile display transfer."""
     co2_source: str = "phase"
     """White contour: optical phase labels, or positive total mass per area."""
+    restrict_to_reporting_domain: bool = False
+    """Show only the rig's reporting area when its saved mask is available."""
 
     def __post_init__(self):
         """Validate contour settings without changing the photograph transfer."""
@@ -85,6 +89,19 @@ class PhotographSettings:
             raise ValueError("Photograph percentiles must be ordered in [0, 100]")
         if not math.isfinite(self.gamma) or self.gamma <= 0:
             raise ValueError("Photograph gamma must be finite and positive")
+
+
+def source_photograph_settings(settings: PhotographSettings, source: Path):
+    """Use the RAW decoder's camera metadata with the shared sRGB conversion."""
+    if settings.transfer != "srgb" or settings.matrix is not None:
+        return settings
+    source = Path(source)
+    matrix = (
+        raw_display_matrix(source)
+        if source.suffix.lower() in RAW_SUFFIXES
+        else np.eye(3)
+    )
+    return replace(settings, matrix=tuple(tuple(map(float, row)) for row in matrix))
 
 
 def outline_masks(
@@ -164,6 +181,10 @@ def photograph(linear_rgb: np.ndarray, settings: PhotographSettings) -> np.ndarr
     Pixels without a finite value in every channel are grey.
 
     """
+    if settings.matrix is None:
+        raise ValueError(
+            "Resolve the photograph's source colour matrix before rendering."
+        )
     valid = np.isfinite(linear_rgb).all(axis=-1)
     linear = np.where(valid[..., None], linear_rgb, 0).astype(np.float64)
     srgb = np.clip(linear @ np.asarray(settings.matrix, dtype=np.float64), 0, 1)

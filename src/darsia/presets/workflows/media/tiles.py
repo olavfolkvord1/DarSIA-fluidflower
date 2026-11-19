@@ -163,6 +163,17 @@ class Frame:
     """The sand layers and pore space, for the depth-scaled mean."""
     rules: np.ndarray | None = None
     """Stored phase provenance, including explicitly allocated hidden gas bridges."""
+    reporting_domain: np.ndarray | None = None
+    """The saved rig reporting mask on the photograph's grid, when available."""
+
+    def photo_samples(self, settings: PhotographSettings, step: int = 1) -> np.ndarray:
+        """Sample the photograph, optionally masking what lies beyond the rig."""
+        values = self.image[::step, ::step]
+        if not settings.restrict_to_reporting_domain or self.reporting_domain is None:
+            return values
+        if self.reporting_domain.shape != self.image.shape[:2]:
+            raise ValueError("The photograph and reporting domain have different grids")
+        return np.where(self.reporting_domain[::step, ::step, None], values, np.nan)
 
 
 def graph_axes(
@@ -228,14 +239,16 @@ def draw_tile(
                     "First-frame transfer requires the run's fixed photograph limits"
                 )
             photo = stretched_photo(
-                frame.image,
+                frame.photo_samples(photograph_settings),
                 size,
                 photograph_limits,
                 photograph_settings.gamma,
                 photograph_settings.invalid_grey,
             )
         else:
-            photo = photograph(frame.image[::step, ::step], photograph_settings)
+            photo = photograph(
+                frame.photo_samples(photograph_settings, step), photograph_settings
+            )
         outlines, drawn = [], {}
         if photograph_settings.co2_outline or photograph_settings.gas_contour:
             mass_area = None
@@ -275,6 +288,11 @@ def draw_tile(
             )
             if photograph_settings.co2_source != "phase":
                 drawn["co2_source"] = photograph_settings.co2_source
+        if (
+            photograph_settings.restrict_to_reporting_domain
+            and frame.reporting_domain is not None
+        ):
+            drawn["photograph_restricted_to_reporting_domain"] = True
         if direct:
             drawn.update(
                 photograph_transfer="first-frame",

@@ -42,9 +42,17 @@ def resized_photo(image, size) -> np.ndarray:
     small = cv2.resize(
         np.where(valid[..., None], image, 0), size, interpolation=cv2.INTER_AREA
     )
-    known = cv2.resize(valid.astype(np.float32), size, interpolation=cv2.INTER_AREA)
-    small[known < 1] = np.nan
+    small[~_resampled_known(valid, size)] = np.nan
     return small
+
+
+def _resampled_known(valid, size) -> np.ndarray:
+    """The whole source footprint is known when it has zero invalid weight."""
+    # Interpolating a mask of ones can round below one even with full support.
+    invalid = cv2.resize(
+        (~valid).astype(np.float32), size, interpolation=cv2.INTER_AREA
+    )
+    return invalid == 0
 
 
 def first_frame_limits(image, size, percentiles=(0.5, 99.5)) -> tuple[float, float]:
@@ -188,22 +196,13 @@ def area_map(values, pore_volume, size, scale, *, colour_map, no_value, over_ran
     values = np.asarray(values, dtype=np.float32)
     valid = np.isfinite(values)
     small = cv2.resize(np.where(valid, values, 0), size, interpolation=cv2.INTER_AREA)
-    known = (
-        cv2.resize(valid.astype(np.float32), size, interpolation=cv2.INTER_AREA) >= 1
-    )
+    known = _resampled_known(valid, size)
     volume = np.asarray(pore_volume)
     pore = (
         cv2.resize((volume > 0).astype(np.float32), size, interpolation=cv2.INTER_AREA)
         > 0
     )
-    geometry = (
-        cv2.resize(
-            (np.isfinite(volume) & (volume >= 0)).astype(np.float32),
-            size,
-            interpolation=cv2.INTER_AREA,
-        )
-        >= 1
-    )
+    geometry = _resampled_known(np.isfinite(volume) & (volume >= 0), size)
     known &= geometry
     index = (np.sqrt(np.clip(small / scale, 0, 1)) * 255).astype(np.uint8)
     lut = (colormaps[colour_map](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)

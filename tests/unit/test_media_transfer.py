@@ -29,6 +29,7 @@ from darsia.presets.workflows.media.transfer import (
     first_frame_limits,
     population_scale,
     probe_indices,
+    resized_photo,
     stretched_photo,
 )
 from tests.unit.test_media import STYLE
@@ -189,6 +190,41 @@ def test_batched_tail_counts_every_positive_before_cutoff_filter(pattern):
     assert result["colour_scale"] == np.percentile(values, 99.9)
     assert result["positive_samples"] == values.size
     assert result["retained_samples"] <= result["buffer_capacity"]
+
+
+def test_fractional_photo_resize_keeps_every_valid_row():
+    image = np.ones((2982, 5472, 3), dtype=np.float32)
+    assert np.isfinite(resized_photo(image, (1368, 746))).all()
+    image[100, 100] = np.nan
+    missing = ~np.isfinite(resized_photo(image, (1368, 746))).all(axis=-1)
+    assert 0 < missing.sum() <= 4
+
+
+def test_display_mask_respects_stored_reporting_domain_and_keeps_source():
+    values = np.full((6, 8, 3), 0.5, dtype=np.float32)
+    values[-2:] = [1, 0, 1]
+    support = np.ones(values.shape[:2], dtype=bool)
+    support[-2:] = False
+    frame = Frame(
+        "case",
+        1,
+        1,
+        values.shape[:2],
+        (0, 0, 8, 6),
+        image=values,
+        reporting_domain=support,
+    )
+    settings = PhotographSettings(restrict_to_reporting_domain=True)
+    shown = frame.photo_samples(settings, step=2)
+    assert np.isnan(shown[-1]).all()
+    np.testing.assert_array_equal(shown[:-1], values[:4:2, ::2])
+    assert np.isfinite(values).all()
+    np.testing.assert_array_equal(
+        frame.photo_samples(
+            replace(settings, restrict_to_reporting_domain=False), step=2
+        ),
+        values[::2, ::2],
+    )
 
 
 def test_area_resampling_keeps_unknown_separate_from_no_pore():
