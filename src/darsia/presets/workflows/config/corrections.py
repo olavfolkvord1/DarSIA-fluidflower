@@ -12,7 +12,7 @@ from darsia.corrections.color.materialilluminationcorrection import (
 
 from ._key_list_sources import ROI_SOURCES
 from .roi_registry import _load_roi_key_list
-from .utils import _get_section_from_toml
+from .utils import _get_key, _get_section_from_toml
 
 if TYPE_CHECKING:
     from .roi_registry import RoiRegistry
@@ -1217,6 +1217,76 @@ class IlluminationCorrectionConfig:
 
 
 @dataclass
+class MaterialReferenceConfig:
+    """The reference run of the material illumination fit.
+
+    The fit uses the reference's fitting grid and fits only blocks pure in both
+    runs; see :class:`darsia.MaterialFitReference`.
+    """
+
+    baseline: Path = field(
+        default_factory=Path,
+        metadata={
+            "name": "Reference baseline",
+            "help": "The reference run's shape-corrected baseline image (.npz).",
+        },
+    )
+    """Path to the reference run's shape-corrected baseline image."""
+    facies: Path = field(
+        default_factory=Path,
+        metadata={
+            "name": "Reference facies",
+            "help": "The reference run's facies (.npz) on its baseline's grid.",
+        },
+    )
+    """Path to the reference run's facies image."""
+    fit_mask: Path | None = field(
+        default=None,
+        metadata={
+            "name": "Reference fit mask",
+            "help": (
+                "Optional boolean image (.npz) of the reference's pixels eligible "
+                "for the fit. Defaults to all its pixels of the materials with a "
+                "target."
+            ),
+        },
+    )
+    """Optional path to a boolean mask of the reference's pixels eligible for the
+    fit."""
+    homography: list[list[float]] = field(
+        default_factory=list,
+        metadata={
+            "name": "Homography to the reference",
+            "help": (
+                "The homography from this run's grid to the reference's grid, both "
+                "in pixel coordinates (column, row; pixel centres at whole numbers), "
+                "as three rows of three numbers."
+            ),
+        },
+    )
+    """Homography from this run's pixel coordinates to the reference's."""
+
+    def load(self, sec: dict) -> "MaterialReferenceConfig":
+        """Load the reference run from the [corrections.material_illumination.reference]
+        table.
+
+        Parameters
+        ----------
+        sec : dict
+            The table's keys.
+
+        Returns
+        -------
+            Self with loaded configuration.
+        """
+        self.baseline = _get_key(sec, "baseline", required=True, type_=Path)
+        self.facies = _get_key(sec, "facies", required=True, type_=Path)
+        self.fit_mask = _get_key(sec, "fit_mask", required=False, type_=Path)
+        self.homography = _get_key(sec, "homography", required=True, type_=list)
+        return self
+
+
+@dataclass
 class MaterialIlluminationCorrectionConfig:
     """Configuration for the material illumination correction.
 
@@ -1303,6 +1373,18 @@ class MaterialIlluminationCorrectionConfig:
         },
     )
     """Settings of the block samples and of the robust fit of the gains."""
+    reference: MaterialReferenceConfig | None = field(
+        default=None,
+        metadata={
+            "name": "Reference run",
+            "help": (
+                "Optional reference run whose fitting grid the fit uses, in "
+                "[corrections.material_illumination.reference]. Without one, the "
+                "fit uses this run's own grid."
+            ),
+        },
+    )
+    """Optional reference run of the fit."""
 
     def load(self, sec: dict) -> "MaterialIlluminationCorrectionConfig":
         """Load material illumination correction configuration from a dictionary.
@@ -1338,6 +1420,8 @@ class MaterialIlluminationCorrectionConfig:
         fit_mask = sec.get("fit_mask", self.fit_mask)
         self.fit_mask = Path(fit_mask) if fit_mask is not None else None
         self.fit = MaterialFitSettings(**sec["fit"])
+        if "reference" in sec:
+            self.reference = MaterialReferenceConfig().load(sec["reference"])
         return self
 
 
