@@ -432,6 +432,26 @@ def test_a_fed_overflow_ends_at_its_stop(tmp_path):
     )
 
 
+def test_own_scale_cutoffs_keep_model_even_with_a_donor(tmp_path):
+    times, weights = _readings(tmp_path)
+    own = darsia.displaced_volume(times, weights, RULES)
+    donor = darsia.DisplacedVolume(
+        np.array([-1.0, 15.0]),
+        np.array([6.0, 6.0]),
+        (),
+        np.array([True, False]),
+    )
+
+    def donor_state(hour):
+        pytest.fail(f"An own-scale decision must not consult the donor at {hour} h.")
+
+    found = darsia.frame_volumes(
+        own, [1.0, 8.0, 13.0], ("other", donor), [0.5] * 3, [1.8] * 3, donor_state
+    )
+    assert found[0].source == darsia.MEASURED and found[0].volume_m3 > 0
+    assert all(row.source is None and row.volume_m3 is None for row in found[1:])
+
+
 def test_a_donor_follows_its_own_rules(tmp_path):
     """An estimate from a donor is withheld where the donor's rules give none."""
     times, weights = _readings(tmp_path)

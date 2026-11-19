@@ -347,11 +347,14 @@ def _volume_at(volume: DisplacedVolume, elapsed_h: float):
 
 
 def _reference_at(volume: DisplacedVolume, elapsed_h: float):
-    """The displaced volume [mL] a frame takes at a time (:func:`_volume_at`),
-    or None: outside the readings, after the volume's end, or in the tail within
-    its floor of zero."""
+    """Return the reading in mL and any explicit reason for withholding a reference.
+
+    For a usable scale curve, a cutoff withholds the overflow target even when
+    a donor has readings at the same time. A time outside the readings can use
+    a donor until the cutoff.
+    """
     if volume.end_h is not None and elapsed_h > volume.end_h:
-        return None
+        return None, "feed_stop"
     observed = _volume_at(volume, elapsed_h)
     if (
         observed is not None
@@ -360,8 +363,12 @@ def _reference_at(volume: DisplacedVolume, elapsed_h: float):
         and elapsed_h > volume.peak_h
         and abs(float(observed)) <= volume.tail_floor_ml
     ):
-        return None
-    return observed
+        return None, "tail_noise"
+    return observed, None
+
+
+def _measured_m3(observed):
+    return max(0.0, float(observed * 1e-6))
 
 
 def measured_reference(volume: DisplacedVolume, elapsed_h: float) -> float | None:
@@ -383,10 +390,8 @@ def measured_reference(volume: DisplacedVolume, elapsed_h: float) -> float | Non
         (:func:`displaced_volume`).
 
     """
-    observed = _reference_at(volume, elapsed_h)
-    if observed is None:
-        return None
-    return max(0.0, float(observed * 1e-6))
+    observed, _ = _reference_at(volume, elapsed_h)
+    return None if observed is None else _measured_m3(observed)
 
 
 def _compatible(recipient: OverflowRun, donor: OverflowRun, settings) -> bool:
@@ -523,10 +528,10 @@ def estimated_reference(
         not between zero and one.
 
     """
-    observed = _reference_at(donor, elapsed_h)
+    observed, _ = _reference_at(donor, elapsed_h)
     if observed is None or mass_g < 0:
         return None
-    volume = max(0.0, float(observed * 1e-6))
+    volume = _measured_m3(observed)
     if donor_mass_g > 0:
         share = volume * donor_density * 1000 / donor_mass_g
     elif volume == 0:
@@ -608,8 +613,9 @@ def frame_volumes(
     usable and reach the frame's time (:func:`measured_reference`); else the
     donor's estimated reference (:func:`estimated_reference`), from the donor's
     injected CO2 mass and gas density at the frame's time; else none, the
-    model's gas. A run has one donor for all its frames (e.g. the first of
-    :func:`ranked_donors` that the caller allows), which is never left for
+    model's gas. A usable own-scale curve can explicitly leave the model's
+    gas as the reference at its tail noise cutoff or after the feed stops.
+    A run has one donor for frames that need it, which is never left for
     another outside its readings.
 
     Parameters
@@ -635,13 +641,17 @@ def frame_volumes(
     usable = own is not None and own.volume_ml is not None and not own.reasons
     found = []
     for k, elapsed_h in enumerate(hours):
-        volume = measured_reference(own, elapsed_h) if usable else None
-        if volume is not None:
-            found.append(FrameVolume(volume, MEASURED))
+        observed, cutoff = _reference_at(own, elapsed_h) if usable else (None, None)
+        if observed is not None:
+            found.append(FrameVolume(_measured_m3(observed), MEASURED))
             continue
+        if cutoff is not None:
+            found.append(FrameVolume(None, None))
+            continue
+        volume = None
         # The donor's state is taken only where its readings reach the frame:
         # elsewhere there is no estimate, and its pressure record may end before.
-        if donor is not None and _reference_at(donor[1], elapsed_h) is not None:
+        if donor is not None and _reference_at(donor[1], elapsed_h)[0] is not None:
             donor_mass, donor_density = donor_state(elapsed_h)
             volume = estimated_reference(
                 donor[1], elapsed_h, donor_mass, donor_density, mass_g[k], density[k]
