@@ -3,7 +3,9 @@
 Each listed module imports only from its own layer or below (methods never import
 the workflow presets or the graphical interface; presets never import the
 interface), imports at module level only, and holds no experiment identifiers,
-file system paths, dates or version suffixes.
+file system paths, dates or version suffixes. A private name (a leading
+underscore) is imported only from a module of the same package, e.g. among the
+modules of ``multiphase``, never across packages.
 
 """
 
@@ -22,6 +24,7 @@ MODULES = [
     "darsia/corrections/color/reference_proposal.py",
     "darsia/corrections/color/sandlightfield.py",
     "darsia/multiphase/phase_model.py",
+    "darsia/multiphase/phase_rules.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
@@ -55,7 +58,8 @@ def _imported(node: ast.AST, package: list[str]) -> list[str]:
 
 @pytest.mark.parametrize("module", MODULES)
 def test_imports_follow_the_layers(module):
-    """No import of a higher layer, and no import inside a function."""
+    """No import of a higher layer or of another package's private names, and no
+    import inside a function."""
     tree = ast.parse((SOURCE / module).read_text(encoding="utf-8"))
     package = module.removesuffix(".py").split("/")[:-1]
     forbidden = _forbidden(module)
@@ -68,6 +72,13 @@ def test_imports_follow_the_layers(module):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for name in _imported(node, package):
                 assert not name.startswith(forbidden), f"{module} imports {name}"
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name.startswith("_") for alias in node.names
+        ):
+            (name,) = _imported(node, package)
+            assert (
+                not name.startswith("darsia.") or name.split(".")[:-1] == package
+            ), f"{module} imports a private name from {name}"
 
 
 @pytest.mark.parametrize("module", MODULES)

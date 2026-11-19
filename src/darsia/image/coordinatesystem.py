@@ -361,3 +361,29 @@ def check_equal_coordinatesystems(
     success = len(failure_log) == 0
 
     return success, failure_log
+
+
+def pixel_centres(image: darsia.Image) -> tuple[np.ndarray, np.ndarray]:
+    """Coordinates of the pixel centres of a 2d image: x per column, y per row.
+
+    The centres lie half a pixel inside the image's top left corner (its origin),
+    one voxel size apart, x to the right and y upwards. Every position on a run
+    grid (boxes, ports, heights, distances) is taken from them.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        A 2d image with its physical dimensions and origin.
+
+    Returns
+    -------
+    tuple of arrays
+        x of each column's centres (cols,) and y of each row's (rows,), in the
+        units of the image's dimensions (metres on a run grid).
+
+    """
+    rows, cols = image.img.shape[:2]
+    dy, dx = image.voxel_size
+    x = image.origin[0] + (np.arange(cols) + 0.5) * dx
+    y = image.origin[1] - (np.arange(rows) + 0.5) * dy
+    return x, y
