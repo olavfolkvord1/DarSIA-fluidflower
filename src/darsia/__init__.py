@@ -117,6 +117,7 @@ from darsia.signals.models.kernelinterpolation import *
 from darsia.signals.models.pwtransformation import *
 from darsia.signals.models.evaluation import *
 from darsia.signals.models.color_path_interpolation import *
+from darsia.signals.models.color_path_signal import *
 from darsia.restoration.tvd import *
 from darsia.restoration.median import *
 from darsia.restoration.resize import *
@@ -132,6 +133,7 @@ from darsia.multi_image_analysis.model_calibration import *
 from darsia.multi_image_analysis.balancing_calibration import *
 from darsia.multi_image_analysis.imageregistration import *
 from darsia.multi_image_analysis.segmentationcomparison import *
+from darsia.multi_image_analysis.run_statistics import *
 from darsia.single_image_analysis.contouranalysis import *
 
 # Managers

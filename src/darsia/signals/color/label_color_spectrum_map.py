@@ -61,6 +61,8 @@ class LabelColorSpectrumMap(dict[int, darsia.ColorSpectrum]):
         """
         color_spectra = {}
         for file in directory.glob("color_spectrum_*.json"):
+            if not file.is_file():
+                continue
             label = int(file.stem.split("_")[-1])
             color_spectrum = darsia.ColorSpectrum.load(file)
             color_spectra[label] = color_spectrum

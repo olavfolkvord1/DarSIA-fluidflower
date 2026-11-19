@@ -387,3 +387,73 @@ def pixel_centres(image: darsia.Image) -> tuple[np.ndarray, np.ndarray]:
     x = image.origin[0] + (np.arange(cols) + 0.5) * dx
     y = image.origin[1] - (np.arange(rows) + 0.5) * dy
     return x, y
+
+
+def optical_pitch_m(
+    pixel_area: darsia.Image, domain: np.ndarray
+) -> tuple[float, float]:
+    """The pitch [m] on the sand plane of one pixel step down a column and along a
+    row.
+
+    Every optical length given in millimetres (a signal mean, a background block or
+    margin, a shadow rule, a measurement's tiles) is converted to pixels with it.
+    The sand lies behind the plane of the rig's coordinates, and the measured pixel
+    areas carry that offset as the optical area factor: their median in the domain
+    over the coordinate cell. The pitch is the coordinate pitch, the grid's
+    dimensions over its pixels, times the factor's square root, so that lengths
+    agree with the areas.
+
+    Parameters
+    ----------
+    pixel_area : darsia.Image
+        Measured area [m2] of each pixel of a grid (e.g. ``Rig.pixel_area``), with
+        the grid's physical dimensions.
+    domain : array
+        Pixels whose areas give the factor, e.g. the rig's domain.
+
+    Returns
+    -------
+    tuple of float
+        The pitch down a column and along a row.
+
+    """
+    pitch = [
+        float(size) / count
+        for size, count in zip(pixel_area.dimensions, pixel_area.img.shape[:2])
+    ]
+    area = np.broadcast_to(np.asarray(pixel_area.img, np.float64), domain.shape)
+    factor = float(np.median(area[domain])) / (pitch[0] * pitch[1])
+    return tuple(step * float(np.sqrt(factor)) for step in pitch)
+
+
+def optical_grid(
+    image: darsia.Image, optical_pitch: tuple[float, float], dtype: type
+) -> darsia.Image:
+    """The image's grid with the dimensions of its pixels at the pitch on the sand
+    plane, in ``dtype``.
+
+    Every optical length given in millimetres is sized on it, e.g. the square of a
+    mean (:class:`darsia.REV`) or the blocks of a background, as our production
+    sized them.
+
+    Parameters
+    ----------
+    image : darsia.Image
+        An image on the grid, e.g. the sand map.
+    optical_pitch : tuple of float
+        Pitch [m] on the sand plane down a column and along a row
+        (:func:`optical_pitch_m`).
+    dtype : type
+        Floating type of the dimensions, that of the images measured.
+
+    Returns
+    -------
+    darsia.Image
+        A scalar image of the image's values with the optical dimensions.
+
+    """
+    rows, cols = image.img.shape
+    return darsia.ScalarImage(
+        image.img,
+        dimensions=[dtype(rows * optical_pitch[0]), dtype(cols * optical_pitch[1])],
+    )
