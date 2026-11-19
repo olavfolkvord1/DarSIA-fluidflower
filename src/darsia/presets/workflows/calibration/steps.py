@@ -65,6 +65,7 @@ from darsia.jobs.step import (
     table,
 )
 from darsia.multiphase.gas_allocation import injection_ports
+from darsia.utils.results import read_description
 from darsia.multiphase.gas_model_cache import GasModelCache
 from darsia.multiphase.gas_zone_cache import GasZoneCache
 from darsia.presets.workflows.analysis.expert_knowledge import ExpertKnowledgeAdapter
@@ -1011,6 +1012,20 @@ def _phase_maps(ctx: StepContext) -> None:
         probabilities.clear()
         allocations = {}
 
+        def placed_before(held_out):
+            """The placed free gas of the frame before a resumed run's start, for
+            the allocation's no-growth rule; None from the run's first frame."""
+            if not start:
+                return None
+            stored = ctx.own(read_description, frame=frames[start - 1])
+            allocation = stored["measurements"]["gas_allocation"]
+            own = (
+                allocation["primary"]
+                if held_out is None
+                else allocation["without"][held_out]
+            )
+            return own["placed_m3"]
+
         def maps(held_out):
             volumes = ctx.read(
                 "overflow", lambda f: darsia.read_frame_volumes(f, held_out)
@@ -1038,6 +1053,7 @@ def _phase_maps(ctx: StepContext) -> None:
                 record=lambda index, value: allocations.__setitem__(
                     held_out, asdict(value)
                 ),
+                placed_before_m3=placed_before(held_out),
             )
 
         found_maps = zip(frames[start:], *(maps(v) for v in variants))

@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import darsia
+from darsia.experiment.overflow import _volume, _volume_json
 from darsia.presets.workflows.config.utils import settings_from_table
 
 SETTINGS = settings_from_table(
@@ -335,3 +336,132 @@ def test_the_atmosphere_is_our_productions_at_its_stored_frames():
             times, pressure, (23.0, 23.0, 23.0), hours, "float32"
         )
         assert abs(donor - found) == difference
+
+
+# The noise rules: single outliers after the peak, the tail floor, the feed stop.
+
+RULES = replace(
+    SETTINGS, outlier_factor=4.0, tail_noise_factor=2.0, end_at_supply_stop=True
+)
+
+
+def _readings(tmp_path, spikes=(), noise_g=0.3, stop_h=11.4):
+    """Readings every 6 minutes on a feed with scale noise and added spikes
+    (time [h], grams)."""
+    t = np.round(np.arange(-0.5, 14.0, 0.1), 1)
+    feed = 30 + 400 * np.minimum(t, stop_h) + 0.2 * np.minimum(t, stop_h) ** 2
+    weight = feed + _displaced(t) + np.random.default_rng(7).normal(0, noise_g, t.size)
+    for h, grams in spikes:
+        weight[np.isclose(t, h)] += grams
+    rows = pd.DataFrame(
+        {
+            "image_time": [START + datetime.timedelta(hours=h) for h in t],
+            "weight_g": weight,
+            "status": "Verified",
+        }
+    )
+    path = tmp_path / "overflow.csv"
+    rows.to_csv(path, index=False)
+    return darsia.OverflowProtocol(path).readings(START, SETTINGS.statuses)
+
+
+def test_without_the_rules_the_volume_and_its_record_are_unchanged(tmp_path):
+    """Default settings: no rule fields, and the stored record has no new keys."""
+    times, weights = _readings(tmp_path)
+    volume = darsia.displaced_volume(times, weights, SETTINGS)
+    assert volume.excluded == () and volume.end_h is None
+    assert volume.peak_h is None and volume.tail_floor_ml is None
+    assert set(_volume_json(volume)) == {
+        "times_h",
+        "volume_ml",
+        "reasons",
+        "baseline",
+        "dtype",
+    }
+
+
+def test_a_single_outlier_after_the_peak_is_left_out(tmp_path):
+    """A spike in the decay is replaced by its neighbours' line; one during the
+    injection's rise is real and kept."""
+    times, weights = _readings(tmp_path, spikes=((4.0, 8.0), (1.0, 8.0)))
+    plain = darsia.displaced_volume(times, weights, SETTINGS)
+    # The synthetic decay has a corner at 6 h (2.5 mL off its neighbours' line),
+    # which a smooth real decay has not; a wider limit keeps it.
+    cleaned = darsia.displaced_volume(
+        times, weights, replace(RULES, outlier_factor=10.0)
+    )
+    i = int(np.flatnonzero(np.isclose(times, 4.0))[0])
+    rise = int(np.flatnonzero(np.isclose(times, 1.0))[0])
+    assert cleaned.excluded == (i,)
+    between = (plain.volume_ml[i - 1] + plain.volume_ml[i + 1]) / 2
+    assert cleaned.volume_ml[i] == pytest.approx(between)
+    assert cleaned.volume_ml[rise] == plain.volume_ml[rise]
+    assert cleaned.peak_h == pytest.approx(2.0, abs=0.11)
+    others = np.ones(times.size, bool)
+    others[i] = False
+    assert np.array_equal(cleaned.volume_ml[others], plain.volume_ml[others])
+
+
+def test_the_tail_within_the_noise_gives_no_reference(tmp_path):
+    """After the peak a volume near zero leaves the model's gas; early small
+    volumes before the peak still count."""
+    times, weights = _readings(tmp_path)
+    plain = darsia.displaced_volume(times, weights, SETTINGS)
+    ruled = darsia.displaced_volume(times, weights, RULES)
+    assert 0 < ruled.tail_floor_ml < 2.0
+    assert darsia.measured_reference(plain, 8.0) is not None
+    assert darsia.measured_reference(ruled, 8.0) is None
+    assert darsia.measured_reference(ruled, 1.05) == pytest.approx(
+        darsia.measured_reference(plain, 1.05)
+    )
+    assert darsia.measured_reference(ruled, 0.05) is not None
+
+
+def test_a_fed_overflow_ends_at_its_stop(tmp_path):
+    """After the feed stops the weight shows no displaced water: no reference."""
+    times, weights = _readings(tmp_path, noise_g=0.0)
+    plain = darsia.displaced_volume(times, weights, SETTINGS)
+    ended = darsia.displaced_volume(
+        times, weights, replace(SETTINGS, end_at_supply_stop=True)
+    )
+    assert ended.end_h == pytest.approx(11.4)
+    assert darsia.measured_reference(plain, 13.0) == 0.0
+    assert darsia.measured_reference(ended, 13.0) is None
+    assert darsia.measured_reference(ended, 3.0) == pytest.approx(
+        darsia.measured_reference(plain, 3.0)
+    )
+
+
+def test_a_donor_follows_its_own_rules(tmp_path):
+    """An estimate from a donor is withheld where the donor's rules give none."""
+    times, weights = _readings(tmp_path)
+    donor = darsia.displaced_volume(times, weights, RULES)
+    found = darsia.frame_volumes(
+        None,
+        [1.0, 8.0, 13.0],
+        ("other", donor),
+        [0.5, 0.5, 0.5],
+        [1.8, 1.8, 1.8],
+        lambda h: (0.5, 1.8),
+    )
+    assert found[0].source == "other" and found[0].volume_m3 > 0
+    assert found[1].volume_m3 is None and found[2].volume_m3 is None
+
+
+def test_the_rules_survive_the_stored_record(tmp_path):
+    """A donor read back keeps its rules."""
+    times, weights = _readings(tmp_path, spikes=((4.0, 8.0),))
+    volume = darsia.displaced_volume(times, weights, RULES)
+    back = _volume(_volume_json(volume))
+    assert back.excluded == volume.excluded
+    assert back.end_h == volume.end_h and back.peak_h == volume.peak_h
+    assert back.tail_floor_ml == volume.tail_floor_ml
+    assert np.array_equal(back.volume_ml, volume.volume_ml)
+
+
+def test_the_rules_need_a_fed_overflow_and_positive_factors():
+    """A circulation has no stop or late window; factors must be positive."""
+    with pytest.raises(ValueError, match="feed variant"):
+        replace(CIRCULATION, tail_noise_factor=2.0)
+    with pytest.raises(ValueError, match="positive"):
+        replace(SETTINGS, outlier_factor=0.0)

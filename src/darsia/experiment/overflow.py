@@ -81,8 +81,8 @@ class OverflowSettings:
     """Settings of the overflow reference; the ``[overflow]`` table.
 
     ``variant`` chooses the variant, and the table of that name holds its
-    settings. Tables given as mappings, as read from a TOML file, become their
-    settings.
+    settings; the configuration's loader makes the nested tables their settings
+    (:func:`darsia.presets.workflows.config.utils.settings_from_table`).
 
     """
 
@@ -114,7 +114,7 @@ class OverflowSettings:
     """Whether a fed overflow gives no reference after its feed stops."""
 
     def __post_init__(self) -> None:
-        """Check the variant and its table."""
+        """Check the variant, its table and the noise rules."""
         for name in ("outlier_factor", "tail_noise_factor"):
             value = getattr(self, name)
             if value is not None and not (np.isfinite(value) and value > 0):
@@ -641,7 +641,7 @@ def frame_volumes(
             continue
         # The donor's state is taken only where its readings reach the frame:
         # elsewhere there is no estimate, and its pressure record may end before.
-        if donor is not None and _volume_at(donor[1], elapsed_h) is not None:
+        if donor is not None and _reference_at(donor[1], elapsed_h) is not None:
             donor_mass, donor_density = donor_state(elapsed_h)
             volume = estimated_reference(
                 donor[1], elapsed_h, donor_mass, donor_density, mass_g[k], density[k]
@@ -655,13 +655,22 @@ def _volume_json(volume: DisplacedVolume | None) -> dict | None:
     if volume is None:
         return None
     ml = None if volume.volume_ml is None else volume.volume_ml.tolist()
-    return {
+    record = {
         "times_h": volume.times_h.tolist(),
         "volume_ml": ml,
         "reasons": list(volume.reasons),
         "baseline": volume.baseline.tolist(),
         "dtype": volume.times_h.dtype.name,
     }
+    rules = {
+        "excluded": list(volume.excluded),
+        "end_h": volume.end_h,
+        "peak_h": volume.peak_h,
+        "tail_floor_ml": volume.tail_floor_ml,
+    }
+    if volume.excluded or any(rules[k] is not None for k in rules if k != "excluded"):
+        record.update(rules)
+    return record
 
 
 def _volume(value: Mapping | None) -> DisplacedVolume | None:
@@ -675,6 +684,10 @@ def _volume(value: Mapping | None) -> DisplacedVolume | None:
         None if ml is None else np.asarray(ml, dtype),
         tuple(value["reasons"]),
         np.asarray(value["baseline"], bool),
+        excluded=tuple(value.get("excluded", ())),
+        end_h=value.get("end_h"),
+        peak_h=value.get("peak_h"),
+        tail_floor_ml=value.get("tail_floor_ml"),
     )
 
 
