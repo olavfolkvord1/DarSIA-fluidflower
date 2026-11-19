@@ -50,6 +50,7 @@ class ProtocolledExperiment:
         blacklist_protocol: Optional[
             Path | tuple[Path, str] | dict[Path, Path | tuple[Path, str]]
         ] = None,
+        injection_reference_density: Optional[float] = None,
     ):
         self.data = data
         """Pool of data paths."""
@@ -82,7 +83,9 @@ class ProtocolledExperiment:
             self.imaging_protocols = None
             self._resolved_protocol_folders = []
         """Imaging protocol(s)."""
-        self.injection_protocol = darsia.InjectionProtocol(injection_protocol)
+        self.injection_protocol = darsia.InjectionProtocol(
+            injection_protocol, injection_reference_density
+        )
         """Injection protocol."""
         self.pressure_temperature_protocol = darsia.PressureTemperatureProtocol(
             pressure_temperature_protocol
@@ -122,6 +125,7 @@ class ProtocolledExperiment:
             injection_protocol=config.protocols.injection,
             pressure_temperature_protocol=config.protocols.pressure_temperature,
             blacklist_protocol=config.protocols.blacklist,
+            injection_reference_density=config.protocols.injection_reference_density,
         )
 
     def time_since_start(self, date: datetime) -> float:
