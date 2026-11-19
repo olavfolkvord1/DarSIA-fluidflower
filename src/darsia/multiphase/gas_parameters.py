@@ -5,7 +5,7 @@ locate the gas across that depth. These dimensionless ratios define the method;
 they are not a particular rig's lengths or user configuration defaults.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
@@ -28,6 +28,10 @@ class GasAllocationSettings:
     cost_up_per_mm: float
     cost_side_per_mm: float
     cost_down_per_mm: float
+    no_growth_after_injection: bool = field(default=False, kw_only=True)
+    """Whether a frame at which no port injects (between injections and after
+    the last) holds at most the free gas the run's frame before it placed:
+    without a source, free gas only dissolves, so gone gas stays gone."""
 
 
 @dataclass(frozen=True)

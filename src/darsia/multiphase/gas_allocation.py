@@ -84,6 +84,9 @@ class GasAllocationRecord:
     """Inferred bridge gas, already included in placed_m3, never an extra volume."""
     active_link_diagnostics: list[dict] = field(default_factory=list)
     """Raw geometry outcomes for active ports, including local-depth refusals."""
+    growth_limit_m3: float | None = None
+    """The previous frame's placed gas that bounded this frame's while no port
+    injected (``no_growth_after_injection``); None where it did not."""
 
 
 def _active_link_diagnostics(zone, ports):
@@ -479,6 +482,7 @@ def free_gas(
     record: Callable[[int, GasAllocationRecord], None] | None = None,
     model_frames: Sequence[GasModelFrame] | None = None,
     zones: Sequence[GasZone] | None = None,
+    placed_before_m3: float | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
@@ -615,6 +619,7 @@ def free_gas(
                 model_frames=prepared,
                 zones=contours,
                 depth_m=depth_m,
+                placed_before_m3=placed_before_m3,
             )
         return
     if zones is None or len(model_frames) != len(dates) or len(zones) != len(dates):
@@ -632,6 +637,13 @@ def free_gas(
     def stored_labels(index):
         return model_frames[index].before
 
+    growth = getattr(settings, "no_growth_after_injection", False)
+    previous = placed_before_m3 if start > 0 else None
+    if growth and start > 0 and previous is None:
+        raise ValueError(
+            "Resuming with no_growth_after_injection needs the placed gas of the"
+            " frame before the start"
+        )
     for index in range(start, len(dates)):
         frame = model_frames[index]
         zone = zones[index]
@@ -683,8 +695,15 @@ def free_gas(
         allowed = keep & (pore_volume_m3 * cap > 0)
         model = allowed & (labels == PhaseLabel.GAS)
         saturation = np.where(model, cap, cap.dtype.type(0))
-        target = volumes_m3[index]
+        requested = target = volumes_m3[index]
         model_volume = float(np.sum(room[model]))
+        bound = None
+        if growth and previous is not None and not injecting:
+            # No source while no port injects: never more gas than the frame before.
+            if target is None and model_volume > previous:
+                target = bound = previous
+            elif target is not None and target > previous:
+                target = bound = previous
         seeds = None
         if target is not None:
             if target >= model_volume:
@@ -753,6 +772,8 @@ def free_gas(
         # Keep optical WATER and before labels intact: this is inferred free
         # gas, not model evidence and not an inferred dissolved concentration.
         rules[inferred] = PhaseRule.GAS_BRIDGE
+        if growth:
+            previous = float(np.sum(pore_volume * saturation.astype(np.float64)))
         if record is not None:
             placed = float(np.sum(pore_volume * saturation.astype(np.float64)))
             disconnected = np.zeros_like(model)
@@ -774,7 +795,7 @@ def free_gas(
             record(
                 index,
                 GasAllocationRecord(
-                    None if target is None else float(target),
+                    None if requested is None else float(requested),
                     model_volume,
                     placed,
                     0.0 if target is None else max(0.0, float(target) - placed),
@@ -785,6 +806,7 @@ def free_gas(
                     settings.geometry_record(),
                     float(np.sum(pore_volume[inferred] * saturation[inferred])),
                     _active_link_diagnostics(zone, injecting),
+                    growth_limit_m3=bound,
                 ),
             )
         yield labels, rules, saturation, _co2(own), own

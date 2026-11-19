@@ -52,6 +52,34 @@ class FeedSettings:
     maximum_pre_injection_rate_g_h: float
     """Readings before the injection must rise slower than this."""
 
+    def supply_stop_h(self, times_h: np.ndarray, weights_g: np.ndarray) -> float:
+        """The time [h] the feed stops: the first reading, from ``supply_check_h``
+        on, after which the weight rises by less than ``supply_stop_rise_g``
+        within ``supply_check_span_h``; the last reading's time if it never
+        stops. ``weights_g`` are the weights as read."""
+        t, w = times_h, weights_g
+        for i in np.flatnonzero(t >= self.supply_check_h):
+            later = (t > t[i]) & (t <= t[i] + self.supply_check_span_h)
+            if later.any() and w[later].max() - w[i] < self.supply_stop_rise_g:
+                return t[i]
+        return t[-1]
+
+    def late_readings(self, times_h: np.ndarray, stop_h: float) -> np.ndarray:
+        """Which readings lie in the late window before the feed's stop, where
+        the weight is the feed alone."""
+        t = times_h
+        start, end = self.late_window_h
+        return (t >= stop_h - start) & (t <= stop_h - end)
+
+    def reading_noise_ml(self, times_h: np.ndarray, weights_g: np.ndarray) -> float:
+        """The scale's reading noise [mL]: the standard deviation of the late
+        weights about their line, the quantity ``maximum_late_sd_g`` bounds
+        (one gram of water per mL). ``weights_g`` are the weights as read."""
+        t, w = times_h, weights_g
+        late = self.late_readings(t, self.supply_stop_h(t, w))
+        rate, offset = np.polyfit(t[late], w[late], 1)
+        return float(np.std(w[late] - (offset + rate * t[late])))
+
     def displaced_ml(
         self,
         times_h: np.ndarray,
@@ -92,13 +120,8 @@ class FeedSettings:
         t, w, c = times_h, weights_g, corrected_g
         pre = t < 0
         reference = np.flatnonzero(pre)[-1]
-        stop = t[-1]
-        for i in np.flatnonzero(t >= self.supply_check_h):
-            later = (t > t[i]) & (t <= t[i] + self.supply_check_span_h)
-            if later.any() and w[later].max() - w[i] < self.supply_stop_rise_g:
-                stop = t[i]
-                break
-        late = (t >= stop - self.late_window_h[0]) & (t <= stop - self.late_window_h[1])
+        stop = self.supply_stop_h(t, w)
+        late = self.late_readings(t, stop)
         rate, offset = np.polyfit(t[late], w[late], 1)
         line = w - (offset + rate * t)
 

@@ -14,6 +14,15 @@ frame without usable readings of its own takes the free-gas share of the
 injected CO2 mass from the most similar run with readings
 (:func:`ranked_donors`, :func:`estimated_reference`).
 
+Three optional rules keep the scale's noise out of the free gas
+(:func:`displaced_volume`): a single reading after the volume's peak that
+leaves both its neighbours on one side by more than ``outlier_factor`` times
+the run's reading noise is left out, the volume between its neighbours taking
+its place; after the peak, a volume within ``tail_noise_factor`` times that
+noise of zero gives no reference, so the model's gas stands; and with
+``end_at_supply_stop`` a fed overflow gives none after its feed stops, where
+the weight no longer shows displaced water.
+
 Every setting is a field of :class:`OverflowSettings` or of its variant's
 settings.
 
@@ -83,6 +92,15 @@ class OverflowSettings:
     readings before the injection."""
     evaporation: EvaporationSettings | None = None
     """The evaporation correction; without it no run is corrected."""
+    outlier_factor: float | None = None
+    """A single reading after the volume's peak that leaves both its neighbours
+    on one side by more than this many times the run's reading noise is left
+    out; without it, every reading is used."""
+    tail_noise_factor: float | None = None
+    """After the volume's peak, a volume within this many times the run's
+    reading noise of zero gives no reference; without it, every volume does."""
+    end_at_supply_stop: bool = False
+    """Whether a fed overflow gives no reference after its feed stops."""
 
     def __post_init__(self) -> None:
         """Turn tables given as mappings into settings; check the variant."""
@@ -94,6 +112,20 @@ class OverflowSettings:
             table = getattr(self, name)
             if isinstance(table, Mapping):
                 object.__setattr__(self, name, kind(**table))
+        for name in ("outlier_factor", "tail_noise_factor"):
+            value = getattr(self, name)
+            if value is not None and not (np.isfinite(value) and value > 0):
+                raise ValueError(f"The overflow's {name} must be positive.")
+        needs_noise = (
+            self.outlier_factor is not None
+            or self.tail_noise_factor is not None
+            or self.end_at_supply_stop
+        )
+        if needs_noise and self.variant != "feed":
+            raise ValueError(
+                "The overflow's noise rules need the feed variant's reading noise"
+                " and stop."
+            )
         if self.variant not in ("feed", "circulation"):
             raise ValueError(f"The overflow variant {self.variant!r} is unknown.")
         for name in ("feed", "circulation"):
@@ -127,6 +159,17 @@ class DisplacedVolume:
     """Why the readings are not usable; empty when they are."""
     baseline: np.ndarray
     """Which readings are the baseline: before the injection, in the window."""
+    excluded: tuple[int, ...] = ()
+    """Indices of the readings left out as single outliers; their volumes are
+    those between their neighbours."""
+    end_h: float | None = None
+    """No reference after this time [h], the fed overflow's stop; None without
+    an end."""
+    peak_h: float | None = None
+    """Time [h] of the largest volume, from which the tail rule applies."""
+    tail_floor_ml: float | None = None
+    """After ``peak_h``, a volume within this [mL] of zero gives no reference;
+    None without the rule."""
 
 
 @dataclass(frozen=True)
@@ -200,7 +243,77 @@ def displaced_volume(
         return DisplacedVolume(t, None, reasons, baseline)
     corrected = w if evaporation_g_h is None else w + evaporation_g_h * t
     volume, reasons = variant.displaced_ml(t, w, corrected, baseline)
-    return DisplacedVolume(t, volume, reasons, baseline)
+    if volume is None or (
+        settings.outlier_factor is None
+        and settings.tail_noise_factor is None
+        and not settings.end_at_supply_stop
+    ):
+        return DisplacedVolume(t, volume, reasons, baseline)
+    stop = float(variant.supply_stop_h(t, w))
+    noise = variant.reading_noise_ml(t, w)
+    scope = (t >= 0) & (t <= stop)
+    peak = int(np.argmax(np.where(scope, volume, -np.inf)))
+    excluded = ()
+    if settings.outlier_factor is not None:
+        # The last readings before the stop follow the emptying tank, not the
+        # feed: the check ends where the late window does.
+        steady = stop - variant.late_window_h[1]
+        volume, excluded = _without_outliers(
+            t, volume, peak, steady, settings.outlier_factor * noise
+        )
+    return DisplacedVolume(
+        t,
+        volume,
+        reasons,
+        baseline,
+        excluded=excluded,
+        end_h=stop if settings.end_at_supply_stop else None,
+        peak_h=float(t[peak]),
+        tail_floor_ml=(
+            None
+            if settings.tail_noise_factor is None
+            else settings.tail_noise_factor * noise
+        ),
+    )
+
+
+def _without_outliers(
+    times_h: np.ndarray,
+    volume_ml: np.ndarray,
+    peak: int,
+    stop_h: float,
+    limit_ml: float,
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """The volumes with single outliers after the peak replaced, and their
+    indices.
+
+    A reading after the peak (index ``peak``) whose neighbours both lie within
+    the feed, up to ``stop_h``, is an outlier where both neighbours lie on the
+    same side of it and it leaves the line between them by more than
+    ``limit_ml``. Its volume becomes that line's at its time. Before the peak
+    the injection's own turns are real, and are kept.
+    """
+    t, v = times_h, volume_ml
+    candidates = []
+    for i in range(peak + 1, len(t) - 1):
+        if t[i + 1] > stop_h:
+            break
+        up, down = v[i] - v[i - 1], v[i] - v[i + 1]
+        if up * down <= 0:
+            continue
+        between = v[i - 1] + (t[i] - t[i - 1]) / (t[i + 1] - t[i - 1]) * (
+            v[i + 1] - v[i - 1]
+        )
+        if abs(v[i] - between) > limit_ml:
+            candidates.append((abs(v[i] - between), i, between))
+    # A spike also makes its neighbours turn; the largest turn is the outlier,
+    # and a reading next to one already left out is kept.
+    cleaned, found = v.copy(), set()
+    for _, i, between in sorted(candidates, reverse=True):
+        if i - 1 not in found and i + 1 not in found:
+            cleaned[i] = between
+            found.add(i)
+    return cleaned, tuple(sorted(found))
 
 
 def _volume_at(volume: DisplacedVolume, elapsed_h: float):
@@ -220,6 +333,24 @@ def _volume_at(volume: DisplacedVolume, elapsed_h: float):
     )
 
 
+def _reference_at(volume: DisplacedVolume, elapsed_h: float):
+    """The displaced volume [mL] a frame takes at a time (:func:`_volume_at`),
+    or None: outside the readings, after the volume's end, or in the tail within
+    its floor of zero."""
+    if volume.end_h is not None and elapsed_h > volume.end_h:
+        return None
+    observed = _volume_at(volume, elapsed_h)
+    if (
+        observed is not None
+        and volume.tail_floor_ml is not None
+        and volume.peak_h is not None
+        and elapsed_h > volume.peak_h
+        and abs(float(observed)) <= volume.tail_floor_ml
+    ):
+        return None
+    return observed
+
+
 def measured_reference(volume: DisplacedVolume, elapsed_h: float) -> float | None:
     """Free-gas volume [m3] of a frame from its run's displaced water.
 
@@ -235,10 +366,11 @@ def measured_reference(volume: DisplacedVolume, elapsed_h: float) -> float | Non
     -------
     float or None
         The displaced volume at the frame's time, at least zero; None outside
-        the readings.
+        the readings or where the volume's rules give none
+        (:func:`displaced_volume`).
 
     """
-    observed = _volume_at(volume, elapsed_h)
+    observed = _reference_at(volume, elapsed_h)
     if observed is None:
         return None
     return max(0.0, float(observed * 1e-6))
@@ -378,7 +510,7 @@ def estimated_reference(
         not between zero and one.
 
     """
-    observed = _volume_at(donor, elapsed_h)
+    observed = _reference_at(donor, elapsed_h)
     if observed is None or mass_g < 0:
         return None
     volume = max(0.0, float(observed * 1e-6))
