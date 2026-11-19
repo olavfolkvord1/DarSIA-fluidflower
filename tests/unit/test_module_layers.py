@@ -44,6 +44,8 @@ MODULES = [
     "darsia/multiphase/gas_zone_cache.py",
     "darsia/multiphase/mass_maps.py",
     "darsia/multiphase/unknown_mass.py",
+    "darsia/presets/workflows/analysis/domains.py",
+    "darsia/presets/workflows/analysis/domain_mass.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
