@@ -168,7 +168,8 @@ def colour_key(
     over_range: str | None = None,
 ) -> np.ndarray:
     """A map's key: a thin vertical bar of ``colour_map`` from 0 to ``limit`` with
-    three ticks and ``label`` above, on a dark backing; RGBA pixels."""
+    three ticks and ``label`` above, on a dark backing; RGBA pixels. The width
+    includes the measured tick and unit text, so precise limits are not clipped."""
     width = int(round(font_px * 4.6))
     ticks = [0.0, limit / (4 if normalization == "sqrt" else 2), limit]
     figure = canvas((width, int(height)), constrained=False)
@@ -191,7 +192,7 @@ def colour_key(
     bar.ax.tick_params(labelsize=_points(font_px), colors="white", length=2)
     bar.ax.set_yticklabels([f"{value:g}" for value in ticks])
     bar.outline.set_edgecolor("white")
-    figure.text(
+    heading = figure.text(
         left,
         1 - 0.55 * top,
         label,
@@ -200,6 +201,20 @@ def colour_key(
         va="center",
         ha="left",
     )
+    renderer = figure.canvas.get_renderer()
+    right = max(
+        text.get_window_extent(renderer).x1
+        for text in (*bar.ax.get_yticklabels(), heading)
+    )
+    needed = max(width, math.ceil(right + 0.5 * font_px))
+    if needed > width:
+        # Enlarge only the backing; the bar keeps its original pixel position
+        # and width, while its labels gain the room they actually need.
+        figure.set_size_inches(needed / PIXEL_DPI, height / PIXEL_DPI, forward=False)
+        axis.set_position(
+            [left * width / needed, bottom, bar_w * width / needed, 1 - top - bottom]
+        )
+        heading.set_x(left * width / needed)
     image = pixels(figure)
     image.setflags(write=False)
     return image

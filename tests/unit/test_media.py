@@ -106,6 +106,48 @@ SMALL = TileSettings(width_px=160, display_cells=40, colour_scale=1.7, graph_axe
 UNKNOWN = PhaseLabel.UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "limit,label,font",
+    [
+        (1.87654321, "g/L", 22),
+        (0.0000123456, "g/m²", 14),
+        (1234567.89, "mg/(L pore water)", 18),
+    ],
+)
+def test_colour_key_keeps_full_tick_and_unit_text_inside_its_image(
+    monkeypatch, limit, label, font
+):
+    """A precise scale must not be silently shortened by the key's backing."""
+    from darsia.presets.workflows.media import layouts
+
+    original = layouts.pixels
+    seen = []
+
+    def inspect(figure):
+        # The production pixels() clears the figure after copying its pixels.
+        figure.canvas.draw()
+        width, height = figure.canvas.get_width_height()
+        renderer = figure.canvas.get_renderer()
+        axis = figure.axes[0]
+        texts = [*axis.get_yticklabels(), *figure.texts]
+        for text in texts:
+            box = text.get_window_extent(renderer)
+            assert 0 <= box.x0 <= box.x1 <= width
+            assert 0 <= box.y0 <= box.y1 <= height
+        assert [text.get_text() for text in axis.get_yticklabels()] == [
+            f"{value:g}" for value in (0, limit / 4, limit)
+        ]
+        assert figure.texts[0].get_text() == label
+        image = original(figure)
+        seen.append(image.shape)
+        return image
+
+    monkeypatch.setattr(layouts, "pixels", inspect)
+    layouts.colour_key.cache_clear()
+    image = layouts.colour_key(limit, label, 220, font, "viridis", "sqrt", "magenta")
+    assert seen == [image.shape] and not image.flags.writeable
+
+
 def rgb(colour: str) -> tuple:
     """A colour as 8-bit (red, green, blue)."""
     return bgr(colour)[::-1]
