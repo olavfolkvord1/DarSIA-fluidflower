@@ -1,5 +1,8 @@
 """Recorded observation exclusions are not unknown physical pores or barriers."""
 
+import csv
+from datetime import datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,7 +11,9 @@ import darsia
 from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule
 from darsia.presets.workflows.analysis.domains import AnalysisDomain
 from darsia.presets.workflows.comparison import mass_wasserstein as mw
+from darsia.presets.workflows.comparison import steps
 from darsia.presets.workflows.comparison.steps import _observed_geometry
+from darsia.utils.locations import Frame
 
 
 def _inputs():
@@ -123,3 +128,93 @@ def test_unrecorded_unknown_pixels_are_not_inferred_as_chart_exclusions():
     assert count == 0
     assert np.array_equal(observed.counted, geometry.counted)
 
+
+def test_distance_adapter_uses_stored_rules_and_publishes_exclusion_counts(
+    tmp_path, monkeypatch
+):
+    sand, geometry, values, labels, rules = _inputs()
+    # Empty observed masses exercise the adapter without the solver's separate
+    # identical-nonempty stopping-condition case.
+    image = darsia.ScalarImage(np.zeros_like(values), dimensions=sand.dimensions)
+    zero = darsia.full_like(image, np.zeros_like(values))
+    maps = darsia.SimpleMassAnalysisResults(
+        name="frame",
+        date=None,
+        time=None,
+        mass=image,
+        mass_g=zero,
+        mass_aq=image,
+        saturation_g=zero,
+        color_signal=zero,
+        concentration_aq=image,
+    )
+    rig = SimpleNamespace(
+        labels=sand,
+        permeability=darsia.full_like(image, values * 100),
+        porosity=darsia.full_like(image, values * 0.4),
+        depth=image,
+        facies=sand,
+        baseline=image,
+        grid_to_rig=None,
+    )
+    grid = SimpleNamespace(
+        rig=rig, geometry=geometry, facies=values.astype(int), positions=None
+    )
+    experiment = SimpleNamespace(
+        injection_protocol=None,
+        get_datetime=lambda _path: datetime(2020, 1, 1),
+        time_since_start=lambda _date: 0.0,
+    )
+    monkeypatch.setattr(steps, "run_grid", lambda *_args: grid)
+    monkeypatch.setattr(steps, "run_settings", lambda *_args: None)
+    monkeypatch.setattr(steps, "make_experiment", lambda *_args: experiment)
+    monkeypatch.setattr(steps, "start_co2", lambda *_args: None)
+    monkeypatch.setattr(
+        steps,
+        "distance_scales",
+        lambda *_args: mw.DistanceScales(1.0, 1.0, {"sand": np.nan}),
+    )
+    frame = Frame("session", "frame.png")
+    captured = {}
+
+    def read(kind, reader, **_where):
+        if kind == "rig":
+            return (None, None) if reader is steps.read_grid_model else rig
+        if kind == "mass-maps":
+            return maps
+        assert kind == "phase-maps"
+        return dict(labels=labels, rules=rules)
+
+    def publish(writer, **metadata):
+        writer(tmp_path)
+        captured.update(metadata)
+
+    ctx = SimpleNamespace(
+        settings=dict(
+            wasserstein=mw.WassersteinSettings(
+                3.0, 3, 1e-12, 60, 1e-4, 1e-2, (0, 10, 20)
+            ),
+            distances=steps.DistanceSettings((0.0,), 0.1, "a"),
+            material=None,
+            domains=SimpleNamespace(
+                sand_labels=(1,), domains={"sand": {"kind": "sand", "name": "Sand"}}
+            ),
+        ),
+        selection=SimpleNamespace(
+            frames={"a": (frame,), "b": (frame,)}, domains=("sand",)
+        ),
+        task=SimpleNamespace(part="0.0h"),
+        read=read,
+        publish=publish,
+        photo=lambda _run, _frame: tmp_path / "frame.png",
+    )
+    steps.DISTANCES.run(ctx)
+    with (tmp_path / "distances.csv").open(newline="", encoding="utf-8") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["status"] == "success" and float(row["distance_kg_m"]) == 0.0
+    assert row["case_id_1"] == row["case_id_2"] == "session/frame.png"
+    assert captured["measurements"] == {
+        "colorchecker_excluded_counted_pixels": {"a": 4, "b": 4}
+    }
+    assert np.all(labels[1, 2:6] == PhaseLabel.UNKNOWN)
+    assert geometry.counted.all()
