@@ -1279,6 +1279,58 @@ def test_learned_admission_keeps_the_process_base_and_smaller_peak(monkeypatch):
     assert service.need(500, {"estimate": 100, "bytes": 450, "base": 100}) == 500
 
 
+def test_declared_admission_raises_only_on_a_matching_completed_overrun(
+    tmp_path, monkeypatch, started
+):
+    config, selection = _project(tmp_path / "project")
+    selection = Selection(
+        {run: frames[:2] for run, frames in selection.frames.items()}, selection.sessions
+    )
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        '[jobs]\nmemory_admission = "declared"\nmemory_buffer_fraction = 0.1\n',
+        encoding="utf-8",
+    )
+    job = create_job(
+        tmp_path / "jobs", (LIGHT,), selection, [config, policy], sizes=SIZES
+    )
+    running, _ = _service(tmp_path, monkeypatch, threads=1)
+    record = read_job(job)
+    tasks = queue.tasks(job)
+    baseline = {"imports_bytes": 2**26, "backend_bytes": 2**27, "ready_bytes": 2**28}
+    probes = []
+
+    def probe(command, **kwargs):
+        probes.append(command)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(baseline), stderr="")
+
+    monkeypatch.setattr(service.subprocess, "run", probe, raising=False)
+    running._keep(dict(step=LIGHT.name, bytes=4 * GIB, estimate=GIB, format=".npz"))
+    running.poll()
+    unbuffered = GIB + baseline["ready_bytes"]
+    reserved = unbuffered + (unbuffered + 9) // 10
+    assert [live.bytes for live in running.live.values()] == [reserved]
+    assert len(probes) == 1 and probes[0][3] == "probe-memory"
+    assert all(item["buffer_fraction"] == 0.1 for item in record["memory"].values())
+
+    first = started[0]
+    claim = queue.Claim(job, first.task, first.token, "here")
+    queue.finish(
+        claim, memory={"attempt": first.token, "job_commit_peak": 2 * GIB}
+    )
+    first.code = 0
+    running.poll()
+    second = tasks[started[1].task]
+    assert running._reserve(record, second) == (2 * GIB, reserved)
+    assert len(probes) == 1
+    other = GIB + (GIB + 9) // 10
+    assert running._reserve(dict(record, id="other-job"), second) == (other, other)
+    changed = dict(record["memory"][second.id], frames=100)
+    assert running._reserve(
+        dict(record, memory={second.id: changed}), second
+    ) == (reserved, reserved)
+
+
 def test_peak_records_keep_distinct_workloads_and_ignore_bad_measurements(tmp_path):
     """A lower relative peak at a larger resolution must not erase a smaller
     workload's larger scaling factor; malformed records cannot break admission."""

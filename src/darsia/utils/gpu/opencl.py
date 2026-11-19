@@ -428,6 +428,12 @@ class OpenCLBackend:
             (device.platform.name, device.name, device.driver_version)
         )
         """The platform, the device and its driver, recorded with each result."""
+        self.hardware = {
+            "backend": self.name,
+            "platform": device.platform.name,
+            "model": device.name,
+            "driver": device.driver_version,
+        }
         self._context = cl.Context([device])
         self._queue = cl.CommandQueue(self._context)
         self._programs = {}

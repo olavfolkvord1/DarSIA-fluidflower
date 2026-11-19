@@ -432,6 +432,7 @@ def finish(
     *,
     deadline: float | None = None,
     memory: Mapping | None = None,
+    measurements: Mapping | None = None,
 ) -> None:
     """Move a claim to ``done/``, naming its accepted tokens, or to ``failed/``.
 
@@ -452,6 +453,8 @@ def finish(
         token (:meth:`darsia.jobs.service.Family.peaks`), which its done marker
         keeps as the measurement of its step's memory; a failed marker keeps
         none.
+    measurements : Mapping, optional
+        Plain JSON observations of this attempt, stored only on completion.
 
     Raises
     ------
@@ -466,6 +469,8 @@ def finish(
         content = {"token": claim.token, "accepted": sorted({claim.token, *accepted})}
         if memory:
             content["memory"] = dict(memory)
+        if measurements:
+            content["measurements"] = dict(measurements)
     else:
         state, content = FAILED, {"token": claim.token, "traceback": traceback}
     _write(

@@ -30,6 +30,8 @@ import math
 import os
 import shutil
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
+from dataclasses import asdict
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -40,7 +42,17 @@ import pandas as pd
 import toml
 
 import darsia
-from darsia.jobs.step import RUNS, Memory, Order, Scope, Step, StepContext, run_tables
+from darsia.image.raw import RAW_SUFFIXES, measure_raw_frame, raw_stage
+from darsia.jobs.step import (
+    RUNS,
+    Memory,
+    Order,
+    Scope,
+    Step,
+    StepContext,
+    Term,
+    run_tables,
+)
 from darsia.presets.workflows.config.depth import DepthConfig
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.sections import list_required_sections
@@ -550,17 +562,31 @@ def _corrected_image(ctx: StepContext) -> None:
     run = ctx.task.run
     rig = ctx.read("rig", read_rig)
     rig.load_experiment(make_experiment(run_settings(ctx, run, EXPERIMENT)))
+    profile_raw = ctx.tables.get("jobs", {}).get("profile_raw", False)
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
-        image, found = corrected_photo(rig, ctx.photo(run, frame))
+        path = ctx.photo(run, frame)
+        profile = profile_raw and path.suffix.casefold() in RAW_SUFFIXES
+        with measure_raw_frame() if profile else nullcontext() as measured:
+            image, found = corrected_photo(rig, path)
 
-        def write(folder, image=image, found=found):
-            image.save(Path(folder) / "image.npz")
-            if found is not None:
-                darsia.write_frame_registration(folder, found)
+            def write(folder, image=image, found=found):
+                with raw_stage("write_payload"):
+                    image.save(Path(folder) / "image.npz")
+                    if found is not None:
+                        darsia.write_frame_registration(folder, found)
+                if measured is not None:
+                    measured.output_bytes = sum(
+                        file.stat().st_size for file in folder.iterdir()
+                    )
 
-        ctx.publish(write, frame=frame)
+            with raw_stage("publish"):
+                ctx.publish(write, frame=frame)
+        if measured is not None:
+            ctx.task_measurements.setdefault("raw_frames", []).append(
+                {"case_id": f"{frame.session}/{frame.name}", **asdict(measured)}
+            )
 
 
 def _drawing_files(tables: Mapping[str, Any], project, folders) -> list[str]:
@@ -599,11 +625,37 @@ def _rig_stamped(tables: Mapping[str, Any], project, folders) -> list[str]:
     return [str(path) for path in found if path is not None]
 
 
+def _sand_edge_fill_bytes(tables: Mapping, run: str | None, context) -> int:
+    """Retained distance maps, masks and nearest-label scratch for edge filling."""
+    own = run_tables(tables, run) if run is not None else tables
+    if own.get("labeling", {}).get("sand_map", {}).get("edge_fill_mm", 0) <= 0:
+        return 0
+    grid = context.grid_pixels
+    # An unknown shape may be a one-pixel strip. Its padded area is maximal.
+    rows, cols = context.grid_shape or (1, grid)
+    padded = (rows + 2) * (cols + 2)
+    distance = np.dtype(np.float32).itemsize
+    mask = np.dtype(np.bool_).itemsize
+    label = np.dtype(np.uint8).itemsize
+    # Padded boundary distances with their source and OpenCV scratch; the
+    # candidate set may cover the whole grid. Its indexed distance copies,
+    # selection masks and update of the retained nearest labels share a lifetime.
+    return padded * (3 * distance + 2 * mask) + grid * (
+        3 * distance + 4 * mask + 3 * label
+    )
+
+
+def _registered(tables: Mapping, run: str | None, context=None) -> int:
+    """Whether corrected photos are sampled through a per-frame registration."""
+    own = run_tables(tables, run) if run is not None else tables
+    return int(own.get("corrections", {}).get("registration") is not None)
+
+
 SAND_MAP = Step(
     "sand-map",
     {},
     Order.RUN,
-    Memory(camera_bytes=16.0),
+    Memory(camera_bytes=16.0, terms=(Term(_sand_edge_fill_bytes, fixed_bytes=1),)),
     _sand_map,
     sections=tuple(list_required_sections(setup_sand_map)),
     files=_drawing_files,
@@ -631,12 +683,19 @@ CORRECTED_IMAGE = Step(
         grid=15.0,
         camera_bytes=18.0,
         grid_bytes=68.0,
+        terms=(
+            # The per-frame camera view and sampled sensor RGB coexist with
+            # the retained previous output and the channel-wise x/y mappings
+            # as the registration samples the new image.
+            Term(_registered, camera=1 + 3, grid=3 + 2 * 3 + 3),
+        ),
         photos=1,
         photo_bytes=darsia.decoded_bytes,
     ),
     _corrected_image,
     sections=EXPERIMENT,
     files=protocol_files,
+    accelerated=True,  # The backend's remapping must agree bit for bit.
 )
 """Each frame's corrected image (R1)."""
 STEPS = (SAND_MAP, RIG, CORRECTED_IMAGE)

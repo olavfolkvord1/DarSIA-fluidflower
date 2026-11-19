@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -38,6 +40,7 @@ from darsia.presets.workflows.calibration.steps import (
 )
 from darsia.presets.workflows.media import tiles as media
 from darsia.presets.workflows.media.films import FilmSettings, write_films
+from darsia.presets.workflows.media.layouts import grid_layout
 from darsia.presets.workflows.media.panels import (
     PhotographSettings,
     source_photograph_settings,
@@ -350,6 +353,42 @@ def _films(ctx: StepContext) -> None:
     ctx.publish(write)
 
 
+def _film_bytes(tables: Mapping, run: str | None, context) -> int:
+    """The tile cache and metadata, compositor, and native encoder/decoder pools."""
+    films = tables["media"]["films"]
+    film = next(item for item in films if item["name"] == context.part)
+    width, height = film["size_px"]
+    canvas = width * height
+    runs = max(len(context.runs), 1)
+    rows, columns = context.grid_shape or (height, width)
+    layout = film["layout"]
+    if layout in ("grid", "single"):
+        tile = grid_layout(runs, columns / rows, (width, height)).tile
+        cache_pixels = 4 * runs * tile[0] * tile[1]
+        active_panels = runs
+    else:
+        # All panels draw from a 24-tile reader. Each composited tile occupies
+        # at most half the output canvas for side-by-side or pyramid layouts.
+        cache_pixels = 24 * canvas // 2
+        active_panels = len(film["panels"])
+    byte = 1  # every composed colour channel and YUV420 component is uint8
+    rgb = 3 * canvas * byte
+    aligned = ((width + 63) // 64 * 64) * ((height + 63) // 64 * 64)
+    yuv420 = aligned * 3 // 2
+    # OpenCV's FFmpeg wrapper defaults to at most 16 decode threads. Budget a
+    # current and next surface per thread plus the H.264 picture buffer and two
+    # handoff frames. An external libx264 fast encoder keeps 30 lookahead inputs,
+    # two references, reorder frames and one encoder thread.
+    threads = min(os.cpu_count() or 1, 16)
+    decode = (2 * threads + 16 + 2) * yuv420 + 3 * rgb
+    encode = (30 + 2 + 3 + 2) * yuv420 + 3 * rgb if film["codec"] == "libx264" else decode
+    ref = sys.getsizeof([None]) - sys.getsizeof([])
+    row = sys.getsizeof({"target": None, "source": None, "elapsed": None, "held": None})
+    row += 3 * sys.getsizeof(0.0) + context.case_id_bytes + ref
+    metadata = context.frames * active_panels * row
+    return cache_pixels * 3 * byte + max(decode, encode + 2 * rgb) + metadata
+
+
 FILM_TILES = Step(
     "film-tiles",
     {
@@ -383,7 +422,7 @@ FILMS = Step(
     "films",
     {"film-tiles": Scope.ALL},
     Order.PARTS,
-    Memory(),
+    Memory(terms=(Term(_film_bytes, fixed_bytes=1),)),
     _films,
     {
         "media": MediaSettings,

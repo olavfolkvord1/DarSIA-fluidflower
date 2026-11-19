@@ -42,7 +42,9 @@ from __future__ import annotations
 import argparse
 import functools
 import importlib
+import json
 import os
+import platform
 import socket
 import sys
 import threading
@@ -52,6 +54,7 @@ from pathlib import Path
 from time import monotonic
 
 import cv2
+import numpy as np
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from darsia.jobs import queue, service
@@ -70,11 +73,17 @@ from darsia.utils import results
 from darsia.utils.gpu.backend import (
     ComputeBackend,
     backend_named,
+    choose_compute_backend,
     compute_backend,
     use_compute_backend,
 )
 from darsia.utils.locations import normal_path
 from darsia.utils.storage import StorageSettings, use_storage
+
+if os.name == "nt":
+    import winreg
+else:
+    winreg = None
 
 STEPS: dict[str, Step] = {
     step.name: step
@@ -130,7 +139,7 @@ def heads(job: Path, record: Mapping) -> tuple[LogisticHead, LogisticHead] | Non
     return model.co2_presence, model.gas_within_co2
 
 
-def backend_of(job: Path, record: Mapping) -> ComputeBackend:
+def backend_of(job: Path, record: Mapping, task: Task | None = None) -> ComputeBackend:
     """A job's compute backend on this host, checked as its task starts
     (:func:`darsia.backend_named`): the CPU, or the device of its class that gives
     the CPU's numbers, for the phase probabilities with the job's heads.
@@ -142,6 +151,24 @@ def backend_of(job: Path, record: Mapping) -> ComputeBackend:
 
     """
     label = str(record["environment"].get("backend", "cpu"))
+    if label == "auto":
+        if task is None or not step_of(record, task.step).accelerated:
+            return backend_named("cpu")
+        sizes = record.get("sizes") or {}
+        shape = sizes.get("grid_shape")
+        if shape is None or sizes.get("itemsize") not in (4, 8):
+            return backend_named("cpu")
+        tables = read_tables([Path(job) / name for name in record["config"]])
+        qualified = (
+            tables.get("jobs", {}).get("qualified_backends", {}).get(task.step, [])
+        )
+        if not qualified:
+            return backend_named("cpu")
+        dtype = np.dtype(f"f{sizes['itemsize']}").type
+        backend, _ = choose_compute_backend(
+            tuple(shape), dtype, heads=heads(job, record), measured=qualified
+        )
+        return backend
     try:
         return backend_named(
             label, heads=None if label == "cpu" else heads(job, record)
@@ -177,6 +204,43 @@ def other_revision(record: Mapping, code: str | None) -> str | None:
     return f"This process runs revision {known}, not the job's {record['revision']}."
 
 
+@functools.cache
+def cpu_model() -> str:
+    """The processor's model from local hardware metadata."""
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as key:
+                return str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+        except OSError:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            with Path("/proc/cpuinfo").open(encoding="utf-8", errors="replace") as info:
+                for line in info:
+                    name, _, value = line.partition(":")
+                    if name.strip() in {"model name", "Hardware"} and value.strip():
+                        return value.strip()
+        except OSError:
+            pass
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def hardware_provenance(backend: ComputeBackend) -> dict:
+    """The backend device or CPU and the loaded BLAS libraries, without host identity."""
+    if backend.label != "cpu":
+        return dict(getattr(backend, "hardware", {"device": backend.device}))
+    fields = ("internal_api", "version", "architecture", "num_threads")
+    blas = [
+        {key: pool[key] for key in fields if key in pool}
+        for pool in threadpool_info()
+        if pool.get("user_api") == "blas"
+    ]
+    return {"backend": "cpu", "model": cpu_model(), "blas": blas}
+
+
 def context(job: Path, task: Task, token: str, code: str | None = None) -> StepContext:
     """The context of a claimed task (:class:`darsia.jobs.step.StepContext`), whose
     results record the revision of this process's code (by default looked at
@@ -190,6 +254,7 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
         section: settings_from_table(kind, table(tables, section))
         for section, kind in step.settings.items()
     }
+    backend = compute_backend()
     return StepContext(
         step,
         task,
@@ -202,9 +267,47 @@ def context(job: Path, task: Task, token: str, code: str | None = None) -> StepC
         record,
         functools.cache(lambda name: queue.accepted(job, name)),
         revision() if code is None else code,
-        compute_backend().device,
+        backend.device,
         service.WaitingLock,
+        hardware=hardware_provenance(backend),
     )
+
+
+def probe_memory(folder: Path, task_name: str, *, inputs=False) -> dict:
+    """Measure the actual worker setup without claiming or running a task."""
+    imported = service.startup_bytes()
+    record = read_job(folder)
+    if why := refusal(record["environment"]):
+        raise ValueError(why)
+    task = queue.task(folder, task_name)
+    backend = backend_of(folder, record, task)
+    use_compute_backend(backend)
+    configured = service.startup_bytes()
+    threads = int(record["environment"]["threads"])
+    cv2.setNumThreads(threads)
+    threadpool_limits(threads)
+    stop, began = threading.Event(), threading.Event()
+
+    def idle_heartbeat():
+        began.set()
+        stop.wait()
+
+    heartbeat = threading.Thread(target=idle_heartbeat, daemon=True)
+    heartbeat.start()
+    began.wait()
+    try:
+        ctx = context(folder, task, "memory-probe")
+        use_storage(settings_from_table(StorageSettings, ctx.tables.get("storage", {})))
+        if inputs:
+            plan = ctx.step.memory.ready
+            if plan is None:
+                raise ValueError(f"Step {ctx.step.name} has no accepted-input memory plan.")
+            return dict(plan(ctx))
+        return dict(imports_bytes=imported, backend_bytes=configured,
+                    ready_bytes=service.startup_bytes(), device=backend.device)
+    finally:
+        stop.set()
+        heartbeat.join()
 
 
 def _lost(error: OSError, what: str) -> int:
@@ -289,6 +392,7 @@ def run(
         failed, and its service runs it again).
 
     """
+    imported = service.startup_bytes()
     job = Path(job)
     claim = queue.Claim(job, task_name, token, machine)
     try:
@@ -299,7 +403,8 @@ def run(
         return _lost(error, "reading its job")
     code = revision()
     why = other_revision(record, code) or refusal(record["environment"])
-    if why is None:
+    automatic = record["environment"].get("backend") == "auto"
+    if why is None and not automatic:
         try:
             use_compute_backend(backend_of(job, record))
         except ValueError as error:
@@ -330,14 +435,25 @@ def run(
         target=_beats, args=(claim, stop, host, renewed), daemon=True
     )
     beats.start()
-    failure, adopted, out = None, (), None
+    failure, adopted, out, measurements = None, (), None, {}
     try:
         task = queue.task(job, task_name)
+        if automatic:
+            use_compute_backend(backend_of(job, record, task))
+        configured = service.startup_bytes()
         ctx = context(job, task, token, code)
         storage = ctx.tables.get("storage", {})
         use_storage(settings_from_table(StorageSettings, storage))
+        ready = service.startup_bytes()
         ctx.step.run(ctx)
         adopted = tuple(ctx.adopted)
+        measurements = ctx.task_measurements
+        if record.get("memory_admission") == "declared":
+            measurements = dict(measurements, startup_memory=dict(
+                imports_bytes=imported, backend_bytes=configured, ready_bytes=ready,
+                device=compute_backend().device,
+                buffer_fraction=record.get("memory_buffer_fraction", 0.0),
+            ))
     except Exception as error:
         if _out(error):
             out = error
@@ -353,7 +469,14 @@ def run(
         memory = family.peaks(token)  # once no other process of it runs
     try:
         deadline = renewed[0] + results.STALE
-        queue.finish(claim, adopted, failure, deadline=deadline, memory=memory)
+        queue.finish(
+            claim,
+            adopted,
+            failure,
+            deadline=deadline,
+            memory=memory,
+            **({"measurements": measurements} if measurements else {}),
+        )
     except queue.Revoked as error:
         service.say(str(error))
         return REVOKED
@@ -383,6 +506,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     running.add_argument("task")
     running.add_argument("token")
     running.add_argument("--machine", default=socket.gethostname())
+    probing = commands.add_parser("probe-memory", help="Measure the startup memory of a worker.")
+    probing.add_argument("job", type=Path)
+    probing.add_argument("task")
+    probing.add_argument("--inputs", action="store_true")
     asking = commands.add_parser(
         "request", help="Set a host's request: auto, or at most n tasks (0 drains)."
     )
@@ -390,6 +517,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     asking.add_argument("request")
     asking.add_argument("--machine", default=socket.gethostname())
     args = parser.parse_args(argv)
+    if args.command == "probe-memory":
+        print(json.dumps(probe_memory(args.job, args.task, inputs=args.inputs)))
+        return 0
     if args.command == "run":  # its job object first, before any other process
         family = service.Family.start()
         return run(args.job, args.task, args.token, args.machine, family)

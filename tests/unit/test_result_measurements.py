@@ -27,6 +27,7 @@ def _context(tmp_path):
         task=SimpleNamespace(id="phase-maps.run"),
         revision="test-revision",
         device="cpu",
+        hardware=None,
         token="123abc",
         locations=SimpleNamespace(results=tmp_path),
     )

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -443,6 +444,57 @@ def test_a_task_runs_on_its_job_backend(tmp_path, monkeypatch, kept_threads):
         "This host cannot run the job's backend opencl:Device: none gives the CPU's "
         "numbers."
     )
+
+
+def test_auto_backend_uses_each_steps_capability_and_records_hardware(
+    tmp_path, monkeypatch, kept_threads
+):
+    accelerated = replace(NUMBERS, name="accelerated-numbers", accelerated=True)
+    monkeypatch.setitem(jobs_main.STEPS, accelerated.name, accelerated)
+    config, selection = _project(tmp_path, kernel=HERE, backend="auto")
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        '[jobs.qualified_backends]\nnumbers = ["opencl:Device"]\n'
+        'accelerated-numbers = ["opencl:Device"]\n',
+        encoding="utf-8",
+    )
+    one = Selection({"r2": selection.frames["r2"][:1]}, selection.sessions)
+    job = create_job(
+        tmp_path / "jobs",
+        (NUMBERS, accelerated),
+        one,
+        [config, policy],
+        sizes=Sizes(4, 6, 6, (2, 3)),
+    )
+    gpu = SimpleNamespace(
+        label="opencl:Device",
+        device="Device | driver 1",
+        hardware=dict(backend="opencl", platform="Vendor", model="Device", driver="1"),
+    )
+    calls, used = [], []
+
+    def choose(shape, dtype, *, heads, measured):
+        calls.append((shape, dtype, measured))
+        return gpu, "qualified"
+
+    monkeypatch.setattr(jobs_main, "choose_compute_backend", choose)
+    monkeypatch.setattr(jobs_main, "use_compute_backend", used.append)
+    monkeypatch.setattr(jobs_main, "compute_backend", lambda: used[-1])
+    monkeypatch.setattr(jobs_main, "cpu_model", lambda: "Test CPU")
+    for step in (NUMBERS, accelerated):
+        claim = queue.claim(job, f"{step.name}.r2.0000", "here")
+        assert jobs_main.run(job, claim.task, claim.token, "here") == 0
+    assert calls == [((2, 3), np.float32, ["opencl:Device"])]
+    assert [device.label for device in used] == ["cpu", "opencl:Device"]
+    cpu_record, _ = _stored(tmp_path / "project", "numbers/r2/day1/r2-00.npz")
+    assert cpu_record["hardware"]["model"] == "Test CPU"
+    assert cpu_record["hardware"]["blas"]
+    gpu_record, _ = _stored(
+        tmp_path / "project", "accelerated-numbers/r2/day1/r2-00.npz"
+    )
+    assert gpu_record["hardware"] == gpu.hardware
+    assert cpu_record["environment"]["backend"] == "auto"
+    assert gpu_record["environment"]["backend"] == "auto"
 
 
 def test_a_task_process_of_another_revision_refuses_its_task(tmp_path, kept_threads):

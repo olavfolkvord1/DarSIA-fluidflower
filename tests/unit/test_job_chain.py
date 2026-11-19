@@ -91,6 +91,7 @@ from tests.unit.test_job_hosts import _record
 from tests.unit.test_job_service import _serve, importable, numpys_blas  # noqa: F401
 from tests.unit.test_minimal_chain import COLOURS, _head
 
+
 @pytest.fixture(autouse=True)
 def local_model_cache(tmp_path, monkeypatch):
     """Keep retained model evidence, including child workers', inside this test."""
@@ -477,6 +478,7 @@ def _project(root: Path, precision: str, scale: int = 1) -> tuple[Path, Selectio
     targets = "".join(f'"{m}" = {np.log(COLOURS[m] * 1e3).tolist()}\n' for m in (1, 2))
     text = SETTINGS.format(kernel=KERNEL, precision=precision, targets=targets)
     text = text.replace("pixel_size_mm = 5.0\n", f"pixel_size_mm = {5.0 / scale}\n")
+    # Frozen synthetic targets are independent of the actual photo dates.
     for run, selected in frames.items():
         text += f"\n[ensemble.target_h.{run}]\n"
         text += "".join(
@@ -713,8 +715,8 @@ def _direct(root: Path, selection: Selection) -> dict:
                 grid.chart,
                 gas_threshold=model.gas_threshold,
                 depth_m=rig.depth.img,
-                record=lambda index, value: records.append(asdict(value)),
                 positions=measured,
+                record=lambda index, value: records.append(asdict(value)),
             )
             names = ("labels", "rules", "saturation", "co2", "before")
             variants[run][held_out] = [dict(zip(names, m)) for m in maps]
@@ -1306,7 +1308,11 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     ]
     assert queue.waiting(job) == set()
     _compare(project, selection, direct)
-    for name in ("events/events.csv", "ensemble/mass_long.csv", "ensemble/events_summary.csv"):
+    for name in (
+        "events/events.csv",
+        "ensemble/mass_long.csv",
+        "ensemble/events_summary.csv",
+    ):
         assert (project / "results" / name).is_file()
     if precision == "float64":
         _reused_only_while_unchanged(jobs, project, config, selection)
@@ -2126,6 +2132,11 @@ def test_the_phase_maps_count_their_window_variants_and_support(tmp_path):
     )
     assert memory.terms[6].count(tables, "r1", context) == 1
     assert limited == one + 2
+    # An enabled growth rule holds reachable-region and prior saturation arrays.
+    tables["gas_allocation"]["growth_only_from_injecting_ports"] = True
+    assert memory.terms[3].count(tables, "r1", context) > 127
+    tables["runs"]["r1"]["gas_allocation"] = {"growth_only_from_injecting_ports": False}
+    assert memory.terms[3].count(tables, "r1", context) == 127
 
 
 def test_phase_maps_refuse_frames_out_of_time_order(tmp_path, monkeypatch):
@@ -2332,7 +2343,6 @@ def test_a_job_without_a_fit_run_or_the_reference_run_is_refused(tmp_path):
     alone = Selection({"r1": frames["r1"]}, selection.sessions)
     with pytest.raises(ValueError, match=r"distances needs run\(s\) \['r2'\]"):
         create_job(jobs, (comparison.DISTANCES,), alone, config)
-
 
 
 EXPERT_TABLES = """

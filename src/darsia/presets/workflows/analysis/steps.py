@@ -22,6 +22,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 import darsia
 from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, Term, run_tables
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
@@ -69,10 +71,23 @@ class DomainSettings:
     """The smallest area [cm2] of a layer's part other than its largest."""
 
 
-def _domain_count(tables: Mapping, run: str | None, context=None) -> int:
-    """An upper bound for the selected domains' retained int64 pixel indices."""
+def _domain_overlap(tables: Mapping, run: str | None, context=None) -> int:
+    """Bound retained pixel indices by the largest number of domains at one pixel.
+
+    A pixel has one sand-map label. Layer domains of different labels cannot
+    contribute indices for that same pixel. Treat all other domains as possibly
+    overlapping, including every part of the same named layer.
+    """
     tables = run_tables(tables, run) if run is not None else tables
-    return len(tables.get("domains", {}).get("domains", {}))
+    unrestricted = 0
+    by_label: dict[int, int] = {}
+    for domain in tables.get("domains", {}).get("domains", {}).values():
+        if domain.get("kind") == "layer" and type(domain.get("label")) is int:
+            label = domain["label"]
+            by_label[label] = by_label.get(label, 0) + 1
+        else:
+            unrestricted += 1
+    return unrestricted + max(by_label.values(), default=0)
 
 
 def _copy_cells(tables, run, context) -> int:
@@ -256,7 +271,7 @@ DOMAIN_MASS = Step(
         camera_bytes=18.0,
         grid_bytes=231.0,
         # DomainMass._pixels retains an int64 index per pixel in each domain.
-        terms=(Term(_domain_count, grid_bytes=8.0),),
+        terms=(Term(_domain_overlap, grid_bytes=np.dtype(np.intp).itemsize),),
     ),
     _domain_mass,
     {"domains": DomainSettings, "material": MaterialSettings},

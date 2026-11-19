@@ -31,6 +31,7 @@ class _StatisticsContext:
         self.task = SimpleNamespace(run="run", frames=frames)
         self.selection = Selection({"run": selected}, {})
         self.settings = settings
+        self.tables = {}
         self.published = []
         self.images_read = []
 

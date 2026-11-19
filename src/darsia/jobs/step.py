@@ -101,6 +101,9 @@ class MemoryContext:
     project: Path | None = None
     grid_shape: tuple[int, int] | None = None
     runs: tuple[str, ...] = ()
+    case_id_bytes: int = 0
+    domains: tuple[str, ...] = ()
+    part: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,8 @@ class Memory:
     knows no reader formats; a workflow supplies its reader's own function."""
     frame_bytes: float = 0.0
     """Bytes retained per input frame, independent of image size."""
+    ready: Callable[[StepContext], Mapping[str, int]] | None = None
+    """Additional bytes by part, from the accepted input shapes once they exist."""
 
     def bytes(
         self,
@@ -172,6 +177,9 @@ class Memory:
         project: Path | None = None,
         grid_shape: tuple[int, int] | None = None,
         runs: tuple[str, ...] = (),
+        case_id_bytes: int = 0,
+        domains: tuple[str, ...] = (),
+        part: str | None = None,
     ) -> int:
         """Bytes a task holds at its peak: its values in the precision, its arrays
         of a fixed type, and each decoded photo's bytes by its format.
@@ -198,6 +206,12 @@ class Memory:
             Rows and columns of the run grid, when known.
         runs : tuple of str, optional
             The job's selected runs, for terms retained across runs.
+        case_id_bytes : int, optional
+            Largest in-memory case identity of the frames a task reads.
+        domains : tuple of str, optional
+            The selected domains, for terms retained across domains.
+        part : str, optional
+            The task's configured part, for example a film or calibration fold.
 
         Returns
         -------
@@ -216,7 +230,8 @@ class Memory:
                 "The grid shape needs two positive dimensions whose product is grid pixels."
             )
         context = MemoryContext(
-            itemsize, camera_pixels, grid_pixels, frames, project, grid_shape, runs
+            itemsize, camera_pixels, grid_pixels, frames, project, grid_shape, runs,
+            case_id_bytes, domains, part,
         )
         counts = [term.count(tables, run, context) for term in self.terms]
         values = [
@@ -449,6 +464,9 @@ class Step:
     :attr:`Scope.ONE`, given the run and the configuration's tables, e.g. the fit
     of the run's calibration group; by default, and for a task of no run, the
     step's first part."""
+
+    accelerated: bool = False
+    """Whether an automatically selected compute backend can accelerate this step."""
 
     @property
     def stored(self) -> Each:
@@ -875,6 +893,7 @@ class StepContext:
         revision: str,
         device: str = "cpu",
         locks: Callable[[str], AbstractContextManager] | None = None,
+        hardware: Mapping[str, Any] | None = None,
     ) -> None:
         self.step = step
         """The step."""
@@ -894,10 +913,14 @@ class StepContext:
         """The task's claim token."""
         self.adopted: set[str] = set()
         """Tokens of an earlier attempt's results this task adopted."""
+        self.task_measurements: dict[str, Any] = {}
+        """Measurements of this attempt, recorded in its accepted marker."""
         self.revision = revision
         """The revision of the code that makes this task's results."""
         self.device = device
         """The device that makes this task's results."""
+        self.hardware = None if hardware is None else plain(dict(hardware))
+        """Hardware provenance for the result, without the host's identity."""
         self._job = job
         self._accepted = accepted
         self._locks = locks
@@ -1147,6 +1170,8 @@ class StepContext:
             "revision": self.revision,
             "device": self.device,
         }
+        if self.hardware is not None:
+            description["hardware"] = self.hardware
         if measurements is not None:
             description["measurements"] = dict(measurements)
         try:

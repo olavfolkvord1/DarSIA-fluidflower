@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ from darsia.multi_image_analysis.run_statistics import (
     RunStatisticsSettings,
     SandHistogram,
 )
-from darsia.utils.results import write_json
+from darsia.utils.results import read_description, write_json
 
 _LOG_GAIN_BOUND = 700.0
 """Bound of the logarithm of the gain in the solver, against an overflow of its
@@ -872,6 +873,84 @@ def write_frames(
         },
     }
     write_json(Path(folder) / STATISTICS, record)
+
+
+def statistics_memory(frames, dtype, held_out=None, *, json_bytes=0):
+    """Storage-independent array shapes and the reader's peak for one statistics payload.
+
+    The input can be the records already held by the producer, or the plain
+    JSON rows from a version that did not record the shapes. All branches are
+    parsed at once. Only the requested branch becomes typed arrays.
+    """
+    dtype = np.dtype(dtype)
+    pointer = np.dtype(np.intp).itemsize
+    py_float = sys.getsizeof(0.0)
+    array_header = sys.getsizeof(np.empty(0, dtype))
+    branches = {}
+    decoded = 0
+    for name, rows in (("", frames), *(held_out or {}).items()):
+        array_bytes, records, largest = 0, 0, 0
+        for row in rows:
+            plain_row = isinstance(row, dict)
+            hist = row["dissolved"] if plain_row else row.dissolved
+            gas = row["gas"] if plain_row else row.gas
+            sands = gas["sands"] if plain_row else gas.sands
+            column = row["column"] if plain_row else row.column
+            run = row["run"] if plain_row else row.run
+            vectors = [v for h in hist.values() for v in (h if plain_row else (h.relative, h.weight))]
+            if column is not None:
+                vectors += [column[key] if plain_row else getattr(column, key)
+                            for key in ("relative", "ratio", "weight")]
+            lengths = [len(v) for v in vectors]
+            payload = sum(lengths) * dtype.itemsize
+            array_bytes += payload
+            largest = max(largest, max(lengths, default=0) * dtype.itemsize)
+            # Each statistics row retains a frame and gas record and optional
+            # column record. Each sand adds a gas record and/or histogram.
+            # Use a dict and object shell for every record and float/key slots.
+            shell = sys.getsizeof(object()) + sys.getsizeof(dict.fromkeys(range(12)))
+            scalar = sys.getsizeof(run) + 16 * py_float
+            records += ((3 + len(sands) + len(hist)) * shell + scalar
+                        + len(vectors) * array_header)
+            decoded += sum(n * (py_float + 2 * pointer) + sys.getsizeof([]) for n in lengths)
+        branches[name] = dict(arrays=array_bytes, records=records, largest=largest, rows=len(rows))
+    # read_text and json both use strings while the row objects are live.
+    return dict(branches=branches, parse=decoded + 5 * json_bytes)
+
+
+def stored_statistics_memory(folder: Path):
+    """Read the accepted operational shape record, or inspect one older payload."""
+    description = read_description(folder)
+    path = Path(folder) / STATISTICS
+    summary = description.get("measurements", {}).get("fit_memory")
+    length = path.stat().st_size
+    if summary is None:
+        record = json.loads(path.read_bytes())
+        return statistics_memory(record["frames"], record["dtype"], record["held_out"], json_bytes=length)
+    return dict(branches=summary["branches"], parse=summary["parse"] + 5 * length)
+
+
+def calibration_memory(records, held, settings, sands):
+    """Retained selected variants plus the larger parse, fit or output scratch."""
+    chosen = [r["branches"].get(held, r["branches"][""]) for r in records]
+    arrays = sum(r["arrays"] for r in chosen)
+    objects = sum(r["records"] for r in chosen)
+    rows = sum(r["rows"] for r in chosen)
+    parse = max((r["parse"] for r in records), default=0)
+    vector = max((r["largest"] for r in chosen), default=0)
+    gain, beta, growth = (sum(int(segment[2]) for segment in grid) for grid in
+                          (settings.gain_grid, settings.beta_grid, settings.beta_growth_grid))
+    scalar = np.dtype(np.float64).itemsize
+    # One/two-parameter least squares retains its residuals, Jacobians and
+    # work arrays. The separate Swi fit allocates a matrix by sand and frame.
+    solver = (32 * 2 + 4 * sands) * (rows + 2) * scalar
+    parameter_grid = 8 * scalar * (gain + beta + growth + beta * growth)
+    # Decision/anchor/prediction and scalar tables each hold one frame's
+    # dictionaries and up to eight float slots, with copies during publication.
+    row_state = sys.getsizeof(dict.fromkeys(range(12))) + 8 * sys.getsizeof(0.0)
+    fit = 3 * vector + solver + parameter_grid + 4 * rows * row_state
+    output = 12 * rows * row_state
+    return arrays + objects + max(parse, fit, output)
 
 
 def read_frames(

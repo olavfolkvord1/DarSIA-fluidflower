@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import socket
 import subprocess
@@ -752,10 +753,16 @@ class Live:
         return int(held)
 
 
-def estimate(record: dict, task: str) -> int:
+def startup_bytes() -> int:
+    """The current process's peak commit on Windows, or measured resident bytes."""
+    memory = psutil.Process().memory_info()
+    return int(getattr(memory, "peak_pagefile", memory.rss))
+
+
+def estimate(record: dict, task: str, base: int | None = None) -> int:
     """The bytes a task of a job holds by its step's memory
     (:func:`darsia.jobs.job.task_bytes`), and its process's own (:data:`PROCESS`)."""
-    return record.get("bytes", {}).get(task, 0) + PROCESS
+    return record.get("bytes", {}).get(task, 0) + (PROCESS if base is None else base)
 
 
 def need(estimate: int, peak: dict | None) -> int:
@@ -942,6 +949,13 @@ class Service:
         Setup's sizes (``itemsize``, ``camera`` and ``grid`` pixels) and its
         photos' ``format``. They are kept in the host's record, and a later service
         of this host and revision takes them up."""
+        self._overruns: dict[tuple, int] = {}
+        """Whole-task peaks above the declaration for the same workload in this job."""
+        self._baselines: dict[tuple[str, str], dict] = {}
+        """Local process baselines for each job and, for automatic devices, each step."""
+        self._input_probes = {}
+        self._input_plans: dict[tuple[str, str], dict[str, int]] = {}
+        """Accepted-input declarations by step and part, independent of process peaks."""
         self.token = queue.new_token()
         """This service's token in its host's record."""
         self.held = False
@@ -1076,6 +1090,14 @@ class Service:
             "reserve": reserve(),
             "live": live,
             "reason": self.reason,
+            "startup_memory": [
+                {"job": job, "step": step or None, **self._baselines[(job, step)]}
+                for job, step in sorted(self._baselines)
+            ],
+            "input_memory": [
+                {"job": job, "step": step, "parts": self._input_plans[(job, step)]}
+                for job, step in sorted(self._input_plans)
+            ],
             "unfit": [
                 {"blas_kernel": kernel, "backend": backend, "job": job, "reason": why}
                 for (kernel, backend), (job, why) in sorted(self.unfit.items())
@@ -1261,6 +1283,8 @@ class Service:
                 lease = (
                     {} if marked else queue.lease(claim.job, claim.task, claim.token)
                 )
+                if marked:
+                    self._note_overrun(live)
             except (OSError, ValueError) as error:  # kept for the next round
                 say(f"The claim {claim.path} cannot be read now: {error}")
                 continue
@@ -1312,6 +1336,8 @@ class Service:
         if live.task is None or live.peak <= 0 or live.estimate <= 0:
             return
         record = self._records.get(live.claim.job.name, {})
+        if record.get("memory_admission") == "declared":
+            return
         sizes = record.get("memory", {}).get(live.task.id) or record.get("sizes") or {}
         photo = task_photo(live.task)
         self._keep(
@@ -1375,9 +1401,142 @@ class Service:
         if best is None or peak["bytes"] > best["bytes"]:
             self.peaks[key] = dict(peak)
 
+    @staticmethod
+    def _workload(record: dict, task: Task) -> tuple:
+        """The declared task shape within a job's frozen configuration."""
+        memory = record.get("memory", {}).get(task.id)
+        if memory is None:
+            return record["id"], task.id
+        return (
+            record["id"],
+            task.step,
+            memory["bytes"],
+            memory["frames"],
+            memory["itemsize"],
+            memory["camera"],
+            memory["grid"],
+            tuple(memory.get("grid_shape", ())),
+            memory["format"],
+        )
+
+    def _note_overrun(self, live: Live) -> None:
+        """Only a completed, token-matched whole-task peak can raise its peers' bound."""
+        claim = live.claim
+        record = self._records.get(claim.job.name, {})
+        if live.task is None or record.get("memory_admission") != "declared":
+            return
+        path = claim.job / queue.DONE / claim.path.name
+        try:
+            marker = queue.read_marker(path)
+        except FileNotFoundError as error:
+            if results.share_out(error):
+                raise
+            return
+        memory = marker.get("memory")
+        observed = marker.get("measurements", {}).get("startup_memory")
+        key = self._baseline_key(record, live.task)
+        if (
+            marker.get("token") == claim.token
+            and isinstance(observed, dict)
+            and type(observed.get("ready_bytes")) is int
+            and observed["ready_bytes"] > self._baselines.get(key, {}).get("ready_bytes", 0)
+        ):
+            self._baselines[key] = observed
+        if not isinstance(memory, Mapping):
+            return
+        peak = memory.get("job_commit_peak")
+        if (
+            marker.get("token") == claim.token
+            and memory.get("attempt") == claim.token
+            and type(peak) is int
+            and peak > live.estimate
+        ):
+            workload = self._workload(record, live.task)
+            self._overruns[workload] = max(peak, self._overruns.get(workload, 0))
+
+    @staticmethod
+    def _baseline_key(record: dict, task: Task) -> tuple[str, str]:
+        backend = record["environment"].get("backend", "cpu")
+        return record["id"], task.step if backend == "auto" else ""
+
+    def _probe_baseline(self, job: Path, record: dict, task: Task) -> None:
+        """Measure a matching worker independently before any of its tasks is claimed."""
+        key = self._baseline_key(record, task)
+        if key in self._baselines:
+            return
+        environment = Environment(**record["environment"])
+        command = [sys.executable, "-m", "darsia.jobs", "probe-memory", str(job), task.id]
+        probe = subprocess.run(
+            command, cwd=project_of(job, record), env={**os.environ, **environment.variables()},
+            capture_output=True, text=True, timeout=55,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if probe.returncode:
+            lines = probe.stderr.strip().splitlines() or probe.stdout.strip().splitlines()
+            reason = lines[-1] if lines else f"Worker probe exited with {probe.returncode}."
+            raise ValueError(reason)
+        lines = probe.stdout.strip().splitlines()
+        if not lines:
+            raise ValueError("The worker probe returned no startup measurement.")
+        baseline = json.loads(lines[-1])
+        fields = ("imports_bytes", "backend_bytes", "ready_bytes")
+        if not isinstance(baseline, dict) or any(
+            type(baseline.get(field)) is not int or baseline[field] <= 0 for field in fields
+        ):
+            raise ValueError("The worker's startup memory was not measured.")
+        self._baselines[key] = baseline
+
+    def _observe_memory(self, job: Path, record: dict, task: Task) -> bool:
+        """Measure a declared task's startup and collect its optional input plan."""
+        self._probe_baseline(job, record, task)
+        if task.step not in record.get("ready_memory", ()):
+            return True
+        key = record["id"], task.step
+        if key in self._input_plans:
+            return task.part in self._input_plans[key]
+        pending = self._input_probes.get(key)
+        if pending is None:
+            environment = Environment(**record["environment"])
+            command = [sys.executable, "-m", "darsia.jobs", "probe-memory", str(job), task.id, "--inputs"]
+            output = tempfile.TemporaryFile(mode="w+b")
+            try:
+                process = subprocess.Popen(
+                    command, cwd=project_of(job, record), env={**os.environ, **environment.variables()},
+                    stdout=output, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                output.close()
+                raise
+            self._input_probes[key] = process, output
+            return False
+        process, output = pending
+        if process.poll() is None:
+            return False
+        del self._input_probes[key]
+        with output:
+            output.seek(0)
+            lines = output.read().decode("utf-8", errors="replace").splitlines()
+        if process.returncode or not lines:
+            raise ValueError(lines[-1] if lines else "The accepted-input memory planner returned no result.")
+        plan = json.loads(lines[-1])
+        if not isinstance(plan, dict) or task.part not in plan or any(
+            type(value) is not int or value < 0 for value in plan.values()
+        ):
+            raise ValueError("The accepted-input memory plan is incomplete.")
+        self._input_plans[key] = plan
+        return True
+
     def _reserve(self, record: dict, task: Task) -> tuple[int, int]:
         """The bytes a task of a job reserves (:func:`need`, with its step's
         measured peak), and its estimate (:func:`estimate`)."""
+        if record.get("memory_admission") == "declared":
+            baseline = self._baselines.get(self._baseline_key(record, task), {})
+            made = estimate(record, task.id, baseline.get("ready_bytes", PROCESS))
+            made += self._input_plans.get((record["id"], task.step), {}).get(task.part, 0)
+            made += math.ceil(made * record.get("memory_buffer_fraction", 0.0))
+            overrun = self._overruns.get(self._workload(record, task), 0)
+            return max(made, overrun), made
         made = estimate(record, task.id)
         photo = task_photo(task)
         photo_format = (
@@ -1461,6 +1620,9 @@ class Service:
                         one = one or queue.task(job, task)
                     except (OSError, ValueError):
                         complete = False  # Its task unreadable now: not counted.
+                        continue
+                    if record.get("memory_admission") == "declared" and not self._observe_memory(job, record, one):
+                        complete = False
                         continue
                     reserved, made = self._reserve(record, one)
                     threads = record["environment"]["threads"]
@@ -1558,6 +1720,15 @@ class Service:
                 self._tasks[record["id"]] = queue.tasks(job)
             smallest: dict[str, int] = {}
             for task in queue.ready(job, self._tasks[record["id"]]):
+                if record.get("memory_admission") == "declared":
+                    try:
+                        if not self._observe_memory(job, record, task):
+                            self.reason = f"Measuring the accepted inputs for {task.step}."
+                            continue
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        self.reason = f"It could not measure worker startup memory for {task.id}: {error}."
+                        say(self.reason, job / LOG)
+                        break
                 reserved = self._reserve(record, task)[0]
                 if reserved >= smallest.get(task.step, reserved + 1):
                     continue  # its step passed over a task that reserves less
@@ -1574,6 +1745,8 @@ class Service:
                         return
                     smallest[task.step] = reserved
                     unfit = f"{named} does not fit this host now: {why}."
+                    if record.get("memory_admission") == "declared" and reserved > alone - kept:
+                        unfit += " Try a coarser Setup grid or float32 where supported."
                     passed = passed or unfit
                     step = (record["id"], task.step)
                     if step not in passing:
