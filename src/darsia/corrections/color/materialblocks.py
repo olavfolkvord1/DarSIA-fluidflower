@@ -6,7 +6,8 @@ constant target colour of the material, excludes blocks of outlying chromaticity
 and fits the gain fields of :class:`MaterialIlluminationCorrection` on the
 training folds of the blocks. Optionally, the fitting grid is a reference run's:
 the baseline is placed on it through a homography, and only blocks pure in both
-runs are fitted.
+runs are fitted. The constant target colours themselves are measured on the
+blocks of a reference run's corrected baseline (:func:`measure_material_targets`).
 
 """
 
@@ -214,6 +215,7 @@ def collect_block_samples(
     settings: MaterialFitSettings,
     dtype: np.dtype,
     reference: dict | None = None,
+    colours: np.ndarray | None = None,
 ) -> dict:
     """Median colour of each block of pure material on the fitting grid.
 
@@ -249,6 +251,11 @@ def collect_block_samples(
     reference : dict, optional
         Projection of a reference run's baseline onto the same fitting grid, see
         :func:`project_to_fit_grid`; its colours are not used.
+    colours : array, optional
+        Colours on the same fitting grid, in the image's units, whose block
+        medians are taken instead of the projection's, e.g. those of a corrected
+        copy of the baseline; a cell must then be finite in them too. The cells
+        are chosen by the projection's image as without them.
 
     Returns
     -------
@@ -266,6 +273,9 @@ def collect_block_samples(
         keep &= reference["materials"] == materials_map
     keep &= np.isfinite(before).all(-1)
     keep &= (before > settings.dark_level).all(-1)
+    if colours is not None:
+        before = colours * np.float32(dn_scale)
+        keep &= np.isfinite(before).all(-1)
 
     # Physical margin along the edges.
     height, width = shape
@@ -361,6 +371,118 @@ def block_color_outliers(
         members = samples["material"] == material
         outliers[members] = np.any(np.abs(chroma[members] - centre) > cutoff, axis=1)
     return outliers
+
+
+def measure_material_targets(
+    baseline: np.ndarray,
+    corrected: np.ndarray,
+    material_map: np.ndarray,
+    fit_mask: np.ndarray,
+    materials: list[int],
+    *,
+    dimensions: tuple[float, float],
+    fit_shape: tuple[int, int],
+    block_size: int,
+    edge_margin: float,
+    dn_scale: float,
+    settings: MaterialFitSettings,
+    minimum_blocks: int,
+) -> tuple[dict[int, np.ndarray], dict[int, tuple[int, int]]]:
+    """Measure the constant target colour of each material on a reference run.
+
+    The blocks are those of the fit (:func:`collect_block_samples`): the cells
+    are chosen by the baseline as for the fit, and the block medians are taken
+    of the corrected baseline, e.g. the baseline with its light field divided
+    out (:meth:`darsia.SandLightField.flatten`). On the training folds, blocks
+    whose chromaticity deviates from their material's are left out
+    (:func:`block_color_outliers` of the block colours themselves, against a unit
+    target), and the target of a material is the channel-wise median of the
+    logarithm of its remaining block medians. It computes in single precision,
+    the positions in the baseline's floating precision.
+
+    Parameters
+    ----------
+    baseline : array
+        Linear RGB baseline (rows, cols, 3) of the reference run in units of the
+        sensor's white level; it chooses the cells.
+    corrected : array
+        The corrected baseline on the same grid, whose blocks are measured;
+        pixels with a non-finite channel are not used.
+    material_map : array
+        Integer material of each pixel (rows, cols).
+    fit_mask : array
+        Boolean pixels eligible for the fit (rows, cols).
+    materials : list of int
+        Materials whose targets are measured.
+    dimensions : tuple of float
+        Physical height and width of the image.
+    fit_shape : tuple of int
+        Rows and columns of the fitting grid.
+    block_size : int
+        Block side length in cells of the fitting grid.
+    edge_margin : float
+        Physical margin along the edges left out.
+    dn_scale : float
+        Factor from image units to the units of the targets.
+    settings : MaterialFitSettings
+        Settings of the block samples and of the colour outliers.
+    minimum_blocks : int
+        Fewest training blocks without colour outliers a material must keep.
+
+    Returns
+    -------
+    dict
+        Natural logarithm of the target RGB of each material, in units of
+        ``dn_scale`` times the image values.
+    dict
+        The training blocks of each material and those kept, as a pair.
+
+    Raises
+    ------
+    ValueError
+        If the images are not of one grid, a block median is not positive, or a
+        material keeps too few training blocks.
+
+    """
+    baseline, corrected = np.asarray(baseline), np.asarray(corrected)
+    if corrected.shape != baseline.shape:
+        raise ValueError("The baseline and its corrected copy need one grid.")
+    fit_shape = tuple(min(int(n), m) for n, m in zip(fit_shape, baseline.shape))
+    materials = sorted(int(material) for material in materials)
+    projection = project_to_fit_grid(
+        baseline, material_map, fit_mask, fit_shape, materials, settings
+    )
+    finite = np.isfinite(corrected).all(-1)
+    colours = _reduce_rgb(
+        np.where(finite[..., None], corrected, np.nan).astype(np.float32, copy=False),
+        (fit_shape[1], fit_shape[0]),
+    )
+    samples = collect_block_samples(
+        projection,
+        {material: np.zeros(3) for material in materials},
+        dimensions=dimensions,
+        edge_margin=edge_margin,
+        block_size=block_size,
+        dn_scale=dn_scale,
+        settings=settings,
+        dtype=np.result_type(baseline, np.float32),
+        colours=colours,
+    )
+    training = np.isin(samples["fold"], _TRAINING_FOLDS)
+    samples = {name: values[training] for name, values in samples.items()}
+    if np.any(samples["before"] <= 0):
+        raise ValueError("The corrected blocks need positive medians.")
+    outliers = block_color_outliers(samples, materials, settings)
+    log_rgb = np.log(samples["before"])
+    targets, blocks = {}, {}
+    for material in materials:
+        mine = samples["material"] == material
+        clean = mine & ~outliers
+        if int(clean.sum()) < minimum_blocks:
+            raise ValueError(f"Too few clean training blocks for material {material}.")
+        targets[material] = np.median(log_rgb[clean], axis=0)
+        blocks[material] = (int(mine.sum()), int(clean.sum()))
+    return targets, blocks
 
 
 def fit_block_field(
