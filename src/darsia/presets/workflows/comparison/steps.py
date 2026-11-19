@@ -21,12 +21,13 @@ one is removed, or it is made in another results folder.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext, Term
+from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule
 from darsia.presets.workflows.analysis.domain_mass import RunSeries
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import (
@@ -201,6 +202,32 @@ def _times(selection: Selection, tables: Mapping) -> tuple[str, ...]:
     return tuple(named_times(tables["distances"]["times_h"]))
 
 
+def _observed_geometry(geometry, labels, rules):
+    """Remove the saved chart exclusion from this frame's observed support.
+
+    The reference's continued sand and permeability are unchanged, as are the
+    other run's observations. Only pixels explicitly marked COLOR_CHECKER in
+    this frame are excluded; unrelated unknown phases remain unknown. Never
+    reconstruct the region from current settings or turn its phase into water.
+    Return the frame's geometry and the number of previously counted pixels
+    excluded, for the result's observation-support diagnostic.
+    """
+    labels, rules = np.asarray(labels), np.asarray(rules)
+    if (
+        labels.shape != geometry.counted.shape
+        or rules.shape != labels.shape
+        or not np.issubdtype(rules.dtype, np.integer)
+    ):
+        raise ValueError(
+            "Saved phase labels, rule map and geometry must share their grid"
+        )
+    hidden = rules == PhaseRule.COLOR_CHECKER
+    if np.any(hidden & (labels != PhaseLabel.UNKNOWN)):
+        raise ValueError("Saved COLOR_CHECKER pixels must have unknown phase")
+    count = int(np.count_nonzero(hidden & geometry.counted))
+    return replace(geometry, counted=geometry.counted & ~hidden), count
+
+
 def _distances(ctx: StepContext) -> None:
     """The distances of every pair of runs in every domain at one time; the first
     selected run's sand map is the reference."""
@@ -208,6 +235,7 @@ def _distances(ctx: StepContext) -> None:
     material, domains = ctx.settings["material"], _domains(ctx)
     time_h = named_times(distances.times_h)[ctx.task.part]
     frames, reference, scales = {}, None, None
+    observation_pixels = {}
     for run, run_frames in ctx.selection.frames.items():
         grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
@@ -240,13 +268,17 @@ def _distances(ctx: StepContext) -> None:
             continue
         frame = run_frames[nearest]
         maps = ctx.read("mass-maps", read_mass_maps, run=run, frame=frame)
-        labels = ctx.read("phase-maps", read_maps, run=run, frame=frame)["labels"]
+        phase = ctx.read("phase-maps", read_maps, run=run, frame=frame)
+        labels = phase["labels"]
+        geometry, hidden = _observed_geometry(grid.geometry, labels, phase["rules"])
+        del phase
+        observation_pixels[run] = hidden
         frames[run] = frame_cells(
             maps,
             labels,
             grid.rig.labels,
             grid.facies,
-            grid.geometry,
+            geometry,
             reference,
             settings,
         )
@@ -254,7 +286,8 @@ def _distances(ctx: StepContext) -> None:
     rows = [asdict(distance) for distance in found]
     columns = list(rows[0]) if rows else []
     ctx.publish(
-        lambda folder: write_rows(Path(folder) / "distances.csv", rows, columns)
+        lambda folder: write_rows(Path(folder) / "distances.csv", rows, columns),
+        measurements={"colorchecker_excluded_counted_pixels": observation_pixels},
     )
 
 
