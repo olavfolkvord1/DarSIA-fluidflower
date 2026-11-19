@@ -30,6 +30,16 @@ MODULES = [
     "darsia/signals/color/color_path_fit.py",
     "darsia/signals/models/beer_lambert.py",
     "darsia/multi_image_analysis/run_statistics.py",
+    "darsia/experiment/overflow.py",
+    "darsia/experiment/overflow_feed.py",
+    "darsia/experiment/overflow_circulation.py",
+    "darsia/experiment/overflow_evaporation.py",
+    "darsia/multiphase/gas_allocation.py",
+    "darsia/multiphase/gas_bridge.py",
+    "darsia/multiphase/gas_model_cache.py",
+    "darsia/multiphase/gas_parameters.py",
+    "darsia/multiphase/gas_zone.py",
+    "darsia/multiphase/gas_zone_cache.py",
 ]
 """Modules under the rules, relative to the source folder."""
 

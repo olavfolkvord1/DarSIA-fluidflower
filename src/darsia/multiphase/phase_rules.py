@@ -34,7 +34,7 @@ setting is a field of :class:`PhaseRuleSettings`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -213,7 +213,9 @@ def phase_labels(
     return labels
 
 
-def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshold):
+def _time_average(
+    labels, gas, neighbours, domain, chart, settings, gas_threshold, end_gas=None
+):
     """Decide free gas by the time-averaged gas probability; return the raw gas.
 
     The gas probability of the frame (weight one) and of each neighbour (weight
@@ -221,7 +223,9 @@ def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshol
     probabilities give CO2 and zero elsewhere, is averaged. Within the frame's
     CO2 the average decides free gas, except that gas the smallest-patch rule
     removed is not restored, nor is gas on the chart. The raw gas is the frame's
-    own gas decision before the smallest-patch rule.
+    own gas decision before the smallest-patch rule. A weight per pixel
+    (``end_gas``) multiplies the average and the raw gas probability before
+    their threshold.
     """
     dtype = gas.dtype.type
     scored = _co2(labels)
@@ -233,13 +237,18 @@ def _time_average(labels, gas, neighbours, domain, chart, settings, gas_threshol
             other = domain & (other_co2 >= settings.co2_threshold)
             total += dtype(weight) * np.where(other, other_gas, 0)
             weight_sum += weight
-    averaged = scored & (total / dtype(weight_sum) >= gas_threshold)
+    mean = total / dtype(weight_sum)
+    if end_gas is not None:
+        mean = (mean * end_gas).astype(mean.dtype)
+    averaged = scored & (mean >= gas_threshold)
     raw = scored & (gas >= gas_threshold)
     gained = (labels == PhaseLabel.DISSOLVED) & averaged & ~raw
     if chart is not None:
         gained &= ~chart
     labels[(labels == PhaseLabel.GAS) & ~averaged] = PhaseLabel.DISSOLVED
     labels[gained] = PhaseLabel.GAS
+    if end_gas is not None:
+        raw &= gas * end_gas >= dtype(gas_threshold)
     return raw
 
 
@@ -396,21 +405,49 @@ def _sinking_fingers(co2, anchors, width_mm, pitch_mm):
     return lobes
 
 
-def _gravity(labels, rules, started, radius, lower, y, pitch_mm, settings):
-    """Dissolve free gas below the lowest started port and in sinking lobes.
+def _gravity_limit(co2, started, radius, lower, y, pitch_mm, settings):
+    """Where free gas breaks gravity: below the lowest started port, and lobes.
 
     The started ports' lower zones are exempt from the first; CO2 reaching a
-    started port's radius or lower zone is no sinking lobe.
+    started port's radius or lower zone is no sinking lobe. Returns both masks.
     """
-    below = np.zeros(labels.shape, bool)
-    anchors = np.zeros(labels.shape, bool)
+    below = np.zeros(co2.shape, bool)
+    anchors = np.zeros(co2.shape, bool)
     if started:
         exempt = np.logical_or.reduce([lower[port] for port in started])
         anchors = exempt | np.logical_or.reduce([radius[port] for port in started])
         below = (y[:, None] < min(port[1] for port in started)) & ~exempt
-    lobes = _sinking_fingers(_co2(labels), anchors, settings.finger_width_mm, pitch_mm)
-    broken = (below | lobes) & (labels == PhaseLabel.GAS)
-    _change(labels, rules, broken, PhaseLabel.DISSOLVED, PhaseRule.GRAVITY)
+    return below, _sinking_fingers(co2, anchors, settings.finger_width_mm, pitch_mm)
+
+
+def _pitch_mm(grid: darsia.Image) -> tuple[float, float]:
+    """The grid's pitch [mm] down a column and along a row."""
+    dy, dx = grid.voxel_size
+    return dy * 1000, dx * 1000
+
+
+def _port_zones(x, y, ports, settings):
+    """Each port's radius disc and the lower half-ellipse below it."""
+    radius, lower = {}, {}
+    for port in ports:
+        lateral = (x[None, :] - port[0]) * 1000
+        height = (y[:, None] - port[1]) * 1000
+        radius[port] = lateral**2 + height**2 <= settings.port_radius_mm**2
+        lower[port] = (height <= 0) & (
+            (lateral / settings.port_zone_half_width_mm) ** 2
+            + (height / settings.port_zone_depth_mm) ** 2
+            <= 1
+        )
+    return radius, lower
+
+
+def _seal(facies, domain, permeability, settings):
+    """Domain pixels of porous facies below the seal fraction of the highest."""
+    porous = {
+        k: v for k, v in permeability.items() if k not in settings.free_water_facies
+    }
+    limit = settings.seal_permeability_fraction * max(porous.values())
+    return domain & np.isin(facies, [k for k, v in porous.items() if v < limit])
 
 
 def _time_average_rules(before, labels):
@@ -433,6 +470,7 @@ def phase_maps(
     protocol: darsia.InjectionProtocol,
     settings: PhaseRuleSettings,
     chart: np.ndarray | None = None,
+    end_gas: Callable[[int], np.ndarray | None] | None = None,
     *,
     gas_threshold: float,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -442,7 +480,10 @@ def phase_maps(
     in the module description. A frame's time average uses its nearest
     ``neighbours_per_side`` earlier and later frames, read from
     ``probabilities`` by index. Each frame's rule map records which rule last
-    changed each pixel's label.
+    changed each pixel's label. After an injection end, ``end_gas`` can weight
+    the averaged and the frame's own gas probability by the free gas the run
+    held at that end (:func:`darsia.free_gas` does); it is called with each
+    frame's index when the frame is due, so it can use the earlier frames.
 
     Parameters
     ----------
@@ -465,6 +506,9 @@ def phase_maps(
         Settings of the labels and rules.
     chart : array, optional
         The colour checker's pixels.
+    end_gas : callable, optional
+        Weight per pixel of a frame's gas probability, by the frame's index, or
+        None for no weight.
     gas_threshold : float
         Gas threshold of the phase model that gave the probabilities, as for
         :func:`phase_labels`.
@@ -479,26 +523,11 @@ def phase_maps(
     """
     facies = sand_map.img
     x, y = darsia.pixel_centres(sand_map)
-    dy, dx = sand_map.voxel_size
-    pitch_mm = (dy * 1000, dx * 1000)
+    pitch_mm = _pitch_mm(sand_map)
 
     injecting = protocol.df[protocol.df["rate_kg_s"] > 0]
     first_start = dict(injecting.groupby(["location_x", "location_y"])["start"].min())
-    lateral = {port: (x[None, :] - port[0]) * 1000 for port in first_start}
-    height = {port: (y[:, None] - port[1]) * 1000 for port in first_start}
-    radius = {
-        port: lateral[port] ** 2 + height[port] ** 2 <= settings.port_radius_mm**2
-        for port in first_start
-    }
-    lower = {
-        port: (height[port] <= 0)
-        & (
-            (lateral[port] / settings.port_zone_half_width_mm) ** 2
-            + (height[port] / settings.port_zone_depth_mm) ** 2
-            <= 1
-        )
-        for port in first_start
-    }
+    radius, lower = _port_zones(x, y, first_start, settings)
 
     free = np.isin(facies, settings.free_water_facies)
     region = None
@@ -506,11 +535,7 @@ def phase_maps(
         margin = int(round(settings.chart_margin_mm / pitch_mm[1]))
         extend = int(round(settings.chart_extend_below_mm / pitch_mm[0]))
         region = _chart_region(chart, margin, extend)
-    porous = {
-        k: v for k, v in permeability.items() if k not in settings.free_water_facies
-    }
-    limit = settings.seal_permeability_fraction * max(porous.values())
-    seal = domain & np.isin(facies, [k for k, v in porous.items() if v < limit])
+    seal = _seal(facies, domain, permeability, settings)
     open_ = domain & ~seal
     if region is not None:
         open_ &= ~region
@@ -520,7 +545,10 @@ def phase_maps(
     home = {
         port: compartments.flat[
             np.where(
-                compartments > 0, height[port] ** 2 + lateral[port] ** 2, np.inf
+                compartments > 0,
+                ((y[:, None] - port[1]) * 1000) ** 2
+                + ((x[None, :] - port[0]) * 1000) ** 2,
+                np.inf,
             ).argmin()
         ]
         for port in first_start
@@ -539,8 +567,9 @@ def phase_maps(
             co2, gas, domain, pixel_area_mm2, settings, gas_threshold=gas_threshold
         )
         before = labels.copy()
+        weight = None if end_gas is None else end_gas(index)
         raw = _time_average(
-            labels, gas, neighbours, domain, chart, settings, gas_threshold
+            labels, gas, neighbours, domain, chart, settings, gas_threshold, weight
         )
         lowest = min((port[1] for port in started), default=None)
         _small_bubbles(labels, raw, lowest, y, pixel_area_mm2, settings)
@@ -552,7 +581,11 @@ def phase_maps(
         _minimum_area(labels, rules, domain, pixel_area_mm2, settings)
         sources = {home[port] for port in started} - {0}
         _compartments(labels, rules, compartments, count, seal, sources)
-        _gravity(labels, rules, started, radius, lower, y, pitch_mm, settings)
+        below, lobes = _gravity_limit(
+            _co2(labels), started, radius, lower, y, pitch_mm, settings
+        )
+        broken = (below | lobes) & (labels == PhaseLabel.GAS)
+        _change(labels, rules, broken, PhaseLabel.DISSOLVED, PhaseRule.GRAVITY)
         yield labels, rules
 
 
