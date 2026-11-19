@@ -23,8 +23,12 @@ LibRaw is used through the optional package ``rawpy`` (``pip install darsia[raw]
 
 """
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
+from time import perf_counter, process_time
 
 import cv2
 import numpy as np
@@ -61,6 +65,45 @@ RAW_SUFFIXES = (
     ".x3f",
 )
 """File suffixes (lower case) of camera raw formats, read by :func:`imread_from_raw`."""
+
+
+@dataclass
+class RawMeasurements:
+    """A profiled frame's wall and CPU times and payload sizes."""
+
+    stages: dict = field(default_factory=dict)
+    input_bytes: int = 0
+    output_bytes: int = 0
+
+
+_raw_measurements = ContextVar[RawMeasurements | None]("raw_measurements", default=None)
+
+
+@contextmanager
+def measure_raw_frame():
+    """Enable timing of the native RAW stages for the duration of one frame."""
+    profile = RawMeasurements()
+    token = _raw_measurements.set(profile)
+    try:
+        yield profile
+    finally:
+        _raw_measurements.reset(token)
+
+
+@contextmanager
+def raw_stage(name: str):
+    """Record elapsed and CPU seconds for a stage when a frame is being measured."""
+    profile = _raw_measurements.get()
+    if profile is None:
+        yield
+        return
+    wall, cpu = perf_counter(), process_time()
+    try:
+        yield
+    finally:
+        entry = profile.stages.setdefault(name, {"wall_s": 0.0, "cpu_s": 0.0})
+        entry["wall_s"] += perf_counter() - wall
+        entry["cpu_s"] += process_time() - cpu
 
 
 def imread_from_raw(
@@ -113,9 +156,10 @@ def imread_from_raw(
         kwargs["series"] = True
     else:
         image = _decode(path, dtype)
-    return darsia.OpticalImage(
-        image, transformations=transformations, color_space="RGB", **kwargs
-    )
+    with raw_stage("corrections"):
+        return darsia.OpticalImage(
+            image, transformations=transformations, color_space="RGB", **kwargs
+        )
 
 
 @dataclass(frozen=True)
@@ -163,7 +207,15 @@ def read_raw_sensor(path: Path, demosaic: str, *, display: bool = False) -> RawS
         raise ImportError("Reading camera raw files requires rawpy (darsia[raw]).")
     if demosaic != "edge_aware":
         raise ValueError(f"Unknown demosaic {demosaic!r}; 'edge_aware' is supported.")
-    with rawpy.imread(str(path)) as raw:
+    profile = _raw_measurements.get()
+    source = str(path)
+    if profile is not None:
+        with raw_stage("read_raw"):
+            raw_bytes = Path(path).read_bytes()
+            profile.input_bytes += len(raw_bytes)
+            source = BytesIO(raw_bytes)
+            del raw_bytes
+    with raw_stage("unpack_raw"), rawpy.imread(source) as raw:
         if np.shape(raw.raw_pattern) != (2, 2):
             raise ValueError(f"{path} has no Bayer colour filter array.")
         mosaic = raw.raw_image_visible.copy()
@@ -189,9 +241,10 @@ def read_raw_sensor(path: Path, demosaic: str, *, display: bool = False) -> RawS
 
     # OpenCV names a Bayer layout by the second row's second and third photosites.
     code = getattr(cv2, f"COLOR_Bayer{'RGB'[phase[1, 1]]}{'RGB'[phase[1, 0]]}2RGB_EA")
-    subtracted = mosaic - np.minimum(mosaic, black)
-    values = cv2.demosaicing(subtracted, code)
-    invalid = _invalid(subtracted, mosaic >= white, phase)
+    with raw_stage("demosaic"):
+        subtracted = mosaic - np.minimum(mosaic, black)
+        values = cv2.demosaicing(subtracted, code)
+        invalid = _invalid(subtracted, mosaic >= white, phase)
     return RawSensor(values, invalid, int(white - black), matrix)
 
 
@@ -271,9 +324,10 @@ def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
 
     """
     sensor = read_raw_sensor(path, "edge_aware")
-    image = sensor.values.astype(dtype)
-    image /= image.dtype.type(sensor.white_range)
-    image[sensor.invalid] = np.nan
+    with raw_stage("normalise"):
+        image = sensor.values.astype(dtype)
+        image /= image.dtype.type(sensor.white_range)
+        image[sensor.invalid] = np.nan
     return image
 
 

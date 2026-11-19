@@ -10,6 +10,7 @@ import pytest
 import tifffile
 
 import darsia
+from darsia.image.raw import measure_raw_frame
 from darsia.presets.workflows.config.corrections import CorrectionsConfig
 from darsia.presets.workflows.rig import Rig
 
@@ -112,6 +113,22 @@ def test_the_sensor_values_are_the_demosaic_before_the_division(tmp_path):
     assert sensor.values.dtype == np.uint16 and sensor.white_range == WHITE - BLACK
     np.testing.assert_array_equal(sensor.values, expected)
     np.testing.assert_array_equal(sensor.invalid, np.isnan(image.img))
+
+
+def test_measured_raw_decode_matches_the_regular_payload(tmp_path):
+    path = tmp_path / "image.dng"
+    mosaic = np.random.default_rng(4).integers(600, 15000, (32, 48), dtype=np.uint16)
+    write_dng(path, mosaic, LAYOUTS["RGGB"][0])
+    options = dict(demosaic="edge_aware", dtype="float32")
+    reference = darsia.imread(path, **options)
+    with measure_raw_frame() as measured:
+        image = darsia.imread(path, **options)
+    np.testing.assert_array_equal(image.img, reference.img)
+    assert measured.input_bytes == path.stat().st_size
+    assert measured.stages.keys() == {
+        "read_raw", "unpack_raw", "demosaic", "normalise", "corrections",
+    }
+    assert all(stage["wall_s"] >= 0 for stage in measured.stages.values())
 
 
 def test_a_list_or_folder_of_raw_files_is_a_time_series(tmp_path):

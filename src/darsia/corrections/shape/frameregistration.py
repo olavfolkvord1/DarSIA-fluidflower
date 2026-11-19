@@ -37,6 +37,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import numpy as np
 
 import darsia
+from darsia.image.raw import raw_stage
 
 
 @dataclass(frozen=True)
@@ -265,22 +266,23 @@ def register_raw_frame(
     """
     dtype = np.dtype(dtype)
     sensor = darsia.read_raw_sensor(path, registration.demosaic)
-    coordinates = darsia.lens_coordinates(path, registration.lens)
-    white = dtype.type(sensor.white_range)
-    channel = registration.channel
-    view = camera_view(
-        sensor.values[..., channel : channel + 1].astype(dtype),
-        coordinates,
-        registration.camera_shape,
-        (channel,),
-    )[..., 0]
-    found = darsia.projective_registration(
-        np.asarray(registration.reference, dtype) * white,
-        view,
-        registration.homography,
-        registration.settings,
-    )
-    return _sample(sensor, coordinates, found.homography, registration, dtype), found
+    with raw_stage("registration_and_sampling"):
+        coordinates = darsia.lens_coordinates(path, registration.lens)
+        white = dtype.type(sensor.white_range)
+        channel = registration.channel
+        view = camera_view(
+            sensor.values[..., channel : channel + 1].astype(dtype),
+            coordinates,
+            registration.camera_shape,
+            (channel,),
+        )[..., 0]
+        found = darsia.projective_registration(
+            np.asarray(registration.reference, dtype) * white,
+            view,
+            registration.homography,
+            registration.settings,
+        )
+        return _sample(sensor, coordinates, found.homography, registration, dtype), found
 
 
 FRAME_REGISTRATION = "registration.json"

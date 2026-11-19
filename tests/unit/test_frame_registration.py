@@ -258,6 +258,7 @@ def test_a_rig_registers_its_photographs_and_the_step_stores_their_homography(
     frame = Frame("photos", "frame.dng")
     ctx = SimpleNamespace(
         task=SimpleNamespace(run="r1", frames=(frame,)),
+        tables={},
         read=lambda kind, reader: loaded,
         done=lambda frame: False,
         photo=lambda run, frame: photos / frame.name,
