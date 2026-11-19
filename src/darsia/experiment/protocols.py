@@ -646,6 +646,38 @@ class InjectionProtocol:
 
         return total
 
+    def injections(self) -> pd.DataFrame:
+        """The injections: each port's consecutive steps, in start order.
+
+        A protocol that ramps the rate at one port in many steps gives one
+        injection; a step at another port starts the next one.
+
+        Returns
+        -------
+        pd.DataFrame
+            Per injection its ``number`` (from 1), the port's ``location_x`` and
+            ``location_y``, and its ``start_h`` and ``end_h``: hours since the first
+            step's start, the clock of a run's frames.
+
+        """
+        rows: list[dict] = []
+        for step in self.df.sort_values("start", kind="stable").itertuples():
+            port = (step.location_x, step.location_y)
+            if rows and rows[-1]["port"] == port:
+                rows[-1]["end"] = max(rows[-1]["end"], step.end)
+            else:
+                rows.append(dict(port=port, start=step.start, end=step.end))
+        origin = rows[0]["start"] if rows else None
+        return pd.DataFrame(
+            {
+                "number": range(1, len(rows) + 1),
+                "location_x": [row["port"][0] for row in rows],
+                "location_y": [row["port"][1] for row in rows],
+                "start_h": [(r["start"] - origin).total_seconds() / 3600 for r in rows],
+                "end_h": [(r["end"] - origin).total_seconds() / 3600 for r in rows],
+            }
+        )
+
     def _load_protocol(self, path: Path | tuple[Path, str]) -> pd.DataFrame:
         df = _read_table(path)
 
