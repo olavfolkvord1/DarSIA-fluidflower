@@ -145,31 +145,58 @@ class RoiRegistry:
             if "roi" not in data:
                 continue
 
-            roi_data = data["roi"]
-            # Strict format: [[roi]] is a list, not nested dicts like [roi.*]
-            if not isinstance(roi_data, list):
-                raise ValueError(
-                    "The [roi] section must be an array-of-tables format (use [[roi]]), not"
-                    "nested tables."
-                )
-
-            for entry in roi_data:
-                name = entry.get("name")
-                if name is None:
-                    raise ValueError(
-                        "Each [[roi]] entry must have a required 'name' field."
-                    )
-                name = str(name).strip()
-
-                if name in seen_names:
-                    raise ValueError(
-                        f"ROI name '{name}' is duplicated. ROI names must be globally unique."
-                    )
-                seen_names.add(name)
-
-                self.rois[name] = RoiConfig().load(entry)
+            self._add_entries(data["roi"], seen_names)
 
         return self
+
+    @classmethod
+    def from_entries(cls, entries: list) -> "RoiRegistry":
+        """A registry of ``[[roi]]`` entries already read, e.g. from a job's merged
+        configuration tables, by the same rules as :meth:`load`.
+
+        Parameters
+        ----------
+        entries : list
+            The ``roi`` array-of-tables, each entry a table with its ``name``.
+
+        Returns
+        -------
+            The registry.
+
+        Raises
+        ------
+        ValueError
+            If the entries are not an array of tables, or an entry has no name or
+            a duplicate one.
+        """
+        registry = cls()
+        registry._add_entries(entries, set())
+        return registry
+
+    def _add_entries(self, roi_data, seen_names: set[str]) -> None:
+        """Add each named ``[[roi]]`` entry, refusing duplicates across all files."""
+        # Strict format: [[roi]] is a list, not nested dicts like [roi.*]
+        if not isinstance(roi_data, list):
+            raise ValueError(
+                "The [roi] section must be an array-of-tables format (use [[roi]]), not"
+                "nested tables."
+            )
+
+        for entry in roi_data:
+            name = entry.get("name")
+            if name is None:
+                raise ValueError(
+                    "Each [[roi]] entry must have a required 'name' field."
+                )
+            name = str(name).strip()
+
+            if name in seen_names:
+                raise ValueError(
+                    f"ROI name '{name}' is duplicated. ROI names must be globally unique."
+                )
+            seen_names.add(name)
+
+            self.rois[name] = RoiConfig().load(entry)
 
     def register(self, key: str, roi: RoiConfig) -> None:
         """Add a single ROI entry to the registry without overwriting existing entries.

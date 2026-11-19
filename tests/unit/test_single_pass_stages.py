@@ -41,6 +41,9 @@ VALUES = {0: [0.0, 0.4], 1: [0.0, 0.3, 0.9], 2: [0.0, 0.2, 0.7, 1.2]}
 class Regions:
     """Expert knowledge with given masks (the real rule of applying them)."""
 
+    phase_maps = None
+    """No image's own phase map."""
+
     def __init__(self, keep_aq, keep_g):
         self.masks = {"concentration_aq": keep_aq, "saturation_g": keep_g}
 
@@ -48,6 +51,19 @@ class Regions:
         return self.masks[mode]
 
     apply = ExpertKnowledgeAdapter.apply
+
+
+class PhaseRegions(Regions):
+    """Expert knowledge with given masks and a phase map for every image."""
+
+    phase_maps = "phase maps"
+
+    def __init__(self, keep_aq, keep_g, phase):
+        super().__init__(keep_aq, keep_g)
+        self.phase = phase
+
+    def _phase_labels(self, image):
+        return self.phase
 
 
 def _labels() -> darsia.ScalarImage:
@@ -246,6 +262,18 @@ def test_generic_stages_are_used_for_other_setups(monkeypatch):
     analysis, _ = _analysis()
     analysis.flash.restoration = lambda field: field
     _assert_identical(analysis, image, monkeypatch, (True, True, False))
+
+    # Expert knowledge with each image's phase map: unknown pixels are unknown
+    phase = np.full(SHAPE, darsia.PhaseLabel.DISSOLVED, dtype=np.uint8)
+    phase[-2:] = darsia.PhaseLabel.UNKNOWN
+    keep = np.ones(SHAPE, dtype=bool)
+    analysis, _ = _analysis(expert=PhaseRegions(keep, keep, phase))
+    _assert_identical(analysis, image, monkeypatch, (True, True, False))
+    assert np.isnan(
+        analysis.call_flash_and_mass_analysis(
+            analysis.call_pH_analysis(analysis.call_color_interpretation(image))
+        ).mass.img[-2:]
+    ).all()
 
     # Analyses with further steps
     analysis, _ = _analysis()

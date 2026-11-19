@@ -64,12 +64,59 @@ class ExpertKnowledgeConfig:
         },
     )
     """ROI registry keys where concentration_aq is forced to zero (exclusion)."""
+    phase_maps: Path | None = field(
+        default=None,
+        metadata={
+            "name": "Phase maps",
+            "help": (
+                "Folder with one phase map per image, named by the image's stem "
+                "(.npz). concentration_aq is kept only where the map says CO2, "
+                "saturation_g only where it says free gas; both are unknown (NaN) "
+                "where the map is unknown."
+            ),
+        },
+    )
+    """Folder of per-image phase maps, as dynamic expert knowledge."""
 
     def load(
         self, path: Path | list[Path], roi_registry: "RoiRegistry | None" = None
     ) -> "ExpertKnowledgeConfig":
         sec = _get_section_from_toml(path, "expert_knowledge")
+        return self._read(sec, roi_registry)
 
+    @classmethod
+    def from_table(
+        cls, sec: dict, roi_registry: "RoiRegistry | None" = None
+    ) -> "ExpertKnowledgeConfig":
+        """The configuration of an ``[expert_knowledge]`` table already read, e.g.
+        from a job's merged configuration tables, by the same rules as
+        :meth:`load`.
+
+        Parameters
+        ----------
+        sec : dict
+            The ``[expert_knowledge]`` table.
+        roi_registry : RoiRegistry, optional
+            The registry its ROI keys are resolved in; needed when it names any.
+
+        Returns
+        -------
+            The configuration.
+
+        Raises
+        ------
+        ValueError
+            If a key list is not a list of strings, or keys are named without a
+            registry.
+        KeyError
+            If a named ROI is not in the registry.
+        """
+        return cls()._read(sec, roi_registry)
+
+    def _read(
+        self, sec: dict, roi_registry: "RoiRegistry | None"
+    ) -> "ExpertKnowledgeConfig":
+        """Set and check the fields from the section's table."""
         self.saturation_g = _get_key(sec, "saturation_g", required=False, default=[])
         self.concentration_aq = _get_key(
             sec, "concentration_aq", required=False, default=[]
@@ -80,6 +127,7 @@ class ExpertKnowledgeConfig:
         self.no_concentration_aq = _get_key(
             sec, "no_concentration_aq", required=False, default=[]
         )
+        self.phase_maps = _get_key(sec, "phase_maps", required=False, type_=Path)
 
         roi_key_fields = (
             ("saturation_g", self.saturation_g),

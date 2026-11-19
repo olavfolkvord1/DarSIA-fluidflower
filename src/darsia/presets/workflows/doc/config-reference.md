@@ -356,6 +356,17 @@ Notes:
 - Both lists default to empty.
 - Empty lists are a strict no-op (analysis behavior is unchanged).
 - If provided, values outside the union of the configured ROIs are set to zero.
+Example, no CO2 in the uppermost sand layer (raw label 3):
+```toml
+[[roi]]
+name = "top_sand_layer"
+shape = "label"
+label_index = 3
+
+[expert_knowledge]
+no_concentration_aq = ["top_sand_layer"]
+no_saturation_g = ["top_sand_layer"]
+```
 
 ## Notes on legacy vs current naming
 - Current rig section is `[rig]`.
