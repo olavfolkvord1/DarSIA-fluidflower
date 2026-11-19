@@ -1,6 +1,7 @@
 """Physical gas lengths follow measured rig depth, independent of a project."""
 
 from dataclasses import fields
+from typing import get_type_hints
 
 import numpy as np
 import pytest
@@ -38,7 +39,8 @@ def test_every_geometric_length_scales_with_measured_depth(depth_mm):
 def test_depth_uses_grid_median_and_cannot_be_a_series_length():
     values = np.array([[1, 2, 3], [8, np.nan, 0]]) / 1000
     assert gas_parameters(BASE_SETTINGS, values).depth_mm == pytest.approx(2.5)
-    assert set(f.name for f in fields(GasAllocationSettings)) == {
+    types = get_type_hints(GasAllocationSettings)
+    assert {f.name for f in fields(GasAllocationSettings) if types[f.name] is not bool} == {
         "seed_mm2",
         "persistent_seed_mm2",
         "seed_window_h",
