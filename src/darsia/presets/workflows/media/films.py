@@ -132,7 +132,7 @@ def _choice(rows, target: float, size, read) -> tuple:
         return None, True, f"no image before {target:g} h", None
     tile = read(row["path"], tuple(size))
     shown = float(row["target_h"])
-    note = f"no image at {target:.2f} h Â· showing {shown:.2f} h" if is_held else ""
+    note = f"no image at {target:.2f} h · showing {shown:.2f} h" if is_held else ""
     return tile, is_held, note, row
 
 
@@ -316,7 +316,7 @@ def pyramid_frame(
         )
     cell_size = layout.cells[0][2:] if paired else layout.left_cell[2:]
     choices = [_choice(rows, target, cell_size, read) for rows in tiles]
-    unit = "g/mÂ²" if tile_settings.mass_quantity == "area" else unit
+    unit = "g/m²" if tile_settings.mass_quantity == "area" else unit
     shown = next(
         (row for _t, is_held, _n, row in (*choices[1:], choices[0]) if not is_held),
         None,
@@ -329,7 +329,7 @@ def pyramid_frame(
     lines = [
         run.upper(),
         elapsed,
-        f"Target {target:.2f} h Â· frame {number} of {count}",
+        f"Target {target:.2f} h · frame {number} of {count}",
     ]
     note = _note(film, film.panels, [choice[3] for choice in choices])
     if note:
@@ -481,7 +481,7 @@ def grid_frame(
     layout = grid_layout(len(runs), _aspect(tiles.values()), film.size_px)
     choices = {run: _choice(tiles[run], target, layout.tile, read) for run in runs}
     (panel,) = film.panels
-    unit = "g/mÂ²" if tile_settings.mass_quantity == "area" else unit
+    unit = "g/m²" if tile_settings.mass_quantity == "area" else unit
     is_map = panel.content not in (IMAGE, GRAPH)
     scale = tile_settings.colour_scale
     note = _note(
@@ -494,9 +494,9 @@ def grid_frame(
         own_note = "; ".join(filter(None, (held_note, *_display_notes(panel, row))))
         choices[run] = tile, is_held, own_note, row
     lines = [
-        panel.label + (f" Â· 0 to {scale:g} {unit}" if is_map else ""),
-        f"Target {target:.2f} h Â· frame {number} of {count}",
-        f"{len(runs)} runs, by name" + (f" Â· maps: {note}" if note else ""),
+        panel.label + (f" · 0 to {scale:g} {unit}" if is_map else ""),
+        f"Target {target:.2f} h · frame {number} of {count}",
+        f"{len(runs)} runs, by name" + (f" · maps: {note}" if note else ""),
         "Grey: no image at this target; the run's last image is held.",
     ]
     frame = compose_grid(
