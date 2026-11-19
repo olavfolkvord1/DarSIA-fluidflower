@@ -61,7 +61,7 @@ def test_phase_workflow_shares_prepass_retains_models_and_cleans_zones(
         "phase_rules": SimpleNamespace(pitch_stride=1),
         "phase_model": SimpleNamespace(pixel_size_mm=None, accept_canvas=False),
         "material": object(),
-        "gas_allocation": object(),
+        "gas_allocation": SimpleNamespace(growth_only_from_injecting_ports=False),
     }
     seen = {
         "models": [],

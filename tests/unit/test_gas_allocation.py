@@ -85,7 +85,7 @@ def _run(
     positions=None,
     record=None,
     settings=BASE_SETTINGS,
-    placed_before_m3=None,
+    saturation_before=None,
     start=0,
     periods=None,
 ):
@@ -95,13 +95,13 @@ def _run(
         [
             {
                 "id": k + 1,
-                "location_x": 0.0405,
-                "location_y": 0.0045,
-                "start": START + datetime.timedelta(hours=a),
-                "end": START + datetime.timedelta(hours=b),
+                "location_x": period[2] if len(period) > 2 else 0.0405,
+                "location_y": period[3] if len(period) > 2 else 0.0045,
+                "start": START + datetime.timedelta(hours=period[0]),
+                "end": START + datetime.timedelta(hours=period[1]),
                 "rate_g/s": 0.01,
             }
-            for k, (a, b) in enumerate(periods or [(-1.0, end_h)])
+            for k, period in enumerate(periods or [(-1.0, end_h)])
         ]
     ).to_csv(csv, index=False)
     return list(
@@ -125,7 +125,7 @@ def _run(
             depth_m=np.full(SHAPE, 0.02),
             positions=positions,
             record=record,
-            placed_before_m3=placed_before_m3,
+            saturation_before=saturation_before,
             start=start,
         )
     )
@@ -362,14 +362,14 @@ def test_no_growth_after_injection_keeps_gone_gas_gone(tmp_path):
     model = 400 * PORE * (1 - SWI)
     frames, hours = [probabilities] * 4, [0.5, 2.0, 3.0, 4.0]
     volumes = [0.4 * model, 0.0, 0.3 * model, None]
-    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    no_growth = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
     found, plain = [], []
     _run(tmp_path, frames, hours, volumes, end_h=1.0, settings=no_growth,
          record=lambda i, r: found.append(r))
     _run(tmp_path, frames, hours, volumes, end_h=1.0,
          record=lambda i, r: plain.append(r))
     assert found[0].placed_m3 == pytest.approx(plain[0].placed_m3)
-    assert found[0].growth_limit_m3 is None and found[1].placed_m3 == 0
+    assert found[0].growth_limit_m3 == 0 and found[1].placed_m3 == 0
     assert plain[2].placed_m3 > 0 and plain[3].placed_m3 > 0
     assert found[2].placed_m3 == 0 and found[3].placed_m3 == 0
     assert found[2].growth_limit_m3 == 0 and found[3].growth_limit_m3 == 0
@@ -381,16 +381,32 @@ def test_no_growth_bounds_by_the_frame_before_a_resumed_start(tmp_path):
     """A resumed run takes the bound from the stored frame before its start."""
     probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
     model = 400 * PORE * (1 - SWI)
-    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    no_growth = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
     found = []
+    before = np.zeros(SHAPE, np.float32)
+    before[20:24, 30:50] = 1 - SWI  # 80 of the 400 gas pixels: 0.2 of the model
     _run(tmp_path, [probabilities] * 2, [2.0, 3.0], [None, 0.5 * model],
-         end_h=1.0, settings=no_growth, start=1, placed_before_m3=0.2 * model,
+         end_h=1.0, settings=no_growth, start=1, saturation_before=before,
          record=lambda i, r: found.append(r))
     assert found[-1].placed_m3 == pytest.approx(0.2 * model)
     assert found[-1].growth_limit_m3 == pytest.approx(0.2 * model)
-    with pytest.raises(ValueError, match="placed gas of the frame before"):
+    with pytest.raises(ValueError, match="saturation of the frame before"):
         _run(tmp_path, [probabilities] * 2, [2.0, 3.0], [None, None],
              end_h=1.0, settings=no_growth, start=1)
+
+
+@pytest.mark.parametrize("requested", [None, 400 * PORE * (1 - SWI)])
+def test_the_first_frame_waits_for_an_active_port(tmp_path, requested):
+    gas = np.s_[20:40, 30:50]
+    frame = _frame(co2=[np.s_[10:50, 20:60]], gas=[gas])
+    settings = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
+    (labels, rules, saturation, _, before), = _run(
+        tmp_path, [frame], [0.5], [requested], settings=settings, periods=[(1.0, 2.0)]
+    )
+    assert np.all(before[gas] == G)
+    assert np.all(labels[gas] == D)
+    assert np.all(rules[gas] == RULE.PEELED)
+    assert not saturation.any()
 
 
 def test_no_growth_holds_between_injections_but_not_during_them(tmp_path):
@@ -398,7 +414,7 @@ def test_no_growth_holds_between_injections_but_not_during_them(tmp_path):
     port injects it may."""
     probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
     model = 400 * PORE * (1 - SWI)
-    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    no_growth = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
     found = []
     _run(tmp_path, [probabilities] * 4, [0.5, 1.5, 2.5, 3.5],
          [0.4 * model, 0.6 * model, 0.6 * model, 0.8 * model],
@@ -406,6 +422,145 @@ def test_no_growth_holds_between_injections_but_not_during_them(tmp_path):
          record=lambda i, r: found.append(r))
     assert found[1].placed_m3 == pytest.approx(found[0].placed_m3)
     assert found[1].growth_limit_m3 == pytest.approx(found[0].placed_m3)
-    assert found[2].growth_limit_m3 is None
+    assert found[2].growth_limit_m3 == 0
     assert found[2].placed_m3 == pytest.approx(0.6 * model)
     assert found[3].placed_m3 == pytest.approx(found[2].placed_m3)
+
+
+def test_rising_reach_goes_up_and_sideways_never_down():
+    """From a seed the reach climbs and spreads along each row, and a seal row
+    with a gap lets it through only at the gap."""
+    passable = np.ones((6, 5), bool)
+    passable[2, :4] = False  # a seal with a gap at the right
+    seeds = np.zeros((6, 5), bool)
+    seeds[4, 1] = True
+    reach = darsia.rising_reach(passable, seeds, top_first=True)
+    assert not reach[5].any()  # below the seed
+    assert reach[4].all() and reach[3].all()
+    assert not reach[2, :4].any() and reach[2, 4]
+    assert reach[1].all() and reach[0].all()
+
+
+def test_gas_below_a_seal_cannot_grow_while_only_a_port_above_injects(tmp_path):
+    """Only the upper port injects at the second frame: the lower box, which its
+    gas cannot reach by rising, keeps at most its earlier gas."""
+    facies = np.ones(SHAPE, int)
+    facies[28:33] = 2  # a seal band at 27.5-31.5 mm
+    lower_co2, upper_co2 = np.s_[35:55, 20:60], np.s_[5:24, 20:60]
+    first = _frame(co2=[lower_co2], gas=[np.s_[35:40, 30:50]])
+    second = _frame(
+        co2=[lower_co2, upper_co2], gas=[np.s_[35:45, 30:50], np.s_[5:10, 30:50]]
+    )
+    model = 100 * PORE * (1 - SWI)
+    rules = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
+    found = []
+    maps = _run(
+        tmp_path,
+        [first, second],
+        [0.5, 2.0],
+        [model, 6 * model],
+        facies=facies,
+        settings=rules,
+        periods=[(-1.0, 1.0, 0.0405, 0.0045), (1.5, 3.0, 0.0405, 0.0345)],
+        record=lambda i, r: found.append(r),
+    )
+    lower = np.zeros(SHAPE, bool)
+    lower[33:] = True
+    held = np.sum(PORE * maps[0][2][lower].astype(float))
+    later = np.sum(PORE * maps[1][2][lower].astype(float))
+    assert held > 0
+    assert later <= held + 1e-15
+    assert found[1].growth_limit_m3 == pytest.approx(held)
+
+
+def test_unreachable_model_gas_cannot_move_to_a_disconnected_patch(tmp_path):
+    old, new = np.s_[18:28, 10:25], np.s_[18:28, 55:70]
+    frames = [_frame(co2=[old], gas=[old]), _frame(co2=[new], gas=[new])]
+    facies = np.ones(SHAPE, int)
+    facies[:, 39:42] = 2
+    settings = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
+    maps = _run(
+        tmp_path,
+        frames,
+        [0.5, 1.5],
+        [None, None],
+        facies=facies,
+        settings=settings,
+        periods=[(-1.0, 1.0, 0.0205, 0.0045)],
+    )
+    assert np.all(maps[0][2][old] > 0)
+    assert not maps[0][2][new].any()
+    assert np.all(maps[1][4][new] == G)
+    assert np.all(maps[1][1][new] == RULE.PEELED)
+    assert not maps[1][2].any()
+
+
+def test_an_unsupported_gas_pool_can_rise_within_its_held_volume(tmp_path):
+    old, higher = np.s_[28:38, 30:50], np.s_[15:28, 30:50]
+    frames = [_frame(co2=[old], gas=[old]), _frame(co2=[higher, old], gas=[higher, old])]
+    settings = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
+    found = []
+    maps = _run(
+        tmp_path,
+        frames,
+        [0.5, 1.5],
+        [None, None],
+        settings=settings,
+        periods=[(-1.0, 1.0)],
+        record=lambda i, value: found.append(value),
+    )
+    assert maps[0][2][old].any()
+    assert not maps[0][2][higher].any()
+    assert not maps[1][2][old].any()
+    assert maps[1][2][higher].any()
+    assert found[1].placed_m3 == pytest.approx(found[0].placed_m3)
+    assert found[1].growth_limit_m3 == pytest.approx(found[0].placed_m3)
+    assert found[1].growth_peeled_m3 > 0
+
+
+def test_supported_inferred_gas_can_stay_when_injection_stops(tmp_path):
+    co2, gas = np.s_[10:50, 20:60], np.s_[20:40, 30:50]
+    frame = _frame(co2=[co2], gas=[gas])
+    narrowed = _frame(co2=[gas], gas=[gas])
+    model = 400 * PORE * (1 - SWI)
+    settings = replace(BASE_SETTINGS, growth_only_from_injecting_ports=True)
+    found = []
+    maps = _run(
+        tmp_path,
+        [frame, frame, narrowed],
+        [0.5, 1.5, 2.0],
+        [1.5 * model, 2 * model, 2 * model],
+        settings=settings,
+        periods=[(-1.0, 1.0)],
+        record=lambda i, value: found.append(value),
+    )
+    assert found[0].placed_m3 == pytest.approx(1.5 * model)
+    assert model < found[1].placed_m3 <= found[0].placed_m3
+    assert 0 < found[1].growth_retained_m3 <= 0.5 * model
+    assert found[1].placed_m3 == pytest.approx(model + found[1].growth_retained_m3)
+    assert found[1].model_m3 == pytest.approx(model)
+    assert np.all(maps[1][2][maps[0][0] == D] <= maps[0][2][maps[0][0] == D])
+    assert np.all(maps[1][0][maps[0][0] == D] == D)
+    assert found[2].placed_m3 == pytest.approx(model)
+    assert found[2].growth_retained_m3 == 0
+
+
+def test_an_unsupported_pool_cannot_spend_another_pools_previous_volume():
+    shape = (6, 9)
+    passable = np.ones(shape, bool)
+    passable[:, 4] = False
+    driven = np.zeros(shape, bool)
+    previous = np.zeros(shape, np.float32)
+    previous[4, 1] = 0.7
+    previous[4, 6:9] = 0.7
+    model = np.zeros(shape, bool)
+    model[3, :4] = True
+    cap = model.astype(np.float32)
+    pore = np.ones(shape)
+    y = np.broadcast_to(np.arange(shape[0], 0, -1)[:, None], shape)
+    bound, peeled = allocation_module._hold_model_gas(
+        cap, model, pore, passable, driven, previous, y, True
+    )
+    assert bound == pytest.approx(2.8)
+    assert peeled == pytest.approx(3.3)
+    assert cap.sum() == pytest.approx(0.7)

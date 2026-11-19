@@ -69,7 +69,6 @@ from darsia.jobs.step import (
     table,
 )
 from darsia.multiphase.gas_allocation import injection_ports
-from darsia.utils.results import read_description
 from darsia.multiphase.gas_model_cache import GasModelCache
 from darsia.multiphase.gas_parameters import parameters_at_depth
 from darsia.multiphase.gas_zone_cache import GasZoneCache
@@ -1359,19 +1358,17 @@ def _phase_maps(ctx: StepContext) -> None:
         probabilities.clear()
         allocations = {}
 
-        def placed_before(held_out):
-            """The placed free gas of the frame before a resumed run's start, for
-            the allocation's no-growth rule; None from the run's first frame."""
-            if not start:
+        def saturation_before(held_out):
+            """The free-gas saturation of the frame before a resumed run's start,
+            for the allocation's growth rule; None from the run's first frame."""
+            if not (
+                start and settings["gas_allocation"].growth_only_from_injecting_ports
+            ):
                 return None
-            stored = ctx.own(read_description, frame=frames[start - 1])
-            allocation = stored["measurements"]["gas_allocation"]
-            own = (
-                allocation["primary"]
-                if held_out is None
-                else allocation["without"][held_out]
+            return ctx.own(
+                lambda folder: darsia.read_phase_maps(folder, held_out)["saturation"],
+                frame=frames[start - 1],
             )
-            return own["placed_m3"]
 
         def maps(held_out):
             volumes = ctx.read(
@@ -1400,7 +1397,7 @@ def _phase_maps(ctx: StepContext) -> None:
                 record=lambda index, value: allocations.__setitem__(
                     held_out, asdict(value)
                 ),
-                placed_before_m3=placed_before(held_out),
+                saturation_before=saturation_before(held_out),
             )
 
         found_maps = zip(frames[start:], *(maps(v) for v in variants))
