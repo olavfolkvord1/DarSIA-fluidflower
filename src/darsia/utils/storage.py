@@ -76,10 +76,14 @@ def save_arrays(path: str | Path, /, **arrays) -> None:
         The arrays by name.
 
     """
+    save_arrays_as(path, storage_settings(), **arrays)
+
+
+def save_arrays_as(path: str | Path, settings: StorageSettings, /, **arrays) -> None:
+    """Write a NumPy archive with explicit storage settings for this file."""
     file = os.fspath(path)
     if not file.endswith(".npz"):
         file += ".npz"
-    settings = storage_settings()
     method = zipfile.ZIP_DEFLATED if settings.compress else zipfile.ZIP_STORED
     with zipfile.ZipFile(
         file, "w", method, allowZip64=True, compresslevel=settings.level

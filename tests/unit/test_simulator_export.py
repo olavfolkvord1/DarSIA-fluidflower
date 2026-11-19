@@ -335,7 +335,10 @@ def test_adjusted_runs_carry_their_own_geometry(tmp_path):
     assert starts[0] == starts[1]
 
 
-def test_mass_maps_go_on_the_geometry_s_cells_from_the_floor_up(tmp_path):
+@pytest.mark.parametrize("compression_level", [1, 6])
+def test_mass_maps_go_on_the_geometry_s_cells_from_the_floor_up(
+    tmp_path, compression_level
+):
     """A run's mass maps are written on the geometry's cells: the cells hold the
     map's total mass, the first row is the floor's, and maps on a grid that does not
     start at the canvas's lower left corner are refused."""
@@ -365,13 +368,20 @@ def test_mass_maps_go_on_the_geometry_s_cells_from_the_floor_up(tmp_path):
 
     injection, pressure = _protocols(tmp_path, "r", 1.01)
     recipe = {"alkalinity_M": 0.001}
-    settings = SimulatorExportSettings(**SETTINGS)
+    settings = SimulatorExportSettings(
+        **SETTINGS, mass_compression_level=compression_level
+    )
     folder = tmp_path / "package"
     folder.mkdir()
     run = SimulatorRun(injection, pressure, recipe, mass=frames([0.0, 0.1]))
     manifest = write_simulator_package(folder, series, {"r": run}, settings, OVERFLOW)
 
     assert manifest["runs"]["r"]["mass_frames"] == 1
+    mass = folder / "runs" / "r" / "mass"
+    assert (
+        json.loads((mass / "manifest.json").read_bytes())["compression_level"]
+        == compression_level
+    )
     with np.load(folder / "runs" / "r" / "mass" / "1mm" / "f.npz") as cells:
         total = cells["mass_total_g"]
     pixels = values.astype(np.float64) * geometry.pore_volume_m3 * 1000
