@@ -17,6 +17,7 @@ from darsia.presets.analysis.porosity import patched_porosity_analysis
 from darsia.presets.workflows.config.corrections import (
     CorrectionsConfig,
     IlluminationCorrectionConfig,
+    MaterialIlluminationCorrectionConfig,
     PatchwiseIlluminationCorrectionConfig,
 )
 from darsia.presets.workflows.config.image_porosity import ImagePorosityConfig
@@ -123,6 +124,7 @@ class Rig:
                 darsia.RelativeColorCorrection,
                 darsia.IlluminationCorrection,
                 darsia.PatchwiseIlluminationCorrection,
+                darsia.MaterialIlluminationCorrection,
             ),
         )
 
@@ -409,6 +411,17 @@ class Rig:
             self.illumination_correction = self.setup_patchwise_illumination_correction(
                 corrections_config.patchwise_illumination,
                 show_plot=show_plot,
+            )
+            self.color_corrections.append(self.illumination_correction)
+
+        # 1c) Material illumination correction.
+        if corrections_config.material_illumination:
+            assert not (
+                corrections_config.illumination
+                or corrections_config.patchwise_illumination
+            ), "Can only use a single illumination correction method at a time."
+            self.illumination_correction = self.setup_material_illumination_correction(
+                corrections_config.material_illumination
             )
             self.color_corrections.append(self.illumination_correction)
 
@@ -768,6 +781,42 @@ class Rig:
             )
 
         return illumination_correction
+
+    def setup_material_illumination_correction(
+        self, config: MaterialIlluminationCorrectionConfig
+    ) -> darsia.MaterialIlluminationCorrection:
+        """Fit and return the material illumination correction.
+
+        The fit uses the shape-corrected baseline and the facies as materials.
+        Pixels of facies without a target are corrected with the common field.
+
+        Parameters
+        ----------
+        config : MaterialIlluminationCorrectionConfig
+            Configuration of the material illumination correction.
+
+        Returns
+        -------
+        darsia.MaterialIlluminationCorrection
+            Correction for images on the grid of the shape-corrected baseline.
+        """
+        facies = self.facies.img
+        if config.fit_mask is None:
+            fit_mask = np.isin(facies, list(config.targets))
+        else:
+            fit_mask = darsia.imread(config.fit_mask).img.astype(bool)
+        return darsia.fit_material_illumination(
+            self.shape_corrected_baseline.img,
+            facies,
+            fit_mask,
+            config.targets,
+            dimensions=self.shape_corrected_baseline.dimensions,
+            fit_shape=config.fit_shape,
+            block_size=config.block_size,
+            edge_margin=config.edge_margin,
+            dn_scale=config.dn_scale,
+            settings=config.fit,
+        )
 
     # ! ---- ILLUMINATION CORRECTION ----
     def setup_patchwise_illumination_correction(

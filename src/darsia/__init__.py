@@ -83,6 +83,8 @@ from darsia.corrections.shape.imagemapping import *
 from darsia.corrections.color.colorbalance import *
 from darsia.corrections.color.colorcheckerfinder import *
 from darsia.corrections.color.illuminationcorrection import *
+from darsia.corrections.color.materialilluminationcorrection import *
+from darsia.corrections.color.materialblocks import *
 from darsia.corrections.color.patchwiseilluminationcorrection import *
 from darsia.corrections.color.dynamicilluminationcorrection import *
 from darsia.corrections.color.colorcorrection import *
