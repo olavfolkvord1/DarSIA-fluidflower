@@ -23,6 +23,7 @@ one is removed, or it is made in another results folder.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -585,10 +586,29 @@ def _distances(ctx: StepContext) -> None:
     measurements = {"colorchecker_excluded_counted_pixels": observation_pixels}
     if distances.excluded_runs:
         measurements["domain_excluded_runs"] = dict(distances.excluded_runs)
-    ctx.publish(
-        lambda folder: write_rows(Path(folder) / "distances.csv", rows, columns),
-        measurements=measurements,
-    )
+
+    def write(folder):
+        write_rows(Path(folder) / "distances.csv", rows, columns)
+        if settings.direct_solver_ordering == "symmetric":
+            solved = [row for row in found if row.direct_ordering_fallbacks is not None]
+            fallback = [
+                dict(
+                    run_1=row.run_1,
+                    run_2=row.run_2,
+                    domain_id=row.domain_id,
+                    reasons=row.direct_ordering_fallbacks,
+                )
+                for row in solved
+                if row.direct_ordering_fallbacks
+            ]
+            (Path(folder) / "solver-ordering.json").write_text(
+                json.dumps(
+                    dict(ordering="symmetric", solved_pairs=len(solved), fallback=fallback)
+                ),
+                encoding="utf-8",
+            )
+
+    ctx.publish(write, measurements=measurements)
 
 
 EVENTS = Step(

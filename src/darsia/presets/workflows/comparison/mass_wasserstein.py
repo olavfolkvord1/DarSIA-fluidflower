@@ -108,6 +108,12 @@ class WassersteinSettings:
     """Step [mm] of the edges of the cells' measured extent before its whole cells
     (:func:`darsia.measured_extent`), our production's 10; needed with measured
     models."""
+    direct_solver_ordering: Literal["general", "symmetric"] = "general"
+    """Ordering of the Bregman pressure factorization, with checked fallback."""
+
+    def __post_init__(self) -> None:
+        if self.direct_solver_ordering not in ("general", "symmetric"):
+            raise ValueError("Direct solver ordering must be general or symmetric.")
 
 
 def _edge_mm(settings: WassersteinSettings) -> int:
@@ -205,6 +211,8 @@ class WassersteinDistance:
     expected_mass_kg: float = np.nan
     """Mass [kg] injected into the region by the time; NaN for a region without an
     injection of its own (a sand layer, the sand), and when missing."""
+    direct_ordering_fallbacks: dict[str, int] | None = None
+    """Recorded LU fallback reasons for a solve with symmetric ordering."""
 
 
 @dataclass(frozen=True)
@@ -234,6 +242,7 @@ def distance_rows(
     rows = []
     for distance in distances:
         row = asdict(distance)
+        row.pop("direct_ordering_fallbacks")
         for side, run in enumerate((distance.run_1, distance.run_2), 1):
             frame = frames[run]
             if frame is None and distance.status != "missing":
@@ -650,7 +659,8 @@ def _distance(
         dimensions=reference.dimensions,
         origin=reference.origin,
     )
-    distance, converged = darsia.wasserstein_distance(
+    symmetric = settings.direct_solver_ordering == "symmetric"
+    distance, solve = darsia.wasserstein_distance(
         mass_1,
         mass_2,
         weight=cell_weight.subregion(crop),
@@ -662,8 +672,11 @@ def _distance(
             tol_increment=settings.increment_tolerance,
             bregman_update=lambda iteration: iteration in settings.bregman_updates,
             region=active[crop],
+            direct_solver_ordering=settings.direct_solver_ordering,
+            return_solver_info=symmetric,
         ),
     )
+    converged = solve["converged"] if symmetric else solve
     return dict(
         masses,
         status="success" if converged else "not_converged",
@@ -671,6 +684,9 @@ def _distance(
         normalized_plume=float(distance / scales.plume_kg_m),
         normalized_rig=float(distance / scales.rig_kg_m),
         normalized_mass=float(distance / average),
+        direct_ordering_fallbacks=(
+            solve["direct_ordering_fallbacks"] if symmetric else None
+        ),
     )
 
 
