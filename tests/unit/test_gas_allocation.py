@@ -84,19 +84,24 @@ def _run(
     facies=None,
     positions=None,
     record=None,
+    settings=BASE_SETTINGS,
+    placed_before_m3=None,
+    start=0,
+    periods=None,
 ):
     """Phase and rule maps and saturations of a run, one port at height 4.5 mm."""
     csv = tmp_path / "protocol.csv"
     pd.DataFrame(
         [
             {
-                "id": 1,
+                "id": k + 1,
                 "location_x": 0.0405,
                 "location_y": 0.0045,
-                "start": START - datetime.timedelta(hours=1),
-                "end": START + datetime.timedelta(hours=end_h),
+                "start": START + datetime.timedelta(hours=a),
+                "end": START + datetime.timedelta(hours=b),
                 "rate_g/s": 0.01,
             }
+            for k, (a, b) in enumerate(periods or [(-1.0, end_h)])
         ]
     ).to_csv(csv, index=False)
     return list(
@@ -115,11 +120,13 @@ def _run(
             np.full(SHAPE, PORE),
             np.full(SHAPE, SWI),
             volumes,
-            BASE_SETTINGS,
+            settings,
             gas_threshold=GAS_THRESHOLD,
             depth_m=np.full(SHAPE, 0.02),
             positions=positions,
             record=record,
+            placed_before_m3=placed_before_m3,
+            start=start,
         )
     )
 
@@ -345,3 +352,60 @@ def test_a_held_out_variant_stores_only_the_maps_that_differ(
         for name, values in made.items():
             assert found[name].dtype == values.dtype
             assert found[name].tobytes() == values.tobytes()
+
+
+def test_no_growth_after_injection_keeps_gone_gas_gone(tmp_path):
+    """After every injection ends a frame holds at most the frame before's gas:
+    once the gas is gone it stays gone, whatever the overflow or the model say.
+    During the injection and without the setting nothing changes."""
+    probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
+    model = 400 * PORE * (1 - SWI)
+    frames, hours = [probabilities] * 4, [0.5, 2.0, 3.0, 4.0]
+    volumes = [0.4 * model, 0.0, 0.3 * model, None]
+    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    found, plain = [], []
+    _run(tmp_path, frames, hours, volumes, end_h=1.0, settings=no_growth,
+         record=lambda i, r: found.append(r))
+    _run(tmp_path, frames, hours, volumes, end_h=1.0,
+         record=lambda i, r: plain.append(r))
+    assert found[0].placed_m3 == pytest.approx(plain[0].placed_m3)
+    assert found[0].growth_limit_m3 is None and found[1].placed_m3 == 0
+    assert plain[2].placed_m3 > 0 and plain[3].placed_m3 > 0
+    assert found[2].placed_m3 == 0 and found[3].placed_m3 == 0
+    assert found[2].growth_limit_m3 == 0 and found[3].growth_limit_m3 == 0
+    assert found[2].target_m3 == pytest.approx(0.3 * model)
+    assert found[3].target_m3 is None and found[2].unplaced_m3 == 0
+
+
+def test_no_growth_bounds_by_the_frame_before_a_resumed_start(tmp_path):
+    """A resumed run takes the bound from the stored frame before its start."""
+    probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
+    model = 400 * PORE * (1 - SWI)
+    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    found = []
+    _run(tmp_path, [probabilities] * 2, [2.0, 3.0], [None, 0.5 * model],
+         end_h=1.0, settings=no_growth, start=1, placed_before_m3=0.2 * model,
+         record=lambda i, r: found.append(r))
+    assert found[-1].placed_m3 == pytest.approx(0.2 * model)
+    assert found[-1].growth_limit_m3 == pytest.approx(0.2 * model)
+    with pytest.raises(ValueError, match="placed gas of the frame before"):
+        _run(tmp_path, [probabilities] * 2, [2.0, 3.0], [None, None],
+             end_h=1.0, settings=no_growth, start=1)
+
+
+def test_no_growth_holds_between_injections_but_not_during_them(tmp_path):
+    """Between two injections and after the last the gas cannot grow; while a
+    port injects it may."""
+    probabilities = _frame(co2=[np.s_[10:50, 20:60]], gas=[np.s_[20:40, 30:50]])
+    model = 400 * PORE * (1 - SWI)
+    no_growth = replace(BASE_SETTINGS, no_growth_after_injection=True)
+    found = []
+    _run(tmp_path, [probabilities] * 4, [0.5, 1.5, 2.5, 3.5],
+         [0.4 * model, 0.6 * model, 0.6 * model, 0.8 * model],
+         settings=no_growth, periods=[(-1.0, 1.0), (2.0, 3.0)],
+         record=lambda i, r: found.append(r))
+    assert found[1].placed_m3 == pytest.approx(found[0].placed_m3)
+    assert found[1].growth_limit_m3 == pytest.approx(found[0].placed_m3)
+    assert found[2].growth_limit_m3 is None
+    assert found[2].placed_m3 == pytest.approx(0.6 * model)
+    assert found[3].placed_m3 == pytest.approx(found[2].placed_m3)
