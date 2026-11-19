@@ -105,7 +105,12 @@ def read_marker(path: Path) -> dict:
         if not text:
             return {}
         if text.endswith(b"\n"):
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except ValueError:
+                # A heartbeat may be writing while a reader still sees the
+                # previous contents. Such a read can end in a newline.
+                pass
         if attempt == 0:
             sleep(results.SHARE_CACHE)
     raise results.Unavailable(f"The marker {path} reads short twice")

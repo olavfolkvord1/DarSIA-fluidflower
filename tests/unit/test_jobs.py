@@ -543,6 +543,26 @@ def test_a_superseded_owner_commits_nothing(tmp_path, monkeypatch):
     assert queue.markers(job, queue.QUEUE)[other.id] == "back"
 
 
+@pytest.mark.parametrize("recovers", [True, False])
+def test_a_claim_marker_retries_a_partial_json_write(tmp_path, monkeypatch, recovers):
+    marker = tmp_path / "lease"
+    marker.write_bytes(b'{"token": "one"}\n"beat": 1}\n')
+    waited = []
+
+    def next_observation(seconds):
+        waited.append(seconds)
+        if recovers:
+            marker.write_bytes(b'{"token": "one", "beat": 1}\n')
+
+    monkeypatch.setattr(queue, "sleep", next_observation)
+    if recovers:
+        assert queue.read_marker(marker) == {"token": "one", "beat": 1}
+    else:
+        with pytest.raises(results.Unavailable, match="reads short twice"):
+            queue.read_marker(marker)
+    assert waited == [results.SHARE_CACHE]
+
+
 def test_a_retried_task_adopts_its_earlier_attempt(tmp_path, monkeypatch):
     """A task whose process ended after two of its frames resumes: it adopts their
     results, names their token in its done marker, and readers accept both."""
