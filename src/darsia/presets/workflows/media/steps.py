@@ -6,7 +6,7 @@
   mean, the depth-scaled one on the run's sand map and geometry, or the mass graph
   of the run's whole domain (R8) with the injected mass, on axes shared by the
   selected runs; a grid film's graph tiles keep room for the run's label. A
-  frame's target time is its own time since the injection start.
+  frame carries its frozen target and its actual time since injection start.
 - ``films`` makes one configured film from the selected runs' tiles
   (:func:`write_films`): a pyramid per run or one grid over the runs, each encoder
   opened under the host's waiting lock (:data:`ENCODER_LOCK`), and stores the
@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,7 +33,11 @@ from darsia.presets.workflows.calibration.steps import (
 )
 from darsia.presets.workflows.media import tiles as media
 from darsia.presets.workflows.media.films import FilmSettings, write_films
-from darsia.presets.workflows.media.panels import PhotographSettings, tile_size
+from darsia.presets.workflows.media.panels import (
+    PhotographSettings,
+    source_photograph_settings,
+    tile_size,
+)
 from darsia.presets.workflows.media.style import FigureStyle
 from darsia.presets.workflows.media.transfer import divided_size, first_frame_limits
 from darsia.presets.workflows.setup.setup_rig import make_experiment
@@ -135,6 +140,9 @@ def _film_tiles(ctx: StepContext) -> None:
     style, tile_settings = settings["style"], settings["tiles"]
     found = drawings(settings["media"])
     panels = [media.Panel(**d["panel"]) for d in found]
+    shared = ctx.tables.get("ensemble", {}).get("target_h")
+    targets = film_frame_targets(run, ctx.task.frames, shared, settings["media"])
+    has_photo = any(panel.content == media.IMAGE for panel in panels)
     graphs, axes = {run: ()}, None
     if any(panel.content == media.GRAPH for panel in panels):
         graphs = {name: _graph_rows(ctx, name) for name in ctx.selection.frames}
@@ -166,10 +174,11 @@ def _film_tiles(ctx: StepContext) -> None:
             phase = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
             date = experiment.get_datetime(ctx.photo(run, frame))
             hours = experiment.time_since_start(date)
+            case = frame_key(frame)
             shown = media.Frame(
-                case=frame_key(frame),
+                case=case,
                 elapsed_h=hours,
-                target_h=hours,
+                target_h=targets[case] if targets is not None else hours,
                 shape=shape,
                 box=(0, 0, shape[1], shape[0]),
                 image=ctx.read("corrected-image", read_image, frame=frame).img,
@@ -179,7 +188,15 @@ def _film_tiles(ctx: StepContext) -> None:
                 saturation=phase["saturation"],
                 sand=sand,
                 rules=phase["rules"],
+                reporting_domain=(
+                    rig.reporting_domain
+                    if settings["photograph"].restrict_to_reporting_domain
+                    else None
+                ),
             )
+            photo = settings["photograph"]
+            if has_photo:
+                photo = source_photograph_settings(photo, ctx.photo(run, frame))
             if (
                 settings["photograph"].transfer == "first-frame"
                 and photograph_limits is None
@@ -190,7 +207,7 @@ def _film_tiles(ctx: StepContext) -> None:
                     else divided_size(shape, tile_settings.grid_divisor)
                 )
                 photograph_limits = first_frame_limits(
-                    shown.image, size, settings["photograph"].percentiles
+                    shown.photo_samples(photo), size, photo.percentiles
                 )
             for k, (panel, drawing) in enumerate(zip(panels, found)):
                 tile, drawn = media.draw_tile(
@@ -198,7 +215,7 @@ def _film_tiles(ctx: StepContext) -> None:
                     shown,
                     tile_settings,
                     style=style,
-                    photograph_settings=settings["photograph"],
+                    photograph_settings=photo,
                     rows=graphs[run],
                     axes=axes,
                     label_room=drawing["label_room"],
@@ -211,6 +228,35 @@ def _film_tiles(ctx: StepContext) -> None:
         write_json(Path(folder) / DRAWINGS, found)
 
     ctx.publish(write)
+
+
+def film_frame_targets(run, frames, shared, settings: MediaSettings):
+    """Use the frozen ensemble assignment by case; never rematch by time."""
+    if shared is None:
+        if any(film.layout == "grid" for film in settings.films):
+            raise ValueError(
+                "Grid films need the frozen [ensemble.target_h] assignments."
+            )
+        return None
+    assigned = shared.get(run, {})
+    found = {}
+    used = set()
+    for frame in frames:
+        case = frame_key(frame)
+        value = assigned.get(case)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"No finite frozen film target for {run}/{case}.")
+        if value in used:
+            raise ValueError(
+                f"Multiple selected images of {run} have target {value} h."
+            )
+        found[case] = float(value)
+        used.add(value)
+    return found
 
 
 def read_film_tiles(folder: Path) -> list[tuple[dict, list[dict]]]:
@@ -259,7 +305,10 @@ def _display_bytes(tables, _run, context):
         # Finite RGB handling, conversion and percentile selection coexist only
         # during first-frame measurement; all reduced RGB buffers fit this bound.
         transfer = 88 * context.grid_pixels
-    return max(area, overlay, transfer)
+    masked_photo = (
+        24 * context.grid_pixels if photo.get("restrict_to_reporting_domain") else 0
+    )
+    return max(area, overlay, transfer) + masked_photo
 
 
 def _films(ctx: StepContext) -> None:
@@ -315,7 +364,7 @@ FILM_TILES = Step(
         "domains": DomainSettings,
         "material": MaterialSettings,
     },
-    sections=EXPERIMENT,
+    sections=(*EXPERIMENT, "ensemble"),
     files=protocol_files,
 )
 """Each run's tiles of the films' panels."""

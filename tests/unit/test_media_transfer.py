@@ -398,6 +398,7 @@ def test_workflow_fixes_earliest_photo_transfer_and_records_actual_times(
     ctx = SimpleNamespace(
         task=SimpleNamespace(run="run", frames=frames),
         settings=settings,
+        tables={"ensemble": {"target_h": {"run": {"s/first": 1.95, "s/later": 2.05}}}},
         read=read,
         photo=lambda run, frame: frame.name,
         publish=lambda writer: writer(tmp_path),
@@ -405,6 +406,7 @@ def test_workflow_fixes_earliest_photo_transfer_and_records_actual_times(
     steps._film_tiles(ctx)
     rows = read_tile_index(tmp_path / "00")
     assert [row["elapsed_h"] for row in rows] == [1.98, 2.03]
+    assert [row["target_h"] for row in rows] == [1.95, 2.05]
     expected = list(first_frame_limits(first, (20, 10)))
     assert all(row["photograph_limits"] == expected for row in rows)
     assert [row["case_id"] for row in rows] == ["s/first", "s/later"]
