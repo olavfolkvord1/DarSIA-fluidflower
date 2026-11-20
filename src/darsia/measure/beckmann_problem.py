@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import time
+import tracemalloc
 from abc import abstractmethod
 from enum import StrEnum
+from functools import wraps
+from threading import RLock
 from typing import Optional
 
 import numpy as np
@@ -17,6 +20,34 @@ import darsia
 _PART_BALANCE_RTOL = 1e-5
 """Relative tolerance to which each part of a transport region must hold the same
 mass in both distributions."""
+
+_MEMORY_TRACE = RLock()
+
+
+def _profile_memory(method):
+    """Measure a solve on request without leaving process tracing enabled."""
+
+    @wraps(method)
+    def solve(self, *args, **kwargs):
+        if not self.options.get("profile_memory", False):
+            distance, solution, info = method(self, *args, **kwargs)
+            info.setdefault("peak_memory_consumption", 0.0)
+            return distance, solution, info
+        with _MEMORY_TRACE:
+            started = not tracemalloc.is_tracing()
+            if started:
+                tracemalloc.start()
+            try:
+                distance, solution, info = method(self, *args, **kwargs)
+                info["peak_memory_consumption"] = (
+                    tracemalloc.get_traced_memory()[1] / 10**9
+                )
+                return distance, solution, info
+            finally:
+                if started:
+                    tracemalloc.stop()
+
+    return solve
 
 
 def transport_components(region: np.ndarray) -> tuple[np.ndarray, int]:
@@ -126,6 +157,7 @@ class BeckmannProblem(darsia.EMD):
                 aa_restart (int)             None    Anderson acceleration restart
                 regularization (float)       eps     avoid division by zero
                 lumping (bool)               True    lump the mass matrix
+                profile_memory (bool)        False   trace peak Python allocations
                 region (np.ndarray of bool)  None    cells that take part in
                     transport; a face touching any other cell carries no flux
                     (see _setup_region)
@@ -267,6 +299,16 @@ class BeckmannProblem(darsia.EMD):
 
         self.quad_weights = quad_weights
         """np.ndarray: quadrature weights in reference cell"""
+        self._rt0_points = None
+        if dim == 2 and l1_mode == L1Mode.RAVIART_THOMAS:
+            self._rt0_points = quad_pts.copy()
+            self._rt0_interpolation = tuple(
+                (point[0], 1 - point[0], point[1], 1 - point[1]) for point in quad_pts
+            )
+            self._rt0_faces = tuple(
+                faces.reshape(shape, order="F")
+                for faces, shape in zip(self.grid.faces, self.grid.faces_shape)
+            )
 
     def _setup_region(self) -> None:
         """Cells that take part in transport, from the option ``region``.
@@ -581,26 +623,25 @@ class BeckmannProblem(darsia.EMD):
         mass_diff = self.flat_view(mass_diff_img)
 
         # Main method
+        direct = self.linear_solver
+        report_ordering = (
+            isinstance(direct, darsia.BeckmannDirectSolver)
+            and direct.ordering == "symmetric"
+        )
+        if report_ordering:
+            direct.symmetric_fallbacks.clear()
+            direct.symmetric_factorizations = 0
         distance, solution, info = self.solve_beckmann_problem(mass_diff)
-
-        # Split the solution
-        flux = solution[self.flux_slice]
-        pressure = solution[self.pressure_slice]
-
-        # Reshape the fluxes and pressure to grid format
-        flux_img = darsia.face_to_cell(self.grid, flux)
-        pressure_img = pressure.reshape(self.grid.shape, order="F")
-
-        # Determine transport density
-        transport_density = self.transport_density(flux, flatten=False)
-
-        # Cell-weighted flux
-        weighted_flux_img = self.cell_weighted_flux(flux_img)
+        if report_ordering:
+            info["direct_ordering_fallbacks"] = dict(direct.symmetric_fallbacks)
+            info["symmetric_factorizations"] = direct.symmetric_factorizations
 
         # Return solution
         return_info = self.options.get("return_info", False)
         return_status = self.options.get("return_status", False)
         if return_info:
+            flux = solution[self.flux_slice]
+            flux_img = darsia.face_to_cell(self.grid, flux)
             info.update(
                 {
                     "grid": self.grid,
@@ -608,13 +649,18 @@ class BeckmannProblem(darsia.EMD):
                     "flux": flux_img,
                     "weight": self.cell_weights,
                     "weight_inv": 1.0 / self.cell_weights,
-                    "weighted_flux": weighted_flux_img,
-                    "pressure": pressure_img,
-                    "transport_density": transport_density,
+                    "weighted_flux": self.cell_weighted_flux(flux_img),
+                    "transport_density": self.transport_density(flux, flatten=False),
                     "src": img_1,
                     "dst": img_2,
                 }
             )
+            if self.options.get("return_pressure", True):
+                info["pressure"] = solution[self.pressure_slice].reshape(
+                    self.grid.shape, order="F"
+                )
+            return distance, info
+        elif self.options.get("return_solver_info", False):
             return distance, info
         elif return_status:
             return distance, info["converged"]
@@ -743,18 +789,75 @@ class BeckmannProblem(darsia.EMD):
         np.ndarray
             Transport density, flattened if requested.
         """
+        cell_weights = None
+        if self.weight is not None:
+            if self.cell_weights.ndim == 2:
+                cell_weights = self.cell_weights[..., np.newaxis]
+            else:
+                cell_weights = self.cell_weights
+        use_rt0_buffers = (
+            self._rt0_points is not None
+            and self.callbacks is None
+            and flat_flux.dtype == np.float64
+            and type(self).cell_weighted_flux is BeckmannProblem.cell_weighted_flux
+            and np.array_equal(self.quad_pts, self._rt0_points)
+            and (
+                cell_weights is None
+                or (
+                    (
+                        self.cell_weights.ndim == 2
+                        or self.cell_weights.shape == (*self.grid.shape, 2)
+                    )
+                    and np.result_type(cell_weights.dtype, np.float64) == np.float64
+                )
+            )
+        )
         # Integrate over reference cell (normalization not required)
-        transport_density = np.zeros(self.grid.shape, dtype=float)
-        for quad_pt, quad_weight in zip(self.quad_pts, self.quad_weights):
-            cell_flux = darsia.face_to_cell(self.grid, flat_flux, pt=quad_pt)
-            weighted_cell_flux = self.cell_weighted_flux(cell_flux)
-            cell_flux_norm = np.linalg.norm(weighted_cell_flux, 2, axis=-1)
-            transport_density += quad_weight * cell_flux_norm
+        if use_rt0_buffers:
+            transport_density = self._transport_density_rt0(flat_flux, cell_weights)
+        else:
+            transport_density = np.zeros(self.grid.shape, dtype=float)
+            for quad_pt, quad_weight in zip(self.quad_pts, self.quad_weights):
+                cell_flux = darsia.face_to_cell(self.grid, flat_flux, pt=quad_pt)
+                weighted_cell_flux = self.cell_weighted_flux(cell_flux)
+                cell_flux_norm = np.linalg.norm(weighted_cell_flux, 2, axis=-1)
+                transport_density += quad_weight * cell_flux_norm
 
         if flatten:
             return self.flat_view(transport_density)
         else:
             return transport_density
+
+    def _transport_density_rt0(
+        self, flat_flux: np.ndarray, cell_weights: np.ndarray | None
+    ) -> np.ndarray:
+        """Integrate two-dimensional RT0 flux with the ordinary quadrature order."""
+        faces_y, faces_x = (flat_flux[indices] for indices in self._rt0_faces)
+        cell_flux = np.empty((*self.grid.shape, 2), dtype=float)
+        work = np.empty(self.grid.shape, dtype=float)
+        norm = np.empty_like(work)
+        density = np.zeros_like(work)
+        for (y0, y1, x0, x1), weight in zip(self._rt0_interpolation, self.quad_weights):
+            # Match face_to_cell, including starting the sums with positive zero.
+            cell_flux.fill(0)
+            np.multiply(y0, faces_y, out=work[:-1, :])
+            cell_flux[:-1, :, 0] += work[:-1, :]
+            np.multiply(y1, faces_y, out=work[1:, :])
+            cell_flux[1:, :, 0] += work[1:, :]
+            np.multiply(x0, faces_x, out=work[:, :-1])
+            cell_flux[:, :-1, 1] += work[:, :-1]
+            np.multiply(x1, faces_x, out=work[:, 1:])
+            cell_flux[:, 1:, 1] += work[:, 1:]
+            if cell_weights is not None:
+                np.multiply(cell_flux, cell_weights, out=cell_flux)
+            # The L2 norm squares and sums the two components in this order.
+            np.multiply(cell_flux[..., 0], cell_flux[..., 0], out=norm)
+            np.multiply(cell_flux[..., 1], cell_flux[..., 1], out=work)
+            np.add(norm, work, out=norm)
+            np.sqrt(norm, out=norm)
+            np.multiply(weight, norm, out=norm)
+            density += norm
+        return density
 
     def transport_density_faces(self, flat_flux: np.ndarray) -> np.ndarray:
         """Compute the transport density from the solution.
@@ -789,8 +892,10 @@ class BeckmannProblem(darsia.EMD):
             L1 dissipation.
         """
         # The L1 dissipation corresponds to the integral over the transport density
-        transport_density = self.transport_density(flat_flux)
-        return self.mass_matrix_cells.dot(transport_density).sum()
+        return self._integrate_transport_density(self.transport_density(flat_flux))
+
+    def _integrate_transport_density(self, flat_density: np.ndarray) -> float:
+        return self.mass_matrix_cells.dot(flat_density).sum()
 
     # ! ---- Lumping of effective mobility
 
@@ -808,7 +913,9 @@ class BeckmannProblem(darsia.EMD):
             self.grid, 1.0 / cell_values, mode="harmonic"
         )
 
-    def _compute_face_weight(self, flat_flux: np.ndarray) -> np.ndarray:
+    def _compute_face_weight(
+        self, flat_flux: np.ndarray, cell_density: np.ndarray | None = None
+    ) -> np.ndarray:
         """FV-style face weighting, using harmonic averaging.
 
         The goal is to compute a face weight resembling the effective mobility
@@ -830,9 +937,11 @@ class BeckmannProblem(darsia.EMD):
             # Idea: Compute first weight ** 2 / |weight * flux| on cells
             # and reduce the values to faces via harmonic averaging.
             # |weight * flux| on cells
-            weighted_cell_flux_norm = self.transport_density(
-                flat_flux, weighted=True, flatten=False
-            )
+            weighted_cell_flux_norm = cell_density
+            if weighted_cell_flux_norm is None:
+                weighted_cell_flux_norm = self.transport_density(
+                    flat_flux, weighted=True, flatten=False
+                )
             regularized_weighted_cell_flux_norm = np.maximum(
                 weighted_cell_flux_norm,
                 self.regularization,
@@ -853,9 +962,11 @@ class BeckmannProblem(darsia.EMD):
             # cell_weight: cell -> face via harmonic averaging
             harm_avg_face_weights = self._harmonic_average(self.cell_weights)
             # |weight * flux|
-            weighted_cell_flux_norm = self.transport_density(
-                flat_flux, weighted=True, flatten=False
-            )
+            weighted_cell_flux_norm = cell_density
+            if weighted_cell_flux_norm is None:
+                weighted_cell_flux_norm = self.transport_density(
+                    flat_flux, weighted=True, flatten=False
+                )
             regularized_weighted_cell_flux_norm = np.maximum(
                 weighted_cell_flux_norm,
                 self.regularization,
@@ -964,6 +1075,9 @@ class BeckmannProblem(darsia.EMD):
         rhs: np.ndarray,
         previous_solution: Optional[np.ndarray] = None,
         reuse_solver: bool = False,
+        *,
+        cache_darcy: bool = False,
+        symmetric_pressure: bool = False,
     ) -> tuple:
         """Solve the linear system.
 
@@ -981,6 +1095,11 @@ class BeckmannProblem(darsia.EMD):
             Previous solution. Defaults to None.
         reuse_solver : bool
             Reuse the solver. Defaults to False.
+        cache_darcy : bool
+            Reuse an exact direct factorisation of the Darcy start.
+        symmetric_pressure : bool
+            Allow symmetric ordering in the pressure reduction of a
+            diagonal-flux problem, when requested in the solver options.
 
         Returns
         -------
@@ -998,7 +1117,7 @@ class BeckmannProblem(darsia.EMD):
             # Setup LU factorization for the full system
             tic = time.time()
             if setup_linear_solver:
-                self.linear_solver.setup(matrix)
+                self._factorize(matrix, cache_darcy)
             time_setup = time.time() - tic
 
             # Solve the full system
@@ -1028,7 +1147,7 @@ class BeckmannProblem(darsia.EMD):
 
             # 2. Build linear solver for reduced system
             if setup_linear_solver:
-                self.linear_solver.setup(self.reduced_matrix)
+                self._factorize(self.reduced_matrix, cache_darcy)
 
             # Stop timer to measure setup time
             time_setup = time.time() - tic
@@ -1071,25 +1190,35 @@ class BeckmannProblem(darsia.EMD):
                     "Implementation requires solution satisfy the constraint."
                 )
 
-            # 1. Reduce flux block
-            (
-                self.reduced_matrix,
-                self.reduced_rhs,
-                self.matrix_flux_inv,
-            ) = self.eliminate_flux(matrix, rhs)
-
-            # 2. Reduce to pure pressure system
-            (
-                self.fully_reduced_matrix,
-                self.fully_reduced_rhs,
-            ) = self.eliminate_lagrange_multiplier(
-                self.reduced_matrix,
-                self.reduced_rhs,
+            same_reduction = (
+                not setup_linear_solver
+                and hasattr(self, "fully_reduced_matrix")
+                and np.array_equal(
+                    matrix.diagonal()[self.flux_slice], self._reduced_flux_diagonal
+                )
             )
+            if same_reduction:
+                self.reduced_rhs = self._reduce_flux_rhs(rhs, self.matrix_flux_inv)
+                self.fully_reduced_rhs = self._reduce_pressure_rhs(self.reduced_rhs)
+            else:
+                (
+                    self.reduced_matrix,
+                    self.reduced_rhs,
+                    self.matrix_flux_inv,
+                ) = self.eliminate_flux(matrix, rhs)
+                (
+                    self.fully_reduced_matrix,
+                    self.fully_reduced_rhs,
+                ) = self.eliminate_lagrange_multiplier(
+                    self.reduced_matrix,
+                    self.reduced_rhs,
+                )
 
             # 3. Build linear solver for pure pressure system
             if setup_linear_solver:
-                self.linear_solver.setup(self.fully_reduced_matrix)
+                self._factorize(
+                    self.fully_reduced_matrix, cache_darcy, symmetric_pressure
+                )
 
             # Stop timer to measure setup time
             time_setup = time.time() - tic
@@ -1119,6 +1248,26 @@ class BeckmannProblem(darsia.EMD):
 
         return solution, stats
 
+    def _factorize(self, matrix, cache_darcy, symmetric_pressure=False):
+        solver = self.linear_solver
+        if type(solver) is not darsia.BeckmannDirectSolver:
+            solver.setup(matrix)
+        elif symmetric_pressure and solver.ordering == "symmetric":
+            diagonal = self.matrix_flux_inv.diagonal()
+            positive = bool(np.all(np.isfinite(diagonal) & (diagonal > 0)))
+            if not positive:
+                solver.symmetric_fallbacks["flux_diagonal"] += 1
+            solver.setup(matrix, cache_darcy=cache_darcy, symmetric_pressure=positive)
+        elif cache_darcy:
+            solver.setup(matrix, cache_darcy=True)
+        else:
+            solver.setup(matrix)
+
+    def _reduce_flux_rhs(self, residual, inverse):
+        reduced_residual = residual[self.reduced_system_slice].copy()
+        reduced_residual -= self.D.dot(inverse.dot(residual[self.flux_slice]))
+        return reduced_residual
+
     def eliminate_flux(self, jacobian: sps.csc_matrix, residual: np.ndarray) -> tuple:
         """Eliminate the flux block from the jacobian and residual.
 
@@ -1142,15 +1291,15 @@ class BeckmannProblem(darsia.EMD):
             assert hasattr(self, "jacobian_subblock")
 
         # Build Schur complement wrt flux-block
-        J_inv = sps.diags(1.0 / jacobian.diagonal()[self.flux_slice])
+        self._reduced_flux_diagonal = jacobian.diagonal()[self.flux_slice]
+        J_inv = sps.diags(1.0 / self._reduced_flux_diagonal)
         schur_complement = self.D.dot(J_inv.dot(self.DT))
 
         # Gauss eliminiation on matrices
         reduced_jacobian = self.jacobian_subblock + schur_complement
 
         # Gauss elimination on vectors
-        reduced_residual = residual[self.reduced_system_slice].copy()
-        reduced_residual -= self.D.dot(J_inv.dot(residual[self.flux_slice]))
+        reduced_residual = self._reduce_flux_rhs(residual, J_inv)
 
         return reduced_jacobian, reduced_residual, J_inv
 
@@ -1234,16 +1383,15 @@ class BeckmannProblem(darsia.EMD):
         # FIXME omit if not required
         self.fully_reduced_jacobian.indices = self.fully_reduced_jacobian_indices.copy()
 
+        return self.fully_reduced_jacobian, self._reduce_pressure_rhs(reduced_residual)
+
+    def _reduce_pressure_rhs(self, reduced_residual):
         # Rhs is not affected by Gauss elimination as it is assumed that the residual
         # is zero in the constrained cell, and the pressure is zero there as well.
         # If not, we need to do a proper Gauss elimination on the right hand side!
         if abs(reduced_residual[-1]) > 1e-6:
             raise NotImplementedError("Implementation requires residual to be zero.")
-        fully_reduced_residual = reduced_residual[
-            self.fully_reduced_system_indices
-        ].copy()
-
-        return self.fully_reduced_jacobian, fully_reduced_residual
+        return reduced_residual[self.fully_reduced_system_indices].copy()
 
     def _setup_eliminate_lagrange_multiplier(self) -> None:
         """Additional setup of infrastructure for fully reduced systems.

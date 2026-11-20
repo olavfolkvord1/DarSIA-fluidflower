@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import tracemalloc
 import warnings
 from typing import Optional, override
 
@@ -11,6 +10,7 @@ import numpy as np
 import scipy.sparse as sps
 
 import darsia
+from darsia.measure.beckmann_problem import MobilityMode, _profile_memory
 
 
 class BeckmannBregmanSolver(darsia.BeckmannProblem):
@@ -67,6 +67,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         self,
         flux: np.ndarray,
         shrink_factor: float | np.ndarray,
+        cell_density: np.ndarray | None = None,
     ) -> np.ndarray:
         """Shrink operation in the split Bregman method, operating on fluxes.
 
@@ -80,25 +81,31 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
             Flux.
         shrink_factor : float or np.ndarray
             Shrink factor.
+        cell_density : np.ndarray, optional
+            Weighted density of the input flux.
 
         Returns
         -------
         np.ndarray
             Shrunk fluxes.
         """
-        _, face_weights_inv = self._compute_face_weight(flux)
+        _, face_weights_inv = self._compute_face_weight(flux, cell_density)
         scaling = np.maximum(face_weights_inv - shrink_factor, 0) / (
             face_weights_inv + self.regularization
         )
         return scaling * flux
 
-    def _compute_heterogeneous_bregman_regularization(self, flux: np.ndarray) -> tuple:
+    def _compute_heterogeneous_bregman_regularization(
+        self, flux: np.ndarray, cell_density: np.ndarray | None = None
+    ) -> tuple:
         """Update the regularization based on the current approximation of the flux.
 
         Parameters
         ----------
         flux : np.ndarray
             Flux.
+        cell_density : np.ndarray, optional
+            Weighted density of the input flux.
 
         Returns
         -------
@@ -107,7 +114,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         """
 
         # Assign the weight and shrink factor
-        face_weights, face_weights_inv = self._compute_face_weight(flux)
+        face_weights, face_weights_inv = self._compute_face_weight(flux, cell_density)
         weight = sps.diags(face_weights)
         shrink_factor = face_weights_inv
 
@@ -119,6 +126,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         return l_scheme_mixed_darcy, weight, shrink_factor
 
     @override
+    @_profile_memory
     def solve_beckmann_problem(
         self, flat_mass_diff: np.ndarray
     ) -> tuple[float, np.ndarray, dict]:
@@ -134,10 +142,6 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         tuple
             Distance, solution, info.
         """
-        # Setup time and memory profiling
-        tic = time.time()
-        tracemalloc.start()
-
         # Define right hand side
         rhs = np.concatenate(
             [
@@ -149,7 +153,13 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
 
         # Initialize Newton iteration with Darcy solution for unitary mobility
         solution = np.zeros_like(rhs, dtype=float)
-        solution, _ = self.linear_solve(self.darcy_init.copy(), rhs.copy(), solution)
+        solution, _ = self.linear_solve(
+            self.darcy_init.copy(),
+            rhs.copy(),
+            solution,
+            cache_darcy=True,
+            symmetric_pressure=True,
+        )
 
         # Initialize distance in case below iteration fails
         distance = 0
@@ -182,11 +192,31 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
             weight @ self.mass_matrix_faces
         )
 
+        # The cell-based mobility and L1 norm use the same weighted quadrature.
+        # Callbacks can change the weights or quadrature between iterations.
+        reuse_density = (
+            self.callbacks is None
+            and self.mobility_mode
+            in (
+                MobilityMode.CELL_BASED,
+                MobilityMode.CELL_BASED_ARITHMETIC,
+                MobilityMode.CELL_BASED_HARMONIC,
+            )
+            and type(self).l1_dissipation is darsia.BeckmannProblem.l1_dissipation
+        )
+
         # Initialize Bregman variables
         flux = self.flux_view(solution)
-        old_aux_flux = self._shrink(flux, shrink_factor)
+        cell_density = (
+            self.transport_density(flux, flatten=False) if reuse_density else None
+        )
+        old_aux_flux = self._shrink(flux, shrink_factor, cell_density)
         old_force = flux - old_aux_flux
-        old_distance = self.l1_dissipation(flux)
+        old_distance = (
+            self.l1_dissipation(flux)
+            if cell_density is None
+            else self._integrate_transport_density(self.flat_view(cell_density))
+        )
 
         # Cache the reference norm of the mass difference for the residual
         mass_diff_norm = np.linalg.norm(self.pressure_view(rhs), 2)
@@ -201,7 +231,9 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                     l_scheme_mixed_darcy,
                     weight,
                     shrink_factor,
-                ) = self._compute_heterogeneous_bregman_regularization(flux)
+                ) = self._compute_heterogeneous_bregman_regularization(
+                    flux, cell_density
+                )
                 # 1. Make relaxation step (solve quadratic optimization problem)
                 # Here, re-initialize the aux flux and force with zero values again.
                 rhs_copy = rhs.copy()  # may change during direct solve
@@ -212,6 +244,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                         l_scheme_mixed_darcy,
                         rhs_copy,
                         reuse_solver=False,  # force to update solver
+                        symmetric_pressure=True,
                     )
                 except Exception:
                     warnings.warn(
@@ -224,7 +257,12 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
 
                 # 2. Shrink step for vectorial fluxes.
                 tic = time.time()
-                new_aux_flux = self._shrink(flux, shrink_factor)
+                cell_density = (
+                    self.transport_density(flux, flatten=False)
+                    if reuse_density
+                    else None
+                )
+                new_aux_flux = self._shrink(flux, shrink_factor, cell_density)
                 timings["time_shrink"] = time.time() - tic
 
                 # 3. Update force
@@ -245,6 +283,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                         l_scheme_mixed_darcy,
                         rhs_copy,
                         reuse_solver=iter > 0,  # force to reuse solver
+                        symmetric_pressure=True,
                     )
                 except Exception:
                     warnings.warn(
@@ -252,6 +291,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                     )
                     break
                 flux = self.flux_view(solution)
+                cell_density = None
                 timings["time_solve"] = time.time() - tic
                 timings["time_assemble"] = time_assemble
 
@@ -284,7 +324,13 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                 timings["time_acceleration"] = 0.0
 
             # Update distance and flux norm for reference
-            distance = self.l1_dissipation(flux)
+            if reuse_density and cell_density is None:
+                cell_density = self.transport_density(flux, flatten=False)
+            distance = (
+                self.l1_dissipation(flux)
+                if cell_density is None
+                else self._integrate_transport_density(self.flat_view(cell_density))
+            )
             flux_norm = np.linalg.norm(flux, 2)
 
             # Catch nan values
@@ -367,17 +413,21 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
             old_force = new_force.copy()
             old_distance = distance
 
-        # Solve for the pressure by solving a single Newton iteration
-        newton_jacobian, _, _ = self._compute_heterogeneous_bregman_regularization(flux)
         solution = np.zeros_like(rhs)
         solution[self.flux_slice] = flux.copy()
-        newton_residual = self.optimality_conditions(solution, rhs)
-        newton_update, _ = self.linear_solve(newton_jacobian, newton_residual, solution)
-        solution[self.pressure_slice] = self.pressure_view(newton_update)
+        if self.options.get("return_pressure", True):
+            # Recover pressure in one Newton iteration when requested.
+            newton_jacobian, _, _ = self._compute_heterogeneous_bregman_regularization(
+                flux, cell_density
+            )
+            newton_residual = self.optimality_conditions(solution, rhs)
+            newton_update, _ = self.linear_solve(
+                newton_jacobian, newton_residual, solution
+            )
+            solution[self.pressure_slice] = self.pressure_view(newton_update)
 
-        # Summarize profiling (time in seconds, memory in GB)
+        # Summarize timings in seconds.
         total_timings = self._sum_timings(convergence_history.timings)
-        peak_memory_consumption = tracemalloc.get_traced_memory()[1] / 10**9
 
         # Compute l1 norm of the flux
         unweighted_transport_density = self.transport_density(flux, weighted=False)
@@ -391,7 +441,6 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
             "number_iterations": iter,
             "convergence_history": convergence_history.as_dict(),
             "timings": total_timings,
-            "peak_memory_consumption": peak_memory_consumption,
         }
 
         return distance, solution, info

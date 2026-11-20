@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import tracemalloc
 import warnings
 from typing import Optional, override
 
@@ -11,6 +10,7 @@ import numpy as np
 import scipy.sparse as sps
 
 import darsia
+from darsia.measure.beckmann_problem import _profile_memory
 
 
 class BeckmannNewtonSolver(darsia.BeckmannProblem):
@@ -106,6 +106,7 @@ class BeckmannNewtonSolver(darsia.BeckmannProblem):
         return np.sqrt(residual_opt**2 + residual_div**2)
 
     @override
+    @_profile_memory
     def solve_beckmann_problem(
         self, mass_diff: np.ndarray
     ) -> tuple[float, np.ndarray, dict]:
@@ -121,10 +122,6 @@ class BeckmannNewtonSolver(darsia.BeckmannProblem):
         tuple
             Distance, solution, info.
         """
-        # Setup time and memory profiling
-        tic = time.time()
-        tracemalloc.start()
-
         # Convert mass diff to full right hand side
         beckmann_problem_rhs = np.concatenate(
             [
@@ -137,7 +134,10 @@ class BeckmannNewtonSolver(darsia.BeckmannProblem):
         # Initialize Newton iteration with Darcy solution for unitary mobility
         solution = np.zeros(self.ndofs(), dtype=float)
         solution, _ = self.linear_solve(
-            self.darcy_init.copy(), beckmann_problem_rhs.copy(), solution
+            self.darcy_init.copy(),
+            beckmann_problem_rhs.copy(),
+            solution,
+            cache_darcy=True,
         )
 
         # Initialize distance in case below iteration fails
@@ -279,7 +279,6 @@ class BeckmannNewtonSolver(darsia.BeckmannProblem):
 
         # Summarize profiling (time in seconds, memory in GB)
         total_timings = self._sum_timings(convergence_history.timings)
-        peak_memory_consumption = tracemalloc.get_traced_memory()[1] / 10**9
 
         # Compute l1 norm of the flux
         unweighted_transport_density = self.transport_density(flux, weighted=False)
@@ -293,7 +292,6 @@ class BeckmannNewtonSolver(darsia.BeckmannProblem):
             "number_iterations": iter,
             "convergence_history": convergence_history.as_dict(),
             "timings": total_timings,
-            "peak_memory_consumption": peak_memory_consumption,
         }
 
         return distance, solution, info
