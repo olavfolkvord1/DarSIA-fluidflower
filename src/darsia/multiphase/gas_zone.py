@@ -12,7 +12,7 @@ from skimage.graph import MCP_Geometric
 
 import darsia
 from darsia.multiphase.gas_parameters import gas_parameters
-from darsia.multiphase.phase_rules import PhaseLabel, _co2, _pitch_mm, _seal
+from darsia.multiphase.phase_rules import PhaseLabel, _co2, _seal
 
 
 @dataclass(frozen=True)
@@ -159,9 +159,7 @@ def _injector_link(
     observed,
     probability,
     path,
-    x,
-    y,
-    pitch_mm,
+    positions,
     settings,
     *,
     current_co2,
@@ -175,7 +173,7 @@ def _injector_link(
     zero denominator remains impassable rather than receiving an offset. The
     nearest meeting cannot lie below the injector by more than its local depth.
     """
-    squared = (x - port[0]) ** 2 + (y - port[1]) ** 2
+    squared = (positions.x - port[0]) ** 2 + (positions.y - port[1]) ** 2
     start = np.unravel_index(np.argmin(squared), squared.shape)
     note = {"port_pixel": [int(value) for value in start]}
     if contour[start] and current_co2[start]:
@@ -198,7 +196,7 @@ def _injector_link(
             f"Injector {port} requires finite positive local rig depth "
             f"at pixel {start}; received {local_depth_m}"
         )
-    drop_m = float(port[1]) - float(y[meeting])
+    drop_m = float(port[1]) - float(positions.y[meeting])
     if not np.isfinite(drop_m):
         raise ValueError("The injector and meeting need finite physical heights")
     note["local_depth_mm"] = 1000 * local_depth_m
@@ -211,7 +209,7 @@ def _injector_link(
     seen = observed & path
     if not seen[meeting]:
         return None, None, {**note, "status": "no_observed_co2_path"}
-    signal = _gaussian(probability, settings.link_smoothing_mm[0], pitch_mm)
+    signal = _gaussian(probability, settings.link_smoothing_mm[0], positions.pitch_mm)
     p_ref = float(np.median(signal[seen]))
     note["p_ref"] = p_ref if np.isfinite(p_ref) else None
     if not np.isfinite(p_ref) or p_ref < 0:
@@ -238,7 +236,7 @@ def _injector_link(
     origin = (meeting[0] - box[0].start, meeting[1] - box[1].start)
     if not np.isfinite(cost[origin]):
         return None, None, {**note, "status": "no_finite_path"}
-    solver = MCP_Geometric(cost, fully_connected=True, sampling=pitch_mm)
+    solver = MCP_Geometric(cost, fully_connected=True, sampling=positions.pitch_mm)
     cumulative, _ = solver.find_costs(starts=[origin])
     possible = np.where(targets[box], cumulative, np.inf)
     finish = np.unravel_index(np.argmin(possible), possible.shape)
@@ -246,7 +244,7 @@ def _injector_link(
         return None, None, {**note, "status": "no_finite_path"}
     points = np.asarray(solver.traceback(finish), np.float64)
     line, fraction, seen_coordinates = _smooth_path(
-        points, local, pitch_mm, settings.link_smoothing_mm[1]
+        points, local, positions.pitch_mm, settings.link_smoothing_mm[1]
     )
     placed = np.zeros(contour.shape, bool)
     placed[box] = line
@@ -256,7 +254,7 @@ def _injector_link(
     pixels = tuple(coordinates.T)
     distance = float(
         1000
-        * np.hypot(np.diff(x[pixels]), np.diff(y[pixels])).sum()
+        * np.hypot(np.diff(positions.x[pixels]), np.diff(positions.y[pixels])).sum()
     )
     diagnostics = {
         **note,
@@ -420,6 +418,7 @@ def gas_model_zones(
     protocol,
     rule_settings,
     settings,
+    positions=None,
     chart=None,
     *,
     depth_m,
@@ -454,6 +453,8 @@ def gas_model_zones(
         Phase rules defining free water and seals.
     settings : GasAllocationSettings
         Explicit contour, path and smoothing lengths in millimetres.
+    positions : darsia.GridPositions, optional
+        Measured pixel positions and metric pitch; defaults to the image grid.
     chart : array, optional
         Colour checker pixels excluded from all contour evidence.
     depth_m : array
@@ -468,9 +469,8 @@ def gas_model_zones(
     """
     settings = gas_parameters(settings, depth_m)
 
-    columns, rows = darsia.pixel_centres(sand_map)
-    x, y = np.broadcast_arrays(columns[None, :], rows[:, None])
-    pitch_mm = _pitch_mm(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
     ports = injection_ports(protocol)
     porous = domain & np.isin(
         sand_map.img,
@@ -495,7 +495,7 @@ def gas_model_zones(
         new_gas = bool((own_gas & ~gas).any())
         gas |= own_gas
         if new_gas:
-            base = _envelope(gas, path, pitch_mm, settings)
+            base = _envelope(gas, path, positions.pitch_mm, settings)
         active = {
             port: next(
                 ((begin, end) for begin, end in intervals if begin <= date < end), None
@@ -529,9 +529,7 @@ def gas_model_zones(
                 observed[port],
                 maximum[port],
                 route_path,
-                x,
-                y,
-                pitch_mm,
+                positions,
                 settings,
                 current_co2=co2,
                 depth_m=depth_m,
@@ -541,18 +539,18 @@ def gas_model_zones(
                 lines[port] = line
                 routes[port] = coordinates
                 bodies |= (
-                    ndimage.distance_transform_edt(~line, sampling=pitch_mm)
+                    ndimage.distance_transform_edt(~line, sampling=positions.pitch_mm)
                     <= settings.link_width_mm / 2
                 ) & path
         rounded = (
-            _envelope(bodies, path, pitch_mm, settings) if lines else base
+            _envelope(bodies, path, positions.pitch_mm, settings) if lines else base
         )
         bare = previous_bare | rounded
         expanded, margin_record = _depth_margin(
             bare,
             depth_m,
             path,
-            pitch_mm,
+            positions.pitch_mm,
             previous=(
                 (previous_bare, previous_expanded)
                 if previous_expanded is not None
@@ -566,7 +564,7 @@ def gas_model_zones(
         links = {}
         for port, line in lines.items():
             distance = ndimage.distance_transform_edt(
-                ~line, sampling=pitch_mm
+                ~line, sampling=positions.pitch_mm
             )
             scale = settings.link_width_mm / 2 + settings.fade_length_mm
             t = np.clip(distance / scale, 0, 1)

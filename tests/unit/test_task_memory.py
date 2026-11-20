@@ -1,6 +1,6 @@
 """Array budgets before job metadata or host admission is introduced."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -111,6 +111,20 @@ def test_output_cell_memory_handles_nominal_canvas_and_shape(itemsize, scale):
     tables["mass_copy"]["copy_mm"] = 5
     fine = MASS_COPY.memory.bytes(itemsize, pixels, pixels, 1, tables, "run")
     assert fine - coarse == (2400 - 600) * 18 * 8
+    model = [
+        [0.01 / scale, 0, 0.005 / scale],
+        [0, -0.01 / scale, 0.2 - 0.005 / scale],
+        [0, 0, 1],
+    ]
+    tables["labeling"] = {"sand_map": {"grid_to_rig": model}}
+    with pytest.raises(ValueError, match="Sizes.grid_shape"):
+        output_cells(tables, ("run",), context, 10, 10)
+    assert (
+        output_cells(tables, ("run",), replace(context, grid_shape=shape), 10, 10)
+        == 600
+    )
+    tables["labeling"]["sand_map"].update(canvas_origin=[0, 0], canvas_shape=shape)
+    assert output_cells(tables, ("run",), context, 10, 10) == 600
 
 
 def test_phase_window_memory_uses_the_configured_run():

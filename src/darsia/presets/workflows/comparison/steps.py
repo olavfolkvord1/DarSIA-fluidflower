@@ -39,7 +39,6 @@ from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
 from darsia.presets.workflows.calibration.steps import (
     MaterialSettings,
-    co2_state,
     frame_key,
     run_grid,
 )
@@ -73,6 +72,7 @@ from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
     output_cells,
     protocol_files,
+    read_grid_model,
     read_rig,
     run_settings,
 )
@@ -340,6 +340,38 @@ def _observed_geometry(geometry, labels, rules):
     return replace(geometry, counted=geometry.counted & ~hidden), count
 
 
+def start_co2(baseline: darsia.Image, experiment) -> darsia.CO2MassAnalysis:
+    """The reference run's CO2 at the experiment's start, as our production's
+    comparison took it for the distances' scales: the official
+    :class:`darsia.CO2MassAnalysis` on the reference rig's baseline (its nominal
+    heights), at the pressure and temperature of the experiment's protocol and
+    their gradients at the start.
+
+    Parameters
+    ----------
+    baseline : darsia.Image
+        The reference rig's baseline.
+    experiment : darsia.ProtocolledExperiment
+        The reference run's experiment.
+
+    Returns
+    -------
+    darsia.CO2MassAnalysis
+        The CO2's solubility and gas density on the baseline's grid.
+
+    """
+    protocol = experiment.pressure_temperature_protocol
+    state = protocol.get_state(experiment.experiment_start)
+    gradient = protocol.get_gradient(experiment.experiment_start)
+    return darsia.CO2MassAnalysis(
+        baseline=baseline,
+        atmospheric_pressure=state.pressure,
+        atmospheric_temperature=state.temperature,
+        atmospheric_pressure_gradient=gradient.pressure,
+        atmospheric_temperature_gradient=gradient.temperature,
+    )
+
+
 def _distances(ctx: StepContext) -> None:
     """The distances of every pair of runs in every domain at one time, on the
     configured reference run's sand map, which a job must select
@@ -350,6 +382,21 @@ def _distances(ctx: StepContext) -> None:
     run = distances.reference_run
     grid = run_grid(ctx.read("rig", read_rig, run=run), material)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
+    # With measured models, the cells cover the measured corners of every compared
+    # run's measurement canvas.
+    models = {r: ctx.read("rig", read_grid_model, run=r) for r in ctx.selection.frames}
+    extent = None
+    if any(model is not None for model, _ in models.values()):
+        if settings.extent_edge_mm is None:
+            raise ValueError("Measured models need [wasserstein] extent_edge_mm")
+        dtype = grid.rig.pixel_area.img.dtype
+        corners = [
+            darsia.grid_corners(grid.rig.labels, model, dtype, canvas)
+            for model, canvas in models.values()
+        ]
+        extent = darsia.measured_extent(
+            corners, settings.cell_mm, settings.extent_edge_mm
+        )
     reference = wasserstein_reference(
         grid.rig.labels,
         grid.rig.permeability.img,
@@ -358,11 +405,13 @@ def _distances(ctx: StepContext) -> None:
         distances.chart_labels,
         domains,
         settings,
+        grid.positions,
+        extent,
     )
     scales = distance_scales(
         time_h,
         experiment.injection_protocol,
-        co2_state(grid, experiment, experiment.experiment_start),
+        start_co2(grid.rig.baseline, experiment),
         grid.rig.depth.img,
         grid.rig.facies.dimensions,
         domains,
@@ -399,6 +448,7 @@ def _distances(ctx: StepContext) -> None:
             geometry,
             reference,
             settings,
+            grid.positions,
         )
     found = wasserstein_distances(time_h, frames, reference, scales, settings)
     rows = distance_rows(found, selected_frames)

@@ -14,6 +14,7 @@ TABLES = tomllib.loads(
     # The values our production ran with.
     [mass_copy]
     copy_mm = 1.0
+    extent_edge_mm = 10
 
     # A calibration record as the calibration delivers it (rounded values).
     [calibration]
@@ -156,6 +157,30 @@ def test_the_datum_is_the_declared_top_on_a_grid_extended_to_whole_cells():
         np.testing.assert_allclose(co2.height_map[:, 0], 0.5 - y, rtol=0, atol=1e-15)
 
 
+def test_the_head_reads_each_pixels_measured_height():
+    """With each pixel's measured height, the head is the datum less it, in double
+    precision; at the pixel centres' heights the tables are the default's."""
+    for dtype in (np.float32, np.float64):
+        baseline = darsia.ScalarImage(np.zeros((50, 4), dtype), dimensions=[0.5, 0.1])
+        default = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01
+        )
+        centres = darsia.grid_positions(baseline)
+        same = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01, y_m=centres.y
+        )
+        tilted = (centres.y + 0.002 * centres.x).astype(dtype)
+        measured = darsia.PrecisionCO2MassAnalysis(
+            baseline, datum_m=0.5, atmospheric_pressure=1.01, y_m=tilted
+        )
+        np.testing.assert_array_equal(
+            measured.height_map, 0.5 - np.asarray(tilted, np.float64)
+        )
+        for field in ("density_gaseous_co2", "solubility_co2"):
+            np.testing.assert_array_equal(getattr(same, field), getattr(default, field))
+            assert not np.array_equal(getattr(measured, field), getattr(default, field))
+
+
 def test_mass_lies_only_in_the_co2_the_phase_map_measures():
     """Dissolved share from the signal, saturated water under free gas, no mass
     outside CO2, and unknown CO2 left unknown."""
@@ -208,6 +233,35 @@ def test_the_official_route_and_ours_give_mass_maps_of_one_form():
     unknown = np.unravel_index(copy.cells.index.reshape(6, 6)[NO_SWI], (30, 30))
     assert cells["mass_total_known_fraction"][unknown] == 0
     assert copy.static["domain_area_m2"].sum() == pytest.approx(5 * 6 * 25e-6)
+
+
+def test_the_copy_places_each_pixel_by_its_measured_position():
+    """With measured positions and the cells' extent, each pixel goes onto the
+    copy's cells by its position, as our production's copy placed its pixels; the
+    totals are kept, and the copy's image covers the extent."""
+    geometry, co2, _, ours = frame()
+    image = darsia.ScalarImage(np.zeros((6, 6)), dimensions=[0.03, 0.03])
+    model = [[0.0049, 0.0002, 0.0009], [0.0001, -0.0051, 0.0287], [0.0, 0.0, 1.0]]
+    positions = darsia.grid_positions(image, model, np.float32)
+    canvas = darsia.MeasurementCanvas((-2, -1), (8, 10))
+    corners = darsia.grid_corners(image, model, np.float32, canvas)
+    extent = darsia.measured_extent(
+        [corners], SETTINGS.copy_mm, SETTINGS.extent_edge_mm
+    )
+    copy = darsia.MassCopy(geometry, SETTINGS, positions, extent)
+    cells = darsia.metric_cells((6, 6), [0.03, 0.03], 1.0, positions, extent)
+    np.testing.assert_array_equal(copy.cells.index, cells.index)
+    plain = darsia.MassCopy(geometry, SETTINGS)
+    assert not np.array_equal(copy.cells.index, plain.cells.index)
+    found = copy(ours, LABELS)
+    assert found["mass_total_g"].sum() == pytest.approx(
+        geometry.mass_g(ours.mass.img, geometry.domain), rel=1e-6
+    )
+    volume = np.asarray(geometry.pore_volume_m3, np.float64) * 1000
+    np.testing.assert_array_equal(
+        copy.static["pore_volume_l"], darsia.cell_sums(cells, volume)
+    )
+    assert copy.extent == extent
 
 
 def test_the_gas_density_at_no_head_is_our_productions():

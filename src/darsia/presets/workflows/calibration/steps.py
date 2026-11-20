@@ -52,6 +52,8 @@ from functools import lru_cache, partial
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+from scipy.fft import next_fast_len
 
 import darsia
 from darsia.jobs.step import (
@@ -67,33 +69,36 @@ from darsia.jobs.step import (
     table,
 )
 from darsia.multiphase.gas_allocation import injection_ports
-from darsia.utils.results import read_description
 from darsia.multiphase.gas_model_cache import GasModelCache
+from darsia.multiphase.gas_parameters import parameters_at_depth
 from darsia.multiphase.gas_zone_cache import GasZoneCache
 from darsia.presets.workflows.analysis.expert_knowledge import ExpertKnowledgeAdapter
 from darsia.presets.workflows.calibration.model_cache import model_cache_identity
 from darsia.presets.workflows.config.expert_knowledge import ExpertKnowledgeConfig
-from darsia.presets.workflows.config.roi_registry import RoiRegistry
 from darsia.presets.workflows.config.protocols import InjectionProtocolConfig
+from darsia.presets.workflows.config.roi_registry import RoiRegistry
 from darsia.presets.workflows.config.utils import settings_from_table
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
     EXPERIMENT,
     corrected_photo,
+    grid_canvas,
     grid_mask,
+    grid_model,
     protocol_files,
     read_image,
     read_rig,
     run_settings,
 )
 
-EXPERT = ("expert_knowledge", "roi")
-"""Named expert limits read by phase-map jobs."""
-
 READING = ("reading",)
 """The section of the sands' colour paths, which a step reads per run
 (:func:`run_reading`)."""
+EXPERT = ("expert_knowledge", "roi")
+"""The sections of a run's expert knowledge: where CO2 and free gas may be
+(``[expert_knowledge]``) and the named regions it names (``[[roi]]``), which the
+phase maps read per run (:func:`expert_limits`)."""
 
 
 @dataclass(frozen=True)
@@ -265,23 +270,47 @@ class RunGrid:
     facies: np.ndarray
     permeability: dict[int, float]
     domain: np.ndarray
+    """The pixels whose phase is decided and whose colour change is measured: the
+    reporting domain's pixels of a material with porosity, or every pixel."""
     geometry: darsia.RunGeometry
+    """The geometry over the reporting domain (:func:`darsia.run_geometry`)."""
     chart: np.ndarray | None
     pixel_mm: float
     datum_m: float
     optical_pitch: tuple[float, float]
+    """The pitch [m] on the sand plane (:func:`darsia.optical_pitch_m` over the
+    reporting domain); with a measurement canvas, with its counts, on which the
+    optical grid is sized (:class:`darsia.OpticalPitch`)."""
+    positions: darsia.GridPositions
+    """Each pixel's position on the rig and the grid's pitch, by the rig's measured
+    model of its grid (:func:`darsia.grid_positions`), in the grid's precision."""
     pixel_area_mm2: np.ndarray
     """Each pixel's area [mm2], the rig's pixel areas in double precision times a
     million, as our production's phase rules took them."""
+    reporting: np.ndarray
+    """The pixels the run reports on (``Rig.reporting_domain``), or every pixel."""
 
 
-def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
-    """A run's grid: its facies and their permeability, the domain of the facies
-    with one, the geometry with each facies' Swi, the colour checker, the pixel
-    size, the datum of the hydrostatic head and the pitch on the sand plane.
+def run_grid(
+    rig: Rig, material: MaterialSettings, pitch_stride: int | None = None
+) -> RunGrid:
+    """A run's grid: its facies and their permeability, the domains, the geometry
+    with each facies' Swi, the colour checker, the pixel size, the datum of the
+    hydrostatic head, the pitch on the sand plane, and each pixel's position on the
+    rig by the rig's measured model of its grid, with the grid's pitch over the
+    rig's measurement canvas where a pitch stride is given
+    (:func:`darsia.grid_positions`; the phase maps take it).
 
-    Depth, porosity and Swi take the precision of the rig's pixel areas, the run
-    grid's.
+    With the rig's reporting domain (``Rig.reporting_domain``), the run reports on
+    it, as our production's mass did: the geometry and the optical pitch are taken
+    over it, and the domain whose phase is decided is its pixels of a material with
+    porosity, our production's analysis domain, and the colour checker is its
+    pixels of the chart. Without one both domains are every pixel.
+    With the rig's measurement canvas, the optical pitch is the voxel size of the
+    optical grid sized on the canvas' pixels, as production sized it.
+
+    Depth, porosity, Swi and the measured positions take the precision of the
+    rig's pixel areas, the run grid's.
 
     """
     facies = rig.facies.img
@@ -290,22 +319,36 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
         int(f): float(rig.permeability.img[facies == f].flat[0])
         for f in np.unique(facies)
     }
-    domain = np.isin(facies, list(permeability))
+    reporting = rig.reporting_domain
+    if reporting is None:
+        reporting = domain = np.isin(facies, list(permeability))
+    else:
+        domain = reporting & (rig.porosity.img > 0)
     swi = np.full(facies.shape, np.nan, dtype)
     for name, value in material.swi.items():
         swi[facies == int(name)] = value
     chart = None
     if material.chart_label is not None:
         chart = rig.labels.img == material.chart_label
+        if rig.reporting_domain is not None:  # the chart the run reports on
+            chart &= reporting
+    positions = darsia.grid_positions(
+        rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas, pitch_stride
+    )
     geometry = darsia.run_geometry(
         rig.facies,
         rig.pixel_area.img,
         rig.depth.img.astype(dtype),
         rig.porosity.img.astype(dtype),
         swi,
-        domain,
+        reporting,
         chart,
+        positions,
     )
+    measured = None if rig.grid_to_rig is None else positions
+    optical = darsia.optical_pitch_m(rig.pixel_area, reporting, measured)
+    if rig.measurement_canvas is not None:
+        optical = darsia.OpticalPitch(optical, rig.measurement_canvas.shape)
     scaling = [
         c
         for c in rig.shape_corrections
@@ -321,8 +364,10 @@ def run_grid(rig: Rig, material: MaterialSettings) -> RunGrid:
         chart,
         float(rig.baseline.voxel_size[0]) * 1000,
         float(datum),
-        darsia.optical_pitch_m(rig.pixel_area, domain),
+        optical,
+        positions,
         np.asarray(rig.pixel_area.img, np.float64) * 1e6,
+        reporting,
     )
 
 
@@ -343,6 +388,7 @@ def co2_state(grid: RunGrid, experiment, date) -> darsia.PrecisionCO2MassAnalysi
         atmospheric_temperature=temperature,
         atmospheric_pressure_gradient=pressure_gradient,
         atmospheric_temperature_gradient=temperature_gradient,
+        y_m=grid.positions.y,
     )
 
 
@@ -405,7 +451,13 @@ def response_reading(
     sands = [int(sand) for sand in reading.sands]
     light = darsia.shadow_light(baseline, facies, pitch, sands, ctx.settings["shadow"])
     background = darsia.reference_background(
-        baseline, facies, pitch, grid.geometry.known, light, settings
+        baseline,
+        facies,
+        pitch,
+        grid.geometry.known,
+        light,
+        settings,
+        canvas=grid.rig.measurement_canvas,
     )
     ranges = ctx.read("color-ranges", darsia.read_color_ranges)
     factor = reading.sands[str(reference)].scale / ranges[reference]
@@ -884,6 +936,216 @@ def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
     return shared + max(building, allocations)
 
 
+def _gas_pitch(tables: Mapping, context) -> tuple[float, float]:
+    """The allocation's coordinate pitch from grid metadata, without grid arrays.
+
+    A configured measurement canvas supplies the sampling extent without a grid
+    shape. Its pitch is independent of the cropped image dimensions; a one-pixel
+    view only checks that the canvas contains the grid's origin. With a supplied
+    shape, grid_pitch also checks that the canvas contains the whole grid.
+    """
+    model, canvas = grid_model(tables), grid_canvas(tables)
+    shape = context.grid_shape
+    if shape is None:
+        if model is None or canvas is None:
+            raise ValueError(
+                "Phase-map gas memory needs Sizes.grid_shape (rows, columns), "
+                "or a measured grid_to_rig with canvas_origin and canvas_shape."
+            )
+        shape = (1, 1)
+    rig = tables["rig"]
+    image = darsia.Image(
+        np.broadcast_to(np.uint8(0), shape),
+        dimensions=[rig["height"], rig["width"]],
+        space_dim=2,
+    )
+    stride = tables.get("phase_rules", {}).get("pitch_stride")
+    pitch = darsia.grid_pitch(
+        image, model, np.dtype(f"f{context.itemsize}"), canvas, stride
+    )
+    if pitch is None or any(not np.isfinite(value) or value <= 0 for value in pitch):
+        raise ValueError(
+            "Phase-map gas memory needs a finite positive grid pitch; measured "
+            "grids require phase_rules.pitch_stride and at least two samples per axis."
+        )
+    return pitch
+
+
+def _gas_depth_bound_mm(tables: Mapping, context) -> float:
+    """Bound the run-grid median by its configured depth source's maximum.
+
+    Linear-in-hull/nearest depth interpolation and the rig's linear resize are
+    convex combinations. Their output median cannot exceed the largest source
+    depth. This reads only that source, never a complete rig or camera image.
+    The source is also a declared rig input. Runtime lengths still use the
+    actual median of the accepted run grid, not this admission upper bound.
+    """
+    depth = tables.get("depth", {})
+    triangulated = depth.get("interpolation") == "triangulation"
+    named = depth.get("measurements") if triangulated else depth.get("depth_map")
+    if not named and not triangulated:
+        results = tables.get("data", {}).get("results")
+        if results:
+            named = Path(results) / "setup" / "depth" / "depth_map.npz"
+    if not named:
+        raise ValueError("Gas memory requires a configured measured depth source")
+    path = Path(named)
+    if not path.is_absolute():
+        if context.project is None:
+            raise ValueError("Relative depth sources need the job's project")
+        path = Path(context.project) / path
+    values = (
+        pd.read_csv(path, usecols=["depth"])["depth"].to_numpy()
+        if triangulated
+        else darsia.imread(path).img
+    )
+    valid = values[np.isfinite(values) & (values > 0)]
+    if not valid.size:
+        raise ValueError("Gas memory requires finite positive measured depth")
+    # Round upward in the eventual working dtype, including interpolation's
+    # conversion, rather than underestimating a float32 endpoint by one ulp.
+    dtype = np.dtype(f"f{context.itemsize}")
+    bound = np.nextafter(dtype.type(valid.max()), dtype.type(np.inf))
+    return float(bound) * 1000
+
+
+def _gas_route_bytes(tables: Mapping, run: str | None, context) -> int:
+    """Retained ordered coordinates, including resampling and endpoint restoration.
+
+    A simple MCP path has at most pixels-1 diagonal steps. Gaussian smoothing
+    cannot increase total variation; restoring endpoints adds at most that
+    variation again. Rounding adds at most one grid step per resampled segment.
+    Four times the sample count plus a straight hidden segment therefore bounds
+    the ordered raster, including repeated pixels. Three copies cover two zone
+    payloads and the route currently being built. Fixed grid terms deliberately
+    remain conservative instead of subtracting their ordinary coordinate count.
+    """
+    own = run_tables(tables, run) if run is not None else tables
+    pitch = _gas_pitch(own, context)
+    pixels = context.grid_pixels
+    samples = int(np.ceil(max(0, pixels - 1) * np.hypot(*pitch) / min(pitch))) + 2
+    shape = context.grid_shape
+    if shape is None:
+        canvas = grid_canvas(own)
+        if canvas is None or int(np.prod(canvas.shape)) < pixels:
+            raise ValueError("Gas route memory needs a grid shape or complete canvas")
+        shape = canvas.shape
+    vertices = 4 * samples + max(shape) + 1
+    return 3 * 8 * vertices * _gas_port_count(tables, run, context)
+
+
+def _gas_scratch_parts(tables: Mapping, run: str | None, context) -> dict[str, int]:
+    """Array estimates for sequential contour, link and FFT-score operations.
+
+    EDT counts its int8 input, two int32 feature/index grids, float64 coordinate
+    differences and result, plus caller masks. MCP includes its float64 costs,
+    cumulative costs, int16 offsets, int8 edges, indexed heap, Python traceback
+    and arc-length resampling. FFT uses the actual fast lengths and half spectra;
+    an additional real-grid workspace allowance is retained for the backend.
+    These are implementation/configuration estimates, not universal bounds for
+    external-library workspaces; host measured admission remains necessary.
+    """
+    own = run_tables(tables, run) if run is not None else tables
+    pitch = _gas_pitch(own, context)
+    shape = context.grid_shape
+    if shape is None:
+        canvas = grid_canvas(own)
+        if canvas is None or int(np.prod(canvas.shape)) < context.grid_pixels:
+            raise ValueError(
+                "Gas scratch memory needs Sizes.grid_shape (rows, columns), "
+                "or an explicit measurement canvas containing the complete grid."
+            )
+        # The full explicit canvas bounds a crop's shape; do not factor pixels.
+        shape = canvas.shape
+    shape = tuple(int(value) for value in shape)
+    settings = asdict(
+        parameters_at_depth(
+            darsia.GasAllocationSettings(**own["gas_allocation"]),
+            _gas_depth_bound_mm(own, context),
+        )
+    )
+    window = settings["score_window_mm"]
+    pixels, working = context.grid_pixels, context.itemsize
+    widths = {}
+    for name, length in (("contour_smoothing_mm", 2), ("contour_blend_mm", 3)):
+        values = tuple(float(value) for value in settings[name])
+        if len(values) != length or any(not np.isfinite(v) or v < 0 for v in values):
+            raise ValueError(f"Gas {name} needs {length} finite nonnegative lengths.")
+        widths[name] = values
+    closing = float(settings["closing_length_mm"])
+    if not np.isfinite(closing) or closing < 0:
+        raise ValueError("Gas closing_length_mm must be finite and nonnegative.")
+    margin, rounding = widths["contour_smoothing_mm"]
+    _, blend_closing, blend_rounding = widths["contour_blend_mm"]
+    reach = max(closing + margin + 4 * rounding, blend_closing + 4 * blend_rounding)
+    padding = tuple(int(np.ceil(reach / step)) + 2 for step in pitch)
+    padded = (shape[0] + 2 * padding[0]) * (shape[1] + 2 * padding[1])
+    contour = 40 * padded + 12 * pixels + 64 * sum(shape)
+
+    # The eight-neighbour path is simple. Its physical arc length cannot exceed
+    # (pixels-1) diagonal steps, including a winding observed component.
+    samples = int(np.ceil(max(0, pixels - 1) * np.hypot(*pitch) / min(pitch))) + 2
+    pointer = np.dtype(np.intp).itemsize
+    capacity = 1 << (max(128, pixels) - 1).bit_length()
+    retained = (3 + 2 * working + 8 + 8 + 2 + 4 + pointer + 8) * pixels
+    heap = (16 + pointer) * (capacity + capacity // 2)
+    traceback = (
+        sys.getsizeof((0, 0)) + 2 * sys.getsizeof(max(shape)) + 2 * pointer + 16
+    ) * pixels
+    # Original points/length/arc arrays use 32 B per vertex. Resampled points,
+    # smooth/intermediate paths and raster conversion use at most 192 B/sample,
+    # including repeated raster coordinates.
+    # The solver remains alive through traceback and path smoothing, so its
+    # allocated heap may coexist with either operation's temporary arrays.
+    links = (
+        retained
+        + heap
+        + max(48 * pixels, traceback, 32 * pixels + 192 * samples)
+        + 4096
+    )
+    positions = working if grid_model(own) is not None else 8
+    links = max(links, (3 * positions + 5) * pixels)
+
+    sigma = window / np.sqrt(12)
+    kernel_shape = tuple(2 * int(np.ceil(3 * sigma / step)) + 1 for step in pitch)
+    cells = kernel_shape[0] * kernel_shape[1]
+    fft_shape = tuple(
+        next_fast_len(n + k - 1, real=True) for n, k in zip(shape, kernel_shape)
+    )
+    real_cells = fft_shape[0] * fft_shape[1]
+    complex_cells = fft_shape[0] * (fft_shape[1] // 2 + 1)
+    kernel_building = 25 * cells + 16 * sum(kernel_shape)
+    retained_kernel = (9 + working) * cells + 8 * sum(kernel_shape)
+    fft = 3 * working * pixels + 6 * working * complex_cells + 4 * working * real_cells
+    exact_support = (2 * working + 36) * pixels
+    score = max(kernel_building, retained_kernel + max(fft, exact_support))
+
+    # Depth values are not loaded by admission. The implementation caps kernel
+    # offsets at the grid edges, which bounds even an arbitrarily deep cell.
+    # Quantised levels run sequentially; there is no number-of-levels multiplier.
+    depth_kernel = tuple(2 * size - 1 for size in shape)
+    depth_cells = depth_kernel[0] * depth_kernel[1]
+    depth_fft = tuple(
+        next_fast_len(n + k - 1, real=True) for n, k in zip(shape, depth_kernel)
+    )
+    depth_real = depth_fft[0] * depth_fft[1]
+    depth_complex = depth_fft[0] * (depth_fft[1] // 2 + 1)
+    depth_building = 12 * depth_cells + 16 * sum(depth_kernel)
+    depth_filter = 5 * depth_cells + 4 * pixels + 24 * depth_complex + 16 * depth_real
+    depth = 18 * pixels + max(depth_building, depth_filter)
+    return {
+        "contour": int(contour),
+        "links": int(links),
+        "score": int(score),
+        "depth": int(depth),
+    }
+
+
+def _gas_scratch_bytes(tables: Mapping, run: str | None, context) -> int:
+    """Largest scratch estimate; contour, link search and scoring are sequential."""
+    return max(_gas_scratch_parts(tables, run, context).values())
+
+
 class _Probabilities(Sequence):
     """A run's phase probabilities by frame, computed when asked for, a window of
     them kept; each frame's previous image is the run's acquisition just before
@@ -1002,7 +1264,7 @@ def _phase_maps(ctx: StepContext) -> None:
     if late:
         raise ValueError(f"The frames of run {run} are not in time order: {late}.")
     rules, source = settings["phase_rules"], settings["phase_model"]
-    grid = run_grid(ctx.read("rig", read_rig), settings["material"])
+    grid = run_grid(ctx.read("rig", read_rig), settings["material"], rules.pitch_stride)
     model = ctx.read(
         "phase-model",
         lambda folder: darsia.read_phase_model(
@@ -1046,7 +1308,7 @@ def _phase_maps(ctx: StepContext) -> None:
         rules,
         grid.chart,
         gas_threshold=model.gas_threshold,
-
+        positions=grid.positions,
     )
     previous_photos = [
         previous_acquisition(
@@ -1087,7 +1349,7 @@ def _phase_maps(ctx: StepContext) -> None:
             experiment.injection_protocol,
             rules,
             settings["gas_allocation"],
-
+            positions=grid.positions,
             chart=grid.chart,
             depth_m=grid.rig.depth.img,
         )
@@ -1096,19 +1358,17 @@ def _phase_maps(ctx: StepContext) -> None:
         probabilities.clear()
         allocations = {}
 
-        def placed_before(held_out):
-            """The placed free gas of the frame before a resumed run's start, for
-            the allocation's no-growth rule; None from the run's first frame."""
-            if not start:
+        def saturation_before(held_out):
+            """The free-gas saturation of the frame before a resumed run's start,
+            for the allocation's growth rule; None from the run's first frame."""
+            if not (
+                start and settings["gas_allocation"].growth_only_from_injecting_ports
+            ):
                 return None
-            stored = ctx.own(read_description, frame=frames[start - 1])
-            allocation = stored["measurements"]["gas_allocation"]
-            own = (
-                allocation["primary"]
-                if held_out is None
-                else allocation["without"][held_out]
+            return ctx.own(
+                lambda folder: darsia.read_phase_maps(folder, held_out)["saturation"],
+                frame=frames[start - 1],
             )
-            return own["placed_m3"]
 
         def maps(held_out):
             volumes = ctx.read(
@@ -1133,11 +1393,11 @@ def _phase_maps(ctx: StepContext) -> None:
                 model_frames=cached,
                 zones=zones,
                 depth_m=grid.rig.depth.img,
-
+                positions=grid.positions,
                 record=lambda index, value: allocations.__setitem__(
                     held_out, asdict(value)
                 ),
-                placed_before_m3=placed_before(held_out),
+                saturation_before=saturation_before(held_out),
             )
 
         found_maps = zip(frames[start:], *(maps(v) for v in variants))
@@ -1448,7 +1708,9 @@ PHASE_MAPS = Step(
             Term(_variants, grid=4.0, grid_bytes=80.0),
             Term(_supported, grid=6.0),
             Term(_injection_map_bytes, grid_bytes=1.0),
-            Term(_expert_limited, grid_bytes=2.0),
+            Term(_gas_scratch_bytes, fixed_bytes=1.0),
+            Term(_gas_route_bytes, fixed_bytes=1.0),
+            Term(_expert_limited, grid_bytes=2.0),  # two bool limit masks
         ),
         photos=1,
         photo_bytes=darsia.decoded_bytes,

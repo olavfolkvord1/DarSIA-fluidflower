@@ -25,6 +25,7 @@ that a result made before one of them was changed is not reused.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -216,6 +217,22 @@ def read_rig(folder: Path) -> Rig:
     return Rig.load(Path(folder))
 
 
+def read_grid_model(
+    folder: Path,
+) -> tuple[list[list[float]] | None, darsia.MeasurementCanvas | None]:
+    """A stored rig's measured model of its grid (``Rig.grid_to_rig``) and the
+    canvas its pixels were measured on (``Rig.measurement_canvas``), from its meta
+    data alone; None for a grid in rig metres and for the grid itself."""
+    with open(Path(folder) / "meta_data.json", "r") as f:
+        meta = json.load(f)
+    canvas = meta.get("measurement_canvas")
+    if canvas is not None:
+        canvas = darsia.MeasurementCanvas(
+            tuple(canvas["origin"]), tuple(canvas["shape"])
+        )
+    return meta.get("grid_to_rig"), canvas
+
+
 def read_image(folder: Path) -> darsia.Image:
     """A stored corrected image."""
     return darsia.imread(Path(folder) / "image.npz")
@@ -228,20 +245,15 @@ def _sand_map(ctx: StepContext) -> None:
     ctx.publish(lambda folder: labels.save(Path(folder) / "labels.npz"))
 
 
-def grid_depth(
-    rig: Rig,
-    measurements: Path,
-    grid_to_rig: Sequence[Sequence[float]] | np.ndarray | None = None,
-) -> darsia.Image:
+def grid_depth(rig: Rig, measurements: Path) -> darsia.Image:
     """A rig's depth by the depth rule of its measurements: linear inside their
     hull and the nearest one outside (:func:`darsia.interpolate_linear_in_hull`),
     in the precision of the rig's grid, that of its pixel areas, as our
-    production's mass evaluated it on its run grid. With the run's measured model
-    of its grid, the rule is evaluated at each pixel's position on the rig: the
-    model applied to its column and row (whole numbers) in the grid's precision
-    (:func:`darsia.project_xy`), as our production's mass placed its pixels in
-    metres; without one, at the pixel centres of the grid in metres
-    (:func:`darsia.pixel_centres`, cast to the grid's precision).
+    production's mass evaluated it on its run grid, at each pixel's position on
+    the rig (:func:`darsia.grid_positions` by the rig's measured model of its
+    grid, ``Rig.grid_to_rig``, cast to the grid's precision): the model at the
+    pixel's column and row, as our production's mass placed its pixels in metres,
+    or without one the pixel centres.
 
     Parameters
     ----------
@@ -249,9 +261,6 @@ def grid_depth(
         The rig, on its run grid.
     measurements : Path
         The depth measurements' table: ``x``, ``y`` [m] and :data:`DEPTH`.
-    grid_to_rig : array, optional
-        The run's measured homography from its grid's pixels to rig metres
-        (:func:`grid_model`).
 
     Returns
     -------
@@ -262,16 +271,8 @@ def grid_depth(
     table = pd.read_csv(measurements)
     columns = ["x" if "x" in table else "X", "y" if "y" in table else "Y", DEPTH]
     dtype = rig.pixel_area.img.dtype
-    if grid_to_rig is None:
-        x, y = darsia.pixel_centres(rig.baseline)
-        xx, yy = np.meshgrid(x, y)
-    else:
-        rows, cols = rig.baseline.img.shape[:2]
-        xx, yy = darsia.project_xy(
-            np.asarray(grid_to_rig, dtype),
-            np.arange(cols, dtype=dtype)[None, :],
-            np.arange(rows, dtype=dtype)[:, None],
-        )
+    positions = darsia.grid_positions(rig.baseline, rig.grid_to_rig, dtype)
+    xx, yy = positions.x, positions.y
     points = np.column_stack((xx.ravel(), yy.ravel()))
     values, _ = darsia.interpolate_linear_in_hull(
         tuple(table[c].to_numpy() for c in columns), points.astype(dtype)
@@ -296,16 +297,81 @@ def grid_model(tables: Mapping[str, Any]) -> list[list[float]] | None:
     return tables.get("labeling", {}).get("sand_map", {}).get("grid_to_rig")
 
 
+def grid_canvas(tables: Mapping[str, Any]) -> darsia.MeasurementCanvas | None:
+    """The canvas a run's pixels were measured on, in its grid's pixels
+    (``[labeling.sand_map] canvas_origin``, the column and row of its first
+    pixel, and ``canvas_shape``, its rows and columns), if it has one.
+
+    Raises
+    ------
+    ValueError
+        If one of the two is given without the other, or a canvas without the
+        grid's measured model.
+
+    """
+    table = tables.get("labeling", {}).get("sand_map", {})
+    origin, shape = table.get("canvas_origin"), table.get("canvas_shape")
+    if origin is None and shape is None:
+        return None
+    if origin is None or shape is None or table.get("grid_to_rig") is None:
+        raise ValueError(
+            "[labeling.sand_map] canvas_origin and canvas_shape go together, with "
+            "grid_to_rig."
+        )
+    return darsia.MeasurementCanvas(
+        (int(origin[0]), int(origin[1])), (int(shape[0]), int(shape[1]))
+    )
+
+
 def output_cells(
     tables, runs, context, cell_mm: float, edge_mm=None, reference=None
 ) -> int:
-    """Count nominal metric cells from configured physical rig dimensions."""
+    """Count metric output cells from configured dimensions or measured corners.
+
+    Measured canvases take precedence over the optional grid shape. With neither,
+    a homography cannot locate the last row and column from pixel count alone.
+    A zero-stride image supplies grid metadata to the existing corner calculation
+    without allocating an image. Mixed measured/nominal runs use the nominal
+    rig's full rectangle, conservatively covering its pixel centres.
+    """
     if not math.isfinite(cell_mm) or cell_mm <= 0:
         raise ValueError("Memory estimation needs a finite positive output cell size.")
     own = {r: run_tables(tables, r) if r is not None else tables for r in runs}
+    measured = any(grid_model(t) is not None for t in own.values())
     step = Decimal(str(float(cell_mm))) / Decimal(1000)
-    rig = own[reference if reference is not None else next(iter(own))]["rig"]
-    lengths = (rig["height"], rig["width"])
+    if not measured:
+        rig = own[reference if reference is not None else next(iter(own))]["rig"]
+        lengths = (rig["height"], rig["width"])
+    else:
+        if edge_mm is None:
+            raise ValueError("Measured output-cell memory needs extent_edge_mm.")
+        corners = []
+        for name, one in own.items():
+            rig, model = one["rig"], grid_model(one)
+            if model is None:
+                corners.append(
+                    (np.array([0, rig["width"]]), np.array([0, rig["height"]]))
+                )
+                continue
+            canvas = grid_canvas(one)
+            shape = context.grid_shape
+            if shape is None and canvas is None:
+                raise ValueError(
+                    f"Memory for run {name!r}'s measured output extent needs "
+                    "Sizes.grid_shape=(rows, columns) or configured "
+                    "canvas_origin/canvas_shape."
+                )
+            grid = darsia.Image(
+                np.broadcast_to(np.uint8(0), shape or (1, 1)),
+                dimensions=[rig["height"], rig["width"]],
+            )
+            dtype = np.float32 if context.itemsize == 4 else np.float64
+            corners.append(darsia.grid_corners(grid, model, dtype, canvas))
+        x0, x1, y0, y1 = darsia.measured_extent(corners, cell_mm, edge_mm)
+        lengths = (
+            Decimal(str(y1)) - Decimal(str(y0)),
+            Decimal(str(x1)) - Decimal(str(x0)),
+        )
     if any(not math.isfinite(float(n)) or n <= 0 for n in lengths):
         raise ValueError("Memory estimation needs finite positive output dimensions.")
     return math.prod(
@@ -392,23 +458,37 @@ def _material_reference(
 
 def _rig(ctx: StepContext) -> None:
     """The run's rig, with its sand map as the labels and their facies, fitted on
-    its reference run's grid where the configuration names one, and with the depth
-    rule evaluated on its grid, by its measured model where it has one, where the
-    run's configuration chooses it."""
+    its reference run's grid where the configuration names one, and with the run's
+    measured model of its grid (``Rig.grid_to_rig``) and the canvas its pixels were
+    measured on (``Rig.measurement_canvas``), by which the depth rule is evaluated
+    on its grid where the run's configuration chooses it. The model is that of the
+    sand map's grid, so a rig on another grid (e.g. scaled to whole metric cells)
+    with a model is refused, as is a canvas that does not hold the grid."""
     run = ctx.task.run
     labels = ctx.read("sand-map", lambda folder: Path(folder) / "labels.npz")
+    sand_map = darsia.imread(labels)
     with TemporaryDirectory() as folder:
         reference = Path(folder) / "reference"
-        made = _material_reference(ctx, run, darsia.imread(labels), reference)
+        made = _material_reference(ctx, run, sand_map, reference)
         config = run_settings(ctx, run, list_required_sections(setup_rig), made)
         facies = Path(folder) / "facies.npz"
-        make_facies(config, darsia.imread(labels)).save(facies)
+        make_facies(config, sand_map).save(facies)
         # A depth rule evaluated on the grid needs no depth map.
         rule = config.depth.interpolation == "triangulation"
         rig = make_rig(Rig, config, labels=labels, facies=facies, depth=not rule)
+    rig.grid_to_rig = grid_model(run_tables(ctx.tables, run))
+    if rig.grid_to_rig is not None and rig.baseline.img.shape[:2] != sand_map.shape[:2]:
+        raise ValueError(
+            "[labeling.sand_map] grid_to_rig is the measured model of the sand "
+            "map's grid; the rig's grid is another one."
+        )
+    rig.measurement_canvas = grid_canvas(run_tables(ctx.tables, run))
+    if rig.measurement_canvas is not None and not rig.measurement_canvas.holds(
+        *sand_map.shape[:2]
+    ):
+        raise ValueError("[labeling.sand_map] the canvas does not hold the grid.")
     if rule:
-        model = grid_model(run_tables(ctx.tables, run))
-        rig.depth = grid_depth(rig, Path(config.depth.measurements), model)
+        rig.depth = grid_depth(rig, Path(config.depth.measurements))
         rig.setup_geometry()
     ctx.publish(lambda folder: rig.save(Path(folder)))
 

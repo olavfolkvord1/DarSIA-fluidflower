@@ -27,10 +27,7 @@ def _scene(shape=(70, 90), pitch=(1.0, 1.0)):
     image = darsia.Image(
         np.ones(shape, int), dimensions=np.asarray(shape) * pitch / 1000
     )
-    columns, rows = darsia.pixel_centres(image)
-    x, y = np.broadcast_arrays(columns[None, :], rows[:, None])
-    positions = SimpleNamespace(x=x, y=y, pitch_mm=tuple(pitch))
-    return image, positions, np.ones(shape, bool)
+    return image, darsia.grid_positions(image), np.ones(shape, bool)
 
 
 def _protocol(positions, pixel=None):
@@ -89,7 +86,7 @@ def test_contour_preserves_observed_seal_gas_and_excludes_checker_water():
             _protocol(positions),
             RULES,
             settings,
-            
+            positions=positions,
             chart=chart,
         )
     )[-1]
@@ -142,7 +139,7 @@ def test_link_reaches_injector_inside_observed_co2_and_preserves_endpoints():
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         SETTINGS,
         current_co2=observed,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -158,7 +155,7 @@ def test_link_reaches_injector_inside_observed_co2_and_preserves_endpoints():
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         SETTINGS,
         current_co2=observed,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -171,7 +168,7 @@ def test_link_reaches_injector_inside_observed_co2_and_preserves_endpoints():
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         SETTINGS,
         current_co2=observed,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -196,7 +193,7 @@ def test_porosity_anchors_links_without_changing_observed_co2(offset):
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         SETTINGS,
         current_co2=observed,
         depth_m=np.full(np.shape(contour), 0.1),
@@ -213,7 +210,7 @@ def test_porosity_anchors_links_without_changing_observed_co2(offset):
             observed,
             probability,
             path,
-            positions.x, positions.y, positions.pitch_mm,
+            positions,
             SETTINGS,
             current_co2=observed,
             depth_m=np.full(np.shape(contour), 0.1),
@@ -228,7 +225,7 @@ def test_porosity_anchors_links_without_changing_observed_co2(offset):
         observed,
         probability,
         path,
-        positions.x, positions.y, positions.pitch_mm,
+        positions,
         SETTINGS,
         current_co2=observed,
         depth_m=np.full(np.shape(contour), 0.1),

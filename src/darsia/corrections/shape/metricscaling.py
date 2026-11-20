@@ -10,8 +10,10 @@ Nothing is interpolated, so 1 mm, 5 mm or any other size is the same scaling.
 
 """
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 
 import numpy as np
@@ -28,13 +30,64 @@ class MetricCells:
     dimensions: list[float]
     """Height and width of the cells' extent, in metres (whole cells)."""
     index: np.ndarray
-    """Flat index of the cell of each canvas pixel, in row-major order."""
+    """Flat index of the cell of each canvas pixel, in row-major order; -1 for a
+    pixel without a cell (:func:`placed_cells`)."""
     pixel_area: float
     """Area of a canvas pixel in square metres."""
 
 
+def measured_extent(
+    corners: Sequence[tuple[np.ndarray, np.ndarray]],
+    cell_size_mm: float,
+    edge_mm: int,
+) -> tuple[float, float, float, float]:
+    """The whole cells of a size that cover given positions, e.g. the corner
+    pixels' measured positions of the compared runs' measurement canvases
+    (:func:`darsia.grid_corners`): x0, x1, y0, y1 [m]. The positions' extent is
+    first taken in whole steps of ``edge_mm`` (the step at or below the smallest
+    position and the one past the largest), then rounded outward to whole cells in
+    exact decimal arithmetic, as our production took its comparison's cells from
+    its frames' measured corners (in 10 mm steps).
+
+    Parameters
+    ----------
+    corners : sequence of (array, array)
+        The x and y [m] of positions, e.g. one pair per compared run.
+    cell_size_mm : float
+        Cell size in millimetres.
+    edge_mm : int
+        Step [mm] of the extent's edges before its whole cells.
+
+    Returns
+    -------
+    tuple of float
+        The extent x0, x1, y0, y1 [m], on whole cells counted from the origin.
+
+    """
+    per_metre = 1000 // int(edge_mm)
+    step = Decimal(str(float(cell_size_mm))) / Decimal(1000)
+    extent = []
+    for axis in (0, 1):
+        values = np.concatenate([np.ravel(pair[axis]) for pair in corners])
+        edges = (
+            math.floor(float(np.min(values)) * per_metre) / per_metre,
+            (math.floor(float(np.max(values)) * per_metre) + 1) / per_metre,
+        )
+        extent += [
+            float(
+                (Decimal(str(edge)) / step).to_integral_value(rounding=rounding) * step
+            )
+            for edge, rounding in zip(edges, (ROUND_FLOOR, ROUND_CEILING))
+        ]
+    return tuple(extent)
+
+
 def metric_cells(
-    native_shape: tuple[int, int], dimensions: list[float], cell_size_mm: float
+    native_shape: tuple[int, int],
+    dimensions: list[float],
+    cell_size_mm: float,
+    positions: "darsia.GridPositions | None" = None,
+    extent: tuple[float, float, float, float] | None = None,
 ) -> MetricCells:
     """Cover a canvas with whole metric cells and assign its pixels to them.
 
@@ -44,6 +97,13 @@ def metric_cells(
     canvas' lower left corner; a pixel belongs to the cell whose half-open
     interval holds its centre.
 
+    With each pixel's measured position on the rig (``positions``) and the
+    cells' extent in rig metres (``extent``, e.g. :func:`measured_extent`), a pixel
+    belongs to the cell that holds its position, its offset from the extent's
+    lower left corner divided by the cell size in the positions' precision, as our
+    production assigned its frames' pixels; a position outside the extent is
+    refused.
+
     Parameters
     ----------
     native_shape : tuple of int
@@ -52,16 +112,29 @@ def metric_cells(
         Height and width of the canvas in metres.
     cell_size_mm : float
         Cell size in millimetres.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig.
+    extent : tuple of float, optional
+        The extent x0, x1, y0, y1 [m] of the cells, whole cells; needed with positions.
 
     Returns
     -------
     MetricCells
         The cells and the cell of each pixel.
 
+    Raises
+    ------
+    ValueError
+        If a position lies outside the extent, or positions come without one.
+
     """
     rows, cols = (int(n) for n in native_shape)
     height, width = (float(length) for length in dimensions)
     step = Decimal(str(float(cell_size_mm))) / Decimal(1000)
+    if positions is not None:
+        if extent is None:
+            raise ValueError("Measured positions need the cells' extent")
+        return _measured_cells(rows, cols, height, width, step, positions, extent)
     counts = [
         int((Decimal(str(length)) / step).to_integral_value(rounding=ROUND_CEILING))
         for length in (height, width)
@@ -80,11 +153,167 @@ def metric_cells(
     )
 
 
+def _measured_cells(rows, cols, height, width, step, positions, extent) -> MetricCells:
+    """The cells of :func:`metric_cells` by each pixel's measured position."""
+    x0, x1, y0, y1 = (float(value) for value in extent)
+    counts = [
+        int(((Decimal(str(high)) - Decimal(str(low))) / step).to_integral_value())
+        for low, high in ((y0, y1), (x0, x1))
+    ]
+    size = float(step)
+    column = np.floor((positions.x - x0) / size).astype(np.int64)
+    row = np.floor((positions.y - y0) / size).astype(np.int64)
+    if np.any((column < 0) | (column >= counts[1]) | (row < 0) | (row >= counts[0])):
+        raise ValueError("A pixel's measured position lies outside the cells' extent")
+    dy, dx = np.float64(height) / rows, np.float64(width) / cols
+    return MetricCells(
+        shape=tuple(counts),
+        dimensions=[float(count * step) for count in counts],
+        index=((counts[0] - 1 - row) * counts[1] + column).ravel(),
+        pixel_area=float(dx * dy),
+    )
+
+
+def placed_cells(
+    cells: MetricCells,
+    cell_size_mm: float,
+    extent: tuple[float, float, float, float],
+    onto: tuple[float, float, float, float],
+) -> MetricCells:
+    """Cells of one extent placed onto the cells of another of the same size.
+
+    Each pixel keeps its cell, which moves by the whole cells between the two
+    extents' lower left corners, counted in exact decimal arithmetic. A pixel
+    whose cell lies outside ``onto`` gets none (index -1), and counts in no
+    cell's sum or mean. This is how our production placed its reference run's
+    pixels: first on cells over the reference run's own positions
+    (:func:`measured_extent`), then onto the comparison's cells, cut to them.
+
+    Parameters
+    ----------
+    cells : MetricCells
+        Cells over ``extent`` (:func:`metric_cells`).
+    cell_size_mm : float
+        Cell size in millimetres.
+    extent, onto : tuple of float
+        The extents x0, x1, y0, y1 [m] of the given cells and of the cells to place
+        them on.
+
+    Returns
+    -------
+    MetricCells
+        The cells over ``onto`` and the cell of each pixel, -1 for none.
+
+    Raises
+    ------
+    ValueError
+        If the extents do not share cell edges.
+
+    """
+    step = Decimal(str(float(cell_size_mm))) / Decimal(1000)
+
+    def whole(length: Decimal) -> int:
+        ratio = length / step
+        if ratio != ratio.to_integral_value():
+            raise ValueError("The cells' extents do not share cell edges")
+        return int(ratio)
+
+    x0, _, y0, _ = (Decimal(str(float(value))) for value in extent)
+    u0, u1, v0, v1 = (Decimal(str(float(value))) for value in onto)
+    counts = [whole(v1 - v0), whole(u1 - u0)]
+    rows, cols = cells.shape
+    row = rows - 1 - cells.index // cols + whole(y0 - v0)
+    column = cells.index % cols + whole(x0 - u0)
+    inside = (column >= 0) & (column < counts[1]) & (row >= 0) & (row < counts[0])
+    inside &= cells.index >= 0
+    return MetricCells(
+        shape=tuple(counts),
+        dimensions=[float(count * step) for count in counts],
+        index=np.where(inside, (counts[0] - 1 - row) * counts[1] + column, -1),
+        pixel_area=cells.pixel_area,
+    )
+
+
+def rectangular_cells(
+    native_shape: tuple[int, int],
+    dimensions: Sequence[float],
+    shape: tuple[int, int],
+    extent: tuple[float, float, float, float],
+    positions: "darsia.GridPositions",
+    *,
+    boundary_tolerance_m: float = 0.0,
+) -> MetricCells:
+    """Assign measured pixel centres to a fixed rectangular cell grid.
+
+    The target is ``shape`` rows and columns over ``extent`` x0, x1, y0, y1
+    in metres. Its x and y pitches may differ, as for a native simulator canvas.
+    Cells are half-open from the lower left; rows in the returned grid start
+    at the top, just as :func:`metric_cells`. Outside or nonfinite positions get
+    index -1, so a caller must account for those pixels before reducing data.
+    Neither coordinates nor extensive values are interpolated or stretched.
+    A caller may supply a documented numerical boundary tolerance in metres:
+    positions within it of the outer frame join the nearest boundary cell.
+    This changes only the cell index, never a source coordinate or value. The
+    default is strict, with no tolerance; larger excursions remain outside.
+    """
+    rows, cols = (int(n) for n in native_shape)
+    target = tuple(int(n) for n in shape)
+    lengths = np.asarray(dimensions, dtype=float)
+    bounds = np.asarray(extent, dtype=float)
+    if rows <= 0 or cols <= 0 or len(target) != 2 or min(target) <= 0:
+        raise ValueError("Source and target cell grids need positive shapes.")
+    if lengths.shape != (2,) or not np.isfinite(lengths).all() or np.any(lengths <= 0):
+        raise ValueError("The source grid needs two positive finite dimensions.")
+    if bounds.shape != (4,) or not np.isfinite(bounds).all():
+        raise ValueError("The target extent needs four finite coordinates.")
+    x0, x1, y0, y1 = bounds
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("The target extent must have positive width and height.")
+    if not np.isfinite(boundary_tolerance_m) or boundary_tolerance_m < 0:
+        raise ValueError("The boundary tolerance must be finite and nonnegative.")
+    x, y = np.broadcast_arrays(positions.x, positions.y)
+    if x.shape != (rows, cols):
+        raise ValueError("Measured positions must match the source grid.")
+    inside = np.isfinite(x) & np.isfinite(y)
+    if boundary_tolerance_m:
+        inside &= (
+            (x >= x0 - boundary_tolerance_m)
+            & (x <= x1 + boundary_tolerance_m)
+            & (y >= y0 - boundary_tolerance_m)
+            & (y <= y1 + boundary_tolerance_m)
+        )
+    else:
+        inside &= (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+    # Convert in double precision without changing the recorded coordinates.
+    column = np.floor(
+        (np.where(inside, x, x0).astype(float) - x0) / ((x1 - x0) / target[1])
+    ).astype(np.int64)
+    row = np.floor(
+        (np.where(inside, y, y0).astype(float) - y0) / ((y1 - y0) / target[0])
+    ).astype(np.int64)
+    if boundary_tolerance_m:
+        column = np.clip(column, 0, target[1] - 1)
+        row = np.clip(row, 0, target[0] - 1)
+    else:
+        inside &= (column < target[1]) & (row < target[0])
+    return MetricCells(
+        shape=target,
+        dimensions=[float(y1 - y0), float(x1 - x0)],
+        index=np.where(inside, (target[0] - 1 - row) * target[1] + column, -1).ravel(),
+        pixel_area=float(np.prod(lengths / (rows, cols))),
+    )
+
+
 def _cell_sums(cells: MetricCells, values: np.ndarray) -> np.ndarray:
-    """Sums per cell of values (pixels, channels), in their dtype and pixel order."""
+    """Sums per cell of values (pixels, channels), in their dtype and pixel order;
+    a pixel without a cell (index -1) counts in none."""
+    index = cells.index
+    kept = index >= 0
+    if not kept.all():
+        index, values = index[kept], values[kept]
     sums = np.zeros((values.shape[1], cells.shape[0] * cells.shape[1]), values.dtype)
     for channel, total in enumerate(sums):
-        np.add.at(total, cells.index, values[:, channel])
+        np.add.at(total, index, values[:, channel])
     return sums.T
 
 

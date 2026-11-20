@@ -285,8 +285,10 @@ max_iterations = 60
 distance_tolerance = 1e-4
 increment_tolerance = 1e-2
 bregman_updates = [0, 10, 20]
+extent_edge_mm = 10
 [mass_copy]
 copy_mm = 10.0
+extent_edge_mm = 10
 [distances]
 times_h = [3.0]
 tolerance_h = 0.6
@@ -501,6 +503,7 @@ def _co2_state(grid, experiment, date) -> darsia.PrecisionCO2MassAnalysis:
         atmospheric_temperature=value["temperature_celsius"],
         atmospheric_pressure_gradient=value["pressure_gradient_bar"],
         atmospheric_temperature_gradient=value["temperature_gradient_celsius"],
+        y_m=grid.positions.y,
     )
 
 
@@ -531,10 +534,14 @@ def _direct(root: Path, selection: Selection) -> dict:
             facies=root / f"facies-{run}.npz",
         ).save(root / run)
         rig = Rig.load(root / run)
-        if run == "r1":  # the depth rule at the grid's pixel centres, in its dtype
+        sand_map = run_tables(tables, run).get("labeling", {}).get("sand_map", {})
+        rig.grid_to_rig = sand_map.get("grid_to_rig")
+        rig.measurement_canvas = setup.grid_canvas(run_tables(tables, run))
+        if run == "r1":  # the depth rule at the grid's positions, in its dtype
             depths = pd.read_csv(root / "depth.csv")
-            x, y = darsia.pixel_centres(rig.baseline)
-            points = np.stack(np.meshgrid(x, y), axis=-1).reshape(-1, 2)
+            dtype = rig.pixel_area.img.dtype
+            placed = darsia.grid_positions(rig.baseline, rig.grid_to_rig, dtype)
+            points = np.column_stack((placed.x.ravel(), placed.y.ravel()))
             values, outside = darsia.interpolate_linear_in_hull(
                 (depths["x"], depths["y"], depths["depth"]),
                 points.astype(rig.pixel_area.img.dtype),
@@ -657,6 +664,14 @@ def _direct(root: Path, selection: Selection) -> dict:
         ]
         variants[run] = {}
         allocations[run] = {}
+        # The phase rules' pitch over the rig's canvas, by the rules' stride.
+        measured = darsia.grid_positions(
+            rig.facies,
+            rig.grid_to_rig,
+            rig.pixel_area.img.dtype,
+            rig.measurement_canvas,
+            rules.pitch_stride,
+        )
         for held_out, found in volumes[run].items():
             records = []
             maps = darsia.free_gas(
@@ -676,6 +691,7 @@ def _direct(root: Path, selection: Selection) -> dict:
                 gas_threshold=model.gas_threshold,
                 depth_m=rig.depth.img,
                 record=lambda index, value: records.append(asdict(value)),
+                positions=measured,
             )
             names = ("labels", "rules", "saturation", "co2", "before")
             variants[run][held_out] = [dict(zip(names, m)) for m in maps]
@@ -836,7 +852,18 @@ def _direct(root: Path, selection: Selection) -> dict:
     masses = darsia.mass_calibrations(fit, statistics)
     made, copies = {}, {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
-        copy = darsia.MassCopy(grid.geometry, darsia.MassCopySettings(10.0))
+        copy_settings = darsia.MassCopySettings(10.0, 10)
+        rig, positions, extent = grid.rig, None, None
+        if rig.grid_to_rig is not None:  # by the positions, over the canvas' corners
+            canvas = darsia.grid_corners(
+                rig.facies,
+                rig.grid_to_rig,
+                rig.pixel_area.img.dtype,
+                rig.measurement_canvas,
+            )
+            extent = darsia.measured_extent([canvas], 10.0, 10)
+            positions = grid.positions
+        copy = darsia.MassCopy(grid.geometry, copy_settings, positions, extent)
         start, reading, native = (
             experiment.experiment_start,
             readings[run],
@@ -887,7 +914,9 @@ def _direct(root: Path, selection: Selection) -> dict:
     domains = [AnalysisDomain(domain_id=n, **defined[n]) for n in selection.domains]
     domain_mass = {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
-        sums = DomainMass(domains, grid.geometry, grid.rig.labels, sand_labels)
+        sums = DomainMass(
+            domains, grid.geometry, grid.rig.labels, sand_labels, grid.positions
+        )
         start, rows = experiment.experiment_start, []
         for frame, date in zip(selection.frames[run], dates):
             h = (date - start).total_seconds() / 3600
@@ -899,6 +928,19 @@ def _direct(root: Path, selection: Selection) -> dict:
     wasserstein = settings(WassersteinSettings, "wasserstein")
     chart = settings(comparison.DistanceSettings, "distances").chart_labels
     grid, experiment = runs["r2"][:2]  # the configured reference run
+    extent = None  # with a measured model: cells over every run's measured corners
+    if any(runs[run][0].rig.grid_to_rig is not None for run in runs):
+        dtype = grid.rig.pixel_area.img.dtype
+        corners = [
+            darsia.grid_corners(
+                grid.rig.labels,
+                runs[run][0].rig.grid_to_rig,
+                dtype,
+                runs[run][0].rig.measurement_canvas,
+            )
+            for run in runs
+        ]
+        extent = darsia.measured_extent(corners, wasserstein.cell_mm, 10)
     reference = wasserstein_reference(
         grid.rig.labels,
         grid.rig.permeability.img,
@@ -907,11 +949,25 @@ def _direct(root: Path, selection: Selection) -> dict:
         chart,
         domains,
         wasserstein,
+        grid.positions,
+        extent,
+    )
+    # The scales take the official CO2 analysis at the start, as production's
+    # comparison did: the baseline's nominal heights, the protocol's state.
+    begin = experiment.experiment_start
+    begun = experiment.pressure_temperature_protocol.get_state(begin)
+    gradient = experiment.pressure_temperature_protocol.get_gradient(begin)
+    official = darsia.CO2MassAnalysis(
+        grid.rig.baseline,
+        begun.pressure,
+        begun.temperature,
+        gradient.pressure,
+        gradient.temperature,
     )
     scales = distance_scales(
         3.0,
         experiment.injection_protocol,
-        _co2_state(grid, experiment, experiment.experiment_start),
+        official,
         grid.rig.depth.img,
         grid.rig.facies.dimensions,
         domains,
@@ -933,6 +989,7 @@ def _direct(root: Path, selection: Selection) -> dict:
             grid.geometry,
             reference,
             wasserstein,
+            grid.positions,
         )
     distances = wasserstein_distances(3.0, found, reference, scales, wasserstein)
     style = settings(FigureStyle, "style")
@@ -1127,7 +1184,7 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         assert (stored / name).read_bytes() == (project / "figures" / name).read_bytes()
 
 
-@pytest.mark.parametrize("precision", ["float32", "float64"])
+@pytest.mark.parametrize("precision", ["float32", "float64", "measured"])
 def test_the_chain_as_jobs_equals_the_direct_calls(
     tmp_path, monkeypatch, importable, precision  # noqa: F811
 ):
@@ -1135,10 +1192,24 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     comparisons' distances, the films' tiles and films and the ensemble's figures;
     each film's encoder opens under the host's waiting lock. Single precision runs
     through the service's task processes, which store the results' arrays
-    compressed by the configuration, double precision in this process."""
+    compressed by the configuration, double precision in this process. With
+    a measured model of the first run's grid (in single precision, in this
+    process, on the sand map's grid), every step places that run's pixels by it."""
     project = tmp_path / "project"
-    config, selection = _project(project, precision)
+    config, selection = _project(
+        project, "float32" if precision == "measured" else precision
+    )
     monkeypatch.chdir(project)
+    if precision == "measured":
+        grid = darsia.Image(np.zeros((120, 180)), dimensions=[0.3, 0.45])
+        # Inside the rig's frame, and 1.5 mm off at the port, across the cells' edge.
+        shrink = np.array([[0.996, 0, 0.0024], [0, 0.996, 0.0021], [0, 0, 1.0]])
+        model = shrink @ np.linalg.inv(rig_grid(grid))
+        config.write_text(
+            config.read_text().replace("pixel_size_mm = 5.0\n", "")
+            + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {model.tolist()}\n"
+            + "canvas_origin = [-7, -5]\ncanvas_shape = [130, 194]\n"
+        )
     direct = _direct(project, selection)
     if precision == "float32":
         config.write_text(config.read_text() + "[storage]\ncompress = true\n")
@@ -1456,7 +1527,8 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     fitting grid: with the reference's stored baseline and facies, the fit mask the
     reference's own fit read, and the homography between the runs' grids built in
     the rig's precision; the reference run itself is fitted on its own grid and is
-    made first."""
+    made first. A run's rig keeps its measured model, by which its depth rule and
+    its run grid's positions place each pixel."""
     project = tmp_path / "project"
     config, selection = _project(project, "float32")
     monkeypatch.chdir(project)
@@ -1479,6 +1551,7 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
         + '[material_reference]\nrun = "r2"\n'
         + '[runs.r2.corrections.material_illumination]\nfit_mask = "mask-r2.npz"\n'
         + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {measured.tolist()}\n"
+        + "canvas_origin = [-5, -3]\ncanvas_shape = [126, 190]\n"
     )
     job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
     tasks = queue.tasks(job)
@@ -1544,6 +1617,70 @@ def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
     centres = np.stack(np.meshgrid(cx, cy), axis=-1).reshape(-1, 2).astype(f32)
     nominal, _ = darsia.interpolate_linear_in_hull(measurements, centres)
     assert not np.array_equal(first.depth.img, nominal.reshape(120, 180))
+    # The rig keeps its model, and its run grid places each pixel by it.
+    assert first.grid_to_rig == measured.tolist() and reference.grid_to_rig is None
+    # It keeps the canvas its pixels were measured on.
+    canvas = darsia.MeasurementCanvas((-5, -3), (126, 190))
+    assert first.measurement_canvas == canvas and reference.measurement_canvas is None
+    material = settings_from_table(
+        calibration.MaterialSettings, table(tables, "material")
+    )
+    grid = calibration.run_grid(first, material)
+    placed = grid.positions
+    assert np.array_equal(placed.x, x) and np.array_equal(placed.y, y)
+    assert np.array_equal(grid.geometry.y_m, y)
+
+
+def test_a_measurement_canvas_goes_with_a_model_and_holds_the_grid():
+    """A run's measurement canvas is its first pixel's column and row on the grid
+    and its rows and columns, given together and with the grid's measured model;
+    without them there is none."""
+    model = np.eye(3).tolist()
+    table = {"grid_to_rig": model, "canvas_origin": [-4, -2], "canvas_shape": [9, 12]}
+    found = setup.grid_canvas({"labeling": {"sand_map": table}})
+    assert found == darsia.MeasurementCanvas((-4, -2), (9, 12))
+    assert setup.grid_canvas({"labeling": {"sand_map": {"grid_to_rig": model}}}) is None
+    for wrong in (
+        {"grid_to_rig": model, "canvas_origin": [-4, -2]},
+        {"grid_to_rig": model, "canvas_shape": [9, 12]},
+        {"canvas_origin": [-4, -2], "canvas_shape": [9, 12]},
+    ):
+        with pytest.raises(ValueError, match="go together"):
+            setup.grid_canvas({"labeling": {"sand_map": wrong}})
+
+
+def test_a_rigs_model_and_canvas_are_read_from_its_meta_data_alone(tmp_path):
+    """A stored rig's measured model of its grid and its measurement canvas are
+    read from its meta data alone, none where it has none."""
+    model = [[0.001, 0.0, 0.0], [0.0, -0.001, 0.3], [0.0, 0.0, 1.0]]
+    canvas = {"origin": [-7, -5], "shape": [130, 194]}
+    (tmp_path / "meta_data.json").write_text(
+        json.dumps({"grid_to_rig": model, "measurement_canvas": canvas})
+    )
+    found, measured = setup.read_grid_model(tmp_path)
+    assert found == model
+    assert measured == darsia.MeasurementCanvas((-7, -5), (130, 194))
+    (tmp_path / "meta_data.json").write_text(json.dumps({"baseline_path": "b"}))
+    assert setup.read_grid_model(tmp_path) == (None, None)
+
+
+def test_a_measured_model_of_another_grid_than_the_rigs_is_refused(
+    tmp_path, monkeypatch
+):
+    """A measured model is that of the sand map's grid: a rig scaled to whole
+    metric cells, another grid, with a model is refused."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float32")
+    monkeypatch.chdir(project)
+    grid = darsia.Image(np.zeros((120, 180)), dimensions=[0.3, 0.45])
+    model = np.linalg.inv(rig_grid(grid))
+    config.write_text(
+        config.read_text()
+        + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {model.tolist()}\n"
+    )
+    job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
+    with pytest.raises(ValueError, match="the rig's grid is another one"):
+        _run(job)
 
 
 def test_a_run_reads_its_reference_runs_files_in_the_read_of_its_rig(
@@ -1755,7 +1892,9 @@ def test_a_runs_atmosphere_is_its_record_over_its_hours(tmp_path):
         assert found == gradients[dtype]
         image = darsia.ScalarImage(np.zeros((2, 2), dtype), dimensions=[0.02, 0.02])
         grid = SimpleNamespace(
-            rig=SimpleNamespace(baseline=image, pixel_area=image), datum_m=0.02
+            rig=SimpleNamespace(baseline=image, pixel_area=image),
+            datum_m=0.02,
+            positions=darsia.grid_positions(image),
         )
         for h, value, gradient in zip(hours, values, gradients[dtype]):
             date = start + datetime.timedelta(hours=h)

@@ -135,9 +135,25 @@ def _mass_maps(ctx: StepContext) -> None:
 
 
 def _mass_copy(ctx: StepContext) -> None:
-    """Each frame's mass maps copied onto metric cells."""
+    """Each frame's mass maps copied onto metric cells. With the run's measured
+    model each pixel goes onto them by its measured position, on cells over the
+    corners of the run's measurement canvas, as our production's copy placed its
+    pixels."""
     grid = run_grid(ctx.read("rig", read_rig), ctx.settings["material"])
-    copy = darsia.MassCopy(grid.geometry, ctx.settings["mass_copy"])
+    settings, rig = ctx.settings["mass_copy"], grid.rig
+    positions = extent = None
+    if rig.grid_to_rig is not None:
+        if settings.extent_edge_mm is None:
+            raise ValueError("A measured model needs [mass_copy] extent_edge_mm")
+        dtype = rig.pixel_area.img.dtype
+        corners = darsia.grid_corners(
+            rig.facies, rig.grid_to_rig, dtype, rig.measurement_canvas
+        )
+        extent = darsia.measured_extent(
+            [corners], settings.copy_mm, settings.extent_edge_mm
+        )
+        positions = grid.positions
+    copy = darsia.MassCopy(grid.geometry, settings, positions, extent)
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
@@ -146,7 +162,7 @@ def _mass_copy(ctx: StepContext) -> None:
         fields = {**copy(maps, labels), **copy.static}
         ctx.publish(
             lambda folder: darsia.write_mass_copy(
-                folder, fields, grid.rig.facies, copy.cells, frame.name
+                folder, fields, grid.rig.facies, copy.cells, frame.name, copy.extent
             ),
             frame=frame,
         )
@@ -167,6 +183,7 @@ def _domain_mass(ctx: StepContext) -> None:
         grid.geometry,
         grid.rig.labels,
         settings.sand_labels,
+        grid.positions,
         chart_labels=settings.chart_labels,
         min_part_area_cm2=settings.min_part_area_cm2,
     )

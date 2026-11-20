@@ -19,10 +19,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from darsia.utils import results
-
 from math import hypot
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -46,7 +44,7 @@ from darsia.multiphase.phase_rules import (
     _gravity_limit,
     _port_zones,
     _seal,
-    _pitch_mm,
+    _single,
     _summed_areas,
     phase_labels,
     phase_maps,
@@ -88,8 +86,112 @@ class GasAllocationRecord:
     active_link_diagnostics: list[dict] = field(default_factory=list)
     """Raw geometry outcomes for active ports, including local-depth refusals."""
     growth_limit_m3: float | None = None
-    """The previous frame's placed gas that bounded this frame's while no port
-    injected (``no_growth_after_injection``); None where it did not."""
+    """The previous gas volume outside the active ports' rising reach."""
+    growth_peeled_m3: float = 0.0
+    """Model volume removed by the growth rule before matching the target."""
+    growth_retained_m3: float = 0.0
+    """Earlier gas retained on still-supported cells outside injecting reach."""
+
+
+def rising_reach(
+    passable: np.ndarray, seeds: np.ndarray, top_first: bool
+) -> np.ndarray:
+    """The pixels gas from ``seeds`` can reach by rising or moving sideways,
+    never down, through ``passable`` pixels.
+
+    One pass from the bottom row to the top: a row's pixels are reached where a
+    passable run of the row holds a seed or lies directly above a reached pixel,
+    and then the whole run is reached.
+
+    Parameters
+    ----------
+    passable : array of bool
+        Pixels gas can move through, e.g. porous sand that is no seal.
+    seeds : array of bool
+        Where the gas enters, e.g. the injecting ports' discs.
+    top_first : bool
+        Whether the first row is the top of the rig.
+
+    Returns
+    -------
+    array of bool
+        The reached pixels.
+
+    """
+    passable = np.asarray(passable, bool)
+    seeds = np.asarray(seeds, bool) & passable
+    reach = np.zeros(passable.shape, bool)
+    below = np.zeros(passable.shape[1], bool)
+    count = passable.shape[0]
+    rows = range(count - 1, -1, -1) if top_first else range(count)
+    for r in rows:
+        run = passable[r]
+        entry = run & (seeds[r] | below)
+        if entry.any():
+            starts = run & ~np.r_[False, run[:-1]]
+            ids = np.cumsum(starts) * run
+            row = np.isin(ids, np.unique(ids[entry])) & run
+        else:
+            row = entry
+        reach[r] = row
+        below = row
+    return reach
+
+
+def _hold_model_gas(
+    cap, model, pore_volume, passable, driven, previous, y, top_first, *, carried=None
+):
+    """Allow buoyant migration within each reachable pool's prior volume."""
+    outside = ~driven
+    optical = model & outside
+    at_risk = optical if carried is None else optical | carried
+    original = float(
+        np.sum(np.multiply(cap[optical], pore_volume[optical], dtype=np.float64))
+    )
+    if previous is None:
+        cap[at_risk] = 0
+        return 0.0, original
+
+    # The injecting reach is closed under upward and lateral steps. Gas already
+    # inside it cannot fund another pool outside it.
+    seeds = outside & passable & (previous > 0)
+    weights = np.multiply(previous[seeds], pore_volume[seeds], dtype=np.float64)
+    bound = float(weights.sum())
+    if not at_risk.any():
+        return bound, 0.0
+    migration = rising_reach(passable & outside, seeds, top_first)
+    cap[at_risk & ~migration] = 0
+    held_model = at_risk & migration
+    if not held_model.any():
+        return bound, original
+
+    regions, count = ndimage.label(migration)
+    counts = count + 1
+    prior = np.bincount(
+        regions[seeds],
+        weights=weights,
+        minlength=counts,
+    )
+    rows, cols = np.nonzero(held_model)
+    pixels = rows, cols
+    pools = regions[pixels]
+    room = np.multiply(cap[pixels], pore_volume[pixels], dtype=np.float64)
+    totals = np.bincount(pools, weights=room, minlength=counts)
+    excess = np.maximum(totals - prior, 0)
+    remove = np.flatnonzero(excess[pools] > 0)
+    if remove.size:
+        order = np.lexsort((y[rows[remove], cols[remove]], pools[remove]))
+        ordered = remove[order]
+        groups, starts = np.unique(pools[ordered], return_index=True)
+        stops = np.r_[starts[1:], ordered.size]
+        for pool, start, stop in zip(groups, starts, stops, strict=True):
+            group = ordered[start:stop]
+            cells = rows[group], cols[group]
+            volume = room[group]
+            retained = np.clip(np.cumsum(volume) - excess[pool], 0, volume)
+            cap[cells] = np.minimum(cap[cells], retained / pore_volume[cells])
+    kept = float(np.sum(np.multiply(cap[optical], pore_volume[optical], dtype=np.float64)))
+    return bound, max(0.0, original - kept)
 
 
 def _active_link_diagnostics(zone, ports):
@@ -333,7 +435,8 @@ def _peel_order(model, y, room, pitch_mm, settings):
 
     On a lattice of cells, each 8-connected piece's core is its cells deepest
     inside it; pixels go by the highest cost from the cores first, then by
-    cell, then the lowest first, then row-major.
+    cell, then the lowest first (by their heights ``y`` in double precision),
+    then row-major.
     """
     cell = tuple(max(1, int(round(settings.lattice_mm / pitch))) for pitch in pitch_mm)
     step = (cell[0] * pitch_mm[0], cell[1] * pitch_mm[1])
@@ -355,7 +458,7 @@ def _peel_order(model, y, room, pitch_mm, settings):
     order = np.lexsort(
         (
             rows * model.shape[1] + cols,
-            y[rows],
+            np.asarray(y, np.float64)[rows, cols],
             cell_rows * shape[1] + cell_cols,
             -value,
         )
@@ -403,6 +506,7 @@ def gas_model_frames(
     chart=None,
     *,
     gas_threshold,
+    positions=None,
 ):
     """Yield the model's preallocation state once for every selected frame.
 
@@ -432,6 +536,8 @@ def gas_model_frames(
         Colour checker mask.
     gas_threshold : float
         Conditional gas probability threshold of the phase model.
+    positions : darsia.GridPositions, optional
+        Measured pixel positions and metric pitch.
 
     Yields
     ------
@@ -450,7 +556,7 @@ def gas_model_frames(
         chart,
         None,
         gas_threshold=gas_threshold,
-
+        positions=positions,
     )
     for index, (labels, rules) in enumerate(made):
         probability = probabilities[index]
@@ -482,10 +588,11 @@ def free_gas(
     gas_threshold: float,
     depth_m: np.ndarray | None = None,
     start: int = 0,
+    positions: darsia.GridPositions | None = None,
     record: Callable[[int, GasAllocationRecord], None] | None = None,
     model_frames: Sequence[GasModelFrame] | None = None,
     zones: Sequence[GasZone] | None = None,
-    placed_before_m3: float | None = None,
+    saturation_before: np.ndarray | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Phase and rule maps and free-gas saturations of a run's frames, by volume.
 
@@ -539,6 +646,10 @@ def free_gas(
     start : int, optional
         Index of the first frame to allocate. The complete run remains the
         source of the contour, neighbours and any active-injection signal.
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig and the grid's pitch, by the run's
+        measured model of its grid; by default the sand map's pixel centres
+        (:func:`darsia.grid_positions`).
     record : callable, optional
         Receives a frame index and its numeric :class:`GasAllocationRecord`
         before that frame is yielded. The iterator still yields five arrays.
@@ -584,7 +695,7 @@ def free_gas(
                 rule_settings,
                 chart,
                 gas_threshold=gas_threshold,
-
+                positions=positions,
             )
             made = gas_model_zones(
                 prepared.store(originals),
@@ -595,7 +706,7 @@ def free_gas(
                 protocol,
                 rule_settings,
                 settings,
-
+                positions=positions,
                 chart=chart,
                 depth_m=depth_m,
             )
@@ -617,12 +728,12 @@ def free_gas(
                 chart,
                 gas_threshold=gas_threshold,
                 start=start,
-
+                positions=positions,
                 record=record,
                 model_frames=prepared,
                 zones=contours,
                 depth_m=depth_m,
-                placed_before_m3=placed_before_m3,
+                saturation_before=saturation_before,
             )
         return
     if zones is None or len(model_frames) != len(dates) or len(zones) != len(dates):
@@ -630,23 +741,42 @@ def free_gas(
     if not 0 <= start <= len(dates):
         raise ValueError("Allocation start lies outside the selected run")
     facies = sand_map.img
-    x, y = darsia.pixel_centres(sand_map)
-    pitch_mm = _pitch_mm(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
+    y, pitch_mm = positions.y, positions.pitch_mm
     ports = injection_ports(protocol)
-    radius, lower = _port_zones(x, y, ports, rule_settings)
+    radius, lower = _port_zones(*_single(positions), ports, rule_settings)
     seal = _seal(facies, domain, permeability, rule_settings)
     eligible = pore_volume_m3 > 0
 
     def stored_labels(index):
         return model_frames[index].before
 
-    growth = getattr(settings, "no_growth_after_injection", False)
-    previous = placed_before_m3 if start > 0 else None
+    growth = getattr(settings, "growth_only_from_injecting_ports", False)
+    previous = saturation_before if start > 0 else None
     if growth and start > 0 and previous is None:
         raise ValueError(
-            "Resuming with no_growth_after_injection needs the placed gas of the"
-            " frame before the start"
+            "Resuming with growth_only_from_injecting_ports needs the saturation of"
+            " the frame before the start"
         )
+    reaches, entries = {}, {}
+    if growth:
+        passable = (
+            domain & eligible & ~seal & ~np.isin(facies, rule_settings.free_water_facies)
+        )
+        if chart is not None:
+            passable &= ~chart
+        top_first = bool(np.mean(y[0]) > np.mean(y[-1]))
+        # Gas enters at the port: the passable pixel nearest to it, so that a
+        # port just above a seal never seeds the sand below that seal.
+        if ports and passable.any():
+            px, py = (np.asarray(v, np.float64) for v in (positions.x, positions.y))
+            for port in ports:
+                d2 = (px - port[0]) ** 2
+                d2 += (py - port[1]) ** 2
+                d2[~passable] = np.inf
+                entries[port] = int(d2.argmin())
+            del px, py, d2
     for index in range(start, len(dates)):
         frame = model_frames[index]
         zone = zones[index]
@@ -693,32 +823,79 @@ def free_gas(
         cap[keep] = swi.dtype.type(1) - swi[keep]
         dismissed = (own == PhaseLabel.DISSOLVED) & (gas_probability >= gas_threshold)
         cap[dissolved & (dismissed | below | lobes)] = 0
+        requested = target = volumes_m3[index]
+        bound = region = None
+        growth_peeled = 0.0
+        carried = None
+        if growth:
+            key = tuple(injecting)
+            if key not in reaches:
+                entry = np.zeros(co2.shape, bool)
+                for port in injecting:
+                    if port in entries:
+                        entry.flat[entries[port]] = True
+                reaches[key] = rising_reach(passable, entry, top_first)
+                del entry
+            region = reaches[key]
+            optical_model = (cap > 0) & (labels == PhaseLabel.GAS)
+            if previous is not None and target is not None:
+                # The existing volume outside the driven region can stay
+                # where the current observation still supports it. It shares
+                # the same pool budget as migrating model gas.
+                carried = (
+                    passable
+                    & ~region
+                    & (previous > 0)
+                    & (cap > 0)
+                    & (dissolved | hidden)
+                    & ~below
+                    & ~lobes
+                    & limit
+                )
+                cap[carried] = np.minimum(previous[carried], cap[carried])
+            bound, growth_peeled = _hold_model_gas(
+                cap,
+                optical_model,
+                pore_volume_m3,
+                passable,
+                region,
+                previous,
+                y,
+                top_first,
+                carried=carried,
+            )
+            _change(
+                labels,
+                rules,
+                optical_model & (cap == 0),
+                PhaseLabel.DISSOLVED,
+                PhaseRule.PEELED,
+            )
+            del optical_model
         pore_volume = np.where(keep, pore_volume_m3, 0).astype(np.float64)
         room = pore_volume * cap.astype(np.float64)
         allowed = keep & (pore_volume_m3 * cap > 0)
         model = allowed & (labels == PhaseLabel.GAS)
-        saturation = np.where(model, cap, cap.dtype.type(0))
-        requested = target = volumes_m3[index]
+        present = model if carried is None else model | (carried & allowed)
+        saturation = np.where(present, cap, cap.dtype.type(0))
         model_volume = float(np.sum(room[model]))
-        bound = None
-        if growth and previous is not None and not injecting:
-            # No source while no port injects: never more gas than the frame before.
-            if target is None and model_volume > previous:
-                target = bound = previous
-            elif target is not None and target > previous:
-                target = bound = previous
+        present_volume = model_volume if carried is None else float(np.sum(room[present]))
+        if region is not None and not region.any() and target is not None:
+            target = min(present_volume, target)
         seeds = None
         if target is not None:
-            if target >= model_volume:
+            if target >= present_volume and (region is None or region.any()):
                 inward = _inward_weight(limit, pitch_mm, decay)
                 candidate = (
                     allowed & (dissolved | hidden) & ~seal & ~below & ~lobes & limit
                 )
+                if region is not None:
+                    candidate &= region
                 allowance = np.zeros(co2.shape, bool)
                 for port in injecting:
                     allowance |= radius[port]
                 seeds = _seeds(
-                    model,
+                    present,
                     candidate,
                     allowance & co2,
                     neighbours,
@@ -744,8 +921,8 @@ def free_gas(
                         meetings.append(tuple(points[int(seen[0])]))
                 seeds = _add(
                     saturation,
-                    target - model_volume,
-                    model & ~seal,
+                    target - present_volume,
+                    present & ~seal,
                     candidate,
                     room,
                     cap,
@@ -757,11 +934,11 @@ def free_gas(
                     bridges=bridges,
                     meetings=meetings,
                 )
-            else:
+            elif target < present_volume:
                 saturation, freed = _peel(
                     saturation,
-                    model_volume - target if target > 0 else None,
-                    model,
+                    present_volume - target if target > 0 else None,
+                    present,
                     room,
                     pore_volume,
                     cap,
@@ -769,20 +946,20 @@ def free_gas(
                     pitch_mm,
                     settings,
                 )
-                _change(labels, rules, freed, PhaseLabel.DISSOLVED, PhaseRule.PEELED)
+                _change(labels, rules, freed & model, PhaseLabel.DISSOLVED, PhaseRule.PEELED)
             saturation = np.minimum(saturation, cap)
         inferred = hidden & (saturation > 0)
         # Keep optical WATER and before labels intact: this is inferred free
         # gas, not model evidence and not an inferred dissolved concentration.
         rules[inferred] = PhaseRule.GAS_BRIDGE
         if growth:
-            previous = float(np.sum(pore_volume * saturation.astype(np.float64)))
+            previous = saturation.copy()
         if record is not None:
             placed = float(np.sum(pore_volume * saturation.astype(np.float64)))
             disconnected = np.zeros_like(model)
             if seeds is not None:
-                added = (saturation > 0) & ~model
-                disconnected = added & ~_touching(model | added, seeds)
+                added = (saturation > 0) & ~present
+                disconnected = added & ~_touching(present | added, seeds)
             disconnected_area = (
                 float(pixel_area_mm2) * int(disconnected.sum())
                 if np.ndim(pixel_area_mm2) == 0
@@ -810,9 +987,16 @@ def free_gas(
                     float(np.sum(pore_volume[inferred] * saturation[inferred])),
                     _active_link_diagnostics(zone, injecting),
                     growth_limit_m3=bound,
+                    growth_peeled_m3=growth_peeled,
+                    growth_retained_m3=(
+                        0.0
+                        if carried is None
+                        else float(np.sum(pore_volume[carried] * saturation[carried]))
+                    ),
                 ),
             )
         yield labels, rules, saturation, _co2(own), own
+
 
 def _maps_file(held_out: str | None) -> str:
     """The file of a frame's stored maps, or of its maps without a held-out run's

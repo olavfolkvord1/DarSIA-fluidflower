@@ -179,8 +179,12 @@ class MassFrames:
     """The run's geometry (:func:`darsia.run_geometry`)."""
     frames: Iterable[tuple[str, darsia.SimpleMassAnalysisResults, np.ndarray]]
     """Each frame's name, its mass maps and its phase map."""
+    positions: darsia.GridPositions | None = None
+    """Measured source pixel centres; required for a run with measured geometry."""
     sources: Mapping[str, "MassFrameSource"] | None = None
     """Original source identities and times by exported frame name, never inferred."""
+    boundary_tolerance_m: float = 0.0
+    """Explicit numerical tolerance at the outer grid, recorded in the manifest."""
 
 
 @dataclass(frozen=True)
@@ -822,9 +826,9 @@ def write_simulator_mass(
 
     The shared native MassCopy reducers preserve extensive masses and known
     fractions; completed sand geometry never supplies missing observed mass.
-    The uniform source grid must span the canvas and share its lower-left
-    origin. Native export requires its own grid; metric export uses the common
-    metric-cell reducer. Unknown mass contributes no known
+    ``mass.positions`` locates measured source pixels, independently of array
+    shape and nominal image origin. Without it the legacy uniform grid must
+    share the canvas's lower-left origin. Unknown mass contributes no known
     sum, and its pore-volume fraction remains explicit. Every resolution's sum
     is checked against the source finite mass before publication by the caller.
 
@@ -843,8 +847,20 @@ def write_simulator_mass(
         float(canvas.origin[1] - canvas.dimensions[0]),
     )
     rows, cols = mass.geometry.domain.shape
-    if not np.allclose(mass.geometry.dimensions, canvas.dimensions):
-        raise ValueError("Uniform source geometry must span the export canvas.")
+    positions = mass.positions
+    if positions is None:
+        height, width = mass.geometry.dimensions
+        x = lower_left[0] + (np.arange(cols, dtype=float) + 0.5) * width / cols
+        y = (
+            lower_left[1]
+            + height
+            - (np.arange(rows, dtype=float) + 0.5) * height / rows
+        )
+        positions = darsia.GridPositions(
+            np.broadcast_to(x[None, :], (rows, cols)),
+            np.broadcast_to(y[:, None], (rows, cols)),
+            None,
+        )
     copies, grids = {}, {}
     for size in sizes:
         target_cells = _export_cells(canvas.img.shape[:2], canvas.dimensions, size)
@@ -855,11 +871,14 @@ def write_simulator_mass(
             lower_left[1],
             lower_left[1] + height,
         )
-        if size is None and (rows, cols) != tuple(canvas.img.shape[:2]):
-            raise ValueError("Uniform native export requires the canvas's own grid.")
-        cells = _export_cells((rows, cols), mass.geometry.dimensions, size)
-        if cells.shape != target_cells.shape:
-            raise ValueError("Uniform source cells must match the export grid.")
+        cells = darsia.rectangular_cells(
+            mass.geometry.domain.shape,
+            mass.geometry.dimensions,
+            target_cells.shape,
+            extent,
+            positions,
+            boundary_tolerance_m=mass.boundary_tolerance_m,
+        )
         copy = darsia.MassCopy.from_cells(mass.geometry, cells, extent)
         name = _size_name(size)
         copies[name] = copy
@@ -867,6 +886,16 @@ def write_simulator_mass(
             shape=list(cells.shape),
             extent_m=extent,
             cell_pitch_m=dict(dy=height / cells.shape[0], dx=width / cells.shape[1]),
+        )
+        outside = (
+            (positions.x < extent[0])
+            | (positions.x >= extent[1])
+            | (positions.y < extent[2])
+            | (positions.y >= extent[3])
+        )
+        assigned = cells.index.reshape(rows, cols) >= 0
+        grids[name]["boundary_assigned_source_pixels"] = int(
+            np.count_nonzero(outside & assigned & mass.geometry.domain)
         )
     for name, copy in copies.items():
         target = folder / name
@@ -893,7 +922,7 @@ def write_simulator_mass(
             raise ValueError(f"Duplicate simulator frame name: {name}")
         seen.add(name.casefold())
         corner = (maps.mass.origin[0], maps.mass.origin[1] - maps.mass.dimensions[0])
-        if not np.allclose(corner, lower_left):
+        if mass.positions is None and not np.allclose(corner, lower_left):
             raise ValueError(
                 f"The mass maps of {name} do not start at the canvas's lower left "
                 "corner, so their cells would not be the geometry's."
@@ -945,12 +974,16 @@ def write_simulator_mass(
         index="index.csv",
         grids=grids,
         axes="rows: y from the floor up; columns: x from the left",
-        source_positions="uniform lower-left aligned",
+        source_positions=(
+            "measured" if mass.positions is not None else "uniform lower-left aligned"
+        ),
         source_times=(
             "recorded capture and injection origin"
             if mass.sources is not None
             else "not supplied"
         ),
+        boundary_tolerance_m=float(mass.boundary_tolerance_m),
+        boundary_rule="Only outer cell assignment uses the explicit tolerance; source coordinates, masses and the physical frame are unchanged.",
         static_geometry="observed source pore volume and area; not completed simulator sand",
         unknown_mass="Known finite sum only; read each mass_known_fraction. NaN coverage is not known zero.",
         units=dict(

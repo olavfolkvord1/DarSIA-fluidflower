@@ -63,6 +63,10 @@ class MassCopySettings:
 
     copy_mm: float
     """Size [mm] of the metric cells of the maps' copy."""
+    extent_edge_mm: int | None = None
+    """Step [mm] of the edges of the cells' measured extent
+    (:func:`darsia.measured_extent`), our production's 10; needed with a measured
+    model."""
 
 
 class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
@@ -74,10 +78,11 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
     interpolation of the tables run in the floating dtype of the baseline image,
     as our production computed them. The hydrostatic head of a pixel is the
     datum, the rig's declared top, where the atmospheric pressure is given, less
-    the height of the pixel's centre (:func:`darsia.pixel_centres`); the head and
-    the top pressure are computed in double precision and taken to the
-    baseline's dtype. A pressure outside the tables is refused, as the official
-    interpolation refuses it.
+    the pixel's height: its measured position on the rig where given
+    (:func:`darsia.grid_positions`), else its centre (:func:`darsia.pixel_centres`);
+    the head and the top pressure are computed in double precision and taken to
+    the baseline's dtype, as our production took its head. A pressure outside the
+    tables is refused, as the official interpolation refuses it.
 
     """
 
@@ -90,6 +95,7 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
         atmospheric_temperature: float = 23.0,
         atmospheric_pressure_gradient: float = 0.0,
         atmospheric_temperature_gradient: float = 0.0,
+        y_m: np.ndarray | None = None,
     ) -> None:
         """The CO2 fields of a frame on the run's grid.
 
@@ -111,10 +117,15 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
             Atmospheric pressure gradient [bar/m].
         atmospheric_temperature_gradient : float
             Temperature gradient [Celsius/m].
+        y_m : array, optional
+            Height y [m] of each pixel (rows, cols), its measured position on the
+            rig (``GridPositions.y``); by default the pixel centres' heights.
 
         """
         self.datum_m = float(datum_m)
         """Height [m] of zero hydrostatic head."""
+        self.y_m = y_m
+        """Height y [m] of each pixel, or None for the pixel centres' heights."""
         super().__init__(
             baseline,
             atmospheric_pressure,
@@ -125,8 +136,10 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
 
     @property
     def height_map(self) -> np.ndarray:
-        """Hydrostatic head [m] of each pixel: the datum less the height of the
-        pixel's centre, in double precision."""
+        """Hydrostatic head [m] of each pixel: the datum less the pixel's height, in
+        double precision."""
+        if self.y_m is not None:
+            return self.datum_m - np.asarray(self.y_m, np.float64)
         _, y = darsia.pixel_centres(self.baseline)
         head = self.datum_m - np.asarray(y, np.float64)
         return np.broadcast_to(head[:, None], self.baseline.num_voxels)
@@ -234,7 +247,8 @@ class RunGeometry:
     swi: np.ndarray
     """Irreducible water saturation of each pixel; NaN where none is given."""
     y_m: np.ndarray
-    """Height y [m] of the pixel centres of each row (:func:`darsia.pixel_centres`)."""
+    """Height y [m] of each pixel (rows, cols), its position on the rig
+    (:func:`darsia.grid_positions`)."""
     dimensions: list[float]
     """Height and width of the grid [m]."""
 
@@ -290,6 +304,7 @@ def run_geometry(
     swi: np.ndarray,
     domain: np.ndarray,
     excluded: np.ndarray | None = None,
+    positions: darsia.GridPositions | None = None,
 ) -> RunGeometry:
     """The geometry of a run's grid, once for all of its frames.
 
@@ -312,6 +327,9 @@ def run_geometry(
     excluded : array, optional
         Pixels of the domain whose mass does not count (e.g., behind the colour
         checker).
+    positions : darsia.GridPositions, optional
+        Each pixel's position on the rig, by the run's measured model of its grid;
+        by default the sand map's pixel centres (:func:`darsia.grid_positions`).
 
     Returns
     -------
@@ -328,7 +346,8 @@ def run_geometry(
         & (porosity > 0)
     )
     counted = known if excluded is None else known & ~excluded
-    _, y = darsia.pixel_centres(sand_map)
+    if positions is None:
+        positions = darsia.grid_positions(sand_map)
     return RunGeometry(
         domain=domain,
         known=known,
@@ -336,7 +355,7 @@ def run_geometry(
         pore_volume_m3=np.where(known, pixel_area_m2 * depth_m * porosity, 0),
         pixel_area_m2=np.broadcast_to(pixel_area_m2, shape),
         swi=np.broadcast_to(swi, shape),
-        y_m=y,
+        y_m=positions.y,
         dimensions=[float(length) for length in sand_map.dimensions],
     )
 
@@ -555,7 +574,13 @@ class MassCopy:
 
     """
 
-    def __init__(self, geometry: RunGeometry, settings: MassCopySettings) -> None:
+    def __init__(
+        self,
+        geometry: RunGeometry,
+        settings: MassCopySettings,
+        positions: darsia.GridPositions | None = None,
+        extent: tuple[float, float, float, float] | None = None,
+    ) -> None:
         """Set up the copy of a run's maps.
 
         Parameters
@@ -564,11 +589,22 @@ class MassCopy:
             The run's geometry.
         settings : MassCopySettings
             The size of the cells.
+        positions : darsia.GridPositions, optional
+            Each pixel's measured position on the rig, by which it goes onto the
+            cells over ``extent`` (:func:`darsia.metric_cells`), as our production's
+            copy placed its pixels; by default the grid's cells.
+        extent : tuple of float, optional
+            The extent x0, x1, y0, y1 [m] of the cells, with positions, e.g. over the
+            corners of the run's measurement canvas (:func:`darsia.measured_extent`).
 
         """
         shape = geometry.domain.shape
-        self.cells = darsia.metric_cells(shape, geometry.dimensions, settings.copy_mm)
+        self.cells = darsia.metric_cells(
+            shape, geometry.dimensions, settings.copy_mm, positions, extent
+        )
         """The cells (:func:`darsia.metric_cells`)."""
+        self.extent = None if extent is None else tuple(float(v) for v in extent)
+        """x0, x1, y0, y1 [m] of measured cells; None for the grid's."""
         self._geometry(geometry, (settings.copy_mm / 1000) ** 2)
 
     @classmethod
@@ -711,15 +747,19 @@ def write_mass_copy(
     grid: darsia.Image,
     cells: darsia.MetricCells,
     name: str,
+    extent: tuple[float, float, float, float] | None = None,
 ) -> None:
     """Store a frame's copy on metric cells in ``folder``: each field
     (:class:`MassCopy`, its ``static`` fields included) as an image on the cells'
     grid, named ``name``, which extends the run's ``grid`` from its lower left
-    corner."""
+    corner, or covers the measured cells' ``extent`` (``MassCopy.extent``)."""
     bottom = grid.origin[1] - grid.dimensions[0]
+    left = grid.origin[0]
+    if extent is not None:
+        left, bottom = float(extent[0]), float(extent[2])
     metadata = {
         "dimensions": cells.dimensions,
-        "origin": [grid.origin[0], bottom + cells.dimensions[0]],
+        "origin": [left, bottom + cells.dimensions[0]],
     }
     for field, values in fields.items():
         image = darsia.ScalarImage(values, name=name, **metadata)

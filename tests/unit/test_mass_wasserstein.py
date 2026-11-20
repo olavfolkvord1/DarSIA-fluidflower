@@ -21,6 +21,7 @@ SETTINGS = mw.WassersteinSettings(
         distance_tolerance = 1e-4
         increment_tolerance = 1e-2
         bregman_updates = [0, 10, 20]
+        extent_edge_mm = 10
         """
     )
 )
@@ -177,6 +178,102 @@ def test_regions_sum_their_own_pixels_onto_the_cells():
     upper = cells["upper"]  # the sand of the upper half: no water, no chart
     assert upper.pixels.sum() == 12 * 45 - 6 * 9
     assert upper.unknown == upper.filled == 0
+
+
+def test_each_run_goes_onto_the_cells_by_its_own_measured_positions():
+    """With measured positions the cells cover every run's corners, the reference
+    and each run go onto them by their own positions, and the boxes read them;
+    without them nothing changes."""
+    regions = [
+        AnalysisDomain("box", "lower", "lower", bounds_mm=(0.5, 10.5, 0.0, 15.0)),
+        AnalysisDomain("whole", "whole", "whole"),
+    ]
+    sand = _sand_map()
+    centres = darsia.grid_positions(sand)
+    moved = darsia.GridPositions(
+        (centres.x + 0.002).astype(np.float32),
+        (centres.y - 0.0004).astype(np.float32),
+        centres.pitch_mm,
+    )
+    corners = [
+        darsia.grid_corners(sand),
+        (
+            moved.x[[0, 0, -1, -1], [0, -1, 0, -1]],
+            moved.y[[0, 0, -1, -1], [0, -1, 0, -1]],
+        ),
+    ]
+    extent = darsia.measured_extent(corners, SETTINGS.cell_mm, 10)
+    permeability = np.select(
+        [sand.img == LOWER, sand.img == UPPER, sand.img == OTHER], [400.0, 100.0, 200.0]
+    )
+    permeability[np.isin(sand.img, (CHART, WATER))] = np.nan
+    porosity = np.where(sand.img == CHART, 0.0, 0.4)
+    reference = mw.wasserstein_reference(
+        sand, permeability, porosity, SAND, (CHART,), regions, SETTINGS, None, extent
+    )
+    assert reference.extent == extent and reference.cells.shape == (10, 17)
+    mass = _plume(16, 4)
+    labels = np.ones((ROWS, COLS), np.uint8)
+    facies = np.where(sand.img == LOWER, 1, 2)
+    geometry = _geometry(sand)
+    found = mw.frame_cells(
+        _maps(mass), labels, sand, facies, geometry, reference, SETTINGS, moved
+    )
+    cells = darsia.metric_cells(sand.img.shape, sand.dimensions, 3.0, moved, extent)
+    grams = np.where(geometry.counted, mass * geometry.pore_volume_m3 * 1000, 0)
+    x, y = (np.asarray(v, np.float64) for v in (moved.x, moved.y))
+    box = geometry.counted & (x >= 0.0005) & (x < 0.0105) & (y >= 0) & (y < 0.015)
+    expected = darsia.cell_sums(cells, np.where(box, grams, 0.0)) / 1000 / 0.003**2
+    np.testing.assert_array_equal(found["lower"].mass.img, expected.astype(np.float32))
+    np.testing.assert_array_equal(found["lower"].pixels, darsia.cell_sums(cells, box))
+    plain = _cells(mass, _reference(regions)[1], sand)
+    assert not np.array_equal(plain["lower"].pixels.sum(), found["lower"].pixels.sum())
+
+
+def test_the_reference_goes_onto_its_own_cells_first():
+    """With measured positions the reference's pixels go onto the cells over its
+    own positions, then by whole cells onto the comparison's, as in our
+    production; in single precision a pixel can land in another cell than by
+    counting on the comparison's cells directly."""
+    sand = _sand_map()
+    centres = darsia.grid_positions(sand)
+    shifted = darsia.GridPositions(
+        (centres.x + 0.0105).astype(np.float32),
+        centres.y.astype(np.float32),
+        centres.pitch_mm,
+    )
+    pair = [darsia.grid_corners(sand), (shifted.x, shifted.y)]
+    extent = darsia.measured_extent(pair, SETTINGS.cell_mm, 10)
+    own = darsia.measured_extent([(shifted.x, shifted.y)], SETTINGS.cell_mm, 10)
+    assert own[0] > extent[0]
+    permeability = np.select(
+        [sand.img == LOWER, sand.img == UPPER, sand.img == OTHER], [400.0, 100.0, 200.0]
+    )
+    permeability[np.isin(sand.img, (CHART, WATER))] = np.nan
+    porosity = np.where(sand.img == CHART, 0.0, 0.4)
+    whole = [AnalysisDomain("whole", "whole", "whole")]
+    reference = mw.wasserstein_reference(
+        sand, permeability, porosity, SAND, (CHART,), whole, SETTINGS, shifted, extent
+    )
+    cells = darsia.metric_cells(sand.img.shape, sand.dimensions, 3.0, shifted, own)
+    placed = darsia.placed_cells(cells, 3.0, own, extent)
+    np.testing.assert_array_equal(reference.cells.index, placed.index)
+    direct = darsia.metric_cells(sand.img.shape, sand.dimensions, 3.0, shifted, extent)
+    assert not np.array_equal(direct.index, placed.index)
+
+    # On cells over the plain grid's corners only, the reference reaches past them:
+    # its cells there are cut, and every other cell keeps its weight.
+    narrow = darsia.measured_extent([darsia.grid_corners(sand)], SETTINGS.cell_mm, 10)
+    cut = mw.wasserstein_reference(
+        sand, permeability, porosity, SAND, (CHART,), whole, SETTINGS, shifted, narrow
+    )
+    assert cut.cells.shape == (10, 17) and reference.cells.shape == (10, 20)
+    assert np.count_nonzero(cut.cells.index < 0) == 150  # the last five columns
+    for field in ("weight", "own", "porous"):
+        np.testing.assert_array_equal(
+            getattr(cut.weights["whole"], field),
+            getattr(reference.weights["whole"], field)[:, :17],
+        )
 
 
 def test_the_sand_continues_under_the_colour_checker():
