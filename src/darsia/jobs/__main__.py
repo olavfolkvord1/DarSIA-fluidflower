@@ -511,7 +511,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     probing.add_argument("task")
     probing.add_argument("--inputs", action="store_true")
     asking = commands.add_parser(
-        "request", help="Set a host's request: auto, or at most n tasks (0 drains)."
+        "request", help="Set a host's request: auto, or exactly n tasks (0 drains)."
     )
     asking.add_argument("jobs", type=Path)
     asking.add_argument("request")

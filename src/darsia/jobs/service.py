@@ -30,8 +30,10 @@ says why. Every :data:`POLL` seconds the service
   per round, and keeps the largest observed peak of each workload for its step.
 
 Each round it also reads its host's request (``machines/<machine>.request.json``,
-:func:`write_request`): :data:`AUTO`, or at most a number of tasks, 0 taking no new
-ones; a request that cannot be read now keeps the last. It writes its host's
+:func:`write_request`): :data:`AUTO`, by the rules above, or a number of tasks the
+host runs exactly, whatever its threads and memory (the user's own choice; an
+out-of-memory end or a crash is reported as such), 0 taking no new ones; a
+request that cannot be read now keeps the last. It writes its host's
 record (``machines/<machine>.json``): the live tasks with the threads and bytes
 they reserve, the free memory, the reserve, why it took no more tasks, and each
 step's measured peak with the Setup's sizes and the photos' format it was
@@ -808,12 +810,14 @@ def admit(
 ) -> tuple[bool, str]:
     """Whether a task may start beside a host's live tasks, and why not.
 
-    A task starts only when the live tasks' threads and its own are at most the
-    host's threads, and its bytes are at most the free memory, less the reserve,
-    less what the live tasks may still take: each one's reserved bytes beyond
-    what its processes held at the round's look (:attr:`Live.held`). The live
-    tasks include the survivors of an earlier service. A request of a number of
-    tasks is a ceiling, never more than these rules admit; 0 takes no new tasks.
+    With the request :data:`AUTO`, a task starts only when the live tasks' threads
+    and its own are at most the host's threads, and its bytes are at most the free
+    memory, less the reserve, less what the live tasks may still take: each one's
+    reserved bytes beyond what its processes held at the round's look
+    (:attr:`Live.held`). The live tasks include the survivors of an earlier
+    service. A request of a number of tasks is the user's own choice: the host
+    runs exactly that many, and neither threads nor memory hold one back; 0 takes
+    no new tasks.
 
     Parameters
     ----------
@@ -824,7 +828,7 @@ def admit(
     live : Sequence[Live]
         The tasks running on the host.
     request : int or str
-        The host's request: :data:`AUTO`, or at most this many tasks.
+        The host's request: :data:`AUTO`, or exactly this many tasks.
     threads : int
         The host's threads: its logical cores less one, or fewer.
     free : int
@@ -838,8 +842,10 @@ def admit(
         Whether it starts, and why not; empty when it does.
 
     """
-    if request != AUTO and len(live) >= int(request):
-        return False, f"the request caps the host at {int(request)} tasks"
+    if request != AUTO:
+        if len(live) >= int(request):
+            return False, f"the request sets the host at {int(request)} tasks"
+        return True, ""
     used = sum(task.threads for task in live)
     if used + task_threads > threads:
         return False, (
@@ -923,7 +929,7 @@ class Service:
         self.revision = revision()
         """The code's revision of this service, when it started."""
         self.request: int | str | None = None
-        """The host's request: :data:`AUTO`, or at most this many tasks; None
+        """The host's request: :data:`AUTO`, or exactly this many tasks; None
         until it has been read once."""
         self.reason = ""
         """Why the host took no more tasks in its last round."""
@@ -1720,7 +1726,7 @@ class Service:
                 self._tasks[record["id"]] = queue.tasks(job)
             smallest: dict[str, int] = {}
             for task in queue.ready(job, self._tasks[record["id"]]):
-                if record.get("memory_admission") == "declared":
+                if record.get("memory_admission") == "declared" and self.request == AUTO:
                     try:
                         if not self._observe_memory(job, record, task):
                             self.reason = f"Measuring the accepted inputs for {task.step}."

@@ -188,10 +188,11 @@ def test_a_tasks_bytes_count_its_terms_fixed_arrays_and_photos(tmp_path):
     assert found["counted.r2"] == 4 * (10 + 3 * 100) + 50 + 9 * 100 + photo
 
 
-def test_admission_by_threads_and_bytes_with_a_request_as_a_ceiling():
-    """A task starts when the live tasks' threads and its own are within the
-    host's, and its bytes within the free memory less the reserve and what the
-    live tasks may still take; a request of a number of tasks only caps."""
+def test_admission_by_threads_and_bytes_or_by_an_exact_request():
+    """Automatic: a task starts when the live tasks' threads and its own are within
+    the host's, and its bytes within the free memory less the reserve and what the
+    live tasks may still take. A request of a number of tasks runs exactly that
+    many, whatever the threads and memory (the owner's F32)."""
     live = [service.Live(None, 1, None, bytes=4 * GIB, held=GIB) for _ in range(2)]
     # Free 10 GiB, reserve 1 GiB, 6 GiB still to come: 3 GiB are left.
     assert service.admit(3 * GIB, 1, live, "auto", 3, 10 * GIB, GIB) == (True, "")
@@ -205,10 +206,13 @@ def test_admission_by_threads_and_bytes_with_a_request_as_a_ceiling():
     assert not started and "its 2 threads and the live tasks' 2 exceed" in why
     assert service.admit(GIB, 1, live, 2, 3, 10 * GIB, GIB) == (
         False,
-        "the request caps the host at 2 tasks",
+        "the request sets the host at 2 tasks",
     )
     assert service.admit(GIB, 1, live, 3, 3, 10 * GIB, GIB)[0]
-    assert not service.admit(4 * GIB, 1, live, 9, 3, 10 * GIB, GIB)[0]  # a ceiling
+    # Exact: neither the memory nor the threads hold the third task back.
+    assert service.admit(40 * GIB, 1, live, 3, 3, 10 * GIB, GIB) == (True, "")
+    assert service.admit(GIB, 2, live, 3, 2, 10 * GIB, GIB) == (True, "")
+    assert service.admit(GIB, 1, live, 0, 3, 10 * GIB, GIB)[0] is False
 
 
 CHILD = """
@@ -507,6 +511,19 @@ def test_a_host_record_shows_its_live_tasks_and_why(tmp_path, monkeypatch, start
     )
 
 
+def test_a_manual_request_runs_exactly_that_many_tasks(
+    tmp_path, monkeypatch, started
+):
+    """A host's request of a number of tasks runs that many though memory and
+    threads would admit fewer (the owner's F32): the user's choice is not refused
+    in advance."""
+    job = _job(tmp_path, (HEAVY,), runs=("r1",))
+    running, _ = _service(tmp_path, monkeypatch, threads=1, free=6 * GIB)
+    service.write_request(job.parent, "here", 2)
+    running.poll()  # automatic would start one: 4 GiB each, 5 GiB room, 1 thread
+    assert len(started) == 2
+
+
 def test_a_request_caps_the_host_and_zero_takes_no_new_tasks(
     tmp_path, monkeypatch, started, capsys
 ):
@@ -518,7 +535,7 @@ def test_a_request_caps_the_host_and_zero_takes_no_new_tasks(
     assert jobs_main.main(["request", str(jobs), "1", "--machine", "here"]) == 0
     running.poll()
     assert (
-        len(started) == 1 and "the request caps the host at 1 tasks" in running.reason
+        len(started) == 1 and "the request sets the host at 1 tasks" in running.reason
     )
     service.write_request(jobs, "here", 0)
     started[0].end()
