@@ -79,6 +79,7 @@ from darsia.presets.workflows.setup.sand_map import (
     rasterize_sand_map,
     rig_grid,
 )
+from darsia.utils.storage import StorageSettings, save_arrays_as
 
 FORMAT = "darsia-simulator-package"
 """Format of the package's manifest."""
@@ -115,6 +116,13 @@ UNITS = {
     "drawn_behind_facies_area_fractions": "1 of the cell (one layer per facies id)",
 }
 """The arrays of a geometry on metric cells and their units."""
+
+
+def _check_mass_compression_level(level: int) -> None:
+    if type(level) is not int or not 1 <= level <= 9:
+        raise ValueError(
+            "Simulator mass compression requires an integer level from 1 to 9."
+        )
 
 
 @dataclass(frozen=True)
@@ -163,8 +171,12 @@ class SimulatorExportSettings:
     """Paragraphs the README adds about the series' package, e.g. how an earlier
     package of the series differs."""
 
+    mass_compression_level: int = 6
+    """Lossless deflate level of the simulator's mass archives, from 1 to 9."""
+
     def __post_init__(self) -> None:
-        """Turn a flow reference given as a mapping into its record."""
+        """Validate the compression level and resolve a flow reference mapping."""
+        _check_mass_compression_level(self.mass_compression_level)
         if isinstance(self.flow_reference, Mapping):
             object.__setattr__(
                 self, "flow_reference", FlowReference(**self.flow_reference)
@@ -817,6 +829,8 @@ def write_simulator_mass(
     mass: MassFrames,
     canvas: darsia.Image,
     sizes: Sequence[float | None],
+    *,
+    compression_level: int = 6,
 ) -> int:
     """Stream a run's observed maps onto the simulator geometry's exact grids.
 
@@ -831,7 +845,10 @@ def write_simulator_mass(
     The destination must be empty. An index gives supplied source identities,
     capture times and injection-relative seconds, as well as conservation totals.
     The output names are distinct safe stems; sessions never overwrite each other.
+    The compression level changes lossless storage only.
     """
+    _check_mass_compression_level(compression_level)
+    storage = StorageSettings(compress=True, level=compression_level)
     folder = Path(folder)
     if folder.exists() and any(folder.iterdir()):
         raise FileExistsError("The simulator mass destination must be empty.")
@@ -871,8 +888,10 @@ def write_simulator_mass(
     for name, copy in copies.items():
         target = folder / name
         target.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            target / "static.npz", **{k: v[::-1] for k, v in copy.static.items()}
+        save_arrays_as(
+            target / "static.npz",
+            storage,
+            **{k: v[::-1] for k, v in copy.static.items()},
         )
     index, seen = [], set()
     fields = {
@@ -929,8 +948,9 @@ def write_simulator_mass(
                         f"The {size} export does not conserve {field} for {name}."
                     )
                 row[size + "_" + field] = found
-            np.savez_compressed(
+            save_arrays_as(
                 folder / size / f"{name}.npz",
+                storage,
                 **{k: v[::-1] for k, v in cells.items()},
             )
         index.append(row)
@@ -943,6 +963,7 @@ def write_simulator_mass(
     manifest = dict(
         frames=len(index),
         index="index.csv",
+        compression_level=compression_level,
         grids=grids,
         axes="rows: y from the floor up; columns: x from the left",
         source_positions="uniform lower-left aligned",
@@ -1173,7 +1194,11 @@ def write_simulator_package(
         donor_runs[name] = _donor_run(run, sand_map, injection, volume)
         if run.mass is not None:
             entry["mass_frames"] = write_simulator_mass(
-                target / "mass", run.mass, series.canvas, settings.cell_sizes_mm
+                target / "mass",
+                run.mass,
+                series.canvas,
+                settings.cell_sizes_mm,
+                compression_level=settings.mass_compression_level,
             )
         entries[name] = entry
 
