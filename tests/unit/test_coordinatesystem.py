@@ -377,6 +377,49 @@ def test_the_pitch_is_taken_over_the_canvas_the_pixels_were_measured_on():
     assert not darsia.MeasurementCanvas((0, 0), (129, 200)).holds(130, 200)
 
 
+def test_grid_pixel_areas_are_the_measured_models_jacobian_in_its_precision():
+    """A pixel's area is the model's Jacobian at its column and row: the model in
+    millimetres, cast to the precision and inverted twice there, the area in
+    double precision stored in single precision as square millimetres, the area
+    factor applied in single precision, and square metres in the precision; a
+    model crossing its horizon on the grid is refused."""
+    image = darsia.Image(np.zeros((300, 400)), dimensions=[0.05, 0.066])
+    model = [
+        [0.00016634789062663913, 4.3004735772456115e-08, -6.023491368978284e-05],
+        [1.642236013843501e-09, -0.00016619959205854684, 0.046765316277742386],
+        [6.102835570231946e-09, 2.6038710743137017e-08, 0.9966205954551697],
+    ]
+    f32 = np.float32
+    x = np.arange(400, dtype=np.float64)[None, :]
+    y = np.arange(300, dtype=np.float64)[:, None]
+
+    def rule(dtype, inversions=2, factor=None, factor_dtype=f32):
+        matrix = np.asarray(np.diag([1000.0, 1000.0, 1.0]) @ np.array(model), dtype)
+        for _ in range(inversions):
+            matrix = np.linalg.inv(np.asarray(matrix, dtype))
+        w = matrix[2, 0] * x + matrix[2, 1] * y + matrix[2, 2]
+        area = (abs(np.linalg.det(matrix)) / np.abs(w) ** 3).astype(f32)
+        if factor is not None:
+            area = (area.astype(factor_dtype) * factor).astype(f32)
+        return np.asarray(area, dtype) / 1e6
+
+    for dtype in (f32, np.float64):
+        for factor in (None, 1.0344):
+            areas = darsia.grid_pixel_areas(image, model, dtype, factor)
+            assert areas.dtype == dtype and areas.shape == (300, 400)
+            np.testing.assert_array_equal(areas, rule(dtype, factor=factor))
+    areas = darsia.grid_pixel_areas(image, model, f32, 1.0344)
+    assert np.unique(areas).size > 100  # each pixel its own
+    # Each choice of the rule tells: the precision of the matrices, the two
+    # inversions and the factor in single precision.
+    assert not np.array_equal(areas, rule(np.float64, factor=1.0344).astype(f32))
+    assert not np.array_equal(areas, rule(f32, inversions=0, factor=1.0344))
+    assert not np.array_equal(areas, rule(f32, factor=1.0344, factor_dtype=np.float64))
+    horizon = [[1e-4, 0, 0], [0, -1e-4, 0.05], [0, -1e-2, 1.0]]  # w = 0 at row 100
+    with pytest.raises(ValueError, match="horizon"):
+        darsia.grid_pixel_areas(image, horizon)
+
+
 def test_grid_record_tells_images_on_one_grid():
     """Images on one grid have one record, whatever their channels; another
     origin is another grid."""
@@ -399,6 +442,58 @@ def test_optical_pitch_takes_the_area_factor_of_the_pixel_areas():
     pitch = darsia.optical_pitch_m(image, np.ones((2, 4), bool))
 
     assert np.allclose(pitch, (0.11, 0.22))
+
+
+def test_optical_pitch_takes_the_measured_coordinate_pitch_with_positions():
+    """With measured positions the coordinate pitch is the mean distance, in the
+    positions' precision and averaged in double, between neighbouring pixels both
+    inside the domain."""
+    image = darsia.Image(np.zeros((30, 40)), dimensions=[0.005, 0.0066])
+    model = [
+        [0.00016634789062663913, 4.3004735772456115e-08, -6.023491368978284e-05],
+        [1.642236013843501e-09, -0.00016619959205854684, 0.046765316277742386],
+        [6.102835570231946e-09, 2.6038710743137017e-08, 0.9966205954551697],
+    ]
+    positions = darsia.grid_positions(image, model, np.float32)
+    area = darsia.Image(
+        darsia.grid_pixel_areas(image, model, np.float32, 1.0344),
+        dimensions=[0.005, 0.0066],
+    )
+    domain = np.ones((30, 40), bool)
+    domain[:5, :7] = False
+    x, y = positions.x, positions.y
+    down = np.hypot(np.diff(x, axis=0), np.diff(y, axis=0))[domain[1:] & domain[:-1]]
+    along = np.hypot(np.diff(x, axis=1), np.diff(y, axis=1))[
+        domain[:, 1:] & domain[:, :-1]
+    ]
+    assert down.dtype == np.float32
+    coordinate = [
+        float(np.mean(down, dtype=np.float64)),
+        float(np.mean(along, dtype=np.float64)),
+    ]
+    factor = float(np.median(area.img.astype(np.float64)[domain])) / np.prod(coordinate)
+    expected = tuple(p * float(np.sqrt(factor)) for p in coordinate)
+    assert darsia.optical_pitch_m(area, domain, positions) == expected
+    assert darsia.optical_pitch_m(area, domain) != expected
+    whole = darsia.optical_pitch_m(area, np.ones((30, 40), bool), positions)
+    assert whole != expected
+
+
+def test_the_optical_grid_is_sized_on_the_canvas_of_its_pitch():
+    """A pitch with the counts of its canvas sizes the optical grid on the canvas'
+    pixels: the canvas' dimensions at the pitch in the dtype, over its pixels; the
+    pitch stays the pair it is."""
+    image = darsia.Image(np.zeros((100, 150)), dimensions=[0.02, 0.03])
+    pitch = (1.6714851236783506e-4, 1.6712130886473872e-4)
+    sized = darsia.OpticalPitch(pitch, (101, 202))
+    assert sized == pitch and sized.counts == (101, 202)
+    assert darsia.OpticalPitch(pitch).counts is None
+    found = darsia.optical_grid(image, sized, np.float32).voxel_size
+    expected = [np.float32(n * p) / n for n, p in zip((101, 202), pitch)]
+    assert found == expected and all(v.dtype == np.float32 for v in found)
+    own = darsia.optical_grid(image, pitch, np.float32).voxel_size
+    assert own == [np.float32(n * p) / n for n, p in zip((100, 150), pitch)]
+    assert own[0] != found[0] and own[1] != found[1]
 
 
 def test_optical_grid_sizes_the_pixels_with_the_pitch_in_the_given_dtype():

@@ -62,7 +62,7 @@ import csv
 import json
 import re
 import shutil
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -185,6 +185,9 @@ class MassFrames:
     """Original source identities and times by exported frame name, never inferred."""
     boundary_tolerance_m: float = 0.0
     """Explicit numerical tolerance at the outer grid, recorded in the manifest."""
+    co2: Callable[[str], darsia.CO2MassAnalysis] | None = None
+    """Native CO2 state for a frame, for concentration in g/L as well as its
+    stored dimensionless share of local solubility. Never inferred from mass."""
 
 
 @dataclass(frozen=True)
@@ -949,8 +952,29 @@ def write_simulator_mass(
                 )
             )
             row["source_" + field] = totals[field]
+        concentration_g_l = None
+        if mass.co2 is not None:
+            # As in DomainMass: convert each original pixel at the frame's
+            # local pressure/temperature before taking any spatial mean.
+            concentration_g_l = (
+                maps.concentration_aq.img * mass.co2(name).solubility_co2
+            )
+            if concentration_g_l.shape != (rows, cols):
+                raise ValueError("Physical concentration must match the source grid.")
+            if np.any(
+                (mass.geometry.pore_volume_m3 > 0)
+                & np.isfinite(maps.concentration_aq.img)
+                & ~np.isfinite(concentration_g_l)
+            ):
+                raise ValueError(
+                    "The CO2 state leaves a known concentration undefined."
+                )
         for size, copy in copies.items():
             cells = copy(maps, labels)
+            if concentration_g_l is not None:
+                cells["concentration_aq_g_l"] = darsia.cell_means(
+                    copy.cells, concentration_g_l, copy.volume_l
+                )
             for field, expected in totals.items():
                 found = float(np.sum(cells[field], dtype=float))
                 if not np.isclose(found, expected, rtol=1e-9, atol=1e-12):
@@ -984,11 +1008,17 @@ def write_simulator_mass(
         ),
         boundary_tolerance_m=float(mass.boundary_tolerance_m),
         boundary_rule="Only outer cell assignment uses the explicit tolerance; source coordinates, masses and the physical frame are unchanged.",
+        physical_concentration=(
+            "source relative concentration times native local solubility, then pore-volume weighted"
+            if mass.co2 is not None
+            else "not supplied; concentration_aq is dimensionless"
+        ),
         static_geometry="observed source pore volume and area; not completed simulator sand",
         unknown_mass="Known finite sum only; read each mass_known_fraction. NaN coverage is not known zero.",
         units=dict(
             mass="g per cell",
             concentration_aq="1 (share of local CO2 solubility)",
+            concentration_aq_g_l="g/L (when the native CO2 state is supplied)",
             saturation_g="1",
             pore_volume_l="L",
             domain_area_m2="m2",
