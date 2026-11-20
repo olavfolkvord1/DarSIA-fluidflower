@@ -12,15 +12,19 @@ from darsia.presets.workflows.config.sections import (
     required_sections,
 )
 from darsia.presets.workflows.setup.illustrations import save_discrete_map_illustration
+from darsia.presets.workflows.setup.setup_sand_map import setup_sand_map
 
 logger = logging.getLogger(__name__)
 
 
 @required_sections("labeling", "rig")
 def segment_colored_image(path: Path, show: bool = False):
-    """Segment colored image based on config file."""
+    """Segment colored image based on config file.
 
-    logger.info("\033[92mSegmenting colored image...\033[0m")
+    With [labeling.sand_map], the labels come from the sand-map drawing instead
+    (:func:`setup_sand_map`).
+
+    """
 
     config = FluidFlowerConfig(path, require_data=False, require_results=False)
     config.check(*list_required_sections(segment_colored_image))
@@ -31,6 +35,12 @@ def segment_colored_image(path: Path, show: bool = False):
         config.labeling,
     ]:
         assert c is not None
+
+    if config.labeling.sand_map is not None:
+        setup_sand_map(path, show)
+        return
+
+    logger.info("\033[92mSegmenting colored image...\033[0m")
 
     # Step 1: Unsupervised labeling of manually colored image
     manually_colored_image = darsia.imread(
