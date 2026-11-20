@@ -24,15 +24,26 @@ pixel centres at whole numbers), and gives the layer of each pixel:
 A run whose sand has settled keeps its own geometry: its adjustment moves anchors
 of the common drawing for that run only (:meth:`SandMapDrawing.moved`).
 
+A drawing is saved only as a closed partition of the rig's frame, the rectangle of
+the rig's inner width and height that the rig's configuration gives: the polygons
+of the layers not drawn on top cover every point of the frame exactly once, also
+where the camera does not see, and each of their boundaries is shared with a
+neighbouring polygon along the same anchors or lies on the frame's edge. Layers
+drawn on top, e.g. a colour checker, lie inside the frame over the partition,
+which continues beneath them. :func:`partition_faults` finds where a drawing is
+not such a partition.
+
 """
 
 import json
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import cv2
 import numpy as np
+import shapely
 
 import darsia
 
@@ -50,9 +61,14 @@ class SandMapDrawing:
     """Layer (1 to 255) and anchor indices of each polygon, in drawing order."""
     on_top: frozenset[int] = frozenset()
     """Layers whose polygons win over those of all other layers."""
+    frame: tuple[float, float] | None = None
+    """Width and height in metres of the rig's inner frame that the layers
+    partition, from the rig's configuration; None if not given."""
 
     @classmethod
-    def read(cls, path: Path) -> "SandMapDrawing":
+    def read(
+        cls, path: Path, frame: tuple[float, float] | None = None
+    ) -> "SandMapDrawing":
         """Read a drawing from a JSON file.
 
         The file holds ``anchors`` (a list of [x, y] in metres), ``polygons`` (a
@@ -63,6 +79,9 @@ class SandMapDrawing:
         ----------
         path : Path
             Path to the drawing.
+        frame : tuple of float, optional
+            Width and height in metres of the rig's inner frame, from the rig's
+            configuration.
 
         Returns
         -------
@@ -97,7 +116,49 @@ class SandMapDrawing:
             anchors=anchors,
             polygons=polygons,
             on_top=frozenset(int(layer) for layer in data.get("on_top", ())),
+            frame=None if frame is None else (float(frame[0]), float(frame[1])),
         )
+
+    def write(self, path: Path) -> None:
+        """Save the drawing as a JSON file that :meth:`read` reads.
+
+        The frame is not written; the rig's configuration gives it.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the file.
+
+        Raises
+        ------
+        ValueError
+            If the drawing has no frame, or is not a closed partition of it
+            (:func:`partition_faults`).
+
+        """
+        if self.frame is None:
+            raise ValueError(
+                "A drawing is saved as a partition of the rig's frame; give it "
+                "the frame's width and height."
+            )
+        faults = partition_faults(self)
+        if faults:
+            counts = Counter(fault.kind for fault in faults)
+            largest = max(faults, key=lambda fault: fault.area)
+            x0, y0, x1, y1 = (1000 * value for value in largest.bounds)
+            raise ValueError(
+                "The drawing is not a closed partition of the rig's frame: "
+                + ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+                + f"; the largest is a {largest.kind} of "
+                f"{largest.area * 1e6:.3f} mm2 at x {x0:.1f} to {x1:.1f} mm, "
+                f"y {y0:.1f} to {y1:.1f} mm."
+            )
+        data = {
+            "anchors": np.asarray(self.anchors, dtype=np.float64).tolist(),
+            "polygons": [[layer, list(indices)] for layer, indices in self.polygons],
+            "on_top": sorted(self.on_top),
+        }
+        Path(path).write_text(json.dumps(data, indent=1), encoding="utf-8")
 
     def moved(self, anchors: Mapping[int, Sequence[float]]) -> "SandMapDrawing":
         """The drawing with some anchors at new positions, e.g., a run's adjustment.
@@ -128,7 +189,7 @@ class SandMapDrawing:
                     f"The drawing has no anchor {index} ({len(positions)} anchors)."
                 )
             positions[index] = position
-        return SandMapDrawing(positions, self.polygons, self.on_top)
+        return replace(self, anchors=positions)
 
 
 def read_moved_anchors(path: Path) -> dict[int, tuple[float, float]]:
@@ -150,6 +211,223 @@ def read_moved_anchors(path: Path) -> dict[int, tuple[float, float]]:
     return {
         int(index): (float(x), float(y)) for index, (x, y) in data["anchors"].items()
     }
+
+
+@dataclass(frozen=True)
+class PartitionFault:
+    """A place where a drawing is not a closed partition of its frame."""
+
+    kind: Literal["gap", "overlap", "outside", "crossing", "unlinked"]
+    """``gap``: part of the frame that no polygon covers; ``overlap``: part that
+    two polygons not on top cover, or two on top; ``outside``: part of a polygon
+    beyond the frame; ``crossing``: a point where a polygon's boundary meets
+    itself; ``unlinked``: an edge that is neither shared with a neighbour nor on
+    the frame's edge and bounds none of the other faults."""
+    area: float
+    """Area in square metres; 0 for a crossing or an unlinked edge."""
+    bounds: tuple[float, float, float, float]
+    """Smallest x, smallest y, largest x and largest y of the place, in metres."""
+    layers: tuple[int, ...]
+    """Layers of the polygons at the place: those bordering a gap along a stretch,
+    those that overlap or reach outside, the polygon of a crossing or an edge."""
+
+
+def partition_faults(drawing: SandMapDrawing) -> list[PartitionFault]:
+    """Where a drawing is not a closed partition of its frame.
+
+    The drawing is a closed partition if its polygons are simple, those on top lie
+    inside the frame without overlapping each other, and each edge of the others
+    is either shared by exactly one other of them, in the opposite direction, or
+    lies on the frame's edge, which these edges then cover exactly once. The test
+    is exact: it compares anchors and coordinates, without a tolerance or pixels.
+    Its edges then bound the frame and nothing else, so the polygons not on top
+    cover each point of the frame once. Otherwise the faults are measured by
+    polygon overlays in double precision.
+
+    Parameters
+    ----------
+    drawing : SandMapDrawing
+        The drawing, with its frame.
+
+    Returns
+    -------
+    list of PartitionFault
+        The faults, the largest area first; empty for a closed partition.
+
+    Raises
+    ------
+    ValueError
+        If the drawing has no frame.
+
+    """
+    if drawing.frame is None:
+        raise ValueError("The drawing has no frame to partition.")
+    points = np.asarray(drawing.anchors, dtype=np.float64)
+    rings = [_ring(points, indices) for _layer, indices in drawing.polygons]
+    layers = [layer for layer, _indices in drawing.polygons]
+    top = [layer in drawing.on_top for layer in layers]
+    width, height = drawing.frame
+    unlinked, sides = _boundary(points, rings, top, drawing.frame)
+    crossings = [
+        _crossings(points[ring]) if len(ring) > 2 else np.zeros((0, 2))
+        for ring in rings
+    ]
+    shapes = [
+        shapely.make_valid(shapely.Polygon(points[ring])) if len(ring) > 2 else None
+        for ring in rings
+    ]
+    frame = shapely.box(0, 0, width, height)
+    base = [k for k in range(len(rings)) if not top[k]]
+    above = [k for k in range(len(rings)) if top[k]]
+
+    def overlaps(group: list[int]) -> list[tuple[shapely.Geometry, tuple[int, int]]]:
+        """The intersections of each pair of the polygons."""
+        return [
+            (shapes[i].intersection(shapes[j]), (i, j))
+            for n, i in enumerate(group)
+            for j in group[n + 1 :]
+            if shapes[i] is not None
+            and shapes[j] is not None
+            and shapes[i].intersects(shapes[j])
+        ]
+
+    if (
+        not unlinked
+        and all(
+            ends == [0.0, width if side % 2 == 0 else height]
+            for side, ends in sides.items()
+        )
+        and all(
+            len(ring) > 2 and len(set(ring)) == len(ring) and not len(found)
+            for ring, found in zip(rings, crossings)
+        )
+        and all(frame.covers(shapes[k]) for k in above)
+        and not any(geometry.area > 0 for geometry, _pair in overlaps(above))
+    ):
+        return []
+
+    places = [
+        ("gap", frame.difference(shapely.union_all([shapes[k] for k in base])), base),
+        *(("overlap", *found) for found in overlaps(base) + overlaps(above)),
+        (
+            "outside",
+            shapely.union_all(
+                [shape for shape in shapes if shape is not None]
+            ).difference(frame),
+            range(len(rings)),
+        ),
+    ]
+    faults, pieces = [], []
+    for kind, geometry, near in places:
+        for piece in shapely.get_parts(geometry):
+            if piece.geom_type != "Polygon" or not piece.area > 0:
+                continue
+            shared = [
+                shapes[k].intersection(piece) if shapes[k] is not None else None
+                for k in near
+            ]
+            nearby = {
+                layers[k]
+                for k, part in zip(near, shared)
+                if part is not None
+                and (part.length if kind == "gap" else part.area) > 0
+            }
+            faults.append(
+                PartitionFault(
+                    kind,
+                    float(piece.area),
+                    tuple(float(value) for value in piece.bounds),
+                    tuple(sorted(nearby)),
+                )
+            )
+            pieces.append(piece)
+    for k, found in enumerate(crossings):
+        for x, y in found.tolist():
+            faults.append(PartitionFault("crossing", 0.0, (x, y, x, y), (layers[k],)))
+            pieces.append(shapely.Point(x, y))
+    measured = shapely.union_all(pieces)
+    for k, start, end in unlinked:
+        if measured.is_empty or shapely.LineString(points[[start, end]]).distance(
+            measured
+        ):
+            (x0, y0), (x1, y1) = points[start], points[end]
+            bounds = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            faults.append(PartitionFault("unlinked", 0.0, bounds, (layers[k],)))
+    return sorted(faults, key=lambda fault: -fault.area)
+
+
+def _ring(points: np.ndarray, indices: Sequence[int]) -> list[int]:
+    """A polygon's anchors counter-clockwise, without repeats of the one before."""
+    ring = [i for n, i in enumerate(indices) if i != indices[n - 1]]
+    x, y = points[ring, 0], points[ring, 1]
+    if np.dot(x, np.roll(y, -1)) < np.dot(y, np.roll(x, -1)):
+        ring.reverse()
+    return ring
+
+
+def _boundary(
+    points: np.ndarray,
+    rings: list[list[int]],
+    top: list[bool],
+    frame: tuple[float, float],
+) -> tuple[list[tuple[int, int, int]], dict[int, list[float]]]:
+    """The unlinked edges (polygon, start, end) of the polygons not on top, and the
+    stretches the frame's edge is covered by, per side (bottom, right, top, left).
+
+    An edge is unlinked if no other polygon has it in the opposite direction,
+    or a polygon has it twice, and it does not lie on the frame's edge in the
+    frame's counter-clockwise direction. A side's stretches are given by their
+    ends along the side, merged where they meet; a side covered exactly once is
+    [0, its length]. Coordinates are compared exactly.
+
+    """
+    width, height = frame
+    edges = Counter(
+        (start, end)
+        for ring, on_top in zip(rings, top)
+        if not on_top
+        for start, end in zip(ring, ring[1:] + ring[:1])
+    )
+    unlinked = []
+    stretches: dict[int, list[tuple[float, float]]] = {side: [] for side in range(4)}
+    for k, ring in enumerate(rings):
+        if top[k]:
+            continue
+        for start, end in zip(ring, ring[1:] + ring[:1]):
+            if edges[(end, start)] == 1 and edges[(start, end)] == 1:
+                continue
+            (x0, y0), (x1, y1) = points[start], points[end]
+            if y0 == y1 == 0 and x0 < x1:
+                stretches[0].append((x0, x1))
+            elif x0 == x1 == width and y0 < y1:
+                stretches[1].append((y0, y1))
+            elif y0 == y1 == height and x1 < x0:
+                stretches[2].append((x1, x0))
+            elif x0 == x1 == 0 and y1 < y0:
+                stretches[3].append((y1, y0))
+            else:
+                unlinked.append((k, start, end))
+    sides = {}
+    for side, found in stretches.items():
+        ends: list[float] = []
+        for low, high in sorted(found):
+            if ends and ends[-1] == low:
+                ends[-1] = high
+            else:
+                ends += [low, high]
+        sides[side] = ends
+    return unlinked, sides
+
+
+def _crossings(points: np.ndarray) -> np.ndarray:
+    """Points where a closed boundary meets itself, other than where consecutive
+    edges join."""
+    noded = shapely.get_parts(shapely.node(shapely.LinearRing(points)))
+    ends = np.array([shapely.get_coordinates(part)[[0, -1]] for part in noded]).reshape(
+        -1, 2
+    )
+    nodes, counts = np.unique(ends, axis=0, return_counts=True)
+    return nodes[counts > 2]
 
 
 def rig_grid(grid: darsia.Image) -> np.ndarray:

@@ -1,6 +1,7 @@
 """Tests of the sand map: a drawing of sand layers placed on a run's grid."""
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from darsia.presets.workflows.config.labeling import SandMapConfig
 from darsia.presets.workflows.setup.sand_map import (
     SandMapDrawing,
     grid_homographies,
+    partition_faults,
     rasterize_sand_map,
     rig_grid,
 )
@@ -214,3 +216,132 @@ def test_a_run_adjustment_changes_only_that_run(tmp_path):
     assert np.array_equal(moved, expected[1][0]) and np.any(moved != common)
     assert np.array_equal(moved > 0, expected[1][1])
     assert (tmp_path / "drawing.json").read_text() == text
+
+
+def _framed(drawing: SandMapDrawing, **changes) -> SandMapDrawing:
+    """The drawing with the test rig's frame, and other fields changed."""
+    return replace(drawing, frame=(WIDTH, HEIGHT), **changes)
+
+
+def test_a_linked_drawing_is_a_closed_partition_of_its_frame():
+    """A split along shared anchors reaching the frame's edge has no fault, also
+    after a shared anchor moves or with a polygon drawn clockwise; a layer on top
+    inside the frame lies over it, but not beyond the frame."""
+    drawing = _framed(_split_drawing())
+    assert partition_faults(drawing) == []
+    assert partition_faults(drawing.moved({5: [0.15, 0.15]})) == []
+    upper, (layer, lower) = drawing.polygons
+    assert (
+        partition_faults(_framed(drawing, polygons=(upper, (layer, lower[::-1])))) == []
+    )
+    anchors = drawing.anchors.tolist()
+    checker = (9, _rectangle(anchors, 0.05, 0.1, 0.15, 0.2))
+    covered = _framed(
+        drawing,
+        anchors=np.array(anchors),
+        polygons=drawing.polygons + (checker,),
+        on_top=frozenset({9}),
+    )
+    assert partition_faults(covered) == []
+    (fault,) = partition_faults(covered.moved({10: [0.1, 0.21], 11: [0.05, 0.21]}))
+    assert fault.kind == "outside" and fault.layers == (9,)
+    assert fault.area == pytest.approx(0.05 * 0.01)
+    second = (10, _rectangle(anchors, 0.08, 0.12, 0.1, 0.17))
+    (fault,) = partition_faults(
+        _framed(
+            covered,
+            anchors=np.array(anchors),
+            polygons=covered.polygons + (second,),
+            on_top=frozenset({9, 10}),
+        )
+    )
+    assert fault.kind == "overlap" and fault.layers == (9, 10)
+    assert fault.area == pytest.approx(0.02 * 0.02)
+
+
+def test_a_twisted_polygon_is_refused_although_its_edges_are_shared():
+    """A polygon whose boundary crosses itself, inside a neighbour that runs along
+    it in the opposite direction, shares all its edges but is no partition."""
+    anchors = np.array(
+        [[0, 0], [WIDTH, 0], [WIDTH, HEIGHT], [0, HEIGHT]]
+        + [[0.1, 0.05], [0.3, 0.15], [0.3, 0.05], [0.1, 0.15]]
+    )
+    twisted = (2, (4, 5, 6, 7))
+    around = (1, (0, 1, 2, 3, 0, 4, 7, 6, 5, 4))
+    faults = partition_faults(
+        SandMapDrawing(anchors, (around, twisted), frame=(WIDTH, HEIGHT))
+    )
+    assert any(
+        fault.kind == "crossing" and fault.bounds == pytest.approx((0.2, 0.1) * 2)
+        for fault in faults
+    )
+
+
+def test_a_polygon_drawn_twice_overlaps_itself_along_the_frame():
+    """Two layers on the same four corners share no edge in opposite directions,
+    so the frame's edge is covered twice: the whole frame is an overlap."""
+    corners = np.array([[0, 0], [WIDTH, 0], [WIDTH, HEIGHT], [0, HEIGHT]])
+    twice = SandMapDrawing(
+        corners, ((1, (0, 1, 2, 3)), (2, (0, 1, 2, 3))), frame=(WIDTH, HEIGHT)
+    )
+    (fault,) = partition_faults(twice)
+    assert fault.kind == "overlap" and fault.layers == (1, 2)
+    assert fault.area == pytest.approx(WIDTH * HEIGHT)
+
+
+def test_the_faults_of_a_drawing_have_their_area_and_place():
+    """An anchor a neighbour does not share opens an overlap, a corner short of
+    the frame a gap, one beyond it a part outside, a boundary along the diagonal
+    crossings, and a boundary through a neighbour's edge without its anchor
+    unlinked edges."""
+    drawing = _framed(_split_drawing())
+    anchors = np.vstack([drawing.anchors, [[0.17, 0.124]]])
+    upper, lower = drawing.polygons
+    (fault,) = partition_faults(
+        _framed(drawing, anchors=anchors, polygons=(upper, (2, (0, 1, 2, 7, 6, 8, 4))))
+    )
+    assert fault.kind == "overlap" and fault.layers == (1, 2)
+    assert fault.area == pytest.approx(0.5 * 0.004 * (0.27 - 0.13))
+    assert fault.bounds == pytest.approx((0.13, 0.02, 0.27, 0.124))
+
+    (fault,) = partition_faults(drawing.moved({2: [WIDTH, 0.198]}))
+    assert fault.kind == "gap" and fault.layers == (1,)
+    assert fault.area == pytest.approx(0.5 * WIDTH * 0.002)
+    assert fault.bounds == pytest.approx((0, 0.198, WIDTH, HEIGHT))
+    (fault,) = partition_faults(drawing.moved({2: [WIDTH, 0.203]}))
+    assert fault.kind == "outside" and fault.layers == (1, 2)
+    assert fault.area == pytest.approx(0.5 * WIDTH * 0.003)
+
+    twisted = (1, (0, 4, 5, 6, 7, 3, 2))
+    faults = partition_faults(_framed(drawing, polygons=(twisted, lower)))
+    crossings = [fault for fault in faults if fault.kind == "crossing"]
+    assert len(crossings) == 3 and all(fault.layers == (1,) for fault in crossings)
+    assert all(
+        fault.bounds[1] == pytest.approx(fault.bounds[0] / 2) for fault in crossings
+    )
+
+    anchors = [[0, 0], [WIDTH, 0], [WIDTH, 0.1], [0, 0.1], [WIDTH, HEIGHT], [0, HEIGHT]]
+    halves = ((1, (3, 6, 2, 4, 5)), (2, (0, 1, 2, 3)))
+    anchors.append([0.2, 0.1])
+    faults = partition_faults(
+        _framed(drawing, anchors=np.array(anchors), polygons=halves)
+    )
+    assert {fault.kind for fault in faults} == {"unlinked"} and len(faults) == 3
+    assert all(fault.area == 0 for fault in faults)
+
+
+def test_a_drawing_is_saved_only_as_a_closed_partition(tmp_path):
+    """A closed partition is written and read back with its frame; a drawing with a
+    gap, or without a frame, is refused and nothing is written."""
+    drawing = _framed(_split_drawing(), on_top=frozenset({3}))
+    drawing.write(tmp_path / "drawing.json")
+    read = SandMapDrawing.read(tmp_path / "drawing.json", frame=(WIDTH, HEIGHT))
+    assert np.array_equal(read.anchors, drawing.anchors)
+    assert read.polygons == drawing.polygons and read.on_top == drawing.on_top
+    assert read.frame == (WIDTH, HEIGHT)
+    assert SandMapDrawing.read(tmp_path / "drawing.json").frame is None
+    with pytest.raises(ValueError, match="1 gap"):
+        drawing.moved({2: [WIDTH, 0.198]}).write(tmp_path / "gap.json")
+    with pytest.raises(ValueError, match="frame"):
+        _split_drawing().write(tmp_path / "unframed.json")
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["drawing.json"]
