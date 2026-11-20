@@ -154,7 +154,11 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
         # Initialize Newton iteration with Darcy solution for unitary mobility
         solution = np.zeros_like(rhs, dtype=float)
         solution, _ = self.linear_solve(
-            self.darcy_init.copy(), rhs.copy(), solution, cache_darcy=True
+            self.darcy_init.copy(),
+            rhs.copy(),
+            solution,
+            cache_darcy=True,
+            symmetric_pressure=True,
         )
 
         # Initialize distance in case below iteration fails
@@ -240,6 +244,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                         l_scheme_mixed_darcy,
                         rhs_copy,
                         reuse_solver=False,  # force to update solver
+                        symmetric_pressure=True,
                     )
                 except Exception:
                     warnings.warn(
@@ -278,6 +283,7 @@ class BeckmannBregmanSolver(darsia.BeckmannProblem):
                         l_scheme_mixed_darcy,
                         rhs_copy,
                         reuse_solver=iter > 0,  # force to reuse solver
+                        symmetric_pressure=True,
                     )
                 except Exception:
                     warnings.warn(

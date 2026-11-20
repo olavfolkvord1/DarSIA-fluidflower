@@ -7,6 +7,7 @@ import pytest
 import scipy.sparse as sps
 
 import darsia
+import darsia.measure.beckmann_linalg as linalg
 from darsia.measure.beckmann_linalg import _darcy_lu
 from darsia.measure.beckmann_problem import MobilityMode, _profile_memory
 from darsia.measure.wasserstein import _matching_grid
@@ -64,6 +65,49 @@ def test_cached_darcy_lu_preserves_the_direct_solvers_csc_state():
         for name in ("data", "indices", "indptr"):
             assert getattr(actual, name).tobytes() == getattr(reference, name).tobytes()
         assert cached(rhs).tobytes() == plain(rhs).tobytes()
+
+
+@pytest.mark.parametrize("failure", ["factorization", "residual"])
+def test_symmetric_pressure_ordering_falls_back_and_reports(failure, monkeypatch):
+    matrix = sps.csc_matrix([[4.0, -1.0], [-1.0, 3.0]])
+    rhs = np.array([1.0, 5.0])
+    direct = darsia.BeckmannDirectSolver({})
+    direct.setup(matrix.copy())
+    expected = direct(rhs)
+    original = linalg._direct_factor
+
+    def factor(system, symmetric):
+        if not symmetric:
+            return original(system, False)
+        if failure == "factorization":
+            raise RuntimeError("controlled symmetric failure")
+        return SimpleNamespace(solve=lambda values: np.zeros_like(values))
+
+    monkeypatch.setattr(linalg, "_direct_factor", factor)
+    solver = darsia.BeckmannDirectSolver({"direct_solver_ordering": "symmetric"})
+    solver.setup(matrix.copy(), symmetric_pressure=True)
+    assert solver(rhs).tobytes() == expected.tobytes()
+    assert solver.symmetric_fallbacks == {failure: 1}
+    solver.setup(matrix.copy())
+    assert solver(rhs).tobytes() == expected.tobytes()
+    assert solver.symmetric_fallbacks == {failure: 1}
+
+
+def test_symmetric_ordering_option_is_applied_only_to_bregman_pressure():
+    first, second = _pair()
+    options = {
+        "return_solver_info": True,
+        "num_iter": 8,
+        "direct_solver_ordering": "symmetric",
+    }
+    _, pressure = darsia.wasserstein_distance(
+        first, second, method="bregman", options=options
+    )
+    _, mixed = darsia.wasserstein_distance(
+        first, second, method="bregman", options={**options, "formulation": "full"}
+    )
+    assert pressure["symmetric_factorizations"] > 0
+    assert mixed["symmetric_factorizations"] == 0
 
 
 @pytest.mark.parametrize(

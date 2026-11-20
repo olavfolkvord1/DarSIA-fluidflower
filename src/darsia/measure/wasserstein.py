@@ -39,6 +39,9 @@ def wasserstein_distance(
         - options (dict): options for the method. Set ``profile_memory`` to
           trace Python allocations. ``return_pressure`` controls pressure
           recovery and defaults to the value of ``return_info``.
+          ``return_solver_info`` reports the solve without building diagnostic
+          images. Bregman supports ``direct_solver_ordering="symmetric"`` for
+          its positive pressure reductions; the default is ``"general"``.
 
     Returns
     -------

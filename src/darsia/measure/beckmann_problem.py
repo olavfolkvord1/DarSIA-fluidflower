@@ -623,7 +623,18 @@ class BeckmannProblem(darsia.EMD):
         mass_diff = self.flat_view(mass_diff_img)
 
         # Main method
+        direct = self.linear_solver
+        report_ordering = (
+            isinstance(direct, darsia.BeckmannDirectSolver)
+            and direct.ordering == "symmetric"
+        )
+        if report_ordering:
+            direct.symmetric_fallbacks.clear()
+            direct.symmetric_factorizations = 0
         distance, solution, info = self.solve_beckmann_problem(mass_diff)
+        if report_ordering:
+            info["direct_ordering_fallbacks"] = dict(direct.symmetric_fallbacks)
+            info["symmetric_factorizations"] = direct.symmetric_factorizations
 
         # Return solution
         return_info = self.options.get("return_info", False)
@@ -648,6 +659,8 @@ class BeckmannProblem(darsia.EMD):
                 info["pressure"] = solution[self.pressure_slice].reshape(
                     self.grid.shape, order="F"
                 )
+            return distance, info
+        elif self.options.get("return_solver_info", False):
             return distance, info
         elif return_status:
             return distance, info["converged"]
@@ -1064,6 +1077,7 @@ class BeckmannProblem(darsia.EMD):
         reuse_solver: bool = False,
         *,
         cache_darcy: bool = False,
+        symmetric_pressure: bool = False,
     ) -> tuple:
         """Solve the linear system.
 
@@ -1083,6 +1097,9 @@ class BeckmannProblem(darsia.EMD):
             Reuse the solver. Defaults to False.
         cache_darcy : bool
             Reuse an exact direct factorisation of the Darcy start.
+        symmetric_pressure : bool
+            Allow symmetric ordering in the pressure reduction of a
+            diagonal-flux problem, when requested in the solver options.
 
         Returns
         -------
@@ -1199,7 +1216,9 @@ class BeckmannProblem(darsia.EMD):
 
             # 3. Build linear solver for pure pressure system
             if setup_linear_solver:
-                self._factorize(self.fully_reduced_matrix, cache_darcy)
+                self._factorize(
+                    self.fully_reduced_matrix, cache_darcy, symmetric_pressure
+                )
 
             # Stop timer to measure setup time
             time_setup = time.time() - tic
@@ -1229,11 +1248,20 @@ class BeckmannProblem(darsia.EMD):
 
         return solution, stats
 
-    def _factorize(self, matrix, cache_darcy):
-        if cache_darcy and type(self.linear_solver) is darsia.BeckmannDirectSolver:
-            self.linear_solver.setup(matrix, cache_darcy=True)
+    def _factorize(self, matrix, cache_darcy, symmetric_pressure=False):
+        solver = self.linear_solver
+        if type(solver) is not darsia.BeckmannDirectSolver:
+            solver.setup(matrix)
+        elif symmetric_pressure and solver.ordering == "symmetric":
+            diagonal = self.matrix_flux_inv.diagonal()
+            positive = bool(np.all(np.isfinite(diagonal) & (diagonal > 0)))
+            if not positive:
+                solver.symmetric_fallbacks["flux_diagonal"] += 1
+            solver.setup(matrix, cache_darcy=cache_darcy, symmetric_pressure=positive)
+        elif cache_darcy:
+            solver.setup(matrix, cache_darcy=True)
         else:
-            self.linear_solver.setup(matrix)
+            solver.setup(matrix)
 
     def _reduce_flux_rhs(self, residual, inverse):
         reduced_residual = residual[self.reduced_system_slice].copy()
