@@ -512,6 +512,30 @@ def publish(
         retry_transient(lambda folder=folder: _flush_folder(folder))
 
 
+def exists(path: Path) -> bool:
+    """Whether a file or folder exists, e.g. a queue marker.
+
+    Interruptions of the share are retried, never taken for a missing file.
+
+    Parameters
+    ----------
+    path : Path
+        The file or folder.
+
+    Returns
+    -------
+    bool
+        True if it exists, False if it does not.
+
+    Raises
+    ------
+    Unavailable
+        If the share gives no answer within :data:`GRACE`.
+
+    """
+    return _observe(Path(path), lambda: _exists(Path(path)))
+
+
 def is_complete(location: Path) -> bool:
     """Whether a complete result is stored at a location.
 

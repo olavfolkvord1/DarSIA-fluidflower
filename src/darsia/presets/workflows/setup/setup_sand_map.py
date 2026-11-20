@@ -53,6 +53,43 @@ def setup_sand_map(path: Path | list[Path], show: bool = False) -> None:
 
     config = FluidFlowerConfig(path, require_data=False, require_results=False)
     config.check(*list_required_sections(setup_sand_map))
+    assert config.labeling is not None
+    image = make_sand_map(config)
+    image.save(config.labeling.labels)
+    save_discrete_map_illustration(
+        image.img,
+        config.labeling.labels.with_suffix(".jpg"),
+        title="Labels",
+        colorbar_label="Label id",
+    )
+    if show:
+        image.show(title="Labels")
+
+
+def make_sand_map(config: FluidFlowerConfig) -> darsia.Image:
+    """The labels of a run from the series' sand-map drawing, on the run's grid.
+
+    The labels :func:`setup_sand_map` stores and the Setup's sand-map step
+    publishes.
+
+    Parameters
+    ----------
+    config : FluidFlowerConfig
+        The configuration, with [labeling.sand_map], [rig] and
+        [corrections.mapping].
+
+    Returns
+    -------
+    darsia.Image
+        The labels, on the grid of the rig's image mapping.
+
+    Raises
+    ------
+    ValueError
+        If the rig has no image mapping, or pixels inside the rig's frame lie in
+        no layer of the drawing.
+
+    """
     assert config.labeling is not None and config.rig is not None
     sand_map = config.labeling.sand_map
     assert sand_map is not None and config.corrections is not None
@@ -86,13 +123,4 @@ def setup_sand_map(path: Path | list[Path], show: bool = False) -> None:
             "drawing; extend its polygons to cover the frame."
         )
 
-    image = darsia.Image(labels, **mapping.correct_metadata())
-    image.save(config.labeling.labels)
-    save_discrete_map_illustration(
-        labels,
-        config.labeling.labels.with_suffix(".jpg"),
-        title="Labels",
-        colorbar_label="Label id",
-    )
-    if show:
-        image.show(title="Labels")
+    return darsia.Image(labels, **mapping.correct_metadata())

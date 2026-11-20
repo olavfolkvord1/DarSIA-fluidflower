@@ -6,9 +6,11 @@ import numpy as np
 import pytest
 
 import darsia
+from darsia.presets.workflows.config.utils import settings_from_table
 
-SETTINGS = darsia.ColorPathFitSettings(
-    **tomllib.loads(
+SETTINGS = settings_from_table(
+    darsia.ColorPathFitSettings,
+    tomllib.loads(
         """
         # The settings our production fitted the colour paths with.
         sands = [1, 2]

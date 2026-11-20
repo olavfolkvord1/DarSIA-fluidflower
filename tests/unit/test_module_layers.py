@@ -75,6 +75,15 @@ MODULES = [
     "darsia/utils/gpu/backend.py",
     "darsia/utils/gpu/cpu.py",
     "darsia/utils/gpu/opencl.py",
+    "darsia/jobs/step.py",
+    "darsia/jobs/queue.py",
+    "darsia/jobs/job.py",
+    "darsia/jobs/service.py",
+    "darsia/jobs/__main__.py",
+    "darsia/presets/workflows/setup/steps.py",
+    "darsia/presets/workflows/calibration/steps.py",
+    "darsia/presets/workflows/analysis/steps.py",
+    "darsia/presets/workflows/comparison/steps.py",
 ]
 """Modules under the rules, relative to the source folder."""
 
@@ -90,8 +99,9 @@ LITERALS = re.compile(
 
 
 def _forbidden(module: str) -> tuple[str, ...]:
-    """Packages the module must not import, by its layer."""
-    if module.startswith("darsia/gui/"):
+    """Packages the module must not import, by its layer; the job engine's commands
+    join the engine and the presets' steps, as the window does."""
+    if module.startswith("darsia/gui/") or module == "darsia/jobs/__main__.py":
         return ()
     if module.startswith("darsia/presets/"):
         return ("darsia.gui",)
