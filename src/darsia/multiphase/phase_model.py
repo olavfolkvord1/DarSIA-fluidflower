@@ -86,9 +86,6 @@ _SPATIAL_CONTEXT_FRACTION = 0.0015
 """Width of the local change statistics, as a fraction of the shorter physical
 side of the image (on square pixels, of its shorter pixel count)."""
 
-_ROWS_PER_CHUNK = 64
-"""Image rows per feature chunk; the full feature matrix is never held."""
-
 _PIXELS_PER_BLOCK = 4096
 """Pixels whose features are computed together, few enough for the processor's
 cache."""
@@ -334,6 +331,38 @@ def _log_ratios(rgb: np.ndarray, epsilon: np.floating) -> np.ndarray:
     )
 
 
+def phase_feature_sizes(
+    shape: tuple[int, ...], texture_sigma_mm: float, pixel_size_mm: float, dtype: type
+) -> tuple[float, np.floating, int]:
+    """The sizes of a frame's features in pixels of its grid.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Shape of the images, rows and columns first.
+    texture_sigma_mm : float
+        Standard deviation (mm) of the Gaussian defining the image texture.
+    pixel_size_mm : float
+        Pixel size of the images' grid.
+    dtype : type
+        Floating dtype of the features.
+
+    Returns
+    -------
+    sigma : float
+        The texture's standard deviation in pixels.
+    spatial : floating
+        The standard deviation of the local change statistics in pixels: a fraction
+        of the shorter side, at least the texture's, in the features' dtype.
+    width : int
+        Side of the support window: twice four texture sigmas, rounded, plus one.
+
+    """
+    sigma = texture_sigma_mm / pixel_size_mm
+    spatial = dtype(max(sigma, _SPATIAL_CONTEXT_FRACTION * min(shape[:2])))
+    return sigma, spatial, 2 * round(4 * sigma) + 1
+
+
 class PhaseFeatures:
     """The optical features of one frame, from filters of the whole frame.
 
@@ -393,8 +422,9 @@ class PhaseFeatures:
             )
         current, baseline = images[:2]
 
-        sigma = texture_sigma_mm / pixel_size_mm
-        spatial = dtype(max(sigma, _SPATIAL_CONTEXT_FRACTION * min(current.shape[:2])))
+        sigma, spatial, width = phase_feature_sizes(
+            current.shape, texture_sigma_mm, pixel_size_mm, dtype
+        )
         gray = [np.mean(image, axis=2, dtype=dtype) for image in images]
         self._smooth = [darsia.gaussian_blur(g, sigma) for g in gray]
         self._contrast = [g - s for g, s in zip(gray, self._smooth)]
@@ -412,7 +442,6 @@ class PhaseFeatures:
             self._local_dynamic_mean = darsia.gaussian_blur(self._dynamic_norm, spatial)
         self._images = images
         self.dtype = dtype
-        width = 2 * round(4 * sigma) + 1
         self.support = cv2.erode(
             valid.astype(np.uint8), np.ones((width, width), np.uint8)
         ).astype(bool)
@@ -549,8 +578,9 @@ def phase_probabilities(
     """CO2-presence and gas-within-CO2 probabilities of one frame.
 
     Both heads read the frame's :class:`PhaseFeatures` with the model's texture
-    scale, built in chunks of rows into one matrix. Outside the features' support
-    both probabilities are NaN, so the support travels with the result.
+    scale, on the process's compute backend (:func:`darsia.compute_backend`).
+    Outside the features' support both probabilities are NaN, so the support
+    travels with the result.
 
     Parameters
     ----------
@@ -570,26 +600,14 @@ def phase_probabilities(
         outside the support.
 
     """
-    features = PhaseFeatures(
+    return darsia.compute_backend().phase_probabilities(
         current,
         baseline,
         previous,
         texture_sigma_mm=model.texture_sigma_mm,
         pixel_size_mm=pixel_size_mm,
+        heads=(model.co2_presence, model.gas_within_co2),
     )
-    rows, cols = features.support.shape
-    co2 = np.empty((rows, cols), features.dtype)
-    gas = np.empty((rows, cols), features.dtype)
-    chunk_pixels = min(rows, _ROWS_PER_CHUNK) * cols
-    buffer = np.empty((chunk_pixels, len(PHASE_FEATURE_NAMES)), features.dtype)
-    for start in range(0, rows, _ROWS_PER_CHUNK):
-        chunk = np.s_[start : start + _ROWS_PER_CHUNK]
-        matrix = features.matrix(chunk, out=buffer[: co2[chunk].size])
-        co2[chunk] = model.co2_presence.probability(matrix).reshape(-1, cols)
-        gas[chunk] = model.gas_within_co2.probability(matrix).reshape(-1, cols)
-    co2[~features.support] = np.nan
-    gas[~features.support] = np.nan
-    return co2, gas
 
 
 def limit_probabilities(
