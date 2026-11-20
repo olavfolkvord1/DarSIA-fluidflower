@@ -92,7 +92,10 @@ def test_minimal_chain_runs_on_a_coarse_grid(tmp_path):
         for name in ("baseline", "frame")
     )
     pixel_mm = [size * 1000 for size in frame.voxel_size]
-    model = darsia.read_phase_model(tmp_path / "model", pixel_size_mm=0.5)
+    # A folder in the delivered layout records no canvas: read by explicit choice.
+    model = darsia.read_phase_model(
+        tmp_path / "model", pixel_size_mm=0.5, canvas=rig.canvas, accept_canvas=True
+    )
     co2, gas = darsia.phase_probabilities(
         model,
         frame.img,

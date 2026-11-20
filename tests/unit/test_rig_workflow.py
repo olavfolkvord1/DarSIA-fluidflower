@@ -1,5 +1,6 @@
 """Unit tests for Rig correction workflow setup behavior."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -360,6 +361,75 @@ FIT = (
     "chroma_cutoff = 0.08\nchroma_sigmas = 3.5\n"
 )
 """The fit's settings our production ran with."""
+
+
+def test_rig_canvas_records_settings_not_locations(tmp_path):
+    """The canvas holds the format, the corrections and the grid in rig metres; a
+    moved project keeps it, a changed setting changes it, and the rig saves it.
+    Whole metric cells keep the canvas' extent from before they extend it, and the
+    run's optical area factor is not part of the canvas."""
+    i, j = np.mgrid[0:4, 0:5].astype(np.float32)
+    mapping = darsia.ImageMappingCorrection(
+        1.5 + 1.25 * j, 0.75 + 1.5 * i, source_shape=(8, 10), dimensions=[0.4, 0.5]
+    )
+    rows, cols = np.mgrid[0:8, 0:10].astype(np.float32)
+    canvases = []
+    float32 = '[corrections.type]\ntarget_type = "float32"\n'
+    cells = (
+        '[corrections.grid]\nprecision = "float32"\npixel_size_mm = 150.0\n'
+        "area_factor = 1.0337\n"
+    )
+    for project, extra in (("a", ""), ("b", ""), ("b", float32), ("c", cells)):
+        folder = tmp_path / project
+        folder.mkdir(exist_ok=True)
+        mapping.save(folder / "mapping.npz")
+        darsia.OpticalImage(
+            np.stack([rows, cols, rows + cols], -1), color_space="RGB"
+        ).save(folder / "baseline.npz")
+        mapping_path = (folder / "mapping.npz").as_posix()
+        (folder / "config.toml").write_text(
+            f'{extra}[corrections.mapping]\npath = "{mapping_path}"\n'
+        )
+        rig = Rig()
+        rig.setup_reading(
+            folder / "baseline.npz",
+            experiment=None,
+            corrections_config=CorrectionsConfig().load(folder / "config.toml"),
+        )
+        canvases.append(rig.canvas)
+    rig.baseline_path = tmp_path / "b" / "baseline.npz"
+    rig.color_corrections = []
+    with pytest.warns(UserWarning):
+        rig.save(tmp_path / "rig")
+    saved = json.loads((tmp_path / "rig" / "meta_data.json").read_text())
+
+    assert (
+        canvases[0]
+        == canvases[1]
+        == {
+            "source": {"format": "NPZ"},
+            "corrections": {"mapping": {"path": "mapping.npz"}},
+            "grid": {
+                "shape": [4, 5],
+                "dimensions": [0.4, 0.5],
+                "origin": [0.0, 0.4],
+                "extent": {"dimensions": [0.4, 0.5], "origin": [0.0, 0.4]},
+            },
+        }
+    )
+    assert canvases[2]["corrections"]["type"] == {"target_type": "float32"}
+    # 150 mm cells extend the 0.4 x 0.5 m canvas to 3 x 4 cells upwards and right.
+    assert canvases[3]["corrections"]["grid"] == {
+        "precision": "float32",
+        "pixel_size_mm": 150.0,
+    }
+    assert canvases[3]["grid"] == {
+        "shape": [3, 4],
+        "dimensions": [0.45, 0.6],
+        "origin": [0.0, 0.45],
+        "extent": {"dimensions": [0.4, 0.5], "origin": [0.0, 0.4]},
+    }
+    assert saved["canvas"] == canvases[3]
 
 
 def _material_rig(tmp_path) -> tuple[Rig, CorrectionsConfig, np.ndarray]:
