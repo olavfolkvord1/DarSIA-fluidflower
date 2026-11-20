@@ -33,7 +33,11 @@ logger = logging.getLogger(__name__)
 
 def _stored_ignore_mask(mass_folder: Path) -> str | None:
     """Ignore mask of the stored calibration (None without stored calibration)."""
-    files = sorted((mass_folder / "color_path_interpretation").glob("*.json"))
+    files = sorted(
+        path
+        for path in (mass_folder / "color_path_interpretation").glob("*.json")
+        if path.is_file()
+    )
     if len(files) == 0:
         return None
     try:
@@ -50,7 +54,11 @@ def _load_baseline_color_spectrum_for_color_to_mass(
 ) -> darsia.LabelColorSpectrumMap | None:
     """Load baseline colour spectrum for color-to-mass calibration if present."""
 
-    spectrum_files = list(baseline_color_spectrum_folder.glob("color_spectrum_*.json"))
+    spectrum_files = [
+        path
+        for path in baseline_color_spectrum_folder.glob("color_spectrum_*.json")
+        if path.is_file()
+    ]
     if len(spectrum_files) == 0:
         return None
 

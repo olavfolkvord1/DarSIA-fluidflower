@@ -356,6 +356,15 @@ Notes:
 - Both lists default to empty.
 - Empty lists are a strict no-op (analysis behavior is unchanged).
 - If provided, values outside the union of the configured ROIs are set to zero.
+- The jobs' phase-map step reads the same section per run, with the `[[roi]]`
+  entries it names, and limits each frame's phase probabilities before the
+  phase rules and the free-gas allocation: where `concentration_aq` may not be,
+  there is no CO2 at all, and where `saturation_g` may not be, CO2 is
+  dissolved. Each phase map's result records the CO2 and free-gas area the model
+  saw where none may be (`measurements.expert_knowledge`). `phase_maps` cannot
+  limit the phase maps themselves. Without the section, the phase maps are
+  unchanged.
+
 Example, no CO2 in the uppermost sand layer (raw label 3):
 ```toml
 [[roi]]

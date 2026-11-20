@@ -444,12 +444,14 @@ def save_tile(folder: Path, frame: Frame, tile: np.ndarray, drawn: Mapping) -> d
 
     The row holds the frame, its elapsed and production target time [h], the file,
     the tile's size (width, height) and how it was drawn (``drawn``, from
-    :func:`draw_tile`). Rows are listed by :func:`write_tile_index`.
+    :func:`draw_tile`). Rows are listed by :func:`write_tile_index`. A frame known
+    by its session and name (``<session>/<name>``) has its tiles in the session's
+    folder.
 
     """
     folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
     name = tile_name(frame.case, frame.target_h)
+    (folder / name).parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(folder / name), cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)):
         raise OSError(f"Could not write the tile {name}")
     return dict(

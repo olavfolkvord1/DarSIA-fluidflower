@@ -35,6 +35,7 @@ parameters are a :class:`darsia.MassCalibration`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -175,6 +176,37 @@ class PrecisionCO2MassAnalysis(darsia.CO2MassAnalysis):
         )
 
 
+def atmospheric_gas_density(pressure_bar: float, temperature_c: float, dtype) -> float:
+    """The gas density [kg/m3] of CO2 at an atmospheric pressure and temperature, at
+    no hydrostatic head, from the official tables in ``dtype``
+    (:class:`PrecisionCO2MassAnalysis` on one pixel at its datum): a frame's gas
+    density as the estimated overflow reference reads it, our production's
+    density at zero height.
+
+    Parameters
+    ----------
+    pressure_bar, temperature_c : float
+        The atmospheric pressure [bar] and temperature [Celsius].
+    dtype : dtype
+        The floating precision of the tables' evaluation.
+
+    Returns
+    -------
+    float
+        The density.
+
+    """
+    pixel = darsia.ScalarImage(np.zeros((1, 1), dtype), dimensions=[1.0, 1.0])
+    _, y = darsia.pixel_centres(pixel)
+    co2 = PrecisionCO2MassAnalysis(
+        pixel,
+        datum_m=float(np.asarray(y).ravel()[0]),
+        atmospheric_pressure=pressure_bar,
+        atmospheric_temperature=temperature_c,
+    )
+    return float(co2.density_gaseous_co2.ravel()[0])
+
+
 def _table(values, supports, table):
     """Linear interpolation of a table in the dtype of the values; a value outside
     the table is refused."""
@@ -309,15 +341,19 @@ def run_geometry(
     )
 
 
-def relative_signal(signal: np.ndarray, calibration: MassCalibration) -> np.ndarray:
+def relative_signal(
+    signal: np.ndarray, calibration: MassCalibration | darsia.RunStatisticsSettings
+) -> np.ndarray:
     """The read signal relative to the concentration curve's range, in [0, 1].
 
     Parameters
     ----------
     signal : array
         Read signal of the dissolved CO2.
-    calibration : MassCalibration
-        The curve's bottom and top.
+    calibration : MassCalibration or darsia.RunStatisticsSettings
+        The curve's bottom and top (``zero_signal``, ``saturation_signal``): a
+        calibration's, or before the calibration the run statistics' it is fitted
+        on.
 
     Returns
     -------
@@ -667,3 +703,34 @@ def read_mass_maps(folder: Path) -> darsia.SimpleMassAnalysisResults:
         color_signal=None,
         **images,
     )
+
+
+def write_mass_copy(
+    folder: Path,
+    fields: Mapping[str, np.ndarray],
+    grid: darsia.Image,
+    cells: darsia.MetricCells,
+    name: str,
+) -> None:
+    """Store a frame's copy on metric cells in ``folder``: each field
+    (:class:`MassCopy`, its ``static`` fields included) as an image on the cells'
+    grid, named ``name``, which extends the run's ``grid`` from its lower left
+    corner."""
+    bottom = grid.origin[1] - grid.dimensions[0]
+    metadata = {
+        "dimensions": cells.dimensions,
+        "origin": [grid.origin[0], bottom + cells.dimensions[0]],
+    }
+    for field, values in fields.items():
+        image = darsia.ScalarImage(values, name=name, **metadata)
+        image.save(Path(folder) / f"{field}.npz")
+
+
+def read_mass_copy(folder: Path) -> dict[str, darsia.Image]:
+    """A frame's stored copy of its mass maps on metric cells, by field
+    (:func:`write_mass_copy`)."""
+    return {
+        f.stem: darsia.imread(f)
+        for f in sorted(Path(folder).glob("*.npz"))
+        if f.is_file()
+    }

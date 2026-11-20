@@ -65,7 +65,9 @@ def _resolve_result_format(
 def _collect_result_files(
     source_paths: list[Path], result_folder: Path, suffix: str
 ) -> list[Path]:
-    available = sorted(result_folder.glob(f"*.{suffix}"))
+    available = sorted(
+        path for path in result_folder.glob(f"*.{suffix}") if path.is_file()
+    )
     if len(available) == 0:
         raise FileNotFoundError(
             f"No '*.{suffix}' files found in result folder {result_folder}."

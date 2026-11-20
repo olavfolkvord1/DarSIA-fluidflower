@@ -2,8 +2,9 @@
 
 - ``mass-maps`` (R7) turns a frame's read signal, phase maps and free gas into its
   CO2 mass per pore volume (:func:`darsia.mass_maps`), with its run's calibration
-  and the CO2 tables at the frame's pressure and temperature; each field of the
-  maps is stored as an image.
+  and the CO2 tables at the frame's pressure and temperature; the signal is read
+  as the run statistics read it, every sand by Beer–Lambert as the reference sand
+  (:func:`response_reading`), and each field of the maps is stored as an image.
 - ``mass-copy`` copies each frame's mass maps onto metric cells, e.g. 1 mm
   (:class:`darsia.MassCopy`), a second result of the frame; each field of the copy,
   and the run's pore volume and domain area per cell, is stored as an image on
@@ -17,7 +18,6 @@
 
 from __future__ import annotations
 
-import csv
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,16 +27,16 @@ from darsia.jobs.step import Memory, Order, Scope, Step, StepContext, Term, run_
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain
 from darsia.presets.workflows.calibration.steps import (
+    READING,
+    RESPONSE,
     MaterialSettings,
-    ReadingSettings,
     co2_state,
     frame_key,
-    read_maps,
-    read_mass_calibrations,
+    native_reading,
     read_signal,
     reading_sands,
+    response_reading,
     run_grid,
-    sand_reading,
 )
 from darsia.presets.workflows.setup.setup_rig import make_experiment
 from darsia.presets.workflows.setup.steps import (
@@ -48,8 +48,8 @@ from darsia.presets.workflows.setup.steps import (
     run_settings,
 )
 
-FIELDS = ("mass", "mass_g", "mass_aq", "saturation_g", "concentration_aq")
-"""The fields of the mass maps a result stores, one image each."""
+DOMAIN_MASS_TABLE = "domain_mass.csv"
+"""The file of a run's stored mass per domain (R8)."""
 
 
 @dataclass(frozen=True)
@@ -67,25 +67,6 @@ class DomainSettings:
     a domain names a part of a layer."""
     min_part_area_cm2: float = 1.0
     """The smallest area [cm2] of a layer's part other than its largest."""
-
-
-def read_mass_maps(folder: Path) -> darsia.SimpleMassAnalysisResults:
-    """A frame's stored mass maps."""
-    images = {name: darsia.imread(Path(folder) / f"{name}.npz") for name in FIELDS}
-    first = images["mass"]
-    return darsia.SimpleMassAnalysisResults(
-        name=first.name,
-        date=first.date,
-        time=first.time,
-        color_signal=None,
-        **images,
-    )
-
-
-def _write_maps(folder: Path, maps: darsia.SimpleMassAnalysisResults) -> None:
-    """Store each field of a frame's mass maps as an image."""
-    for name in FIELDS:
-        getattr(maps, name).save(Path(folder) / f"{name}.npz")
 
 
 def _domain_count(tables: Mapping, run: str | None, context=None) -> int:
@@ -107,17 +88,18 @@ def _mass_maps(ctx: StepContext) -> None:
     """Each frame's CO2 mass per pore volume."""
     run, settings = ctx.task.run, ctx.settings
     grid = run_grid(ctx.read("rig", read_rig), settings["material"])
-    calibration = ctx.read("calibration", read_mass_calibrations)[run]
-    reading = sand_reading(settings["reading"])
+    calibration = ctx.read("calibration", darsia.read_mass_calibrations)[run]
+    reading = response_reading(ctx, run, grid)
+    native = native_reading(ctx, run)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
     start = experiment.experiment_start
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
         image = ctx.read("corrected-image", read_image, frame=frame)
-        maps = ctx.read("phase-maps", read_maps, frame=frame)
+        maps = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)
         signal, measured = read_signal(
-            grid, image.img, maps, reading, settings["run_statistics"]
+            grid, image.img, maps, reading, settings["run_statistics"], native
         )
         date = experiment.get_datetime(ctx.photo(run, frame))
         relative = darsia.ScalarImage(
@@ -128,7 +110,7 @@ def _mass_maps(ctx: StepContext) -> None:
             dimensions=image.dimensions,
             origin=image.origin,
         )
-        hours = (date - start).total_seconds() / 3600
+        hours = experiment.time_since_start(date)
         factor = darsia.dilution_factor(
             hours,
             grid.geometry.pore_volume(grid.domain & maps["co2"]),
@@ -149,42 +131,25 @@ def _mass_maps(ctx: StepContext) -> None:
             calibration,
             factor,
         )
-        ctx.publish(lambda folder: _write_maps(folder, result), frame=frame)
-
-
-def read_mass_copy(folder: Path) -> dict[str, darsia.Image]:
-    """A frame's stored copy of its mass maps on metric cells, by field."""
-    return {f.stem: darsia.imread(f) for f in sorted(Path(folder).glob("*.npz"))}
-
-
-def _cells_grid(grid: darsia.Image, cells: darsia.MetricCells) -> dict:
-    """The metadata of an image on metric cells over a run's grid: the cells
-    extend the grid from its lower left corner."""
-    bottom = grid.origin[1] - grid.dimensions[0]
-    return {
-        "dimensions": cells.dimensions,
-        "origin": [grid.origin[0], bottom + cells.dimensions[0]],
-    }
+        ctx.publish(lambda folder: darsia.write_mass_maps(folder, result), frame=frame)
 
 
 def _mass_copy(ctx: StepContext) -> None:
     """Each frame's mass maps copied onto metric cells."""
     grid = run_grid(ctx.read("rig", read_rig), ctx.settings["material"])
     copy = darsia.MassCopy(grid.geometry, ctx.settings["mass_copy"])
-    metadata = _cells_grid(grid.rig.facies, copy.cells)
     for frame in ctx.task.frames:
         if ctx.done(frame):
             continue
-        maps = ctx.read("mass-maps", read_mass_maps, frame=frame)
-        labels = ctx.read("phase-maps", read_maps, frame=frame)["labels"]
+        maps = ctx.read("mass-maps", darsia.read_mass_maps, frame=frame)
+        labels = ctx.read("phase-maps", darsia.read_phase_maps, frame=frame)["labels"]
         fields = {**copy(maps, labels), **copy.static}
-
-        def write(folder, fields=fields):
-            for name, values in fields.items():
-                image = darsia.ScalarImage(values, name=frame.name, **metadata)
-                image.save(Path(folder) / f"{name}.npz")
-
-        ctx.publish(write, frame=frame)
+        ctx.publish(
+            lambda folder: darsia.write_mass_copy(
+                folder, fields, grid.rig.facies, copy.cells, frame.name
+            ),
+            frame=frame,
+        )
 
 
 def _domain_mass(ctx: StepContext) -> None:
@@ -206,25 +171,17 @@ def _domain_mass(ctx: StepContext) -> None:
         min_part_area_cm2=settings.min_part_area_cm2,
     )
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
-    start = experiment.experiment_start
     rows = []
     for frame in ctx.task.frames:
-        maps = ctx.read("mass-maps", read_mass_maps, frame=frame)
+        maps = ctx.read("mass-maps", darsia.read_mass_maps, frame=frame)
         date = experiment.get_datetime(ctx.photo(run, frame))
-        hours = (date - start).total_seconds() / 3600
+        hours = experiment.time_since_start(date)
         for row in sums(maps, co2_state(grid, experiment, date)):
             case = frame_key(frame)
             rows.append({**row, "run": run, "case_id": case, "elapsed_h": hours})
     ctx.publish(
-        lambda folder: write_domain_mass(Path(folder) / "domain_mass.csv", rows)
+        lambda folder: write_domain_mass(Path(folder) / DOMAIN_MASS_TABLE, rows)
     )
-
-
-def read_domain_mass(folder: Path) -> list[dict]:
-    """A run's stored masses per domain, a row per frame and domain, as read from
-    its table (:meth:`RunSeries.from_domain_mass` reads them)."""
-    with open(Path(folder) / "domain_mass.csv", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
 
 
 MASS_MAPS = Step(
@@ -234,6 +191,8 @@ MASS_MAPS = Step(
         "corrected-image": Scope.OWN,
         "phase-maps": Scope.OWN,
         "calibration": Scope.ONE,
+        "color-ranges": Scope.ONE,
+        "path-ratios": Scope.ONE,
     },
     Order.FRAMES,
     Memory(
@@ -248,10 +207,10 @@ MASS_MAPS = Step(
     _mass_maps,
     {
         "material": MaterialSettings,
-        "reading": ReadingSettings,
         "run_statistics": darsia.RunStatisticsSettings,
+        **RESPONSE,
     },
-    sections=EXPERIMENT,
+    sections=(*READING, *EXPERIMENT),
     files=protocol_files,
 )
 """Each frame's mass maps (R7)."""

@@ -1,22 +1,26 @@
 """The minimal chain on a coarse run grid run as one job, against the direct calls.
 
 Two synthetic runs of six frames each (the minimal chain's sensor images, mapping,
-material light correction and delivered phase model) are set up, calibrated,
-analysed and compared by the presets' steps. Their mass maps equal the methods
-called directly, in single precision through the service and in double precision
-in this process; a run whose phase maps were interrupted after the injection end
-resumes at its first missing frame with the same maps.
+material light correction and delivered phase model) are set up, calibrated (the
+sands' colour ranges and path ratios measured, every sand read by Beer–Lambert),
+analysed, compared and filmed by the presets' steps. Their mass maps, distances,
+film tiles, films and ensemble figures equal the methods called directly, in
+single precision through the service and in double precision in this process; a
+run whose phase maps were interrupted after the injection end resumes at its first
+missing frame with the same maps.
 
 """
 
 import datetime
 import json
 import tomllib
-from dataclasses import asdict
+import zipfile
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import toml
 
@@ -24,14 +28,21 @@ import darsia
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import queue
 from darsia.jobs.job import create_job
-from darsia.jobs.step import Selection, StepContext, table
+from darsia.jobs.step import Selection, StepContext, run_tables, table
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
 from darsia.presets.workflows.calibration import steps as calibration
 from darsia.presets.workflows.comparison import steps as comparison
+from darsia.presets.workflows.comparison.ensemble import (
+    EnsembleRun,
+    ensemble_tables,
+)
+from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
 from darsia.presets.workflows.comparison.mass_wasserstein import (
+    ComparedFrame,
     WassersteinSettings,
+    distance_rows,
     distance_scales,
     frame_cells,
     wasserstein_distances,
@@ -39,6 +50,21 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
 )
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.utils import settings_from_table
+from darsia.presets.workflows.media import steps as media_steps
+from darsia.presets.workflows.media.films import write_films
+from darsia.presets.workflows.media.panels import PhotographSettings
+from darsia.presets.workflows.media.style import FigureStyle
+from darsia.presets.workflows.media.tiles import Frame as MediaFrame
+from darsia.presets.workflows.media.tiles import (
+    Panel,
+    SandGeometry,
+    TileSettings,
+    draw_tile,
+    graph_axes,
+    read_tile_index,
+    save_tile,
+    write_tile_index,
+)
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup import steps as setup
 from darsia.presets.workflows.setup.setup_facies import make_facies
@@ -49,9 +75,22 @@ from tests.unit.test_gas_allocation import TABLES as RULE_TABLES
 from tests.unit.test_job_service import _serve, importable, numpys_blas  # noqa: F401
 from tests.unit.test_minimal_chain import COLOURS, _head
 
+@pytest.fixture(autouse=True)
+def local_model_cache(tmp_path, monkeypatch):
+    """Keep retained model evidence, including child workers', inside this test."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "app-cache"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "app-cache"))
+
+
 START = datetime.datetime(2026, 1, 1, 12)
 HOUR = datetime.timedelta(hours=1)
-STEPS = setup.STEPS + calibration.STEPS + analysis.STEPS + comparison.STEPS
+STEPS = (
+    setup.STEPS
+    + calibration.STEPS
+    + analysis.STEPS
+    + comparison.STEPS
+    + media_steps.STEPS
+)
 KERNEL = sorted(
     {r["architecture"] for r in numpys_blas() if r.get("internal_api") == "openblas"}
 )[0]
@@ -129,9 +168,13 @@ swi = {{"1" = 0.1, "2" = 0.2}}
 measured_swi = [1, 2]
 [overflow]
 statuses = ["Verified"]
-recipe_tolerance = {{}}
+recipe_tolerance = {{alkalinity = 0.05}}
 variant = "circulation"
 circulation = {{minimum_readings = 3}}
+evaporation = {{minimum_readings = 3, rates_g_h = {{r1 = "measured"}}}}
+[recipe]
+alkalinity = 1.0
+indicator = "bromocresol green"
 [run_statistics]
 mean_mm = 10.0
 zero_signal = 0.0
@@ -142,13 +185,60 @@ colors = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]]
 values = [0.0, 1.0]
 supports = [0.0, 1.0]
 table = [0.0, 1.0]
-factor = 1.0
+scale = 0.3
 [reading.sands.2]
 colors = [[0.0, 0.0, 0.0], [0.3, 0.0, 0.0]]
 values = [0.0, 1.0]
 supports = [0.0, 1.0]
 table = [0.0, 1.0]
-factor = 1.0
+scale = 0.3
+[response]
+range_runs = ["r1", "r2"]
+ratio_run = "r2"
+ratio_gain = 1.0
+[color_ranges]
+mean_mm = 5.0
+inner_mm = 0.0
+gas_mm = 5.0
+minimum_inner_mm2 = 25.0
+minimum_gas_mm2 = 25.0
+gas_percentile = 90.0
+[shadow]
+fine_mm = 10.0
+broad_mm = 50.0
+below = 0.75
+reach_mm = 10.0
+smallest_mm2 = 2000.0
+darkest = 0.2
+[path_ratios]
+mean_mm = 10.0
+tile_mm = 15.0
+band_mm = [5.0, 15.0]
+far_mm = 30.0
+min_dissolved_share = 0.8
+gas_free_mm = 5.0
+min_band_mm2 = 25.0
+flat_tol_per_mm = 1.0
+arrived_share = 0.5
+equalise_h = 0.5
+min_level = 0.01
+ceiling_margin = 0.99
+min_tiles = 1
+block_mm = 50.0
+bootstrap = 20
+seed = 0
+[beer_lambert]
+reference_sand = 1
+mean_mm = 10.0
+background_degree = 1
+background_margin_mm = 5.0
+unshaded_light = 0.95
+background_fill = 0.5
+background_iterations = 4
+background_huber_threshold = 1.5
+[unknown_mass]
+column_reach_mm = 20.0
+intervals = 32768
 [calibration_fit]
 gain_window_h = [1.0, 3.0]
 dilution_start_h = 3.5
@@ -197,12 +287,74 @@ copy_mm = 10.0
 [distances]
 times_h = [3.0]
 tolerance_h = 0.6
+reference_run = "r2"
+[style]
+dpi = 50
+log_span = 50.0
+surface = "#fcfcfb"
+ink = "#0b0b0b"
+secondary = "#52514e"
+muted = "#898781"
+grid = "#e1e0d9"
+axis = "#c3c2b7"
+washes = ["#ebeae4", "#dcdcd4"]
+series = "#2a78d6"
+frame = "#1e2226"
+empty = "#3e4246"
+no_value = "#e6edf2"
+colour_map = "viridis"
+marker = "#667085"
+curves = [
+    {{column = "total_quantified_mass_g", name = "Total", colour = "#175aad", line = "-"}},
+    {{column = "injected_mass_g", name = "Injected", colour = "black", line = "--"}},
+]
+[tiles]
+width_px = 320
+display_cells = 40
+colour_scale = 0.5
+[photograph]
+matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+invalid_grey = 128
+[[media.films]]
+name = "pyramid"
+layout = "pyramid"
+panels = [
+    {{content = "graph", label = "Mass", display_mean = "none"}},
+    {{content = "image", label = "Corrected image", display_mean = "none"}},
+    {{content = "mass", label = "Total CO2", display_mean = "depth"}},
+]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
+[[media.films]]
+name = "maps"
+layout = "grid"
+panels = [{{content = "mass", label = "Total CO2", display_mean = "depth"}}]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
+[[media.films]]
+name = "graphs"
+layout = "grid"
+panels = [{{content = "graph", label = "Mass", display_mean = "none"}}]
+size_px = [480, 270]
+fps = 3.0
+codec = "mp4v"
+note = "Synthetic runs"
 [runs.r2.data]
 folder = "photos-r2"
-[runs.r2.protocols]
-overflow = "overflow-r2.csv"
+[runs.r2.depth]
+depth_map = "depth-r2.npz"
+[runs.r2.recipe]
+alkalinity = 1.04
+[runs.r1.depth]
+interpolation = "triangulation"
 [runs.r1.protocols]
 overflow = "overflow-r1.csv"
+[runs.r2.reading.sands.1]
+colors = [[0.0, 0.0, 0.0], [0.3, 0.02, 0.0]]
 """
 
 
@@ -232,11 +384,14 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
             lines.append(f"{name},{START + k * HOUR}")
             names.append(name)
         (root / f"imaging-{run}.csv").write_text("\n".join(lines) + "\n")
+        # Water evaporates before the injection, 0.4 g/h, which the correction
+        # adds back; the second run has no readings of its own.
         (root / f"overflow-{run}.csv").write_text(
             "image_time,weight_g,status\n"
             + "".join(
-                f"{START + h * HOUR},{1000 + max(0.0, h + 1) * grow / 4},Verified\n"
-                for h in (-1.5, -1.25, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+                f"{START + h * HOUR},"
+                f"{1000 + max(0.0, h + 1) * grow / 4 - 0.4 * (h + 2)},Verified\n"
+                for h in (-1.75, -1.5, -1.25, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
             )
         )
         frames[run] = tuple(Frame(f"photos-{run}", name) for name in names)
@@ -250,7 +405,20 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     darsia.ScalarImage(labels, dimensions=[0.3, 0.45]).save(root / "labels.npz")
     depth = darsia.ScalarImage(np.full((120, 180), 0.01), dimensions=[0.3, 0.45])
     depth.save(root / "depth.npz")
+    # The second run's rig is deeper, so that the distances' reference run counts.
+    deeper = darsia.ScalarImage(np.full((120, 180), 0.012), dimensions=[0.3, 0.45])
+    deeper.save(root / "depth-r2.npz")
     (root / "props.csv").write_text("id,porosity,permeability\n1,0.44,100\n2,0.4,50\n")
+    # The first run's depth comes from these measurements by the rule on its grid;
+    # its edges lie outside their hull.
+    points = [(x, y) for y in (0.05, 0.15, 0.25) for x in (0.05, 0.15, 0.25, 0.4)]
+    (root / "depth.csv").write_text(
+        "x,y,depth\n"
+        + "".join(
+            f"{x},{y},{0.009 + 0.01 * x**2 + 0.004 * y + 0.0003 * (k % 3):.6f}\n"
+            for k, (x, y) in enumerate(points)
+        )
+    )
     corners = [(x, y) for y in (0, 0.15, 0.3) for x in (0, 0.225, 0.45)]
     drawing = {
         "anchors": [list(corner) for corner in corners],
@@ -268,8 +436,10 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     )
     (root / "pt.csv").write_text(
         "datetime,pressure_bar,temperature_celsius,pressure_gradient_bar,"
-        f"temperature_gradient_celsius\n{START - 3 * HOUR},1.013,20.0,0.0,0.0\n"
-        f"{START + 24 * HOUR},1.013,20.0,0.0,0.0\n"
+        f"temperature_gradient_celsius\n{START - 3 * HOUR},1.013,20.0,-1.2e-4,0.0\n"
+        f"{START + 1.4 * HOUR},1.0207,20.6,-1.1e-4,0.02\n"
+        f"{START + 3.7 * HOUR},1.0061,19.7,-1.3e-4,-0.01\n"
+        f"{START + 24 * HOUR},1.0153,20.2,-1.15e-4,0.03\n"
     )
     heads = root / "model" / "models" / "generic"
     heads.mkdir(parents=True)
@@ -286,10 +456,49 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     rules = toml.dumps({k: RULE_TABLES[k] for k in ("phase_rules", "gas_allocation")})
     targets = "".join(f'"{m}" = {np.log(COLOURS[m] * 1e3).tolist()}\n' for m in (1, 2))
     text = SETTINGS.format(kernel=KERNEL, precision=precision, targets=targets)
+    for run, selected in frames.items():
+        text += f"\n[ensemble.target_h.{run}]\n"
+        text += "".join(
+            f'"{frame.session}/{frame.name}" = {float(index + 1)}\n'
+            for index, frame in enumerate(selected)
+        )
     (root / "config.toml").write_text(text + rules)
     sessions = {run: {f"photos-{run}": f"photos-{run}"} for run in frames}
     selection = Selection(frames, sessions, domains=("whole", "upper"))
     return root / "config.toml", selection
+
+
+ATMOSPHERE = (
+    "pressure_bar",
+    "temperature_celsius",
+    "pressure_gradient_bar",
+    "temperature_gradient_celsius",
+)
+
+
+def _atmosphere(experiment, h: float, dtype) -> dict:
+    """Our production's rule for a run's atmosphere and its gradients at a time:
+    the record linear in its hours, those in the dtype."""
+    record = experiment.pressure_temperature_protocol.df
+    start = experiment.experiment_start
+    times = [(date - start).total_seconds() / 3600 for date in record["datetime"]]
+    times = np.asarray(times, dtype)
+    return {name: float(np.interp(h, times, record[name])) for name in ATMOSPHERE}
+
+
+def _co2_state(grid, experiment, date) -> darsia.PrecisionCO2MassAnalysis:
+    """The CO2 state on a run's grid at a frame's atmosphere by our production's
+    rule, in the grid's dtype."""
+    h = (date - experiment.experiment_start).total_seconds() / 3600
+    value = _atmosphere(experiment, h, grid.rig.pixel_area.img.dtype)
+    return darsia.PrecisionCO2MassAnalysis(
+        grid.rig.baseline,
+        datum_m=grid.datum_m,
+        atmospheric_pressure=value["pressure_bar"],
+        atmospheric_temperature=value["temperature_celsius"],
+        atmospheric_pressure_gradient=value["pressure_gradient_bar"],
+        atmospheric_temperature_gradient=value["temperature_gradient_celsius"],
+    )
 
 
 def _direct(root: Path, selection: Selection) -> dict:
@@ -301,9 +510,8 @@ def _direct(root: Path, selection: Selection) -> dict:
 
     material = settings(calibration.MaterialSettings, "material")
     statistics = settings(darsia.RunStatisticsSettings, "run_statistics")
-    reading = calibration.sand_reading(settings(calibration.ReadingSettings, "reading"))
-    rules = settings(darsia.PhaseRuleSettings, "phase_rules")
-    runs, frames = {}, []
+    overflow = settings(darsia.OverflowSettings, "overflow")
+    runs, donors = {}, {}
     for run, run_frames in selection.frames.items():
         own = root / f"{run}.toml"
         own.write_text(toml.dumps(tables["runs"][run]))
@@ -320,6 +528,16 @@ def _direct(root: Path, selection: Selection) -> dict:
             facies=root / f"facies-{run}.npz",
         ).save(root / run)
         rig = Rig.load(root / run)
+        if run == "r1":  # the depth rule at the grid's pixel centres, in its dtype
+            depths = pd.read_csv(root / "depth.csv")
+            x, y = darsia.pixel_centres(rig.baseline)
+            points = np.stack(np.meshgrid(x, y), axis=-1).reshape(-1, 2)
+            values, outside = darsia.interpolate_linear_in_hull(
+                (depths["x"], depths["y"], depths["depth"]),
+                points.astype(rig.pixel_area.img.dtype),
+            )
+            assert outside.any() and not outside.all()
+            rig.depth.img = values.reshape(rig.depth.img.shape)
         experiment = make_experiment(config)
         rig.load_experiment(experiment)
         images = []
@@ -327,6 +545,93 @@ def _direct(root: Path, selection: Selection) -> dict:
             rig.read_image(root / frame.session / frame.name).save(root / "image.npz")
             images.append(darsia.imread(root / "image.npz"))
         grid = calibration.run_grid(rig, material)
+        start = experiment.experiment_start
+        dates = [
+            experiment.get_datetime(root / frame.session / frame.name)
+            for frame in run_frames
+        ]
+        runs[run] = (grid, experiment, images, dates)
+        volume = None
+        workbook = tables["runs"][run].get("protocols", {}).get("overflow")
+        if workbook is not None:  # the second run has no readings of its own
+            readings = darsia.OverflowProtocol(root / workbook).readings(
+                start, ["Verified"]
+            )
+            proposal = darsia.proposed_evaporation(
+                darsia.displaced_volume(*readings, overflow), overflow.evaporation
+            )
+            rate = darsia.approved_evaporation(run, proposal, overflow.evaporation)
+            assert rate is not None and rate > 0
+            volume = darsia.displaced_volume(*readings, overflow, rate)
+        pressure = experiment.pressure_temperature_protocol.df
+        steps = experiment.injection_protocol.df
+        donors[run] = darsia.OverflowRun(
+            sand_map="drawing.json",
+            recipe=tables["recipe"],
+            pressure_h=np.asarray(
+                [(d - start).total_seconds() / 3600 for d in pressure["datetime"]]
+            ),
+            pressure_bar=np.asarray(pressure["pressure_bar"], np.float64),
+            injection_h=(
+                (steps["start"].min() - start).total_seconds() / 3600,
+                (steps["end"].max() - start).total_seconds() / 3600,
+            ),
+            volume=volume,
+        )
+
+    def density(experiment, h, dtype):
+        value = _atmosphere(experiment, h, dtype)
+        return darsia.atmospheric_gas_density(
+            value["pressure_bar"], value["temperature_celsius"], dtype
+        )
+
+    def readings(run, dtype):
+        # Our production interpolated the readings in the job's precision.
+        volume = donors[run].volume
+        if volume is None:
+            return None
+        return replace(
+            volume,
+            times_h=volume.times_h.astype(dtype),
+            volume_ml=volume.volume_ml.astype(dtype),
+        )
+
+    volumes = {}
+    for run, (grid, experiment, images, dates) in runs.items():
+        start, dtype = experiment.experiment_start, grid.rig.pixel_area.img.dtype
+        hours = [(date - start).total_seconds() / 3600 for date in dates]
+        mass = [
+            experiment.injection_protocol.injected_mass(time=h) * 1000 for h in hours
+        ]
+        here = [density(experiment, h, dtype) for h in hours]
+        ranked = darsia.ranked_donors(run, donors, overflow)
+
+        def state(donor, h, dtype=dtype):
+            other = runs[donor][1]
+            injected = other.injection_protocol.injected_mass(time=h) * 1000
+            return injected, density(other, h, dtype)
+
+        def frame_volumes(donor):
+            return darsia.frame_volumes(
+                readings(run, dtype),
+                hours,
+                None if donor is None else (donor, readings(donor, dtype)),
+                mass,
+                here,
+                None if donor is None else lambda h: state(donor, h),
+            )
+
+        volumes[run] = {None: frame_volumes(ranked[0] if ranked else None)}
+        if ranked:  # the second run's donor is held out of the fold: no next donor
+            assert ranked == ["r1"] and run == "r2"
+            assert {v.source for v in volumes[run][None]} == {"r1"}
+            volumes[run]["r1"] = frame_volumes(None)
+    rules = settings(darsia.PhaseRuleSettings, "phase_rules")
+    allocation = settings(darsia.GasAllocationSettings, "gas_allocation")
+    variants, frames = {}, {None: [], "r1": []}
+    allocations = {}
+    for run, (grid, experiment, images, dates) in runs.items():
+        rig, start = grid.rig, experiment.experiment_start
         model = darsia.read_phase_model(
             root / "model", 0.5, canvas=rig.canvas, accept_canvas=True
         )
@@ -337,18 +642,6 @@ def _direct(root: Path, selection: Selection) -> dict:
             )
             for frame in selection.frames[run]
         ]
-        start = experiment.experiment_start
-        dates = [
-            experiment.get_datetime(root / frame.session / frame.name)
-            for frame in run_frames
-        ]
-        hours = [(date - start).total_seconds() / 3600 for date in dates]
-        overflow = settings(darsia.OverflowSettings, "overflow")
-        readings = darsia.OverflowProtocol(root / f"overflow-{run}.csv").readings(
-            start, ["Verified"]
-        )
-        volume = darsia.displaced_volume(*readings, overflow)
-        volumes = [darsia.measured_reference(volume, h) for h in hours]
         probabilities = [
             darsia.phase_probabilities(
                 model,
@@ -359,94 +652,199 @@ def _direct(root: Path, selection: Selection) -> dict:
             )
             for image, before in zip(images, previous)
         ]
-        maps = darsia.free_gas(
-            probabilities,
-            dates,
-            rig.facies,
-            grid.domain,
-            grid.pixel_area_mm2,
-            grid.permeability,
-            experiment.injection_protocol,
-            rules,
-            grid.geometry.pore_volume_m3,
-            grid.geometry.swi,
-            volumes,
-            settings(darsia.GasAllocationSettings, "gas_allocation"),
-            grid.chart,
-            gas_threshold=model.gas_threshold,
-        )
-        maps = [dict(zip(("labels", "rules", "saturation", "co2"), m)) for m in maps]
-        runs[run] = (grid, experiment, images, maps, dates)
-        for index, (image, frame_maps, date) in enumerate(zip(images, maps, dates)):
-            h = (date - start).total_seconds() / 3600
-            co2 = calibration.co2_state(grid, experiment, date)
-            capacity = darsia.dissolved_capacity(
+        variants[run] = {}
+        allocations[run] = {}
+        for held_out, found in volumes[run].items():
+            records = []
+            maps = darsia.free_gas(
+                probabilities,
+                dates,
+                rig.facies,
+                grid.domain,
+                grid.pixel_area_mm2,
+                grid.permeability,
+                experiment.injection_protocol,
+                rules,
                 grid.geometry.pore_volume_m3,
-                co2.solubility_co2,
-                frame_maps["saturation"],
+                grid.geometry.swi,
+                [v.volume_m3 for v in found],
+                allocation,
+                grid.chart,
+                gas_threshold=model.gas_threshold,
+                depth_m=rig.depth.img,
+                record=lambda index, value: records.append(asdict(value)),
             )
-            support = grid.domain & np.isfinite(image.img).all(axis=-1)
-            histograms = next(
-                darsia.run_statistics(
-                    [
-                        (
-                            image.img,
-                            frame_maps["labels"],
-                            frame_maps["rules"],
-                            support,
-                            capacity,
-                        )
-                    ],
-                    rig.baseline.img,
-                    rig.facies,
-                    grid.optical_pitch,
+            names = ("labels", "rules", "saturation", "co2", "before")
+            variants[run][held_out] = [dict(zip(names, m)) for m in maps]
+            allocations[run][held_out] = records
+    # Each run's colour paths; the second run's reference sand has its own.
+    paths, own_paths = {}, {}
+    for run in runs:
+        own_paths[run] = settings_from_table(
+            calibration.ReadingSettings, run_tables(tables, run)["reading"]
+        )
+        paths[run] = calibration.sand_paths(own_paths[run])
+
+    def measured_frames(run):
+        grid, _, images, _ = runs[run]
+        return [
+            (
+                image.img,
+                m["labels"],
+                m["rules"],
+                grid.domain & np.isfinite(image.img).all(-1),
+            )
+            for image, m in zip(images, variants[run][None])
+        ]
+
+    ranges = darsia.color_ranges(
+        [
+            (
+                measured_frames(run),
+                runs[run][0].rig.baseline.img,
+                runs[run][0].rig.facies,
+                runs[run][0].optical_pitch,
+                paths[run],
+            )
+            for run in ("r1", "r2")
+        ],
+        settings(darsia.ColorRangeSettings, "color_ranges"),
+    )
+    shadow = settings(darsia.ShadowSettings, "shadow")
+    grid, experiment, images, dates = runs["r2"]  # the run of the path ratios
+    plain = darsia.SandColorPaths(
+        paths["r2"],
+        {k: own_paths["r2"].sands[str(k)].scale / ranges[k] for k in paths["r2"]},
+    )
+    baseline, facies, pitch = grid.rig.baseline.img, grid.rig.facies, grid.optical_pitch
+    ratios = darsia.path_ratios(
+        measured_frames("r2"),
+        [(date - experiment.experiment_start).total_seconds() / 3600 for date in dates],
+        baseline,
+        facies,
+        pitch,
+        grid.geometry.known,
+        plain,
+        darsia.shadow_light(baseline, facies, pitch, [1, 2], shadow),
+        1,
+        1.2,  # the curve's top at the gain 1
+        settings(darsia.PathRatioSettings, "path_ratios"),
+    )
+    assert set(ratios.ratio) == {2}
+    response = replace(
+        settings(darsia.BeerLambertSettings, "beer_lambert"), path_ratio=ratios.ratio
+    )
+    readings = {}
+    for run, (grid, experiment, images, dates) in runs.items():
+        baseline, facies = grid.rig.baseline.img, grid.rig.facies
+        pitch = grid.optical_pitch
+        light = darsia.shadow_light(baseline, facies, pitch, [1, 2], shadow)
+        readings[run] = darsia.BeerLambertReading(
+            paths[run][1],
+            own_paths[run].sands["1"].scale / ranges[1],
+            darsia.reference_background(
+                baseline, facies, pitch, grid.geometry.known, light, response
+            ),
+            facies,
+            pitch,
+            response,
+        )
+    natives = {
+        run: darsia.SandColorPaths(paths[run], {k: 1.0 for k in paths[run]})
+        for run in runs
+    }
+    for run, (grid, experiment, images, dates) in runs.items():
+        start, reading, native = (
+            experiment.experiment_start,
+            readings[run],
+            natives[run],
+        )
+        for held_out in (None, "r1"):
+            found = volumes[run].get(held_out, volumes[run][None])
+            maps = variants[run].get(held_out, variants[run][None])
+            for index, (image, frame_maps, date) in enumerate(zip(images, maps, dates)):
+                h = (date - start).total_seconds() / 3600
+                co2 = _co2_state(grid, experiment, date)
+                capacity = darsia.dissolved_capacity(
+                    grid.geometry.pore_volume_m3,
+                    co2.solubility_co2,
+                    frame_maps["saturation"],
+                )
+                signal, measured = calibration.read_signal(
+                    grid, image.img, frame_maps, reading, statistics, native
+                )
+                histograms = darsia.signal_histograms(
+                    signal,
+                    measured
+                    & (frame_maps["labels"] == darsia.PhaseLabel.DISSOLVED)
+                    & ~darsia.model_gas(frame_maps["labels"], frame_maps["rules"]),
+                    grid.facies,
                     grid.geometry.counted,
-                    reading,
+                    capacity,
+                    reading.sands,
                     statistics,
                 )
-            )
-            gas = darsia.gas_statistics(
-                frame_maps["co2"],
-                darsia.model_gas(frame_maps["labels"], frame_maps["rules"]),
-                frame_maps["saturation"],
-                grid.facies,
-                grid.geometry.counted,
-                grid.geometry.pore_volume_m3,
-                co2.density_gaseous_co2,
-                co2.solubility_co2,
-            )
-            frames.append(
-                darsia.CalibrationFrame(
-                    run,
-                    index,
-                    h,
-                    h,
-                    experiment.injection_protocol.injected_mass(time=h) * 1000,
-                    histograms,
-                    gas,
-                    None,
-                    volumes[index],
-                    volumes[index] is not None,
+                unknown = darsia.unknown_statistics(
+                    darsia.relative_signal(signal, statistics),
+                    frame_maps["labels"],
+                    frame_maps["rules"],
+                    measured,
+                    grid.geometry,
+                    co2,
+                    settings(darsia.UnknownMassSettings, "unknown_mass"),
                 )
-            )
-    fit = darsia.fit_calibration(
-        frames,
-        ["r1", "r2"],
+                gas = darsia.gas_statistics(
+                    frame_maps["co2"],
+                    darsia.model_gas(frame_maps["labels"], frame_maps["rules"]),
+                    frame_maps["saturation"],
+                    grid.facies,
+                    grid.geometry.counted,
+                    grid.geometry.pore_volume_m3,
+                    co2.density_gaseous_co2,
+                    co2.solubility_co2,
+                )
+                frames[held_out].append(
+                    darsia.CalibrationFrame(
+                        run,
+                        index,
+                        h,
+                        h,
+                        experiment.injection_protocol.injected_mass(time=h) * 1000,
+                        histograms,
+                        gas,
+                        unknown.column_estimate(),
+                        found[index].volume_m3,
+                        found[index].source == darsia.MEASURED,
+                    )
+                )
+    arguments = (
         settings(darsia.CalibrationFitSettings, "calibration_fit"),
         {1: 0.1, 2: 0.2},
         [1, 2],
     )
+    fit = darsia.fit_calibration(frames[None], ["r1", "r2"], *arguments)
+    fold, predictions = darsia.calibration_fold(
+        frames["r1"], ["r1", "r2"], *arguments, "r1"
+    )
+    runs = {
+        run: (grid, experiment, images, variants[run][None], dates)
+        for run, (grid, experiment, images, dates) in runs.items()
+    }
     masses = darsia.mass_calibrations(fit, statistics)
     made, copies = {}, {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
         copy = darsia.MassCopy(grid.geometry, darsia.MassCopySettings(10.0))
-        start = experiment.experiment_start
+        start, reading, native = (
+            experiment.experiment_start,
+            readings[run],
+            natives[run],
+        )
         for frame, image, frame_maps, date in zip(
             selection.frames[run], images, maps, dates
         ):
             h = (date - start).total_seconds() / 3600
             signal, measured = calibration.read_signal(
-                grid, image.img, frame_maps, reading, statistics
+                grid, image.img, frame_maps, reading, statistics, native
             )
             relative = darsia.ScalarImage(
                 darsia.relative_signal(signal, masses[run]),
@@ -473,7 +871,7 @@ def _direct(root: Path, selection: Selection) -> dict:
                 frame_maps["saturation"],
                 measured,
                 grid.geometry,
-                calibration.co2_state(grid, experiment, date),
+                _co2_state(grid, experiment, date),
                 calibrated,
                 factor,
             )
@@ -490,37 +888,40 @@ def _direct(root: Path, selection: Selection) -> dict:
         start, rows = experiment.experiment_start, []
         for frame, date in zip(selection.frames[run], dates):
             h = (date - start).total_seconds() / 3600
-            co2 = calibration.co2_state(grid, experiment, date)
+            co2 = _co2_state(grid, experiment, date)
             for row in sums(made[(run, frame)], co2):
                 case = f"{frame.session}/{frame.name}"
                 rows.append({**row, "run": run, "case_id": case, "elapsed_h": h})
         domain_mass[run] = rows
     wasserstein = settings(WassersteinSettings, "wasserstein")
     chart = settings(comparison.DistanceSettings, "distances").chart_labels
-    found, reference, scales = {}, None, None
+    grid, experiment = runs["r2"][:2]  # the configured reference run
+    reference = wasserstein_reference(
+        grid.rig.labels,
+        grid.rig.permeability.img,
+        grid.rig.porosity.img,
+        sand_labels,
+        chart,
+        domains,
+        wasserstein,
+    )
+    scales = distance_scales(
+        3.0,
+        experiment.injection_protocol,
+        _co2_state(grid, experiment, experiment.experiment_start),
+        grid.rig.depth.img,
+        grid.rig.facies.dimensions,
+        domains,
+    )
+    found, compared_frames = {}, {}
     for run, (grid, experiment, images, maps, dates) in runs.items():
         start = experiment.experiment_start
         hours = [(date - start).total_seconds() / 3600 for date in dates]
-        if reference is None:  # the first run's sand map
-            reference = wasserstein_reference(
-                grid.rig.labels,
-                grid.rig.permeability.img,
-                grid.rig.porosity.img,
-                sand_labels,
-                chart,
-                domains,
-                wasserstein,
-            )
-            scales = distance_scales(
-                3.0,
-                experiment.injection_protocol,
-                calibration.co2_state(grid, experiment, start),
-                grid.rig.depth.img,
-                grid.rig.facies.dimensions,
-                domains,
-            )
         nearest = int(np.argmin([abs(h - 3.0) for h in hours]))
         frame = selection.frames[run][nearest]
+        compared_frames[run] = ComparedFrame(
+            calibration.frame_key(frame), dates[nearest].isoformat(), hours[nearest]
+        )
         found[run] = frame_cells(
             made[(run, frame)],
             maps[nearest]["labels"],
@@ -531,37 +932,165 @@ def _direct(root: Path, selection: Selection) -> dict:
             wasserstein,
         )
     distances = wasserstein_distances(3.0, found, reference, scales, wasserstein)
+    style = settings(FigureStyle, "style")
+    tile_settings = settings(TileSettings, "tiles")
+    films = settings(media_steps.MediaSettings, "media").films
+    drawings = media_steps.drawings(settings(media_steps.MediaSettings, "media"))
+    graphs, ensemble = {}, []
+    for run, (grid, experiment, images, maps, dates) in runs.items():
+        protocol = experiment.injection_protocol
+        rows = domain_mass[run]
+        injected = {
+            row["case_id"]: protocol.injected_mass(time=row["elapsed_h"]) * 1000
+            for row in rows
+        }
+        times = tables["ensemble"]["target_h"][run]
+        ensemble.append(EnsembleRun(rows, injected, times, protocol))
+        graphs[run] = [
+            {**row, "injected_mass_g": injected[row["case_id"]]}
+            for row in rows
+            if row["domain_id"] == "whole"
+        ]
+    axes = graph_axes(tile_settings, list(graphs.values()), style)
+    for run, (grid, experiment, images, maps, dates) in runs.items():
+        sand = SandGeometry(
+            grid.rig.labels.img,
+            sand_labels,
+            grid.geometry.pore_volume_m3,
+            grid.rig.depth.img,
+            grid.rig.pixel_area.img,
+        )
+        start, shape = experiment.experiment_start, grid.rig.facies.img.shape
+        rows = [[] for _ in drawings]
+        for frame, image, frame_maps, date in zip(
+            selection.frames[run], images, maps, dates
+        ):
+            h = (date - start).total_seconds() / 3600
+            shown = MediaFrame(
+                f"{frame.session}/{frame.name}",
+                h,
+                h,
+                shape,
+                (0, 0, shape[1], shape[0]),
+                image.img,
+                {k: getattr(made[(run, frame)], k).img for k in media_steps.MAPS},
+                "g/L",
+                frame_maps["labels"],
+                frame_maps["saturation"],
+                sand,
+            )
+            for k, drawing in enumerate(drawings):
+                tile, drawn = draw_tile(
+                    Panel(**drawing["panel"]),
+                    shown,
+                    tile_settings,
+                    style=style,
+                    photograph_settings=settings(PhotographSettings, "photograph"),
+                    rows=graphs[run],
+                    axes=axes,
+                    label_room=drawing["label_room"],
+                )
+                folder = root / "tiles" / run / f"{k:02d}"
+                rows[k].append(save_tile(folder, shown, tile, drawn))
+        for k, made_rows in enumerate(rows):
+            write_tile_index(root / "tiles" / run / f"{k:02d}", made_rows)
+    records = {}
+    for film in films:
+        grid_film = film.layout == "grid"
+        chosen = [
+            drawings.index(
+                {"panel": asdict(p), "label_room": p.content == "graph" and grid_film}
+            )
+            for p in film.panels
+        ]
+        tiles = {
+            run: [read_tile_index(root / "tiles" / run / f"{k:02d}") for k in chosen]
+            for run in runs
+        }
+        records[film.name] = write_films(
+            tiles,
+            root / "films" / film.name,
+            film=film,
+            tile_settings=tile_settings,
+            unit="g/L",
+            style=style,
+        )
+    ensemble_settings = settings(comparison.EnsembleInputSettings, "ensemble")
+    tables = ensemble_tables(ensemble, domains, ensemble_settings)
+    (root / "figures").mkdir()
+    ensemble_figures(root / "figures", tables, ensemble, ensemble_settings, style)
     return {
         "maps": made,
+        "allocations": allocations,
         "copies": copies,
         "fit": fit,
+        "fold": (fold, predictions),
         "domain_mass": domain_mass,
-        "distances": [asdict(distance) for distance in distances],
+        "distances": distance_rows(distances, compared_frames),
+        "statistics": frames[None],
+        "drawings": len(drawings),
+        "films": records,
     }
 
 
 def _compare(project: Path, selection: Selection, direct: dict) -> None:
-    """Every stored mass map, its copy on metric cells and the fit equal the
-    direct calls'."""
+    """Every stored mass map, its copy on metric cells, each frame's histograms of
+    its sands' signal and the fit equal the direct calls', and so do the films'
+    tiles, the films and the ensemble's figures."""
     results = project / "results"
+    for run, frames in selection.frames.items():
+        records = direct["allocations"][run]
+        for index, frame in enumerate(frames):
+            folder = results / "phase-maps" / run / frame.session / frame.name
+            stored = json.loads((folder / "result.json").read_text())
+            assert stored["measurements"]["gas_allocation"] == {
+                "primary": records[None][index],
+                "without": {
+                    held: values[index]
+                    for held, values in records.items()
+                    if held is not None
+                },
+            }
     for (run, frame), maps in direct["maps"].items():
-        stored = analysis.read_mass_maps(
+        stored = darsia.read_mass_maps(
             results / "mass-maps" / run / frame.session / frame.name
         )
-        for name in analysis.FIELDS:
+        for name in ("mass", *darsia.MASS_FIELDS):  # the total read as its sum
             np.testing.assert_array_equal(
                 getattr(stored, name).img, getattr(maps, name).img
             )
             assert getattr(stored, name).img.dtype == getattr(maps, name).img.dtype
     for (run, frame), copy in direct["copies"].items():
         folder = results / "mass-copy" / run / frame.session / frame.name
-        stored = analysis.read_mass_copy(folder)
+        stored = darsia.read_mass_copy(folder)
         assert set(stored) == set(copy)
         for name, values in copy.items():
             np.testing.assert_array_equal(stored[name].img, values)
-    record = calibration.read_json(results / "calibration" / "fit", "calibration.json")
-    assert record["calibration"]["gain"] == direct["fit"].gain
-    assert record["calibration"]["beta"] == direct["fit"].beta
+    for run in selection.frames:  # each frame's histograms of its sands' signal
+        made = [frame for frame in direct["statistics"] if frame.run == run]
+        stored = [
+            item
+            for index, frame in enumerate(selection.frames[run])
+            for item in darsia.read_frames(
+                results / "run-statistics" / run / frame.session / frame.name,
+                first_index=index,
+            )
+        ]
+        assert len(stored) == len(made)
+        for one, other in zip(stored, made):
+            assert one.dissolved.keys() == other.dissolved.keys()
+            for sand, histogram in other.dissolved.items():
+                found = one.dissolved[sand]
+                np.testing.assert_array_equal(found.relative, histogram.relative)
+                np.testing.assert_array_equal(found.weight, histogram.weight)
+    record = darsia.read_calibration(results / "calibration" / "fit")
+    assert record["calibration"] == json.loads(json.dumps(asdict(direct["fit"])))
+    # The fold leaving the second run's donor out read its frames without it.
+    record = darsia.read_calibration(results / "calibration" / "fold-r1")
+    fold, predictions = direct["fold"]
+    assert record["calibration"] == json.loads(json.dumps(asdict(fold)))
+    rows = [asdict(prediction) for prediction in predictions]
+    assert record["predictions"] == json.loads(json.dumps(rows))
     for run, rows in direct["domain_mass"].items():  # on each run's sand map
         write_domain_mass(project / f"domain-mass-{run}.csv", rows)
         stored = results / "domain-mass" / run / "domain_mass.csv"
@@ -571,25 +1100,73 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
     write_rows(project / "distances.csv", rows, list(rows[0]))
     stored = results / "distances" / "3.0h" / "distances.csv"
     assert stored.read_text() == (project / "distances.csv").read_text()
+    assert direct["drawings"] == 4  # the films' five panels, one shared
+    for run in selection.frames:  # each drawing of the films' tiles, once
+        for k in range(direct["drawings"]):
+            stored = results / "film-tiles" / run / f"{k:02d}"
+            made = project / "tiles" / run / f"{k:02d}"
+            index = (made / "tiles.json").read_text()
+            assert (stored / "tiles.json").read_text() == index
+            for row in read_tile_index(made):
+                tile = Path(row["path"]).read_bytes()
+                assert (stored / row["file"]).read_bytes() == tile
+    for name, records in direct["films"].items():
+        folder = results / "films" / name
+        stored = json.loads((folder / media_steps.RECORDS).read_text())
+        assert stored == json.loads(json.dumps(records))
+        for record in records:
+            figure = (project / "films" / name / record["figure"]).read_bytes()
+            assert (folder / record["figure"]).read_bytes() == figure
+    figures = sorted(path.name for path in (project / "figures").iterdir())
+    stored = results / "ensemble" / comparison.FIGURES
+    assert figures and sorted(path.name for path in stored.iterdir()) == figures
+    for name in figures:
+        assert (stored / name).read_bytes() == (project / "figures" / name).read_bytes()
 
 
 @pytest.mark.parametrize("precision", ["float32", "float64"])
 def test_the_chain_as_jobs_equals_the_direct_calls(
     tmp_path, monkeypatch, importable, precision  # noqa: F811
 ):
-    """Every frame's mass maps of the job equal the direct calls'; the comparisons
-    are made; single precision runs through the service's task processes, double
-    precision in this process."""
+    """Every frame's mass maps of the job equal the direct calls', and so do the
+    comparisons' distances, the films' tiles and films and the ensemble's figures;
+    each film's encoder opens under the host's waiting lock. Single precision runs
+    through the service's task processes, which store the results' arrays
+    compressed by the configuration, double precision in this process."""
     project = tmp_path / "project"
     config, selection = _project(project, precision)
     monkeypatch.chdir(project)
     direct = _direct(project, selection)
+    if precision == "float32":
+        config.write_text(config.read_text() + "[storage]\ncompress = true\n")
     jobs = tmp_path / "jobs"
     job = create_job(jobs, STEPS, selection, config)
     if precision == "float32":
         _serve(jobs, tmp_path, seconds=1200.0)
+        stored = project / "results"  # every image and phase map, compressed
+        paths = [stored / "rig" / "r1" / "baseline.npz"]
+        for kind in ("corrected-image", "phase-maps", "mass-maps", "mass-copy"):
+            paths += (path for path in (stored / kind).rglob("*.npz") if path.is_file())
+        for path in paths:
+            with zipfile.ZipFile(path) as archive:
+                methods = {member.compress_type for member in archive.infolist()}
+            assert methods <= {zipfile.ZIP_DEFLATED}, path
     else:
+        taken = []
+
+        class Recorded:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                taken.append(self.name)
+
+            def __exit__(self, *_):
+                pass
+
+        monkeypatch.setattr(jobs_main.service, "WaitingLock", Recorded)
         _run(job)
+        assert taken == [media_steps.ENCODER_LOCK] * 4  # two pyramids, two grids
     failed = queue.markers(job, queue.FAILED)
     assert not failed, [
         queue.read_marker(job / queue.FAILED / f"{t}.{k}")["traceback"]
@@ -597,7 +1174,7 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     ]
     assert queue.waiting(job) == set()
     _compare(project, selection, direct)
-    for name in ("events/events.csv", "ensemble/mass_long.csv"):
+    for name in ("events/events.csv", "ensemble/mass_long.csv", "ensemble/events_summary.csv"):
         assert (project / "results" / name).is_file()
     if precision == "float64":
         _reused_only_while_unchanged(jobs, project, config, selection)
@@ -659,13 +1236,27 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     at the first missing frame; every map and saturation equals the whole run's."""
     project = tmp_path / "project"
     config, selection = _project(project, "float32")
+    config.write_text(  # the first run alone, the one fit run
+        config.read_text().replace('fit = ["r1", "r2"]', 'fit = ["r1"]')
+    )
     monkeypatch.chdir(project)
     one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
-    early = setup.STEPS + calibration.STEPS[:3]
+    early = setup.STEPS + (
+        calibration.PHASE_MODEL,
+        calibration.DISPLACED_VOLUME,
+        calibration.OVERFLOW,
+        calibration.PHASE_MAPS,
+    )
     _run(create_job(tmp_path / "jobs", early, one, config))
     folder = project / "results" / "phase-maps" / "r1"
     whole = {
-        f: calibration.read_maps(folder / f.session / f.name) for f in one.frames["r1"]
+        f: darsia.read_phase_maps(folder / f.session / f.name) for f in one.frames["r1"]
+    }
+    measurements = {
+        f: json.loads((folder / f.session / f.name / "result.json").read_text())[
+            "measurements"
+        ]
+        for f in one.frames["r1"]
     }
     again = project / "config-again.toml"
     again.write_text(
@@ -697,9 +1288,271 @@ def test_phase_maps_resumed_after_the_injection_end_equal_the_whole_run(
     assert again_published == list(one.frames["r1"][4:])  # from the first missing
     folder = project / "again" / "phase-maps" / "r1"
     for frame, maps in whole.items():
-        resumed = calibration.read_maps(folder / frame.session / frame.name)
+        resumed = darsia.read_phase_maps(folder / frame.session / frame.name)
         for name, array in maps.items():
             np.testing.assert_array_equal(resumed[name], array)
+        record = json.loads(
+            (folder / frame.session / frame.name / "result.json").read_text()
+        )
+        assert record["measurements"] == measurements[frame]
+
+
+def test_a_frame_without_measured_colour_below_co2_gives_the_fit_a_column(
+    tmp_path, monkeypatch
+):
+    """Dissolved CO2 whose colour is not measured, below measured CO2 in its
+    column, reaches the fit as the frame's column estimate: the stored statistics
+    hold the frame's unknown-mass statistics, read from above."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    monkeypatch.chdir(project)
+    steps = setup.STEPS + calibration.STEPS[:7]
+    job = create_job(tmp_path / "jobs", steps, selection, config)
+    statistics = {
+        task.id for task in queue.tasks(job).values() if task.step == "run-statistics"
+    }
+    _run(job, skip=statistics)
+    frame = selection.frames["r1"][-1]
+    results = project / "results"
+    maps = darsia.read_phase_maps(
+        results / "phase-maps" / "r1" / frame.session / frame.name
+    )
+    dissolved = maps["labels"] == darsia.PhaseLabel.DISSOLVED
+    rows, columns = np.nonzero(dissolved[1:] & dissolved[:-1])
+    row, column = rows[len(rows) // 2] + 1, columns[len(rows) // 2]
+    stored = results / "corrected-image" / "r1" / frame.session / frame.name
+    image = darsia.imread(stored / "image.npz")
+    image.img[row, column] = np.nan  # its colour is not measured
+    image.save(stored / "image.npz")
+    _run(job, skip={name for name in statistics if ".r2." in name})
+    found = darsia.read_frames(
+        results / "run-statistics" / "r1" / frame.session / frame.name,
+        first_index=len(selection.frames["r1"]) - 1,
+    )[0]
+    tables = tomllib.loads(config.read_text())
+    material = settings_from_table(calibration.MaterialSettings, tables["material"])
+    grid = calibration.run_grid(Rig.load(results / "rig" / "r1"), material)
+    statistics = settings_from_table(
+        darsia.RunStatisticsSettings, tables["run_statistics"]
+    )
+    task = next(
+        task
+        for task in queue.tasks(job).values()
+        if task.step == "run-statistics" and task.run == "r1" and frame in task.frames
+    )
+    ctx = jobs_main.context(job, task, "")  # its reading, as the step makes it
+    reading = calibration.response_reading(ctx, "r1", grid)
+    native = calibration.native_reading(ctx, "r1")
+    signal, measured = calibration.read_signal(
+        grid, image.img, maps, reading, statistics, native
+    )
+    assert not measured[row, column]
+    experiment = make_experiment(
+        FluidFlowerConfig([config], require_data=False, require_results=False)
+    )
+    co2 = _co2_state(
+        grid, experiment, experiment.get_datetime(project / frame.session / frame.name)
+    )
+    wanted = darsia.unknown_statistics(
+        darsia.relative_signal(signal, statistics),
+        maps["labels"],
+        maps["rules"],
+        measured,
+        grid.geometry,
+        co2,
+        settings_from_table(darsia.UnknownMassSettings, tables["unknown_mass"]),
+    ).column_estimate()
+    assert wanted is not None and found.column is not None
+    assert wanted.weight.sum() > 0
+    for name in ("relative", "ratio", "weight"):
+        np.testing.assert_array_equal(
+            getattr(found.column, name), getattr(wanted, name)
+        )
+
+
+def test_a_fold_without_a_runs_donor_takes_the_next_donor(tmp_path, monkeypatch):
+    """A run without readings of its own takes its free gas from the most similar
+    fit run with readings; where that donor is held out of a fold, the frames get
+    the next donor's volumes too, which the fold reads."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    monkeypatch.chdir(project)
+    tables = tomllib.loads(config.read_text())
+    tables["runs"]["r3"] = {
+        "data": {"folder": "photos-r1"},
+        "protocols": {"overflow": "overflow-r3.csv"},
+    }
+    readings = (project / "overflow-r1.csv").read_text().splitlines()
+    rows = [line.split(",") for line in readings[1:]]
+    (project / "overflow-r3.csv").write_text(  # thrice the first run's water
+        "\n".join(
+            [readings[0]] + [f"{t},{3 * float(w) - 2000},{s}" for t, w, s in rows]
+        )
+        + "\n"
+    )
+    tables["calibration_runs"] = {"fit": ["r1", "r2", "r3"], "folds": ["r1"]}
+    frames = {**selection.frames, "r3": selection.frames["r1"]}
+    overflow = settings_from_table(darsia.OverflowSettings, tables["overflow"])
+    fits = settings_from_table(calibration.FitRuns, tables["calibration_runs"])
+    stored = {}
+
+    def ctx(run, step):
+        def publish(write):
+            folder = tmp_path / step / run
+            folder.mkdir(parents=True)
+            write(folder)
+            stored[step, run] = folder
+
+        def read(kind, reader, run=run):
+            if kind == "rig":
+                return SimpleNamespace(pixel_area=SimpleNamespace(img=np.zeros(1)))
+            return reader(stored[kind, run])
+
+        return SimpleNamespace(
+            task=SimpleNamespace(run=run, frames=frames[run]),
+            selection=SimpleNamespace(frames=frames),
+            config=(config,),
+            tables=tables,
+            settings={"overflow": overflow, "calibration_runs": fits},
+            photo=lambda run, frame: project / frame.session / frame.name,
+            publish=publish,
+            read=read,
+        )
+
+    for run in frames:
+        calibration._displaced_volume(ctx(run, "displaced-volume"))
+    calibration._overflow(ctx("r2", "overflow"))
+    folder = stored["overflow", "r2"]
+    primary = darsia.read_frame_volumes(folder)
+    without = darsia.read_frame_volumes(folder, held_out="r1")
+    assert darsia.held_out_runs(folder) == ("r1",)
+    assert {v.source for v in primary.values()} == {"r1"}  # ties go by name
+    assert {v.source for v in without.values()} == {"r3"}
+    for key, volume in primary.items():
+        assert without[key].volume_m3 > volume.volume_m3 > 0
+    assert darsia.read_frame_volumes(folder, held_out="r3") == primary
+    calibration._overflow(ctx("r1", "overflow"))  # its own readings
+    own = stored["overflow", "r1"]
+    assert {v.source for v in darsia.read_frame_volumes(own).values()} == {"measured"}
+    assert darsia.held_out_runs(own) == ()
+
+
+def test_the_readings_count_from_the_sheets_own_injection_start(tmp_path, monkeypatch):
+    """A sheet whose readings keep another clock than the photographs' records its
+    own injection start, from which they count: the displaced volume is the same as
+    with the photographs' clock. A workbook's sheet is given as the other protocols
+    are, and its file is the workbook."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    monkeypatch.chdir(project)
+    tables = tomllib.loads(config.read_text())
+    overflow = settings_from_table(darsia.OverflowSettings, tables["overflow"])
+    stored = {}
+
+    def ctx(name):
+        def publish(write):
+            folder = tmp_path / name
+            folder.mkdir()
+            write(folder)
+            stored[name] = folder
+
+        return SimpleNamespace(
+            task=SimpleNamespace(run="r1", frames=selection.frames["r1"]),
+            config=(config,),
+            tables=tables,
+            settings={"overflow": overflow},
+            photo=lambda run, frame: project / frame.session / frame.name,
+            publish=publish,
+        )
+
+    calibration._displaced_volume(ctx("own"))
+    sheet = pd.read_csv(project / "overflow-r1.csv", parse_dates=["image_time"])
+    early = datetime.timedelta(hours=1, minutes=5)  # the scale's clock
+    sheet["image_time"] -= early
+    sheet["injection_start"] = [START - HOUR - early] + [None] * (len(sheet) - 1)
+    sheet.to_excel(project / "overflow.xlsx", sheet_name="r1", index=False)
+    tables["runs"]["r1"]["protocols"]["overflow"] = ["overflow.xlsx", "r1"]
+    calibration._displaced_volume(ctx("sheet"))
+    files = calibration._displaced_files(tables["runs"]["r1"], project, [])
+    assert "overflow.xlsx" in files
+    own, sheet = (
+        darsia.read_overflow_run(stored[name]).volume for name in ("own", "sheet")
+    )
+    np.testing.assert_allclose(sheet.times_h, own.times_h, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(sheet.volume_ml, own.volume_ml, rtol=0, atol=1e-6)
+    assert sheet.reasons == own.reasons == ()
+
+
+def test_a_runs_atmosphere_is_its_record_over_its_hours(tmp_path):
+    """A run's atmosphere and its upward gradients at a time, which its frames'
+    CO2 state and its donor's gas densities take, are its pressure-temperature
+    record interpolated over the hours since its start, in the grid's dtype: our
+    production's values for this record."""
+    start = START
+    offsets = ((-30, 7), (17, 41), (52, 13), (96, 58))
+    record = pd.DataFrame(
+        {
+            "datetime": [
+                start + datetime.timedelta(minutes=m, seconds=s) for m, s in offsets
+            ],
+            "pressure_bar": [1.0131, 1.0207, 1.0061, 1.0153],
+            "temperature_celsius": [20.0, 20.6, 19.7, 20.2],
+            "pressure_gradient_bar": [-1.2e-4, -1.1e-4, -1.3e-4, -1.15e-4],
+            "temperature_gradient_celsius": [0.0, 0.02, -0.01, 0.03],
+        }
+    )
+    record.to_csv(tmp_path / "pt.csv", index=False)
+    experiment = SimpleNamespace(
+        pressure_temperature_protocol=darsia.PressureTemperatureProtocol(
+            tmp_path / "pt.csv"
+        ),
+        time_since_start=lambda date: (date - start).total_seconds() / 3600,
+    )
+    wanted = {
+        "float32": [
+            (1.0189291519976085, 20.460196210337518),
+            (1.0147317567027136, 20.232094591263177),
+            (1.0110306515383032, 19.967970192299084),
+        ],
+        "float64": [
+            (1.0189291520672739, 20.46019621583742),
+            (1.0147317567567566, 20.232094594594596),
+            (1.0110306517690875, 19.967970204841713),
+        ],
+    }
+    gradients = {
+        "float32": [
+            (-0.00011233006316104141, 0.015339873677917185),
+            (-0.00011817567574970722, 0.007736486375439165),
+            (-0.00012196089423102742, 0.011437615383926873),
+        ],
+        "float64": [
+            (-0.00011233006306937632, 0.015339873861247372),
+            (-0.00011817567567567567, 0.007736486486486487),
+            (-0.0001219608938547486, 0.011437616387337058),
+        ],
+    }
+    for dtype, values in wanted.items():
+        hours = (0.11, 0.53, 1.27)
+        found = [calibration.run_atmosphere(experiment, h, dtype) for h in hours]
+        assert found == values
+        found = [
+            calibration.run_atmosphere(experiment, h, dtype, gradient=True)
+            for h in hours
+        ]
+        assert found == gradients[dtype]
+        image = darsia.ScalarImage(np.zeros((2, 2), dtype), dimensions=[0.02, 0.02])
+        grid = SimpleNamespace(
+            rig=SimpleNamespace(baseline=image, pixel_area=image), datum_m=0.02
+        )
+        for h, value, gradient in zip(hours, values, gradients[dtype]):
+            date = start + datetime.timedelta(hours=h)
+            co2 = calibration.co2_state(grid, experiment, date)
+            assert (co2.atmospheric_pressure, co2.atmospheric_temperature) == value
+            assert (
+                co2.atmospheric_pressure_gradient,
+                co2.atmospheric_temperature_gradient,
+            ) == gradient
 
 
 def test_phase_maps_refuse_frames_out_of_time_order(tmp_path, monkeypatch):
@@ -860,3 +1713,130 @@ def test_a_comparison_time_keeps_its_digits():
     assert named == {"72.33333h": 72.33333, "72.333334h": 72.333334, "3.0h": 3.0}
     with pytest.raises(ValueError, match="configured twice"):
         comparison.named_times([3, 3.0])
+
+
+def test_a_depth_rule_on_the_grid_reads_no_depth_map(tmp_path, monkeypatch):
+    """A run whose depth rule is evaluated on its grid reads no depth map: its rig
+    is made without one, with the rule's depth, and no map is a file of its
+    results' identity."""
+    depths = {}
+    for name in ("with_map", "without_map"):
+        project = tmp_path / name / "project"
+        config, selection = _project(project, "float64")
+        monkeypatch.chdir(project)
+        if name == "without_map":
+            (project / "depth.npz").unlink()  # the first run's map
+        one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+        jobs = tmp_path / name / "jobs"
+        _run(create_job(jobs, (setup.SAND_MAP, setup.RIG), one, config))
+        depths[name] = Rig.load(project / "results" / "rig" / "r1").depth.img
+    np.testing.assert_array_equal(depths["without_map"], depths["with_map"])
+    assert np.nanmax(np.abs(depths["without_map"] - 0.01)) > 0  # not the map's
+    tables = run_tables(tomllib.loads(config.read_text()), "r1")
+    assert not any(
+        "depth" in Path(p).name for p in setup._rig_stamped(tables, project, [])
+    )
+
+
+def test_the_rig_is_known_by_its_default_depth_map(tmp_path):
+    """A depth table that names no depth map names the depth setup's map in the
+    results folder, so that a map set up again is not taken for the one a stored
+    rig read."""
+    tables = {"data": {"results": "results"}, "depth": {"measurements": "depth.csv"}}
+    found = [Path(path).as_posix() for path in setup._rig_stamped(tables, tmp_path, [])]
+    assert found == ["results/setup/depth/depth_map.npz"]
+
+
+def test_a_job_without_a_fit_run_or_the_reference_run_is_refused(tmp_path):
+    """A job over runs without one of the configured fit runs, among which the
+    overflow ranks its donors and over which the fit is made, is refused, naming
+    it; so is a job of distances without their configured reference run."""
+    config, selection = _project(tmp_path / "project", "float64")
+    jobs, frames = tmp_path / "jobs", selection.frames
+    alone = Selection({"r2": frames["r2"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"overflow needs run\(s\) \['r1'\]"):
+        create_job(jobs, STEPS, alone, config)
+    alone = Selection({"r1": frames["r1"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"distances needs run\(s\) \['r2'\]"):
+        create_job(jobs, (comparison.DISTANCES,), alone, config)
+
+
+
+EXPERT_TABLES = """
+[[roi]]
+name = "upper_right"
+shape = "label"
+label_index = 3
+
+[expert_knowledge]
+no_concentration_aq = ["upper_right"]
+no_saturation_g = ["upper_right"]
+"""
+"""No CO2 in the upper right sand layer (raw label 3)."""
+
+
+def test_expert_knowledge_keeps_co2_out_of_a_region_of_the_phase_maps(
+    tmp_path, monkeypatch
+):
+    """A run's expert knowledge that names a label region in no_concentration_aq and
+    no_saturation_g leaves no CO2 there in its phase maps, decided before the phase
+    rules and the free-gas allocation: the region is water with no free gas. Each
+    phase map records the CO2 area the model saw there, and CO2 elsewhere stays."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float32")
+    config.write_text(  # the first run alone, the one fit run
+        config.read_text().replace('fit = ["r1", "r2"]', 'fit = ["r1"]')
+    )
+    monkeypatch.chdir(project)
+    one = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    early = setup.STEPS + (
+        calibration.PHASE_MODEL,
+        calibration.DISPLACED_VOLUME,
+        calibration.OVERFLOW,
+        calibration.PHASE_MAPS,
+    )
+    _run(create_job(tmp_path / "jobs", early, one, config))
+    limited = project / "config-limited.toml"
+    limited.write_text(
+        config.read_text().replace('results = "results"', 'results = "limited"')
+        + EXPERT_TABLES
+    )
+    _run(create_job(tmp_path / "limited-jobs", early, one, limited))
+    labels = darsia.imread(project / "limited" / "rig" / "r1" / "labels.npz").img
+    region = labels == 3
+    co2_phases = (darsia.PhaseLabel.DISSOLVED, darsia.PhaseLabel.GAS)
+    seen_in_plain = seen_in_record = 0.0
+    for frame in one.frames["r1"]:
+        plain = darsia.read_phase_maps(
+            project / "results" / "phase-maps" / "r1" / frame.session / frame.name
+        )
+        folder = project / "limited" / "phase-maps" / "r1" / frame.session / frame.name
+        maps = darsia.read_phase_maps(folder)
+        assert not np.isin(maps["labels"][region], co2_phases).any()
+        assert not maps["co2"][region].any()
+        assert np.all(np.nan_to_num(maps["saturation"][region]) == 0)
+        record = json.loads((folder / "result.json").read_text())["measurements"]
+        removed = record["expert_knowledge"]
+        assert set(removed) == {"co2_area_mm2", "gas_area_mm2"}
+        if np.isin(plain["labels"][region], co2_phases).any():
+            assert removed["co2_area_mm2"] > 0
+        seen_in_plain += np.isin(plain["labels"][region], co2_phases).sum()
+        seen_in_record += removed["co2_area_mm2"]
+        plain_record = json.loads(
+            (
+                project
+                / "results"
+                / "phase-maps"
+                / "r1"
+                / frame.session
+                / frame.name
+                / "result.json"
+            ).read_text()
+        )["measurements"]
+        assert "expert_knowledge" not in plain_record
+    assert seen_in_plain > 0 and seen_in_record > 0  # the region held CO2 before
+    last = one.frames["r1"][-1]
+    maps = darsia.read_phase_maps(
+        project / "limited" / "phase-maps" / "r1" / last.session / last.name
+    )
+    assert np.isin(maps["labels"][~region], co2_phases).any()  # CO2 elsewhere stays

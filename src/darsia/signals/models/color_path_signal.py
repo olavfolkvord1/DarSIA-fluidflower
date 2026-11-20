@@ -12,19 +12,23 @@ of the given colours.
 
 A sand's factor is its path's scale over its measured colour range: the change
 along its path that its dissolved CO2 reaches beside the free gas
-(:func:`color_ranges`, with the settings of :class:`ColorRangeSettings`).
+(:func:`color_ranges`, with the settings of :class:`ColorRangeSettings`), stored
+by :func:`write_color_ranges`.
 
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
 
 import darsia
+from darsia.utils.results import write_json
 
 
 class ColorPathSignal(darsia.Model):
@@ -279,3 +283,20 @@ def color_ranges(
     return {
         sand: float(np.mean([run[sand] for run in largest])) for sand in sorted(sands)
     }
+
+
+COLOR_RANGES = "color_ranges.json"
+"""The file of stored colour ranges (:func:`write_color_ranges`)."""
+
+
+def write_color_ranges(folder: Path, ranges: Mapping[int, float]) -> None:
+    """Store each sand's colour range (:func:`color_ranges`) in ``folder``, as
+    JSON with every digit kept."""
+    found = {str(int(sand)): float(value) for sand, value in ranges.items()}
+    write_json(Path(folder) / COLOR_RANGES, found)
+
+
+def read_color_ranges(folder: Path) -> dict[int, float]:
+    """Stored colour ranges by facies id (:func:`write_color_ranges`)."""
+    text = (Path(folder) / COLOR_RANGES).read_text(encoding="utf-8")
+    return {int(sand): float(value) for sand, value in json.loads(text).items()}

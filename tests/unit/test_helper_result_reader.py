@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import darsia
 from darsia.presets.workflows.config.format_registry import FormatRegistry
@@ -54,3 +55,18 @@ def test_compute_statistics_uses_geometry_integral() -> None:
     assert minimum == 1.0
     assert maximum == 4.0
     assert integral == 10.0
+
+
+@pytest.mark.parametrize("suffix", ["csv", "npz"])
+def test_collect_result_files_skips_same_suffix_directories(tmp_path, suffix):
+    """Directories neither match a source nor shift the positional fallback."""
+    (tmp_path / f"a.{suffix}").mkdir()
+    with pytest.raises(FileNotFoundError, match="No .* files found"):
+        _collect_result_files([Path("a.jpg")], tmp_path, suffix)
+    files = [tmp_path / f"{stem}.{suffix}" for stem in ("b", "c")]
+    for path in files:
+        path.write_text("1")
+    assert _collect_result_files([Path("c.jpg"), Path("a.jpg")], tmp_path, suffix) == [
+        files[1],
+        files[1],
+    ]

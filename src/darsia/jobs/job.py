@@ -22,6 +22,8 @@ marker's token, is looked at once more after the share's cache time.
 from __future__ import annotations
 
 import functools
+import hashlib
+import importlib.metadata
 import os
 import subprocess
 import tomllib
@@ -44,7 +46,9 @@ from darsia.jobs.step import (
     Task,
     file_identity,
     merged,
+    missing_runs,
     outputs,
+    read_runs,
     request,
     table,
 )
@@ -95,10 +99,24 @@ class Environment:
         }
 
 
-def revision() -> str | None:
+def _git(folder: Path, *arguments: str) -> str | None:
+    """What git answers in a folder, or None when it fails or is missing."""
+    try:
+        found = subprocess.run(
+            ["git", *arguments], cwd=folder, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+def revision(folder: Path | None = None) -> str | None:
     """The code's revision now: the commit of the checkout this package is run
-    from, marked ``-dirty`` when tracked files differ from it; None when it is not
-    known, e.g. without git or outside a checkout.
+    from, marked ``-dirty`` when tracked files differ from it; without a checkout
+    that tracks the package, e.g. a package installed on a computer without git or
+    into an ignored folder of another repository (a virtual environment inside a
+    clone), its version and a hash of its source files
+    (:func:`installed_revision`); None only when even those cannot be read.
 
     A job records the revision it was created at. A service whose code is of
     another revision takes none of its tasks, and a task process of another
@@ -106,21 +124,54 @@ def revision() -> str | None:
     the revision of the process that made it. Each call looks again, so that a
     service sees its checkout advanced.
 
+    Parameters
+    ----------
+    folder : Path, optional
+        The package's folder; by default this package's.
+
     """
-    folder = Path(__file__).resolve().parents[1]
-    try:
-        found = subprocess.run(
-            ["git", "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*"],
-            cwd=folder,
-            capture_output=True,
-            text=True,
-            timeout=60,
+    folder = Path(__file__).resolve().parents[1] if folder is None else Path(folder)
+    if _git(folder, "ls-files", "--error-unmatch", "__init__.py") is not None:
+        found = _git(
+            folder, "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*"
         )
-    except (OSError, subprocess.SubprocessError):
+        if found:
+            return found
+    try:
+        return installed_revision(folder)
+    except OSError:
         return None
-    if found.returncode != 0:
-        return None
-    return found.stdout.strip() or None
+
+
+def installed_revision(folder: Path) -> str:
+    """The revision of a package without a checkout: its installed version and the
+    SHA-256 of its Python source files (each file's path in the package and
+    content, in order of their paths), e.g. ``"1.1.0+3f2a..."``, so that two
+    installations of other code never share one.
+
+    Parameters
+    ----------
+    folder : Path
+        The package's folder.
+
+    Returns
+    -------
+    str
+        The revision.
+
+    """
+    try:
+        version = importlib.metadata.version(Path(folder).name)
+    except importlib.metadata.PackageNotFoundError:
+        version = "unversioned"
+    found = hashlib.sha256()
+    files = sorted(
+        Path(folder).rglob("*.py"), key=lambda p: p.relative_to(folder).as_posix()
+    )
+    for file in files:
+        found.update(file.relative_to(folder).as_posix().encode("utf-8") + b"\0")
+        found.update(hashlib.sha256(file.read_bytes()).digest())
+    return f"{version}+{found.hexdigest()}"
 
 
 def read_tables(paths: Sequence[Path]) -> dict[str, Any]:
@@ -148,6 +199,56 @@ def locations_of(job: Path, record: Mapping) -> Locations:
     """The locations of a job's results and photos."""
     selection = Selection.from_json(record["selection"])
     return Locations(project_of(job, record), record["results"], selection.sessions)
+
+
+def discard_failed(job: Path, step: Step, task: str) -> list[str]:
+    """Set aside the results a failed task's attempts stored, so that its retry
+    (:func:`darsia.jobs.queue.retry_failed`) makes them again after a mend of what
+    they are made from, e.g. a protocol or a configured file.
+
+    Only results that name this job and task are set aside, and none is deleted:
+    each is renamed beside its location (``.<name>.<token>.discarded``), never over
+    a publication. A failed task's results are accepted by no done marker, so no
+    consumer reads them. The Jobs page asks the owner before it calls this.
+
+    Parameters
+    ----------
+    job : Path
+        The job's folder.
+    step : Step
+        The task's step.
+    task : str
+        The task's name.
+
+    Returns
+    -------
+    list of str
+        The keys of the results set aside.
+
+    Raises
+    ------
+    ValueError
+        If the task is not failed.
+
+    """
+    if task not in queue.markers(job, queue.FAILED):
+        raise ValueError(f"Task {task} is not failed.")
+    record = read_job(job)
+    locations = locations_of(job, record)
+    found = []
+    for output in outputs(step, queue.tasks(job)[task]):
+        location = locations.result(
+            output.kind, run=output.run, frame=output.frame, part=output.part
+        )
+        if not results.is_complete(location):
+            continue
+        stored = results.read(location, results.read_description, committed=True)
+        if (stored.get("job"), stored.get("task")) != (record["id"], task):
+            continue
+        aside = location.with_name(f".{location.name}.{stored['token']}.discarded")
+        results.rename(location, aside)
+        found.append(output.key)
+    return found
 
 
 def _ordered(steps: Sequence[Step]) -> list[Step]:
@@ -179,8 +280,9 @@ def _units(step: Step, selection: Selection, tables: Mapping):
 def _reads(
     step: Step, run, frames, part, kinds: Mapping[str, Step], selection, tables
 ) -> list[Input]:
-    """The results one unit of a step reads, by the scope of each read."""
-    found = []
+    """The results one unit of a step reads, by the scope of each read: a read of
+    every run is of the runs the step reads over the selection (:func:`read_runs`)."""
+    found, every = [], read_runs(step, selection, tables)
     for kind, wanted in step.reads.items():
         if kind not in kinds:
             raise ValueError(f"No step makes {kind}, which {step.name} reads.")
@@ -193,10 +295,10 @@ def _reads(
         elif wanted is Scope.ONE:
             raise ValueError(f"{kind} is not a single result ({step.name}).")
         elif stored is Each.FRAME:
-            runs = selection.frames if wanted is Scope.ALL else {run: frames}
+            runs = every if wanted is Scope.ALL else {run: frames}
             found += [Input(kind, r, f) for r, fs in runs.items() for f in fs]
         elif stored is Each.RUN:
-            runs = selection.frames if wanted is Scope.ALL else [run]
+            runs = every if wanted is Scope.ALL else [run]
             found += [Input(kind, r) for r in runs]
         elif wanted is Scope.ALL:
             found += [Input(kind, part=p) for p in producer.parts(selection, tables)]
@@ -344,8 +446,8 @@ def create_job(
     code = revision()
     if code is None:
         raise ValueError(
-            "The code's revision is not known (no git checkout of the package, or "
-            "no git on the PATH); a job locks the revision of its code."
+            "The code's revision is not known (no checkout, and its source files "
+            "cannot be read); a job locks the revision of its code."
         )
     results_folder = str(table(tables, "data.results"))
     locations = Locations(project, results_folder, selection.sessions)
@@ -420,6 +522,12 @@ def _plan(steps, selection, tables, env, creation, kinds):
     refused: list[str] = []
     made_tasks: list[Task] = []
     for step in _ordered(steps):
+        missing = missing_runs(step, selection, tables)
+        if missing:
+            raise ValueError(
+                f"{step.name} needs run(s) {missing}, which its configuration names "
+                "and the selection lacks."
+            )
         kept: list[Task] = []
         for run, frames, part in _units(step, selection, tables):
             inputs = []

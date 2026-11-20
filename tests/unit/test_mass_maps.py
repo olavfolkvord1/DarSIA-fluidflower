@@ -210,6 +210,25 @@ def test_the_official_route_and_ours_give_mass_maps_of_one_form():
     assert copy.static["domain_area_m2"].sum() == pytest.approx(5 * 6 * 25e-6)
 
 
+def test_the_gas_density_at_no_head_is_our_productions():
+    """CO2's gas density at a pressure and temperature with no hydrostatic head
+    equals our production's (its phase split's, at zero height) in single and
+    double precision."""
+    states = [
+        (0.9851389500286174, 20.668747606192046),
+        (0.994208630395766, 22.141837002689577),
+        (1.028076467912384, 22.155780887760123),
+    ]
+    wanted = {
+        np.float32: [1.7839505672454834, 1.7913336753845215, 1.852557897567749],
+        np.float64: [1.7839506175841124, 1.7913337041055843, 1.8525579593140251],
+    }
+    for dtype, values in wanted.items():
+        assert [
+            darsia.atmospheric_gas_density(p, t, dtype) for p, t in states
+        ] == values
+
+
 def test_the_stored_maps_give_back_their_total_mass_bit_for_bit(tmp_path):
     """The stored maps hold no total mass; read back, it is the total of the maps
     made, bit for bit with its NaN, also from maps stored with their total by the
@@ -235,3 +254,13 @@ def test_the_stored_maps_give_back_their_total_mass_bit_for_bit(tmp_path):
         assert cells.keys() == made.keys()
         for key, values in made.items():
             assert cells[key].tobytes() == values.tobytes()
+
+
+def test_read_mass_copy_ignores_same_suffix_directories(tmp_path):
+    """Only field files in a frame leaf are read as stored mass maps."""
+    values = np.arange(6, dtype=np.float32).reshape(2, 3)
+    darsia.ScalarImage(values, dimensions=[2, 3]).save(tmp_path / "mass.npz")
+    (tmp_path / "nested.npz").mkdir()
+    stored = darsia.read_mass_copy(tmp_path)
+    assert set(stored) == {"mass"}
+    np.testing.assert_array_equal(stored["mass"].img, values)

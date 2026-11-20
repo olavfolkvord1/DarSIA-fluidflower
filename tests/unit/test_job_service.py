@@ -1,5 +1,6 @@
 """Tests of the job engine's service: task processes, environments and hosts."""
 
+import json
 import os
 import secrets
 import subprocess
@@ -22,6 +23,7 @@ from darsia.jobs.step import Selection
 from darsia.utils import results
 from tests.unit.test_jobs import no_share_wait  # noqa: F401
 from tests.unit.test_jobs import NUMBERS, SUMS, _project, _stored
+from tests.unit.test_minimal_chain import _head
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -246,6 +248,41 @@ def test_one_service_per_host_and_its_survivors(tmp_path, importable):
             _kill(pid)
 
 
+@pytest.mark.parametrize("hidden", [psutil.NoSuchProcess, psutil.AccessDenied])
+def test_a_survivor_gone_or_hidden_is_gone_and_a_live_one_keeps_its_threads(
+    tmp_path, monkeypatch, capsys, hidden
+):
+    """A restarted service's look at its host's claims takes a process that is
+    gone, or that it may not look at, for gone: it returns that task at once and
+    goes on. A claim whose process still runs is counted, and its threads leave
+    no room for a new task."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    gone = queue.claim(job, "numbers.r1.0000", "here")
+    kept = queue.claim(job, "numbers.r2.0000", "here")
+    queue.beat(gone, 1, 999_999, 1.0e9)
+    queue.beat(kept, 1, os.getpid(), service.birth(os.getpid()))
+    real = psutil.Process
+
+    class Hidden:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            raise hidden(self.pid)
+
+    def process(pid):
+        return Hidden(pid) if pid == 999_999 else real(pid)
+
+    monkeypatch.setattr(service.psutil, "Process", process)
+    again = service.Service(tmp_path / "jobs", "here", 1, tmp_path / "logs")
+    again.poll()
+    assert "cannot be done now" not in capsys.readouterr().out
+    assert [live.pid for live in again.live.values()] == [os.getpid()]
+    assert set(queue.markers(job, queue.CLAIMED)) == {"numbers.r2.0000"}
+    assert "numbers.r1.0000" in queue.markers(job, queue.QUEUE)
+
+
 def test_a_job_of_another_revision_is_not_taken(tmp_path, capsys):
     """A service whose code revision differs from the job's takes none of its
     tasks and says why."""
@@ -261,7 +298,10 @@ def test_a_job_of_another_revision_is_not_taken(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     "kernel, backend, wanted",
-    [("NoSuchKernel", "cpu", "NoSuchKernel"), ("Haswell", "opencl-gpu", "opencl-gpu")],
+    [
+        ("NoSuchKernel", "cpu", "not the job's NoSuchKernel"),
+        ("Haswell", "opencl-gpu", "the job's backend opencl-gpu: No compute backend"),
+    ],
 )
 def test_a_host_without_the_job_environment_returns_the_task(
     tmp_path, importable, kernel, backend, wanted
@@ -278,7 +318,7 @@ def test_a_host_without_the_job_environment_returns_the_task(
     live.process.wait(120)
     again.poll()
     assert set(queue.markers(job, queue.QUEUE)) == {"numbers.r2.0000"}
-    assert f"not the job's {wanted}" in again.refused[job.name]
+    assert wanted in again.refused[job.name]
     assert not again.live
 
 
@@ -324,6 +364,52 @@ def test_a_beat_delayed_into_the_mark_lands_before_it(
     assert jobs_main.run(job, claim.task, claim.token, "here") == 0
     assert landed.is_set()
     assert queue.accepted(job, claim.task) == {claim.token}
+
+
+def test_a_task_runs_on_its_job_backend(tmp_path, monkeypatch, kept_threads):
+    """A task process takes its job's compute backend by its label, checked with
+    the job's phase-model heads, runs the step on it and records its device with
+    each result; a host whose device of that class fails the check refuses the
+    task, saying why."""
+    job = _one(tmp_path, kernel=HERE, backend="opencl:Device")
+    model = tmp_path / "project" / "model" / "models" / "generic"
+    model.mkdir(parents=True)
+    for role, intercept in (("co2_presence", -3.0), ("gas_within_co2", -2.5)):
+        (model / f"{role}_signal.json").write_text(json.dumps(_head(20, intercept)))
+    policy = {"models": {"generic": {"gas_within_co2": {"presence_threshold": 0.66}}}}
+    (model.parents[1] / "phase_decision_policy.json").write_text(json.dumps(policy))
+    config = tmp_path / "jobs" / job.name / "config-0.toml"
+    config.write_text(
+        config.read_text() + '[phase_model]\nfolder = "model"\npixel_size_mm = 0.5\n'
+    )
+    device = SimpleNamespace(label="opencl:Device", device="Device (driver 1)")
+    asked, used = [], []
+
+    def named(label, heads=None):
+        asked.append((label, heads))
+        if len(asked) > 1:
+            raise ValueError("none gives the CPU's numbers.")
+        return device
+
+    monkeypatch.setattr(jobs_main, "backend_named", named)
+    monkeypatch.setattr(jobs_main, "use_compute_backend", used.append)
+    monkeypatch.setattr(jobs_main, "compute_backend", lambda: used[-1])
+    claim = queue.claim(job, "numbers.r2.0000", "here")
+    assert jobs_main.run(job, claim.task, claim.token, "here") == 0
+    ((label, heads),) = asked
+    assert label == "opencl:Device" and used == [device]
+    assert [head.intercept for head in heads] == [-3.0, -2.5]
+    stored, _ = _stored(tmp_path / "project", "numbers/r2/day1/r2-00.npz")
+    assert stored["device"] == "Device (driver 1)"
+    assert stored["environment"]["backend"] == "opencl:Device"
+    again = _one(tmp_path / "again", kernel=HERE, backend="opencl:Device")
+    claim = queue.claim(again, "numbers.r2.0000", "here")
+    assert jobs_main.run(again, claim.task, claim.token, "here") == service.REFUSED
+    why = queue.lease(again, claim.task, claim.token)["refused"]
+    assert why == (
+        "This host cannot run the job's backend opencl:Device: none gives the CPU's "
+        "numbers."
+    )
 
 
 def test_a_task_process_of_another_revision_refuses_its_task(tmp_path, kept_threads):
@@ -383,6 +469,27 @@ def test_an_exit_whose_claim_says_no_refusal_is_no_refusal(tmp_path, code):
     assert set(queue.markers(job, queue.QUEUE)) == {"numbers.r2.0000"}
     assert job.name not in running.refused
     assert running.exits == {(job.name, "numbers.r2.0000"): 1}
+
+
+def test_a_retried_task_is_returned_once_more_after_an_unmarked_exit(tmp_path):
+    """A task failed after two unmarked exits and then retried starts its count
+    again: its next unmarked exit returns it to the queue once more."""
+    job = _one(tmp_path)
+    running = service.Service(tmp_path / "jobs", "here", 0, tmp_path / "logs")
+    running.poll()  # no threads: it reads the job and starts nothing
+    ended = subprocess.Popen([sys.executable, "-c", "import os; os._exit(1)"])
+    assert ended.wait(60) == 1
+    name = "numbers.r2.0000"
+    for _ in range(2):
+        claim = queue.claim(job, name, "here")
+        running.live[claim.path] = service.Live(claim, 1, ended)
+        running.poll()
+    assert set(queue.markers(job, queue.FAILED)) == {name}
+    assert queue.retry_failed(job, name)
+    claim = queue.claim(job, name, "here")
+    running.live[claim.path] = service.Live(claim, 1, ended)
+    running.poll()
+    assert set(queue.markers(job, queue.QUEUE)) == {name}
 
 
 def test_a_job_read_short_stops_nothing(tmp_path, capsys):
@@ -471,6 +578,63 @@ def test_the_host_lock_is_the_machines(tmp_path, monkeypatch):
         assert subprocess.run(command, env=other, timeout=60).returncode == 1
     with service.HostMutex(name):
         pass
+
+
+def test_a_waiting_lock_waits_for_its_holder():
+    """A second taker of a host's waiting lock waits until the first releases it,
+    and the first may then take it again."""
+    name = f"jobs-test-{secrets.token_hex(8)}"
+    first, second = service.WaitingLock(name), service.WaitingLock(name)
+    held, times = threading.Event(), {}
+
+    def other():
+        held.wait(30)
+        with second:
+            times["taken"] = time.monotonic()
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    with first:
+        held.set()
+        time.sleep(0.5)
+        times["released"] = time.monotonic()
+    thread.join(30)
+    assert times["taken"] >= times["released"]
+    with first:
+        pass
+
+
+_HOLD = """
+import os, sys, time
+from darsia.jobs import service
+lock = service.WaitingLock(sys.argv[1])
+lock.__enter__()
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+if sys.argv[3] == "abandon":
+    os._exit(0)
+lock.__exit__()
+"""
+
+
+@pytest.mark.parametrize("ending", ["release", "abandon"])
+def test_a_waiting_lock_held_by_another_process_is_taken_once_it_lets_go(
+    importable, ending
+):
+    """A waiting lock held by another process is taken once that process releases
+    it, or dies holding it: a dead holder hands it on."""
+    name = f"jobs-test-{secrets.token_hex(8)}"
+    command = [sys.executable, "-c", _HOLD, name, "1.0", ending]
+    holder = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        began = time.monotonic()
+        with service.WaitingLock(name):
+            waited = time.monotonic() - began
+        assert waited > 0.5
+    finally:
+        holder.wait(60)
+        holder.stdout.close()
 
 
 def test_a_delayed_renewal_keeps_its_start_time_for_terminal_marking(monkeypatch):

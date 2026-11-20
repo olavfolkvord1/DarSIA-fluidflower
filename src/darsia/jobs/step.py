@@ -23,11 +23,11 @@ e.g. a depth map. Photos are not identified: a photo is never changed, by rule.
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePath
@@ -420,6 +420,12 @@ class Step:
     protocols or a model folder, given a run's tables (the job's for a result of no
     run), the project folder and the run's photo folders; each one's content is
     part of its results' identity (:func:`file_identity`)."""
+    stamped: Callable[[Mapping[str, Any], Path, Sequence[Path]], Iterable] | None = None
+    """The large files its configuration names that it reads, given as for
+    :attr:`files`, e.g. a depth map or an image mapping; each one's size and
+    modification time are part of its results' identity (:func:`file_stamp`).
+    Photos and stored results are not named here: a photo is never changed, by
+    rule, and a result is bound by its token."""
     domains: bool = False
     """Whether its results are made from the selection's domains, which their scope
     then records."""
@@ -427,6 +433,15 @@ class Step:
     """Whether a result of no run is made from the selection's frames; False for a
     step that reads none of them, e.g. the copy of a configured model, whose scope
     is then its part alone."""
+    runs: Callable[[Mapping[str, Any]], Sequence[str]] | None = None
+    """The selected runs a task of the step over the selection reads, named by the
+    configuration's tables, e.g. the runs a measurement is made on; by default
+    every selected run (:func:`read_runs`)."""
+    required: Callable[[Mapping[str, Any]], Iterable[str]] | None = None
+    """The runs the configuration names that a job of the step must select, e.g.
+    the fit runs among which a run's overflow ranks its donors and over which the
+    calibration fits, or the distances' reference run; a job without one of them
+    is refused (:func:`missing_runs`)."""
 
     @property
     def stored(self) -> Each:
@@ -438,6 +453,37 @@ class Step:
         if self.order is Order.RUN:
             return Each.RUN
         return Each.PART if self.parts is not None else Each.ONE
+
+
+def read_runs(
+    step: Step, selection: Selection, tables: Mapping[str, Any]
+) -> dict[str, tuple[Frame, ...]]:
+    """The frames of the runs a step reads over the whole selection (each read of
+    :attr:`Scope.ALL`): every selected run's, or those of the runs its
+    configuration names (:attr:`Step.runs`).
+
+    Raises
+    ------
+    ValueError
+        If the configuration names a run the selection lacks.
+
+    """
+    if step.runs is None:
+        return dict(selection.frames)
+    named = list(step.runs(tables))
+    missing = [run for run in named if run not in selection.frames]
+    if missing:
+        raise ValueError(f"{step.name} reads run(s) {missing}, which are not selected.")
+    return {run: selection.frames[run] for run in named}
+
+
+def missing_runs(
+    step: Step, selection: Selection, tables: Mapping[str, Any]
+) -> list[str]:
+    """The runs a step needs, by its configuration (:attr:`Step.required`), that
+    the selection lacks."""
+    named = [] if step.required is None else list(step.required(tables))
+    return [run for run in dict.fromkeys(named) if run not in selection.frames]
 
 
 def result_key(
@@ -511,6 +557,12 @@ def file_identity(path: Path) -> str:
     str
         The identity.
 
+    Raises
+    ------
+    darsia.utils.results.Unavailable
+        If the share gave no answer within the retries, also as a missing path:
+        an outage is not a missing file.
+
     """
     path = Path(path)
 
@@ -524,10 +576,50 @@ def file_identity(path: Path) -> str:
             found.update(hashlib.sha256(file.read_bytes()).digest())
         return found.hexdigest()
 
+    return _known(path, lambda: results.retry_transient(digest))
+
+
+def file_stamp(path: Path) -> str:
+    """The identity of a large file that a configuration names: its size and
+    modification time, through the share's interruptions; ``"missing"`` if there
+    is none. A file written again, even with the same content, is another one.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+
+    Returns
+    -------
+    str
+        The identity, e.g. ``"size 1024, modified 1731628800123456789"``.
+
+    Raises
+    ------
+    darsia.utils.results.Unavailable
+        If the share gave no answer within the retries, also as a missing path.
+
+    """
+
+    def stamp() -> str:
+        found = results.retry_transient(lambda: Path(path).stat())
+        return f"size {found.st_size}, modified {found.st_mtime_ns}"
+
+    return _known(path, stamp)
+
+
+def _known(path: Path, look: Callable[[], str]) -> str:
+    """A file's identity by a look through the share's interruptions;
+    ``"missing"`` only for a file that is not there, :class:`Unavailable` when the
+    share is out (:func:`darsia.utils.results.share_out`)."""
     try:
-        return results.retry_transient(digest)
-    except FileNotFoundError:
-        return "missing"
+        return look()
+    except OSError as error:
+        if results.share_out(error):
+            raise results.Unavailable(f"No answer about {path}: {error}") from error
+        if isinstance(error, FileNotFoundError):
+            return "missing"
+        raise
 
 
 def _file_name(path: Path, project: Path) -> str:
@@ -547,14 +639,17 @@ def configured(
     tables: Mapping[str, Any],
     locations: Locations,
     identity: Callable[[Path], str] = file_identity,
+    files: Mapping[str, str] | None = None,
 ) -> tuple[dict, dict[str, str]]:
     """What of the configuration one result of a task is made from: the tables of
-    every section its step reads, and the identity of every small file its step
-    reads that the configuration names.
+    every section its step reads, and the identity of every file its step reads
+    that the configuration names: a small file's content, a large file's size and
+    time (:func:`file_stamp`).
 
     The sections of the step's settings are the job's; its other sections
-    (:attr:`Step.sections`) and its files (:attr:`Step.files`) are each run's, of
-    the task's run or of every selected run.
+    (:attr:`Step.sections`) and its files (:attr:`Step.files`,
+    :attr:`Step.stamped`) are each run's, of the task's run or of every run it
+    reads over the selection (:func:`read_runs`).
 
     Parameters
     ----------
@@ -568,6 +663,9 @@ def configured(
         The project's results and photos.
     identity : Callable[[Path], str], optional
         The identity of a file (:func:`file_identity`), e.g. one remembered.
+    files : Mapping[str, str], optional
+        The identities of the configured files taken earlier, e.g. when the task
+        started; by default each file is looked at now.
 
     Returns
     -------
@@ -582,7 +680,7 @@ def configured(
     if task.run is not None:
         runs: list[str | None] = [task.run]
     else:
-        runs = list(selection.frames) if step.selected else [None]
+        runs = list(read_runs(step, selection, tables)) if step.selected else [None]
     own = {run: tables if run is None else run_tables(tables, run) for run in runs}
     if step.sections:
         settings[RUNS] = {
@@ -590,12 +688,15 @@ def configured(
             for run in runs
             if run is not None
         }
-    files: dict[str, str] = {}
-    for run in runs if step.files is not None else ():
-        folders = list(locations.sessions.get(run, {}).values()) if run else []
-        for path in step.files(own[run], locations.project, folders):
-            full = normal_path(path, locations.project)
-            files[_file_name(full, locations.project)] = identity(full)
+    if files is not None:
+        return plain(settings), dict(files)
+    files = {}
+    for named, known in ((step.files, identity), (step.stamped, file_stamp)):
+        for run in runs if named is not None else ():
+            folders = list(locations.sessions.get(run, {}).values()) if run else []
+            for path in named(own[run], locations.project, folders):
+                full = normal_path(path, locations.project)
+                files[_file_name(full, locations.project)] = known(full)
     return plain(settings), files
 
 
@@ -613,15 +714,19 @@ def outputs(step: Step, task: Task) -> tuple[Input, ...]:
 
 
 def scope(
-    step: Step, task: Task, selection: Selection, frame: Frame | None = None
+    step: Step,
+    task: Task,
+    selection: Selection,
+    tables: Mapping[str, Any],
+    frame: Frame | None = None,
 ) -> dict:
     """What of the frozen selection one result of a task is made from.
 
     A frame's result of a step over frames is made from that frame alone; a result
     of a task per run from the run's frames; any other from its part and, unless
-    its step reads no selection (:attr:`Step.selected`), the whole selection's
-    frames. The selection's domains are recorded for a step that reads them
-    (:attr:`Step.domains`).
+    its step reads no selection (:attr:`Step.selected`), the frames of the runs it
+    reads (:func:`read_runs`, by default the whole selection's). The selection's
+    domains are recorded for a step that reads them (:attr:`Step.domains`).
 
     """
     if step.order is Order.FRAMES and frame is not None:
@@ -631,9 +736,8 @@ def scope(
     else:
         found = {"part": task.part}
         if step.selected:
-            found["frames"] = {
-                run: [list(f) for f in fs] for run, fs in selection.frames.items()
-            }
+            read = read_runs(step, selection, tables)
+            found["frames"] = {run: [list(f) for f in fs] for run, fs in read.items()}
     if step.domains:
         found["domains"] = list(selection.domains)
     return found
@@ -659,6 +763,7 @@ def request(
     *,
     locations: Locations,
     identity: Callable[[Path], str] = file_identity,
+    files: Mapping[str, str] | None = None,
 ) -> dict:
     """What one result of a task would record now (:data:`REUSED`), to publish it or
     to compare a stored result with it (:func:`darsia.utils.results.reusable`).
@@ -681,6 +786,8 @@ def request(
         The project's results and photos, where the configured files are found.
     identity : Callable[[Path], str], optional
         The identity of a file (:func:`file_identity`), e.g. one remembered.
+    files : Mapping[str, str], optional
+        The identities of the configured files taken earlier (:func:`configured`).
 
     Returns
     -------
@@ -692,11 +799,13 @@ def request(
 
     """
     used = made_from(step, task, frame)
-    settings, files = configured(step, task, selection, tables, locations, identity)
+    settings, files = configured(
+        step, task, selection, tables, locations, identity, files
+    )
     return {
         "step": step.name,
         "settings": settings,
-        "scope": scope(step, task, selection, frame),
+        "scope": scope(step, task, selection, tables, frame),
         "environment": plain(dict(environment)),
         "inputs": {**{i.key: tokens[i.key] for i in used}, **files},
     }
@@ -733,6 +842,13 @@ class StepContext:
     revision : str
         The revision of the code this process runs, which its results record
         (:func:`darsia.jobs.job.revision`).
+    device : str, optional
+        The device of this process's compute backend, driver included, which its
+        results record (:attr:`darsia.ComputeBackend.device`).
+    locks : Callable[[str], AbstractContextManager], optional
+        The host's lock of a name that its taker waits for
+        (:class:`darsia.jobs.service.WaitingLock`); by default none, e.g. for a
+        task run in a test's process.
 
     """
 
@@ -749,6 +865,8 @@ class StepContext:
         job: Mapping[str, Any],
         accepted: Callable[[str], frozenset[str]],
         revision: str,
+        device: str = "cpu",
+        locks: Callable[[str], AbstractContextManager] | None = None,
     ) -> None:
         self.step = step
         """The step."""
@@ -770,11 +888,33 @@ class StepContext:
         """Tokens of an earlier attempt's results this task adopted."""
         self.revision = revision
         """The revision of the code that makes this task's results."""
+        self.device = device
+        """The device that makes this task's results."""
         self._job = job
         self._accepted = accepted
+        self._locks = locks
         self._tokens: dict[str, str] = {}
         self._outputs = {i.key: i for i in outputs(step, task)}
-        self._identity = functools.cache(file_identity)
+        self._files = self._configured_files()
+
+    def host_lock(self, name: str) -> AbstractContextManager:
+        """The host's lock of a name, which a task waits for while another holds
+        it, e.g. around a film encoder's open; none for a task run in a test's
+        process.
+
+        Parameters
+        ----------
+        name : str
+            The lock's name.
+
+        Returns
+        -------
+        AbstractContextManager
+            The lock, to be held with ``with`` (also more than once, one after the
+            other).
+
+        """
+        return nullcontext() if self._locks is None else self._locks(name)
 
     def _input(self, kind, run, frame, part) -> Input:
         """The declared input of a kind, frame, part and run (by default the
@@ -855,8 +995,15 @@ class StepContext:
         self.token_of(i)
         return results.read(self._location(i), reader, committed=True)
 
+    def _configured_files(self) -> dict[str, str]:
+        """The identities of the configured files the task reads, looked at now."""
+        return configured(
+            self.step, self.task, self.selection, self.tables, self.locations
+        )[1]
+
     def _request(self, frame: Frame | None) -> dict:
-        """What one of this task's results records now."""
+        """What one of this task's results records now, with the identities of its
+        configured files as they were when the task started."""
         used = made_from(self.step, self.task, frame)
         tokens = {i.key: self.token_of(i) for i in used}
         return request(
@@ -868,7 +1015,7 @@ class StepContext:
             tokens,
             frame,
             locations=self.locations,
-            identity=self._identity,
+            files=self._files,
         )
 
     def _own(self, output: Input, stored: Mapping, frame: Frame | None) -> None:
@@ -942,10 +1089,11 @@ class StepContext:
     ) -> None:
         """Publish one of this task's results under its claim token.
 
-        The description records the request (:func:`request`), the job, the task
-        and the revision of the code that made it. A location that already holds an
-        earlier attempt's result of the same task that serves now is adopted
-        instead.
+        The description records the request (:func:`request`), the job, the task,
+        the revision of the code that made it and the device it ran on. A location
+        that already holds an earlier attempt's result of the same task that serves
+        now is adopted instead. Nothing is published once a configured file the task
+        reads has changed since it started.
 
         Parameters
         ----------
@@ -966,15 +1114,30 @@ class StepContext:
         ------
         FileExistsError
             If another's result is stored there.
+        RuntimeError
+            If a configured file the task reads changed since it started, naming
+            it.
 
         """
         output = self._output(run, frame, part)
         location = self._location(output)
+        now = self._configured_files()
+        changed = sorted(
+            k
+            for k in now.keys() | self._files.keys()
+            if now.get(k) != self._files.get(k)
+        )
+        if changed:
+            raise RuntimeError(
+                f"{', '.join(changed)} changed while task {self.task.id} read it; "
+                "it publishes nothing more."
+            )
         description = {
             **self._request(frame),
             "job": self._job["id"],
             "task": self.task.id,
             "revision": self.revision,
+            "device": self.device,
         }
         if measurements is not None:
             description["measurements"] = dict(measurements)

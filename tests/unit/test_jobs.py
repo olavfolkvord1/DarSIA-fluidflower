@@ -2,8 +2,10 @@
 
 import builtins
 import errno
+import importlib.metadata
 import json
 import os
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from threadpoolctl import threadpool_info
 
 from darsia.jobs import job as job_module
 from darsia.jobs import queue
+from darsia.jobs import step as step_module
 from darsia.jobs.job import create_job, locations_of, read_job, read_tables, revision
 from darsia.jobs.step import (
     Memory,
@@ -39,6 +42,20 @@ KERNEL = "Haswell"
 def no_share_wait(monkeypatch):
     """A local folder has no share's cache: the looks again do not wait."""
     monkeypatch.setattr(results, "SHARE_CACHE", 0.0)
+
+
+NETWORK_CODES = (53, 67) if os.name == "nt" else (errno.EHOSTDOWN,)
+"""The codes of a share that is out, as the platform gives them: Windows' network
+path and network name not found (its errors 53 and 67), which Python takes for a
+missing file, and POSIX's host that is down, which an SMB client gives while its
+server is out of reach."""
+
+
+def network_error(code=NETWORK_CODES[0], path=None):
+    """The error of a share that is out, by one of :data:`NETWORK_CODES`."""
+    if os.name == "nt":
+        return OSError(errno.ENOENT, "The network path was not found", path, code)
+    return OSError(code, os.strerror(code), path)
 
 
 @dataclass(frozen=True)
@@ -148,7 +165,65 @@ FIT = Step(
     _parts,
 )
 SUMMARY = Step("summary", {"fit": Scope.ALL}, Order.PARTS, Memory(), _summary)
-STEPS = (NUMBERS, SUMS, DOMAIN_SUMS, FIT, SUMMARY)
+
+
+def _measured(ctx: StepContext) -> None:
+    """The total of the sums of the runs the configuration names."""
+    runs = ctx.tables["measured"]["runs"]
+    total = sum(ctx.read("sums", read_values, run=run)["total"] for run in runs)
+    ctx.publish(lambda folder: _write(folder, total=total))
+
+
+MEASURED = Step(
+    "measured",
+    {"sums": Scope.ALL},
+    Order.PARTS,
+    Memory(),
+    _measured,
+    runs=lambda tables: tables["measured"]["runs"],
+)
+
+
+def _depth(tables, project, folders):
+    """The toy's large file."""
+    return ["depth.npz"]
+
+
+STAMPED = Step(
+    "stamped",
+    {},
+    Order.FRAMES,
+    Memory(),
+    _numbers,
+    {"toy": ToySettings},
+    stamped=_depth,
+)
+
+
+def _halting(ctx: StepContext) -> None:
+    """A number per frame, halting at the second while the project holds a file
+    named "halt"."""
+    for k, frame in enumerate(ctx.task.frames):
+        if ctx.done(frame):
+            continue
+        if k == 1 and (ctx.locations.project / "halt").exists():
+            raise RuntimeError("Halted")
+        ctx.publish(lambda folder: _write(folder, value=k), frame=frame)
+
+
+HALTING = Step("halting", {}, Order.FRAMES, Memory(), _halting)
+HALTING_READ = Step("halting-read", {}, Order.FRAMES, Memory(), _halting, files=_files)
+STEPS = (
+    NUMBERS,
+    SUMS,
+    DOMAIN_SUMS,
+    FIT,
+    SUMMARY,
+    MEASURED,
+    STAMPED,
+    HALTING,
+    HALTING_READ,
+)
 """The test steps, which a task process finds by their module."""
 
 
@@ -248,6 +323,27 @@ def test_a_global_fit_waits_for_every_selected_run(tmp_path):
     work(job)
     assert queue.waiting(job) == set()
     assert _stored(tmp_path / "project", "fit/a")[1]["total"] == 324.0
+
+
+def test_a_step_reads_only_the_runs_its_configuration_names(tmp_path):
+    """A measurement on the runs its configuration names waits for those runs
+    alone and records their frames alone, so that it serves a job over other runs
+    beside them; a named run the selection lacks refuses the job."""
+    config, selection = _project(tmp_path)
+    config.write_text(config.read_text() + '[measured]\nruns = ["r2"]\n')
+    jobs, steps = tmp_path / "jobs", (NUMBERS, SUMS, MEASURED)
+    job = create_job(jobs, steps, selection, config)
+    task = queue.tasks(job)["measured"]
+    assert [i.key for i in task.inputs] == ["sums/r2"] and task.after == ("sums.r2",)
+    work(job)
+    description, values = _stored(tmp_path / "project", "measured")
+    assert list(description["scope"]["frames"]) == ["r2"]
+    assert values["total"] == _stored(tmp_path / "project", "sums/r2")[1]["total"]
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    assert queue.tasks(create_job(jobs, steps, one, config)) == {}
+    other = Selection({"r1": selection.frames["r1"]}, selection.sessions)
+    with pytest.raises(ValueError, match=r"\['r2'\], which are not selected"):
+        create_job(jobs, steps, other, config)
 
 
 def test_an_input_made_outside_the_job_is_bound_by_its_token(tmp_path):
@@ -376,6 +472,70 @@ def test_a_retried_task_adopts_its_earlier_attempt(tmp_path, monkeypatch):
         ctx.step.run(ctx)
 
 
+def test_a_failed_task_retried_in_its_job_adopts_what_it_stored(tmp_path):
+    """A failed task returned to its queue runs again once its cause is mended: it
+    adopts the frame its failed attempt stored, makes the others, and its done
+    marker names both tokens."""
+    config, selection = _project(tmp_path)
+    project = tmp_path / "project"
+    (project / "halt").write_text("", encoding="utf-8")
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (HALTING,), one, config)
+    work(job)
+    failed = queue.markers(job, queue.FAILED)
+    assert set(failed) == {"halting.r2.0000"} and queue.waiting(job) == set()
+    (project / "halt").unlink()
+    assert queue.retry_failed(job, "halting.r2.0000")
+    assert not queue.retry_failed(job, "halting.r2.0000")  # it is queued now
+    work(job)
+    accepted = queue.accepted(job, "halting.r2.0000")
+    assert failed["halting.r2.0000"] in accepted and len(accepted) == 2
+    first, _ = _stored(project, "halting/r2/day1/r2-00.npz")
+    later, _ = _stored(project, "halting/r2/day1/r2-02.npz")
+    assert first["token"] == failed["halting.r2.0000"] != later["token"]
+    assert queue.waiting(job) == set() and not queue.markers(job, queue.FAILED)
+
+
+def test_a_retry_after_a_mend_of_its_inputs_needs_its_results_set_aside(tmp_path):
+    """A mend of what a failed attempt's results are made from (here a protocol)
+    leaves them not serving, so the retry refuses them; once they are set aside,
+    never deleted, the retry makes them again."""
+    config, selection = _project(tmp_path)
+    project, name = tmp_path / "project", "halting-read.r2.0000"
+    (project / "halt").write_text("", encoding="utf-8")
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    job = create_job(tmp_path / "jobs", (HALTING_READ,), one, config)
+    work(job)
+    (project / "halt").unlink()
+    (project / "injection.csv").write_text("start,rate\n0,2\n", encoding="utf-8")
+    assert queue.retry_failed(job, name)
+    work(job)
+    assert set(queue.markers(job, queue.FAILED)) == {name}
+    found = job_module.discard_failed(job, HALTING_READ, name)
+    assert found == ["halting-read/r2/day1/r2-00.npz"]
+    assert queue.retry_failed(job, name)
+    work(job)
+    assert queue.waiting(job) == set() and not queue.markers(job, queue.FAILED)
+    day = project / "results" / "halting-read" / "r2" / "day1"
+    assert len(list(day.glob(".r2-00.npz.*.discarded"))) == 1
+
+
+def test_a_share_outage_is_no_empty_state_folder(tmp_path, monkeypatch):
+    """A state folder of a job the share gives no answer about within the grace,
+    also as a missing network path, is not known now: never an empty folder."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+
+    def out(folder):
+        raise network_error()
+
+    monkeypatch.setattr(queue.os, "listdir", out)
+    with pytest.raises(results.Unavailable):
+        queue.markers(job, queue.FAILED)
+
+
 def test_failed_parts_made_again_with_other_settings(tmp_path):
     """A job over the failed part with other settings publishes only that part; the
     completed parts keep their tokens, and a consumer lists both jobs' tokens."""
@@ -471,6 +631,66 @@ def test_reuse_compares_what_a_step_reads(tmp_path):
     assert "Made with other scope" in str(e.value) and "numbers/" not in str(e.value)
 
 
+def test_a_large_file_is_known_by_its_size_and_time(tmp_path):
+    """A large file the configuration names is part of a result's identity by its
+    size and modification time, not its content: the job made again is reused
+    while the file is untouched, and refused once it is written again."""
+    config, selection = _project(tmp_path)
+    jobs, project = tmp_path / "jobs", tmp_path / "project"
+    depth = project / "depth.npz"
+    depth.write_bytes(b"0" * 64)
+    one = Selection({"r2": selection.frames["r2"]}, selection.sessions)
+    work(create_job(jobs, (STAMPED,), one, config))
+    stored, _ = _stored(project, "stamped/r2/day1/r2-00.npz")
+    found = depth.stat()
+    stamp = f"size 64, modified {found.st_mtime_ns}"
+    assert stored["inputs"]["file:depth.npz"] == stamp
+    assert queue.tasks(create_job(jobs, (STAMPED,), one, config)) == {}
+    os.utime(depth, ns=(found.st_atime_ns, found.st_mtime_ns + 10**9))
+    with pytest.raises(ValueError, match="r2-00.npz is stored and does not") as e:
+        create_job(jobs, (STAMPED,), one, config)
+    assert "Made with other inputs (file:depth.npz)" in str(e.value)
+
+
+def test_a_configured_file_the_share_gives_no_answer_about_is_not_missing(
+    tmp_path, monkeypatch
+):
+    """A configured file the share gives no answer about within the grace, also
+    as a missing network path (Windows' errors 53 and 67), is not known now:
+    neither its stamp nor its content is recorded as missing."""
+    monkeypatch.setattr(results, "GRACE", 0.2)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+    looks = (
+        ("stat", step_module.file_stamp),
+        ("read_bytes", step_module.file_identity),
+    )
+    for code in NETWORK_CODES:
+
+        def out(*args, code=code, **kwargs):
+            raise network_error(code)
+
+        for name, look in looks:
+            with monkeypatch.context() as patched:
+                patched.setattr(Path, name, out)
+                with pytest.raises(results.Unavailable):
+                    look(tmp_path / "depth.npz")
+    assert step_module.file_stamp(tmp_path / "none.npz") == "missing"
+    assert step_module.file_identity(tmp_path / "none.csv") == "missing"
+
+
+def test_a_file_changed_while_its_task_runs_stops_the_task(tmp_path):
+    """A task takes the identities of its configured files when it starts; once
+    one of them changes, it publishes nothing more and names the file."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = queue.tasks(job)["numbers.r1.0000"]
+    ctx = context(job, task, queue.claim(job, task.id, "here").token)
+    (tmp_path / "project" / "injection.csv").write_text("start,rate\n0,2\n")
+    with pytest.raises(RuntimeError, match="file:injection.csv changed while"):
+        ctx.step.run(ctx)
+    assert not (tmp_path / "project" / "results" / "numbers").exists()
+
+
 def test_a_result_just_committed_elsewhere_is_reused(tmp_path, monkeypatch):
     """What a creation does not find is looked at once more after the share's cache
     time: results another job commits meanwhile, and their done markers, are
@@ -503,18 +723,53 @@ def test_a_result_records_the_revision_that_made_it(tmp_path):
     assert stored["revision"] == "another-revision" != read_job(job)["revision"]
 
 
-def test_a_job_of_a_revision_not_known_is_refused(tmp_path, monkeypatch):
-    """Without git, the code's revision is not known, and no job is created: a
-    job locks the revision of its code."""
+def test_an_installed_package_has_a_revision_without_git(tmp_path, monkeypatch):
+    """Without git, or outside a checkout, the revision is the package's version
+    and the hash of its source files, so that a laptop install creates jobs; a
+    changed source file is another revision. A revision not known still refuses a
+    job: a job locks the revision of its code."""
 
     def no_git(*args, **kwargs):
         raise FileNotFoundError("git")
 
     config, selection = _project(tmp_path)
     monkeypatch.setattr(job_module.subprocess, "run", no_git)
+    package = tmp_path / "darsia"
+    (package / "jobs").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "jobs" / "job.py").write_text("A = 1\n", encoding="utf-8")
+    (package / "notes.txt").write_text("not source\n", encoding="utf-8")
+    installed = revision(package)
+    version, _, digest = installed.partition("+")
+    assert version == importlib.metadata.version("darsia") and len(digest) == 64
+    (package / "notes.txt").write_text("changed\n", encoding="utf-8")
+    assert revision(package) == installed
+    (package / "jobs" / "job.py").write_text("A = 2\n", encoding="utf-8")
+    assert revision(package) != installed
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    assert read_job(job)["revision"] == revision() != installed
+    monkeypatch.setattr(job_module, "installed_revision", no_git)
     assert revision() is None
     with pytest.raises(ValueError, match="revision is not known"):
         create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+
+
+def test_a_package_in_an_ignored_folder_of_a_checkout_has_its_own_revision(tmp_path):
+    """A package installed into an ignored folder of another checkout, e.g. a
+    virtual environment inside a clone, is known by its version and source files,
+    not by that checkout's commit: other code there is another revision."""
+    git = ["git", "-c", "user.name=test", "-c", "user.email=test@example.org"]
+    (tmp_path / ".gitignore").write_text("venv/\n", encoding="utf-8")
+    for command in (["init", "-q"], ["add", ".gitignore"], ["commit", "-q", "-m", "a"]):
+        subprocess.run(git + command, cwd=tmp_path, check=True, capture_output=True)
+    package = tmp_path / "venv" / "Lib" / "site-packages" / "darsia"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "x.py").write_text("A = 1\n", encoding="utf-8")
+    installed = revision(package)
+    assert installed == job_module.installed_revision(package)
+    (package / "x.py").write_text("A = 2\n", encoding="utf-8")
+    assert revision(package) != installed
 
 
 @pytest.mark.parametrize("failure", [None, "the task failed"])

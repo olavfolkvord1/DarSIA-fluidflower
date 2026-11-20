@@ -39,7 +39,9 @@ def load_data(
     else:
         raise ValueError(f"Data type {data} not recognized.")
     available_files = sorted(
-        folder / name for name in os.listdir(folder) if name.endswith(".npz")
+        folder / name
+        for name in os.listdir(folder)
+        if name.endswith(".npz") and (folder / name).is_file()
     )
 
     # Fetch experiment protocol

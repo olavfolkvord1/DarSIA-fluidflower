@@ -20,6 +20,9 @@ corner_1 = [0.0, 0.0]
 corner_2 = [0.1, 0.1]
 """
 
+from types import SimpleNamespace
+from darsia.presets.workflows.calibration import steps as calibration
+
 
 def _probabilities(dtype=np.float32):
     co2 = np.array([[0.9, 0.95], [np.nan, 0.2]], dtype)
@@ -103,3 +106,51 @@ def test_a_table_is_read_as_its_file_is_loaded(tmp_path):
         ExpertKnowledgeConfig.from_table({"no_saturation_g": ["missing"]}, registry)
     with pytest.raises(ValueError, match="list"):
         ExpertKnowledgeConfig.from_table({"no_saturation_g": "top"}, registry)
+
+
+def _rig():
+    labels = np.array([[3, 3, 1], [2, 3, 1]])
+    facies = np.array([[5, 5, 1], [2, 5, 1]])
+    return SimpleNamespace(
+        labels=darsia.ScalarImage(labels, dimensions=[0.2, 0.3]),
+        facies=darsia.ScalarImage(facies, dimensions=[0.2, 0.3]),
+    )
+
+
+def test_a_runs_limits_follow_the_regions_its_expert_knowledge_names():
+    tables = {
+        "roi": [{"name": "top", "shape": "label", "label_index": 3}],
+        "expert_knowledge": {
+            "no_concentration_aq": ["top"],
+            "no_saturation_g": ["top"],
+        },
+    }
+    keep_co2, keep_gas = calibration.expert_limits(tables, _rig())
+    expected = np.array([[False, False, True], [True, False, True]])
+    np.testing.assert_array_equal(keep_co2, expected)
+    np.testing.assert_array_equal(keep_gas, expected)
+    # Gas alone: CO2 may be everywhere.
+    tables["expert_knowledge"] = {"no_saturation_g": ["top"]}
+    keep_co2, keep_gas = calibration.expert_limits(tables, _rig())
+    assert keep_co2 is None
+    np.testing.assert_array_equal(keep_gas, expected)
+
+
+def test_a_run_without_expert_knowledge_has_no_limits():
+    assert calibration.expert_limits({}, _rig()) == (None, None)
+    assert calibration.expert_limits({"expert_knowledge": {}}, _rig()) == (None, None)
+
+
+def test_phase_maps_as_expert_knowledge_cannot_limit_the_phase_maps():
+    tables = {"expert_knowledge": {"phase_maps": "maps"}}
+    with pytest.raises(ValueError, match="cannot be limited by phase maps"):
+        calibration.expert_limits(tables, _rig())
+
+
+def test_the_phase_maps_hold_two_masks_where_expert_knowledge_names_a_region():
+    named = {"expert_knowledge": {"no_concentration_aq": ["top"]}}
+    empty = {"expert_knowledge": {"no_concentration_aq": []}}
+    assert calibration._expert_limited(named, "r1") == 1
+    assert calibration._expert_limited(empty, "r1") == 0
+    assert calibration._expert_limited({}, "r1") == 0
+    assert calibration._expert_limited(named, None) == 0
