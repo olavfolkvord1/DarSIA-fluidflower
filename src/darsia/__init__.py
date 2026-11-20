@@ -9,6 +9,7 @@ from darsia.image.image import *
 from darsia.image.indexing import *
 from darsia.image.patches import *
 from darsia.image.imread import *
+from darsia.image.raw import *
 from darsia.image.arithmetics import *
 
 # Numerical integration

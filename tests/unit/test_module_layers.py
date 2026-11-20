@@ -50,6 +50,7 @@ MODULES = [
     "darsia/presets/workflows/comparison/ensemble.py",
     "darsia/presets/workflows/comparison/ensemble_figures.py",
     "darsia/presets/workflows/comparison/mass_wasserstein.py",
+    "darsia/image/raw.py",
 ]
 """Modules under the rules, relative to the source folder."""
 

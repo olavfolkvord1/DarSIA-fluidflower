@@ -2,6 +2,7 @@
 are supported:
 
 * optical images: *jpg, *jpeg, *png, *tif, *tiff
+* camera raw files: *arw, *nef, *cr2, *dng, etc. (see :mod:`darsia.image.raw`)
 * DICOM images: *dcm
 * simulation data: anything which can be read by meshio, e.g. *vtu
 * numpy images: *npy
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Image:
     """Determine and call reading routine depending on filetype.
     Provide interface for numpy arrays, standard optical image formats,
-    dicom images, and vtu images.
+    camera raw files, dicom images, and vtu images.
 
     Parameters
     ----------
@@ -92,6 +93,8 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
         image = imread_from_npz(path, **kwargs)
     elif suffix in [".jpg", ".jpeg", ".png", ".tif", ".tiff"]:
         image = imread_from_optical(path, **kwargs)
+    elif suffix in darsia.RAW_SUFFIXES:
+        image = darsia.imread_from_raw(path, **kwargs)
     elif suffix in [".dcm"]:
         image = imread_from_dicom(path, **kwargs)
     elif suffix in [".vtu"]:
@@ -101,6 +104,44 @@ def imread(path: Union[str, Path, list[str], list[Path]], **kwargs) -> darsia.Im
 
     logger.info(f"Image reading for {path} took %.2f seconds.", time.time() - tic)
     return image
+
+
+def decoded_bytes(path: Union[str, Path]) -> int:
+    """Bytes per pixel that reading a photo holds beside its image in the Setup's
+    precision, by the arrays in the reader. This is a budget for a three-channel
+    photo, with stored NumPy images no wider than float64. Decoder libraries and
+    archive buffers also have a fixed cost covered by the task process's base.
+
+    - A camera raw file: 44, three 16-bit mosaic buffers, a 16-bit RGB demosaic,
+      two int64 colour-index maps, the RGB invalid map and thirteen byte masks
+      and scratch arrays of the invalid-pixel interpolation; the image is decoded
+      in the precision (:func:`darsia.imread_from_raw`).
+    - A JPEG file: two 8-bit colour buffers budgeted at four channels, plus
+      the RGB float64 image returned by the optical reader.
+    - A PNG or TIFF file: the same buffers at up to 16 bits, plus float64 RGB.
+    - A NumPy file: float64 RGB and a second image-sized read/archive buffer.
+
+    Parameters
+    ----------
+    path : str or Path
+        The photo, or its file name.
+
+    Returns
+    -------
+    int
+        The bytes per pixel; 0 for a format that is not a photo's.
+
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in darsia.RAW_SUFFIXES:
+        return 3 * 2 + 3 * 2 + 2 * 8 + 3 + 13
+    if suffix in (".jpg", ".jpeg"):
+        return 2 * 4 + 3 * 8
+    if suffix in (".png", ".tif", ".tiff"):
+        return 2 * 4 * 2 + 3 * 8
+    if suffix in (".npy", ".npz"):
+        return 2 * 3 * 8
+    return 0
 
 
 def imread_from_bytes(
