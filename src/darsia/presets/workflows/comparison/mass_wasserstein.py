@@ -76,7 +76,7 @@ _SOLVER = {
     "mobility_mode": darsia.MobilityMode.CELL_BASED,
     "l1_mode": darsia.L1Mode.RAVIART_THOMAS,
     "linear_solver": "direct",
-    "return_info": True,
+    "return_status": True,
 }
 """Discretisation and linear solver of the Bregman solver, those of the official
 comparison."""
@@ -650,7 +650,7 @@ def _distance(
         dimensions=reference.dimensions,
         origin=reference.origin,
     )
-    distance, info = darsia.wasserstein_distance(
+    distance, converged = darsia.wasserstein_distance(
         mass_1,
         mass_2,
         weight=cell_weight.subregion(crop),
@@ -666,7 +666,7 @@ def _distance(
     )
     return dict(
         masses,
-        status="success" if info["converged"] else "not_converged",
+        status="success" if converged else "not_converged",
         distance_kg_m=float(distance),
         normalized_plume=float(distance / scales.plume_kg_m),
         normalized_rig=float(distance / scales.rig_kg_m),
@@ -680,6 +680,8 @@ def wasserstein_distances(
     reference: WassersteinReference,
     scales: DistanceScales,
     settings: WassersteinSettings,
+    *,
+    excluded_runs: Mapping[str, Sequence[str]] | None = None,
 ) -> list[WassersteinDistance]:
     """The Wasserstein distances of every pair of runs in every region at one time.
 
@@ -699,19 +701,27 @@ def wasserstein_distances(
         The scales of the time (:func:`distance_scales`).
     settings : WassersteinSettings
         The empty mass and the solver's settings.
+    excluded_runs : mapping of str to sequence of str, optional
+        The runs omitted from a region, keyed by domain ID.
 
     Returns
     -------
     list of WassersteinDistance
-        One distance per pair of runs and region.
+        One distance per eligible pair of runs and region.
 
     """
+    excluded = {
+        domain: frozenset(runs) for domain, runs in (excluded_runs or {}).items()
+    }
     results = []
     for run_1, first in frames.items():
         for run_2, second in frames.items():
             if run_1 >= run_2:
                 continue
             for name, weight in reference.weights.items():
+                blocked = excluded.get(name, ())
+                if run_1 in blocked or run_2 in blocked:
+                    continue
                 if first is None or second is None:
                     results.append(
                         WassersteinDistance(time_h, run_1, run_2, name, "missing")

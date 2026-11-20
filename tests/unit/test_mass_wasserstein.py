@@ -352,6 +352,30 @@ def test_both_runs_are_scaled_to_their_mean_mass():
     assert both_empty.distance_kg_m == both_empty.normalized_mass == 0.0
 
 
+def test_a_run_can_be_excluded_from_selected_domains():
+    domains = [
+        AnalysisDomain("box", "lower", "lower", bounds_mm=(0.0, 45.0, 0.0, 15.0)),
+        AnalysisDomain("sand", "sand", "sand"),
+    ]
+    sand, reference = _reference(domains)
+    empty = _cells(np.zeros((ROWS, COLS)), reference, sand)
+    frames = {"a": empty, "b": None, "c": empty}
+    result = mw.wasserstein_distances(
+        1.5,
+        frames,
+        reference,
+        _scales(domains),
+        SETTINGS,
+        excluded_runs={"lower": ["b"]},
+    )
+    assert {(row.run_1, row.run_2, row.domain_id, row.status) for row in result} == {
+        ("a", "b", "sand", "missing"),
+        ("a", "c", "lower", "success"),
+        ("a", "c", "sand", "success"),
+        ("b", "c", "sand", "missing"),
+    }
+
+
 def test_distances_are_normalised_by_the_scales_of_their_time(tmp_path):
     protocol = tmp_path / "injection.csv"
     times = [

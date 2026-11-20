@@ -27,7 +27,7 @@ import math
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -160,7 +160,11 @@ def _distance_cell_bytes(tables, run, context) -> int:
         settings.get("extent_edge_mm"),
         reference,
     )
-    domains = len(tables["domains"]["domains"])
+    domains = (
+        1
+        if tables["distances"].get("split_by_domain")
+        else len(tables["domains"]["domains"])
+    )
     retained = domains * ((context.itemsize + 8) * len(runs) + 8 + 2)
     # Two faces per cell: Bregman flux/force/auxiliary arrays, cell scalars,
     # and eight sparse mixed/stencil operators with value/index storage.
@@ -275,6 +279,19 @@ class DistanceSettings:
     one of the selection's runs."""
     chart_labels: Sequence[int] = ()
     """Labels of the colour checker in the rig's labels."""
+    excluded_runs: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    """Runs omitted from specific domains, by configured domain ID."""
+    split_by_domain: bool = False
+    """Give each selected domain its own task at each comparison time."""
+
+    def __post_init__(self) -> None:
+        if any(
+            isinstance(runs, str)
+            or not isinstance(runs, Sequence)
+            or not all(isinstance(run, str) for run in runs)
+            for runs in self.excluded_runs.values()
+        ):
+            raise ValueError("Distance exclusions must list run IDs for each domain.")
 
 
 def _domains(ctx: StepContext) -> list[AnalysisDomain]:
@@ -368,9 +385,35 @@ def named_times(times_h: Sequence[float]) -> dict[str, float]:
     return named
 
 
+def distance_parts(
+    times_h: Sequence[float], domains: Sequence[str], split_by_domain: bool = False
+) -> dict[str, tuple[float, str | None]]:
+    """Map a task part to its target hour and its optional single domain.
+
+    Domain positions keep arbitrary domain IDs out of result directory names.
+    """
+    times = named_times(times_h)
+    if not split_by_domain:
+        return {part: (hour, None) for part, hour in times.items()}
+    if not domains:
+        raise ValueError("Choose at least one domain for the distance comparisons.")
+    return {
+        f"{part}--domain-{index:04d}": (hour, domain)
+        for part, hour in times.items()
+        for index, domain in enumerate(domains, 1)
+    }
+
+
 def _times(selection: Selection, tables: Mapping) -> tuple[str, ...]:
-    """One part per comparison time, named by its hours (:func:`named_times`)."""
-    return tuple(named_times(tables["distances"]["times_h"]))
+    """One part per comparison time, or per time and selected domain."""
+    distances = tables["distances"]
+    return tuple(
+        distance_parts(
+            distances["times_h"],
+            selection.domains,
+            distances.get("split_by_domain", False),
+        )
+    )
 
 
 def _observed_geometry(geometry, labels, rules):
@@ -432,12 +475,21 @@ def start_co2(baseline: darsia.Image, experiment) -> darsia.CO2MassAnalysis:
 
 
 def _distances(ctx: StepContext) -> None:
-    """The distances of every pair of runs in every domain at one time, on the
-    configured reference run's sand map, which a job must select
-    (:attr:`Step.required`)."""
+    """The selected pairs and domains at one time on the reference run's sand map."""
     settings, distances = ctx.settings["wasserstein"], ctx.settings["distances"]
     material, domains = ctx.settings["material"], _domains(ctx)
-    time_h = named_times(distances.times_h)[ctx.task.part]
+    missing_domains = (
+        distances.excluded_runs.keys() - ctx.settings["domains"].domains.keys()
+    )
+    if missing_domains:
+        raise ValueError(
+            f"Unknown distance domains in excluded_runs: {sorted(missing_domains)}."
+        )
+    time_h, domain_id = distance_parts(
+        distances.times_h, ctx.selection.domains, distances.split_by_domain
+    )[ctx.task.part]
+    if domain_id is not None:
+        domains = [domain for domain in domains if domain.domain_id == domain_id]
     run = distances.reference_run
     grid = run_grid(ctx.read("rig", read_rig, run=run), material)
     experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
@@ -483,9 +535,9 @@ def _distances(ctx: StepContext) -> None:
         grid.rig.facies.dimensions,
         domains,
     )
+    del grid, areas
     frames, selected_frames, observation_pixels = {}, {}, {}
     for run, run_frames in ctx.selection.frames.items():
-        grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         experiment = make_experiment(run_settings(ctx, run, EXPERIMENT))
         dates = [experiment.get_datetime(ctx.photo(run, f)) for f in run_frames]
         hours = [experiment.time_since_start(date) for date in dates]
@@ -501,6 +553,7 @@ def _distances(ctx: StepContext) -> None:
         selected_frames[run] = ComparedFrame(
             frame_key(frame), dates[nearest].isoformat(), hours[nearest]
         )
+        grid = run_grid(ctx.read("rig", read_rig, run=run), material)
         maps = ctx.read("mass-maps", darsia.read_mass_maps, run=run, frame=frame)
         phase = ctx.read("phase-maps", darsia.read_phase_maps, run=run, frame=frame)
         labels = phase["labels"]
@@ -517,12 +570,24 @@ def _distances(ctx: StepContext) -> None:
             settings,
             grid.positions,
         )
-    found = wasserstein_distances(time_h, frames, reference, scales, settings)
+        # Only the independent comparison cells are needed after this run.
+        del maps, labels, geometry, grid
+    found = wasserstein_distances(
+        time_h,
+        frames,
+        reference,
+        scales,
+        settings,
+        excluded_runs=distances.excluded_runs,
+    )
     rows = distance_rows(found, selected_frames)
     columns = list(rows[0]) if rows else []
+    measurements = {"colorchecker_excluded_counted_pixels": observation_pixels}
+    if distances.excluded_runs:
+        measurements["domain_excluded_runs"] = dict(distances.excluded_runs)
     ctx.publish(
         lambda folder: write_rows(Path(folder) / "distances.csv", rows, columns),
-        measurements={"colorchecker_excluded_counted_pixels": observation_pixels},
+        measurements=measurements,
     )
 
 
