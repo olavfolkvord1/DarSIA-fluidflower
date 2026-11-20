@@ -299,10 +299,10 @@ def _move(source: Path, destination: Path) -> None:
         raise
 
 
-def write_json(path: Path, value) -> None:
+def write_json(path: Path, value, *, default: Callable | None = None) -> None:
     """Write a stored result's JSON file, indented and with every digit of its
     numbers (Python's ``repr``); NaN is refused."""
-    encoder = json.JSONEncoder(indent=1, allow_nan=False)
+    encoder = json.JSONEncoder(indent=1, allow_nan=False, default=default)
     # Validate before opening the target, as dumps did: invalid data must not
     # truncate an existing file. Neither pass retains the encoded chunks.
     for _ in encoder.iterencode(value):

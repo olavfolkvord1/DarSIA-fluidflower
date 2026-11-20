@@ -811,23 +811,26 @@ def mass_calibrations(
     }
 
 
-def _array(values, dtype) -> list | None:
-    """An array as a list of plain numbers, or None."""
-    return None if values is None else np.asarray(values, dtype).tolist()
+def _array(values) -> np.ndarray | None:
+    """Keep the original array until the JSON encoder visits it."""
+    return None if values is None else np.asarray(values)
 
 
-def _rows(frames: Sequence[CalibrationFrame], name: str) -> list[dict]:
-    """A run's frames as plain values, the arrays in the dtype ``name``."""
+def _rows(frames: Sequence[CalibrationFrame]) -> list[dict]:
+    """Build the frame records without copying or expanding their arrays."""
     rows = []
     for frame in frames:
-        row = dataclasses.asdict(frame)
+        row = {
+            field.name: getattr(frame, field.name) for field in dataclasses.fields(frame)
+        }
         row["dissolved"] = {
-            str(sand): [_array(h.relative, name), _array(h.weight, name)]
+            str(sand): [_array(h.relative), _array(h.weight)]
             for sand, h in frame.dissolved.items()
         }
+        row["gas"] = dataclasses.asdict(frame.gas)
         if frame.column is not None:
             row["column"] = {
-                key: _array(getattr(frame.column, key), name)
+                key: _array(getattr(frame.column, key))
                 for key in ("relative", "ratio", "weight")
             }
         rows.append(row)
@@ -863,16 +866,24 @@ def write_frames(
 
     """
     name = np.dtype(dtype).name
+
+    def encode_array(value):
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                f"Object of type {type(value).__name__} is not JSON serializable"
+            )
+        return np.asarray(value, dtype=name).tolist()
+
     record = {
         "run": run,
         "dtype": name,
-        "frames": _rows(frames, name),
+        "frames": _rows(frames),
         "held_out": {
-            other: _rows(alternative, name)
+            other: _rows(alternative)
             for other, alternative in (held_out or {}).items()
         },
     }
-    write_json(Path(folder) / STATISTICS, record)
+    write_json(Path(folder) / STATISTICS, record, default=encode_array)
 
 
 def statistics_memory(frames, dtype, held_out=None, *, json_bytes=0):

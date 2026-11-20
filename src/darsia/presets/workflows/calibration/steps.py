@@ -912,7 +912,7 @@ def _range_rigs(tables: Mapping, run: str | None, context=None) -> int:
 
 
 def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
-    """Stored histogram and column-group values for one frame and its variants.
+    """Stored histogram and column-group values for a primary or held-out frame.
 
     A sand histogram has relative/weight arrays of at most intervals + 1
     entries. Column estimates have relative/ratio/weight arrays of at most
@@ -929,26 +929,24 @@ def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
     occupied = min(columns**2, pixels)
     entries = 3 * occupied
     entries += 2 * min(histograms * reading_sands(tables, run), pixels - occupied)
-    return entries * (1 + _variants(tables, run))
+    return entries
 
 
 def _statistics_bytes(tables: Mapping, run: str | None, context) -> int:
-    """One frame's retained statistics and Python records for the streaming writer.
+    """Retained statistics and the current array's serialized values.
 
     Histogram and column arrays follow capacity's dtype: a float64 geometry or
-    CO2 field can promote them even with float32 images. The source arrays stay
-    alive while _rows builds plain lists, and dataclasses.asdict copies a frame.
-    Reserve both arrays at least at float64 width, plus the Python floats and
-    list pointers. _array may also cast one array at a time; that array has at
-    most one entry per pixel, without a sand or variant multiplier. Streaming
-    JSON adds only traversal/chunk/TextIO buffers, covered by the process base.
+    CO2 field can promote them even with float32 images. All variants retain
+    their original arrays. The encoder casts and makes Python values for one
+    array at a time. Every occupied group stores two or three values across
+    distinct arrays and represents at least one pixel.
     """
     array_bytes = max(context.itemsize, np.dtype(np.float64).itemsize)
-    value_bytes = 2 * array_bytes + sys.getsizeof(0.0) + np.dtype(np.intp).itemsize
-    return (
-        _statistics_entries(tables, run, context) * value_bytes
-        + context.grid_pixels * array_bytes
-    )
+    entries = _statistics_entries(tables, run, context)
+    retained = entries * array_bytes * (1 + _variants(tables, run))
+    largest_array = min(context.grid_pixels, entries // 2)
+    encoded_value = context.itemsize + sys.getsizeof(0.0) + np.dtype(np.intp).itemsize
+    return retained + largest_array * encoded_value
 
 
 def _gas_ports(own: Mapping, context) -> dict:
@@ -1663,6 +1661,8 @@ def _run_statistics(ctx: StepContext) -> None:
                     measured=volume.source == darsia.MEASURED,
                 )
             )
+            del maps, capacity, dissolved, histograms, gas, unknown
+        del image, signal, measured, before
         dtype = grid.rig.pixel_area.img.dtype
         primary = rows.pop(None)
         measured = ctx.tables.get("jobs", {}).get("memory_admission") == "declared"
@@ -1672,6 +1672,7 @@ def _run_statistics(ctx: StepContext) -> None:
             frame=frame,
             **({"measurements": facts} if measured else {}),
         )
+        del primary, rows
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
