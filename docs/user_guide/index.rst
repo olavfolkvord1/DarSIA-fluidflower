@@ -52,4 +52,5 @@ Putting it together
 
    assistants
    workflows
+   media
    gui/index

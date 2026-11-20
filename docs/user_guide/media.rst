@@ -1,5 +1,5 @@
 Photo and mass films
-===================
+====================
 
 The ``film-tiles`` and ``films`` steps share their panel functions with other
 callers. They read stored corrected images, phase maps and mass maps. Display
@@ -65,7 +65,7 @@ relabelled as mass per area. Their per-frame contour and clipping descriptions
 are included in both the rendered captions and the existing film record.
 
 Fixed first-frame photographs and grid-sized pairs
-------------------------------------------------
+--------------------------------------------------
 
 ``photograph.transfer = "first-frame"`` measures the configured ``percentiles``
 (by default 0.5 and 99.5) on the earliest selected photograph after INTER_AREA
