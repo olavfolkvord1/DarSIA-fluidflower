@@ -9,10 +9,13 @@ named by its task and the token it moved under (``<task>.<token>``), so every
 destination name is the mover's own.
 
 The claimed marker holds the lease, which its owner rewrites every
-:data:`darsia.utils.results.BEAT`: the token, the machine, the process and its
-birth time, a beat number and the time. A service takes a claim back when its
-lease stays unchanged for :data:`darsia.utils.results.STALE` by its own clock; the
-owner's next beat then finds its marker gone and the owner exits. Only the holder
+:data:`darsia.utils.results.BEAT`: the token, the machine, the identity of the
+host it runs on, the process and its birth time, a beat number and the time. A
+beat is retried while the share is out, for up to
+:data:`darsia.utils.results.GRACE`, so that a short outage loses no claim; GRACE
+and a BEAT are less than STALE. A service takes a claim back when its lease stays
+unchanged for :data:`darsia.utils.results.STALE` by its own clock; the owner's
+next beat then finds its marker gone and the owner exits. Only the holder
 of the current marker can move it to ``done/``, so a superseded or late owner
 commits no terminal state, and a result counts only when its task's done marker
 names its token (:func:`accepted`).
@@ -102,7 +105,12 @@ def read_marker(path: Path) -> dict:
         if not text:
             return {}
         if text.endswith(b"\n"):
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except ValueError:
+                # A heartbeat may be writing while a reader still sees the
+                # previous contents. Such a read can end in a newline.
+                pass
         if attempt == 0:
             sleep(results.SHARE_CACHE)
     raise results.Unavailable(f"The marker {path} reads short twice")
@@ -149,6 +157,9 @@ def _write(claim: Claim, value: Mapping, *, deadline: float | None = None) -> No
     ------
     Revoked
         If the marker is gone.
+    OSError
+        If the share gave no answer within :data:`darsia.utils.results.GRACE`,
+        also as a missing path: an outage is not a lost claim.
 
     """
 
@@ -160,6 +171,8 @@ def _write(claim: Claim, value: Mapping, *, deadline: float | None = None) -> No
     try:
         results.retry_transient(write, deadline=deadline)
     except FileNotFoundError as error:
+        if results.share_out(error):
+            raise
         raise Revoked(f"Task {claim.task} is no longer claimed by {claim.token}") from (
             error
         )
@@ -316,22 +329,34 @@ def _transfer(
     source: Path, destination: Path, *, deadline: float | None = None
 ) -> bool:
     """Move a marker to a name of the mover's own token; False if the source was
-    gone, e.g. moved by another mover."""
+    gone, e.g. moved by another mover.
+
+    Raises
+    ------
+    Unavailable
+        If the share gave no answer within :data:`darsia.utils.results.GRACE`,
+        also as a missing path.
+
+    """
     try:
         results.rename(source, destination, deadline=deadline)
     except FileExistsError:
         pass  # A replay of the mover's own move: only it names the destination.
-    except FileNotFoundError:
+    except OSError as error:
+        if _no_answer(error):  # not known now, never «gone»
+            raise results.Unavailable(f"No answer about {source}: {error}") from error
+        if not isinstance(error, FileNotFoundError):
+            raise
         return results.exists(destination)
     return True
 
 
-def claim(job: Path, task: str, machine: str) -> Claim | None:
+def claim(job: Path, task: str, machine: str, host: str | None = None) -> Claim | None:
     """Claim a queued task under a new token.
 
-    The claimed marker is then written once with the token and the machine, so
-    that what an earlier owner left in it is gone before the task's process starts
-    and becomes the marker's only writer.
+    The claimed marker is then written once with the token, the machine and the
+    host's identity, so that what an earlier owner left in it is gone before the
+    task's process starts and becomes the marker's only writer.
 
     Parameters
     ----------
@@ -341,6 +366,9 @@ def claim(job: Path, task: str, machine: str) -> Claim | None:
         The task's name.
     machine : str
         The claiming machine.
+    host : str, optional
+        The identity of the host it runs on, e.g.
+        :func:`darsia.jobs.service.host_identity`.
 
     Returns
     -------
@@ -356,16 +384,19 @@ def claim(job: Path, task: str, machine: str) -> Claim | None:
         return None
     try:
         with open(held.path, "r+b") as stream:  # once: no process writes it yet
-            stream.write(_text({"token": held.token, "machine": machine}))
+            first = {"token": held.token, "machine": machine}
+            stream.write(_text({**first, **({} if host is None else {"host": host})}))
             stream.truncate()
     except OSError:
         pass  # The task's first beat writes it.
     return held
 
 
-def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
-    """Renew a claim's lease: its token, machine, process and birth time, the beat
-    number and the time.
+def beat(
+    claim: Claim, number: int, pid: int, birth: float, host: str | None = None
+) -> None:
+    """Renew a claim's lease: its token, machine, host, process and birth time, the
+    beat number and the time.
 
     Parameters
     ----------
@@ -377,6 +408,9 @@ def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
         The task's process.
     birth : float
         The process's birth time (``psutil.Process.create_time``).
+    host : str, optional
+        The identity of the host it runs on, by which a service knows the claims
+        whose process it may look at.
 
     Raises
     ------
@@ -387,6 +421,7 @@ def beat(claim: Claim, number: int, pid: int, birth: float) -> None:
     lease = {
         "token": claim.token,
         "machine": claim.machine,
+        **({} if host is None else {"host": host}),
         "pid": pid,
         "birth": birth,
         "beat": number,
@@ -402,6 +437,7 @@ def finish(
     *,
     deadline: float | None = None,
     memory: Mapping | None = None,
+    measurements: Mapping | None = None,
 ) -> None:
     """Move a claim to ``done/``, naming its accepted tokens, or to ``failed/``.
 
@@ -422,6 +458,8 @@ def finish(
         token (:meth:`darsia.jobs.service.Family.peaks`), which its done marker
         keeps as the measurement of its step's memory; a failed marker keeps
         none.
+    measurements : Mapping, optional
+        Plain JSON observations of this attempt, stored only on completion.
 
     Raises
     ------
@@ -436,6 +474,8 @@ def finish(
         content = {"token": claim.token, "accepted": sorted({claim.token, *accepted})}
         if memory:
             content["memory"] = dict(memory)
+        if measurements:
+            content["measurements"] = dict(measurements)
     else:
         state, content = FAILED, {"token": claim.token, "traceback": traceback}
     _write(

@@ -12,10 +12,14 @@ missing frame with the same maps.
 """
 
 import datetime
+import gc
 import json
 import shutil
+import tempfile
 import tomllib
+import tracemalloc
 import zipfile
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,8 +33,15 @@ import darsia
 import darsia.jobs.__main__ as jobs_main
 from darsia.jobs import job as job_module
 from darsia.jobs import queue
-from darsia.jobs.job import create_job
-from darsia.jobs.step import Selection, StepContext, missing_runs, run_tables, table
+from darsia.jobs.job import Sizes, create_job, read_job
+from darsia.jobs.step import (
+    MemoryContext,
+    Selection,
+    StepContext,
+    missing_runs,
+    run_tables,
+    table,
+)
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
@@ -52,6 +63,7 @@ from darsia.presets.workflows.comparison.mass_wasserstein import (
 )
 from darsia.presets.workflows.config.fluidflower_config import FluidFlowerConfig
 from darsia.presets.workflows.config.utils import settings_from_table
+from darsia.presets.workflows.media import films as media_films
 from darsia.presets.workflows.media import steps as media_steps
 from darsia.presets.workflows.media.films import write_films
 from darsia.presets.workflows.media.panels import PhotographSettings
@@ -75,8 +87,10 @@ from darsia.presets.workflows.setup.setup_rig import make_experiment, make_rig
 from darsia.presets.workflows.setup.setup_sand_map import make_sand_map
 from darsia.utils.locations import Frame, normal_path
 from tests.unit.test_gas_allocation import TABLES as RULE_TABLES
+from tests.unit.test_job_hosts import _record
 from tests.unit.test_job_service import _serve, importable, numpys_blas  # noqa: F401
 from tests.unit.test_minimal_chain import COLOURS, _head
+
 
 @pytest.fixture(autouse=True)
 def local_model_cache(tmp_path, monkeypatch):
@@ -363,13 +377,15 @@ colors = [[0.0, 0.0, 0.0], [0.3, 0.02, 0.0]]
 """
 
 
-def _project(root: Path, precision: str) -> tuple[Path, Selection]:
-    """Two runs of the minimal chain: the plume grows in each frame."""
+def _project(root: Path, precision: str, scale: int = 1) -> tuple[Path, Selection]:
+    """Two runs of the minimal chain: the plume grows in each frame. With a scale,
+    the photos and the run grid have that many times the pixels along each side."""
     root.mkdir(parents=True)
-    facies = np.ones((120, 180), int)
-    facies[60:] = 2
+    rows, columns = 120 * scale, 180 * scale
+    facies = np.ones((rows, columns), int)
+    facies[rows // 2 :] = 2
     colour = COLOURS[np.pad(facies, ((0, 1), (0, 1)), mode="edge")]
-    light = np.exp(0.2 * np.linspace(-1, 1, 181))[None, :, None]
+    light = np.exp(0.2 * np.linspace(-1, 1, columns + 1))[None, :, None]
     frames = {}
     for run, grow in (("r1", 4), ("r2", 5)):
         folder = root / f"photos-{run}"
@@ -380,9 +396,9 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
         )
         names = []
         for k in range(6):
-            plume = np.zeros((121, 181, 3))
-            r = 10 + grow * k
-            plume[60 - r : 60 + r // 2, 90 - r : 90 + r, 0] = 0.3
+            plume = np.zeros((rows + 1, columns + 1, 3))
+            r, c = (10 + grow * k) * scale, rows // 2
+            plume[c - r : c + r // 2, columns // 2 - r : columns // 2 + r, 0] = 0.3
             name = f"frame{k:02d}.npz"
             image = darsia.OpticalImage((colour + plume) * light, color_space="RGB")
             image.save(folder / name)
@@ -400,18 +416,18 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
             )
         )
         frames[run] = tuple(Frame(f"photos-{run}", name) for name in names)
-    i, j = np.mgrid[0:120, 0:180].astype(np.float32)
+    i, j = np.mgrid[0:rows, 0:columns].astype(np.float32)
     darsia.ImageMappingCorrection(
-        j, i, source_shape=(121, 181), dimensions=[0.3, 0.45]
+        j, i, source_shape=(rows + 1, columns + 1), dimensions=[0.3, 0.45]
     ).save(root / "mapping.npz")
     # Two sand layers of each facies, split at the plume's centre: the labels are
     # not the facies (no facies file: each run's facies follow its sand map).
-    labels = facies + 2 * (np.arange(180) >= 90)[None, :]
+    labels = facies + 2 * (np.arange(columns) >= columns // 2)[None, :]
     darsia.ScalarImage(labels, dimensions=[0.3, 0.45]).save(root / "labels.npz")
-    depth = darsia.ScalarImage(np.full((120, 180), 0.01), dimensions=[0.3, 0.45])
+    depth = darsia.ScalarImage(np.full(facies.shape, 0.01), dimensions=[0.3, 0.45])
     depth.save(root / "depth.npz")
     # The second run's rig is deeper, so that the distances' reference run counts.
-    deeper = darsia.ScalarImage(np.full((120, 180), 0.012), dimensions=[0.3, 0.45])
+    deeper = darsia.ScalarImage(np.full(facies.shape, 0.012), dimensions=[0.3, 0.45])
     deeper.save(root / "depth-r2.npz")
     (root / "props.csv").write_text("id,porosity,permeability\n1,0.44,100\n2,0.4,50\n")
     # The first run's depth comes from these measurements by the rule on its grid;
@@ -461,6 +477,8 @@ def _project(root: Path, precision: str) -> tuple[Path, Selection]:
     rules = toml.dumps({k: RULE_TABLES[k] for k in ("phase_rules", "gas_allocation")})
     targets = "".join(f'"{m}" = {np.log(COLOURS[m] * 1e3).tolist()}\n' for m in (1, 2))
     text = SETTINGS.format(kernel=KERNEL, precision=precision, targets=targets)
+    text = text.replace("pixel_size_mm = 5.0\n", f"pixel_size_mm = {5.0 / scale}\n")
+    # Frozen synthetic targets are independent of the actual photo dates.
     for run, selected in frames.items():
         text += f"\n[ensemble.target_h.{run}]\n"
         text += "".join(
@@ -697,8 +715,8 @@ def _direct(root: Path, selection: Selection) -> dict:
                 grid.chart,
                 gas_threshold=model.gas_threshold,
                 depth_m=rig.depth.img,
-                record=lambda index, value: records.append(asdict(value)),
                 positions=measured,
+                record=lambda index, value: records.append(asdict(value)),
             )
             names = ("labels", "rules", "saturation", "co2", "before")
             variants[run][held_out] = [dict(zip(names, m)) for m in maps]
@@ -1196,6 +1214,7 @@ def _compare(project: Path, selection: Selection, direct: dict) -> None:
         for record in records:
             figure = (project / "films" / name / record["figure"]).read_bytes()
             assert (folder / record["figure"]).read_bytes() == figure
+            assert (folder / record["movie"]).stat().st_size > 0
     figures = sorted(path.name for path in (project / "figures").iterdir())
     stored = results / "ensemble" / comparison.FIGURES
     assert figures and sorted(path.name for path in stored.iterdir()) == figures
@@ -1238,9 +1257,13 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     if precision == "float32":
         config.write_text(config.read_text() + "[storage]\ncompress = true\n")
     jobs = tmp_path / "jobs"
-    job = create_job(jobs, STEPS, selection, config)
+    itemsize = np.dtype("float32" if precision == "measured" else precision).itemsize
+    sizes = Sizes(itemsize, 121 * 181, 120 * 180, (120, 180))
+    job = create_job(jobs, STEPS, selection, config, sizes=sizes)
+    assert read_job(job)["bytes"]["mass-maps.r1.0000"] > 0  # admitted by its bytes
     if precision == "float32":
         _serve(jobs, tmp_path, seconds=1200.0)
+        assert _record(jobs, "here")["live"] == []
         stored = project / "results"  # every image and phase map, compressed
         paths = [stored / "rig" / "r1" / "baseline.npz"]
         for kind in ("corrected-image", "phase-maps", "mass-maps", "mass-copy"):
@@ -1262,9 +1285,22 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
             def __exit__(self, *_):
                 pass
 
+        encoded = []
+
+        class Encoder(media_films.MovieWriter):
+            def __init__(self, path, *args, **kwargs):
+                encoded.append(Path(path))
+                super().__init__(path, *args, **kwargs)
+
         monkeypatch.setattr(jobs_main.service, "WaitingLock", Recorded)
+        monkeypatch.setattr(media_films, "MovieWriter", Encoder)
         _run(job)
         assert taken == [media_steps.ENCODER_LOCK] * 4  # two pyramids, two grids
+        # Each film is encoded on the host, then copied into its result.
+        assert len(encoded) == 4
+        local, stored = Path(tempfile.gettempdir()).resolve(), project / "results"
+        for path in encoded:  # on the host, outside the result's partial folder
+            assert local in path.resolve().parents and stored not in path.parents
     failed = queue.markers(job, queue.FAILED)
     assert not failed, [
         queue.read_marker(job / queue.FAILED / f"{t}.{k}")["traceback"]
@@ -1272,10 +1308,72 @@ def test_the_chain_as_jobs_equals_the_direct_calls(
     ]
     assert queue.waiting(job) == set()
     _compare(project, selection, direct)
-    for name in ("events/events.csv", "ensemble/mass_long.csv", "ensemble/events_summary.csv"):
+    for name in (
+        "events/events.csv",
+        "ensemble/mass_long.csv",
+        "ensemble/events_summary.csv",
+    ):
         assert (project / "results" / name).is_file()
     if precision == "float64":
         _reused_only_while_unchanged(jobs, project, config, selection)
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_each_tasks_estimate_covers_its_measured_peak_at_two_sizes(
+    tmp_path, monkeypatch, precision
+):
+    """At twice the pixels along each side of the photos and the run grid, what each
+    task of the chain allocates at its peak fits the array estimate plus its
+    process base. Growth also fits the change in the array estimate, so fixed
+    process overhead cannot hide an underestimate that grows with resolution.
+    Tracemalloc covers Python/NumPy allocations; native-library peaks must also
+    be observed by the service in a separate process."""
+    monkeypatch.setattr(jobs_main.service, "WaitingLock", lambda name: nullcontext())
+    found = {}
+    for scale in (1, 2):
+        project = tmp_path / f"project-{scale}"
+        config, selection = _project(project, precision, scale)
+        monkeypatch.chdir(project)
+        rows, columns = 120 * scale, 180 * scale
+        # The grid's cells of 5 mm / scale over the photos' pixels of 2.5 mm / scale.
+        sizes = Sizes(
+            np.dtype(precision).itemsize,
+            (rows + 1) * (columns + 1),
+            (rows // 2) * (columns // 2),
+            (rows // 2, columns // 2),
+        )
+        job = create_job(
+            tmp_path / f"jobs-{scale}", STEPS, selection, config, sizes=sizes
+        )
+        estimates = read_job(job)["bytes"]
+        tracemalloc.start()
+        try:
+            while ready := queue.ready(job):
+                for task in ready:
+                    claim = queue.claim(job, task.id, "here")
+                    ctx = jobs_main.context(job, task, claim.token)
+                    gc.collect()  # what earlier tasks left unreferenced
+                    before = tracemalloc.get_traced_memory()[0]
+                    tracemalloc.reset_peak()
+                    ctx.step.run(ctx)
+                    peak = tracemalloc.get_traced_memory()[1] - before
+                    queue.finish(claim, ctx.adopted)
+                    found.setdefault(task.id, []).append((peak, estimates[task.id]))
+        finally:
+            tracemalloc.stop()
+        assert not queue.markers(job, queue.FAILED) and not queue.waiting(job)
+    assert found and all(len(both) == 2 for both in found.values())
+    assert all(
+        peak <= amount + jobs_main.service.PROCESS
+        for both in found.values()
+        for peak, amount in both
+    )
+    uncovered = {
+        task: (small, large)
+        for task, (small, large) in found.items()
+        if large[0] - small[0] > max(large[1] - small[1], 2**16)
+    }
+    assert not uncovered
 
 
 def _reused_only_while_unchanged(jobs, project, config, selection):
@@ -1995,6 +2093,52 @@ def test_a_runs_atmosphere_is_its_record_over_its_hours(tmp_path):
             ) == gradient
 
 
+def test_the_phase_maps_count_their_window_variants_and_support(tmp_path):
+    """The phase maps' memory counts the frames their rules' window keeps, a held-out
+    variant for a run whose calibration group has folds, and the masked images of a
+    run that names a phase support."""
+    config, _ = _project(tmp_path / "project", "float32")
+    tables = tomllib.loads(config.read_text())
+    memory = calibration.PHASE_MAPS.memory
+    context = MemoryContext(4, 0, 1, 0, config.parent, (1, 1))
+    counts = {
+        r: [term.count(tables, r, context) for term in memory.terms]
+        for r in ("r1", "r2")
+    }
+    assert {run: values[:4] for run, values in counts.items()} == {
+        "r1": [6, 1, 0, 198],
+        "r2": [6, 1, 0, 198],
+    }
+    # The gas scratch and route bytes, and no expert-knowledge masks without them.
+    assert all(
+        len(values) == 7 and min(values[4:6]) > 0 and values[6] == 0
+        for values in counts.values()
+    )
+    tables["phase_rules"]["neighbours_per_side"] = 1
+    tables["runs"] = {"r1": {"labeling": {"sand_map": {"phase_support": "s.npz"}}}}
+    del tables["calibration_runs"]
+    changed = [term.count(tables, "r1", context) for term in memory.terms]
+    assert changed[:4] == [4, 0, 1, 127]
+    one = memory.bytes(
+        4, 0, 1, 0, tables, "r1", project=config.parent, grid_shape=(1, 1)
+    )
+    assert one == 4 * (memory.grid + 5 * 4 + 6) + memory.grid_bytes + 127 + sum(
+        changed[4:6]
+    )
+    # A run whose expert knowledge names a region holds its two bool masks.
+    tables["expert_knowledge"] = {"no_concentration_aq": ["top"]}
+    limited = memory.bytes(
+        4, 0, 1, 0, tables, "r1", project=config.parent, grid_shape=(1, 1)
+    )
+    assert memory.terms[6].count(tables, "r1", context) == 1
+    assert limited == one + 2
+    # An enabled growth rule holds reachable-region and prior saturation arrays.
+    tables["gas_allocation"]["growth_only_from_injecting_ports"] = True
+    assert memory.terms[3].count(tables, "r1", context) > 127
+    tables["runs"]["r1"]["gas_allocation"] = {"growth_only_from_injecting_ports": False}
+    assert memory.terms[3].count(tables, "r1", context) == 127
+
+
 def test_phase_maps_refuse_frames_out_of_time_order(tmp_path, monkeypatch):
     """A run's frames out of time order are refused before any map is made: the
     phase maps and the allocation read the frames by index."""
@@ -2199,7 +2343,6 @@ def test_a_job_without_a_fit_run_or_the_reference_run_is_refused(tmp_path):
     alone = Selection({"r1": frames["r1"]}, selection.sessions)
     with pytest.raises(ValueError, match=r"distances needs run\(s\) \['r2'\]"):
         create_job(jobs, (comparison.DISTANCES,), alone, config)
-
 
 
 EXPERT_TABLES = """

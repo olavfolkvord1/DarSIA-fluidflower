@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -34,8 +35,13 @@ import numpy as np
 import darsia
 from darsia.jobs.step import Memory, Order, Scope, Selection, Step, StepContext, Term
 from darsia.multiphase.phase_rules import PhaseLabel, PhaseRule
-from darsia.presets.workflows.analysis.domain_mass import RunSeries, read_domain_mass
-from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
+from darsia.presets.workflows.analysis.domain_mass import (
+    CENTRES,
+    COLUMNS as DOMAIN_COLUMNS,
+    RunSeries,
+    read_domain_mass,
+)
+from darsia.presets.workflows.analysis.domains import COMPONENTS, AnalysisDomain, write_rows
 from darsia.presets.workflows.analysis.steps import DOMAIN_MASS_TABLE, DomainSettings
 from darsia.presets.workflows.calibration.steps import (
     MaterialSettings,
@@ -80,6 +86,59 @@ from darsia.utils.locations import Locations, normal_path
 
 FIGURES = "figures"
 """The folder of the ensemble's figures, beside its tables."""
+
+
+def _series_dimensions(tables, context):
+    definitions = tables.get("domains", {}).get("domains", {})
+    domains = context.domains or tuple(definitions)
+    return definitions, domains
+
+
+def _domain_series_bytes(tables, _run, context) -> int:
+    """Parsed domain-mass rows and their dense float64 RunSeries arrays."""
+    definitions, domains = _series_dimensions(tables, context)
+    domain_rows = context.frames * (len(domains) + 1)  # the optional full-rig row
+    # CSV values are independent str objects. The numeric spelling covers the
+    # sign, float64 precision, and a three-digit scientific exponent.
+    number = sys.getsizeof("-1.2345678901234567e-308")
+    description = max(
+        (
+            sys.getsizeof(key)
+            + sys.getsizeof(config.get("name", key))
+            + sys.getsizeof(config.get("kind", "whole"))
+            for key, config in definitions.items()
+        ),
+        default=3 * sys.getsizeof("whole"),
+    )
+    run = max(map(sys.getsizeof, context.runs), default=sys.getsizeof(""))
+    case = context.case_id_bytes or sys.getsizeof("")
+    pointers = np.dtype(np.intp).itemsize
+    row = (
+        sys.getsizeof(dict.fromkeys(DOMAIN_COLUMNS))
+        + (len(DOMAIN_COLUMNS) - 5) * number
+        + run + case + description
+        + 2 * pointers  # the retained CSV list and the RunSeries row list
+    )
+    arrays = np.dtype(np.float64).itemsize * (
+        domain_rows * len(COMPONENTS) * (1 + len(CENTRES)) + 2 * context.frames
+    )
+    return domain_rows * row + arrays
+
+
+def _ensemble_tables_bytes(tables, _run, context) -> int:
+    """The mass and centre long tables retained while rendering the ensemble."""
+    _, domains = _series_dimensions(tables, context)
+    rows = context.frames * len(COMPONENTS)
+    pointer = np.dtype(np.intp).itemsize
+    number = max(sys.getsizeof(0.0), sys.getsizeof(np.float64()))
+    # Long rows reference existing IDs and labels. The numeric fields may be
+    # new scalars. The centre time reducer also indexes rows by four fields.
+    mass_row = sys.getsizeof(dict.fromkeys(range(11))) + 5 * number + pointer
+    centre_row = (
+        sys.getsizeof(dict.fromkeys(range(13))) + 7 * number + pointer
+        + sys.getsizeof((None, None, None, None)) + 2 * pointer
+    )
+    return rows * ((len(domains) + 1) * mass_row + len(domains) * centre_row)
 
 
 def _distance_cell_bytes(tables, run, context) -> int:
@@ -471,7 +530,7 @@ EVENTS = Step(
     "events",
     {"domain-mass": Scope.ALL},
     Order.PARTS,
-    Memory(),
+    Memory(terms=(Term(_domain_series_bytes, fixed_bytes=1),)),
     _events,
     {"events": EventSettings},
     sections=EXPERIMENT,
@@ -483,7 +542,13 @@ ENSEMBLE = Step(
     "ensemble",
     {"domain-mass": Scope.ALL, "events": Scope.ONE},
     Order.PARTS,
-    Memory(camera_bytes=14.0),
+    Memory(
+        camera_bytes=14.0,
+        terms=(
+            Term(_domain_series_bytes, fixed_bytes=1),
+            Term(_ensemble_tables_bytes, fixed_bytes=1),
+        ),
+    ),
     _ensemble,
     {
         "ensemble": EnsembleInputSettings,

@@ -15,6 +15,7 @@ import numpy as np
 import skimage
 
 import darsia
+from darsia.image.raw import raw_stage
 from darsia.presets.analysis.porosity import patched_porosity_analysis
 from darsia.presets.workflows.config.corrections import (
     CorrectionsConfig,
@@ -1830,16 +1831,17 @@ class Rig:
         values, found = darsia.register_raw_frame(
             path, registration, self.raw_decoding["dtype"]
         )
-        img = darsia.OpticalImage(
-            values,
-            transformations=self.corrections,
-            date=self.experiment.get_datetime(path),
-            reference_date=self.reference_date,
-            name=path.name,
-            color_space="RGB",
-            dimensions=list(registration.dimensions),
-            origin=list(registration.origin),
-        )
+        with raw_stage("corrections"):
+            img = darsia.OpticalImage(
+                values,
+                transformations=self.corrections,
+                date=self.experiment.get_datetime(path),
+                reference_date=self.reference_date,
+                name=path.name,
+                color_space="RGB",
+                dimensions=list(registration.dimensions),
+                origin=list(registration.origin),
+            )
         return img, found
 
     # ! ---- EXPERIMENT AND PROTOCOLS ----

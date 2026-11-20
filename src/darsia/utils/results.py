@@ -55,7 +55,10 @@ REUSED = ("step", "settings", "scope", "environment", "inputs")
 
 # The errors of a share that is out: Windows network-path errors, which Python may
 # report as a missing file or path, and the network errors of POSIX.
-_NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 58, 59, 64, 67, 121, 1231, 1236})
+_NETWORK_WINERRORS = frozenset(
+    {51, 53, 54, 55, 58, 59, 64, 67, 70, 121, 1167, 1201, 1203, 1222, 1226, 1229}
+    | {1231, 1232, 1233, 1235, 1236, 2250}
+)
 _NETWORK_ERRNOS = frozenset(
     {
         errno.ENETDOWN,
@@ -65,6 +68,7 @@ _NETWORK_ERRNOS = frozenset(
         errno.ECONNABORTED,
         errno.ECONNRESET,
         errno.ETIMEDOUT,
+        errno.ESTALE,
     }
 )
 
@@ -295,10 +299,10 @@ def _move(source: Path, destination: Path) -> None:
         raise
 
 
-def write_json(path: Path, value) -> None:
+def write_json(path: Path, value, *, default: Callable | None = None) -> None:
     """Write a stored result's JSON file, indented and with every digit of its
     numbers (Python's ``repr``); NaN is refused."""
-    encoder = json.JSONEncoder(indent=1, allow_nan=False)
+    encoder = json.JSONEncoder(indent=1, allow_nan=False, default=default)
     # Validate before opening the target, as dumps did: invalid data must not
     # truncate an existing file. Neither pass retains the encoded chunks.
     for _ in encoder.iterencode(value):

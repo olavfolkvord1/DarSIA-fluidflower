@@ -50,6 +50,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
 from pathlib import Path
+from zipfile import ZipFile, is_zipfile
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,11 @@ from darsia.multiphase.gas_allocation import injection_ports
 from darsia.multiphase.gas_model_cache import GasModelCache
 from darsia.multiphase.gas_parameters import parameters_at_depth
 from darsia.multiphase.gas_zone_cache import GasZoneCache
+from darsia.multi_image_analysis.calibration_fit import (
+    calibration_memory,
+    statistics_memory,
+    stored_statistics_memory,
+)
 from darsia.presets.workflows.analysis.expert_knowledge import ExpertKnowledgeAdapter
 from darsia.presets.workflows.calibration.model_cache import model_cache_identity
 from darsia.presets.workflows.config.expert_knowledge import ExpertKnowledgeConfig
@@ -518,6 +524,16 @@ def _model_files(tables: Mapping, project, folders) -> list[str]:
     return [str(tables["phase_model"]["folder"])]
 
 
+def _model_copy_bytes(tables: Mapping, run: str | None, context) -> int:
+    """The copy buffer and directory-entry records retained by recursive copytree."""
+    path = Path(tables["phase_model"]["folder"])
+    if context.project is not None:
+        path = context.project / path
+    pointer = np.dtype(np.intp).itemsize
+    entries = sum(sys.getsizeof(str(item)) + sys.getsizeof(item) + pointer for item in path.rglob("*"))
+    return 2 * shutil.COPY_BUFSIZE + entries
+
+
 def _overflow_workbook(tables: Mapping) -> Path | tuple[Path, str] | None:
     """A run's overflow protocol, ``[protocols] overflow`` of its tables: a file,
     or a workbook and its sheet (``[path, sheet]``), as the other protocols are
@@ -548,6 +564,49 @@ def _displaced_files(tables: Mapping, project, folders) -> list[str]:
     drawing = tables.get("labeling", {}).get("sand_map", {}).get("drawing")
     found = protocol_files(tables, project, folders)
     return found + [str(path) for path in (workbook, drawing) if path is not None]
+
+
+@lru_cache(maxsize=128)
+def _protocol_table_bytes(path: Path, size: int, stamp: int) -> int:
+    """Bound a parsed protocol from table bytes and its decoder's live rows."""
+    ref = np.dtype(np.intp).itemsize
+    objects = max(sys.getsizeof(0.0), sys.getsizeof(pd.Timestamp(0)))
+    per_cell = objects + 3 * ref
+    if is_zipfile(path):
+        with ZipFile(path) as archive:
+            sheets = [entry.file_size for entry in archive.infolist()
+                      if entry.filename.startswith("xl/worksheets/")
+                      and not entry.filename.endswith(".rels")]
+            shared = sum(entry.file_size for entry in archive.infolist()
+                         if entry.filename in ("xl/sharedStrings.xml", "xl/styles.xml"))
+        # A cell needs at least an opening tag and a delimiter. Strings and
+        # tokenizer/XML buffers are counted separately from pandas' row arrays.
+        expanded = max(sheets, default=0)
+        return (expanded // 4) * per_cell + 5 * (expanded + shared) + size
+    # A CSV date, number or text occupies at least one byte and a delimiter.
+    # Tabular conversion retains both the temporary rows and numeric columns.
+    return (size // 2) * per_cell + 5 * size
+
+
+def _displaced_table_bytes(tables: Mapping, run: str | None, context) -> int:
+    """The protocol frames, scale series and largest in-flight table decoder."""
+    selected = run_tables(tables, run) if run is not None else tables
+    if context.project is None:
+        return 0
+    protocols = selected.get("protocols", {})
+    values = []
+    for name in ("imaging", "blacklist", "injection", "pressure_temperature", "overflow"):
+        value = protocols.get(name)
+        values.extend(value.values() if isinstance(value, Mapping) else (value,))
+    files = []
+    for value in values:
+        if value is None:
+            continue
+        location = Path(value[0] if isinstance(value, (list, tuple)) else value)
+        location = context.project / location
+        stat = location.stat()
+        files.append(_protocol_table_bytes(location, stat.st_size, stat.st_mtime_ns))
+    return sum(files)
 
 
 def _displaced_volume(ctx: StepContext) -> None:
@@ -853,7 +912,7 @@ def _range_rigs(tables: Mapping, run: str | None, context=None) -> int:
 
 
 def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
-    """Stored histogram and column-group values for one frame and its variants.
+    """Stored histogram and column-group values for a primary or held-out frame.
 
     A sand histogram has relative/weight arrays of at most intervals + 1
     entries. Column estimates have relative/ratio/weight arrays of at most
@@ -870,31 +929,28 @@ def _statistics_entries(tables: Mapping, run: str | None, context) -> int:
     occupied = min(columns**2, pixels)
     entries = 3 * occupied
     entries += 2 * min(histograms * reading_sands(tables, run), pixels - occupied)
-    return entries * (1 + _variants(tables, run))
+    return entries
 
 
 def _statistics_bytes(tables: Mapping, run: str | None, context) -> int:
-    """One frame's retained statistics and Python records for the streaming writer.
+    """Retained statistics and the current array's serialized values.
 
     Histogram and column arrays follow capacity's dtype: a float64 geometry or
-    CO2 field can promote them even with float32 images. The source arrays stay
-    alive while _rows builds plain lists, and dataclasses.asdict copies a frame.
-    Reserve both arrays at least at float64 width, plus the Python floats and
-    list pointers. _array may also cast one array at a time; that array has at
-    most one entry per pixel, without a sand or variant multiplier. Streaming
-    JSON adds only traversal/chunk/TextIO buffers, covered by the process base.
+    CO2 field can promote them even with float32 images. All variants retain
+    their original arrays. The encoder casts and makes Python values for one
+    array at a time. Every occupied group stores two or three values across
+    distinct arrays and represents at least one pixel.
     """
     array_bytes = max(context.itemsize, np.dtype(np.float64).itemsize)
-    value_bytes = 2 * array_bytes + sys.getsizeof(0.0) + np.dtype(np.intp).itemsize
-    return (
-        _statistics_entries(tables, run, context) * value_bytes
-        + context.grid_pixels * array_bytes
-    )
+    entries = _statistics_entries(tables, run, context)
+    retained = entries * array_bytes * (1 + _variants(tables, run))
+    largest_array = min(context.grid_pixels, entries // 2)
+    encoded_value = context.itemsize + sys.getsizeof(0.0) + np.dtype(np.intp).itemsize
+    return retained + largest_array * encoded_value
 
 
-def _gas_port_count(tables: Mapping, run: str | None, context) -> int:
-    """Distinct measured injecting ports, including per-run protocol overrides."""
-    own = run_tables(tables, run) if run is not None else tables
+def _gas_ports(own: Mapping, context) -> dict:
+    """Read measured injecting ports and periods from one run's protocol."""
     config = InjectionProtocolConfig()
     config.load_injection(own["protocols"])
     source = config.injection
@@ -909,7 +965,7 @@ def _gas_port_count(tables: Mapping, run: str | None, context) -> int:
     protocol = darsia.InjectionProtocol(
         source, reference_density=config.injection_reference_density
     )
-    return len(injection_ports(protocol))
+    return injection_ports(protocol)
 
 
 def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
@@ -926,13 +982,39 @@ def _injection_map_bytes(tables: Mapping, run: str | None, context) -> int:
     current limit and float64 inward fade; they have no running signal maximum.
     Builder and allocation lifetimes are sequential, so reserve the larger.
     """
-    count, working = _gas_port_count(tables, run, context), context.itemsize
+    own = run_tables(tables, run) if run is not None else tables
+    ports, working = _gas_ports(own, context), context.itemsize
+    count, variants = len(ports), 1 + _variants(tables, run)
     shared = (GasModelCache.DEFAULT_KEPT + 1) * (working + 3) + 2 * (1 + 13 * count)
     building = 11 * count + count * (working + 1) + 28
     # Hidden bridge profiles/transition (float32), mask, centreline coordinates
     # plus coupled threshold coefficients/fixed fractions/capacity scales.
     # Active meeting fallback adds a seed copy and component-selection overlap.
-    allocations = (20 * count + 51) * (1 + _variants(tables, run))
+    allocations = (20 * count + 51) * variants
+    if own.get("gas_allocation", {}).get("growth_only_from_injecting_ports", False):
+        # The active set can only change at a protocol boundary. Each variant
+        # holds one passable grid, cached reach grids, and saturation history.
+        boundaries = {
+            date for periods in ports.values() for span in periods for date in span
+        }
+        allocations += (4 + len(boundaries) + 3 * working) * variants
+        # Port distances, reach scanning and volume peeling are sequential.
+        # Only one generator is doing its transient allocation work at a time.
+        shape = context.grid_shape
+        if shape is None:
+            canvas = grid_canvas(own)
+            if canvas is None:
+                raise ValueError("Gas growth memory needs a grid shape or complete canvas")
+            shape = canvas.shape
+        row_bytes = (12 * np.dtype(np.intp).itemsize + 12) * shape[-1]
+        row_bytes_per_pixel = (row_bytes + context.grid_pixels - 1) // context.grid_pixels
+        # Migration: masks, labels and group IDs, candidate indices and the
+        # sorting workspace, pore volumes, capacity and prior/retained volumes.
+        labels_bytes = np.dtype(np.int32).itemsize
+        index_bytes = np.dtype(np.intp).itemsize
+        volume_bytes = np.dtype(np.float64).itemsize
+        migration = 14 + 4 * labels_bytes + 13 * index_bytes + 12 * volume_bytes
+        allocations += max(33, 6 + row_bytes_per_pixel, migration)
     return shared + max(building, allocations)
 
 
@@ -1031,7 +1113,7 @@ def _gas_route_bytes(tables: Mapping, run: str | None, context) -> int:
             raise ValueError("Gas route memory needs a grid shape or complete canvas")
         shape = canvas.shape
     vertices = 4 * samples + max(shape) + 1
-    return 3 * 8 * vertices * _gas_port_count(tables, run, context)
+    return 3 * 8 * vertices * len(_gas_ports(own, context))
 
 
 def _gas_scratch_parts(tables: Mapping, run: str | None, context) -> dict[str, int]:
@@ -1579,12 +1661,18 @@ def _run_statistics(ctx: StepContext) -> None:
                     measured=volume.source == darsia.MEASURED,
                 )
             )
+            del maps, capacity, dissolved, histograms, gas, unknown
+        del image, signal, measured, before
         dtype = grid.rig.pixel_area.img.dtype
         primary = rows.pop(None)
+        measured = ctx.tables.get("jobs", {}).get("memory_admission") == "declared"
+        facts = {"fit_memory": statistics_memory(primary, dtype, rows)} if measured else None
         ctx.publish(
             lambda folder: darsia.write_frames(folder, run, primary, dtype, rows),
             frame=frame,
+            **({"measurements": facts} if measured else {}),
         )
+        del primary, rows
 
 
 def _calibration_parts(selection: Selection, tables: Mapping) -> tuple[str, ...]:
@@ -1615,6 +1703,23 @@ def _run_part(run: str, tables: Mapping) -> str:
     """The fit that a run's mass maps read: its group's, or the one fit."""
     name = fit_runs(tables).group_of(run) if "calibration_runs" in tables else None
     return "fit" if name is None else f"fit-{name}"
+
+
+def _calibration_ready_bytes(ctx: StepContext) -> dict[str, int]:
+    """Inspect each accepted statistics input once for all calibration parts."""
+    frames = {
+        run: [ctx.read("run-statistics", stored_statistics_memory, run=run, frame=frame)
+              for frame in selected]
+        for run, selected in ctx.selection.frames.items()
+    }
+    settings = ctx.settings
+    return {
+        part: calibration_memory(
+            [row for run, rows in frames.items() if not group.runs or run in group.runs for row in rows],
+            held, settings["calibration_fit"], len(settings["material"].swi),
+        )
+        for part, (group, held) in settings["calibration_runs"].parts(list(frames)).items()
+    }
 
 
 def _calibration(ctx: StepContext) -> None:
@@ -1656,7 +1761,7 @@ PHASE_MODEL = Step(
     "phase-model",
     {},
     Order.PARTS,
-    Memory(),
+    Memory(terms=(Term(_model_copy_bytes, fixed_bytes=1),)),
     _phase_model,
     {"phase_model": PhaseModelSource},
     files=_model_files,
@@ -1667,7 +1772,7 @@ DISPLACED_VOLUME = Step(
     "displaced-volume",
     {},
     Order.RUN,
-    Memory(),
+    Memory(terms=(Term(_displaced_table_bytes, fixed_bytes=1),)),
     _displaced_volume,
     {"overflow": darsia.OverflowSettings},
     sections=(*EXPERIMENT, "recipe"),
@@ -1811,13 +1916,14 @@ RUN_STATISTICS = Step(
     },
     sections=(*READING, *EXPERIMENT),
     files=protocol_files,
+    accelerated=True,  # The backend's sand means must agree bit for bit.
 )
 """Each frame's statistics (R5), independent of other selected frames."""
 CALIBRATION = Step(
     "calibration",
     {"run-statistics": Scope.ALL},
     Order.PARTS,
-    Memory(),
+    Memory(ready=_calibration_ready_bytes),
     _calibration,
     {
         "calibration_fit": darsia.CalibrationFitSettings,

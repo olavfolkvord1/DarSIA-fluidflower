@@ -543,6 +543,26 @@ def test_a_superseded_owner_commits_nothing(tmp_path, monkeypatch):
     assert queue.markers(job, queue.QUEUE)[other.id] == "back"
 
 
+@pytest.mark.parametrize("recovers", [True, False])
+def test_a_claim_marker_retries_a_partial_json_write(tmp_path, monkeypatch, recovers):
+    marker = tmp_path / "lease"
+    marker.write_bytes(b'{"token": "one"}\n"beat": 1}\n')
+    waited = []
+
+    def next_observation(seconds):
+        waited.append(seconds)
+        if recovers:
+            marker.write_bytes(b'{"token": "one", "beat": 1}\n')
+
+    monkeypatch.setattr(queue, "sleep", next_observation)
+    if recovers:
+        assert queue.read_marker(marker) == {"token": "one", "beat": 1}
+    else:
+        with pytest.raises(results.Unavailable, match="reads short twice"):
+            queue.read_marker(marker)
+    assert waited == [results.SHARE_CACHE]
+
+
 def test_a_retried_task_adopts_its_earlier_attempt(tmp_path, monkeypatch):
     """A task whose process ended after two of its frames resumes: it adopts their
     results, names their token in its done marker, and readers accept both."""
@@ -635,11 +655,21 @@ def test_a_retry_after_a_mend_of_its_inputs_needs_its_results_set_aside(tmp_path
 
 def test_a_share_outage_is_no_empty_state_folder(tmp_path, monkeypatch):
     """A state folder of a job the share gives no answer about within the grace,
-    also as a missing network path, is not known now: never an empty folder."""
+    also as a missing network path, is not known now: never an empty folder; nor
+    is a marker the share gives no answer about when it is moved ever gone."""
     config, selection = _project(tmp_path)
     job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
     monkeypatch.setattr(results, "GRACE", 0.2)
     monkeypatch.setattr(results, "RETRY_DELAYS", (0.05,))
+
+    def moved(source, destination, **kwargs):
+        raise network_error(path=str(source))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(results, "rename", moved)
+        with pytest.raises(results.Unavailable):
+            queue.claim(job, task, "here")
 
     def out(folder):
         raise network_error()
@@ -647,6 +677,77 @@ def test_a_share_outage_is_no_empty_state_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(queue.os, "listdir", out)
     with pytest.raises(results.Unavailable):
         queue.markers(job, queue.FAILED)
+
+
+@pytest.mark.parametrize("failure", [None, "the task failed"])
+@pytest.mark.parametrize("unlock_move", [25.0, 40.0])
+def test_a_terminal_mark_uses_one_deadline_for_its_write_and_move(
+    tmp_path, monkeypatch, failure, unlock_move
+):
+    """Long sharing violations may clear while the lease is valid. A move
+    cannot renew the write's deadline, and expiry leaves the claim uncommitted."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
+    claim = queue.claim(job, task, "here")
+    waits, writes, moves = [], [], []
+    monkeypatch.setattr(results, "monotonic", lambda: sum(waits))
+    monkeypatch.setattr(queue, "monotonic", lambda: sum(waits))
+    monkeypatch.setattr(results, "sleep", waits.append)
+    monkeypatch.setattr(results, "RETRY_DELAYS", (0.5, 2.0, 5.0))
+    error = OSError(errno.EACCES, "Sharing violation")
+    error.winerror = 32
+
+    def opened(path, *args, **kwargs):
+        if Path(path) == claim.path:
+            writes.append(sum(waits))
+            if sum(waits) < 20.0:
+                raise error
+        return builtins.open(path, *args, **kwargs)
+
+    move = results._move
+
+    def moved(source, destination):
+        moves.append(sum(waits))
+        if sum(waits) < unlock_move:
+            raise error
+        return move(source, destination)
+
+    monkeypatch.setattr(queue, "open", opened, raising=False)
+    monkeypatch.setattr(results, "_move", moved)
+    if unlock_move < 30.0:
+        queue.finish(claim, traceback=failure, deadline=30.0)
+        state = queue.DONE if failure is None else queue.FAILED
+        assert queue.markers(job, state)[task] == claim.token
+        assert not claim.path.exists()
+    else:
+        with pytest.raises(OSError, match="Sharing violation"):
+            queue.finish(claim, traceback=failure, deadline=30.0)
+        assert claim.path.exists()
+        assert task not in queue.markers(job, queue.DONE)
+        assert task not in queue.markers(job, queue.FAILED)
+    assert max(writes + moves) < 30.0
+    assert len(writes) > len(results.RETRY_DELAYS) + 1
+
+
+def test_a_late_terminal_write_does_not_renew_the_observed_lease(tmp_path, monkeypatch):
+    """A terminal write whose move is blocked keeps the last observed renewal's
+    clock, so another service can recover it when that lease becomes stale."""
+    config, selection = _project(tmp_path)
+    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
+    task = sorted(queue.markers(job, queue.QUEUE))[0]
+    claim = queue.claim(job, task, "here")
+    queue.beat(claim, 1, 1234, 1.0)
+    now, seen = [0.0], {}
+    monkeypatch.setattr(queue, "monotonic", lambda: now[0])
+    assert not queue.reclaim(job, seen)
+    now[0] = results.STALE - 50.0
+    queue._write(claim, {"token": claim.token, "traceback": "failed"})
+    assert not queue.reclaim(job, seen)
+    assert seen[f"{job}/{claim.path.name}"][1] == 0.0
+    now[0] = results.STALE + 1.0
+    assert queue.reclaim(job, seen) == [task]
+    assert task in queue.markers(job, queue.QUEUE)
 
 
 def test_failed_parts_made_again_with_other_settings(tmp_path):
@@ -883,74 +984,3 @@ def test_a_package_in_an_ignored_folder_of_a_checkout_has_its_own_revision(tmp_p
     assert installed == job_module.installed_revision(package)
     (package / "x.py").write_text("A = 2\n", encoding="utf-8")
     assert revision(package) != installed
-
-
-@pytest.mark.parametrize("failure", [None, "the task failed"])
-@pytest.mark.parametrize("unlock_move", [25.0, 40.0])
-def test_a_terminal_mark_uses_one_deadline_for_its_write_and_move(
-    tmp_path, monkeypatch, failure, unlock_move
-):
-    """Long sharing violations may clear while the lease is valid. A move
-    cannot renew the write's deadline, and expiry leaves the claim uncommitted."""
-    config, selection = _project(tmp_path)
-    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
-    task = sorted(queue.markers(job, queue.QUEUE))[0]
-    claim = queue.claim(job, task, "here")
-    waits, writes, moves = [], [], []
-    monkeypatch.setattr(results, "monotonic", lambda: sum(waits))
-    monkeypatch.setattr(queue, "monotonic", lambda: sum(waits))
-    monkeypatch.setattr(results, "sleep", waits.append)
-    monkeypatch.setattr(results, "RETRY_DELAYS", (0.5, 2.0, 5.0))
-    error = OSError(errno.EACCES, "Sharing violation")
-    error.winerror = 32
-
-    def opened(path, *args, **kwargs):
-        if Path(path) == claim.path:
-            writes.append(sum(waits))
-            if sum(waits) < 20.0:
-                raise error
-        return builtins.open(path, *args, **kwargs)
-
-    move = results._move
-
-    def moved(source, destination):
-        moves.append(sum(waits))
-        if sum(waits) < unlock_move:
-            raise error
-        return move(source, destination)
-
-    monkeypatch.setattr(queue, "open", opened, raising=False)
-    monkeypatch.setattr(results, "_move", moved)
-    if unlock_move < 30.0:
-        queue.finish(claim, traceback=failure, deadline=30.0)
-        state = queue.DONE if failure is None else queue.FAILED
-        assert queue.markers(job, state)[task] == claim.token
-        assert not claim.path.exists()
-    else:
-        with pytest.raises(OSError, match="Sharing violation"):
-            queue.finish(claim, traceback=failure, deadline=30.0)
-        assert claim.path.exists()
-        assert task not in queue.markers(job, queue.DONE)
-        assert task not in queue.markers(job, queue.FAILED)
-    assert max(writes + moves) < 30.0
-    assert len(writes) > len(results.RETRY_DELAYS) + 1
-
-
-def test_a_late_terminal_write_does_not_renew_the_observed_lease(tmp_path, monkeypatch):
-    """A terminal write whose move is blocked keeps the last observed renewal's
-    clock, so another service can recover it when that lease becomes stale."""
-    config, selection = _project(tmp_path)
-    job = create_job(tmp_path / "jobs", (NUMBERS,), selection, config)
-    task = sorted(queue.markers(job, queue.QUEUE))[0]
-    claim = queue.claim(job, task, "here")
-    queue.beat(claim, 1, 1234, 1.0)
-    now, seen = [0.0], {}
-    monkeypatch.setattr(queue, "monotonic", lambda: now[0])
-    assert not queue.reclaim(job, seen)
-    now[0] = results.STALE - 50.0
-    queue._write(claim, {"token": claim.token, "traceback": "failed"})
-    assert not queue.reclaim(job, seen)
-    assert seen[f"{job}/{claim.path.name}"][1] == 0.0
-    now[0] = results.STALE + 1.0
-    assert queue.reclaim(job, seen) == [task]
-    assert task in queue.markers(job, queue.QUEUE)

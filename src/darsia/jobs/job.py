@@ -2,8 +2,10 @@
 
 :func:`create_job` writes a job's folder in the jobs folder: ``job.json`` with its
 steps, selection, computing environment, results folder, the code's revision, the
-token of each input made outside the job (``bound``) and the earlier jobs it
-completes (``basis``); copies of its configuration files; one file per task in
+token of each input made outside the job (``bound``), the earlier jobs it
+completes (``basis``), the bytes each task declares (``bytes``), and its workload
+description (``memory``, including the Setup's ``sizes`` and photo format);
+copies of its configuration files; one file per task in
 ``tasks/``; and one marker per task in ``queue/`` (:mod:`darsia.jobs.queue`).
 
 Each task's inputs are enumerated from the frozen selection by the scope of each
@@ -24,10 +26,12 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.metadata
+import math
 import os
 import subprocess
+import sys
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,9 +70,8 @@ class Environment:
     order of tasks.
 
     The threads are fixed per job: every task of the job runs with them, since a
-    reduction can change in its last bits with the thread count. So is the compute
-    backend, so that a job's frames are never computed on two backends; a host that
-    cannot provide the job's kernel or backend takes none of its tasks.
+    reduction can change in its last bits with the thread count. A pinned backend
+    is fixed per job. With ``"auto"``, each task selects one qualified local backend.
 
     """
 
@@ -77,7 +80,7 @@ class Environment:
     threads: int = 1
     """Threads of each task: OpenMP, BLAS and OpenCV."""
     backend: str = "cpu"
-    """The compute backend: ``"cpu"``, or an OpenCL device class."""
+    """The compute backend: ``"cpu"``, an OpenCL device class, or ``"auto"``."""
 
     def to_json(self) -> dict:
         """The environment as plain JSON values."""
@@ -108,6 +111,149 @@ def _git(folder: Path, *arguments: str) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return found.stdout.strip() if found.returncode == 0 else None
+
+
+@dataclass(frozen=True)
+class Sizes:
+    """The sizes a step's declared memory is counted in
+    (:class:`darsia.jobs.step.Memory`), from the Setup: the bytes of a value of its
+    precision and the pixels of a camera image and of the run grid."""
+
+    itemsize: int
+    """Bytes per value of the Setup's precision, e.g. 4 for float32."""
+    camera: int
+    """Pixels of a camera image."""
+    grid: int
+    """Pixels of the run grid."""
+    grid_shape: tuple[int, int] | None = None
+    """Rows and columns of the grid, when known; older callers know only pixels."""
+
+    def __post_init__(self) -> None:
+        """Refuse dimensions that describe a different grid from its pixel count."""
+        if self.grid_shape is not None:
+            shape = tuple(self.grid_shape)
+            if (
+                len(shape) != 2
+                or any(type(n) is not int or n <= 0 for n in shape)
+                or shape[0] * shape[1] != self.grid
+            ):
+                raise ValueError(
+                    "Sizes.grid_shape needs two positive dimensions whose product equals grid."
+                )
+            object.__setattr__(self, "grid_shape", shape)
+
+    def to_json(self) -> dict:
+        """The sizes as plain JSON values."""
+        found = {"itemsize": self.itemsize, "camera": self.camera, "grid": self.grid}
+        if self.grid_shape is not None:
+            found["grid_shape"] = list(self.grid_shape)
+        return found
+
+
+def task_photo(
+    task: Task, photo_bytes: Callable[[str], int] | None = None
+) -> str | None:
+    """A task's most expensive photo by its reader's bytes, or None.
+
+    Mixed-format runs reserve the largest decode, rather than assuming that
+    the first frame represents every frame of the task. Without a decoder
+    budget, the name alone breaks ties deterministically.
+    """
+    return max(
+        (frame.name for frame in task.frames),
+        key=lambda name: (0 if photo_bytes is None else photo_bytes(name), name),
+        default=None,
+    )
+
+
+def task_bytes(
+    step: Step,
+    task: Task,
+    selection: Selection,
+    sizes: Sizes,
+    tables: Mapping[str, Any] | None = None,
+    project: Path | None = None,
+) -> int:
+    """The bytes a task of a step holds at its peak by its step's memory
+    (:meth:`darsia.jobs.step.Memory.bytes`), with the frames of its input scope
+    (its own frames and those its inputs cover, a run's result covering the run's
+    selected frames), the counts its configuration sets and the format of its
+    run's photos (:func:`task_photo`).
+
+    Parameters
+    ----------
+    step : Step
+        The task's step.
+    task : Task
+        The task.
+    selection : Selection
+        The job's selection.
+    sizes : Sizes
+        The Setup's sizes.
+    tables : Mapping[str, Any], optional
+        The job's configuration tables; needed for a step whose memory has terms.
+    project : Path, optional
+        The project folder, for terms that read configured metadata files.
+
+    Returns
+    -------
+    int
+        The bytes.
+
+    """
+    return task_memory(step, task, selection, sizes, tables, project)["bytes"]
+
+
+def task_memory(
+    step: Step,
+    task: Task,
+    selection: Selection,
+    sizes: Sizes,
+    tables: Mapping[str, Any] | None = None,
+    project: Path | None = None,
+) -> dict:
+    """A task's array estimate and the workload used to derive it.
+
+    The description is frozen with the job, so peak measurements can be related
+    to its precision, camera and grid pixels, input frames and decoder format.
+    A task over several runs uses their most expensive photo format.
+    """
+    frames = {(task.run, frame) for frame in task.frames}
+    for i in task.inputs:
+        if i.frame is not None:
+            frames.add((i.run, i.frame))
+        elif i.run is not None:
+            frames.update((i.run, frame) for frame in selection.frames.get(i.run, ()))
+    photo_bytes = step.memory.photo_bytes
+    photo = max(
+        (frame.name for _, frame in frames),
+        key=lambda name: (0 if photo_bytes is None else photo_bytes(name), name),
+        default=None,
+    )
+    amount = step.memory.bytes(
+        sizes.itemsize,
+        sizes.camera,
+        sizes.grid,
+        len(frames),
+        tables,
+        task.run,
+        photo,
+        project,
+        sizes.grid_shape,
+        tuple(selection.frames),
+        max(
+            (sys.getsizeof(f"{frame.session}/{frame.name}") for _, frame in frames),
+            default=0,
+        ),
+        tuple(selection.domains),
+        task.part,
+    )
+    return {
+        **sizes.to_json(),
+        "frames": len(frames),
+        "format": None if photo is None else Path(photo).suffix.lower(),
+        "bytes": amount,
+    }
 
 
 def revision(folder: Path | None = None) -> str | None:
@@ -393,8 +539,12 @@ def create_job(
     *,
     known: Sequence[Step] = (),
     project: Path | None = None,
+    sizes: Sizes | None = None,
 ) -> Path:
     """Create a job: its record, configuration, tasks and queue markers.
+
+    The record holds the bytes each task declares (:func:`task_bytes`), which a
+    host's service admits it by (:func:`darsia.jobs.service.admit`).
 
     Parameters
     ----------
@@ -416,6 +566,9 @@ def create_job(
         The steps of the kinds the job reads but does not make.
     project : Path, optional
         The project folder; by default the first configuration file's folder.
+    sizes : Sizes, optional
+        The Setup's sizes of the declared memory; without them the tasks declare
+        no bytes.
 
     Returns
     -------
@@ -435,6 +588,19 @@ def create_job(
     paths = [Path(config)] if isinstance(config, (str, Path)) else list(config)
     tables = read_tables(paths)
     project = Path(project) if project is not None else paths[0].parent
+    memory_settings = tables.get("jobs", {})
+    admission = memory_settings.get("memory_admission", "measured")
+    if admission not in ("measured", "declared"):
+        raise ValueError("Job memory_admission must be 'measured' or 'declared'.")
+    buffer = memory_settings.get("memory_buffer_fraction", 0.0)
+    if type(buffer) not in (float, int) or not math.isfinite(buffer) or buffer < 0:
+        raise ValueError("Job memory_buffer_fraction must be a finite nonnegative fraction.")
+    if buffer and admission != "declared":
+        raise ValueError("Job memory_buffer_fraction applies to declared admission.")
+    if admission == "declared" and sizes is None:
+        raise ValueError("Declared memory admission needs the Setup's memory sizes.")
+    if type(tables.get("jobs", {}).get("profile_raw", False)) is not bool:
+        raise ValueError("Job profile_raw must be a Boolean.")
     if environment is None:
         try:
             given = table(tables, "jobs")
@@ -445,6 +611,21 @@ def create_job(
             raise ValueError("The job names no computing environment ([jobs]).")
     if not environment.blas_kernel:
         raise ValueError("The job's computing environment names no BLAS kernel.")
+    if environment.backend == "auto":
+        qualified = tables.get("jobs", {}).get("qualified_backends", {})
+        if not isinstance(qualified, Mapping) or any(
+            not isinstance(labels, list)
+            or any(
+                not isinstance(label, str)
+                or not label.startswith("opencl:")
+                or label == "opencl:"
+                for label in labels
+            )
+            for labels in qualified.values()
+        ):
+            raise ValueError(
+                "Each jobs.qualified_backends entry must list OpenCL device labels."
+            )
     if selection.parts is not None and not basis:
         raise ValueError("A job over chosen parts names the job it completes.")
     for earlier in basis:
@@ -469,6 +650,16 @@ def create_job(
     if refused:
         raise ValueError("The job is refused:\n" + "\n".join(dict.fromkeys(refused)))
 
+    memory = (
+        {
+            task.id: task_memory(
+                kinds[task.step], task, selection, sizes, tables, project
+            )
+            for task in made_tasks
+        }
+        if sizes is not None
+        else {}
+    )
     created = datetime.now(timezone.utc)
     name = f"{created:%Y%m%dT%H%M%S%fZ}-{queue.new_token()[:6]}"
     partial = jobs / f".{name}.partial"
@@ -493,7 +684,18 @@ def create_job(
         "revision": code,
         "bound": {key: token for key, token in bound.items() if token},
         "basis": list(basis),
+        "sizes": None if sizes is None else sizes.to_json(),
+        "memory": memory,
+        **({"memory_admission": admission} if admission == "declared" else {}),
+        "bytes": {
+            task.id: memory.get(task.id, {}).get("bytes", 0) for task in made_tasks
+        },
     }
+    if admission == "declared":
+        record["ready_memory"] = [step.name for step in steps if step.memory.ready is not None]
+        record["memory_buffer_fraction"] = buffer
+        for description in memory.values():
+            description["buffer_fraction"] = buffer
     queue.write_json(partial / JOB, record)
     for state in queue.STATES:
         (partial / state).mkdir()
