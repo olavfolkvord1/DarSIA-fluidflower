@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
 import darsia
+
+
+@lru_cache(maxsize=8)
+def _matching_grid(shape, voxel_sizes) -> darsia.Grid:
+    """Reuse topology for repeated solves on the same tensor grid."""
+    return darsia.Grid(list(shape), list(voxel_sizes))
 
 
 def wasserstein_distance(
@@ -28,7 +36,9 @@ def wasserstein_distance(
     **kwargs
         Additional arguments (only for "newton", "bregman", "gprox").
 
-        - options (dict): options for the method.
+        - options (dict): options for the method. Set ``profile_memory`` to
+          trace Python allocations. ``return_pressure`` controls pressure
+          recovery and defaults to the value of ``return_info``.
 
     Returns
     -------
@@ -41,11 +51,15 @@ def wasserstein_distance(
     if method_name in ["newton", "bregman", "gprox"]:
         # Use Finite Volume Iterative Method (Newton or Bregman)
 
-        # Extract grid - implicitly assume mass_dst to generate same grid
-        grid: darsia.Grid = darsia.generate_grid(mass_dst)
-
-        # Fetch options and define Wasserstein method
-        options = kwargs.get("options", {})
+        options = dict(kwargs.get("options", {}))
+        options.setdefault("return_pressure", options.get("return_info", False))
+        # Callbacks may inspect and retain the solver's public grid.
+        shared_grid = not options.get("callbacks")
+        grid = (
+            _matching_grid(tuple(mass_dst.num_voxels), tuple(mass_dst.voxel_size))
+            if shared_grid
+            else darsia.generate_grid(mass_dst)
+        )
 
         # Define method
         match method_name:
@@ -55,6 +69,10 @@ def wasserstein_distance(
                 w1 = darsia.BeckmannBregmanSolver(grid, weight, options)
             case "gprox":
                 w1 = darsia.BeckmannGproxPGHDSolver(grid, weight, options)
+        result = w1(mass_src, mass_dst)
+        if shared_grid and options.get("return_info"):
+            result[1]["grid"] = deepcopy(grid)
+        return result
 
     elif method_name == "cv2.emd":
         # Use Earth Mover's Distance from CV2

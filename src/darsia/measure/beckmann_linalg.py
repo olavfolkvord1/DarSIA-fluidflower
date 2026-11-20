@@ -5,6 +5,8 @@ from __future__ import annotations
 import warnings
 from abc import abstractmethod
 from enum import StrEnum
+from functools import lru_cache
+from threading import Lock
 from typing import Optional
 from warnings import warn
 
@@ -13,6 +15,16 @@ import pyamg
 import scipy.sparse as sps
 
 import darsia
+
+
+@lru_cache(maxsize=4)
+def _darcy_lu(shape, data, indices, indptr):
+    """Factor the exact CSC entries of a Darcy start in their existing order."""
+    arrays = [
+        np.frombuffer(raw, dtype).copy() for dtype, raw in (data, indices, indptr)
+    ]
+    matrix = sps.csc_matrix(tuple(arrays), shape=shape)
+    return sps.linalg.splu(matrix), Lock()
 
 
 # Define BeckmannLinearSolverType
@@ -66,16 +78,31 @@ class BeckmannDirectSolver(BeckmannLinearSolver):
     def __init__(self, options: dict) -> None:
         self.linear_solver: Optional[sps.linalg.splu] = None
         """Initialize direct solver."""
+        self._factor_lock = None
 
-    def setup(self, matrix: sps.csc_matrix) -> None:
+    def setup(self, matrix: sps.csc_matrix, *, cache_darcy: bool = False) -> None:
         """Setup direct solver.
 
         Parameters
         ----------
         matrix : sps.csr_matrix
             System matrix.
+        cache_darcy : bool
+            Reuse an exactly matching Darcy-start factorisation.
         """
-        self.linear_solver = sps.linalg.splu(matrix)
+        if cache_darcy:
+            csc = matrix.tocsc(copy=False)
+            # splu normalizes the input CSC in place. Preserve that state on
+            # both cache hits and misses for the next pressure reduction.
+            csc.sum_duplicates()
+            entries = [
+                (array.dtype.str, array.tobytes())
+                for array in (csc.data, csc.indices, csc.indptr)
+            ]
+            self.linear_solver, self._factor_lock = _darcy_lu(csc.shape, *entries)
+        else:
+            self.linear_solver = sps.linalg.splu(matrix)
+            self._factor_lock = None
 
     def __call__(
         self,
@@ -93,7 +120,10 @@ class BeckmannDirectSolver(BeckmannLinearSolver):
         np.ndarray
             Solution.
         """
-        return self.linear_solver.solve(rhs)
+        if self._factor_lock is None:
+            return self.linear_solver.solve(rhs)
+        with self._factor_lock:
+            return self.linear_solver.solve(rhs)
 
 
 class BeckmannAMGSolver(BeckmannLinearSolver):

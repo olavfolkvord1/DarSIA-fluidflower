@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import tracemalloc
 import warnings
 from typing import Optional, override
 
@@ -12,6 +11,7 @@ import pyamg
 import scipy.sparse as sps
 
 import darsia
+from darsia.measure.beckmann_problem import _profile_memory
 
 
 class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
@@ -133,6 +133,7 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
     # ! ---- Main methods ----
 
     @override
+    @_profile_memory
     def solve_beckmann_problem(
         self, flat_mass_diff: np.ndarray
     ) -> tuple[float, np.ndarray, dict]:
@@ -148,9 +149,7 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
         tuple
             Distance, solution, info.
         """
-        # Setup time and memory profiling
         tic = time.time()
-        tracemalloc.start()
 
         # Solver parameters. By default tolerances for increment and distance are
         # set, such that they do not affect the convergence.
@@ -363,17 +362,11 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
             ):
                 break
 
-        # Summarize profiling (time in seconds, memory in GB)
-        # total_timings = self._sum_timings(convergence_history["timing"])
-        # peak_memory_consumption = tracemalloc.get_traced_memory()[1] / 10**9
-
         # Define performance metric
         info = {
             "converged": self.iter < num_iter,
             "number_iterations": self.iter,
             "convergence_history": convergence_history,
-            # "timings": total_timings,
-            # "peak_memory_consumption": peak_memory_consumption,
         }
 
         return new_distance, self.flux, info
@@ -414,17 +407,10 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
         # Main method
         distance, solution, info = self.solve_beckmann_problem(flat_mass_diff)
 
-        # Compute Kantorovich potential solving the weighed-Poisson problem
-        pressure = self.compute_kantorovich_potential(flat_mass_diff, solution)
-        pressure = pressure.reshape(self.grid.shape, order="F")
-
-        # reshape the solution
-        flux_cells = darsia.face_to_cell(self.grid, solution)
-        transport_density_cells = np.linalg.norm(flux_cells, axis=-1)
-
         # Return solution
         return_info = self.options.get("return_info", False)
         if return_info:
+            flux_cells = darsia.face_to_cell(self.grid, solution)
             info.update(
                 {
                     "grid": self.grid,
@@ -436,13 +422,14 @@ class BeckmannGproxPGHDSolver(darsia.BeckmannProblem):
                         self.grid, self.gradient_poisson_pressure
                     ),
                     "flux": flux_cells,
-                    "pressure": pressure,
-                    # "pressure": pressure,
-                    "transport_density": transport_density_cells,
+                    "transport_density": np.linalg.norm(flux_cells, axis=-1),
                     "src": img_1,
                     "dst": img_2,
                 }
             )
+            if self.options.get("return_pressure", True):
+                pressure = self.compute_kantorovich_potential(flat_mass_diff, solution)
+                info["pressure"] = pressure.reshape(self.grid.shape, order="F")
             return distance, info
         else:
             return distance
