@@ -3,6 +3,7 @@
 import json
 
 import numpy as np
+import pytest
 
 import darsia
 
@@ -116,3 +117,40 @@ def test_probabilities_need_a_valid_texture_window(tmp_path):
         assert unsupported.sum() == (2 * half + 1) ** 2
         assert np.array_equal(unsupported, np.isnan(gas))
         assert ((co2[~unsupported] > 0) & (co2[~unsupported] < 1)).all()
+
+
+def test_one_feature_matrix_serves_all_chunks_of_a_frame(tmp_path):
+    """Each chunk, the last one shorter, gives the heads on its own feature matrix;
+    a matrix of another shape, dtype or memory order is refused."""
+    rng = np.random.default_rng(3)
+    model = _model(
+        tmp_path, _head(rng.normal(size=36), 0.1), _head(rng.normal(size=36), -0.2)
+    )
+    # Chunks of 64, 64 and 22 rows; a chunk of 64 rows of 70 pixels is two blocks.
+    baseline = rng.uniform(0.1, 0.9, (150, 70, 3))
+    previous = baseline * rng.uniform(0.9, 1.1, baseline.shape)
+    current = baseline * rng.uniform(0.8, 1.2, baseline.shape)
+    current[120, 30, 0] = np.nan
+    for dtype in (np.float32, np.float64):
+        images = [image.astype(dtype) for image in (current, baseline, previous)]
+        co2, gas = darsia.phase_probabilities(model, *images, pixel_size_mm=0.5)
+        features = darsia.PhaseFeatures(
+            *images, texture_sigma_mm=model.texture_sigma_mm, pixel_size_mm=0.5
+        )
+        for start in (0, 64, 128):
+            chunk = np.s_[start : start + 64]
+            matrix = features.matrix(chunk)
+            for head, result in (
+                (model.co2_presence, co2),
+                (model.gas_within_co2, gas),
+            ):
+                expected = head.probability(matrix).reshape(-1, 70)
+                expected[~features.support[chunk]] = np.nan
+                np.testing.assert_array_equal(result[chunk], expected)
+        for out in (
+            np.empty((64 * 70 + 1, 36), dtype),
+            np.empty((64 * 70, 36), np.float16),
+            np.empty((64 * 70, 36), dtype, order="F"),
+        ):
+            with pytest.raises(ValueError):
+                features.matrix(np.s_[:64], out=out)

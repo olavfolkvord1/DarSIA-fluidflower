@@ -89,6 +89,10 @@ side of the image (on square pixels, of its shorter pixel count)."""
 _ROWS_PER_CHUNK = 64
 """Image rows per feature chunk; the full feature matrix is never held."""
 
+_PIXELS_PER_BLOCK = 4096
+"""Pixels whose features are computed together, few enough for the processor's
+cache."""
+
 
 @dataclass(frozen=True)
 class LogisticHead:
@@ -413,14 +417,21 @@ class PhaseFeatures:
             valid.astype(np.uint8), np.ones((width, width), np.uint8)
         ).astype(bool)
 
-    def matrix(self, selection) -> np.ndarray:
+    def matrix(self, selection, out: np.ndarray | None = None) -> np.ndarray:
         """Feature matrix of the selected pixels.
+
+        Each feature depends on its pixel alone, so the features are computed in
+        blocks of pixels small enough for the processor's cache, and each block
+        is written into its rows of the matrix.
 
         Parameters
         ----------
         selection : slice or tuple of arrays
             Pixels to read: a slice of image rows, or arrays of row and column
             indices.
+        out : array, optional
+            Matrix of shape (pixels, 36) in the features' dtype and C order to write
+            into, e.g. one matrix for all chunks of a frame.
 
         Returns
         -------
@@ -429,14 +440,47 @@ class PhaseFeatures:
             :data:`PHASE_FEATURE_NAMES`, pixels in row-major order of the
             selection.
 
+        Raises
+        ------
+        ValueError
+            If ``out`` has another shape, dtype or memory order.
+
         """
+        fields = [
+            self._images,
+            self._contrast,
+            self._smooth[:2],
+            [self._delta, self._norm, self._local_mean, self._local_std],
+        ]
+        if self._dynamic:
+            fields.append(
+                [self._dynamic_delta, self._dynamic_norm, self._local_dynamic_mean]
+            )
+        count = self._norm[selection].size
+        pixels = [
+            [field[selection].reshape(count, *field.shape[2:]) for field in group]
+            for group in fields
+        ]
+        shape = (count, len(PHASE_FEATURE_NAMES))
+        if out is None:
+            out = np.empty(shape, self.dtype)
+        elif (
+            out.shape != shape or out.dtype != self.dtype or not out.flags.c_contiguous
+        ):
+            raise ValueError(
+                f"The feature matrix must be a C-ordered {shape} array of "
+                f"{np.dtype(self.dtype).name}."
+            )
+        for start in range(0, count, _PIXELS_PER_BLOCK):
+            block = slice(start, start + _PIXELS_PER_BLOCK)
+            self._block(out[block], *([f[block] for f in group] for group in pixels))
+        return out
+
+    def _block(self, out, rgb, contrast, smooth, change, dynamic=None) -> None:
+        """Write the features of one block of pixels into its rows of the matrix."""
         dtype = self.dtype
         epsilon, floor = dtype(1e-4), dtype(0.05)
-        rgb = [image[selection] for image in self._images]
-        contrast = [c[selection] for c in self._contrast]
-        smooth = [s[selection] for s in self._smooth[:2]]
-        local_mean = self._local_mean[selection]
-        local_std = self._local_std[selection]
+        delta, norm, local_mean, local_std = change
         intensity = [np.mean(image, axis=-1, dtype=dtype) for image in rgb]
         fractions = [i / (i.sum(axis=-1, keepdims=True) + epsilon) for i in rgb[:2]]
         texture = [np.abs(c) for c in contrast]
@@ -449,13 +493,13 @@ class PhaseFeatures:
         rel_bright = [np.maximum(rel_current, 0), np.maximum(rel_baseline, 0)]
         persistent = np.minimum(rel_bright[1], rel_bright[0])
         columns = [
-            self._delta[selection],
+            delta,
             intensity[0] - intensity[1],
             fractions[0] - fractions[1],
             _log_ratios(rgb[0], epsilon) - _log_ratios(rgb[1], epsilon),
             texture_delta,
             np.abs(texture_delta),
-            self._norm[selection],
+            norm,
             local_mean,
             local_std,
             local_mean / (local_std + epsilon),
@@ -474,19 +518,24 @@ class PhaseFeatures:
             * persistent
             / (np.maximum(rel_bright[1], rel_bright[0]) + floor),
         ]
-        count = intensity[0].size
-        if self._dynamic:
+        count = len(out)
+        if dynamic:
+            dynamic_delta, dynamic_norm, local_dynamic_mean = dynamic
             columns += [
                 np.ones(count, dtype),
-                self._dynamic_delta[selection],
+                dynamic_delta,
                 intensity[0] - intensity[2],
                 texture[0] - texture[2],
-                self._dynamic_norm[selection],
-                self._local_dynamic_mean[selection],
+                dynamic_norm,
+                local_dynamic_mean,
             ]
         else:
             columns.append(np.zeros((count, 8), dtype))
-        return np.column_stack([c.reshape(count, -1) for c in columns])
+        start = 0
+        for column in columns:
+            values = column.reshape(count, -1)
+            out[:, start : start + values.shape[1]] = values
+            start += values.shape[1]
 
 
 def phase_probabilities(
@@ -500,8 +549,8 @@ def phase_probabilities(
     """CO2-presence and gas-within-CO2 probabilities of one frame.
 
     Both heads read the frame's :class:`PhaseFeatures` with the model's texture
-    scale, built in chunks of rows. Outside the features' support both
-    probabilities are NaN, so the support travels with the result.
+    scale, built in chunks of rows into one matrix. Outside the features' support
+    both probabilities are NaN, so the support travels with the result.
 
     Parameters
     ----------
@@ -531,9 +580,11 @@ def phase_probabilities(
     rows, cols = features.support.shape
     co2 = np.empty((rows, cols), features.dtype)
     gas = np.empty((rows, cols), features.dtype)
+    chunk_pixels = min(rows, _ROWS_PER_CHUNK) * cols
+    buffer = np.empty((chunk_pixels, len(PHASE_FEATURE_NAMES)), features.dtype)
     for start in range(0, rows, _ROWS_PER_CHUNK):
         chunk = np.s_[start : start + _ROWS_PER_CHUNK]
-        matrix = features.matrix(chunk)
+        matrix = features.matrix(chunk, out=buffer[: co2[chunk].size])
         co2[chunk] = model.co2_presence.probability(matrix).reshape(-1, cols)
         gas[chunk] = model.gas_within_co2.probability(matrix).reshape(-1, cols)
     co2[~features.support] = np.nan
