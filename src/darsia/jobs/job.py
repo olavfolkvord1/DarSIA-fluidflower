@@ -281,7 +281,10 @@ def _reads(
     step: Step, run, frames, part, kinds: Mapping[str, Step], selection, tables
 ) -> list[Input]:
     """The results one unit of a step reads, by the scope of each read: a read of
-    every run is of the runs the step reads over the selection (:func:`read_runs`)."""
+    every run is of the runs the step reads over the selection (:func:`read_runs`),
+    of its own kind those of the other runs, e.g. a reference run's; a unit of a run
+    reads the single part of a step in parts that the producer names for its run
+    (:attr:`Step.run_part`), any other unit its first part."""
     found, every = [], read_runs(step, selection, tables)
     for kind, wanted in step.reads.items():
         if kind not in kinds:
@@ -291,7 +294,11 @@ def _reads(
         if stored is Each.ONE:
             found.append(Input(kind))
         elif wanted is Scope.ONE and stored is Each.PART:
-            found.append(Input(kind, part=producer.parts(selection, tables)[0]))
+            if producer.run_part is not None and run is not None:
+                one = producer.run_part(run, tables)
+            else:
+                one = producer.parts(selection, tables)[0]
+            found.append(Input(kind, part=one))
         elif wanted is Scope.ONE:
             raise ValueError(f"{kind} is not a single result ({step.name}).")
         elif stored is Each.FRAME:
@@ -299,7 +306,7 @@ def _reads(
             found += [Input(kind, r, f) for r, fs in runs.items() for f in fs]
         elif stored is Each.RUN:
             runs = every if wanted is Scope.ALL else [run]
-            found += [Input(kind, r) for r in runs]
+            found += [Input(kind, r) for r in runs if kind != step.name or r != run]
         elif wanted is Scope.ALL:
             found += [Input(kind, part=p) for p in producer.parts(selection, tables)]
         else:
@@ -516,7 +523,9 @@ def _durable(folder: Path) -> None:
 def _plan(steps, selection, tables, env, creation, kinds):
     """The tasks of a job, the token of each input bound, and why it is refused:
     each step's units, with their inputs made by the job or stored and accepted,
-    and those whose results are all stored and serve left out (:func:`_reuse`)."""
+    and those whose results are all stored and serve left out (:func:`_reuse`).
+    A unit that reads results of other units of its own step, e.g. a reference
+    run's, is planned after them."""
     made: dict[str, str] = {}
     bound: dict[str, str] = {}
     refused: list[str] = []
@@ -528,36 +537,55 @@ def _plan(steps, selection, tables, env, creation, kinds):
                 f"{step.name} needs run(s) {missing}, which its configuration names "
                 "and the selection lacks."
             )
-        kept: list[Task] = []
-        for run, frames, part in _units(step, selection, tables):
-            inputs = []
-            for i in _reads(step, run, frames, part, kinds, selection, tables):
-                if i.key in made:
-                    inputs.append(Input(i.kind, i.run, i.frame, i.part, made[i.key]))
-                    continue
-                if i.key not in bound:
-                    stored = creation.stored(i)
-                    bound[i.key] = ""
-                    if stored is None:
-                        refused.append(f"{i.key}, which {step.name} reads, is missing.")
-                    elif not creation.accepted(stored):
-                        refused.append(
-                            f"{i.key}, which {step.name} reads, is not "
-                            "accepted by its task's done marker."
+        pending = [
+            (unit, _reads(step, *unit, kinds, selection, tables))
+            for unit in _units(step, selection, tables)
+        ]
+        while pending:
+            waiting = {
+                o.key
+                for unit, _ in pending
+                for o in outputs(step, Task("", step.name, *unit, (), ()))
+            }
+            free = [not {i.key for i in reads} & waiting for _, reads in pending]
+            if not any(free):
+                raise ValueError(f"The tasks of {step.name} read each other's results.")
+            now = [p for p, ok in zip(pending, free) if ok]
+            pending = [p for p, ok in zip(pending, free) if not ok]
+            kept: list[Task] = []
+            for (run, frames, part), reads in now:
+                inputs = []
+                for i in reads:
+                    if i.key in made:
+                        inputs.append(
+                            Input(i.kind, i.run, i.frame, i.part, made[i.key])
                         )
-                    else:
-                        bound[i.key] = stored["token"]
-                inputs.append(i)
-            unit = Task("", step.name, run, frames, part, tuple(inputs), ())
-            refusals = _reuse(step, unit, selection, tables, env, creation, bound)
-            if refusals is None:
-                kept.append(unit)
-            else:
-                refused += refusals
-        for task in _grouped(step, kept):
-            made_tasks.append(task)
-            for o in outputs(step, task):
-                made[o.key] = task.id
+                        continue
+                    if i.key not in bound:
+                        stored = creation.stored(i)
+                        bound[i.key] = ""
+                        if stored is None:
+                            refused.append(
+                                f"{i.key}, which {step.name} reads, is missing."
+                            )
+                        elif not creation.accepted(stored):
+                            refused.append(
+                                f"{i.key}, which {step.name} reads, is not "
+                                "accepted by its task's done marker."
+                            )
+                        else:
+                            bound[i.key] = stored["token"]
+                    inputs.append(i)
+                unit = Task("", step.name, run, frames, part, tuple(inputs), ())
+                refusals = _reuse(step, unit, selection, tables, env, creation, bound)
+                if refusals is None:
+                    kept.append(unit)
+                else:
+                    refused += refusals
+            for task in _grouped(step, kept):
+                made_tasks.append(task)
+                for o in outputs(step, task):
+                    made[o.key] = task.id
     return made_tasks, bound, refused
 
 

@@ -10,6 +10,7 @@ import pytest
 import tifffile
 
 import darsia
+from darsia.image.raw import measure_raw_frame
 from darsia.presets.workflows.config.corrections import CorrectionsConfig
 from darsia.presets.workflows.rig import Rig
 
@@ -41,6 +42,7 @@ def write_dng(path, mosaic, pattern):
             (50714, "H", 1, (BLACK,), True),  # BlackLevel
             (50717, "H", 1, (WHITE,), True),  # WhiteLevel
             (50721, "f", 9, (1, 0, 0, 0, 1, 0, 0, 0, 1), True),  # ColorMatrix1
+            (50728, "f", 3, (0.5, 1, 0.25), True),  # AsShotNeutral
         ],
     )
 
@@ -92,6 +94,41 @@ def test_decode_is_linear_camera_rgb_and_clipping_is_invalid(tmp_path, layout, d
     # The outermost rows and columns copy their neighbours, as OpenCV does.
     np.testing.assert_array_equal(img[[0, -1]], img[[1, -2]])
     np.testing.assert_array_equal(img[:, [0, -1]], img[:, [1, -2]])
+
+
+def test_the_sensor_values_are_the_demosaic_before_the_division(tmp_path):
+    """The raw sensor read gives the 16-bit demosaic in camera units, the invalid
+    values the decode makes NaN, and the white range it divides by."""
+    mosaic = np.random.default_rng(4).integers(600, 15000, (32, 48), dtype=np.uint16)
+    mosaic[10, 20] = WHITE
+    write_dng(tmp_path / "image.dng", mosaic, LAYOUTS["RGGB"][0])
+
+    sensor = darsia.read_raw_sensor(tmp_path / "image.dng", "edge_aware")
+    image = darsia.imread(
+        tmp_path / "image.dng", demosaic="edge_aware", dtype="float32"
+    )
+
+    subtracted = np.maximum(mosaic.astype(int) - BLACK, 0).astype(np.uint16)
+    expected = cv2.demosaicing(subtracted, LAYOUTS["RGGB"][1])
+    assert sensor.values.dtype == np.uint16 and sensor.white_range == WHITE - BLACK
+    np.testing.assert_array_equal(sensor.values, expected)
+    np.testing.assert_array_equal(sensor.invalid, np.isnan(image.img))
+
+
+def test_measured_raw_decode_matches_the_regular_payload(tmp_path):
+    path = tmp_path / "image.dng"
+    mosaic = np.random.default_rng(4).integers(600, 15000, (32, 48), dtype=np.uint16)
+    write_dng(path, mosaic, LAYOUTS["RGGB"][0])
+    options = dict(demosaic="edge_aware", dtype="float32")
+    reference = darsia.imread(path, **options)
+    with measure_raw_frame() as measured:
+        image = darsia.imread(path, **options)
+    np.testing.assert_array_equal(image.img, reference.img)
+    assert measured.input_bytes == path.stat().st_size
+    assert measured.stages.keys() == {
+        "read_raw", "unpack_raw", "demosaic", "normalise", "corrections",
+    }
+    assert all(stage["wall_s"] >= 0 for stage in measured.stages.values())
 
 
 def test_a_list_or_folder_of_raw_files_is_a_time_series(tmp_path):

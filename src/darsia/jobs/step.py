@@ -68,7 +68,8 @@ class Scope(Enum):
     an ensemble, a comparison time or a donor."""
     ONE = "one"
     """The single result, e.g. the phase model; of a step in parts, its first
-    part, e.g. the global fit before the folds."""
+    part, e.g. the global fit before the folds, or the part it names for the
+    reader's run (:attr:`Step.run_part`), e.g. the fit of the run's group."""
 
 
 class Each(Enum):
@@ -437,11 +438,17 @@ class Step:
     """The selected runs a task of the step over the selection reads, named by the
     configuration's tables, e.g. the runs a measurement is made on; by default
     every selected run (:func:`read_runs`)."""
-    required: Callable[[Mapping[str, Any]], Iterable[str]] | None = None
-    """The runs the configuration names that a job of the step must select, e.g.
-    the fit runs among which a run's overflow ranks its donors and over which the
-    calibration fits, or the distances' reference run; a job without one of them
-    is refused (:func:`missing_runs`)."""
+    required: Callable[[Mapping[str, Any], Sequence[str]], Iterable[str]] | None = None
+    """The runs the configuration names that a job of the step must select, given
+    the configuration's tables and the selected runs, e.g. the fit runs among which
+    a run's overflow ranks its donors and over which the calibration fits (of the
+    calibration groups of the selected runs), or the distances' reference run; a
+    job without one of them is refused (:func:`missing_runs`)."""
+    run_part: Callable[[str, Mapping[str, Any]], str] | None = None
+    """For a step in parts, the part that a task of a run reads by
+    :attr:`Scope.ONE`, given the run and the configuration's tables, e.g. the fit
+    of the run's calibration group; by default, and for a task of no run, the
+    step's first part."""
 
     @property
     def stored(self) -> Each:
@@ -482,7 +489,8 @@ def missing_runs(
 ) -> list[str]:
     """The runs a step needs, by its configuration (:attr:`Step.required`), that
     the selection lacks."""
-    named = [] if step.required is None else list(step.required(tables))
+    selected = list(selection.frames)
+    named = [] if step.required is None else list(step.required(tables, selected))
     return [run for run in dict.fromkeys(named) if run not in selection.frames]
 
 

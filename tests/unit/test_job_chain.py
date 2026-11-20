@@ -13,6 +13,7 @@ missing frame with the same maps.
 
 import datetime
 import json
+import shutil
 import tomllib
 import zipfile
 from dataclasses import asdict, replace
@@ -26,9 +27,10 @@ import toml
 
 import darsia
 import darsia.jobs.__main__ as jobs_main
+from darsia.jobs import job as job_module
 from darsia.jobs import queue
 from darsia.jobs.job import create_job
-from darsia.jobs.step import Selection, StepContext, run_tables, table
+from darsia.jobs.step import Selection, StepContext, missing_runs, run_tables, table
 from darsia.presets.workflows.analysis import steps as analysis
 from darsia.presets.workflows.analysis.domain_mass import DomainMass, write_domain_mass
 from darsia.presets.workflows.analysis.domains import AnalysisDomain, write_rows
@@ -67,6 +69,7 @@ from darsia.presets.workflows.media.tiles import (
 )
 from darsia.presets.workflows.rig import Rig
 from darsia.presets.workflows.setup import steps as setup
+from darsia.presets.workflows.setup.sand_map import rig_grid
 from darsia.presets.workflows.setup.setup_facies import make_facies
 from darsia.presets.workflows.setup.setup_rig import make_experiment, make_rig
 from darsia.presets.workflows.setup.setup_sand_map import make_sand_map
@@ -1435,6 +1438,215 @@ def test_a_fold_without_a_runs_donor_takes_the_next_donor(tmp_path, monkeypatch)
     own = stored["overflow", "r1"]
     assert {v.source for v in darsia.read_frame_volumes(own).values()} == {"measured"}
     assert darsia.held_out_runs(own) == ()
+    # With calibration groups, the donors are its group's fit runs alone.
+    groups = {"late": {"runs": ["r2", "r3"], "fit": ["r3"]}, "early": GROUP_EARLY}
+    fits = settings_from_table(calibration.FitRuns, {"groups": groups})
+    calibration._overflow(ctx("r2", "grouped"))
+    grouped = stored["grouped", "r2"]
+    assert {v.source for v in darsia.read_frame_volumes(grouped).values()} == {"r3"}
+    assert darsia.held_out_runs(grouped) == ()
+
+
+GROUP_EARLY = {"runs": ["r1"], "fit": ["r1"], "folds": ["r1"]}
+"""A calibration group of the first run, with its fold."""
+
+
+def test_a_run_is_fitted_on_its_reference_runs_grid(tmp_path, monkeypatch):
+    """The rig step fits a run's material light correction on its reference run's
+    fitting grid: with the reference's stored baseline and facies, the fit mask the
+    reference's own fit read, and the homography between the runs' grids built in
+    the rig's precision; the reference run itself is fitted on its own grid and is
+    made first."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float32")
+    monkeypatch.chdir(project)
+    mask = np.zeros((120, 180), bool)
+    mask[:, 20:150] = True  # the reference's own fit reads part of its sands
+    darsia.Image(mask, dimensions=[0.3, 0.45]).save(project / "mask-r2.npz")
+    # The first run's grid lies slightly rotated and scaled on the rig.
+    angle, scale = 0.003, 1.0007
+    rotation = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0],
+            [np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1],
+        ]
+    )
+    grid = darsia.Image(np.zeros((120, 180)), dimensions=[0.3, 0.45])
+    measured = np.linalg.inv(np.diag([scale, scale, 1.0]) @ rotation @ rig_grid(grid))
+    config.write_text(  # on the mapping's grid, without the scaling onto cells
+        config.read_text().replace("pixel_size_mm = 5.0\n", "")
+        + '[material_reference]\nrun = "r2"\n'
+        + '[runs.r2.corrections.material_illumination]\nfit_mask = "mask-r2.npz"\n'
+        + f"[runs.r1.labeling.sand_map]\ngrid_to_rig = {measured.tolist()}\n"
+    )
+    job = create_job(tmp_path / "jobs", (setup.SAND_MAP, setup.RIG), selection, config)
+    tasks = queue.tasks(job)
+    assert [i.key for i in tasks["rig.r1"].inputs] == ["sand-map/r1", "rig/r2"]
+    assert [i.key for i in tasks["rig.r2"].inputs] == ["sand-map/r2"]
+    _run(job)
+    assert queue.waiting(job) == set()
+
+    def correction(run):
+        folder = project / "results" / "rig" / run
+        (path,) = folder.glob("color_correction_*_materialilluminationcorrection.npz")
+        return darsia.read_correction(path)
+
+    reference = Rig.load(project / "results" / "rig" / "r2")
+    first = Rig.load(project / "results" / "rig" / "r1")
+    f32 = np.dtype(np.float32)
+    model = np.linalg.inv(rig_grid(reference.shape_corrected_baseline))
+    homography = darsia.linalg.solve(model.astype(f32), np.eye(3, dtype=f32))
+    homography = homography @ measured.astype(f32)
+    tables = tomllib.loads(config.read_text())
+    fit = tables["corrections"]["material_illumination"]
+    targets = {int(k): v for k, v in fit["targets"].items()}
+    expected = darsia.fit_material_illumination(
+        first.shape_corrected_baseline.img,
+        first.facies.img,
+        np.isin(first.facies.img, list(targets)),
+        targets,
+        dimensions=first.shape_corrected_baseline.dimensions,
+        fit_shape=tuple(fit["fit_shape"]),
+        block_size=fit["block_size"],
+        edge_margin=fit["edge_margin"],
+        dn_scale=fit["dn_scale"],
+        settings=darsia.MaterialFitSettings(**fit["fit"]),
+        reference=darsia.MaterialFitReference(
+            baseline=reference.shape_corrected_baseline.img,
+            material_map=reference.facies.img,
+            fit_mask=mask,
+            dimensions=tuple(reference.shape_corrected_baseline.dimensions),
+            homography=homography,
+        ),
+    )
+    found = correction("r1")
+    assert np.array_equal(found.grid_to_field, expected.grid_to_field)
+    assert np.array_equal(found.common_coefficients, expected.common_coefficients)
+    for material, coefficients in expected.material_coefficients.items():
+        assert np.array_equal(found.material_coefficients[material], coefficients)
+    assert correction("r2").grid_to_field is None
+
+    # The first run's depth rule at its pixels' positions by its measured model:
+    # the model at each column and row, in the grid's precision.
+    depths = pd.read_csv(project / "depth.csv")
+    measurements = (depths["x"], depths["y"], depths["depth"])
+    columns = np.arange(180, dtype=f32)[None, :]
+    rows = np.arange(120, dtype=f32)[:, None]
+    x, y = darsia.project_xy(measured.astype(f32), columns, rows)
+    by_model, outside = darsia.interpolate_linear_in_hull(
+        measurements, np.column_stack((x.ravel(), y.ravel()))
+    )
+    assert outside.any() and not outside.all()
+    assert first.depth.img.dtype == f32
+    assert np.array_equal(first.depth.img, by_model.reshape(120, 180))
+    cx, cy = darsia.pixel_centres(first.baseline)
+    centres = np.stack(np.meshgrid(cx, cy), axis=-1).reshape(-1, 2).astype(f32)
+    nominal, _ = darsia.interpolate_linear_in_hull(measurements, centres)
+    assert not np.array_equal(first.depth.img, nominal.reshape(120, 180))
+
+
+def test_a_run_reads_its_reference_runs_files_in_the_read_of_its_rig(
+    tmp_path, monkeypatch
+):
+    """The files of the reference's rig that a run's fit reads, its stored baseline
+    and facies, are copied into the task's folder within the one read of the
+    reference's rig, so that a share that does not find them yet is read again;
+    the fit reads the copies."""
+    source = tmp_path / "rig-r2"
+    source.mkdir()
+    grid = darsia.Image(np.zeros((12, 18)), dimensions=[0.3, 0.45])
+    grid.save(source / "labels.npz")
+    names = ("shape_corrected_baseline.npz", "facies.npz")
+    for name in names:
+        (source / name).write_bytes(name.encode())
+    reads = []
+
+    def read(kind, reader, run):
+        reads.append((kind, run))
+        return reader(source)
+
+    ctx = SimpleNamespace(tables={"material_reference": {"run": "r2"}}, read=read)
+    settings = SimpleNamespace(corrections=SimpleNamespace(precision="float32"))
+    monkeypatch.setattr(setup, "run_settings", lambda ctx, run, sections: settings)
+    made = setup._material_reference(ctx, "r1", grid, tmp_path / "task")
+    shutil.rmtree(source)  # nothing of the reference's rig is read after its read
+    table = made["corrections"]["material_illumination"]["reference"]
+    assert reads == [("rig", "r2")]
+    for key, name in zip(("baseline", "facies"), names):
+        assert Path(table[key]) == tmp_path / "task" / name
+        assert Path(table[key]).read_bytes() == name.encode()
+
+
+def test_each_calibration_group_fits_its_runs_and_a_run_reads_its_group(
+    tmp_path, monkeypatch
+):
+    """With calibration groups each group has its own fit and folds over its own
+    runs' frames, and a run's mass maps read its group's fit and no other."""
+    project = tmp_path / "project"
+    config, selection = _project(project, "float64")
+    tables = tomllib.loads(config.read_text())
+    frames = {**selection.frames, "r3": selection.frames["r1"]}
+    selection = Selection(frames, selection.sessions)
+    groups = {"late": {"runs": ["r2", "r3"], "fit": ["r3"]}, "early": GROUP_EARLY}
+    tables["calibration_runs"] = {"groups": groups}
+    fits = settings_from_table(calibration.FitRuns, tables["calibration_runs"])
+    parts = calibration.CALIBRATION.parts(selection, tables)
+    assert parts == ("fit-late", "fit-early", "fold-early-r1")
+    with pytest.raises(ValueError, match="Run r4 is in 0 calibration groups"):
+        fits.group("r4")
+    for wrong in (
+        {**GROUP_EARLY, "fit": ["r1", "r2"]},
+        {**GROUP_EARLY, "folds": ["r2"]},
+    ):
+        with pytest.raises(ValueError, match=r"\['r2'\] of a calibration's fit"):
+            settings_from_table(calibration.FitRuns, {"groups": {"early": wrong}})
+    # A job needs the fit runs and folds of its selected runs' groups alone.
+    early = Selection({"r1": frames["r1"]}, selection.sessions)
+    assert missing_runs(calibration.CALIBRATION, early, tables) == []
+    late = Selection({"r2": frames["r2"]}, selection.sessions)
+    assert missing_runs(calibration.CALIBRATION, late, tables) == ["r3"]
+    assert missing_runs(calibration.OVERFLOW, late, tables) == ["r3"]
+
+    # A run's mass maps read its group's fit.
+    kinds = {step.name: step for step in STEPS}
+    for run, part in (("r1", "fit-early"), ("r2", "fit-late"), ("r3", "fit-late")):
+        inputs = job_module._reads(
+            analysis.MASS_MAPS, run, frames[run][:1], None, kinds, selection, tables
+        )
+        assert [i.part for i in inputs if i.kind == "calibration"] == [part]
+
+    # Each part fits its group's fit runs on its group's runs' frames alone.
+    fitted = {}
+
+    def fit(frames, runs, *args):
+        fitted.update(runs=sorted(set(frames)), fit=list(runs))
+        return SimpleNamespace(anchors={})
+
+    monkeypatch.setattr(
+        darsia, "read_frames", lambda folder, held, first_index=None: [folder.name]
+    )
+    monkeypatch.setattr(darsia, "fit_calibration", fit)
+    monkeypatch.setattr(darsia, "calibration_fold", lambda *a: (fit(*a[:-1]), []))
+    monkeypatch.setattr(darsia, "mass_calibrations", lambda c, s: {})
+    monkeypatch.setattr(darsia, "write_calibration", lambda *a: None)
+    material = settings_from_table(calibration.MaterialSettings, tables["material"])
+    settings = {"calibration_runs": fits, "material": material}
+    settings |= {"calibration_fit": None, "run_statistics": None}
+    for part, runs, fit_runs in (
+        ("fit-late", ["r2", "r3"], ["r3"]),
+        ("fit-early", ["r1"], ["r1"]),
+        ("fold-early-r1", ["r1"], ["r1"]),
+    ):
+        ctx = SimpleNamespace(
+            task=SimpleNamespace(part=part),
+            selection=selection,
+            settings=settings,
+            read=lambda kind, reader, run, frame: reader(tmp_path / run),
+            publish=lambda write: write(tmp_path),
+        )
+        calibration._calibration(ctx)
+        assert fitted == {"runs": runs, "fit": fit_runs}
 
 
 def test_the_readings_count_from_the_sheets_own_injection_start(tmp_path, monkeypatch):

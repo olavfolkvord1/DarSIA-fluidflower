@@ -15,11 +15,20 @@ and set to NaN in their channel. The outermost photosites count as invalid too,
 since the edge-aware demosaic does not interpolate there but copies the neighbouring
 rows and columns.
 
+The demosaiced values in camera units, their invalid values and the white range
+are also given as they are (:func:`read_raw_sensor`), e.g. for a registration that
+compares every value and a sampling that divides by the white range afterwards.
+
 LibRaw is used through the optional package ``rawpy`` (``pip install darsia[raw]``).
 
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
+from time import perf_counter, process_time
 
 import cv2
 import numpy as np
@@ -56,6 +65,45 @@ RAW_SUFFIXES = (
     ".x3f",
 )
 """File suffixes (lower case) of camera raw formats, read by :func:`imread_from_raw`."""
+
+
+@dataclass
+class RawMeasurements:
+    """A profiled frame's wall and CPU times and payload sizes."""
+
+    stages: dict = field(default_factory=dict)
+    input_bytes: int = 0
+    output_bytes: int = 0
+
+
+_raw_measurements = ContextVar[RawMeasurements | None]("raw_measurements", default=None)
+
+
+@contextmanager
+def measure_raw_frame():
+    """Enable timing of the native RAW stages for the duration of one frame."""
+    profile = RawMeasurements()
+    token = _raw_measurements.set(profile)
+    try:
+        yield profile
+    finally:
+        _raw_measurements.reset(token)
+
+
+@contextmanager
+def raw_stage(name: str):
+    """Record elapsed and CPU seconds for a stage when a frame is being measured."""
+    profile = _raw_measurements.get()
+    if profile is None:
+        yield
+        return
+    wall, cpu = perf_counter(), process_time()
+    try:
+        yield
+    finally:
+        entry = profile.stages.setdefault(name, {"wall_s": 0.0, "cpu_s": 0.0})
+        entry["wall_s"] += perf_counter() - wall
+        entry["cpu_s"] += process_time() - cpu
 
 
 def imread_from_raw(
@@ -108,9 +156,96 @@ def imread_from_raw(
         kwargs["series"] = True
     else:
         image = _decode(path, dtype)
-    return darsia.OpticalImage(
-        image, transformations=transformations, color_space="RGB", **kwargs
-    )
+    with raw_stage("corrections"):
+        return darsia.OpticalImage(
+            image, transformations=transformations, color_space="RGB", **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class RawSensor:
+    """The demosaiced values of one raw file, in camera units."""
+
+    values: np.ndarray
+    """Black-subtracted camera RGB (rows, cols, 3) of the 16-bit demosaic."""
+    invalid: np.ndarray
+    """Whether each value draws on an invalid photosite (rows, cols, 3)."""
+    white_range: int
+    """The white level minus the black level."""
+    display_matrix: np.ndarray | None = None
+    """Optional as-shot camera RGB to linear sRGB, for display only."""
+
+
+def read_raw_sensor(path: Path, demosaic: str, *, display: bool = False) -> RawSensor:
+    """Read a camera raw file's demosaiced values, before the division by the white
+    range and with their invalid values marked apart (:func:`imread_from_raw`).
+
+    Parameters
+    ----------
+    path : Path
+        Path to the raw file.
+    demosaic : str
+        Interpolation of the colour filter array; ``"edge_aware"`` is OpenCV's
+        edge-aware Bayer demosaic.
+    display : bool, optional
+        Include an as-shot display colour matrix. The sensor samples stay unchanged.
+
+    Returns
+    -------
+    RawSensor
+        The values, their invalid values and the white range.
+
+    Raises
+    ------
+    ImportError
+        If ``rawpy`` is not installed.
+    ValueError
+        As :func:`imread_from_raw`.
+
+    """
+    if rawpy is None:
+        raise ImportError("Reading camera raw files requires rawpy (darsia[raw]).")
+    if demosaic != "edge_aware":
+        raise ValueError(f"Unknown demosaic {demosaic!r}; 'edge_aware' is supported.")
+    profile = _raw_measurements.get()
+    source = str(path)
+    if profile is not None:
+        with raw_stage("read_raw"):
+            raw_bytes = Path(path).read_bytes()
+            profile.input_bytes += len(raw_bytes)
+            source = BytesIO(raw_bytes)
+            del raw_bytes
+    with raw_stage("unpack_raw"), rawpy.imread(source) as raw:
+        if np.shape(raw.raw_pattern) != (2, 2):
+            raise ValueError(f"{path} has no Bayer colour filter array.")
+        mosaic = raw.raw_image_visible.copy()
+        # RGB index of each photosite of the 2 x 2 cell at the visible origin.
+        rgb_index = np.array(["RGB".find(c) for c in raw.color_desc.decode()])
+        phase = rgb_index[raw.raw_colors_visible[:2, :2]]
+        black_levels = set(raw.black_level_per_channel)
+        white = int(raw.white_level)
+        matrix = _raw_display_matrix(raw) if display else None
+
+    # A Bayer cell has two green photosites on one diagonal, red and blue on the other.
+    if (
+        sorted(phase.ravel()) != [0, 1, 1, 2]
+        or (phase == phase[::-1]).any()
+        or (phase == phase[:, ::-1]).any()
+    ):
+        raise ValueError(f"{path} has no RGB Bayer colour filter array.")
+    if len(black_levels) != 1:
+        raise ValueError(f"{path} has different black levels per colour.")
+    black = black_levels.pop()
+    if white <= black:
+        raise ValueError(f"{path} has no white level above its black level.")
+
+    # OpenCV names a Bayer layout by the second row's second and third photosites.
+    code = getattr(cv2, f"COLOR_Bayer{'RGB'[phase[1, 1]]}{'RGB'[phase[1, 0]]}2RGB_EA")
+    with raw_stage("demosaic"):
+        subtracted = mosaic - np.minimum(mosaic, black)
+        values = cv2.demosaicing(subtracted, code)
+        invalid = _invalid(subtracted, mosaic >= white, phase)
+    return RawSensor(values, invalid, int(white - black), matrix)
 
 
 def raw_display_matrix(path: Path) -> np.ndarray:
@@ -188,35 +323,11 @@ def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
         shape (rows, cols, 3).
 
     """
-    with rawpy.imread(str(path)) as raw:
-        if np.shape(raw.raw_pattern) != (2, 2):
-            raise ValueError(f"{path} has no Bayer colour filter array.")
-        mosaic = raw.raw_image_visible.copy()
-        # RGB index of each photosite of the 2 x 2 cell at the visible origin.
-        rgb_index = np.array(["RGB".find(c) for c in raw.color_desc.decode()])
-        phase = rgb_index[raw.raw_colors_visible[:2, :2]]
-        black_levels = set(raw.black_level_per_channel)
-        white = int(raw.white_level)
-
-    # A Bayer cell has two green photosites on one diagonal, red and blue on the other.
-    if (
-        sorted(phase.ravel()) != [0, 1, 1, 2]
-        or (phase == phase[::-1]).any()
-        or (phase == phase[:, ::-1]).any()
-    ):
-        raise ValueError(f"{path} has no RGB Bayer colour filter array.")
-    if len(black_levels) != 1:
-        raise ValueError(f"{path} has different black levels per colour.")
-    black = black_levels.pop()
-    if white <= black:
-        raise ValueError(f"{path} has no white level above its black level.")
-
-    # OpenCV names a Bayer layout by the second row's second and third photosites.
-    code = getattr(cv2, f"COLOR_Bayer{'RGB'[phase[1, 1]]}{'RGB'[phase[1, 0]]}2RGB_EA")
-    subtracted = mosaic - np.minimum(mosaic, black)
-    image = cv2.demosaicing(subtracted, code).astype(dtype)
-    image /= image.dtype.type(white - black)
-    image[_invalid(subtracted, mosaic >= white, phase)] = np.nan
+    sensor = read_raw_sensor(path, "edge_aware")
+    with raw_stage("normalise"):
+        image = sensor.values.astype(dtype)
+        image /= image.dtype.type(sensor.white_range)
+        image[sensor.invalid] = np.nan
     return image
 
 
