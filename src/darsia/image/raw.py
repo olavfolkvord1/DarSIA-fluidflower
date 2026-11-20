@@ -113,6 +113,64 @@ def imread_from_raw(
     )
 
 
+def raw_display_matrix(path: Path) -> np.ndarray:
+    """Read an as-shot display matrix without demosaicing or postprocessing.
+
+    A row of black-subtracted, white-range-normalized camera RGB multiplied by
+    this matrix gives linear sRGB. Exposure is the camera's recorded sensor
+    scale, with white-balance gains relative to green. No channel-wise or
+    image-dependent brightness normalization is applied. A comparison must use
+    the same matrix for both its before and after samples.
+    """
+    if rawpy is None:
+        raise ImportError("Reading camera colour metadata requires rawpy.")
+    with rawpy.RawPy() as raw:
+        raw.open_file(str(path))
+        return _raw_display_matrix(raw)
+
+
+def _raw_display_matrix(raw) -> np.ndarray:
+    """Camera metadata in the decoder's RGB order, using LibRaw's colour model.
+
+    LibRaw's cam_xyz (rawpy rgb_xyz_matrix) maps XYZ to camera responses.
+    Compose with the standard sRGB-to-XYZ primaries, normalize each camera
+    response to a neutral white and invert, as in LibRaw cam_xyz_coeff. Apply
+    the recorded as-shot gains before this colour conversion. This does not
+    replace the scientific decoder or the fitted light/colour correction.
+    """
+    colours = raw.color_desc.decode().rstrip("\x00")
+    if any(colour not in colours for colour in "RGB"):
+        raise ValueError("Camera display requires RGB colour metadata.")
+    channels = [colours.index(colour) for colour in "RGB"]
+    gains = np.asarray(raw.camera_whitebalance, dtype=float)[channels]
+    xyz_to_camera = np.asarray(raw.rgb_xyz_matrix, dtype=float)[channels, :]
+    if not np.isfinite(gains).all() or np.any(gains <= 0):
+        raise ValueError("The RAW file has no valid as-shot white balance.")
+    # Embedded camera profiles (notably DNG) already supply camera-to-sRGB.
+    # LibRaw prefers cmatrix for as-shot display; cam_xyz may be all zero there.
+    embedded = np.asarray(getattr(raw, "color_matrix", np.zeros((3, 4))), dtype=float)
+    if embedded.shape == (3, 4) and np.any(embedded):
+        embedded = embedded[:, channels]
+        if not np.isfinite(embedded).all() or np.linalg.matrix_rank(embedded) != 3:
+            raise ValueError("The embedded camera display matrix is not invertible.")
+        return np.diag(gains / gains[1]) @ embedded.T
+    if xyz_to_camera.shape != (3, 3) or not np.isfinite(xyz_to_camera).all():
+        raise ValueError("The RAW file has no valid camera colour matrix.")
+    xyz_from_srgb = np.array(
+        [
+            [0.412453, 0.357580, 0.180423],
+            [0.212671, 0.715160, 0.072169],
+            [0.019334, 0.119193, 0.950227],
+        ]
+    )
+    camera_from_srgb = xyz_to_camera @ xyz_from_srgb
+    neutral = camera_from_srgb.sum(axis=1)
+    if np.any(neutral <= 0) or np.linalg.matrix_rank(camera_from_srgb) != 3:
+        raise ValueError("The RAW camera colour matrix is not invertible.")
+    camera_from_srgb /= neutral[:, None]
+    return np.diag(gains / gains[1]) @ np.linalg.inv(camera_from_srgb).T
+
+
 def _decode(path: Path, dtype: np.dtype | str) -> np.ndarray:
     """Decode one raw file with the edge-aware demosaic.
 

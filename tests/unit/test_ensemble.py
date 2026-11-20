@@ -2,10 +2,12 @@
 
 import csv
 import tomllib
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.image import imread
 
 import darsia
 from darsia.presets.workflows.analysis.domain_mass import RunSeries
@@ -26,6 +28,7 @@ from darsia.presets.workflows.comparison.ensemble import (
     write_tables,
 )
 from darsia.presets.workflows.comparison.ensemble_figures import ensemble_figures
+from darsia.presets.workflows.media.style import Curve, FigureStyle
 
 SETTINGS = EnsembleSettings(
     **tomllib.loads(
@@ -36,6 +39,40 @@ SETTINGS = EnsembleSettings(
         centre_component = "total"
         """
     )
+)
+STYLE_TABLE = tomllib.loads(
+    """
+    # Our production's figure style: the ensemble figures' palette, 150 dpi and
+    # the 50x rule for a logarithmic time axis; the films' colours and curves.
+    dpi = 150
+    log_span = 50.0
+    surface = "#fcfcfb"
+    ink = "#0b0b0b"
+    secondary = "#52514e"
+    muted = "#898781"
+    grid = "#e1e0d9"
+    axis = "#c3c2b7"
+    washes = ["#ebeae4", "#dcdcd4"]
+    series = "#2a78d6"
+    frame = "#1e2226"
+    empty = "#3e4246"
+    no_value = "#e6edf2"
+    colour_map = "viridis"
+    marker = "#667085"
+    curves = [
+        {column = "total_mass_g", name = "Total", colour = "#175aad", line = "-"},
+        {column = "aqueous_mass_g", name = "Dissolved", colour = "#169879", line = "-"},
+        {column = "gas_mass_g", name = "Free gas", colour = "#dc398b", line = "-"},
+        {column = "injected_mass_g", name = "Injected", colour = "black", line = "--"},
+    ]
+    """
+)
+STYLE = FigureStyle(
+    **{
+        **STYLE_TABLE,
+        "washes": tuple(STYLE_TABLE["washes"]),
+        "curves": tuple(Curve(**curve) for curve in STYLE_TABLE["curves"]),
+    }
 )
 DOMAINS = [
     AnalysisDomain(kind="whole", domain_id="whole", name="Whole domain"),
@@ -242,10 +279,11 @@ def test_the_event_times_summarised_over_runs(tmp_path):
 
 
 def test_the_figures_are_written(tmp_path):
-    """The mass, fraction and trajectory figures, each with and without title."""
+    """The mass, fraction and trajectory figures, each with and without title, at
+    the style's resolution."""
     runs = ensemble(tmp_path)
     tables = ensemble_tables(runs, DOMAINS[:2], SETTINGS)
-    files = ensemble_figures(tmp_path, tables, runs, SETTINGS)
+    files = ensemble_figures(tmp_path, tables, runs, SETTINGS, STYLE)
 
     assert len(files) == 2 * (3 * 3 + 3 + 2)
     assert "mass_whole-domain_gas_notitle.png" in files
@@ -255,5 +293,11 @@ def test_the_figures_are_written(tmp_path):
     alike = [*DOMAINS[:2], AnalysisDomain("layer", "layer:3", "Low", label=3)]
     with pytest.raises(ValueError, match="named alike"):
         ensemble_figures(
-            tmp_path, ensemble_tables(runs, alike, SETTINGS), runs, SETTINGS
+            tmp_path, ensemble_tables(runs, alike, SETTINGS), runs, SETTINGS, STYLE
         )
+    coarse = tmp_path / "coarse"
+    coarse.mkdir()
+    ensemble_figures(coarse, tables, runs, SETTINGS, replace(STYLE, dpi=75))
+    name = "trajectory_low_total_notitle.png"
+    heights = [imread(folder / name).shape[0] for folder in (tmp_path, coarse)]
+    assert heights[1] == pytest.approx(heights[0] / 2, abs=2)
